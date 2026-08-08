@@ -11,7 +11,9 @@
 use proc_macro2::Span;
 use syn::{Expr, File, Item, Pat, Stmt, punctuated::Punctuated, spanned::Spanned, token::Comma};
 
-use crate::{bridge::HostBridge, schema::TypeTable};
+use std::collections::BTreeMap;
+
+use crate::{bridge::HostBridge, parts::Tables, schema::TypeTable};
 
 /// One subset violation.
 #[derive(Debug)]
@@ -43,11 +45,32 @@ impl std::fmt::Display for Diagnostics {
     }
 }
 
+/// Which document the subset is checking: the root (which may declare
+/// parts and call their `pub` functions) or a part (which declares no
+/// parts and calls nothing outside itself — wiring flows through the
+/// root).
+#[derive(Debug)]
+pub enum SubsetScope<'a> {
+    /// The root document, with the loaded parts for call admission.
+    Root {
+        /// The loaded part tables, keyed by declared name.
+        parts: &'a BTreeMap<String, Tables>,
+    },
+    /// One part document.
+    Part,
+}
+
 /// Validate that `file` is within the interpreted subset.
-pub fn check<B: HostBridge>(file: &File, bridge: &B, types: &TypeTable) -> Result<(), Diagnostics> {
+pub fn check<B: HostBridge>(
+    file: &File,
+    bridge: &B,
+    types: &TypeTable,
+    scope: SubsetScope<'_>,
+) -> Result<(), Diagnostics> {
     let mut c = Checker {
         bridge,
         types,
+        scope,
         diags: Vec::new(),
     };
     for item in &file.items {
@@ -63,6 +86,7 @@ pub fn check<B: HostBridge>(file: &File, bridge: &B, types: &TypeTable) -> Resul
 struct Checker<'a, B: HostBridge> {
     bridge: &'a B,
     types: &'a TypeTable,
+    scope: SubsetScope<'a>,
     diags: Vec<Diagnostic>,
 }
 
@@ -78,13 +102,49 @@ impl<B: HostBridge> Checker<'_, B> {
         match item {
             // config schema: opaque, except #[require(expr)] which admission later
             // evaluates — so its expression must be vetted by the subset too.
-            Item::Struct(s) => self.attr_requires(&s.attrs),
-            Item::Enum(e) => self.attr_requires(&e.attrs),
-            Item::Fn(f) => self.block(&f.block),
+            Item::Struct(s) => {
+                self.item_visibility(&s.vis, s.span());
+                self.attr_requires(&s.attrs);
+            }
+            Item::Enum(e) => {
+                self.item_visibility(&e.vis, e.span());
+                self.attr_requires(&e.attrs);
+            }
+            Item::Fn(f) => {
+                self.item_visibility(&f.vis, f.span());
+                self.block(&f.block);
+            }
+            Item::Mod(m) => match &self.scope {
+                SubsetScope::Root { .. } => {
+                    if m.content.is_some() {
+                        self.reject(
+                            m.span(),
+                            format!(
+                                "inline module bodies are not allowed; declare `mod {};` with                                  the part in `{}.tkd`",
+                                m.ident, m.ident
+                            ),
+                        );
+                    }
+                }
+                SubsetScope::Part => self.reject(
+                    m.span(),
+                    "a part declares no parts — definitions are one level deep",
+                ),
+            },
             other => self.reject(
                 other.span(),
                 format!("item not allowed in a `.tkd`: `{}`", item_kind(other)),
             ),
+        }
+    }
+
+    /// `pub` marks a part's exports; the root exports nothing, so a marked
+    /// root item is a misunderstanding worth naming.
+    fn item_visibility(&mut self, vis: &syn::Visibility, span: Span) {
+        if matches!(self.scope, SubsetScope::Root { .. })
+            && !matches!(vis, syn::Visibility::Inherited)
+        {
+            self.reject(span, "the root exports nothing; remove `pub`");
         }
     }
 
@@ -257,6 +317,39 @@ impl<B: HostBridge> Checker<'_, B> {
                 || self.bridge.knows_assoc(&joined)
                 || (segs.len() == 2 && self.types.is_enum(&segs[0]));
             if !allowed {
+                // The root may call a declared part's `pub` functions; the
+                // refusals below name the exact gap rather than a generic
+                // disallowed call.
+                if let (SubsetScope::Root { parts }, 2) = (&self.scope, segs.len())
+                    && let Some(part) = parts.get(&segs[0])
+                {
+                    {
+                        match part.fns.get(&segs[1]) {
+                            Some(f) if matches!(f.vis, syn::Visibility::Public(_)) => {
+                                self.exprs(&ec.args);
+                                return;
+                            }
+                            Some(_) => {
+                                self.reject(
+                                    ec.span(),
+                                    format!(
+                                        "`{joined}` is not `pub`; a part exports what the                                          root may call"
+                                    ),
+                                );
+                                self.exprs(&ec.args);
+                                return;
+                            }
+                            None => {
+                                self.reject(
+                                    ec.span(),
+                                    format!("part `{}` has no function `{}`", segs[0], segs[1]),
+                                );
+                                self.exprs(&ec.args);
+                                return;
+                            }
+                        }
+                    }
+                }
                 self.reject(ec.span(), format!("call `{joined}` is not allowed"));
             }
         } else {

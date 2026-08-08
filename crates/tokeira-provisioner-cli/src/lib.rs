@@ -309,8 +309,36 @@ pub(crate) async fn retarget_gate<F: tokeira_platform::definition::DefinitionFro
             live_path.display()
         )
     })?;
-    // The engine's refusal IS the error, already naming every changed field.
-    engine.retarget_check(admitted, &prior, &current)
+    // Each side resolves its definition parts against its own set: the
+    // retained revision folder for the prior, the live directory for the
+    // current. A format-less source has no part convention on either side.
+    match &config_source.format {
+        Some(format) => {
+            let prior_parts = tokeira_platform::definition::DirectoryPartSources::new(
+                config_history::retained_parts_dir(
+                    deployment_dir,
+                    &config_source,
+                    envelope.config_revision,
+                ),
+                format.as_str(),
+            );
+            let current_parts = tokeira_platform::definition::DirectoryPartSources::new(
+                live_path
+                    .parent()
+                    .expect("a live definition path has a parent"),
+                format.as_str(),
+            );
+            // The engine's refusal IS the error, already naming every changed field.
+            engine.retarget_check(admitted, &prior, &current, &prior_parts, &current_parts)
+        }
+        None => engine.retarget_check(
+            admitted,
+            &prior,
+            &current,
+            &tokeira_platform::definition::NoPartSources,
+            &tokeira_platform::definition::NoPartSources,
+        ),
+    }
 }
 
 /// Persist an apply's resolved writeback into the deployment's server

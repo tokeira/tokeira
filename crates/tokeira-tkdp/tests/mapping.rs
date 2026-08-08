@@ -36,6 +36,7 @@ fn failure(source: &str) -> String {
             },
             &ctx,
             &vocabulary,
+            &tokeira_platform::definition::NoPartSources,
         )
         .expect_err("source must fail")
         .message

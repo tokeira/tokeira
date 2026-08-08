@@ -79,14 +79,37 @@ pub struct Preflight {
     pub module: ModModule,
     /// Facade names the definition imports, in source order.
     pub imports: Vec<FacadeImport>,
-    /// The `from tokeira import …` statement ranges, blanked by the lowering.
-    pub import_ranges: Vec<TextRange>,
+    /// Non-facade module names this file imports, in source order — the
+    /// candidates the frontend offers to the part resolver. A name the
+    /// resolver serves is a definition part; a name it does not is left for
+    /// Monty (a built-in, or a runtime `ModuleNotFoundError`).
+    pub part_imports: Vec<PartImport>,
     /// Builder-verb call sites for range correlation.
     pub call_sites: Vec<CallSite>,
     /// Range of the `config` entrypoint's name.
     pub config_range: TextRange,
     /// Range of the `deployment` entrypoint's name.
     pub deployment_range: TextRange,
+}
+
+/// A validated definition part: the same admission surface as the root minus
+/// the entrypoint requirement — a part is a plain module of the dialect.
+#[derive(Debug)]
+pub struct PartPreflight {
+    /// Parsed module, reused by the lowering.
+    pub module: ModModule,
+    /// Non-facade module names this part imports (part-to-part edges and
+    /// built-ins alike), in source order.
+    pub part_imports: Vec<PartImport>,
+}
+
+/// One non-facade import: a candidate definition part.
+#[derive(Debug)]
+pub struct PartImport {
+    /// The imported module name.
+    pub name: String,
+    /// The import statement's range in this file.
+    pub range: TextRange,
 }
 
 /// Parses and validates a definition against the facade surface
@@ -112,18 +135,94 @@ pub fn preflight(source: &str, facade_names: &[&str]) -> Result<Preflight, Vec<F
     for stmt in &module.body {
         checker.visit_stmt(stmt);
     }
+    check_import_shadowing(&module, &mut checker);
     let entrypoints = check_entrypoints(&module, &mut checker.findings);
 
     match (entrypoints, checker.findings.is_empty()) {
         (Some((config_range, deployment_range)), true) => Ok(Preflight {
             module,
             imports: checker.imports,
-            import_ranges: checker.import_ranges,
+            part_imports: checker.part_imports,
             call_sites: checker.call_sites,
             config_range,
             deployment_range,
         }),
         _ => Err(checker.findings),
+    }
+}
+
+/// Parses and validates a definition part: the root's admission surface
+/// without the entrypoint requirement.
+pub fn preflight_part(source: &str, facade_names: &[&str]) -> Result<PartPreflight, Vec<Finding>> {
+    let parsed = match ruff_python_parser::parse_module(source) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return Err(vec![Finding::new(
+                "TKDP001",
+                format!("syntax error: {}", err.error),
+                err.location,
+            )]);
+        }
+    };
+    let module = parsed.into_syntax();
+
+    let mut checker = Checker {
+        facade_names,
+        ..Checker::default()
+    };
+    check_indentation(source, &mut checker.findings);
+    for stmt in &module.body {
+        checker.visit_stmt(stmt);
+    }
+    check_import_shadowing(&module, &mut checker);
+
+    if checker.findings.is_empty() {
+        Ok(PartPreflight {
+            module,
+            part_imports: checker.part_imports,
+        })
+    } else {
+        Err(checker.findings)
+    }
+}
+
+/// Refuses a plain `import X` that this file's own module-level `X` would
+/// silently shadow — Python rebinds the name, leaving the module unreachable
+/// and the author confused. The from-form binds only the names it takes and
+/// is always safe.
+fn check_import_shadowing(module: &ModModule, checker: &mut Checker<'_>) {
+    let mut bound: Vec<&str> = Vec::new();
+    for stmt in &module.body {
+        match stmt {
+            Stmt::FunctionDef(def) => bound.push(def.name.as_str()),
+            Stmt::ClassDef(def) => bound.push(def.name.as_str()),
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    if let Expr::Name(name) = target {
+                        bound.push(name.id.as_str());
+                    }
+                }
+            }
+            Stmt::AnnAssign(assign) => {
+                if let Expr::Name(name) = &*assign.target {
+                    bound.push(name.id.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    for import in &checker.plain_imports {
+        if bound.contains(&import.name.as_str()) {
+            checker.findings.push(Finding::new(
+                "TKDP014",
+                format!(
+                    "`import {name}` is shadowed by this file's own `{name}`; \
+                     take names explicitly: `from {name} import …`",
+                    name = import.name
+                ),
+                import.range,
+            ));
+        }
     }
 }
 
@@ -219,7 +318,10 @@ struct Checker<'a> {
     facade_names: &'a [&'a str],
     findings: Vec<Finding>,
     imports: Vec<FacadeImport>,
-    import_ranges: Vec<TextRange>,
+    part_imports: Vec<PartImport>,
+    /// The subset of `part_imports` written as plain `import X` — the form
+    /// the shadow check guards, because a later module-level `X` rebinds it.
+    plain_imports: Vec<PartImport>,
     call_sites: Vec<CallSite>,
 }
 
@@ -242,6 +344,29 @@ impl Checker<'_> {
             return;
         };
         if module.as_str() != FACADE_MODULE {
+            if import.level != 0 {
+                self.findings.push(Finding::new(
+                    "TKDP013",
+                    "relative imports are not supported in definitions",
+                    import.range(),
+                ));
+            } else if module.as_str().contains('.') {
+                self.findings.push(Finding::new(
+                    "TKDP013",
+                    format!(
+                        "module imports are single-level in definitions: `{}` has no meaning here",
+                        module.as_str()
+                    ),
+                    import.range(),
+                ));
+            } else {
+                // A candidate definition part (or a Monty built-in, which the
+                // resolver miss leaves for the runtime to answer).
+                self.part_imports.push(PartImport {
+                    name: module.to_string(),
+                    range: import.range(),
+                });
+            }
             return;
         }
         if import.level != 0 {
@@ -281,7 +406,6 @@ impl Checker<'_> {
                 bound_as,
             });
         }
-        self.import_ranges.push(import.range());
     }
 
     fn check_call(&mut self, call: &ast::ExprCall) {
@@ -478,6 +602,25 @@ impl Visitor<'_> for Checker<'_> {
                             "use `from tokeira import <name>` for facade names",
                             alias.range(),
                         ));
+                    } else if alias.name.as_str().contains('.') {
+                        self.findings.push(Finding::new(
+                            "TKDP013",
+                            format!(
+                                "module imports are single-level in definitions: `{}` has no meaning here",
+                                alias.name.as_str()
+                            ),
+                            alias.range(),
+                        ));
+                    } else {
+                        let entry = PartImport {
+                            name: alias.name.to_string(),
+                            range: alias.range(),
+                        };
+                        self.plain_imports.push(PartImport {
+                            name: entry.name.clone(),
+                            range: entry.range,
+                        });
+                        self.part_imports.push(entry);
                     }
                 }
             }

@@ -1,0 +1,82 @@
+# The platform's model of itself: the configuration vocabulary of a
+# Compose deployment. A conventional part — authored by the platform and
+# shipped into the definition dir with the rest of the source set — so
+# the root and every part share one model (`from platform import
+# Compose`). The root's config() constructs it with the platform's
+# defaults; operator edits are validated against it.
+#
+# DockerSocket lives here because it is Compose-specific; the generic
+# service companions (State, Config, Environment) come from
+# tokeira_provisioner with Service itself.
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Managed:
+    pass
+
+
+@dataclass
+class Preexisting:
+    pass
+
+
+@dataclass
+class InMemory:
+    pass
+
+
+@dataclass
+class Dsql:
+    region: str
+    mode: Managed | Preexisting
+    endpoint: str = ""
+    arn: str = ""
+
+
+@dataclass
+class Aws:
+    region: str
+
+
+@dataclass
+class Tokeirad:
+    image: str
+    replicas: int
+    grpc_port: int
+    metrics_port: int
+
+
+@dataclass
+class Backend:
+    image: str
+    replicas: int
+
+
+@dataclass
+class Grafana:
+    image: str
+    replicas: int
+    port: int
+
+
+@dataclass
+class Observability:
+    mimir: Backend
+    loki: Backend
+    grafana: Grafana
+    alloy: Backend
+
+
+@dataclass
+class DockerSocket:
+    pass
+
+
+@dataclass
+class Compose:
+    storage: InMemory | Dsql
+    aws: Aws
+    tokeirad: Tokeirad
+    observability: Observability

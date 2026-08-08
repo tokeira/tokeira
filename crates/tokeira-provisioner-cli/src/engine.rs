@@ -22,8 +22,9 @@ use tokeira_orchestrator::InfraEngine;
 use tokeira_platform::{
     author::{LocatedValue, ValueShape, from_located_value},
     definition::{
-        DefinitionFrontend, DefinitionSource, DefinitionSourceName, EvaluatedDefinition,
-        FrontendSource, RealizedResourceIndex, evaluate_definition, verify_definition,
+        DefinitionFrontend, DefinitionSource, DefinitionSourceName, DirectoryPartSources,
+        EvaluatedDefinition, FrontendSource, RealizedResourceIndex, evaluate_definition,
+        verify_definition,
     },
     graph::{ModuleNode, WritebackEntry},
     kind::DecodedKind,
@@ -109,6 +110,13 @@ impl<F: DefinitionFrontend> Engine<F> {
             &path,
             DefinitionSourceName::DeploymentRelative(definition.path.clone()),
         )?;
+        // Parts resolve beside the interpreted document: a retained
+        // revision's root loads that revision's parts, never the live ones.
+        let parts_dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(admitted.deployment_ref.dir.as_path());
+        let parts = DirectoryPartSources::new(parts_dir, self.platform.format().as_str());
         evaluate_definition(
             &self.frontend,
             source,
@@ -116,6 +124,7 @@ impl<F: DefinitionFrontend> Engine<F> {
                 project_name: admitted.deployment_ref.name.clone(),
             },
             self.platform.vocabulary(),
+            &parts,
         )
         .map_err(anyhow::Error::from)
     }
@@ -133,11 +142,19 @@ impl<F: DefinitionFrontend> Engine<F> {
             .and_then(|value| value.to_str())
             .unwrap_or("definition")
             .to_string();
+        let parts_dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        let parts = DirectoryPartSources::new(
+            parts_dir.unwrap_or_else(|| Path::new(".")),
+            self.platform.format().as_str(),
+        );
         evaluate_definition(
             &self.frontend,
             source,
             &EvaluationContext { project_name },
             self.platform.vocabulary(),
+            &parts,
         )
         .map_err(anyhow::Error::from)
     }
@@ -334,12 +351,16 @@ impl<F: DefinitionFrontend> Engine<F> {
     /// retained prior source and the live one. Delegates to the frontend
     /// with the platform's vocabulary. Both revisions carry the recorded
     /// definition identity — the compare is between two states of the same
-    /// document, not two documents.
+    /// definition set, each side resolving its parts through its own
+    /// resolver: the retained revision's set for the prior, the live
+    /// directory's for the current.
     pub fn retarget_check(
         &self,
         admitted: &Admitted,
         prior_source: &str,
         current_source: &str,
+        prior_parts: &dyn tokeira_platform::definition::SourceResolver,
+        current_parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<()> {
         let definition = admitted.metadata.definition.as_ref().ok_or_else(|| {
             anyhow::anyhow!("bound deployment metadata records no definition format/path")
@@ -360,6 +381,8 @@ impl<F: DefinitionFrontend> Engine<F> {
                 project_name: admitted.deployment_ref.name.clone(),
             },
             self.platform.vocabulary(),
+            prior_parts,
+            current_parts,
         ) {
             Ok(()) => Ok(()),
             Err(messages) => bail!(
@@ -670,6 +693,7 @@ mod tests {
             _source: FrontendSource<'_>,
             _context: &C,
             _vocabulary: &tokeira_platform::declaration::Vocabulary,
+            _parts: &dyn tokeira_platform::definition::SourceResolver,
         ) -> std::result::Result<
             tokeira_platform::definition::FrontendOutput,
             tokeira_platform::error::FrontendDiagnostic,
@@ -683,6 +707,8 @@ mod tests {
             _current: FrontendSource<'_>,
             _context: &C,
             _vocabulary: &tokeira_platform::declaration::Vocabulary,
+            _prior_parts: &dyn tokeira_platform::definition::SourceResolver,
+            _current_parts: &dyn tokeira_platform::definition::SourceResolver,
         ) -> std::result::Result<(), Vec<String>> {
             Err(vec![
                 "storage.region: eu-west-2 -> us-east-1".to_string(),
@@ -734,7 +760,13 @@ mod tests {
         let admitted = engine.platform().admit_deployment(dir.path()).unwrap();
 
         let error = engine
-            .retarget_check(&admitted, "prior", "current")
+            .retarget_check(
+                &admitted,
+                "prior",
+                "current",
+                &tokeira_platform::definition::NoPartSources,
+                &tokeira_platform::definition::NoPartSources,
+            )
             .unwrap_err()
             .to_string();
         assert!(error.contains("retarget refused"), "{error}");

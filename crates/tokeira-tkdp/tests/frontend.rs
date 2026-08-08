@@ -8,7 +8,9 @@ use tokeira_orchestrator::RelativeDefinitionPath;
 use tokeira_platform::{
     author::{LocatedValue, ValueShape, from_located_value},
     declaration::{KindEntry, KindSet, Vocabulary},
-    definition::{DefinitionFrontend, DefinitionSourceName, FrontendOutput, FrontendSource},
+    definition::{
+        DefinitionFrontend, DefinitionSourceName, FrontendOutput, FrontendSource, NoPartSources,
+    },
     error::KindError,
     graph::WritebackValue,
     kind::{PlacementContext, ProviderKind},
@@ -160,6 +162,7 @@ fn evaluate(source: &str) -> Result<FrontendOutput, String> {
             },
             &ctx(),
             &vocabulary(),
+            &tokeira_platform::definition::NoPartSources,
         )
         .map_err(|diagnostic| diagnostic.message)
 }
@@ -573,6 +576,7 @@ fn transient_program_is_assembled_without_executing() {
                 },
                 &ctx(),
                 &vocabulary(),
+                &NoPartSources,
             )
             .expect("assembles")
     };

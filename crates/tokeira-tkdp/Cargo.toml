@@ -26,6 +26,7 @@ tokeira-platform = { path = "../tokeira-platform" }
 
 [dev-dependencies]
 proptest = "1"
+tempfile = { workspace = true }
 tokeira-iac = { path = "../tokeira-iac" }
 
 [lints]

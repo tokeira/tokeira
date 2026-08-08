@@ -54,6 +54,7 @@ impl DefinitionFrontend for StubFrontend {
         _source: FrontendSource<'_>,
         _context: &C,
         _vocabulary: &tokeira_platform::declaration::Vocabulary,
+        _parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> std::result::Result<FrontendOutput, FrontendDiagnostic> {
         let mut graph = StructuralGraphBuilder::<DecodedKind>::new();
         graph.add_module("state", Vec::new());
@@ -72,6 +73,8 @@ impl DefinitionFrontend for StubFrontend {
         _current: FrontendSource<'_>,
         _context: &C,
         _vocabulary: &tokeira_platform::declaration::Vocabulary,
+        _prior_parts: &dyn tokeira_platform::definition::SourceResolver,
+        _current_parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> std::result::Result<(), Vec<String>> {
         if self.refuse_retarget.is_empty() {
             Ok(())

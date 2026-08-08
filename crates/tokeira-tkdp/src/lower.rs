@@ -8,10 +8,10 @@
 //! original text. That choice is what makes the source map exact where it
 //! matters: any position inside operator-authored code maps back linearly.
 //!
-//! The validated `from tokeira import …` statements are blanked to
-//! equal-width comment padding — every non-newline byte becomes `#` — so the
-//! facade can satisfy the import while every subsequent byte offset stays
-//! identical and the map stays linear.
+//! Import statements are untouched: `from tokeira import …` resolves against
+//! the registered facade module, part imports resolve against their
+//! registered modules, and everything else is Monty's to answer at runtime —
+//! so every import line survives byte-for-byte and the map stays linear.
 //!
 //! Lowered shape for `match <subj>:` (match index `n`, case index `k`):
 //!
@@ -65,13 +65,11 @@ pub struct Lowered {
     pub segments: Vec<Segment>,
 }
 
-/// Lowers all match statements in a preflight-validated module and blanks the
-/// facade import statements.
-pub fn lower(source: &str, module: &ModModule, file_label: &str, blank: &[TextRange]) -> Lowered {
+/// Lowers all match statements in a preflight-validated module.
+pub fn lower(source: &str, module: &ModModule, file_label: &str) -> Lowered {
     let mut emitter = Emitter {
         source,
         file_label,
-        blank,
         line_table: LineTable::new(source),
         out: String::new(),
         map: SourceMapBuilder::new(),
@@ -93,7 +91,6 @@ pub fn lower(source: &str, module: &ModModule, file_label: &str, blank: &[TextRa
 struct Emitter<'a> {
     source: &'a str,
     file_label: &'a str,
-    blank: &'a [TextRange],
     line_table: LineTable,
     out: String,
     map: SourceMapBuilder,
@@ -120,19 +117,6 @@ impl Emitter<'_> {
                 original_start: range.start(),
             },
         );
-    }
-
-    /// Equal-width comment padding for a satisfied import: newlines survive,
-    /// every other byte becomes `#`, so all later offsets are unchanged.
-    fn push_blanked(&mut self, range: TextRange) {
-        let padded: String = self.source[range]
-            .chars()
-            .map(|c| if c == '\n' { '\n' } else { '#' })
-            .collect();
-        // `#` is one byte, so only multi-byte characters change the length —
-        // and the import statement grammar admits none.
-        debug_assert_eq!(padded.len(), range.len().to_usize());
-        self.push_generated(&padded, range, OriginKind::Scaffold);
     }
 
     // ------------------------------------------------------------------
@@ -211,19 +195,12 @@ impl Emitter<'_> {
 
     /// Emits a statement region: statements free of `match` copy through in
     /// bulk (preserving interleaved comments and blank lines); `match`
-    /// statements expand; blanked imports pad; other compounds that *contain*
-    /// a match recurse suite-by-suite with their headers copied verbatim.
+    /// statements expand; other compounds that *contain* a match recurse
+    /// suite-by-suite with their headers copied verbatim.
     fn emit_region(&mut self, stmts: &[Stmt], bounds: TextRange, delta: i32) {
         let mut cursor = bounds.start();
         for stmt in stmts {
-            let blanked = self.blank.contains(&stmt.range());
-            if !blanked && !contains_match(stmt) {
-                continue;
-            }
-            if blanked {
-                self.copy_shifted(TextRange::new(cursor, stmt.range().start()), delta);
-                self.push_blanked(stmt.range());
-                cursor = stmt.range().end();
+            if !contains_match(stmt) {
                 continue;
             }
             let stmt_line_begin = self.line_begin(stmt.range().start());

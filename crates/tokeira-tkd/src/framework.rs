@@ -61,6 +61,7 @@ impl DefinitionFrontend for TkdFrontend {
         source: FrontendSource<'_>,
         context: &C,
         vocabulary: &Vocabulary,
+        parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<FrontendOutput, FrontendDiagnostic>
     where
         C: Serialize,
@@ -77,7 +78,7 @@ impl DefinitionFrontend for TkdFrontend {
         let context = context_fields(context)
             .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
         let bridge = FrameworkBridge::new(vocabulary, context);
-        let (graph, config) = crate::interpret(source_text, &bridge, &())
+        let (graph, config) = crate::interpret(source_text, &bridge, &(), parts)
             .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
         let config = value_to_located(config)
             .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
@@ -90,6 +91,8 @@ impl DefinitionFrontend for TkdFrontend {
         current: FrontendSource<'_>,
         context: &C,
         vocabulary: &Vocabulary,
+        prior_parts: &dyn tokeira_platform::definition::SourceResolver,
+        current_parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<(), Vec<String>>
     where
         C: Serialize,
@@ -98,20 +101,24 @@ impl DefinitionFrontend for TkdFrontend {
         // one evaluation path for checking and execution — and the diff runs
         // over the host-free config values. The *current* source supplies the
         // `#[create]` admission metadata: the annotation set an operator is
-        // editing under is the one that gates them.
+        // editing under is the one that gates them. Each side resolves its
+        // parts through its own resolver — the retained set for the prior,
+        // the live set for the current — so a multi-document definition
+        // compares as the set it was.
         let evaluate_config = |source: FrontendSource<'_>,
+                               parts: &dyn tokeira_platform::definition::SourceResolver,
                                label: &str|
          -> Result<crate::Value<HostValue>, Vec<String>> {
             let text = std::str::from_utf8(source.bytes)
                 .map_err(|error| vec![format!("{label} definition is not UTF-8: {error}")])?;
             let fields = context_fields(context).map_err(|error| vec![error.msg.clone()])?;
             let bridge = FrameworkBridge::new(vocabulary, fields);
-            let (_, config) = crate::interpret(text, &bridge, &())
+            let (_, config) = crate::interpret(text, &bridge, &(), parts)
                 .map_err(|error| vec![format!("{label} definition: {}", error.msg)])?;
             Ok(config)
         };
-        let prior_config = evaluate_config(prior, "prior")?;
-        let current_config = evaluate_config(current, "current")?;
+        let prior_config = evaluate_config(prior, prior_parts, "prior")?;
+        let current_config = evaluate_config(current, current_parts, "current")?;
         let current_text = std::str::from_utf8(current.bytes)
             .map_err(|error| vec![format!("current definition is not UTF-8: {error}")])?;
         crate::retarget_check(current_text, &prior_config, &current_config)
@@ -734,6 +741,7 @@ mod tests {
                     project_name: "example".to_string(),
                 },
                 &vocabulary(),
+                &tokeira_platform::definition::NoPartSources,
             )
             .expect("definition should evaluate");
         let config: TestConfig = from_located_value(output.config).expect("config should decode");
@@ -784,6 +792,8 @@ mod tests {
                 },
                 &context,
                 &vocabulary(),
+                &tokeira_platform::definition::NoPartSources,
+                &tokeira_platform::definition::NoPartSources,
             )
             .expect_err("a create-time change is a retarget");
         assert!(
@@ -805,6 +815,8 @@ mod tests {
                 },
                 &context,
                 &vocabulary(),
+                &tokeira_platform::definition::NoPartSources,
+                &tokeira_platform::definition::NoPartSources,
             )
             .expect("a non-create edit reconciles");
     }

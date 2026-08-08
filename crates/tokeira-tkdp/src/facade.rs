@@ -7,13 +7,26 @@
 //! structural result crosses to the host once, as the driver's final
 //! expression.
 //!
+//! The rendered source registers with Monty as a genuine module named
+//! `tokeira`, so `from tokeira import …` executes as a real import in the
+//! root and in every definition part — one module, one set of class
+//! identities. The module's public face is the full inventory; each
+//! importing file takes exactly the names it imports, by Python's own
+//! semantics.
+//!
 //! Every internal name carries the reserved `__tokeira_internal_` prefix,
 //! which preflight forbids in operator code. Monty performs no CPython name
 //! mangling (verified by capability probe), so the prefix is usable uniformly
-//! for module functions, classes, attributes, and methods. Operator-visible
-//! names exist only as aliases for the exact set the definition imported.
+//! for module functions, classes, attributes, and methods.
 
-use crate::preflight::FacadeImport;
+/// The facade's registered-module name: the `tokeira` the dialect imports
+/// from.
+pub const FACADE_MODULE_NAME: &str = "tokeira";
+
+/// File name facade frames carry in Monty tracebacks. The translator renders
+/// frames from this file as internal rather than mapping them to operator
+/// source.
+pub const FACADE_FILE_NAME: &str = "<tokeira-facade>";
 
 /// Names the facade publishes besides the kind inventory.
 pub const BUILDER_NAMES: &[&str] = &["Context", "Deployment"];
@@ -167,13 +180,10 @@ class __tokeira_internal_Deployment:
 
 "#;
 
-/// Renders the complete facade region: core, context class, kind shells for
-/// every inventory name, and alias bindings for exactly the imported names.
-pub fn render(
-    kind_names: &[&str],
-    imports: &[FacadeImport],
-    context: &serde_json::Value,
-) -> String {
+/// Renders the complete facade module source: core, context class, kind
+/// shells for every inventory name, and public bindings for the whole
+/// importable surface.
+pub fn render(kind_names: &[&str], context: &serde_json::Value) -> String {
     let mut out = String::with_capacity(FACADE_CORE.len() + 1024);
     out.push_str(FACADE_CORE);
 
@@ -204,13 +214,13 @@ pub fn render(
         ));
     }
 
-    for import in imports {
-        let target = match import.name.as_str() {
-            "Deployment" => "__tokeira_internal_Deployment".to_string(),
-            "Context" => "__tokeira_internal_Context".to_string(),
-            kind => format!("__tokeira_internal_kind_{kind}"),
-        };
-        out.push_str(&format!("{} = {target}\n", import.bound_as));
+    // The module's public face: every builder and every inventory kind.
+    // Aliased imports (`from tokeira import server as s`) are Python's own
+    // business at the import site — nothing to render for them here.
+    out.push_str("Deployment = __tokeira_internal_Deployment\n");
+    out.push_str("Context = __tokeira_internal_Context\n");
+    for name in kind_names {
+        out.push_str(&format!("{name} = __tokeira_internal_kind_{name}\n"));
     }
     out.push_str("# --- end tokeira facade ---\n");
     out

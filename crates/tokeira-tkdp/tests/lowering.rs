@@ -5,7 +5,7 @@
 // exactly mapped.
 
 use ruff_python_ast::ModModule;
-use ruff_text_size::{TextRange, TextSize};
+use ruff_text_size::TextSize;
 use tokeira_tkdp::{
     lower::lower,
     source_map::{Mapped, OriginKind, SourceMapBuilder},
@@ -20,7 +20,7 @@ fn parse(source: &str) -> ModModule {
 }
 
 fn lowered_text(source: &str) -> String {
-    lower(source, &parse(source), "test.tkdp", &[]).text
+    lower(source, &parse(source), "test.tkdp").text
 }
 
 const REPRESENTATIVE: &str = r#"def pick(s):
@@ -154,25 +154,24 @@ fn comments_between_statements_survive() {
     }
 }
 
+// Import statements survive lowering byte-for-byte: `from tokeira import …`
+// resolves against the registered facade module at runtime, so nothing is
+// blanked and every offset is preserved.
 #[test]
-fn blanked_imports_pad_to_equal_width_and_preserve_offsets() {
+fn imports_survive_lowering_with_offsets_preserved() {
     let import_stmt = "from tokeira import Context, Deployment";
     let source = format!("{import_stmt}\n\nx = 1\nmatch x:\n    case _:\n        pass\n");
     let module = parse(&source);
-    let import_range = TextRange::new(TextSize::new(0), TextSize::of(import_stmt));
-    let text = lower(&source, &module, "test.tkdp", &[import_range]).text;
+    let text = lower(&source, &module, "test.tkdp").text;
 
-    // The statement becomes equal-width comment padding on its own line.
-    let hashes = "#".repeat(import_stmt.len());
-    assert!(text.starts_with(&format!("{hashes}\n")), "{text}");
-    // Every byte offset after the import is unchanged.
+    assert!(text.starts_with(&format!("{import_stmt}\n")), "{text}");
     assert_eq!(text.find("x = 1"), source.find("x = 1"));
 }
 
 #[test]
 fn map_covers_verbatim_body_and_generated_scaffolding() {
     let module = parse(REPRESENTATIVE);
-    let lowered = lower(REPRESENTATIVE, &module, "test.tkdp", &[]);
+    let lowered = lower(REPRESENTATIVE, &module, "test.tkdp");
     let mut builder = SourceMapBuilder::new();
     for seg in &lowered.segments {
         builder.push(seg.generated.len(), seg.origin.clone());

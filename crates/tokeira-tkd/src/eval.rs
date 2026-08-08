@@ -11,7 +11,8 @@ use syn::{Expr, Pat, punctuated::Punctuated, spanned::Spanned, token::Comma};
 
 use crate::{
     bridge::HostBridge,
-    schema::{FnTable, TypeTable, fn_param_names},
+    parts::Scopes,
+    schema::fn_param_names,
     value::{EnumPath, EvalError, FieldMap, Value, VariantBody},
 };
 
@@ -51,9 +52,121 @@ impl<H: Clone> Env<H> {
 #[derive(Debug)]
 pub struct Interp<'a, B: HostBridge> {
     pub bridge: &'a B,
-    pub types: &'a TypeTable,
-    pub fns: &'a FnTable,
+    pub scope: Scope<'a>,
     pub cx: &'a B::Cx,
+}
+
+/// One evaluation scope over the loaded program: the root, or one part.
+/// Name resolution is one-way — a part sees its own items first and then
+/// the root's types (the shared configuration language); the root reaches
+/// a part only through `part::function(...)` calls; parts see nothing of
+/// each other.
+#[derive(Clone, Copy, Debug)]
+pub struct Scope<'a> {
+    scopes: &'a Scopes,
+    /// `None` is the root; a part scope borrows its key from the loaded
+    /// program so entering a scope allocates nothing.
+    current: Option<&'a str>,
+}
+
+/// What `part::function` resolved to, so refusals name the exact gap.
+#[derive(Debug)]
+pub enum PartFnLookup<'a> {
+    /// No part by that name — the caller falls through to other path
+    /// meanings.
+    NotAPart,
+    /// The part exists; the function does not.
+    Missing,
+    /// The function exists but is not `pub`.
+    Private,
+    /// Callable.
+    Found(&'a syn::ItemFn),
+}
+
+impl<'a> Scope<'a> {
+    /// The root scope over a loaded program.
+    pub fn root(scopes: &'a Scopes) -> Self {
+        Self {
+            scopes,
+            current: None,
+        }
+    }
+
+    fn tables(&self) -> &'a crate::parts::Tables {
+        match self.current {
+            None => &self.scopes.root,
+            Some(name) => &self.scopes.parts[name],
+        }
+    }
+
+    fn in_part(&self) -> bool {
+        self.current.is_some()
+    }
+
+    pub fn is_struct(&self, name: &str) -> bool {
+        self.tables().types.is_struct(name)
+            || (self.in_part() && self.scopes.root.types.is_struct(name))
+    }
+
+    pub fn is_enum(&self, name: &str) -> bool {
+        self.tables().types.is_enum(name)
+            || (self.in_part() && self.scopes.root.types.is_enum(name))
+    }
+
+    pub fn enum_has_unit_variant(&self, ty: &str, variant: &str) -> bool {
+        if self.tables().types.is_enum(ty) {
+            return self.tables().types.enum_has_unit_variant(ty, variant);
+        }
+        self.in_part() && self.scopes.root.types.enum_has_unit_variant(ty, variant)
+    }
+
+    pub fn enum_has_variant(&self, ty: &str, variant: &str) -> bool {
+        if self.tables().types.is_enum(ty) {
+            return self.tables().types.enum_has_variant(ty, variant);
+        }
+        self.in_part() && self.scopes.root.types.enum_has_variant(ty, variant)
+    }
+
+    pub fn struct_field_names(&self, name: &str) -> Option<Vec<String>> {
+        if self.tables().types.is_struct(name) {
+            return self.tables().types.struct_field_names(name);
+        }
+        if self.in_part() {
+            return self.scopes.root.types.struct_field_names(name);
+        }
+        None
+    }
+
+    /// The current scope's own function, for bare-name calls.
+    pub fn local_fn(&self, name: &str) -> Option<&'a syn::ItemFn> {
+        self.tables().fns.get(name)
+    }
+
+    /// Resolve `part::function` from the root. Parts get `NotAPart` for
+    /// everything: wiring flows through the root.
+    pub fn part_fn(&self, part: &str, name: &str) -> PartFnLookup<'a> {
+        if self.in_part() {
+            return PartFnLookup::NotAPart;
+        }
+        let Some(tables) = self.scopes.parts.get(part) else {
+            return PartFnLookup::NotAPart;
+        };
+        match tables.fns.get(name) {
+            None => PartFnLookup::Missing,
+            Some(f) if matches!(f.vis, syn::Visibility::Public(_)) => PartFnLookup::Found(f),
+            Some(_) => PartFnLookup::Private,
+        }
+    }
+
+    /// The named part's scope; the key borrow comes from the program map so
+    /// the scope stays `Copy`.
+    pub fn enter(&self, part: &str) -> Option<Scope<'a>> {
+        let (key, _) = self.scopes.parts.get_key_value(part)?;
+        Some(Scope {
+            scopes: self.scopes,
+            current: Some(key.as_str()),
+        })
+    }
 }
 
 impl<B: HostBridge> Interp<'_, B> {
@@ -64,9 +177,21 @@ impl<B: HostBridge> Interp<'_, B> {
         args: Vec<Value<B::Host>>,
     ) -> Result<Value<B::Host>, EvalError> {
         let f = self
-            .fns
-            .get(name)
+            .scope
+            .local_fn(name)
             .ok_or_else(|| EvalError::new(format!("no function `{name}`")))?;
+        self.call_fn_item(f, name, args)
+    }
+
+    /// Invoke one resolved function item in THIS interp's scope — the part
+    /// boundary is crossed by the caller constructing a part-scoped interp
+    /// first, so the body's names resolve where the function was written.
+    fn call_fn_item(
+        &self,
+        f: &syn::ItemFn,
+        name: &str,
+        args: Vec<Value<B::Host>>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let params = fn_param_names(f)?;
         if params.len() != args.len() {
             return Err(EvalError::new(format!(
@@ -211,8 +336,8 @@ impl<B: HostBridge> Interp<'_, B> {
             }
             2 => {
                 let (ty, variant) = (&segs[0], &segs[1]);
-                if self.types.is_enum(ty) {
-                    if self.types.enum_has_unit_variant(ty, variant) {
+                if self.scope.is_enum(ty) {
+                    if self.scope.enum_has_unit_variant(ty, variant) {
                         return Ok(Value::Enum {
                             path: EnumPath {
                                 ty: ty.clone(),
@@ -224,6 +349,11 @@ impl<B: HostBridge> Interp<'_, B> {
                     }
                     return Err(EvalError::new(format!(
                         "`{ty}` has no unit variant `{variant}`"
+                    )));
+                }
+                if !matches!(self.scope.part_fn(ty, variant), PartFnLookup::NotAPart) {
+                    return Err(EvalError::new(format!(
+                        "part functions are called, not referenced: `{ty}::{variant}(…)`"
                     )));
                 }
                 Err(EvalError::new(format!(
@@ -247,9 +377,9 @@ impl<B: HostBridge> Interp<'_, B> {
         let head = segs[0].clone();
 
         // enum struct-variant: `Storage::Dsql { .. }`
-        if segs.len() == 2 && self.types.is_enum(&head) {
+        if segs.len() == 2 && self.scope.is_enum(&head) {
             let variant = segs[1].clone();
-            if !self.types.enum_has_variant(&head, &variant) {
+            if !self.scope.enum_has_variant(&head, &variant) {
                 return Err(EvalError::new(format!(
                     "`{head}` has no variant `{variant}`"
                 )));
@@ -270,13 +400,13 @@ impl<B: HostBridge> Interp<'_, B> {
 
         // config struct: `Compose { .. }` — validated against its declared fields
         // (no missing, no unknown, no `..` rest; config structs have no defaults).
-        if segs.len() == 1 && self.types.is_struct(&head) {
+        if segs.len() == 1 && self.scope.is_struct(&head) {
             if es.rest.is_some() {
                 return Err(EvalError::new(format!(
                     "`{head}` literal may not use `..` (config structs have no defaults)"
                 )));
             }
-            let declared = self.types.struct_field_names(&head).unwrap_or_default();
+            let declared = self.scope.struct_field_names(&head).unwrap_or_default();
             let mut fields = FieldMap::new();
             for fv in &es.fields {
                 let name = member_name(&fv.member)?;
@@ -346,8 +476,8 @@ impl<B: HostBridge> Interp<'_, B> {
         }
 
         // enum tuple-variant: `Ty::Variant(..)`
-        if segs.len() == 2 && self.types.is_enum(&segs[0]) {
-            if !self.types.enum_has_variant(&segs[0], &segs[1]) {
+        if segs.len() == 2 && self.scope.is_enum(&segs[0]) {
+            if !self.scope.enum_has_variant(&segs[0], &segs[1]) {
                 return Err(EvalError::new(format!(
                     "`{}` has no variant `{}`",
                     segs[0], segs[1]
@@ -362,6 +492,40 @@ impl<B: HostBridge> Interp<'_, B> {
                 variant: segs[1].clone(),
                 body: VariantBody::Tuple(args),
             });
+        }
+
+        // A declared part's `pub` function, called from the root — THE
+        // cross-document seam: arguments evaluate here, the body evaluates
+        // in the part's own scope, and the returned value flows back as
+        // plain data. Wiring stays in the root by construction, because a
+        // part's scope answers `NotAPart` for every part name.
+        if segs.len() == 2 {
+            match self.scope.part_fn(&segs[0], &segs[1]) {
+                PartFnLookup::Found(f) => {
+                    let args = self.eval_args(&ec.args, env)?;
+                    let entered = Interp {
+                        bridge: self.bridge,
+                        scope: self
+                            .scope
+                            .enter(&segs[0])
+                            .expect("part_fn resolved, so the part exists"),
+                        cx: self.cx,
+                    };
+                    return entered.call_fn_item(f, &joined, args);
+                }
+                PartFnLookup::Private => {
+                    return Err(EvalError::new(format!(
+                        "`{joined}` is not `pub`; a part exports what the root may call"
+                    )));
+                }
+                PartFnLookup::Missing => {
+                    return Err(EvalError::new(format!(
+                        "part `{}` has no function `{}`",
+                        segs[0], segs[1]
+                    )));
+                }
+                PartFnLookup::NotAPart => {}
+            }
         }
 
         Err(EvalError::new(format!("unsupported call `{joined}`")))

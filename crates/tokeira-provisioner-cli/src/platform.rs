@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
 use tokeira_platform::declaration::{
     DeploymentRef, InfraConstructor, Ops, PlatformDeclaration, ProviderExecution, Vocabulary,
+    WorkloadExport,
 };
 use tokeira_provisioner::DeploymentBindingMetadata;
 
@@ -247,6 +248,19 @@ impl BoundPlatform {
         })
         .collect()
     }
+
+    /// The provider's workload export — its service projection and applier
+    /// constructor — when its services deploy through the deploy engine,
+    /// paired with the provider's namespace so the constructor receives its
+    /// own attribute block. `None` means the provider's whole deployment
+    /// rides the infra universe.
+    pub fn workload(&self) -> Option<(&'static str, &WorkloadExport)> {
+        self.declaration
+            .provider
+            .workload
+            .as_ref()
+            .map(|workload| (self.declaration.provider.kinds.provider, workload))
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +288,7 @@ mod tests {
             ops: None,
             execution: Box::new(NoProbe),
             infra: None,
+            workload: None,
         })
     }
 

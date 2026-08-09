@@ -46,10 +46,19 @@ impl DescribedDeployment {
     fn module(config: &ExecutionState, spec: &ModuleSpec) -> Box<dyn iac::Module> {
         Box::new(ConcreteModule {
             spec: spec.clone(),
+            // Entries the workload plane claimed leave the infra plane at
+            // this derivation — one engine owns each workload, never both.
+            // The state keeps them so recorded-state paths still see them.
             resources: config
                 .resources
                 .get(&spec.name)
-                .cloned()
+                .map(|resources| {
+                    resources
+                        .iter()
+                        .filter(|resource| !config.claimed.contains(&resource.resource_id()))
+                        .cloned()
+                        .collect()
+                })
                 .unwrap_or_default(),
         })
     }
@@ -60,6 +69,18 @@ impl DescribedDeployment {
             .iter()
             .filter(|module| module.name != config.bootstrap)
             .map(|module| Self::module(config, module))
+            .collect()
+    }
+
+    /// The workload plane, modelled on `all_infra`: the provider's
+    /// projected service models from the execution state, handed to the
+    /// engine as delegating boxes over the shared projections.
+    fn all_services(config: &ExecutionState) -> Vec<Box<dyn deploy_engine::Service>> {
+        config
+            .services
+            .iter()
+            .cloned()
+            .map(|service| Box::new(SharedService(service)) as Box<dyn deploy_engine::Service>)
             .collect()
     }
 }
@@ -99,10 +120,8 @@ impl orchestrator::Deployment for DescribedDeployment {
             .collect()
     }
 
-    // Compose's services realize on the infra plane today; the service
-    // plane's derivations are empty on this path.
-    fn services(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Service>> {
-        Vec::new()
+    fn services(&self, config: &Self::Config) -> Vec<Box<dyn deploy_engine::Service>> {
+        Self::all_services(config)
     }
 
     fn images(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>> {
@@ -249,6 +268,40 @@ impl iac::Module for ConcreteModule {
     }
 }
 
+/// Delegating wrapper: the deploy engine takes owned service boxes while
+/// the execution state keeps the shared projected models, so each operation
+/// hands out delegates rather than re-projecting.
+struct SharedService(Arc<dyn deploy_engine::Service>);
+
+impl std::fmt::Debug for SharedService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("SharedService")
+            .finish_non_exhaustive()
+    }
+}
+
+impl deploy_engine::Service for SharedService {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn module(&self) -> &str {
+        self.0.module()
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        self.0.dependencies()
+    }
+
+    fn manifests(
+        &self,
+        ctx: &deploy_engine::ServiceContext,
+    ) -> Result<Vec<serde_json::Value>, deploy_engine::RuntimeError> {
+        self.0.manifests(ctx)
+    }
+}
+
 /// Delegating wrapper: the engine takes owned resource boxes while the
 /// execution state keeps shared realized resources, so each operation hands
 /// out delegates rather than cloning realizations.
@@ -384,7 +437,168 @@ mod tests {
             index: Default::default(),
             manifests: BTreeMap::new(),
             attributes,
+            claimed: Default::default(),
+            services: Vec::new(),
         }
+    }
+
+    #[derive(Debug)]
+    struct FixedResource {
+        id: &'static str,
+        module: &'static str,
+    }
+
+    #[async_trait]
+    impl iac::Resource for FixedResource {
+        fn resource_type(&self) -> iac::ResourceType {
+            iac::ResourceType::new("fixed")
+        }
+
+        fn resource_id(&self) -> ResourceId {
+            ResourceId(self.id.to_string())
+        }
+
+        fn dependencies(&self) -> Vec<ResourceId> {
+            Vec::new()
+        }
+
+        fn module(&self) -> &str {
+            self.module
+        }
+
+        async fn create(
+            &self,
+            _context: &iac::ProvisionContext,
+        ) -> Result<iac::ResourceState, iac::IacError> {
+            unreachable!("the partition test never provisions")
+        }
+
+        async fn update(
+            &self,
+            _current: &iac::ResourceState,
+            _context: &iac::ProvisionContext,
+        ) -> Result<iac::ResourceState, iac::IacError> {
+            unreachable!("the partition test never provisions")
+        }
+
+        async fn delete(
+            &self,
+            _current: &iac::ResourceState,
+            _context: &iac::ProvisionContext,
+        ) -> Result<(), iac::IacError> {
+            unreachable!("the partition test never provisions")
+        }
+
+        async fn describe(
+            &self,
+            _context: &iac::ProvisionContext,
+        ) -> Result<iac::DescribeResult, iac::IacError> {
+            unreachable!("the partition test never provisions")
+        }
+
+        fn diff(
+            &self,
+            _current: &iac::ResourceState,
+            _context: &iac::ProvisionContext,
+        ) -> iac::InternalChange {
+            iac::InternalChange::NoChange {
+                resource_id: self.resource_id(),
+            }
+        }
+
+        fn change_semantics(&self, _context: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
+            iac::ChangeSemantics::default()
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedWorkload;
+
+    impl deploy_engine::Service for FixedWorkload {
+        fn name(&self) -> &str {
+            "tokeirad"
+        }
+
+        fn module(&self) -> &str {
+            "runtime"
+        }
+
+        fn dependencies(&self) -> Vec<&str> {
+            Vec::new()
+        }
+
+        fn manifests(
+            &self,
+            _ctx: &deploy_engine::ServiceContext,
+        ) -> Result<Vec<serde_json::Value>, deploy_engine::RuntimeError> {
+            Ok(vec![serde_json::json!({"name": "tokeirad"})])
+        }
+    }
+
+    // The partition at derivation: claimed entries leave the infra modules,
+    // the projected services answer `services()` — one engine owns each
+    // workload, never both, while the state keeps every realized resource.
+    #[test]
+    fn the_partition_splits_the_planes() {
+        let mut state = execution_state(BTreeMap::new());
+        state.modules = vec![
+            crate::engine::ModuleSpec {
+                name: "local_state".to_string(),
+                dependencies: Vec::new(),
+            },
+            crate::engine::ModuleSpec {
+                name: "runtime".to_string(),
+                dependencies: vec!["local_state".to_string()],
+            },
+        ];
+        state.bootstrap = "local_state".to_string();
+        state.resources.insert(
+            "runtime".to_string(),
+            vec![
+                Arc::new(FixedResource {
+                    id: "runtime/config",
+                    module: "runtime",
+                }) as Arc<dyn iac::Resource>,
+                Arc::new(FixedResource {
+                    id: "compose/tokeirad",
+                    module: "runtime",
+                }),
+            ],
+        );
+        state
+            .claimed
+            .insert(ResourceId("compose/tokeirad".to_string()));
+        state.services = vec![Arc::new(FixedWorkload) as Arc<dyn deploy_engine::Service>];
+
+        let described = DescribedDeployment::new(
+            DeploymentRef {
+                name: "demo".to_string(),
+                dir: "/tmp/demo".into(),
+            },
+            Vec::new(),
+        );
+
+        let modules = described.infra_modules(&state, &iac::ModuleSelection::All);
+        assert_eq!(modules.len(), 1, "the bootstrap is excluded as ever");
+        let infra_state = iac::InfraState::default();
+        let extensions = std::collections::HashMap::new();
+        let ctx = iac::ModuleContext::new(&infra_state, &extensions);
+        let remaining: Vec<ResourceId> = modules[0]
+            .resources(&ctx)
+            .unwrap()
+            .iter()
+            .map(|resource| resource.resource_id())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![ResourceId("runtime/config".to_string())],
+            "the claimed entry left the infra plane"
+        );
+
+        let services = described.services(&state);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].name(), "tokeirad");
+        assert_eq!(services[0].module(), "runtime");
     }
 
     // The registration contract: project_name from the admitted

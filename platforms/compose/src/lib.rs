@@ -29,8 +29,11 @@
 //!    everything "running on Compose" means: the kind library (`Service`,
 //!    `LocalStateDir`, `ServerConfig`), the Docker mechanics behind those
 //!    kinds, the runtime reads (logs, port mappings) that `tkp` surfaces as
-//!    verbs by presence, and the execution installer the framework calls at
-//!    operation start. Being the compose platform is using the compose
+//!    verbs by presence, the execution installer the framework calls at
+//!    operation start, and the workload export — the projection that
+//!    recognizes the deployment's services among realized entries and the
+//!    applier that deploys their manifests, splitting the service plane
+//!    from the substrate. Being the compose platform is using the compose
 //!    provider; its vocabulary needs no separate wiring act.
 //! 4. **The platform's own kinds** — [`observability`]: the
 //!    `ObservabilityConfiguration` bundle that renders the companion

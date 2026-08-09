@@ -837,6 +837,34 @@ impl<D: Deployment> DeployEngine<D> {
         let _ = self.state_store.save(&state, &version).await?;
         Ok(())
     }
+
+    /// Tear down the declared services owned by `selection`'s modules
+    /// (delete-only), persisting the cleared runtime state.
+    ///
+    /// Services die before the substrate they stand on — callers run this
+    /// pass ahead of the corresponding infrastructure destroy, under the
+    /// same expanded selection so the two planes cannot disagree about
+    /// scope. Fail-closed and reverse-dependency-ordered via
+    /// [`deploy_engine::ServiceEngine::destroy_services`].
+    pub async fn destroy(
+        &mut self,
+        platform: &dyn deploy_engine::Platform,
+        selection: &iac::ModuleSelection,
+    ) -> Result<Vec<deploy_engine::ServiceChange>> {
+        let (mut state, version) = self.state_store.load().await?;
+        let services: Vec<Box<dyn deploy_engine::Service>> = self
+            .deployment
+            .services(&self.config)
+            .into_iter()
+            .filter(|service| selection.includes(service.module()))
+            .collect();
+        let changes = self
+            .engine
+            .destroy_services(&services, platform, &mut self.service_ctx, &mut state)
+            .await?;
+        let _ = self.state_store.save(&state, &version).await?;
+        Ok(changes)
+    }
 }
 
 #[cfg(test)]
@@ -1438,6 +1466,85 @@ mod tests {
             .unwrap();
         let changes = engine.apply(&TestPlatform).await.unwrap();
         assert_eq!(changes.len(), 1);
+    }
+
+    struct DeletingPlatform;
+
+    #[async_trait]
+    impl deploy_engine::Platform for DeletingPlatform {
+        async fn apply_manifests(
+            &self,
+            manifests: &[serde_json::Value],
+        ) -> std::result::Result<usize, deploy_engine::DeployError> {
+            Ok(manifests.len())
+        }
+
+        fn supports_delete(&self) -> bool {
+            true
+        }
+
+        async fn delete_service(
+            &self,
+            _service_name: &str,
+            _manifests: &[serde_json::Value],
+        ) -> std::result::Result<(), deploy_engine::DeployError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_engine_destroy_is_scoped_to_the_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = TestConfig;
+        let mut engine = DeployEngine::new(TestDeployment, &config, temp.path())
+            .await
+            .unwrap();
+        engine.apply(&DeletingPlatform).await.unwrap();
+
+        // A selection that owns no declared service tears down nothing.
+        let none = engine
+            .destroy(
+                &DeletingPlatform,
+                &iac::ModuleSelection::Only(vec!["other".to_string()]),
+            )
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+
+        // The owning module's selection tears its service down.
+        let torn = engine
+            .destroy(
+                &DeletingPlatform,
+                &iac::ModuleSelection::Only(vec!["module".to_string()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(torn.len(), 1);
+        assert!(matches!(torn[0].kind, ServiceChangeKind::Delete));
+        // The cleared state persists: the next apply treats the service as new.
+        let changes = engine.apply(&DeletingPlatform).await.unwrap();
+        assert_eq!(changes.len(), 1);
+    }
+
+    // Fail-closed: a platform that cannot delete refuses the whole pass
+    // before touching any workload.
+    #[tokio::test]
+    async fn deploy_engine_destroy_refuses_without_delete_support() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = TestConfig;
+        let mut engine = DeployEngine::new(TestDeployment, &config, temp.path())
+            .await
+            .unwrap();
+        let error = engine
+            .destroy(&TestPlatform, &iac::ModuleSelection::All)
+            .await
+            .expect_err("a non-deleting platform refuses the pass");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support service deletion"),
+            "unexpected: {error}"
+        );
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@
 //! answers a platform-identity question.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     path::Path,
     sync::Arc,
@@ -17,10 +17,12 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use serde::Serialize;
+use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac::{self as iac, ResourceId};
 use tokeira_orchestrator::InfraEngine;
 use tokeira_platform::{
     author::{LocatedValue, ValueShape, from_located_value},
+    declaration::RealizedEntry,
     definition::{
         DefinitionFrontend, DefinitionSource, DefinitionSourceName, DirectoryPartSources,
         EvaluatedDefinition, FrontendSource, RealizedResourceIndex, evaluate_definition,
@@ -201,6 +203,37 @@ impl<F: DefinitionFrontend> Engine<F> {
                 .or_default()
                 .push(Arc::from(resource));
         }
+        // The workload partition, run where a failure can refuse the whole
+        // operation: a projection that silently dropped a service would read
+        // as "tear it down" to the deploy engine. Claimed entries leave the
+        // infra plane at derivation (`all_infra`), never here — the state
+        // keeps every realized resource so recorded-state paths (recovery,
+        // the hand-off from infra-managed services) still see them.
+        let (claimed, services) = match self.platform.workload() {
+            Some((_, workload)) => {
+                let entries = realized_entries(&resources, &manifests);
+                let projection = workload
+                    .services
+                    .project(&entries)
+                    .context("the provider's service projection failed")?;
+                let all: HashSet<&ResourceId> =
+                    entries.iter().map(|entry| &entry.resource_id).collect();
+                for id in &projection.claimed {
+                    if !all.contains(id) {
+                        bail!(
+                            "the provider's service projection claimed `{}`, which is not a \
+                             realized resource",
+                            id.0
+                        );
+                    }
+                }
+                (
+                    projection.claimed.into_iter().collect(),
+                    projection.services,
+                )
+            }
+            None => (BTreeSet::new(), Vec::new()),
+        };
         let modules: Vec<ModuleSpec> = evaluated
             .graph
             .modules()
@@ -224,6 +257,8 @@ impl<F: DefinitionFrontend> Engine<F> {
             index,
             manifests,
             attributes,
+            claimed,
+            services,
         })
     }
 
@@ -296,12 +331,27 @@ impl<F: DefinitionFrontend> Engine<F> {
         // Destroy expands dependants: taking a module down takes down what
         // stands on it, never what it stands on.
         let selection = operation_selection(&engine, module, iac::SelectionDirection::Dependants)?;
+        // The workload plane dies first: services stand on the substrate,
+        // so their teardown precedes the infrastructure's — under the same
+        // expanded selection, so the two planes cannot disagree about
+        // scope.
+        let mut removed = 0;
+        if !execution.services.is_empty() {
+            let applier = self.workload_applier(admitted, &execution).await?;
+            let mut deploy = self.open_deploy(admitted, &execution).await?;
+            removed += deploy
+                .destroy(applier.as_ref(), &selection)
+                .await
+                .context("service teardown failed")?
+                .len();
+        }
         let composition = engine.compose(selection.clone())?;
-        Ok(engine
-            .destroy(&composition, selection)
-            .await
-            .context("infrastructure destroy failed")?
-            .len())
+        Ok(removed
+            + engine
+                .destroy(&composition, selection)
+                .await
+                .context("infrastructure destroy failed")?
+                .len())
     }
 
     /// Delete exactly the named resource ids (the rollback delete pass):
@@ -396,9 +446,10 @@ impl<F: DefinitionFrontend> Engine<F> {
     // ------------------------------------------------------------------
     // Deploy verbs: the sibling family, reconciling the service set
     // through the deploy engine against state/deploy. The set is the
-    // definition's service plane — empty until the plane split realizes
-    // service nodes — so today these verbs honestly reconcile nothing,
-    // and become real the moment `services()` fills.
+    // provider's projection of the realized definition — the workload
+    // partition computed at `execution()` — so these verbs manage exactly
+    // the services the definition describes, and honestly reconcile
+    // nothing for a provider with no workload export.
     // ------------------------------------------------------------------
 
     /// Read-only service plan: which services would change, by desired
@@ -422,11 +473,35 @@ impl<F: DefinitionFrontend> Engine<F> {
     ) -> Result<Vec<tokeira_orchestrator::ServiceChange>> {
         let execution = self.execution(admitted, None)?;
         self.refuse_on_issue(admitted).await?;
+        let applier = self.workload_applier(admitted, &execution).await?;
         let mut deploy = self.open_deploy(admitted, &execution).await?;
         deploy
-            .apply(&NoWorkloadApplier)
+            .apply(applier.as_ref())
             .await
             .context("service apply failed")
+    }
+
+    /// The provider's workload applier for this deployment, built by its
+    /// declared constructor with the provider's own attribute block. A
+    /// provider without a workload export gets the fail-closed applier —
+    /// its service set is empty by the same absence, so a manifest reaching
+    /// it is a programming error surfaced loudly.
+    async fn workload_applier(
+        &self,
+        admitted: &Admitted,
+        execution: &ExecutionState,
+    ) -> Result<Box<dyn deploy_engine::Platform>> {
+        match self.platform.workload() {
+            Some((namespace, workload)) => workload
+                .platform
+                .construct(
+                    &admitted.deployment_ref,
+                    execution.attributes.get(namespace),
+                )
+                .await
+                .context("failed to construct the workload applier"),
+            None => Ok(Box::new(NoWorkloadApplier)),
+        }
     }
 
     async fn open_deploy(
@@ -520,6 +595,31 @@ impl tokeira_deploy_engine::Platform for NoWorkloadApplier {
     }
 }
 
+/// View the realized resources for service projection: module ownership,
+/// type tag, identity, dependency identities, and the recorded desired
+/// manifest — everything a provider needs to recognize its workloads
+/// without the framework interpreting anything.
+fn realized_entries<'a>(
+    resources: &'a BTreeMap<String, Vec<Arc<dyn iac::Resource>>>,
+    manifests: &'a BTreeMap<ResourceId, serde_json::Value>,
+) -> Vec<RealizedEntry<'a>> {
+    resources
+        .iter()
+        .flat_map(|(module, resources)| {
+            resources.iter().map(move |resource| {
+                let resource_id = resource.resource_id();
+                RealizedEntry {
+                    module,
+                    resource_type: resource.resource_type(),
+                    manifest: manifests.get(&resource_id),
+                    resource_id,
+                    dependencies: resource.dependencies(),
+                }
+            })
+        })
+        .collect()
+}
+
 /// The bootstrap is nominated by shape, not name: the engine stands it up
 /// before every other module (it provisions the state backend itself), and
 /// the framework knows no module names — so the graph must contain exactly
@@ -585,6 +685,14 @@ pub struct ExecutionState {
     /// Namespace → plain-JSON attribute block, transported to the
     /// selections' constructors uninterpreted.
     pub(crate) attributes: BTreeMap<String, serde_json::Value>,
+    /// Engine identities the workload plane claims off the infra plane —
+    /// one engine owns each workload, never both. `resources` keeps the
+    /// claimed entries (recorded-state paths still see them); the infra
+    /// derivation excludes them.
+    pub(crate) claimed: BTreeSet<ResourceId>,
+    /// The provider's projected service models, in realization order — the
+    /// workload plane the deploy engine manages.
+    pub(crate) services: Vec<Arc<dyn deploy_engine::Service>>,
 }
 
 impl fmt::Debug for ExecutionState {
@@ -738,6 +846,7 @@ mod tests {
                 ops: None,
                 execution: Box::new(NoProbe),
                 infra: None,
+                workload: None,
             },
         );
         let platform = BoundPlatform::bind("test", "tkd", declaration).unwrap();

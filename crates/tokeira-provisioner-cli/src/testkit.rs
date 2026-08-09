@@ -116,6 +116,7 @@ fn declaration(probe: FixedProbe) -> PlatformDeclaration {
         ops: None,
         execution: Box::new(probe),
         infra: None,
+        workload: None,
     })
 }
 

@@ -21,6 +21,10 @@ use crate::{author::LocatedValue, error::KindError, kind::ProviderKind};
 
 /// Live host/container port mapping shape shared with the operator surface.
 pub use tokeira_orchestrator::PortMapping;
+/// The deploy-engine contracts a provider's workload export speaks: the
+/// service model the engine manages and the applier that deploys its
+/// manifests.
+pub use tokeira_orchestrator::{DeployPlatform, DeployService};
 
 /// Everything the framework needs to operate one platform.
 ///
@@ -94,6 +98,11 @@ pub struct ProviderExport {
     /// The provider's infra-phase extension constructor, when it has
     /// context handles to register.
     pub infra: Option<Arc<dyn InfraConstructor>>,
+    /// The provider's workload export, when its services deploy as
+    /// manifests through the deploy engine. `None` means the provider has
+    /// no separate service plane — its whole deployment rides the infra
+    /// universe.
+    pub workload: Option<WorkloadExport>,
 }
 
 impl fmt::Debug for ProviderExport {
@@ -102,8 +111,89 @@ impl fmt::Debug for ProviderExport {
             .field("kinds", &self.kinds)
             .field("ops", &self.ops.is_some())
             .field("infra", &self.infra.is_some())
+            .field("workload", &self.workload.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// The workload half of a provider export: how the provider's services
+/// project out of realized deployment state, and how their manifests deploy
+/// onto the substrate.
+///
+/// The kinds stay what they are — authored input realizing provider
+/// resources. It is the provider, here, that recognizes which realized
+/// entries are its services and rebuilds each one's workload model from the
+/// recorded desired manifest; the framework routes the projection to the
+/// deploy engine and everything unclaimed to the infra engine.
+#[derive(Clone)]
+pub struct WorkloadExport {
+    /// Projects the provider's services out of realized state.
+    pub services: Arc<dyn ServiceProjection>,
+    /// Constructs the applier that deploys service manifests.
+    pub platform: Arc<dyn WorkloadConstructor>,
+}
+
+impl fmt::Debug for WorkloadExport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkloadExport").finish_non_exhaustive()
+    }
+}
+
+/// One realized entry of the deployment's execution state, viewed for
+/// service projection: enough for a provider to recognize its workloads and
+/// rebuild each service model from the recorded desired manifest.
+#[derive(Debug)]
+pub struct RealizedEntry<'a> {
+    /// Owning logical module.
+    pub module: &'a str,
+    /// The provider's resource-type tag — the projector's recognition key.
+    pub resource_type: tokeira_iac::ResourceType,
+    /// Engine identity — the claim key.
+    pub resource_id: tokeira_iac::ResourceId,
+    /// The provider-owned desired manifest recorded at realization, when
+    /// one was recorded.
+    pub manifest: Option<&'a serde_json::Value>,
+    /// Realized identities of the entry's declared dependencies.
+    pub dependencies: Vec<tokeira_iac::ResourceId>,
+}
+
+/// A provider's partition of realized state into its service plane.
+///
+/// Claimed entries leave the infra plane — one engine owns each workload,
+/// never both. An entry the projector does not claim stays exactly where it
+/// was.
+#[derive(Debug, Default)]
+pub struct Projection {
+    /// Engine identities the service plane claims off the infra plane.
+    pub claimed: Vec<tokeira_iac::ResourceId>,
+    /// The service models the deploy engine manages, in realization order.
+    pub services: Vec<Arc<dyn DeployService>>,
+}
+
+/// Recognizes a provider's services among realized entries.
+///
+/// Runs at realization, where a failure can refuse the whole operation —
+/// a projection that silently dropped a service would read as "tear it
+/// down" to the deploy engine, so errors here are never absorbed.
+pub trait ServiceProjection: Send + Sync + fmt::Debug {
+    /// Partition the provider's services out of the realized entries.
+    fn project(&self, entries: &[RealizedEntry<'_>]) -> anyhow::Result<Projection>;
+}
+
+/// Constructs the provider's workload applier for one deployment.
+///
+/// The workload analog of [`InfraConstructor`]: `attributes` is the
+/// provider's namespace block from the evaluated configuration, and
+/// connection failures keep the provider's own error root so the
+/// unreachable class renders as a platform issue.
+#[async_trait::async_trait]
+pub trait WorkloadConstructor: Send + Sync + fmt::Debug {
+    /// Build the applier that deploys this deployment's service manifests.
+    async fn construct(
+        &self,
+        deployment: &DeploymentRef,
+        attributes: Option<&serde_json::Value>,
+    ) -> anyhow::Result<Box<dyn DeployPlatform>>;
 }
 
 /// An authorable kind: the contract a kind type implements so it can be

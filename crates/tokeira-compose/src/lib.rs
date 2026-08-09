@@ -73,6 +73,10 @@ pub fn provider() -> tokeira_platform::declaration::ProviderExport {
         ops: Some(Box::new(ops::DockerOps)),
         execution: Box::new(execution::ComposeExecution),
         infra: Some(std::sync::Arc::new(execution::ComposeInfraConstructor)),
+        workload: Some(tokeira_platform::declaration::WorkloadExport {
+            services: std::sync::Arc::new(execution::ComposeServiceProjection),
+            platform: std::sync::Arc::new(execution::ComposeWorkloadConstructor),
+        }),
     }
 }
 
@@ -453,6 +457,50 @@ impl iac::Resource for ComposeService {
                 details,
             }
         }
+    }
+}
+
+/// A placed service on the workload plane: the same [`ComposeService`]
+/// model, viewed as the service unit the deploy engine manages. The engine
+/// hashes [`manifests`](deploy_engine::Service::manifests) to decide
+/// whether the service needs applying, and [`ComposePlatform`] deserializes
+/// the very same manifest back into a [`ComposeService`] to reconcile the
+/// container — one model, one canonical form, both directions.
+#[derive(Debug, Clone)]
+pub struct ComposeWorkload {
+    service: ComposeService,
+    module: String,
+}
+
+impl ComposeWorkload {
+    /// View a placed service as its workload unit, tagged with the logical
+    /// module that owns it.
+    pub fn new(service: ComposeService, module: impl Into<String>) -> Self {
+        Self {
+            service,
+            module: module.into(),
+        }
+    }
+}
+
+impl deploy_engine::Service for ComposeWorkload {
+    fn name(&self) -> &str {
+        &self.service.name
+    }
+
+    fn module(&self) -> &str {
+        &self.module
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        self.service.depends_on.iter().map(String::as_str).collect()
+    }
+
+    fn manifests(
+        &self,
+        _ctx: &deploy_engine::ServiceContext,
+    ) -> Result<Vec<serde_json::Value>, deploy_engine::RuntimeError> {
+        Ok(vec![canonicalize_manifest(self.service.to_manifest())])
     }
 }
 

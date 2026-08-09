@@ -2,11 +2,12 @@
 //!
 //! The verbs drive the deploy engine over the definition's service plane:
 //! desired manifests hashed against recorded runtime state, reconciled per
-//! service. The plane is empty until the service split realizes `.service(`
-//! nodes, so today the verbs honestly reconcile nothing — and become real
-//! the moment the set fills. `deploy apply` follows the same mutating-verb
-//! contract as `infra apply` — gate before any mutation, then a
-//! config-revision advance on success.
+//! service. The plane is the provider's projection of the realized
+//! definition — the workload partition computed at realization — so the
+//! verbs manage exactly the services the definition describes, through the
+//! provider's declared applier. `deploy apply` follows the same
+//! mutating-verb contract as `infra apply` — gate before any mutation,
+//! then a config-revision advance on success.
 //!
 //! The service plane has no explanation model yet (that machinery is the
 //! infra plane's); the verbs render the typed service changes directly and

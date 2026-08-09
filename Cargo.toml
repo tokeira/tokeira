@@ -57,6 +57,7 @@ members = [
 exclude = [
     "scenarios/worker-versioning",
     "scenarios/standalone-activities",
+    "spikes/tuf-platform-definition",
     "tools/simulation/engine",
     "tools/simulation/broker",
     "tools/simulation/placement",

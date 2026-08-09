@@ -1,0 +1,60 @@
+[package]
+name = "spike-tuf-platform-definition"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone spike (root AGENTS.md task): excluded from the tokeira workspace,
+# no tokeira crate dependencies, own lockfile. Mirrored product shapes
+# (SourceResolver, sha256-set-v1 identity) are copied with citations, not
+# imported.
+[workspace]
+
+[dependencies]
+# The TUF client/authoring library under investigation. 0.24 is the current
+# line (2026-07); the Transport trait, RepositoryEditor, and schema types the
+# spike exercises all live here.
+tough = "0.24"
+# AWS KMS as a tough KeySource. RSA / RSASSA_PSS_SHA_256 only at this
+# version — a finding, recorded in the README.
+tough-kms = "0.16"
+aws-config = "1"
+aws-sdk-s3 = "1"
+aws-sdk-kms = "1"
+# tough's own crypto backend; used only to generate Ed25519 pkcs8 signing
+# keys so tests never need pre-provisioned key material.
+aws-lc-rs = "1"
+# Identity mirror uses the same digest crates as tokeira-platform so the
+# sha256-set-v1 computation is byte-identical.
+sha2 = "0.10"
+hex = "0.4"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# tough's editor takes jiff timestamps for role expirations.
+jiff = "0.2"
+thiserror = "2"
+anyhow = "1"
+
+[dev-dependencies]
+# Offline S3: a closure-backed HTTP client stands in for the S3 endpoint so
+# the whole TUF verification chain runs over the real aws-sdk-s3 request
+# path with no credentials and no network.
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
+aws-smithy-types = "1"
+aws-credential-types = { version = "1", features = ["test-util"] }
+http = "1"
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+print_stdout = "deny"
+print_stderr = "deny"

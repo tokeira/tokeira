@@ -15,12 +15,12 @@ completed graph and the host-free configuration value.
 | Concern | Current example | Source |
 |---|---|---|
 | Separate editable values from deployment structure | `config()` and `deployment()` | [Compose definition](../../platforms/compose/definition.tkd) |
-| Admit configuration through a platform serde type | `ComposeConfig` and pure validation | [Compose config](../../platforms/compose/src/config.rs) |
-| Supply platform-specific runtime facts | `ComposeContext` | [Compose context](../../platforms/compose/src/context.rs) |
+| Author the configuration shape once, in the definition | `struct Compose` and kind input validation | [Compose definition](../../platforms/compose/definition.tkd) |
+| Receive platform runtime facts | the framework-supplied evaluation context | [Engine](../../crates/tokeira-provisioner-cli/src/engine.rs) |
 | Select modules from config variants | Conditional DSQL module | [Compose definition](../../platforms/compose/definition.tkd) |
 | Keep host paths out of source | Logical `Volume` values | [Compose kinds](../../crates/tokeira-compose/src/kinds/mod.rs) |
 | Preserve configuration coupling | Resource dependencies plus content digests | [Compose kinds](../../crates/tokeira-compose/src/kinds/mod.rs) |
-| Decode a closed kind set without a registry | `EngineKind` and `kind_functions()` | [Engine kind library](../../crates/tokeira-kinds/src/lib.rs) |
+| Decode kinds from the declared vocabulary | `Vocabulary::of` over the declared kind sets | [Platform declaration](../../crates/tokeira-platform/src/declaration.rs) |
 | Keep checking and execution on one evaluation path | `evaluate_with_context()` | [Compose provisioner](../../platforms/compose/src/lib.rs) |
 | Bind one platform and frontend into `tkp` | Generated composition root | [Provisioner composition](../../crates/tokeira-build/src/composition.rs) |
 

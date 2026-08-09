@@ -1,6 +1,5 @@
 //! `tkp describe` — read-only report of identity, recorded provenance, binding
-//! verdict, and state facts, in **two views** (design §Command behaviour and
-//! outputs). Never gates: it must work precisely when the applying verbs would
+//! verdict, and state facts, in **two views**. Never gates: it must work precisely when the applying verbs would
 //! refuse, so diagnosis works on a drifted or mismatched deployment.
 //!
 //! - **Operator view** (default): a tight summary answering "is this healthy and
@@ -9,7 +8,7 @@
 //!   full record): the complete auditable record — the per-artifact integrity
 //!   manifest (SHA-256), the retained-revision set, the operation marker and
 //!   lock holder. The `EngineIdentity` fields and source-snapshot ref join this
-//!   view when they exist (tasks 16/17; tracked by 19.1).
+//!   view when they exist.
 
 use std::path::Path;
 
@@ -21,22 +20,25 @@ use tokeira_provisioner::{
     check_binding,
 };
 
-use crate::{ProvisionerPlatform, config_history, envelope_store};
+use tokeira_platform::definition::DefinitionFrontend;
 
-pub(crate) async fn describe<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
+use crate::{config_history, engine::Engine, envelope_store, platform::Admitted};
+
+pub(crate) async fn describe<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
     json: bool,
     detail: bool,
 ) -> Result<()> {
+    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
     let (envelope, _version) = envelope_store(deployment_dir).load().await?;
-    let source = platform.config_source(deployment_dir)?;
+    let source = admitted.config_source();
     let retained = config_history::retained_revisions(deployment_dir, &source);
     let report = DescribeReport::build(
         &running,
         &envelope,
-        platform.label(deployment_dir),
+        engine.platform().id().as_str(),
         retained,
         load_bundle_view(deployment_dir),
         read_storage(deployment_dir),
@@ -147,7 +149,7 @@ struct ArtifactView {
 struct IntegrityView {
     provisioner_version: String,
     /// The full closure-scoped identity the artifacts are keyed by
-    /// (tasks 16.2/19.1); `None` is a pre-identity (native dev) manifest.
+    ///; `None` is a pre-identity (native dev) manifest.
     engine_identity: Option<IdentityView>,
     /// Who built the bytes (the admission gate's input).
     authority: BuildAuthority,
@@ -156,7 +158,7 @@ struct IntegrityView {
     artifacts: Vec<ArtifactView>,
 }
 
-/// The complete `EngineIdentity` field set (task 19.1) — the verification
+/// The complete `EngineIdentity` field set — the verification
 /// view's answer to "what exactly is this engine keyed on?".
 #[derive(Serialize)]
 struct IdentityView {
@@ -184,8 +186,8 @@ impl IdentityView {
     }
 }
 
-/// Build provenance from the deployment's bundle sidecar (task 19.1): the
-/// frozen source refs (task 17), the builder, and the test evidence — where
+/// Build provenance from the deployment's bundle sidecar: the
+/// frozen source refs, the builder, and the test evidence — where
 /// the bound bytes came from. Absent for pre-bundle deployments.
 #[derive(Serialize)]
 struct BundleView {
@@ -200,7 +202,7 @@ struct BundleView {
 
 #[derive(Serialize)]
 struct DescribeReport {
-    platform: &'static str,
+    platform: String,
     running: StampView,
     /// Storage kind from `tokeirad.toml` (`infrastructure.storage`) — the
     /// definitive record; `None` when the config is absent or unreadable.
@@ -212,7 +214,7 @@ struct DescribeReport {
     schema_version: u32,
     config_revision: u64,
     effective_config_ref: Option<String>,
-    /// Revisions retained for this platform — the revertable set (task 14.3).
+    /// Revisions retained for this platform — the revertable set.
     retained_revisions: Vec<u64>,
     binding: BindingView,
     integrity: Option<IntegrityView>,
@@ -234,7 +236,7 @@ impl DescribeReport {
     fn build(
         running: &ProvenanceStamp,
         envelope: &DeploymentStateEnvelope,
-        platform: &'static str,
+        platform: &str,
         retained_revisions: Vec<u64>,
         bundle: Option<BundleView>,
         storage: Option<String>,
@@ -242,7 +244,7 @@ impl DescribeReport {
     ) -> Self {
         let verdict = check_binding(envelope.binding.as_ref(), running);
         Self {
-            platform,
+            platform: platform.to_string(),
             running: StampView::of(running),
             storage,
             state_dir: deployment_dir.to_path_buf(),
@@ -276,7 +278,7 @@ impl DescribeReport {
             runtime_head_present: envelope.runtime_head.is_some(),
             operation: envelope.operation.as_ref().map(|op| {
                 match op.audit_log.as_ref().map(|log| log.entries.len()) {
-                    // The in-flight audit log (task 19.2): what B committed,
+                    // The in-flight audit log: what B committed,
                     // visible exactly when recovery needs it.
                     Some(recorded) => format!(
                         "{:?} (phase: {}, {} recorded)",
@@ -461,7 +463,7 @@ impl DescribeReport {
             None => println!("Integrity           none recorded\n"),
         }
 
-        // Build provenance (task 19.1) — where the bound bytes came from:
+        // Build provenance — where the bound bytes came from:
         // the frozen source refs, the builder, the test evidence.
         if let Some(b) = &self.bundle {
             println!("Bundle provenance   request {}", b.request_id);
@@ -649,7 +651,7 @@ mod tests {
     }
 
     // The verification record carries the complete per-artifact manifest —
-    // the by-hand binding-verification surface (19.1's two-view split).
+    // the by-hand binding-verification surface of the two-view split.
     #[test]
     fn verification_record_carries_the_full_artifact_manifest() {
         use tokeira_provisioner::{BinaryArtifactDescriptor, IntegrityManifest, Target};

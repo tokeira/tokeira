@@ -1,4 +1,4 @@
-//! The binding gate for the applying verbs (task 8.3).
+//! The binding gate for the applying verbs.
 //!
 //! Every mutating `tkp` verb evaluates the gate *before* any provider mutation.
 //! A versioned deployment proceeds only on the authoritative `Match`; a dev

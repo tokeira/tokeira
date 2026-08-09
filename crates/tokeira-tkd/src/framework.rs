@@ -10,12 +10,13 @@ use serde::Serialize;
 use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_platform::{
     author::{LocatedValue, ValueShape, VariantShape},
+    declaration::Vocabulary,
     definition::{DefinitionFrontend, FrontendOutput, FrontendSource},
     error::{DiagnosticCategory, FrontendDiagnostic, SourceRange},
     graph::{
         OutputReference, ResourceReference, StructuralGraphBuilder, VerifiedGraph, WritebackValue,
     },
-    kind::{KindFunctions, ProviderKind},
+    kind::DecodedKind,
 };
 
 use crate::{
@@ -55,15 +56,15 @@ impl DefinitionFrontend for TkdFrontend {
         &self.format
     }
 
-    fn evaluate<C, K>(
+    fn evaluate<C>(
         &self,
         source: FrontendSource<'_>,
         context: &C,
-        kinds: KindFunctions<K>,
-    ) -> Result<FrontendOutput<K>, FrontendDiagnostic>
+        vocabulary: &Vocabulary,
+        parts: &dyn tokeira_platform::definition::SourceResolver,
+    ) -> Result<FrontendOutput, FrontendDiagnostic>
     where
         C: Serialize,
-        K: ProviderKind + 'static,
     {
         let source_text =
             std::str::from_utf8(source.bytes).map_err(|error| FrontendDiagnostic {
@@ -76,59 +77,64 @@ impl DefinitionFrontend for TkdFrontend {
         let source_map = SourceMap::new(source.bytes);
         let context = context_fields(context)
             .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
-        let bridge = FrameworkBridge::new(kinds, context);
-        let (graph, config) = crate::interpret(source_text, &bridge, &())
+        let bridge = FrameworkBridge::new(vocabulary, context);
+        let (graph, config) = crate::interpret(source_text, &bridge, &(), parts)
             .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
         let config = value_to_located(config)
             .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
         Ok(FrontendOutput { config, graph })
     }
 
-    fn retarget_check<C, K>(
+    fn retarget_check<C>(
         &self,
         prior: FrontendSource<'_>,
         current: FrontendSource<'_>,
         context: &C,
-        kinds: KindFunctions<K>,
+        vocabulary: &Vocabulary,
+        prior_parts: &dyn tokeira_platform::definition::SourceResolver,
+        current_parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<(), Vec<String>>
     where
         C: Serialize,
-        K: ProviderKind + 'static,
     {
         // Both revisions run the same full interpretation as evaluate() —
         // one evaluation path for checking and execution — and the diff runs
         // over the host-free config values. The *current* source supplies the
         // `#[create]` admission metadata: the annotation set an operator is
-        // editing under is the one that gates them.
+        // editing under is the one that gates them. Each side resolves its
+        // parts through its own resolver — the retained set for the prior,
+        // the live set for the current — so a multi-document definition
+        // compares as the set it was.
         let evaluate_config = |source: FrontendSource<'_>,
+                               parts: &dyn tokeira_platform::definition::SourceResolver,
                                label: &str|
-         -> Result<crate::Value<HostValue<K>>, Vec<String>> {
+         -> Result<crate::Value<HostValue>, Vec<String>> {
             let text = std::str::from_utf8(source.bytes)
                 .map_err(|error| vec![format!("{label} definition is not UTF-8: {error}")])?;
             let fields = context_fields(context).map_err(|error| vec![error.msg.clone()])?;
-            let bridge = FrameworkBridge::new(kinds, fields);
-            let (_, config) = crate::interpret(text, &bridge, &())
+            let bridge = FrameworkBridge::new(vocabulary, fields);
+            let (_, config) = crate::interpret(text, &bridge, &(), parts)
                 .map_err(|error| vec![format!("{label} definition: {}", error.msg)])?;
             Ok(config)
         };
-        let prior_config = evaluate_config(prior, "prior")?;
-        let current_config = evaluate_config(current, "current")?;
+        let prior_config = evaluate_config(prior, prior_parts, "prior")?;
+        let current_config = evaluate_config(current, current_parts, "current")?;
         let current_text = std::str::from_utf8(current.bytes)
             .map_err(|error| vec![format!("current definition is not UTF-8: {error}")])?;
         crate::retarget_check(current_text, &prior_config, &current_config)
     }
 }
 
-enum HostValue<K> {
+enum HostValue {
     Deployment,
     Module(String),
     Resource(ResourceReference),
     Output(OutputReference),
-    Kind(Rc<RefCell<Option<K>>>),
-    Context(FieldMap<HostValue<K>>),
+    Kind(Rc<RefCell<Option<DecodedKind>>>),
+    Context(FieldMap<HostValue>),
 }
 
-impl<K> Clone for HostValue<K> {
+impl Clone for HostValue {
     fn clone(&self) -> Self {
         match self {
             Self::Deployment => Self::Deployment,
@@ -141,7 +147,7 @@ impl<K> Clone for HostValue<K> {
     }
 }
 
-impl<K> fmt::Debug for HostValue<K> {
+impl fmt::Debug for HostValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Deployment => f.write_str("Deployment"),
@@ -154,14 +160,14 @@ impl<K> fmt::Debug for HostValue<K> {
     }
 }
 
-struct FrameworkBridge<K> {
-    kinds: KindFunctions<K>,
-    context: FieldMap<HostValue<K>>,
-    graph: RefCell<Option<StructuralGraphBuilder<K>>>,
+struct FrameworkBridge<'a> {
+    kinds: &'a Vocabulary,
+    context: FieldMap<HostValue>,
+    graph: RefCell<Option<StructuralGraphBuilder<DecodedKind>>>,
 }
 
-impl<K> FrameworkBridge<K> {
-    fn new(kinds: KindFunctions<K>, context: FieldMap<HostValue<K>>) -> Self {
+impl<'a> FrameworkBridge<'a> {
+    fn new(kinds: &'a Vocabulary, context: FieldMap<HostValue>) -> Self {
         Self {
             kinds,
             context,
@@ -171,7 +177,7 @@ impl<K> FrameworkBridge<K> {
 
     fn with_graph<T>(
         &self,
-        action: impl FnOnce(&mut StructuralGraphBuilder<K>) -> Result<T, EvalError>,
+        action: impl FnOnce(&mut StructuralGraphBuilder<DecodedKind>) -> Result<T, EvalError>,
     ) -> Result<T, EvalError> {
         let mut graph = self.graph.borrow_mut();
         let graph = graph
@@ -180,7 +186,7 @@ impl<K> FrameworkBridge<K> {
         action(graph)
     }
 
-    fn module_dependencies(value: Value<HostValue<K>>) -> Result<Vec<String>, EvalError> {
+    fn module_dependencies(value: Value<HostValue>) -> Result<Vec<String>, EvalError> {
         let Value::Vec(values) = value else {
             return Err(EvalError::new(
                 "module dependencies must be an array of module names or handles",
@@ -197,9 +203,7 @@ impl<K> FrameworkBridge<K> {
             .collect()
     }
 
-    fn resource_dependencies(
-        value: Value<HostValue<K>>,
-    ) -> Result<Vec<ResourceReference>, EvalError> {
+    fn resource_dependencies(value: Value<HostValue>) -> Result<Vec<ResourceReference>, EvalError> {
         let Value::Vec(values) = value else {
             return Err(EvalError::new(
                 "resource dependencies must be an array of resource handles",
@@ -216,7 +220,7 @@ impl<K> FrameworkBridge<K> {
             .collect()
     }
 
-    fn add_module(&self, args: Vec<Value<HostValue<K>>>) -> Result<Value<HostValue<K>>, EvalError> {
+    fn add_module(&self, args: Vec<Value<HostValue>>) -> Result<Value<HostValue>, EvalError> {
         let mut args = args.into_iter();
         let name = args
             .next()
@@ -243,8 +247,8 @@ impl<K> FrameworkBridge<K> {
     fn add_resource(
         &self,
         module: String,
-        args: Vec<Value<HostValue<K>>>,
-    ) -> Result<Value<HostValue<K>>, EvalError> {
+        args: Vec<Value<HostValue>>,
+    ) -> Result<Value<HostValue>, EvalError> {
         let mut args = args.into_iter();
         let logical_id = args
             .next()
@@ -282,16 +286,13 @@ impl<K> FrameworkBridge<K> {
     }
 }
 
-impl<K> HostBridge for FrameworkBridge<K>
-where
-    K: ProviderKind + 'static,
-{
-    type Host = HostValue<K>;
+impl HostBridge for FrameworkBridge<'_> {
+    type Host = HostValue;
     type Cx = ();
-    type Output = VerifiedGraph<K>;
+    type Output = VerifiedGraph<DecodedKind>;
 
     fn is_kind(&self, name: &str) -> bool {
-        (self.kinds.contains)(name)
+        self.kinds.contains(name)
     }
 
     fn knows_method(&self, name: &str) -> bool {
@@ -303,7 +304,7 @@ where
     }
 
     fn kind_defaults(&self, name: &str) -> Option<FieldMap<Self::Host>> {
-        match located_to_value((self.kinds.defaults)(name)?).ok()? {
+        match located_to_value(self.kinds.defaults(name)?).ok()? {
             Value::Struct { fields, .. } => Some(fields),
             _ => None,
         }
@@ -322,8 +323,10 @@ where
                 .map(|(name, value)| value_to_located(value).map(|value| (name, value)))
                 .collect::<Result<_, _>>()?,
         });
-        let kind =
-            (self.kinds.decode)(name, input).map_err(|error| EvalError::new(error.message))?;
+        let kind = self
+            .kinds
+            .decode(name, input)
+            .map_err(|error| EvalError::new(error.message))?;
         Ok(HostValue::Kind(Rc::new(RefCell::new(Some(kind)))))
     }
 
@@ -448,7 +451,7 @@ where
     }
 }
 
-fn context_fields<C: Serialize, K>(context: &C) -> Result<FieldMap<HostValue<K>>, EvalError> {
+fn context_fields<C: Serialize>(context: &C) -> Result<FieldMap<HostValue>, EvalError> {
     let value = serde_json::to_value(context)
         .map_err(|error| EvalError::new(format!("cannot encode platform context: {error}")))?;
     let serde_json::Value::Object(fields) = value else {
@@ -462,7 +465,7 @@ fn context_fields<C: Serialize, K>(context: &C) -> Result<FieldMap<HostValue<K>>
         .collect()
 }
 
-fn json_to_value<K>(value: serde_json::Value) -> Result<Value<HostValue<K>>, EvalError> {
+fn json_to_value(value: serde_json::Value) -> Result<Value<HostValue>, EvalError> {
     match value {
         serde_json::Value::Null => Ok(Value::Opt(None)),
         serde_json::Value::Bool(value) => Ok(Value::Bool(value)),
@@ -489,7 +492,7 @@ fn json_to_value<K>(value: serde_json::Value) -> Result<Value<HostValue<K>>, Eva
     }
 }
 
-fn value_to_located<K>(value: Value<HostValue<K>>) -> Result<LocatedValue, EvalError> {
+fn value_to_located(value: Value<HostValue>) -> Result<LocatedValue, EvalError> {
     let value = match value {
         Value::Unit => ValueShape::Unit,
         Value::Bool(value) => ValueShape::Bool(value),
@@ -551,7 +554,7 @@ fn value_to_located<K>(value: Value<HostValue<K>>) -> Result<LocatedValue, EvalE
     Ok(LocatedValue::new(value))
 }
 
-fn located_to_value<K>(value: LocatedValue) -> Result<Value<HostValue<K>>, EvalError> {
+fn located_to_value(value: LocatedValue) -> Result<Value<HostValue>, EvalError> {
     match value.value {
         ValueShape::Unit => Ok(Value::Unit),
         ValueShape::Bool(value) => Ok(Value::Bool(value)),
@@ -655,9 +658,10 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use tokeira_platform::{
         author::from_located_value,
+        declaration::{KindEntry, KindSet, Vocabulary},
         definition::{DefinitionFrontend, DefinitionSourceName, FrontendSource},
         error::KindError,
-        kind::{KindFunctions, PlacementContext, ProviderKind},
+        kind::{PlacementContext, ProviderKind},
     };
 
     use super::TkdFrontend;
@@ -700,19 +704,16 @@ mod tests {
         }
     }
 
-    fn kinds() -> KindFunctions<TestKind> {
-        KindFunctions {
-            names: &["TestResource"],
-            contains: |name| name == "TestResource",
-            defaults: |_| None,
-            decode: |name, _| {
-                if name == "TestResource" {
-                    Ok(TestKind)
-                } else {
-                    Err(KindError::new(format!("unknown kind `{name}`")))
-                }
-            },
-        }
+    fn vocabulary() -> Vocabulary {
+        Vocabulary::of(vec![KindSet::new(
+            "test",
+            vec![KindEntry {
+                name: "TestResource",
+                defaults: || None,
+                decode: |_| Ok(Box::new(TestKind)),
+            }],
+        )])
+        .expect("one-entry test vocabulary composes")
     }
 
     #[test]
@@ -739,7 +740,8 @@ mod tests {
                 &TestContext {
                     project_name: "example".to_string(),
                 },
-                kinds(),
+                &vocabulary(),
+                &tokeira_platform::definition::NoPartSources,
             )
             .expect("definition should evaluate");
         let config: TestConfig = from_located_value(output.config).expect("config should decode");
@@ -789,7 +791,9 @@ mod tests {
                     bytes: &retargeted,
                 },
                 &context,
-                kinds(),
+                &vocabulary(),
+                &tokeira_platform::definition::NoPartSources,
+                &tokeira_platform::definition::NoPartSources,
             )
             .expect_err("a create-time change is a retarget");
         assert!(
@@ -810,7 +814,9 @@ mod tests {
                     bytes: &reconciled,
                 },
                 &context,
-                kinds(),
+                &vocabulary(),
+                &tokeira_platform::definition::NoPartSources,
+                &tokeira_platform::definition::NoPartSources,
             )
             .expect("a non-create edit reconciles");
     }

@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use tokeira_aws::{
     ResourceContext,
@@ -18,11 +21,18 @@ use crate::{config::EcsConfig, services::EcsWorkload};
 #[derive(Debug, Clone)]
 pub struct ObservabilityModule {
     config: EcsConfig,
+    /// The deployment's observability content directory: `dashboards/*.json`
+    /// plus `alerts/observability-alerts.yaml`, mirroring the layout the
+    /// platform ships under `platforms/ecs/observability/`.
+    content_dir: PathBuf,
 }
 
 impl ObservabilityModule {
-    pub fn new(config: EcsConfig) -> Self {
-        Self { config }
+    pub fn new(config: EcsConfig, content_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            config,
+            content_dir: content_dir.into(),
+        }
     }
 }
 
@@ -92,11 +102,11 @@ impl Module for ObservabilityModule {
             "s3-{}-observability-artifacts",
             self.config.project_name
         ));
-        for artifact in observability_artifacts() {
+        for artifact in load_observability_artifacts(&self.content_dir)? {
             resources.push(Box::new(S3Object {
                 bucket_dependency: artifacts_bucket.clone(),
-                key: artifact.key.to_owned(),
-                content: artifact.content.to_owned(),
+                key: artifact.key,
+                content: artifact.content,
                 content_type: artifact.content_type.to_owned(),
                 module: self.name().to_owned(),
             }));
@@ -172,91 +182,75 @@ pub fn all_alloy_services() -> [&'static str; 10] {
     ]
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ObservabilityArtifact {
-    key: &'static str,
-    content_type: &'static str,
-    content: &'static str,
+/// One deployed observability document: its artifact-bucket key, content
+/// type, and content, loaded from the deployment's observability content
+/// directory.
+#[derive(Debug, Clone)]
+pub struct ObservabilityArtifact {
+    pub key: String,
+    pub content_type: &'static str,
+    pub content: String,
 }
 
-fn observability_artifacts() -> &'static [ObservabilityArtifact] {
-    &[
-        ObservabilityArtifact {
-            key: "dashboards/grpc-edge-health.json",
+/// Load the deployment's observability documents from `content_dir`: every
+/// `dashboards/*.json` (sorted by file name, so the resource set is
+/// deterministic) plus `alerts/observability-alerts.yaml`. The set is the
+/// directory's contents — shipping a new dashboard is a content change,
+/// not a code change.
+pub fn load_observability_artifacts(
+    content_dir: &Path,
+) -> Result<Vec<ObservabilityArtifact>, IacError> {
+    let dashboards_dir = content_dir.join("dashboards");
+    let entries = std::fs::read_dir(&dashboards_dir).map_err(|error| {
+        IacError::Provider(format!(
+            "observability content not found: cannot read {} ({error}); the deployment's \
+             observability directory carries dashboards/*.json and \
+             alerts/observability-alerts.yaml",
+            dashboards_dir.display()
+        ))
+    })?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            IacError::Provider(format!(
+                "failed to enumerate {}: {error}",
+                dashboards_dir.display()
+            ))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.ends_with(".json") {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    let mut artifacts = Vec::new();
+    for name in names {
+        let path = dashboards_dir.join(&name);
+        let content = std::fs::read_to_string(&path).map_err(|error| {
+            IacError::Provider(format!("failed to read {}: {error}", path.display()))
+        })?;
+        artifacts.push(ObservabilityArtifact {
+            key: format!("dashboards/{name}"),
             content_type: "application/json",
-            content: include_str!(
-                "../../../../crates/tokeira-compose/dashboards/grpc-edge-health.json"
-            ),
-        },
-        ObservabilityArtifact {
-            key: "dashboards/broker-runtime-health.json",
-            content_type: "application/json",
-            content: include_str!(
-                "../../../../crates/tokeira-compose/dashboards/broker-runtime-health.json"
-            ),
-        },
-        ObservabilityArtifact {
-            key: "dashboards/storage-projection-health.json",
-            content_type: "application/json",
-            content: include_str!(
-                "../../../../crates/tokeira-compose/dashboards/storage-projection-health.json"
-            ),
-        },
-        ObservabilityArtifact {
-            key: "dashboards/log-exploration.json",
-            content_type: "application/json",
-            content: include_str!(
-                "../../../../crates/tokeira-compose/dashboards/log-exploration.json"
-            ),
-        },
-        ObservabilityArtifact {
-            key: "dashboards/dsql-connection-health.json",
-            content_type: "application/json",
-            content: include_str!(
-                "../../../../crates/tokeira-compose/dashboards/dsql-connection-health.json"
-            ),
-        },
-        ObservabilityArtifact {
-            key: "dashboards/occ-contention.json",
-            content_type: "application/json",
-            content: include_str!(
-                "../../../../crates/tokeira-compose/dashboards/occ-contention.json"
-            ),
-        },
-        ObservabilityArtifact {
-            key: "dashboards/placement-controller.json",
-            content_type: "application/json",
-            content: include_str!(
-                "../../../../crates/tokeira-compose/dashboards/placement-controller.json"
-            ),
-        },
-        ObservabilityArtifact {
-            key: "dashboards/autoscaler.json",
-            content_type: "application/json",
-            content: include_str!("../../../../crates/tokeira-compose/dashboards/autoscaler.json"),
-        },
-        ObservabilityArtifact {
-            key: "dashboards/projection-workers.json",
-            content_type: "application/json",
-            content: include_str!(
-                "../../../../crates/tokeira-compose/dashboards/projection-workers.json"
-            ),
-        },
-        ObservabilityArtifact {
-            key: "dashboards/infrastructure-health.json",
-            content_type: "application/json",
-            content: include_str!(
-                "../../../../crates/tokeira-compose/dashboards/infrastructure-health.json"
-            ),
-        },
-        ObservabilityArtifact {
-            key: "alerts/observability-alerts.yaml",
-            content_type: "application/yaml",
-            content: include_str!(
-                "../../../../crates/tokeira-compose/alerts/observability-alerts.yaml"
-            ),
-        },
-    ]
+            content,
+        });
+    }
+    let alerts_path = content_dir.join("alerts/observability-alerts.yaml");
+    let content = std::fs::read_to_string(&alerts_path).map_err(|error| {
+        IacError::Provider(format!(
+            "observability content not found: cannot read {} ({error})",
+            alerts_path.display()
+        ))
+    })?;
+    artifacts.push(ObservabilityArtifact {
+        key: "alerts/observability-alerts.yaml".to_string(),
+        content_type: "application/yaml",
+        content,
+    });
+    Ok(artifacts)
 }
 
 fn storage_bucket(name: String, rctx: &ResourceContext, module: &str) -> S3Bucket {
@@ -437,6 +431,11 @@ mod tests {
     use super::*;
     use tokeira_iac::InfraState;
 
+    /// The platform-owned content tree: what a staged deployment carries.
+    fn content_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("observability")
+    }
+
     fn module_context() -> ModuleContext<'static> {
         let state = Box::leak(Box::new(InfraState::default()));
         let extensions = Box::leak(Box::new(HashMap::new()));
@@ -445,7 +444,7 @@ mod tests {
 
     #[test]
     fn observability_module_reports_name_and_cluster_dependency() {
-        let module = ObservabilityModule::new(EcsConfig::default());
+        let module = ObservabilityModule::new(EcsConfig::default(), content_dir());
 
         assert_eq!(module.name(), "observability");
         assert_eq!(module.dependencies(), &["cluster"]);
@@ -453,7 +452,7 @@ mod tests {
 
     #[test]
     fn observability_module_enumerates_storage_alloy_params_and_services() {
-        let module = ObservabilityModule::new(EcsConfig::default());
+        let module = ObservabilityModule::new(EcsConfig::default(), content_dir());
         let resources = module.resources(&module_context()).expect("resources");
         let ids: Vec<String> = resources
             .iter()
@@ -490,6 +489,82 @@ mod tests {
         assert!(ids.iter().any(|id| id.contains("mimir-data")));
         assert!(ids.iter().any(|id| id.contains("loki-data")));
         assert!(ids.iter().any(|id| id.contains("observability-artifacts")));
+    }
+
+    // The content tree and the loader agree: the artifact set is every
+    // dashboard, sorted, plus the alert rules last — the same set the crate
+    // used to embed.
+    #[test]
+    fn the_platform_content_tree_loads_completely() {
+        let artifacts = load_observability_artifacts(&content_dir()).unwrap();
+        let keys: Vec<&str> = artifacts
+            .iter()
+            .map(|artifact| artifact.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "dashboards/autoscaler.json",
+                "dashboards/broker-runtime-health.json",
+                "dashboards/dsql-connection-health.json",
+                "dashboards/grpc-edge-health.json",
+                "dashboards/infrastructure-health.json",
+                "dashboards/log-exploration.json",
+                "dashboards/occ-contention.json",
+                "dashboards/placement-controller.json",
+                "dashboards/projection-workers.json",
+                "dashboards/storage-projection-health.json",
+                "alerts/observability-alerts.yaml",
+            ]
+        );
+        assert!(
+            artifacts
+                .iter()
+                .all(|artifact| !artifact.content.is_empty())
+        );
+        assert!(
+            artifacts
+                .iter()
+                .take(10)
+                .all(|artifact| artifact.content_type == "application/json")
+        );
+        assert_eq!(artifacts[10].content_type, "application/yaml");
+    }
+
+    // The platform owns its observability content, so it owns the style
+    // contract over it: every shipped dashboard and alert rule validates.
+    #[test]
+    fn dashboards_follow_the_style_contract() {
+        tokeira_observability::testing::DashboardValidator::validate_directory(
+            &content_dir().join("dashboards"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn alert_rules_follow_the_style_contract() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("platforms/ecs sits two levels below the workspace root")
+            .to_path_buf();
+        tokeira_observability::testing::AlertRuleValidator::validate_directory(
+            &content_dir().join("alerts"),
+            &repo_root,
+        )
+        .unwrap();
+    }
+
+    // A deployment without staged content refuses with the expected layout
+    // named — the operator learns what belongs where, not just "not found".
+    #[test]
+    fn missing_content_names_the_expected_layout() {
+        let missing = std::env::temp_dir().join("ecs-observability-missing-content-test");
+        let error = load_observability_artifacts(&missing)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dashboards/*.json"), "{error}");
+        assert!(error.contains("observability-alerts.yaml"), "{error}");
     }
 
     #[test]

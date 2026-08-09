@@ -46,13 +46,13 @@ pub(crate) async fn run(
         }
         PlatformDeploymentConfig::Ecs(config) => {
             if matches!(&action, InfraAction::Apply { .. }) {
-                validate_ecs_mirrors(config).await?;
+                validate_ecs_mirrors(config, &ctx.path).await?;
             }
             run_with_engine(
                 action,
                 deployments,
                 &ctx,
-                EcsDeployment::new(),
+                EcsDeployment::new(&ctx.path),
                 config,
                 format,
             )
@@ -71,8 +71,8 @@ pub(crate) async fn run(
 /// infrastructure that would otherwise reference missing images.
 ///
 /// Failing here saves the operator minutes of rollback work.
-async fn validate_ecs_mirrors(config: &EcsConfig) -> Result<()> {
-    let deployment = EcsDeployment::new();
+async fn validate_ecs_mirrors(config: &EcsConfig, deployment_dir: &Path) -> Result<()> {
+    let deployment = EcsDeployment::new(deployment_dir);
     let mut image_ctx = ImageContext::default();
     deployment
         .register_image_extensions(config, &mut image_ctx)

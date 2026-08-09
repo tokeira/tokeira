@@ -15,8 +15,8 @@ fn workspace_root() -> PathBuf {
 }
 
 #[test]
-fn local_platform_closure_contains_the_provisioner_stack() {
-    let closure = resolve_source_closure(&workspace_root(), "tokeira-local-deployment")
+fn compose_platform_closure_contains_the_platform_stack() {
+    let closure = resolve_source_closure(&workspace_root(), "tokeira-compose-deployment")
         .expect("closure resolves");
 
     let dirs: Vec<String> = closure
@@ -25,9 +25,10 @@ fn local_platform_closure_contains_the_provisioner_stack() {
         .map(|d| d.to_string_lossy().into_owned())
         .collect();
     for expected in [
-        "platforms/local",
-        "crates/tokeira-provisioner-cli",
-        "crates/tokeira-provisioner",
+        "platforms/compose",
+        "crates/tokeira-compose",
+        "crates/tokeira-aws",
+        "crates/tokeira-platform",
     ] {
         assert!(
             dirs.iter().any(|d| d == expected),
@@ -36,7 +37,15 @@ fn local_platform_closure_contains_the_provisioner_stack() {
     }
     assert!(
         !dirs.iter().any(|d| d == "apps/tkr"),
-        "tkr is not in the provisioner closure — a tkr-only change must not re-key the engine"
+        "tkr is not in the platform closure — a tkr-only change must not re-key the engine"
+    );
+    // The shell is deliberately NOT in a platform's closure: the generated
+    // root marries platform and shell as separate dependency roots, so a
+    // shell-only change re-keys through the generated closure, never
+    // through the platform's.
+    assert!(
+        !dirs.iter().any(|d| d == "crates/tokeira-provisioner-cli"),
+        "the shell must not enter a platform's closure; got {dirs:?}"
     );
 
     let files: Vec<String> = closure
@@ -65,8 +74,8 @@ fn local_platform_closure_contains_the_provisioner_stack() {
 #[test]
 fn canonical_lock_bytes_are_deterministic() {
     let root = workspace_root();
-    let a = resolve_source_closure(&root, "tokeira-local-deployment").expect("closure");
-    let b = resolve_source_closure(&root, "tokeira-local-deployment").expect("closure");
+    let a = resolve_source_closure(&root, "tokeira-compose-deployment").expect("closure");
+    let b = resolve_source_closure(&root, "tokeira-compose-deployment").expect("closure");
     assert_eq!(a.canonical_lock_bytes(), b.canonical_lock_bytes());
     assert!(
         a.canonical_lock_bytes()

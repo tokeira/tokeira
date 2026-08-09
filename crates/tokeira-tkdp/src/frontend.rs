@@ -11,17 +11,20 @@
 use serde::Serialize;
 use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_platform::{
+    declaration::Vocabulary,
     definition::{DefinitionFrontend, FrontendOutput, FrontendSource},
     error::{DiagnosticCategory, FrontendDiagnostic, SourceRange},
-    kind::{KindFunctions, ProviderKind},
 };
+
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::{
     convert::convert,
-    diagnostics, facade,
+    diagnostics,
+    facade::{self, FACADE_MODULE_NAME},
     lower::lower,
-    preflight::{Preflight, preflight},
-    program::{Program, assemble},
+    preflight::{PartImport, Preflight, preflight, preflight_part},
+    program::{PartUnit, Program, assemble},
     runner::execute,
 };
 
@@ -81,19 +84,73 @@ impl TkdpFrontend {
         }
     }
 
-    /// Runs admission, preflight, lowering, facade synthesis, and assembly —
-    /// everything `evaluate` does before Monty runs. Shared by `evaluate` and
-    /// [`Self::transient_program`] so an inspected program is byte-for-byte
-    /// the program that executes.
-    fn prepare<'a, C, K>(
+    /// Discovers and prepares the definition's parts: every non-facade import
+    /// is offered to the resolver, transitively — a served name is a part
+    /// (validated, lowered, registered as a source module); an unserved name
+    /// is left for Monty, where it is either a built-in or a runtime
+    /// `ModuleNotFoundError` at the import site.
+    ///
+    /// Part failures carry the part's file name in the message and no range —
+    /// diagnostic ranges are root-source-relative only.
+    fn discover_parts(
+        &self,
+        source: &FrontendSource<'_>,
+        root_imports: &[PartImport],
+        resolver: &dyn tokeira_platform::definition::SourceResolver,
+        facade_names: &[&str],
+    ) -> Result<Vec<PartUnit>, FrontendDiagnostic> {
+        let mut queue: VecDeque<String> = root_imports.iter().map(|i| i.name.clone()).collect();
+        let mut seen = BTreeSet::new();
+        let mut parts = Vec::new();
+        while let Some(name) = queue.pop_front() {
+            if name == FACADE_MODULE_NAME || !seen.insert(name.clone()) {
+                continue;
+            }
+            let Ok(bytes) = resolver.resolve(&name) else {
+                continue;
+            };
+            let file_name = format!("{name}.tkdp");
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|error| {
+                    self.diagnostic(
+                        source,
+                        None,
+                        format!("{file_name}: part source is not UTF-8: {error}"),
+                    )
+                })?
+                .to_owned();
+            let part = preflight_part(&text, facade_names).map_err(|findings| {
+                self.diagnostic(
+                    source,
+                    None,
+                    diagnostics::render(&file_name, &text, &findings),
+                )
+            })?;
+            queue.extend(part.part_imports.iter().map(|i| i.name.clone()));
+            let lowered = lower(&text, &part.module, &file_name);
+            parts.push(PartUnit {
+                name,
+                file_name,
+                original: text,
+                lowered,
+            });
+        }
+        Ok(parts)
+    }
+
+    /// Runs admission, preflight, part discovery, lowering, facade synthesis,
+    /// and assembly — everything `evaluate` does before Monty runs. Shared by
+    /// `evaluate` and [`Self::transient_program`] so an inspected program is
+    /// byte-for-byte the program that executes.
+    fn prepare<'a, C>(
         &self,
         source: &FrontendSource<'a>,
         context: &C,
-        kinds: &KindFunctions<K>,
+        vocabulary: &Vocabulary,
+        parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<Prepared<'a>, FrontendDiagnostic>
     where
         C: Serialize,
-        K: ProviderKind + 'static,
     {
         let text = std::str::from_utf8(source.bytes).map_err(|error| {
             self.diagnostic(
@@ -104,7 +161,8 @@ impl TkdpFrontend {
         })?;
 
         let label = source.source_name.to_string();
-        let names = facade::facade_names(kinds.names);
+        let kind_names: Vec<&str> = vocabulary.names().collect();
+        let names = facade::facade_names(&kind_names);
         let pf = preflight(text, &names).map_err(|findings| {
             self.diagnostic(
                 source,
@@ -120,10 +178,11 @@ impl TkdpFrontend {
                 format!("platform context did not serialize: {error}"),
             )
         })?;
-        let synthesized = facade::render(kinds.names, &pf.imports, &context_value);
+        let synthesized = facade::render(&kind_names, &context_value);
 
-        let lowered = lower(text, &pf.module, &label, &pf.import_ranges);
-        let program = assemble(&synthesized, lowered);
+        let part_units = self.discover_parts(source, &pf.part_imports, parts, &names)?;
+        let lowered = lower(text, &pf.module, &label);
+        let program = assemble(synthesized, lowered, part_units);
         Ok(Prepared {
             text,
             preflight: pf,
@@ -139,17 +198,17 @@ impl TkdpFrontend {
     /// spike CLI): the returned [`Program`] holds the assembled text and its
     /// source map. No operator command surfaces it today, and the text is
     /// never persisted — evaluation always reassembles.
-    pub fn transient_program<C, K>(
+    pub fn transient_program<C>(
         &self,
         source: FrontendSource<'_>,
         context: &C,
-        kinds: KindFunctions<K>,
+        vocabulary: &Vocabulary,
+        parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<Program, FrontendDiagnostic>
     where
         C: Serialize,
-        K: ProviderKind + 'static,
     {
-        self.prepare(&source, context, &kinds)
+        self.prepare(&source, context, vocabulary, parts)
             .map(|prepared| prepared.program)
     }
 }
@@ -159,24 +218,24 @@ impl DefinitionFrontend for TkdpFrontend {
         &self.format
     }
 
-    fn evaluate<C, K>(
+    fn evaluate<C>(
         &self,
         source: FrontendSource<'_>,
         context: &C,
-        kinds: KindFunctions<K>,
-    ) -> Result<FrontendOutput<K>, FrontendDiagnostic>
+        vocabulary: &Vocabulary,
+        parts: &dyn tokeira_platform::definition::SourceResolver,
+    ) -> Result<FrontendOutput, FrontendDiagnostic>
     where
         C: Serialize,
-        K: ProviderKind + 'static,
     {
-        let prepared = self.prepare(&source, context, &kinds)?;
+        let prepared = self.prepare(&source, context, vocabulary, parts)?;
 
         let result = execute(&prepared.program, prepared.text).map_err(|failure| {
             self.diagnostic(&source, failure.range.and_then(to_range), failure.message)
         })?;
 
         let pf = prepared.preflight;
-        convert(result, &kinds, &pf.call_sites, pf.deployment_range)
+        convert(result, vocabulary, &pf.call_sites, pf.deployment_range)
             .map_err(|error| self.diagnostic(&source, to_range(error.range), error.message))
     }
 }

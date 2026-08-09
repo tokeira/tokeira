@@ -1,4 +1,4 @@
-//! The operation-marker gate (task 19.4, Req 9.7/11).
+//! The operation-marker gate.
 //!
 //! An interrupted `upgrade`/`rollback` leaves its marker open in the
 //! envelope. Recovery is **by re-running that same verb** — its steps are

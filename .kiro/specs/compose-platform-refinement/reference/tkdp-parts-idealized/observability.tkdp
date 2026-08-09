@@ -1,0 +1,103 @@
+# The observability slice of the Compose deployment: the config-file
+# renderer plus the mimir/loki/grafana/alloy services, declared against
+# the same deployment the root builds. This part is the successor of the
+# platform's Rust observability module — the same content, now readable
+# beside the definition it serves.
+
+from tokeira_platform import Context, Deployment, Module
+from tokeira_provisioner import (
+    Config,
+    Environment,
+    ObservabilityConfiguration,
+    Service,
+    State,
+)
+
+from platform import Compose, DockerSocket
+
+
+def define(
+    cfg: Compose,
+    cx: Context,
+    d: Deployment,
+    local_state: Module,
+    runtime: Module,
+) -> None:
+    observability = d.module("observability", [local_state, runtime])
+    o = cfg.observability
+    config_files = observability.resource(
+        "config_files",
+        ObservabilityConfiguration(
+            scrape_host="tokeirad",
+            scrape_port=cfg.tokeirad.metrics_port,
+            cluster=cx.project_name,
+            deployment=cx.project_name,
+            mimir_remote_write="http://mimir:9009/api/v1/push",
+            loki_push="http://loki:3100/loki/api/v1/push",
+            mimir_http_port=9009,
+            loki_http_port=3100,
+            retention_hours=168,
+        ),
+    )
+    mimir = observability.resource(
+        "mimir",
+        Service(
+            image=o.mimir.image,
+            replicas=o.mimir.replicas,
+            publish=[9009],
+            volumes=[
+                State(sub="mimir", at="/data"),
+                Config(sub="mimir.yaml", at="/etc/mimir/mimir.yaml"),
+                Config(sub="mimir/rules", at="/data/mimir/rules"),
+            ],
+            command=["--config.file=/etc/mimir/mimir.yaml"],
+        ),
+        [config_files],
+    )
+    loki = observability.resource(
+        "loki",
+        Service(
+            image=o.loki.image,
+            replicas=o.loki.replicas,
+            publish=[3100],
+            volumes=[
+                State(sub="loki", at="/loki"),
+                Config(sub="loki.yaml", at="/etc/loki/loki.yaml"),
+            ],
+            command=["--config.file=/etc/loki/loki.yaml"],
+        ),
+        [config_files],
+    )
+    observability.resource(
+        "grafana",
+        Service(
+            image=o.grafana.image,
+            replicas=o.grafana.replicas,
+            publish=[o.grafana.port],
+            volumes=[
+                State(sub="grafana", at="/var/lib/grafana"),
+                Config(sub="grafana/provisioning", at="/etc/grafana/provisioning/"),
+                Config(sub="grafana/dashboards", at="/var/lib/grafana/dashboards/"),
+            ],
+            environment=[
+                Environment(name="GF_METRICS_ENABLED", value="true"),
+            ],
+            depends_on=["mimir", "loki"],
+        ),
+        [config_files, mimir, loki],
+    )
+    observability.resource(
+        "alloy",
+        Service(
+            image=o.alloy.image,
+            replicas=o.alloy.replicas,
+            publish=[4317, 4318],
+            volumes=[
+                DockerSocket(),
+                Config(sub="alloy.alloy", at="/etc/alloy/config.alloy"),
+            ],
+            command=["run", "/etc/alloy/config.alloy"],
+            depends_on=["tokeirad", "mimir", "loki"],
+        ),
+        [config_files, mimir, loki],
+    )

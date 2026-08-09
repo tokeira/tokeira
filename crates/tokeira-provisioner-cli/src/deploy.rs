@@ -1,87 +1,57 @@
-//! `tkp deploy plan|apply` — the workload universe (design §Command behaviour
-//! and outputs).
+//! `tkp deploy plan|apply` — the workload universe.
 //!
-//! The workload verbs are **conditionally realized**: a platform whose workload
-//! rides the infra universe (compose models its tokeirad containers as
-//! infra resources) realizes them as the infra verbs; a platform with no
-//! workload notion answers [`Realization::NotApplicable`], which the shell turns
-//! into a typed non-zero refusal. `deploy apply` follows the same mutating-verb
-//! contract as `infra apply` — gate before any mutation, then a config-revision
-//! advance on success.
+//! The verbs drive the deploy engine over the definition's service plane:
+//! desired manifests hashed against recorded runtime state, reconciled per
+//! service. The plane is empty until the service split realizes `.service(`
+//! nodes, so today the verbs honestly reconcile nothing — and become real
+//! the moment the set fills. `deploy apply` follows the same mutating-verb
+//! contract as `infra apply` — gate before any mutation, then a
+//! config-revision advance on success.
+//!
+//! The service plane has no explanation model yet (that machinery is the
+//! infra plane's); the verbs render the typed service changes directly and
+//! refuse an `--explanation` request rather than mislabel an infra model.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tokeira_provisioner::{ProvenanceStamp, check_binding};
+use tokeira_orchestrator::{ServiceChange, ServiceChangeKind};
+use tokeira_platform::definition::DefinitionFrontend;
+use tokeira_provisioner::ProvenanceStamp;
 
 use crate::{
-    ProvisionerPlatform, Realization,
     apply::restamp_applied_revision,
+    engine::Engine,
     envelope_store,
     gate::{GateOutcome, evaluate_gate},
+    platform::Admitted,
 };
 
-/// Read-only workload plan: binding verdict (annotates, never refuses) + the
-/// workload Delta.
-pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
-    mode: tokeira_report::Mode,
+/// Read-only workload plan: the per-service Delta, by manifest hash against
+/// recorded runtime state.
+pub(crate) async fn deploy_plan<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
+    _mode: tokeira_report::Mode,
     explanation_path: Option<&Path>,
 ) -> Result<()> {
-    let running = ProvenanceStamp::current(Utc::now());
-    let (envelope, _) = envelope_store(deployment_dir)
-        .load()
-        .await
-        .context("failed to load the deployment envelope")?;
-
-    let verdict = check_binding(envelope.binding.as_ref(), &running);
-    // Causality's S is gathered before the plan runs its refresh
-    // (Requirement 2.3) — see the causality module's isolation rule.
-    let gathered = crate::causality::gather_causality(platform, deployment_dir, &envelope).await?;
-    match platform.deploy_plan(deployment_dir).await? {
-        Realization::NotApplicable { reason } => {
-            anyhow::bail!("not applicable: {reason}");
-        }
-        Realization::Realized(outcome) => {
-            let mut explanation = tokeira_explain::explain_plan(
-                crate::explain_context(platform, deployment_dir, &envelope, "deploy plan"),
-                &outcome,
-            );
-            tokeira_explain::apply_causality(
-                &mut explanation,
-                &crate::causality::causality_view(gathered, &outcome),
-            );
-            let report = crate::render::ExplanationReport {
-                initialized: envelope.binding.is_some(),
-                binding: verdict,
-                explanation,
-            };
-            // Artifact before report (Req 7.6): the verb fails before
-            // claiming anything if the requested artifact cannot be written.
-            if let Some(path) = explanation_path {
-                tokeira_explain::artifact::write(path, &report.explanation)?;
-            }
-            crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
-            // Non-zero on a platform issue, like `infra plan` — the document
-            // is the whole report.
-            if !report.explanation.platform_issues.is_empty() {
-                return Err(crate::PlatformBlocked.into());
-            }
-        }
-    }
+    refuse_explanation(explanation_path)?;
+    let changes = engine.deploy_plan(admitted).await?;
+    render_service_changes("deploy plan", &changes);
     Ok(())
 }
 
 /// Reconcile the workload to desired under the mutating-verb contract.
-pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
+pub(crate) async fn deploy_apply<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
     yes: bool,
-    mode: tokeira_report::Mode,
+    _mode: tokeira_report::Mode,
     explanation_path: Option<&Path>,
 ) -> Result<()> {
+    refuse_explanation(explanation_path)?;
+    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, version) = store
@@ -89,105 +59,111 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
         .await
         .context("failed to load the deployment envelope")?;
 
-    // ── Operation-marker gate (task 19.4): an interrupted upgrade/rollback
+    // ── Operation-marker gate: an interrupted upgrade/rollback
     // is recovered by re-running THAT verb; everything else refuses. ──
     crate::marker::refuse_if_marked(&envelope, "deploy apply")?;
 
     // ── Gate before any mutation ──
-    let verdict = match evaluate_gate(envelope.binding.as_ref(), &running) {
+    match evaluate_gate(envelope.binding.as_ref(), &running) {
         GateOutcome::Refuse { verdict, reason } => {
             anyhow::bail!("binding gate refuses `deploy apply` ({verdict:?}): {reason}");
         }
         // Proceeding verdicts are silent: the gate regime is a standing fact
         // of the deployment (describe's story), not news on every verb. Only
         // a refusal earns narration — and it is the error above.
-        GateOutcome::Proceed { verdict, .. } => verdict,
-    };
+        GateOutcome::Proceed { .. } => {}
+    }
 
     // ── Retarget gate: identical contract to `infra apply`. ──
-    crate::retarget_gate(platform, deployment_dir, &envelope).await?;
+    crate::retarget_gate(engine, admitted, &envelope).await?;
 
-    // ── Destructive gate (§4): identical contract to `infra apply`. The
-    // gate's plan doubles as the applied explanation's field evidence
-    // (Property 9: never invented, only reused). ──
-    let preceding = if yes {
-        None
-    } else {
-        match platform.deploy_plan(deployment_dir).await? {
-            Realization::Realized(planned) => {
-                crate::apply::refuse_destructive_without_yes("deploy apply", &planned.changes)?;
-                Some(planned)
+    // ── Destructive gate (§4), plane-correct: a torn-down service is the
+    // destructive class here. ──
+    if !yes {
+        let planned = engine.deploy_plan(admitted).await?;
+        let destructive: Vec<&ServiceChange> = planned
+            .iter()
+            .filter(|change| matches!(change.kind, ServiceChangeKind::Delete))
+            .collect();
+        if !destructive.is_empty() {
+            let mut lines = String::new();
+            for change in &destructive {
+                lines.push_str(&format!("\n  - {}", change.service));
             }
-            Realization::NotApplicable { .. } => None,
+            anyhow::bail!(
+                "deploy apply: refusing — the plan tears down {}:{lines}\nre-run with `--yes` to proceed",
+                tokeira_report::counted(destructive.len(), "service"),
+            );
         }
-    };
+    }
 
-    // ── Workload apply (realized by the injected platform) ──
-    let applied = match platform.deploy_apply(deployment_dir).await? {
-        Realization::NotApplicable { reason } => {
-            anyhow::bail!("not applicable: {reason}");
-        }
-        Realization::Realized(outcome) => outcome,
-    };
-    // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
-    // — the set the rollback B-delete pass consumes (task 19.3). The
-    // checkpoint consumes the audit vocabulary, not the report identity.
-    envelope.record_post_checkpoint_changes(&crate::change_log_entries(&applied.changes));
+    // ── Service apply, through the deploy engine ──
+    let changes = engine.deploy_apply(admitted).await?;
+    render_service_changes("deploy apply", &changes);
 
     // ── Re-stamp: a workload apply advances the config revision like any apply ──
     let from_revision = envelope.config_revision;
-    let config_source = platform.config_source(deployment_dir)?;
+    let config_source = admitted.config_source();
     restamp_applied_revision(&mut envelope, running, deployment_dir, &config_source)?;
     envelope.stamp_current_schema();
     store
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after deploy apply")?;
-    platform
-        .publish_inspection(deployment_dir)
-        .await
-        .context("deploy apply is committed and recorded; inspection publication failed")?;
-    let mut context = crate::explain_context(platform, deployment_dir, &envelope, "deploy apply");
-    context.current_revision = from_revision;
-    context.proposed_revision = Some(envelope.config_revision);
-    let explanation = tokeira_explain::explain_applied(
-        context,
-        &crate::committed_changes(&applied),
-        preceding.as_ref(),
-    );
-    // Artifact after the state record is safe, before the verb claims
-    // success — same contract as `infra apply` (Req 7.6).
-    crate::config_history::retain_explanation(
-        deployment_dir,
-        envelope.config_revision,
-        &explanation,
-    )
-    .context("the apply is committed and recorded; only explanation retention failed")?;
-    if let Some(path) = explanation_path {
-        tokeira_explain::artifact::write(path, &explanation)
-            .context("the apply is committed and recorded; only the explanation artifact failed")?;
-    }
-    let report = crate::render::ExplanationReport {
-        initialized: true,
-        binding: verdict,
-        explanation,
-    };
-    crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
+    println!("revision {} → {}", from_revision, envelope.config_revision);
     Ok(())
+}
+
+/// The service plane's explanation model arrives with its realizers; until
+/// then the request is refused rather than answered with a mislabeled infra
+/// model.
+fn refuse_explanation(explanation_path: Option<&Path>) -> Result<()> {
+    if explanation_path.is_some() {
+        anyhow::bail!(
+            "the workload verbs carry no explanation model yet; run without `--explanation`"
+        );
+    }
+    Ok(())
+}
+
+/// The typed service Delta, rendered directly: one line per changed
+/// service, and an honest "nothing" when the plane is empty or steady.
+fn render_service_changes(verb: &str, changes: &[ServiceChange]) {
+    let changed: Vec<&ServiceChange> = changes
+        .iter()
+        .filter(|change| !matches!(change.kind, ServiceChangeKind::NoChange))
+        .collect();
+    if changed.is_empty() {
+        println!("{verb}: no service changes (the declared service set is steady)");
+        return;
+    }
+    for change in &changed {
+        let glyph = match change.kind {
+            ServiceChangeKind::Create => "+",
+            ServiceChangeKind::Update => "~",
+            ServiceChangeKind::Delete => "-",
+            ServiceChangeKind::NoChange => unreachable!("filtered above"),
+        };
+        println!("  {glyph} {}", change.service);
+    }
+    println!(
+        "{verb}: {}",
+        tokeira_report::counted(changed.len(), "service change")
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestPlatform;
     use tokeira_provisioner::DeploymentStateEnvelope;
 
     #[tokio::test]
     async fn deploy_apply_refuses_an_unstamped_deployment() {
         let tmp = tempfile::tempdir().unwrap();
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
         let err = deploy_apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             false,
             tokeira_report::Mode::resolve(false, false),
             None,
@@ -212,9 +188,10 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
         deploy_apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             false,
             tokeira_report::Mode::resolve(false, false),
             None,
@@ -224,5 +201,22 @@ mod tests {
 
         let (after, _) = store.load().await.unwrap();
         assert_eq!(after.config_revision, 2, "workload apply is a config apply");
+    }
+
+    // The explanation model belongs to the plane's realizers; until they
+    // arrive the request refuses rather than mislabeling an infra model.
+    #[tokio::test]
+    async fn an_explanation_request_refuses_honestly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = deploy_plan(
+            &engine,
+            &admitted,
+            tokeira_report::Mode::resolve(false, false),
+            Some(std::path::Path::new("/tmp/x.json")),
+        )
+        .await
+        .expect_err("no explanation model on the service plane yet");
+        assert!(err.to_string().contains("no explanation model"), "{err}");
     }
 }

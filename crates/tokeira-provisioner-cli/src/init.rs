@@ -1,13 +1,13 @@
-//! Day-0 mandatory versioning (task 2.2), recording the integrity manifest at
-//! stamp time (task 4.1). Not an operator verb: `tkr deployment create` runs
-//! this as an internal inception step (Req 6.5).
+//! Day-0 mandatory versioning: the first provenance stamp and integrity
+//! manifest are recorded before any resource create. Not an operator verb:
+//! `tkr deployment create` runs this as an internal inception step.
 //!
 //! Versioning is mandatory from Day 0: initialization writes the deployment
 //! envelope's first provenance stamp **before any resource create**, so there is
 //! no create path that leaves state unstamped. After this, every applying verb
 //! finds a recorded binding and the gate can run.
 //!
-//! ## Engine identity vs configuration revision (task 14.1, Req 13)
+//! ## Engine identity vs configuration revision
 //!
 //! The binding's `source_tree_hash` (from `tokeira-build-info`) is the engine /
 //! resource-implementation identity — a digest of the workspace **code**. A
@@ -18,7 +18,8 @@
 //! binding keys only on `source_tree_hash`, while config is tracked by the
 //! separate `config_revision` (see `apply`). (Narrowing the digest to only the
 //! engine crates — versus the whole workspace — is a build-system refinement;
-//! Property 14 holds either way because config is excluded.)
+//! the binding survives config refinement either way, because config is
+//! excluded from the engine identity.)
 
 use std::path::Path;
 
@@ -29,12 +30,10 @@ use tokeira_provisioner::{
     ProvenanceStamp, Target, sha256_hex,
 };
 
-use crate::{ProvisionerPlatform, config_history, envelope_store};
+use crate::{config_history, envelope_store, platform::Admitted};
 
-pub(crate) async fn init<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
-) -> Result<()> {
+pub(crate) async fn init(admitted: &Admitted) -> Result<()> {
+    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (existing, version) = store
@@ -48,7 +47,7 @@ pub(crate) async fn init<P: ProvisionerPlatform>(
         );
     }
 
-    let deployment_id = platform.deployment_id(deployment_dir)?;
+    let deployment_id = admitted.deployment_ref.name.clone();
     let integrity = day_zero_manifest(deployment_dir)?;
 
     let envelope = DeploymentStateEnvelope {
@@ -62,8 +61,8 @@ pub(crate) async fn init<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to write the Day-0 stamp")?;
-    // Retain the Day-0 config source as revision 0 so it is revertable (task 14.3).
-    let config_source = platform.config_source(deployment_dir)?;
+    // Retain the Day-0 config source as revision 0 so it is revertable.
+    let config_source = admitted.config_source();
     config_history::snapshot(deployment_dir, &config_source, 0)
         .context("failed to retain the Day-0 config revision")?;
 
@@ -74,7 +73,7 @@ pub(crate) async fn init<P: ProvisionerPlatform>(
     Ok(())
 }
 
-/// The manifest the Day-0 stamp records (tasks 18.3/19.1): extracted from the
+/// The manifest the Day-0 stamp records: extracted from the
 /// **bundle sidecar** (`tkp.manifest.json` — the full [`ProvisionerBundle`],
 /// whose build provenance `describe` also surfaces) when `tkr deployment
 /// create` placed one next to the deployment's `tkp`, else the pre-identity
@@ -119,15 +118,15 @@ fn day_zero_manifest(deployment_dir: &Path) -> Result<IntegrityManifest> {
     Ok(manifest)
 }
 
-/// Build the integrity manifest for the **running** binary (task 4.1): its
+/// Build the integrity manifest for the **running** binary: its
 /// target triple, SHA-256, and size, with the semver as a human label.
 /// Recorded at stamp time; the launcher verifies a retrieved binary against it
-/// before execution (task 4.2).
+/// before execution.
 ///
 /// A self-stamped native build is a **pre-identity** manifest: it carries no
 /// [`EngineIdentity`](tokeira_provisioner::EngineIdentity) (the closure inputs
-/// exist only once the source snapshot supplies them — task 17) and attests
-/// nothing beyond `LocalDeveloper` authority. The build pipeline (task 18) is
+/// exist only once the source snapshot supplies them) and attests
+/// nothing beyond `LocalDeveloper` authority. The build pipeline is
 /// what records more.
 pub(crate) fn running_integrity_manifest() -> Result<IntegrityManifest> {
     let exe = std::env::current_exe().context("failed to locate the running binary")?;
@@ -148,14 +147,12 @@ pub(crate) fn running_integrity_manifest() -> Result<IntegrityManifest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestPlatform;
 
     #[tokio::test]
     async fn init_stamps_the_envelope_with_binding_and_integrity() {
         let tmp = tempfile::tempdir().unwrap();
-        init(&TestPlatform, tmp.path())
-            .await
-            .expect("init succeeds");
+        let (_engine, admitted) = crate::testkit::engine(tmp.path());
+        init(&admitted).await.expect("init succeeds");
 
         let (env, _) = envelope_store(tmp.path()).load().await.unwrap();
         assert!(env.binding.is_some(), "Day-0 binding recorded");
@@ -181,7 +178,17 @@ mod tests {
                 features: ["provisioner".to_string()].into(),
                 profile: BuildProfile::Dist,
             },
-            bound: None,
+            // Admission (once per command) verifies a placed sidecar before
+            // any verb runs, and requires the bound pair — so the fixture
+            // carries evidence agreeing with the test platform's identity.
+            bound: Some(tokeira_provisioner::BoundProvisionerEvidence {
+                platform: tokeira_orchestrator::PlatformId::new("test").expect("static id"),
+                format: tokeira_orchestrator::DefinitionFormatId::new("tkd").expect("static id"),
+                engine: "0.1.0".into(),
+                generated_root: Sha256Digest::from_bytes(b"root"),
+                source_closure: Sha256Digest::from_bytes(b"src"),
+                lock_closure: Sha256Digest::from_bytes(b"lock"),
+            }),
             authority: BuildAuthority::LocalDeveloper,
             provisioner_version: "0.1.0".into(),
             artifacts: vec![BinaryArtifactDescriptor {
@@ -222,9 +229,8 @@ mod tests {
         )
         .unwrap();
 
-        init(&TestPlatform, tmp.path())
-            .await
-            .expect("init succeeds");
+        let (_engine, admitted) = crate::testkit::engine(tmp.path());
+        init(&admitted).await.expect("init succeeds");
 
         let (env, _) = envelope_store(tmp.path()).load().await.unwrap();
         let recorded = env.integrity.expect("integrity recorded");
@@ -250,14 +256,17 @@ mod tests {
         )
         .unwrap();
 
-        let err = init(&TestPlatform, tmp.path())
-            .await
-            .expect_err("a disagreeing sidecar refuses init");
+        // Admission is the gate now: a sidecar that does not describe the
+        // running binary refuses the command before any verb — init never
+        // runs, nothing is stamped.
+        crate::testkit::write_deployment(tmp.path());
+        let err = crate::testkit::bound_platform()
+            .admit_deployment(tmp.path())
+            .expect_err("a disagreeing sidecar refuses admission");
         assert!(
-            err.to_string().contains("not an artifact"),
+            err.to_string().contains("disagrees with its placed bundle"),
             "unexpected: {err}"
         );
-        // Nothing was stamped.
         let (env, _) = envelope_store(tmp.path()).load().await.unwrap();
         assert!(env.binding.is_none());
     }
@@ -265,25 +274,23 @@ mod tests {
     #[tokio::test]
     async fn init_refuses_an_already_initialized_deployment() {
         let tmp = tempfile::tempdir().unwrap();
-        init(&TestPlatform, tmp.path())
-            .await
-            .expect("first init succeeds");
-        let err = init(&TestPlatform, tmp.path())
-            .await
-            .expect_err("second init refuses");
+        let (_engine, admitted) = crate::testkit::engine(tmp.path());
+        init(&admitted).await.expect("first init succeeds");
+        let err = init(&admitted).await.expect_err("second init refuses");
         assert!(
             err.to_string().contains("already initialized"),
             "unexpected: {err}"
         );
     }
 
-    // Property 14 (task 14.1): configuration refinement (repeated same-engine
+    // Property 14: configuration refinement (repeated same-engine
     // applies) keeps the engine binding — the recorded source_tree_hash is
     // unchanged and the verdict stays proceeding — while config_revision advances.
     #[tokio::test]
     async fn config_refinement_keeps_the_engine_binding_and_advances_revision() {
         let tmp = tempfile::tempdir().unwrap();
-        init(&TestPlatform, tmp.path()).await.expect("init");
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        init(&admitted).await.expect("init");
         let (after_init, _) = envelope_store(tmp.path()).load().await.unwrap();
         let engine_hash = after_init
             .binding
@@ -294,8 +301,8 @@ mod tests {
 
         // Two successive config applies (same binary → same engine).
         crate::apply::apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             None,
             false,
             tokeira_report::Mode::resolve(false, false),
@@ -304,8 +311,8 @@ mod tests {
         .await
         .expect("apply 1");
         crate::apply::apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             None,
             false,
             tokeira_report::Mode::resolve(false, false),
@@ -326,7 +333,7 @@ mod tests {
         );
         assert!(
             after.effective_config_ref.is_some(),
-            "apply records the effective config ref (task 14.2)"
+            "apply records the effective config ref"
         );
     }
 }

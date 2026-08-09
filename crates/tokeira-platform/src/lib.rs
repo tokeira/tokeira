@@ -7,9 +7,9 @@
 //! state-store lifecycle and its existing concrete-store selection seam.
 
 pub mod author;
-pub mod config;
 pub mod content;
 pub mod context;
+pub mod declaration;
 pub mod definition;
 pub mod error;
 pub mod graph;

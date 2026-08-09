@@ -1,4 +1,4 @@
-//! `tkp apply` — apply the deployment, gated on the binding (task 8.3).
+//! `tkp apply` — apply the deployment, gated on the binding.
 //!
 //! The binding gate runs *before* any provider mutation: a versioned deployment
 //! refuses on any non-`Match` verdict; a dev deployment takes the permissive
@@ -12,20 +12,26 @@ use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 use tokeira_report::Mode;
 
+use tokeira_platform::definition::DefinitionFrontend;
+
 use crate::{
-    ProvisionerPlatform, config_history, envelope_store,
+    config_history,
+    engine::Engine,
+    envelope_store,
     gate::{GateOutcome, evaluate_gate},
+    platform::Admitted,
     render::ExplanationReport,
 };
 
-pub(crate) async fn apply<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
+pub(crate) async fn apply<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
     module: Option<&str>,
     yes: bool,
     mode: Mode,
     explanation_path: Option<&Path>,
 ) -> Result<()> {
+    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, version) = store
@@ -33,7 +39,7 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
         .await
         .context("failed to load the deployment envelope")?;
 
-    // ── Operation-marker gate (task 19.4): an interrupted upgrade/rollback
+    // ── Operation-marker gate: an interrupted upgrade/rollback
     // is recovered by re-running THAT verb; everything else refuses. ──
     crate::marker::refuse_if_marked(&envelope, "apply")?;
 
@@ -50,55 +56,53 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
 
     // ── Retarget gate: a `#[create]` change is a new deployment, not an
     // apply — refused absolutely, before even the destructive-plan review. ──
-    crate::retarget_gate(platform, deployment_dir, &envelope).await?;
+    crate::retarget_gate(engine, admitted, &envelope).await?;
 
-    // ── Destructive gate (§4, Proposal 002): the engine classifies, the
+    // ── Destructive gate (§4): the engine classifies, the
     // shell confirms. Skipped under `--yes` — the operator has already
     // reviewed — so the confirmed path pays no extra plan pass. The gate's
     // plan doubles as the applied explanation's field evidence; under
     // `--yes` there is none, and the explanation says so rather than
-    // inventing before-images (Property 9). ──
+    // inventing before-images: field evidence is only ever reused from a
+    // real plan. ──
     let preceding = if yes {
         None
     } else {
-        let planned = platform.infra_plan(deployment_dir, module).await?;
+        let planned = engine.plan(admitted, module).await?;
         refuse_destructive_without_yes("infra apply", &planned.changes)?;
         Some(planned)
     };
 
-    // ── Engine apply (realized by the injected platform) ──
-    // The deployment identity seeds the platform context; it was set at `init`.
+    // ── Engine apply ──
+    // The deployment identity seeds the context; it was set at `init`.
     let project_name = deployment_identity(&envelope.deployment_id);
-    let applied = platform
-        .infra_apply_with_artifacts(deployment_dir, module)
-        .await?;
+    let applied = engine.apply(admitted, module).await?;
     // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
-    // — the set the rollback B-delete pass consumes (task 19.3). The
+    // — the set the rollback B-delete pass consumes. The
     // checkpoint consumes the audit vocabulary, not the report identity.
     envelope.record_post_checkpoint_changes(&crate::change_log_entries(&applied.changes));
+    // The definitive story first: resolved writeback lands in tokeirad.toml
+    // before the re-stamp, so the retained revision snapshots the
+    // post-writeback document.
+    crate::persist_writeback(deployment_dir, &applied.writeback)?;
 
     // ── Re-stamp the envelope ──
     // A config apply keeps the engine identity and advances the config revision
-    // (task 14.2): record the effective config ref and bump `config_revision`.
+    //: record the effective config ref and bump `config_revision`.
     if envelope.deployment_id.is_empty() {
         envelope.deployment_id = project_name;
     }
     // The advance the report states: the revision the verb started from and
-    // the one the re-stamp commits (operator-explanation Req 1 —
-    // `proposed_revision` is `current + 1` for a mutating verb).
+    // the one the re-stamp commits.
     let from_revision = envelope.config_revision;
-    let config_source = platform.config_source(deployment_dir)?;
+    let config_source = admitted.config_source();
     restamp_applied_revision(&mut envelope, running, deployment_dir, &config_source)?;
     envelope.stamp_current_schema();
     store
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after apply")?;
-    platform
-        .publish_inspection(deployment_dir)
-        .await
-        .context("apply is committed and recorded; inspection publication failed")?;
-    let mut context = crate::explain_context(platform, deployment_dir, &envelope, "infra apply");
+    let mut context = crate::explain_context(engine, admitted, &envelope, "infra apply");
     context.current_revision = from_revision;
     context.proposed_revision = Some(envelope.config_revision);
     let explanation = tokeira_explain::explain_applied(
@@ -107,7 +111,7 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
         preceding.as_ref(),
     );
     // The artifact is written only after the state record is safe: a failed
-    // write must fail the verb (Req 7.6) without ever costing the envelope
+    // write must fail the verb without ever costing the envelope
     // its revision advance. The context states the one fact the operator
     // must not misread — the apply itself is committed and recorded.
     config_history::retain_explanation(deployment_dir, envelope.config_revision, &explanation)
@@ -154,7 +158,7 @@ pub(crate) fn refuse_destructive_without_yes(
 
 /// Advance the envelope to a new applied config revision: re-stamp the binding,
 /// bump `config_revision`, record the effective-config ref, and retain the
-/// revision's config source (task 14.2/14.3). Shared by every verb that applies
+/// revision's config source. Shared by every verb that applies
 /// configuration (`apply`, `deploy apply`, `scale`); the caller persists.
 pub(crate) fn restamp_applied_revision(
     envelope: &mut tokeira_provisioner::DeploymentStateEnvelope,
@@ -182,7 +186,7 @@ pub(crate) fn deployment_identity(recorded: &str) -> String {
 
 /// A content ref for the effective configuration — a SHA-256 of the deployment's
 /// recorded config source (format plus safe deployment-relative path), so a given config revision
-/// is identifiable (and revertable to; task 14.3). Absent config falls back to
+/// is identifiable (and revertable to). Absent config falls back to
 /// `"default"`.
 pub(crate) fn config_ref(deployment_dir: &Path, config_source: &crate::ConfigSource) -> String {
     let config_file = config_history::config_file(deployment_dir, config_source);
@@ -195,90 +199,10 @@ pub(crate) fn config_ref(deployment_dir: &Path, config_source: &crate::ConfigSou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProvisionerPlatform, TestPlatform};
     use tokeira_provisioner::DeploymentStateEnvelope;
 
-    struct RetargetRefusingPlatform;
-
-    impl ProvisionerPlatform for RetargetRefusingPlatform {
-        fn label(&self, _deployment_dir: &Path) -> &'static str {
-            "test"
-        }
-
-        fn config_source(&self, _deployment_dir: &Path) -> Result<crate::ConfigSource> {
-            crate::ConfigSource::legacy("deployment.toml")
-        }
-
-        fn deployment_id(&self, _deployment_dir: &Path) -> Result<String> {
-            Ok("tokeira".into())
-        }
-
-        async fn retarget_check(
-            &self,
-            _deployment_dir: &Path,
-            _prior_source: &str,
-            _current_source: &str,
-        ) -> Result<crate::Realization<()>> {
-            anyhow::bail!("retarget refused — `Config.storage` is create-time-immutable")
-        }
-
-        async fn infra_plan(
-            &self,
-            _deployment_dir: &Path,
-            _module: Option<&str>,
-        ) -> Result<crate::PlanOutcome> {
-            unreachable!("the retarget gate refuses before any plan")
-        }
-
-        async fn infra_apply(
-            &self,
-            _deployment_dir: &Path,
-            _module: Option<&str>,
-        ) -> Result<crate::AppliedOutcome> {
-            unreachable!("the retarget gate refuses before any mutation")
-        }
-
-        async fn infra_destroy(
-            &self,
-            _deployment_dir: &Path,
-            _module: Option<&str>,
-        ) -> Result<usize> {
-            unreachable!()
-        }
-
-        async fn infra_destroy_selected(
-            &self,
-            _deployment_dir: &Path,
-            _ids: &[String],
-        ) -> Result<Vec<tokeira_provisioner::ChangeLogEntry>> {
-            unreachable!()
-        }
-
-        async fn deploy_plan(
-            &self,
-            _deployment_dir: &Path,
-        ) -> Result<crate::Realization<crate::PlanOutcome>> {
-            unreachable!()
-        }
-
-        async fn deploy_apply(
-            &self,
-            _deployment_dir: &Path,
-        ) -> Result<crate::Realization<crate::AppliedOutcome>> {
-            unreachable!()
-        }
-
-        async fn scale(
-            &self,
-            _deployment_dir: &Path,
-            _specs: &[String],
-        ) -> Result<crate::Realization<usize>> {
-            unreachable!()
-        }
-    }
-
     #[tokio::test]
-    async fn a_retained_revision_and_a_refusing_platform_stop_apply_before_mutation() {
+    async fn a_retained_revision_and_a_refusing_frontend_stop_apply_before_mutation() {
         let tmp = tempfile::tempdir().unwrap();
         let store = envelope_store(tmp.path());
         let env = DeploymentStateEnvelope {
@@ -289,18 +213,21 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        // Retain revision 1 so the gate has a prior to compare against.
-        let source = crate::ConfigSource::legacy("deployment.toml").unwrap();
-        std::fs::write(
-            tmp.path().join("deployment.toml"),
-            "project_name = \"one\"\n",
-        )
-        .unwrap();
+        let (engine, admitted) = crate::testkit::engine_over(
+            tmp.path(),
+            crate::testkit::FixedProbe(None),
+            crate::testkit::StubFrontend::refusing_retarget(vec![
+                "Config.storage: dsql -> in-memory".to_string(),
+            ]),
+        );
+        // Retain revision 1 so the gate has a prior to compare against —
+        // keyed by the recorded source the admitted metadata names.
+        let source = admitted.config_source();
         config_history::snapshot(tmp.path(), &source, 1).unwrap();
 
         let err = apply(
-            &RetargetRefusingPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             None,
             false,
             Mode::resolve(false, false),
@@ -315,80 +242,6 @@ mod tests {
         assert_eq!(after.config_revision, 1, "no revision advance on refusal");
     }
 
-    struct FailingInspectionPlatform;
-
-    impl ProvisionerPlatform for FailingInspectionPlatform {
-        fn label(&self, _deployment_dir: &Path) -> &'static str {
-            "test"
-        }
-
-        fn config_source(&self, _deployment_dir: &Path) -> Result<crate::ConfigSource> {
-            crate::ConfigSource::legacy("deployment.toml")
-        }
-
-        fn deployment_id(&self, _deployment_dir: &Path) -> Result<String> {
-            Ok("tokeira".into())
-        }
-
-        async fn infra_plan(
-            &self,
-            _deployment_dir: &Path,
-            _module: Option<&str>,
-        ) -> Result<crate::PlanOutcome> {
-            Ok(crate::PlanOutcome::default())
-        }
-
-        async fn infra_apply(
-            &self,
-            _deployment_dir: &Path,
-            _module: Option<&str>,
-        ) -> Result<crate::AppliedOutcome> {
-            Ok(crate::AppliedOutcome::default())
-        }
-
-        async fn publish_inspection(&self, _deployment_dir: &Path) -> Result<usize> {
-            anyhow::bail!("injected inspection failure")
-        }
-
-        async fn infra_destroy(
-            &self,
-            _deployment_dir: &Path,
-            _module: Option<&str>,
-        ) -> Result<usize> {
-            Ok(0)
-        }
-
-        async fn infra_destroy_selected(
-            &self,
-            _deployment_dir: &Path,
-            _ids: &[String],
-        ) -> Result<Vec<tokeira_provisioner::ChangeLogEntry>> {
-            Ok(Vec::new())
-        }
-
-        async fn deploy_plan(
-            &self,
-            _deployment_dir: &Path,
-        ) -> Result<crate::Realization<crate::PlanOutcome>> {
-            Ok(crate::Realization::NotApplicable { reason: "test" })
-        }
-
-        async fn deploy_apply(
-            &self,
-            _deployment_dir: &Path,
-        ) -> Result<crate::Realization<crate::AppliedOutcome>> {
-            Ok(crate::Realization::NotApplicable { reason: "test" })
-        }
-
-        async fn scale(
-            &self,
-            _deployment_dir: &Path,
-            _specs: &[String],
-        ) -> Result<crate::Realization<usize>> {
-            Ok(crate::Realization::NotApplicable { reason: "test" })
-        }
-    }
-
     // Task 19.4: while an upgrade/rollback marker is open, `apply` refuses —
     // recovery goes through the interrupted verb, never around it.
     #[tokio::test]
@@ -397,6 +250,7 @@ mod tests {
         use tokeira_provisioner::ProvenanceStamp;
 
         let tmp = tempfile::tempdir().unwrap();
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
         let store = crate::envelope_store(tmp.path());
         // A dev binding that would otherwise DevIterate straight through.
         let running = ProvenanceStamp::current(Utc::now());
@@ -409,8 +263,8 @@ mod tests {
         store.save(&env, &v).await.unwrap();
 
         let err = apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             None,
             false,
             Mode::resolve(false, false),
@@ -421,7 +275,7 @@ mod tests {
         assert!(err.to_string().contains("in flight"), "unexpected: {err}");
     }
 
-    // §4/Proposal 002: the engine classifies destructive changes; the shell
+    // §4: the engine classifies destructive changes; the shell
     // refuses them without `--yes`, naming the evidence and the remedy.
     #[test]
     fn destructive_plans_refuse_without_yes() {
@@ -459,9 +313,10 @@ mod tests {
         // stamping happens at `create`, so an unstamped deployment at apply time
         // is unverifiable).
         let tmp = tempfile::tempdir().unwrap();
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
         let err = apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             None,
             false,
             Mode::resolve(false, false),
@@ -475,14 +330,15 @@ mod tests {
         );
     }
 
-    // Req 7.1 on the apply side: the artifact is the applied explanation,
+    // The artifact is the applied explanation,
     // revision advance recorded as the field policy states it (current = the
     // revision the verb started from, proposed = the one it committed),
     // field evidence from the gate's own plan pass (never invented —
-    // Property 9).
+    // never invented from state.
     #[tokio::test]
     async fn apply_writes_the_applied_explanation_artifact() {
         let tmp = tempfile::tempdir().unwrap();
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
         let store = envelope_store(tmp.path());
         let env = DeploymentStateEnvelope {
             binding: Some(ProvenanceStamp::current(Utc::now())),
@@ -494,8 +350,8 @@ mod tests {
 
         let path = tmp.path().join("explanation.json");
         apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             None,
             false,
             Mode::resolve(false, false),
@@ -525,12 +381,13 @@ mod tests {
         assert_eq!(retained, model);
     }
 
-    // Req 7.6 without state damage: a failed artifact write fails the verb,
+    // A failed artifact write fails the verb without state damage:
     // but the apply's record — the revision advance — is already safe. The
     // artifact must never cost the envelope its commit.
     #[tokio::test]
     async fn a_failed_artifact_write_fails_the_verb_but_keeps_the_record() {
         let tmp = tempfile::tempdir().unwrap();
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
         let store = envelope_store(tmp.path());
         let env = DeploymentStateEnvelope {
             binding: Some(ProvenanceStamp::current(Utc::now())),
@@ -542,8 +399,8 @@ mod tests {
 
         let path = tmp.path().join("no-such-dir").join("explanation.json");
         let err = apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             None,
             false,
             Mode::resolve(false, false),
@@ -565,38 +422,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspection_failure_is_reported_after_the_apply_record_commits() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = envelope_store(tmp.path());
-        let env = DeploymentStateEnvelope {
-            binding: Some(ProvenanceStamp::current(Utc::now())),
-            config_revision: 4,
-            ..Default::default()
-        };
-        let (_, version) = store.load().await.unwrap();
-        store.save(&env, &version).await.unwrap();
-
-        let error = apply(
-            &FailingInspectionPlatform,
-            tmp.path(),
-            None,
-            false,
-            Mode::resolve(false, false),
-            None,
-        )
-        .await
-        .expect_err("inspection failure is surfaced");
-        let message = format!("{error:#}");
-        assert!(message.contains("apply is committed and recorded"));
-        assert!(message.contains("injected inspection failure"));
-
-        let (after, _) = store.load().await.unwrap();
-        assert_eq!(after.config_revision, 5);
-    }
-
-    #[tokio::test]
     async fn apply_proceeds_on_dev_iterate_and_restamps() {
         let tmp = tempfile::tempdir().unwrap();
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
         let store = envelope_store(tmp.path());
 
         // Pre-stamp (simulating `create`) with the running dev identity. Dev +
@@ -611,8 +439,8 @@ mod tests {
         store.save(&env, &v).await.unwrap();
 
         apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             None,
             false,
             Mode::resolve(false, false),

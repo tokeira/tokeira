@@ -1,31 +1,31 @@
-//! `tkp scale <dim>=<n> …` — change workload capacity (design §Command
-//! behaviour and outputs): fold the specs into a config revision, then a
-//! workload apply.
+//! `tkp scale <dim>=<n> …` — change workload capacity: the platform's ops surface realizes the change,
+//! then the shell folds it into a config revision.
 //!
-//! Conditionally realized: neither current platform has a scale dimension, so
-//! both answer [`Realization::NotApplicable`] and the shell refuses with a
-//! typed non-zero exit **before any mutation**. When a platform (ECS) realizes
-//! scaling, the realized path advances the config revision under the same
-//! mutating-verb contract as every apply.
-
-use std::path::Path;
+//! Conditionally realized through presence: a platform without an ops
+//! surface refuses with a typed non-zero exit **before any mutation** —
+//! after the binding and retarget gates, so the gate ordering stays
+//! observable — and a provider whose ops surface has no scale dimension
+//! states its own refusal as the error, in its own words.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use tokeira_platform::definition::DefinitionFrontend;
 use tokeira_provisioner::ProvenanceStamp;
 
 use crate::{
-    ProvisionerPlatform, Realization,
     apply::restamp_applied_revision,
+    engine::Engine,
     envelope_store,
     gate::{GateOutcome, evaluate_gate},
+    platform::Admitted,
 };
 
-pub(crate) async fn scale<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
+pub(crate) async fn scale<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
     specs: &[String],
 ) -> Result<()> {
+    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, version) = store
@@ -33,7 +33,7 @@ pub(crate) async fn scale<P: ProvisionerPlatform>(
         .await
         .context("failed to load the deployment envelope")?;
 
-    // ── Operation-marker gate (task 19.4): an interrupted upgrade/rollback
+    // ── Operation-marker gate: an interrupted upgrade/rollback
     // is recovered by re-running THAT verb; everything else refuses. ──
     crate::marker::refuse_if_marked(&envelope, "scale")?;
 
@@ -49,25 +49,23 @@ pub(crate) async fn scale<P: ProvisionerPlatform>(
     }
 
     // ── Retarget gate: a capacity change is a config apply, gated the same. ──
-    crate::retarget_gate(platform, deployment_dir, &envelope).await?;
+    crate::retarget_gate(engine, admitted, &envelope).await?;
 
-    // ── Capacity change (realized by the injected platform) ──
-    let change_count = match platform.scale(deployment_dir, specs).await? {
-        Realization::NotApplicable { reason } => {
-            anyhow::bail!("not applicable: {reason}");
-        }
-        Realization::Realized(count) => count,
+    // ── Capacity change, through the platform's ops surface ──
+    let Some(ops) = engine.platform().ops() else {
+        anyhow::bail!("not applicable: this platform declares no ops surface");
     };
+    let change_count = ops.scale(&admitted.deployment_ref, specs).await?;
     println!(
         "[{}] scale {}: {}",
-        platform.label(deployment_dir),
+        engine.platform().id(),
         specs.join(" "),
         tokeira_report::counted(change_count, "change")
     );
 
     // ── Re-stamp: a capacity change is a config revision ──
     let from_revision = envelope.config_revision;
-    let config_source = platform.config_source(deployment_dir)?;
+    let config_source = admitted.config_source();
     restamp_applied_revision(&mut envelope, running, deployment_dir, &config_source)?;
     envelope.stamp_current_schema();
     store
@@ -81,7 +79,6 @@ pub(crate) async fn scale<P: ProvisionerPlatform>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestPlatform;
     use tokeira_provisioner::DeploymentStateEnvelope;
 
     #[tokio::test]
@@ -96,9 +93,10 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = scale(&TestPlatform, tmp.path(), &["web=3".to_string()])
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = scale(&engine, &admitted, &["web=3".to_string()])
             .await
-            .expect_err("no scale dimension → typed refusal");
+            .expect_err("no ops surface → typed refusal");
         assert!(
             err.to_string().contains("not applicable"),
             "unexpected: {err}"
@@ -111,10 +109,11 @@ mod tests {
 
     #[tokio::test]
     async fn scale_gates_before_capability() {
-        // An unstamped deployment refuses at the gate, before the platform's
-        // capability answer is even consulted.
+        // An unstamped deployment refuses at the gate, before the ops
+        // surface is even consulted.
         let tmp = tempfile::tempdir().unwrap();
-        let err = scale(&TestPlatform, tmp.path(), &["web=3".to_string()])
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = scale(&engine, &admitted, &["web=3".to_string()])
             .await
             .expect_err("unstamped refuses at the gate");
         assert!(

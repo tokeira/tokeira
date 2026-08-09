@@ -26,6 +26,7 @@ tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
 tokeira-state = { path = "../../crates/tokeira-state" }
 
 [dev-dependencies]
+tokeira-observability = { workspace = true }
 proptest = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 toml = "0.8"

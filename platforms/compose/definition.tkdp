@@ -70,8 +70,18 @@ class Observability:
 
 
 @dataclass
+class Aws:
+    # The aws provider's deployment-level attributes: the deployed context,
+    # materialized under the provider's namespace. Resource-attached
+    # attributes take precedence by the provider's own rule. Create-time,
+    # like storage — enforced when tkdp's admission surface lands.
+    region: str
+
+
+@dataclass
 class Compose:
     storage: InMemory | Dsql
+    aws: Aws
     tokeirad: Tokeirad
     observability: Observability
 
@@ -102,6 +112,7 @@ class Environment:
 def config() -> Compose:
     return Compose(
         storage=InMemory(),
+        aws=Aws(region="eu-west-2"),
         tokeirad=Tokeirad(
             image="tokeirad:latest",
             replicas=1,

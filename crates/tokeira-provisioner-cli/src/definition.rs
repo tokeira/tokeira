@@ -10,7 +10,9 @@ use anyhow::Result;
 use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_report::{Depth, Mode, Report};
 
-use crate::{ProvisionerPlatform, Realization};
+use tokeira_platform::definition::DefinitionFrontend;
+
+use crate::{engine::Engine, platform::Admitted};
 
 /// One definition, one verdict, the located error when it does not verify.
 /// `deployment` is the check's context — present when checking a deployment's
@@ -75,9 +77,9 @@ impl Report for CheckReport {
     }
 }
 
-pub(crate) async fn check<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
+pub(crate) async fn check<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: Option<&Admitted>,
     source: Option<&Path>,
     requested_format: Option<&DefinitionFormatId>,
     mode: Mode,
@@ -86,44 +88,46 @@ pub(crate) async fn check<P: ProvisionerPlatform>(
         anyhow::bail!("standalone definition checking requires `--format <id>`");
     }
     if let Some(requested) = requested_format {
-        let supported = platform.definition_format().ok_or_else(|| {
-            anyhow::anyhow!("this provisioner has no interpreted definition frontend")
-        })?;
-        if requested.as_str() != supported {
+        let supported = engine.platform().format();
+        if requested != supported {
             anyhow::bail!(
                 "definition format `{requested}` does not match this provisioner's `{supported}` frontend"
             );
         }
     }
-    // A failed check IS the report: catch the platform's located error rather
-    // than crashing through anyhow (which would double-print and break the
-    // `--json`-stdout-purity rule).
-    let error = match platform.definition_check(deployment_dir, source).await {
-        Ok(Realization::Realized(())) => None,
-        Ok(Realization::NotApplicable { reason }) => {
-            anyhow::bail!("not applicable: {reason}");
+    // A failed check IS the report: catch the located error rather than
+    // crashing through anyhow (which would double-print and break the
+    // `--json`-stdout-purity rule). Deployment mode runs the whole pure
+    // pipeline (evaluate, verify, realize); authoring mode has no placement
+    // facts, so it evaluates and verifies the structure alone.
+    let checked: Result<()> = match source {
+        Some(path) => engine.evaluate_authoring(path).and_then(|evaluated| {
+            tokeira_platform::definition::verify_definition(&evaluated)
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        }),
+        None => {
+            let admitted = admitted.expect("deployment-mode check admits its deployment");
+            engine.execution(admitted, None).map(|_| ())
         }
-        Err(e) => Some(format!("{e:#}")),
     };
+    let error = checked.err().map(|e| format!("{e:#}"));
     // Authoring mode (`source`) names the path and no deployment; deployment
     // mode names the deployment, its definition basename, and the revision
     // anchor (read tolerantly — the check's subject is the definition, so an
     // unreadable envelope drops the fact rather than failing the verb).
-    let (deployment, definition, revision) = match source {
-        Some(path) => (None, path.display().to_string(), None),
-        None => (
-            platform.deployment_id(deployment_dir).ok(),
-            platform
-                .config_source(deployment_dir)?
-                .path
-                .as_str()
-                .to_string(),
-            crate::envelope_store(deployment_dir)
+    let (deployment, definition, revision) = match (source, admitted) {
+        (Some(path), _) => (None, path.display().to_string(), None),
+        (None, Some(admitted)) => (
+            Some(admitted.deployment_ref.name.clone()),
+            admitted.config_source().path.as_str().to_string(),
+            crate::envelope_store(&admitted.deployment_ref.dir)
                 .load()
                 .await
                 .ok()
                 .map(|(envelope, _)| envelope.config_revision),
         ),
+        (None, None) => unreachable!("deployment-mode check admits its deployment"),
     };
     let report = CheckReport {
         deployment,
@@ -144,20 +148,16 @@ pub(crate) async fn check<P: ProvisionerPlatform>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestPlatform;
 
-    // The default platform (no interpreted definition) refuses in the typed
-    // NotApplicable shape, matching every other conditionally-realized verb.
+    // A bound platform always interprets: the deployment-mode check runs
+    // the whole pure pipeline over the recorded definition and verifies.
     #[tokio::test]
-    async fn platforms_without_a_definition_refuse_as_not_applicable() {
+    async fn a_bound_platform_checks_its_recorded_definition() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = check(&TestPlatform, tmp.path(), None, None, Mode::default())
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        check(&engine, Some(&admitted), None, None, Mode::default())
             .await
-            .expect_err("no interpreted definition");
-        assert!(
-            err.to_string().contains("not applicable"),
-            "unexpected: {err}"
-        );
+            .expect("the stub world verifies");
     }
 
     // The verifying case renders under the output contract in both forms.

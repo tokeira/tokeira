@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, fmt::Debug};
 
-use crate::{author::LocatedValue, content::ContentIdentity, error::KindError};
+use crate::{content::ContentIdentity, error::KindError};
 
 /// Logical placement supplied to a provider kind exactly once at execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,30 +50,33 @@ pub trait ProviderKind: Debug + Send + Sync {
     ) -> Result<Box<dyn tokeira_iac::Resource>, KindError>;
 }
 
-/// Compile-time constructor functions supplied by one concrete platform.
-#[derive(Debug)]
-pub struct KindFunctions<K> {
-    /// Complete author-visible kind names — the single inventory a frontend
-    /// may enumerate (a definition edited within one engine version can adopt
-    /// any kind the engine ships, so no frontend curates below this set).
-    /// The platform backs `contains` with the same slice; a platform test
-    /// asserts the two agree.
-    pub names: &'static [&'static str],
-    /// Test whether an author-visible name belongs to the platform's closed first-party set.
-    pub contains: fn(&str) -> bool,
-    /// Return provider-owned defaults for `<Kind>::EMPTY`.
-    pub defaults: fn(&str) -> Option<LocatedValue>,
-    /// Decode one named kind into the platform's concrete kind enum.
-    pub decode: fn(&str, LocatedValue) -> Result<K, KindError>,
-}
+/// The vocabulary's decode product: a realizable kind behind the one
+/// object-safe contract.
+pub type DecodedKind = Box<dyn ProviderKind>;
 
-// Manual impls: the struct is function pointers and a static slice, so it is
-// unconditionally copyable — the derive would demand `K: Copy`, which no
-// concrete kind enum satisfies or should.
-impl<K> Clone for KindFunctions<K> {
-    fn clone(&self) -> Self {
-        *self
+// Boxed kinds flow through graphs and realization, which are generic over
+// `K: ProviderKind` — the box must speak the contract itself.
+impl ProviderKind for Box<dyn ProviderKind> {
+    fn kind_name(&self) -> &'static str {
+        self.as_ref().kind_name()
+    }
+
+    fn validate_input(&self) -> Result<(), KindError> {
+        self.as_ref().validate_input()
+    }
+
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        self.as_ref().declared_outputs()
+    }
+
+    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
+        self.as_ref().desired_manifest(placement)
+    }
+
+    fn realize(
+        &self,
+        placement: &PlacementContext,
+    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
+        self.as_ref().realize(placement)
     }
 }
-
-impl<K> Copy for KindFunctions<K> {}

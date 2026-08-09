@@ -1,0 +1,120 @@
+# The Compose deployment definition, Python form. The selected frontend
+# evaluates this source into one transient structural graph and one typed
+# Compose configuration — the logical equal of definition.tkd.
+#
+# Imports name the crates they come from — provenance is visible in the
+# source. `platform` is the conventional part carrying the platform's own
+# configuration model; `observability` is an ordinary part.
+
+from tokeira_aws import DsqlCluster, DynamoDbTable
+from tokeira_platform import Context, Deployment
+from tokeira_provisioner import LocalStateDir, ServerConfig, Service
+
+import observability
+
+from platform import (
+    Aws,
+    Backend,
+    Compose,
+    Dsql,
+    Grafana,
+    InMemory,
+    Observability,
+    Tokeirad,
+)
+
+
+def config() -> Compose:
+    return Compose(
+        storage=InMemory(),
+        aws=Aws(region="eu-west-2"),
+        tokeirad=Tokeirad(
+            image="tokeirad:latest",
+            replicas=1,
+            grpc_port=7233,
+            metrics_port=9090,
+        ),
+        observability=Observability(
+            mimir=Backend(image="grafana/mimir:3.0.6", replicas=1),
+            loki=Backend(image="grafana/loki:3.7.1", replicas=1),
+            grafana=Grafana(
+                image="grafana/grafana-oss:12.4.3",
+                replicas=1,
+                port=3000,
+            ),
+            alloy=Backend(image="grafana/alloy:v1.16.0", replicas=1),
+        ),
+    )
+
+
+def deployment(cfg: Compose, cx: Context) -> Deployment:
+    d = Deployment(["default"])
+
+    local_state = d.module("local_state")
+    local_state.resource("dir", LocalStateDir())
+
+    aws_region = None
+    match cfg.storage:
+        case Dsql(region=region, mode=mode, endpoint=endpoint, arn=arn):
+            aws_region = region
+            dsql = d.module("dsql", [local_state])
+            cluster = dsql.resource(
+                "cluster",
+                DsqlCluster(
+                    identity=cx.project_name + "-compose",
+                    region=region,
+                    mode=mode,
+                    endpoint=endpoint,
+                    arn=arn,
+                ),
+            )
+            rate_limiter = dsql.resource(
+                "rate_limiter",
+                DynamoDbTable(
+                    table=cx.project_name + "-dsql-rate-limiter",
+                    region=region,
+                    hash_key="pk",
+                    ttl="ttl_epoch",
+                ),
+            )
+            conn_lease = dsql.resource(
+                "conn_lease",
+                DynamoDbTable(
+                    table=cx.project_name + "-dsql-conn-lease",
+                    region=region,
+                    hash_key="pk",
+                    ttl="ttl_epoch",
+                ),
+            )
+
+            d.writeback("infrastructure.storage", "dsql")
+            d.writeback(
+                "infrastructure.dsql.endpoint", cluster.output("cluster_endpoint")
+            )
+            d.writeback("infrastructure.dsql.region", region)
+            d.writeback(
+                "infrastructure.dsql.rate_limiter_table",
+                rate_limiter.output("table_name"),
+            )
+            d.writeback(
+                "infrastructure.dsql.conn_lease_table",
+                conn_lease.output("table_name"),
+            )
+        case InMemory():
+            pass
+
+    runtime = d.module("runtime", [local_state])
+    server_config = runtime.resource("server_config", ServerConfig())
+    runtime.resource(
+        "tokeirad",
+        Service(
+            image=cfg.tokeirad.image,
+            replicas=cfg.tokeirad.replicas,
+            publish=[cfg.tokeirad.grpc_port, cfg.tokeirad.metrics_port],
+            aws_region=aws_region,
+        ),
+        [server_config],
+    )
+    observability.define(cfg, cx, d, local_state, runtime)
+
+    return d

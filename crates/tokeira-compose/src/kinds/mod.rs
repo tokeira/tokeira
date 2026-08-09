@@ -1,10 +1,10 @@
 //! The Compose provider's complete kind export.
 //!
-//! Every authorable Docker/local capability of this provider appears in
-//! [`KIND_NAMES`] and decodes through [`decode`]. The engine kind library
-//! aggregates provider exports verbatim — no platform curates below this
-//! set, so a definition edited within one engine version can adopt any kind
-//! the provider ships.
+//! Every authorable Docker/local capability of this provider is a typed
+//! kind selected by type: platforms take the set by value through [`set`]
+//! at their entry point. Platform-owned kinds (the observability
+//! configuration bundle) live with their platforms and join the vocabulary
+//! as the platform's own selections.
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -12,12 +12,11 @@ use crate::ComposeService;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokeira_platform::{
-    author::{LocatedValue, ValueShape, from_located_value},
+    author::{LocatedValue, ValueShape},
+    declaration::{AuthorableKind, KindSet, kind},
     error::KindError,
     kind::{PlacementContext, ProviderKind},
 };
-
-use crate::observability::ObservabilityConfiguration;
 
 /// One environment entry without tuple-shaped author data.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -161,7 +160,7 @@ impl Service {
             }
         }
 
-        let config_id = crate::observability::configuration_resource_id();
+        let config_id = crate::config_content_resource_id();
         if self
             .volumes
             .iter()
@@ -690,89 +689,32 @@ fn local_marker_semantics(
     }
 }
 
-/// The Compose provider's closed kind set.
-#[derive(Debug)]
-pub enum ComposeKind {
-    /// Deployment-local state root.
-    LocalStateDir(LocalStateDir),
-    /// Generated observability configuration.
-    ObservabilityConfiguration(ObservabilityConfiguration),
-    /// The deployment's server configuration (`tokeirad.toml`).
-    ServerConfig(ServerConfig),
-    /// Docker Compose service.
-    Service(Service),
+impl AuthorableKind for LocalStateDir {
+    const NAME: &'static str = "LocalStateDir";
 }
 
-macro_rules! delegate_kind {
-    ($self:ident, $method:ident $(, $argument:expr)?) => {
-        match $self {
-            Self::LocalStateDir(kind) => kind.$method($($argument)?),
-            Self::ObservabilityConfiguration(kind) => kind.$method($($argument)?),
-            Self::ServerConfig(kind) => kind.$method($($argument)?),
-            Self::Service(kind) => kind.$method($($argument)?),
-        }
-    };
+impl AuthorableKind for ServerConfig {
+    const NAME: &'static str = "ServerConfig";
 }
 
-impl ProviderKind for ComposeKind {
-    fn kind_name(&self) -> &'static str {
-        delegate_kind!(self, kind_name)
-    }
+impl AuthorableKind for Service {
+    const NAME: &'static str = "Service";
 
-    fn validate_input(&self) -> Result<(), KindError> {
-        delegate_kind!(self, validate_input)
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        delegate_kind!(self, declared_outputs)
-    }
-
-    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
-        delegate_kind!(self, desired_manifest, placement)
-    }
-
-    fn realize(
-        &self,
-        placement: &PlacementContext,
-    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
-        delegate_kind!(self, realize, placement)
+    fn defaults() -> Option<LocatedValue> {
+        Some(service_defaults())
     }
 }
 
-/// Complete author-visible Compose-provider kind names, in stable order.
-pub const KIND_NAMES: &[&str] = &[
-    "LocalStateDir",
-    "ObservabilityConfiguration",
-    "ServerConfig",
-    "Service",
-];
-
-/// Provider-owned `<Kind>::EMPTY` defaults.
-pub fn defaults(name: &str) -> Option<LocatedValue> {
-    (name == "Service").then(service_defaults)
-}
-
-/// Decode one named Compose-provider kind from a host-free author value.
-pub fn decode(name: &str, value: LocatedValue) -> Result<ComposeKind, KindError> {
-    let range = value.range;
-    macro_rules! decode_as {
-        ($variant:ident, $type:ty) => {
-            from_located_value::<$type>(value)
-                .map(ComposeKind::$variant)
-                .map_err(|error| KindError::new(error.to_string()).at(error.range().or(range)))
-        };
-    }
-    match name {
-        "LocalStateDir" => decode_as!(LocalStateDir, LocalStateDir),
-        "ObservabilityConfiguration" => {
-            decode_as!(ObservabilityConfiguration, ObservabilityConfiguration)
-        }
-        "ServerConfig" => decode_as!(ServerConfig, ServerConfig),
-        "Service" => decode_as!(Service, Service),
-        _ => Err(KindError::new(format!(
-            "unknown Compose-provider kind `{name}`"
-        ))),
-    }
+/// The provider's complete kind library, for the platform declaration.
+pub fn set() -> KindSet {
+    KindSet::new(
+        "compose",
+        vec![
+            kind::<LocalStateDir>(),
+            kind::<ServerConfig>(),
+            kind::<Service>(),
+        ],
+    )
 }
 
 fn service_defaults() -> LocatedValue {
@@ -860,35 +802,35 @@ pub fn inspection_bytes(
 mod kind_inventory_tests {
     use super::*;
 
-    // The inventory is the provider's single kind authority: every listed
-    // name reaches a decode arm (a listed name may fail decode on missing
-    // fields, never as unknown), and unlisted names never decode.
+    // The set is typed: entry names come from the kind types themselves,
+    // each entry decodes its own input shape, and Service carries the EMPTY
+    // defaults for `..Service::EMPTY` merging.
     #[test]
-    fn inventory_matches_decode_arms_exactly() {
-        for name in KIND_NAMES {
-            let probe = decode(
-                name,
-                LocatedValue::new(ValueShape::Struct {
-                    name: (*name).to_string(),
-                    fields: Vec::new(),
-                }),
-            );
+    fn set_is_typed_and_decodes_each_entry() {
+        let set = set();
+        let names: Vec<&str> = set.entries.iter().map(|entry| entry.name).collect();
+        assert_eq!(names, ["LocalStateDir", "ServerConfig", "Service"]);
+        for entry in &set.entries {
+            let probe = (entry.decode)(LocatedValue::new(ValueShape::Struct {
+                name: entry.name.to_string(),
+                fields: Vec::new(),
+            }));
             if let Err(error) = probe {
                 assert!(
                     !error.message.contains("unknown"),
-                    "inventory name `{name}` hit the unknown-kind arm: {}",
+                    "entry `{}` failed as unknown: {}",
+                    entry.name,
                     error.message
                 );
             }
+            if entry.name == "Service" {
+                assert!(
+                    (entry.defaults)().is_some(),
+                    "Service declares EMPTY defaults"
+                );
+            } else {
+                assert!((entry.defaults)().is_none());
+            }
         }
-        let unknown = decode(
-            "NotAComposeKind",
-            LocatedValue::new(ValueShape::Struct {
-                name: "NotAComposeKind".to_string(),
-                fields: Vec::new(),
-            }),
-        )
-        .expect_err("unknown kind must not decode");
-        assert!(unknown.message.contains("unknown"));
     }
 }

@@ -1,4 +1,36 @@
-//! Compose-owned observability configuration and dashboards.
+//! The observability configuration bundle: a platform-owned kind.
+//!
+//! Both the content (`observability/` beside the definitions) and this
+//! machinery — parameter substitution, content digests, the managed file
+//! tree, drift detection — are the platform's: the bundle is
+//! Tokeira-opinionated deployment description, not Docker capability, so it
+//! lives with the platform and joins the authoring vocabulary as the
+//! platform's own kind selection ([`kind_set`]). The provider contributes
+//! only the fencing contract: the well-known resource identity
+//! (`tokeira_compose::config_content_resource_id`) its `Service` consumers
+//! key their `TOKEIRA_CONFIG_DIGEST` on.
+//!
+//! Content is loaded at realization from the definition source's own
+//! directory (desired-source companions, staged with the definition). A
+//! retained revision folder therefore renders THAT revision's content, and
+//! a dashboard edit is a plannable change to the deployment, never a code
+//! release.
+//!
+//! Content layout, relative to the definition source directory:
+//!
+//! ```text
+//! observability/
+//!     templates/    alloy.alloy, mimir.yaml, loki.yaml,
+//!                   grafana-datasources.yaml, grafana-dashboards.yaml
+//!     dashboards/   *.json — every file ships as a Grafana dashboard
+//!     alerts/       observability-alerts.yaml
+//! ```
+//!
+//! Templates carry `{{ name }}` placeholders substituted from the kind's
+//! authored parameters. Substitution is strict both ways: a placeholder the
+//! renderer does not know is refused naming the file and the placeholder, so
+//! a content typo surfaces at plan, not as a silently-literal `{{ tpyo }}`
+//! in a running container.
 
 use std::{
     collections::BTreeMap,
@@ -6,7 +38,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use askama::Template;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -14,6 +45,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokeira_iac as iac;
 use tokeira_platform::{
+    declaration::{AuthorableKind, KindSet, kind},
     error::KindError,
     kind::{PlacementContext, ProviderKind},
 };
@@ -21,7 +53,6 @@ use tokeira_platform::{
 /// The module that owns the observability config-files resource.
 const MODULE_OBSERVABILITY: &str = "observability";
 
-const CONFIG_RESOURCE_ID: &str = "compose/observability-config-files";
 const CONFIG_RESOURCE_TYPE: &str = "observability_config_files";
 const CONFIG_DIR: &str = "config";
 const ALLOY_CONFIG: &str = "config/alloy.alloy";
@@ -30,18 +61,13 @@ const LOKI_CONFIG: &str = "config/loki.yaml";
 const GRAFANA_DATASOURCES: &str = "config/grafana/provisioning/datasources/datasources.yaml";
 const GRAFANA_DASHBOARDS: &str = "config/grafana/provisioning/dashboards/dashboards.yaml";
 const ALERT_RULES: &str = "config/mimir/rules/observability-alerts.yaml";
-const GRPC_EDGE_DASHBOARD: &str = "config/grafana/dashboards/grpc-edge-health.json";
-const BROKER_RUNTIME_DASHBOARD: &str = "config/grafana/dashboards/broker-runtime-health.json";
-const STORAGE_PROJECTION_DASHBOARD: &str =
-    "config/grafana/dashboards/storage-projection-health.json";
-const LOG_EXPLORATION_DASHBOARD: &str = "config/grafana/dashboards/log-exploration.json";
-const DSQL_CONNECTION_DASHBOARD: &str = "config/grafana/dashboards/dsql-connection-health.json";
-const OCC_CONTENTION_DASHBOARD: &str = "config/grafana/dashboards/occ-contention.json";
-const PLACEMENT_CONTROLLER_DASHBOARD: &str = "config/grafana/dashboards/placement-controller.json";
-const AUTOSCALER_DASHBOARD: &str = "config/grafana/dashboards/autoscaler.json";
-const PROJECTION_WORKERS_DASHBOARD: &str = "config/grafana/dashboards/projection-workers.json";
-const INFRASTRUCTURE_HEALTH_DASHBOARD: &str =
-    "config/grafana/dashboards/infrastructure-health.json";
+const GRAFANA_DASHBOARD_DIR: &str = "config/grafana/dashboards";
+
+/// Companion-content locations, relative to the definition source directory.
+const CONTENT_DIR: &str = "observability";
+const CONTENT_TEMPLATES: &str = "templates";
+const CONTENT_DASHBOARDS: &str = "dashboards";
+const CONTENT_ALERTS: &str = "alerts/observability-alerts.yaml";
 
 const MANAGED_DIRECTORIES: &[&str] = &[
     "config/mimir/rules",
@@ -54,41 +80,78 @@ const MANAGED_DIRECTORIES: &[&str] = &[
     "config",
 ];
 
-#[derive(Template, Debug)]
-#[template(path = "alloy.alloy", escape = "none")]
-pub struct AlloyConfigTemplate {
-    pub metrics_target_host: String,
-    pub metrics_target_port: u16,
-    pub cluster: String,
-    pub deployment: String,
-    pub mimir_remote_write_url: String,
-    pub loki_push_url: String,
+/// The loaded companion content: template sources, dashboards, alert rules.
+///
+/// Loaded from the definition source's `observability/` directory at
+/// realization time; the bytes here are exactly what the operator ships, and
+/// every rendered digest derives from them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservabilityContent {
+    alloy: String,
+    mimir: String,
+    loki: String,
+    grafana_datasources: String,
+    grafana_dashboard_provider: String,
+    alerts: String,
+    /// Dashboard file name → contents, in name order. Every `*.json` under
+    /// `dashboards/` ships — adding a dashboard is adding a file.
+    dashboards: Vec<(String, String)>,
 }
 
-#[derive(Template, Debug)]
-#[template(path = "mimir.yaml", escape = "none")]
-pub struct MimirConfigTemplate {
-    pub http_port: u16,
-}
-
-#[derive(Template, Debug)]
-#[template(path = "loki.yaml", escape = "none")]
-pub struct LokiConfigTemplate {
-    pub http_port: u16,
-    pub retention_hours: u32,
-}
-
-#[derive(Template, Debug)]
-#[template(path = "grafana-datasources.yaml", escape = "none")]
-pub struct GrafanaDatasourcesTemplate {
-    pub mimir_url: String,
-    pub loki_url: String,
-}
-
-#[derive(Template, Debug)]
-#[template(path = "grafana-dashboards.yaml", escape = "none")]
-pub struct GrafanaDashboardProviderTemplate {
-    pub dashboards_path: String,
+impl ObservabilityContent {
+    /// Load the content set from one definition source directory.
+    ///
+    /// Absence is stated, never papered over: a missing directory or
+    /// template names the exact path the deployment's description requires.
+    pub fn load(definition_dir: &Path) -> Result<Self, ConfigGenError> {
+        let root = definition_dir.join(CONTENT_DIR);
+        let templates = root.join(CONTENT_TEMPLATES);
+        let read = |path: PathBuf| -> Result<String, ConfigGenError> {
+            fs::read_to_string(&path).map_err(|source| match source.kind() {
+                io::ErrorKind::NotFound => ConfigGenError::MissingContent {
+                    path: path.display().to_string(),
+                },
+                _ => ConfigGenError::ReadFailed {
+                    path: path.display().to_string(),
+                    source,
+                },
+            })
+        };
+        let mut dashboards = Vec::new();
+        let dashboards_dir = root.join(CONTENT_DASHBOARDS);
+        let entries = fs::read_dir(&dashboards_dir).map_err(|source| match source.kind() {
+            io::ErrorKind::NotFound => ConfigGenError::MissingContent {
+                path: dashboards_dir.display().to_string(),
+            },
+            _ => ConfigGenError::ReadFailed {
+                path: dashboards_dir.display().to_string(),
+                source,
+            },
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| ConfigGenError::ReadFailed {
+                path: dashboards_dir.display().to_string(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json")
+                && let Some(name) = path.file_name().and_then(|name| name.to_str())
+            {
+                dashboards.push((name.to_string(), read(path.clone())?));
+            }
+        }
+        // Deterministic rendering order regardless of directory iteration.
+        dashboards.sort();
+        Ok(Self {
+            alloy: read(templates.join("alloy.alloy"))?,
+            mimir: read(templates.join("mimir.yaml"))?,
+            loki: read(templates.join("loki.yaml"))?,
+            grafana_datasources: read(templates.join("grafana-datasources.yaml"))?,
+            grafana_dashboard_provider: read(templates.join("grafana-dashboards.yaml"))?,
+            alerts: read(root.join(CONTENT_ALERTS))?,
+            dashboards,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,44 +212,66 @@ impl ProviderKind for ObservabilityConfiguration {
         "ObservabilityConfiguration"
     }
 
+    /// Parameter validation only — pure, no filesystem. Content problems
+    /// (missing files, unknown placeholders) surface where the content is
+    /// read: the manifest, the diff, and — refusing loudly — create.
     fn validate_input(&self) -> Result<(), KindError> {
-        ConfigGenerator::new(PathBuf::new())
-            .render_all(&self.params())
-            .map(|_| ())
-            .map_err(|error| KindError::new(error.to_string()))
+        validate_params(&self.params()).map_err(|error| KindError::new(error.to_string()))
     }
 
     fn declared_outputs(&self) -> &'static [&'static str] {
         &[]
     }
 
-    fn desired_manifest(&self, _placement: &PlacementContext) -> serde_json::Value {
-        let files = ConfigGenerator::new(PathBuf::new())
-            .render_all(&self.params())
-            .expect("validated observability parameters render")
-            .into_iter()
-            .map(|file| {
-                (
-                    path_key(&file.relative_path),
-                    file_property(file.contents.as_bytes()),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        json!({ "files": files })
+    /// The desired file set with content digests, when the companion content
+    /// loads and renders; otherwise the manifest states the problem — the
+    /// definition said this deployment carries observability content, so
+    /// absence is a visible condition, never an empty success.
+    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
+        match desired_files(&placement.definition_dir, &self.params()) {
+            Ok(files) => {
+                let files = files
+                    .iter()
+                    .map(|file| {
+                        (
+                            path_key(&file.relative_path),
+                            file_property(file.contents.as_bytes()),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                json!({ "files": files })
+            }
+            Err(error) => json!({ "files": {}, "content_error": error.to_string() }),
+        }
     }
 
     fn realize(&self, placement: &PlacementContext) -> Result<Box<dyn iac::Resource>, KindError> {
         self.validate_input()?;
         Ok(Box::new(ObservabilityConfigFilesResource::new(
             placement.deployment_dir.clone(),
+            placement.definition_dir.clone(),
             self.params(),
         )))
     }
 }
 
-/// Engine identity of the rendered-configuration resource.
+/// Engine identity of the rendered-configuration resource — the provider's
+/// fencing contract, implemented here.
 pub fn configuration_resource_id() -> iac::ResourceId {
-    ObservabilityConfigFilesResource::resource_id_value()
+    tokeira_compose::config_content_resource_id()
+}
+
+impl AuthorableKind for ObservabilityConfiguration {
+    const NAME: &'static str = "ObservabilityConfiguration";
+}
+
+/// The platform's own kind selection: the observability configuration
+/// bundle, contributed to the authoring vocabulary at the entry point.
+pub fn kind_set() -> KindSet {
+    KindSet::new(
+        "compose-platform",
+        vec![kind::<ObservabilityConfiguration>()],
+    )
 }
 
 impl ObservabilityParams {
@@ -216,12 +301,25 @@ pub struct RenderedConfigFile {
 pub enum ConfigGenError {
     #[error("invalid template parameter: {field} cannot be {reason}")]
     InvalidParameter { field: String, reason: String },
-    #[error("failed to render template '{template}': {source}")]
-    RenderFailed {
-        template: String,
+    #[error("observability content is missing at {path}")]
+    MissingContent { path: String },
+    #[error("failed to read observability content at {path}: {source}")]
+    ReadFailed {
+        path: String,
         #[source]
-        source: askama::Error,
+        source: io::Error,
     },
+    #[error(
+        "template '{template}' names unknown placeholder `{{{{ {placeholder} }}}}`; \
+         known placeholders: {known}"
+    )]
+    UnknownPlaceholder {
+        template: String,
+        placeholder: String,
+        known: String,
+    },
+    #[error("template '{template}' has an unterminated `{{{{` placeholder")]
+    UnterminatedPlaceholder { template: String },
     #[error("failed to write config file at {path}: {source}")]
     WriteFailed {
         path: String,
@@ -236,222 +334,180 @@ impl From<ConfigGenError> for iac::IacError {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ConfigGenerator;
+/// Load the companion content and render the complete desired file set.
+pub fn desired_files(
+    definition_dir: &Path,
+    params: &ObservabilityParams,
+) -> Result<Vec<RenderedConfigFile>, ConfigGenError> {
+    render_all(&ObservabilityContent::load(definition_dir)?, params)
+}
 
-impl ConfigGenerator {
-    pub fn new(_deployment_dir: impl Into<PathBuf>) -> Self {
-        Self
+/// Render the complete desired file set from loaded content.
+pub fn render_all(
+    content: &ObservabilityContent,
+    params: &ObservabilityParams,
+) -> Result<Vec<RenderedConfigFile>, ConfigGenError> {
+    validate_params(params)?;
+    let mut files = vec![
+        rendered(
+            ALLOY_CONFIG,
+            substitute(
+                "alloy.alloy",
+                &content.alloy,
+                &[
+                    ("metrics_target_host", params.metrics_target_host.clone()),
+                    (
+                        "metrics_target_port",
+                        params.metrics_target_port.to_string(),
+                    ),
+                    ("cluster", params.cluster.clone()),
+                    ("deployment", params.deployment.clone()),
+                    (
+                        "mimir_remote_write_url",
+                        params.mimir_remote_write_url.clone(),
+                    ),
+                    ("loki_push_url", params.loki_push_url.clone()),
+                ],
+            )?,
+        ),
+        rendered(
+            MIMIR_CONFIG,
+            substitute(
+                "mimir.yaml",
+                &content.mimir,
+                &[("http_port", params.mimir_http_port.to_string())],
+            )?,
+        ),
+        rendered(
+            LOKI_CONFIG,
+            substitute(
+                "loki.yaml",
+                &content.loki,
+                &[
+                    ("http_port", params.loki_http_port.to_string()),
+                    ("retention_hours", params.loki_retention_hours.to_string()),
+                ],
+            )?,
+        ),
+        rendered(
+            GRAFANA_DATASOURCES,
+            substitute(
+                "grafana-datasources.yaml",
+                &content.grafana_datasources,
+                &[
+                    ("mimir_url", "http://mimir:9009/prometheus".to_string()),
+                    ("loki_url", "http://loki:3100".to_string()),
+                ],
+            )?,
+        ),
+        rendered(
+            GRAFANA_DASHBOARDS,
+            substitute(
+                "grafana-dashboards.yaml",
+                &content.grafana_dashboard_provider,
+                &[("dashboards_path", "/var/lib/grafana/dashboards".to_string())],
+            )?,
+        ),
+        rendered(ALERT_RULES, content.alerts.clone()),
+    ];
+    for (name, contents) in &content.dashboards {
+        files.push(RenderedConfigFile {
+            relative_path: PathBuf::from(GRAFANA_DASHBOARD_DIR).join(name),
+            contents: contents.clone(),
+        });
     }
+    Ok(files)
+}
 
-    pub fn render_all(
-        &self,
-        params: &ObservabilityParams,
-    ) -> Result<Vec<RenderedConfigFile>, ConfigGenError> {
-        self.validate(params)?;
-        Ok(vec![
-            self.render_alloy(params)?,
-            self.render_mimir(params)?,
-            self.render_loki(params)?,
-            self.render_grafana_datasources()?,
-            self.render_grafana_dashboard_provider()?,
-            self.alert_rules(),
-            self.grpc_edge_dashboard(),
-            self.broker_runtime_dashboard(),
-            self.storage_projection_dashboard(),
-            self.log_exploration_dashboard(),
-            self.dsql_connection_dashboard(),
-            self.occ_contention_dashboard(),
-            self.placement_controller_dashboard(),
-            self.autoscaler_dashboard(),
-            self.projection_workers_dashboard(),
-            self.infrastructure_health_dashboard(),
-        ])
+fn rendered(relative_path: &str, contents: String) -> RenderedConfigFile {
+    RenderedConfigFile {
+        relative_path: PathBuf::from(relative_path),
+        contents,
     }
+}
 
-    fn validate(&self, params: &ObservabilityParams) -> Result<(), ConfigGenError> {
-        validate_non_empty("metrics_target_host", &params.metrics_target_host)?;
-        validate_non_zero("metrics_target_port", params.metrics_target_port)?;
-        validate_non_empty("cluster", &params.cluster)?;
-        validate_non_empty("deployment", &params.deployment)?;
-        validate_non_empty("mimir_remote_write_url", &params.mimir_remote_write_url)?;
-        validate_non_empty("loki_push_url", &params.loki_push_url)?;
-        validate_non_zero("mimir_http_port", params.mimir_http_port)?;
-        validate_non_zero("loki_http_port", params.loki_http_port)?;
-        Ok(())
-    }
-
-    fn render_alloy(
-        &self,
-        params: &ObservabilityParams,
-    ) -> Result<RenderedConfigFile, ConfigGenError> {
-        let template = AlloyConfigTemplate {
-            metrics_target_host: params.metrics_target_host.clone(),
-            metrics_target_port: params.metrics_target_port,
-            cluster: params.cluster.clone(),
-            deployment: params.deployment.clone(),
-            mimir_remote_write_url: params.mimir_remote_write_url.clone(),
-            loki_push_url: params.loki_push_url.clone(),
+/// Strict `{{ name }}` substitution. Every placeholder in the source must be
+/// a known parameter — an unknown one is refused naming the template, the
+/// placeholder, and the known set, so content typos surface at plan time
+/// instead of shipping literally into a running container.
+fn substitute(
+    template: &str,
+    source: &str,
+    values: &[(&str, String)],
+) -> Result<String, ConfigGenError> {
+    let mut output = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("{{") {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            return Err(ConfigGenError::UnterminatedPlaceholder {
+                template: template.to_string(),
+            });
         };
-        render_template(ALLOY_CONFIG, "alloy.alloy", &template)
-    }
-
-    fn render_mimir(
-        &self,
-        params: &ObservabilityParams,
-    ) -> Result<RenderedConfigFile, ConfigGenError> {
-        let template = MimirConfigTemplate {
-            http_port: params.mimir_http_port,
-        };
-        render_template(MIMIR_CONFIG, "mimir.yaml", &template)
-    }
-
-    fn render_loki(
-        &self,
-        params: &ObservabilityParams,
-    ) -> Result<RenderedConfigFile, ConfigGenError> {
-        let template = LokiConfigTemplate {
-            http_port: params.loki_http_port,
-            retention_hours: params.loki_retention_hours,
-        };
-        render_template(LOKI_CONFIG, "loki.yaml", &template)
-    }
-
-    fn render_grafana_datasources(&self) -> Result<RenderedConfigFile, ConfigGenError> {
-        let template = GrafanaDatasourcesTemplate {
-            mimir_url: "http://mimir:9009/prometheus".into(),
-            loki_url: "http://loki:3100".into(),
-        };
-        render_template(GRAFANA_DATASOURCES, "grafana-datasources.yaml", &template)
-    }
-
-    fn render_grafana_dashboard_provider(&self) -> Result<RenderedConfigFile, ConfigGenError> {
-        let template = GrafanaDashboardProviderTemplate {
-            dashboards_path: "/var/lib/grafana/dashboards".into(),
-        };
-        render_template(GRAFANA_DASHBOARDS, "grafana-dashboards.yaml", &template)
-    }
-
-    fn alert_rules(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(ALERT_RULES),
-            contents: include_str!("../../alerts/observability-alerts.yaml").to_string(),
+        let placeholder = after[..end].trim();
+        match values.iter().find(|(name, _)| *name == placeholder) {
+            Some((_, value)) => output.push_str(value),
+            None => {
+                return Err(ConfigGenError::UnknownPlaceholder {
+                    template: template.to_string(),
+                    placeholder: placeholder.to_string(),
+                    known: values
+                        .iter()
+                        .map(|(name, _)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
         }
+        rest = &after[end + 2..];
     }
+    output.push_str(rest);
+    Ok(output)
+}
 
-    fn grpc_edge_dashboard(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(GRPC_EDGE_DASHBOARD),
-            contents: include_str!("../../dashboards/grpc-edge-health.json").to_string(),
-        }
-    }
-
-    fn broker_runtime_dashboard(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(BROKER_RUNTIME_DASHBOARD),
-            contents: include_str!("../../dashboards/broker-runtime-health.json").to_string(),
-        }
-    }
-
-    fn storage_projection_dashboard(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(STORAGE_PROJECTION_DASHBOARD),
-            contents: include_str!("../../dashboards/storage-projection-health.json").to_string(),
-        }
-    }
-
-    fn log_exploration_dashboard(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(LOG_EXPLORATION_DASHBOARD),
-            contents: include_str!("../../dashboards/log-exploration.json").to_string(),
-        }
-    }
-
-    fn dsql_connection_dashboard(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(DSQL_CONNECTION_DASHBOARD),
-            contents: include_str!("../../dashboards/dsql-connection-health.json").to_string(),
-        }
-    }
-
-    fn occ_contention_dashboard(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(OCC_CONTENTION_DASHBOARD),
-            contents: include_str!("../../dashboards/occ-contention.json").to_string(),
-        }
-    }
-
-    fn placement_controller_dashboard(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(PLACEMENT_CONTROLLER_DASHBOARD),
-            contents: include_str!("../../dashboards/placement-controller.json").to_string(),
-        }
-    }
-
-    fn autoscaler_dashboard(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(AUTOSCALER_DASHBOARD),
-            contents: include_str!("../../dashboards/autoscaler.json").to_string(),
-        }
-    }
-
-    fn projection_workers_dashboard(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(PROJECTION_WORKERS_DASHBOARD),
-            contents: include_str!("../../dashboards/projection-workers.json").to_string(),
-        }
-    }
-
-    fn infrastructure_health_dashboard(&self) -> RenderedConfigFile {
-        RenderedConfigFile {
-            relative_path: PathBuf::from(INFRASTRUCTURE_HEALTH_DASHBOARD),
-            contents: include_str!("../../dashboards/infrastructure-health.json").to_string(),
-        }
-    }
+fn validate_params(params: &ObservabilityParams) -> Result<(), ConfigGenError> {
+    validate_non_empty("metrics_target_host", &params.metrics_target_host)?;
+    validate_non_zero("metrics_target_port", params.metrics_target_port)?;
+    validate_non_empty("cluster", &params.cluster)?;
+    validate_non_empty("deployment", &params.deployment)?;
+    validate_non_empty("mimir_remote_write_url", &params.mimir_remote_write_url)?;
+    validate_non_empty("loki_push_url", &params.loki_push_url)?;
+    validate_non_zero("mimir_http_port", params.mimir_http_port)?;
+    validate_non_zero("loki_http_port", params.loki_http_port)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
 pub struct ObservabilityConfigFilesResource {
     deployment_dir: PathBuf,
+    definition_dir: PathBuf,
     params: ObservabilityParams,
 }
 
 impl ObservabilityConfigFilesResource {
-    pub fn new(deployment_dir: PathBuf, params: ObservabilityParams) -> Self {
+    pub fn new(
+        deployment_dir: PathBuf,
+        definition_dir: PathBuf,
+        params: ObservabilityParams,
+    ) -> Self {
         Self {
             deployment_dir,
+            definition_dir,
             params,
         }
     }
 
     pub fn resource_id_value() -> iac::ResourceId {
-        iac::ResourceId(CONFIG_RESOURCE_ID.into())
+        tokeira_compose::config_content_resource_id()
     }
 
     pub fn desired_files(&self) -> Result<Vec<RenderedConfigFile>, ConfigGenError> {
-        ConfigGenerator::new(&self.deployment_dir).render_all(&self.params)
-    }
-
-    fn ensure_directories(&self) -> Result<(), ConfigGenError> {
-        for dir in [
-            self.deployment_dir.join(CONFIG_DIR),
-            self.deployment_dir
-                .join("config/grafana/provisioning/datasources"),
-            self.deployment_dir
-                .join("config/grafana/provisioning/dashboards"),
-            self.deployment_dir.join("config/grafana/dashboards"),
-        ] {
-            fs::create_dir_all(&dir).map_err(|source| ConfigGenError::WriteFailed {
-                path: dir.display().to_string(),
-                source,
-            })?;
-        }
-        Ok(())
+        desired_files(&self.definition_dir, &self.params)
     }
 
     fn write_all(&self) -> Result<iac::ResourceState, iac::IacError> {
         let files = self.desired_files()?;
-        self.ensure_directories()?;
         for file in &files {
             let path = self.deployment_dir.join(&file.relative_path);
             if let Some(parent) = path.parent() {
@@ -506,6 +562,26 @@ impl ObservabilityConfigFilesResource {
                 )
             })
             .collect()
+    }
+
+    /// The managed relative paths for one operation: the recorded set when
+    /// state exists (so destroy removes exactly what was written, even after
+    /// the content set changed), the freshly-rendered set otherwise.
+    fn managed_paths(&self, current: Option<&iac::ResourceState>) -> Vec<String> {
+        if let Some(files) = current
+            .and_then(|state| state.properties.get("files"))
+            .and_then(|files| files.as_object())
+        {
+            return files.keys().cloned().collect();
+        }
+        self.desired_files()
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|file| path_key(&file.relative_path))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn read_live_files(
@@ -587,11 +663,11 @@ impl iac::Resource for ObservabilityConfigFilesResource {
 
     async fn delete(
         &self,
-        _current: &iac::ResourceState,
+        current: &iac::ResourceState,
         _ctx: &iac::ProvisionContext,
     ) -> Result<(), iac::IacError> {
-        for relative_path in managed_relative_paths() {
-            let path = self.deployment_dir.join(relative_path);
+        for relative_path in self.managed_paths(Some(current)) {
+            let path = self.deployment_dir.join(&relative_path);
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -652,6 +728,10 @@ impl iac::Resource for ObservabilityConfigFilesResource {
     ) -> iac::InternalChange {
         let desired_files = match self.desired_files() {
             Ok(files) => files,
+            // Content that fails to load or render is a stated condition on
+            // the plan — the definition says the deployment carries this
+            // content, so the plan names the problem instead of silently
+            // planning nothing.
             Err(error) => {
                 return iac::InternalChange::Update {
                     resource_id: self.resource_id(),
@@ -725,7 +805,8 @@ impl iac::Resource for ObservabilityConfigFilesResource {
     /// overwrites the managed set); the delete genuinely removes the managed
     /// files — read from the delete implementation, as the spec demands —
     /// and is still reversible because the tree is a pure function of the
-    /// definition: `create` re-renders it identically.
+    /// definition and its companion content: `create` re-renders it
+    /// identically from the same revision.
     fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
         // Cited by module identity, never repo layout; every name is a real
         // identifier in this module.
@@ -736,8 +817,8 @@ impl iac::Resource for ObservabilityConfigFilesResource {
         ));
         const DELETE: iac::Citation = iac::Citation::code(concat!(
             module_path!(),
-            "::ObservabilityConfigFilesResource::delete — fs::remove_file over \
-             managed_relative_paths(); refuses non-empty foreign directories"
+            "::ObservabilityConfigFilesResource::delete — fs::remove_file over the \
+             recorded managed set; refuses non-empty foreign directories"
         ));
         use iac::{
             ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
@@ -857,44 +938,6 @@ fn validate_non_zero(field: &str, value: u16) -> Result<(), ConfigGenError> {
     }
 }
 
-fn render_template(
-    relative_path: &str,
-    template_name: &str,
-    template: &impl Template,
-) -> Result<RenderedConfigFile, ConfigGenError> {
-    let contents = template
-        .render()
-        .map_err(|source| ConfigGenError::RenderFailed {
-            template: template_name.into(),
-            source,
-        })?;
-    Ok(RenderedConfigFile {
-        relative_path: PathBuf::from(relative_path),
-        contents,
-    })
-}
-
-fn managed_relative_paths() -> &'static [&'static str] {
-    &[
-        ALLOY_CONFIG,
-        MIMIR_CONFIG,
-        ALERT_RULES,
-        LOKI_CONFIG,
-        GRAFANA_DATASOURCES,
-        GRAFANA_DASHBOARDS,
-        GRPC_EDGE_DASHBOARD,
-        BROKER_RUNTIME_DASHBOARD,
-        STORAGE_PROJECTION_DASHBOARD,
-        LOG_EXPLORATION_DASHBOARD,
-        DSQL_CONNECTION_DASHBOARD,
-        OCC_CONTENTION_DASHBOARD,
-        PLACEMENT_CONTROLLER_DASHBOARD,
-        AUTOSCALER_DASHBOARD,
-        PROJECTION_WORKERS_DASHBOARD,
-        INFRASTRUCTURE_HEALTH_DASHBOARD,
-    ]
-}
-
 fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -953,6 +996,144 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), iac::IacError> {
 }
 
 #[cfg(test)]
+mod content_tests {
+    use tokeira_observability::testing::{AlertRuleValidator, DashboardValidator};
+
+    fn shipped_content() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("observability")
+    }
+
+    // The platform owns its observability content, so it owns the style
+    // contract over it: every shipped dashboard and alert rule validates.
+    #[test]
+    fn dashboards_follow_the_style_contract() {
+        DashboardValidator::validate_directory(&shipped_content().join("dashboards")).unwrap();
+    }
+
+    #[test]
+    fn alert_rules_follow_the_style_contract() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("platforms/compose sits two levels below the workspace root")
+            .to_path_buf();
+        AlertRuleValidator::validate_directory(&shipped_content().join("alerts"), &repo_root)
+            .unwrap();
+    }
+
+    use super::*;
+
+    /// Write a minimal companion-content tree: every template a
+    /// single-placeholder line, one dashboard, one alert file.
+    fn content_fixture(root: &Path) {
+        let obs = root.join(CONTENT_DIR);
+        fs::create_dir_all(obs.join(CONTENT_TEMPLATES)).expect("templates dir");
+        fs::create_dir_all(obs.join(CONTENT_DASHBOARDS)).expect("dashboards dir");
+        fs::create_dir_all(obs.join("alerts")).expect("alerts dir");
+        let template = obs.join(CONTENT_TEMPLATES);
+        fs::write(
+            template.join("alloy.alloy"),
+            "target {{ metrics_target_host }}:{{ metrics_target_port }}\n",
+        )
+        .expect("alloy");
+        fs::write(template.join("mimir.yaml"), "port: {{ http_port }}\n").expect("mimir");
+        fs::write(
+            template.join("loki.yaml"),
+            "port: {{ http_port }}\nretention: {{ retention_hours }}\n",
+        )
+        .expect("loki");
+        fs::write(
+            template.join("grafana-datasources.yaml"),
+            "mimir: {{ mimir_url }}\nloki: {{ loki_url }}\n",
+        )
+        .expect("datasources");
+        fs::write(
+            template.join("grafana-dashboards.yaml"),
+            "path: {{ dashboards_path }}\n",
+        )
+        .expect("dashboard provider");
+        fs::write(obs.join(CONTENT_ALERTS), "groups: []\n").expect("alerts");
+        fs::write(
+            obs.join(CONTENT_DASHBOARDS).join("edge.json"),
+            "{\"title\":\"edge\"}",
+        )
+        .expect("dashboard");
+    }
+
+    // Content is an input: rendering substitutes the authored parameters
+    // into the shipped bytes, every dashboard file ships, and a parameter or
+    // content change moves the digests that fence consumers.
+    #[test]
+    fn renders_from_companion_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        content_fixture(dir.path());
+        let files = desired_files(dir.path(), &ObservabilityParams::reference()).expect("render");
+        let by_path: BTreeMap<String, &str> = files
+            .iter()
+            .map(|file| (path_key(&file.relative_path), file.contents.as_str()))
+            .collect();
+        assert_eq!(by_path[MIMIR_CONFIG], "port: 9009\n");
+        assert_eq!(by_path[ALLOY_CONFIG], "target tokeirad:9090\n");
+        assert_eq!(
+            by_path["config/grafana/dashboards/edge.json"],
+            "{\"title\":\"edge\"}"
+        );
+        assert_eq!(by_path[ALERT_RULES], "groups: []\n");
+
+        // A parameter change moves the rendered bytes deterministically.
+        let mut params = ObservabilityParams::reference();
+        params.mimir_http_port = 9010;
+        let changed = desired_files(dir.path(), &params).expect("render changed");
+        assert_ne!(files, changed);
+    }
+
+    // Absence is stated: the refusal names the exact missing path, so the
+    // operator learns which companion the definition requires.
+    #[test]
+    fn missing_content_names_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = desired_files(dir.path(), &ObservabilityParams::reference())
+            .expect_err("missing content refuses");
+        assert!(
+            error.to_string().contains(CONTENT_DIR),
+            "refusal names the content location: {error}"
+        );
+    }
+
+    // Strict substitution: an unknown placeholder in shipped content is a
+    // located refusal naming template, placeholder, and the known set —
+    // never a literal `{{ typo }}` in a running container.
+    #[test]
+    fn unknown_placeholder_is_refused_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        content_fixture(dir.path());
+        fs::write(
+            dir.path()
+                .join(CONTENT_DIR)
+                .join(CONTENT_TEMPLATES)
+                .join("mimir.yaml"),
+            "port: {{ http_prot }}\n",
+        )
+        .expect("typo template");
+        let error =
+            desired_files(dir.path(), &ObservabilityParams::reference()).expect_err("typo refuses");
+        let message = error.to_string();
+        assert!(
+            message.contains("http_prot"),
+            "names the placeholder: {message}"
+        );
+        assert!(
+            message.contains("mimir.yaml"),
+            "names the template: {message}"
+        );
+        assert!(
+            message.contains("http_port"),
+            "lists the known set: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod semantics_tests {
     use iac::{
         ChangeKind, Confidence, DataEffect, LifecycleOperation, Resource as _, SemanticsContext,
@@ -963,6 +1144,7 @@ mod semantics_tests {
     fn resource() -> ObservabilityConfigFilesResource {
         ObservabilityConfigFilesResource::new(
             PathBuf::from("/tmp/x"),
+            PathBuf::from("/tmp/x"),
             ObservabilityParams::reference(),
         )
     }
@@ -971,7 +1153,7 @@ mod semantics_tests {
     // confidence only. The headline pair: updates are genuinely in place
     // (write_all), and the delete genuinely destroys the managed files —
     // yet stays reversible because the tree re-renders identically from
-    // the definition.
+    // the definition and its companion content.
     #[test]
     fn config_tree_declarations_match_the_write_and_delete_paths() {
         let resource = resource();

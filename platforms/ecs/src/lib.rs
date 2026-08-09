@@ -11,7 +11,7 @@ pub mod modules;
 pub mod services;
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
 
@@ -26,14 +26,20 @@ use tokeira_state::{CasStore, DeploymentStore, S3StateStore, StateBackend, State
 
 pub use config::EcsConfig;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EcsDeployment {
     aws_clients: Arc<OnceLock<tokeira_aws::AwsClients>>,
+    /// The deployment root: anchors runtime-loaded content (the
+    /// observability documents under `<dir>/observability/`).
+    deployment_dir: PathBuf,
 }
 
 impl EcsDeployment {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(deployment_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            aws_clients: Arc::default(),
+            deployment_dir: deployment_dir.into(),
+        }
     }
 
     pub fn default_config_toml() -> String {
@@ -126,7 +132,10 @@ impl tokeira_orchestrator::Deployment for EcsDeployment {
             Box::new(modules::NetworkingModule::new(config.clone())),
             Box::new(modules::DsqlModule::new(config.clone())),
             Box::new(modules::ClusterModule::new(config.clone())),
-            Box::new(modules::ObservabilityModule::new(config.clone())),
+            Box::new(modules::ObservabilityModule::new(
+                config.clone(),
+                self.deployment_dir.join("observability"),
+            )),
             Box::new(modules::ServicesModule::new(config.clone())),
         ];
         for module in candidates {
@@ -771,7 +780,7 @@ mod tests {
 
     #[test]
     fn valid_services_include_observability_targets() {
-        let deployment = EcsDeployment::new();
+        let deployment = EcsDeployment::new(std::env::temp_dir());
 
         assert_eq!(deployment.valid_services().len(), 10);
         assert!(deployment.valid_services().contains(&"mimir"));
@@ -809,7 +818,7 @@ mod tests {
 
     #[test]
     fn dsql_hydration_and_writeback_use_state_properties() {
-        let deployment = EcsDeployment::new();
+        let deployment = EcsDeployment::new(std::env::temp_dir());
         let config = EcsConfig::default();
         let resources = BTreeMap::from([
             resource(

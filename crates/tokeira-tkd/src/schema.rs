@@ -42,6 +42,15 @@ impl TypeTable {
             .is_some_and(|e| e.variants.iter().any(|v| v.ident == variant))
     }
 
+    /// Every declared type name (structs and enums), for part shadowing
+    /// checks.
+    pub fn type_names(&self) -> impl Iterator<Item = &str> {
+        self.structs
+            .keys()
+            .chain(self.enums.keys())
+            .map(String::as_str)
+    }
+
     /// The declared named-field names of a config struct, for exact-set
     /// validation of struct literals (no missing / no unknown fields).
     pub fn struct_field_names(&self, name: &str) -> Option<Vec<String>> {

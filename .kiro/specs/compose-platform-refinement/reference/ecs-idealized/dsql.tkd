@@ -1,0 +1,169 @@
+// dsql.tkd — the DSQL module: the cluster, its VPC endpoints, and the two
+// connect roles.
+//
+// Translated from `platforms/ecs/src/modules/dsql.rs` (679 lines). What
+// the Rust module spends its length on — a bespoke record-only resource
+// for adopted endpoints, a bespoke role wrapper that reads the cluster ARN
+// out of dependency state, twenty lines of preexisting-mode validation —
+// either dissolves into shape here or moves where it belongs: into the aws
+// kind library, once, for every platform.
+
+// The handles this module exports. The root wires them onward — the
+// writeback block, the services module's task roles; nothing else sees
+// inside this file.
+pub struct Handles {
+    pub module: Module,
+    pub cluster: Resource,
+    pub management_endpoint: Resource,
+    pub connection_endpoint: Resource,
+    pub runtime_role: Resource,
+    pub admin_role: Resource,
+}
+
+// `vpc` and `endpoint_security_group` are networking's exports, handed
+// through the root. A payload field holding a resource handle is a
+// reference: realization resolves it to the engine identity AND implies
+// the dependency edge — the typed replacement for today's
+// `vpc_dependency: ResourceId` config fields, in the same family as the
+// `output(...)` references writeback already uses. (The explicit third
+// argument to `resource(...)` remains for order/content dependencies that
+// carry no reference, as compose's server-config digest does.)
+//
+// `deps` is the module edge, passed through so it is declared where it is
+// read: in the root.
+pub fn declare(
+    d: Deployment,
+    cfg: Ecs,
+    cx: Context,
+    vpc: Resource,
+    endpoint_security_group: Resource,
+    deps: Vec<Module>,
+) -> Handles {
+    let m = d.module("dsql", deps);
+
+    // One logical cluster across both modes: `dsql.cluster` stays the
+    // same engine identity whether managed or adopted — the mode lives in
+    // the payload, so adopting a preexisting cluster is a config edit, not
+    // a new resource lineage.
+    let cluster = m.resource(
+        "cluster",
+        DsqlCluster {
+            identity: format!("{}-{}", cx.project_name, cfg.environment),
+            region: cfg.aws.region.clone(),
+            mode: match cfg.dsql {
+                Dsql::Managed => DsqlMode::Managed,
+                Dsql::Preexisting(_) => DsqlMode::Preexisting,
+            },
+            endpoint: match cfg.dsql {
+                Dsql::Managed => None,
+                Dsql::Preexisting(pre) => Some(pre.endpoint.clone()),
+            },
+            ..DsqlCluster::EMPTY
+        },
+    );
+
+    match cfg.dsql {
+        // Managed here: endpoints and roles provisioned alongside the
+        // cluster.
+        Dsql::Managed => {
+            let management_endpoint = m.resource(
+                "management_endpoint",
+                VpcEndpoint {
+                    service: format!("com.amazonaws.{}.dsql-control", cfg.aws.region),
+                    endpoint_type: EndpointType::Interface,
+                    vpc: vpc,
+                    security_group: endpoint_security_group,
+                },
+            );
+
+            let connection_endpoint = m.resource(
+                "connection_endpoint",
+                DsqlConnectionEndpoint {
+                    identity: format!("{}-connection", cx.project_name),
+                    vpc: vpc,
+                    security_group: endpoint_security_group,
+                    cluster: cluster,
+                },
+            );
+
+            // The connect roles. The Rust wrapper hardcodes the ECS task
+            // trust principal; the kind takes `assumed_by`, so EKS authors
+            // the same kind with its own principal. The policy's cluster
+            // ARN resolves at apply time from the referenced cluster's
+            // applied state — the kind's resource keeps that mechanic; the
+            // definition only states the reference.
+            let runtime_role = m.resource(
+                "runtime_role",
+                DsqlRole {
+                    role: format!("{}-dsql-runtime", cx.project_name),
+                    action: DsqlAction::DbConnect,
+                    assumed_by: "ecs-tasks.amazonaws.com".into(),
+                    cluster: cluster,
+                },
+            );
+
+            let admin_role = m.resource(
+                "admin_role",
+                DsqlRole {
+                    role: format!("{}-dsql-admin", cx.project_name),
+                    action: DsqlAction::DbConnectAdmin,
+                    assumed_by: "ecs-tasks.amazonaws.com".into(),
+                    cluster: cluster,
+                },
+            );
+
+            Handles {
+                module: m,
+                cluster: cluster,
+                management_endpoint: management_endpoint,
+                connection_endpoint: connection_endpoint,
+                runtime_role: runtime_role,
+                admin_role: admin_role,
+            }
+        }
+
+        // Adopted from elsewhere: the same five logical identities,
+        // recorded rather than managed — record-only kinds whose delete
+        // retires the record and leaves the cluster running. The required
+        // coordinates arrived as required fields; no runtime validation
+        // exists because no invalid shape evaluates.
+        Dsql::Preexisting(pre) => {
+            let management_endpoint = m.resource(
+                "management_endpoint",
+                AdoptedDsqlEndpoint {
+                    endpoint_id: pre.management_endpoint_id.clone(),
+                },
+            );
+
+            let connection_endpoint = m.resource(
+                "connection_endpoint",
+                AdoptedDsqlEndpoint {
+                    endpoint_id: pre.connection_endpoint_id.clone(),
+                },
+            );
+
+            let runtime_role = m.resource(
+                "runtime_role",
+                AdoptedIamRole {
+                    arn: pre.runtime_role_arn.clone(),
+                },
+            );
+
+            let admin_role = m.resource(
+                "admin_role",
+                AdoptedIamRole {
+                    arn: pre.admin_role_arn.clone(),
+                },
+            );
+
+            Handles {
+                module: m,
+                cluster: cluster,
+                management_endpoint: management_endpoint,
+                connection_endpoint: connection_endpoint,
+                runtime_role: runtime_role,
+                admin_role: admin_role,
+            }
+        }
+    }
+}

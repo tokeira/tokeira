@@ -1,4 +1,4 @@
-//! `tkp rollback` — definition-driven rollback (tasks 8.5, 19.3; Proposal 002).
+//! `tkp rollback` — definition-driven rollback.
 //!
 //! Rollback restores the retained prior configuration revision and lets the
 //! forward engine reconcile toward it — no recorded before-images. The sequence:
@@ -7,7 +7,7 @@
 //! idempotent), the binding re-pins to `A`, and `A` forward-applies its
 //! retained prior revision.
 //!
-//! Two shapes share this code (task 19.3): **single-process** (the running
+//! Two shapes share this code: **single-process** (the running
 //! binary performs the whole sequence — the dev loop, where A and B are the
 //! same build) and **two-binary orchestration** — `tkr` launches B with
 //! `--handoff` (B verifies both binaries, deletes, re-pins, stops with the
@@ -22,12 +22,16 @@ use chrono::Utc;
 use tokeira_provisioner::{BinaryStore, ProvenanceStamp, RollbackCheckpoint, Target};
 use tokeira_state::LocalBackend;
 
+use tokeira_platform::definition::DefinitionFrontend;
+
 use crate::{
-    ProvisionerPlatform, envelope_store,
+    engine::Engine,
+    envelope_store,
     gate::{GateOutcome, evaluate_gate},
+    platform::Admitted,
 };
 
-/// A's retained bytes, verified before B destroys anything (task 19.3).
+/// A's retained bytes, verified before B destroys anything.
 ///
 /// Identity-keyed retention (the bundle era) is the two-binary contract: A's
 /// bytes live under the deployment's `BinaryStore`, addressed by the
@@ -70,11 +74,12 @@ async fn verify_retained_a(
         )
 }
 
-pub(crate) async fn rollback<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
+pub(crate) async fn rollback<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
     handoff: bool,
 ) -> Result<()> {
+    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, mut version) = store
@@ -82,7 +87,7 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
         .await
         .context("failed to load the deployment envelope")?;
 
-    // ── Operation-marker gate (task 19.4) ──
+    // ── Operation-marker gate ──
     // Rollback is BOTH the resumer of its own interrupted run and the abort
     // path for an interrupted upgrade. Its own marker resumes here: the
     // re-pin already committed (binding names A again), so the sequence
@@ -96,8 +101,9 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
             "resuming interrupted rollback {} from phase '{}'",
             operation.operation_id, operation.phase
         );
-        let applied =
-            crate::change_log_entries(&platform.infra_apply(deployment_dir, None).await?.changes);
+        let outcome = engine.apply(admitted, None).await?;
+        crate::persist_writeback(deployment_dir, &outcome.writeback)?;
+        let applied = crate::change_log_entries(&outcome.changes);
         println!(
             "A reconcile (re-apply retained revision): {}",
             tokeira_report::counted(applied.len(), "change")
@@ -148,7 +154,7 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
             "nothing to roll back: no [A final] checkpoint recorded (rollback follows an `upgrade`)"
         )
     })?;
-    // Both binaries verified before anything is destroyed (task 19.3): B —
+    // Both binaries verified before anything is destroyed: B —
     // the running binary — was checksum-verified by the launcher's rollback
     // class against the envelope's manifest; A's bytes must ALSO be
     // retrievable and verified from the deployment's retention now — a
@@ -161,7 +167,7 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
     );
 
     // ── B deletes what it created (keys(S_B) − keys(S_A)) ──
-    // The envelope tracked B's creations incrementally (task 19.3); the pass
+    // The envelope tracked B's creations incrementally; the pass
     // is fail-closed, reverse-dependency-ordered, and idempotent, so an
     // interruption here is recovered by re-running `rollback` — surviving ids
     // are still in the set, deleted ones are already gone from state.
@@ -169,12 +175,9 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
     if undo_ids.is_empty() {
         println!("B delete-only: nothing created since [A final]");
     } else {
-        let deleted = platform
-            .infra_destroy_selected(deployment_dir, &undo_ids)
-            .await
-            .context(
-                "the B delete-only pass failed — state is consistent; re-run `rollback` to retry",
-            )?;
+        let deleted = engine.destroy_selected(admitted, &undo_ids).await.context(
+            "the B delete-only pass failed — state is consistent; re-run `rollback` to retry",
+        )?;
         println!(
             "B delete-only: {} of {} tracked resource(s) removed",
             deleted.len(),
@@ -199,9 +202,9 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
         to_a.version
     );
 
-    // ── Two-binary handoff (task 19.3) ──
+    // ── Two-binary handoff ──
     // The orchestrator relaunches the retained A, whose `rollback` re-run
-    // resumes at the reconcile (19.4's resume path IS the second half); the
+    // resumes at the reconcile (the marker's resume path IS the second half); the
     // orchestrator's lease keeps the lock continuous across the boundary.
     if handoff {
         println!("handoff: stopping for the orchestrator to relaunch A (marker open, lease held)");
@@ -209,8 +212,9 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
     }
 
     // ── A forward-reconciles toward its retained prior configuration revision ──
-    let applied =
-        crate::change_log_entries(&platform.infra_apply(deployment_dir, None).await?.changes);
+    let outcome = engine.apply(admitted, None).await?;
+    crate::persist_writeback(deployment_dir, &outcome.writeback)?;
+    let applied = crate::change_log_entries(&outcome.changes);
     println!(
         "A reconcile (re-apply retained revision): {}",
         tokeira_report::counted(applied.len(), "change")
@@ -229,7 +233,6 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestPlatform;
     use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope, ProvenanceStamp};
 
     #[tokio::test]
@@ -260,7 +263,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = rollback(&TestPlatform, tmp.path(), false)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = rollback(&engine, &admitted, false)
             .await
             .expect_err("a mismatched running binary is refused");
         assert!(
@@ -289,7 +293,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = rollback(&TestPlatform, tmp.path(), false)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = rollback(&engine, &admitted, false)
             .await
             .expect_err("no checkpoint refuses");
         assert!(
@@ -337,7 +342,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        rollback(&TestPlatform, tmp.path(), false)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        rollback(&engine, &admitted, false)
             .await
             .expect("rollback succeeds");
 
@@ -377,7 +383,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        rollback(&TestPlatform, tmp.path(), false)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        rollback(&engine, &admitted, false)
             .await
             .expect("rollback runs the delete pass and completes");
 
@@ -411,7 +418,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = rollback(&TestPlatform, tmp.path(), true)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = rollback(&engine, &admitted, true)
             .await
             .expect_err("the handoff refuses without a retained A");
         assert!(
@@ -451,7 +459,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        rollback(&TestPlatform, tmp.path(), false)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        rollback(&engine, &admitted, false)
             .await
             .expect("the re-run resumes and completes");
 
@@ -488,7 +497,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        rollback(&TestPlatform, tmp.path(), false)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        rollback(&engine, &admitted, false)
             .await
             .expect("rollback aborts the interrupted upgrade");
 

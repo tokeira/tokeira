@@ -1,118 +1,105 @@
 //! Reusable, typed author inputs for AWS resources.
 //!
-//! This module is the AWS provider's complete kind export: every authorable
-//! AWS capability appears in [`KIND_NAMES`] and decodes through [`decode`].
-//! The engine kind library aggregates provider exports verbatim — no platform
-//! curates below this set, so a definition edited within one engine version
-//! can adopt any kind the provider ships.
+//! This module is the AWS provider's kind export. Platforms select kinds by
+//! type at their entry point — [`all`] for the complete export, or
+//! [`select`] over `kind::<DsqlCluster>()`-style entries — and the selection
+//! is the whole wiring act: selected kinds are authorable and executable,
+//! unselected kinds are unknown at `definition check`, and a selection typo
+//! is a compile error.
 
 pub mod dsql_cluster;
 pub mod dynamodb_table;
 
-use tokeira_platform::{
-    author::{LocatedValue, from_located_value},
-    error::KindError,
-    kind::{PlacementContext, ProviderKind},
+use tokeira_platform::declaration::{
+    AuthorableKind, DeploymentRef, InfraConstructor, KindEntry, KindSet, kind,
 };
 
-/// Complete author-visible AWS kind names, in stable order.
-pub const KIND_NAMES: &[&str] = &["DsqlCluster", "DynamoDbTable"];
+pub use dsql_cluster::DsqlCluster;
+pub use dynamodb_table::DynamoDbTable;
 
-/// The AWS provider's closed kind set.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AwsKind {
-    /// Aurora DSQL cluster.
-    DsqlCluster(dsql_cluster::DsqlCluster),
-    /// DynamoDB table.
-    DynamoDbTable(dynamodb_table::DynamoDbTable),
-}
+/// The AWS selection's infra-phase extension constructor: the
+/// [`AwsClients`](crate::AwsClients) bundle every AWS resource reads from
+/// the provision context.
+///
+/// The client region resolves by AWS's own precedence over its attribute
+/// levels: the deployment-level `aws` block's `region` when authored,
+/// otherwise the SDK's ambient default chain. Resource-attached regions
+/// live on the resources themselves and are not this constructor's
+/// question.
+#[derive(Debug)]
+pub struct AwsInfraConstructor;
 
-macro_rules! delegate_kind {
-    ($self:ident, $method:ident $(, $argument:expr)?) => {
-        match $self {
-            Self::DsqlCluster(kind) => kind.$method($($argument)?),
-            Self::DynamoDbTable(kind) => kind.$method($($argument)?),
-        }
-    };
-}
-
-impl ProviderKind for AwsKind {
-    fn kind_name(&self) -> &'static str {
-        delegate_kind!(self, kind_name)
-    }
-
-    fn validate_input(&self) -> Result<(), KindError> {
-        delegate_kind!(self, validate_input)
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        delegate_kind!(self, declared_outputs)
-    }
-
-    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
-        delegate_kind!(self, desired_manifest, placement)
-    }
-
-    fn realize(
+#[async_trait::async_trait]
+impl InfraConstructor for AwsInfraConstructor {
+    async fn construct(
         &self,
-        placement: &PlacementContext,
-    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
-        delegate_kind!(self, realize, placement)
+        _deployment: &DeploymentRef,
+        attributes: Option<&serde_json::Value>,
+        ctx: &mut tokeira_iac::ProvisionContext,
+    ) -> anyhow::Result<()> {
+        let region = attributes
+            .and_then(|block| block.get("region"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(region) = region {
+            loader = loader.region(aws_config::Region::new(region));
+        }
+        let sdk = loader.load().await;
+        ctx.set_extension(crate::AwsClients::new(&sdk));
+        Ok(())
     }
 }
 
-/// Decode one named AWS kind from a host-free author value.
-pub fn decode(name: &str, value: LocatedValue) -> Result<AwsKind, KindError> {
-    let range = value.range;
-    match name {
-        "DsqlCluster" => from_located_value::<dsql_cluster::DsqlCluster>(value)
-            .map(AwsKind::DsqlCluster)
-            .map_err(|error| KindError::new(error.to_string()).at(error.range().or(range))),
-        "DynamoDbTable" => from_located_value::<dynamodb_table::DynamoDbTable>(value)
-            .map(AwsKind::DynamoDbTable)
-            .map_err(|error| KindError::new(error.to_string()).at(error.range().or(range))),
-        _ => Err(KindError::new(format!("unknown AWS kind `{name}`"))),
-    }
+impl AuthorableKind for DsqlCluster {
+    const NAME: &'static str = "DsqlCluster";
 }
 
-/// Provider-owned `<Kind>::EMPTY` defaults; no AWS kind declares any.
-pub fn defaults(_name: &str) -> Option<LocatedValue> {
-    None
+impl AuthorableKind for DynamoDbTable {
+    const NAME: &'static str = "DynamoDbTable";
+}
+
+/// The complete AWS kind selection, for a platform entry point that tracks
+/// the provider: new AWS kinds become authorable without a platform edit.
+pub fn all() -> KindSet {
+    select(vec![kind::<DsqlCluster>(), kind::<DynamoDbTable>()])
+}
+
+/// A typed subset of the AWS kind export, for a platform entry point that
+/// states its vocabulary exactly and grows it only on purpose:
+/// `select(vec![kind::<DsqlCluster>()])`.
+pub fn select(entries: Vec<KindEntry>) -> KindSet {
+    KindSet::new("aws", entries).infra(AwsInfraConstructor)
 }
 
 #[cfg(test)]
 mod tests {
+    use tokeira_platform::author::LocatedValue;
+
     use super::*;
 
-    // The inventory is the provider's single kind authority: every listed
-    // name reaches a decode arm (never the unknown-kind arm), and unlisted
-    // names never decode.
+    // A selection carries exactly the requested kind types, named by the
+    // types themselves; decode admits each entry's own input shape.
     #[test]
-    fn inventory_matches_decode_arms_exactly() {
-        for name in KIND_NAMES {
-            let probe = decode(
-                name,
-                LocatedValue::new(tokeira_platform::author::ValueShape::Struct {
-                    name: (*name).to_string(),
+    fn selection_is_typed_and_decodes_each_entry() {
+        let selection = all();
+        let names: Vec<&str> = selection.entries.iter().map(|entry| entry.name).collect();
+        assert_eq!(names, ["DsqlCluster", "DynamoDbTable"]);
+        for entry in &selection.entries {
+            let probe = (entry.decode)(LocatedValue::new(
+                tokeira_platform::author::ValueShape::Struct {
+                    name: entry.name.to_string(),
                     fields: Vec::new(),
-                }),
-            );
+                },
+            ));
             if let Err(error) = probe {
                 assert!(
                     !error.message.contains("unknown"),
-                    "inventory name `{name}` hit the unknown-kind arm: {}",
+                    "entry `{}` failed as unknown: {}",
+                    entry.name,
                     error.message
                 );
             }
         }
-        assert!(
-            decode(
-                "NotAnAwsKind",
-                LocatedValue::new(tokeira_platform::author::ValueShape::Unit)
-            )
-            .expect_err("unknown kind must not decode")
-            .message
-            .contains("unknown")
-        );
     }
 }

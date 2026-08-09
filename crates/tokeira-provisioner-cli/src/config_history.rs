@@ -27,13 +27,21 @@ struct RetainedSourceIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     format: Option<DefinitionFormatId>,
     path: RelativeDefinitionPath,
+    /// File names of the definition parts retained beside the root — the
+    /// sibling `.{format}` files present when the revision was taken. The
+    /// whole set is retained (not just the parts the evaluation served):
+    /// the revision folder is a snapshot of the authored source set, the
+    /// shape the platform-source-set work will formalize.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    parts: Vec<String>,
 }
 
-impl From<&ConfigSource> for RetainedSourceIdentity {
-    fn from(source: &ConfigSource) -> Self {
+impl RetainedSourceIdentity {
+    fn new(source: &ConfigSource, parts: Vec<String>) -> Self {
         Self {
             format: source.format.clone(),
             path: source.path.clone(),
+            parts,
         }
     }
 }
@@ -64,7 +72,8 @@ fn identity_path(deployment_dir: &Path, revision: u64) -> PathBuf {
     revision_root(deployment_dir, revision).join(SOURCE_METADATA)
 }
 
-/// Retain exact live bytes and their independently admitted format/path.
+/// Retain exact live bytes and their independently admitted format/path,
+/// plus every sibling definition part (`*.{format}` beside the root).
 pub(crate) fn snapshot(deployment_dir: &Path, source: &ConfigSource, revision: u64) -> Result<()> {
     let live = config_file(deployment_dir, source);
     let bytes = match std::fs::read(&live) {
@@ -85,7 +94,19 @@ pub(crate) fn snapshot(deployment_dir: &Path, source: &ConfigSource, revision: u
         .with_context(|| format!("failed to create {}", parent.display()))?;
     std::fs::write(&destination, bytes)
         .with_context(|| format!("failed to write {}", destination.display()))?;
-    let identity = serde_json::to_vec_pretty(&RetainedSourceIdentity::from(source))?;
+    let parts = live_part_names(&live, source)?;
+    for part in &parts {
+        let live_part = live
+            .parent()
+            .expect("a live source has a parent")
+            .join(part);
+        let retained_part = parent.join(part);
+        let bytes = std::fs::read(&live_part)
+            .with_context(|| format!("failed to read part {}", live_part.display()))?;
+        std::fs::write(&retained_part, bytes)
+            .with_context(|| format!("failed to write {}", retained_part.display()))?;
+    }
+    let identity = serde_json::to_vec_pretty(&RetainedSourceIdentity::new(source, parts))?;
     let identity_path = identity_path(deployment_dir, revision);
     std::fs::write(&identity_path, identity)
         .with_context(|| format!("failed to write {}", identity_path.display()))?;
@@ -123,6 +144,52 @@ pub(crate) fn retain_explanation(
         .with_context(|| format!("failed to create {}", root.display()))?;
     tokeira_explain::artifact::write(&root.join("explanation.json"), explanation)?;
     Ok(())
+}
+
+/// The sibling definition parts beside the live root: every `.{format}`
+/// file in the root's directory except the root itself, ascending by name.
+/// A format-less source has no part convention and yields none.
+fn live_part_names(live_root: &Path, source: &ConfigSource) -> Result<Vec<String>> {
+    let Some(format) = &source.format else {
+        return Ok(Vec::new());
+    };
+    let dir = live_root.parent().expect("a live source has a parent");
+    let root_name = live_root.file_name();
+    let mut names = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to list {}", dir.display()));
+        }
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("failed to list {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some(format.as_str())
+            && path.file_name() != root_name
+            && path.is_file()
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+        {
+            names.push(name.to_string());
+        }
+    }
+    names.sort_unstable();
+    Ok(names)
+}
+
+/// Directory the retarget gate resolves a retained revision's parts from —
+/// the revision folder itself, which holds the part files flat beside the
+/// retained root.
+pub(crate) fn retained_parts_dir(
+    deployment_dir: &Path,
+    source: &ConfigSource,
+    revision: u64,
+) -> PathBuf {
+    snapshot_path(deployment_dir, source, revision)
+        .parent()
+        .expect("a retained deployment-relative path has a revision parent")
+        .to_path_buf()
 }
 
 fn retained_identity(
@@ -193,11 +260,15 @@ pub(crate) fn retained_revisions(deployment_dir: &Path, source: &ConfigSource) -
     revisions
 }
 
-/// Restore one same-format, same-path revision into the recorded live source.
+/// Restore one same-format, same-path revision into the recorded live
+/// source, definition parts included. Parts the revision retained are
+/// written back over their live counterparts; a live part file the revision
+/// never knew is left in place — the restored root decides what it imports,
+/// and an unimported file is inert.
 pub(crate) fn restore(deployment_dir: &Path, source: &ConfigSource, revision: u64) -> Result<()> {
     let retained = retained_identity(deployment_dir, revision)?;
-    match retained {
-        Some(retained) if identity_matches(&retained, source) => {}
+    let parts = match retained {
+        Some(retained) if identity_matches(&retained, source) => retained.parts,
         Some(retained) => bail!(
             "config revision {revision} records format/path {:?}/{}; current source is {:?}/{}",
             retained.format,
@@ -205,11 +276,11 @@ pub(crate) fn restore(deployment_dir: &Path, source: &ConfigSource, revision: u6
             source.format,
             source.path.as_str()
         ),
-        None if source.format.is_none() => {}
+        None if source.format.is_none() => Vec::new(),
         None => bail!(
             "config revision {revision} has no format-bearing source identity; refusing restore"
         ),
-    }
+    };
 
     let snapshot = snapshot_path(deployment_dir, source, revision);
     let bytes = std::fs::read(&snapshot).with_context(|| {
@@ -220,10 +291,24 @@ pub(crate) fn restore(deployment_dir: &Path, source: &ConfigSource, revision: u6
         )
     })?;
     let live = config_file(deployment_dir, source);
+    replace_file(&live, bytes)?;
+    let retained_dir = retained_parts_dir(deployment_dir, source, revision);
+    let live_dir = live.parent().expect("a live source has a parent");
+    for part in &parts {
+        let bytes = std::fs::read(retained_dir.join(part))
+            .with_context(|| format!("config revision {revision} has no retained part {part}"))?;
+        replace_file(&live_dir.join(part), bytes)?;
+    }
+    Ok(())
+}
+
+/// Writes bytes next to the target and renames into place, so a torn write
+/// never leaves a half-restored file.
+fn replace_file(live: &Path, bytes: Vec<u8>) -> Result<()> {
     let temporary = live.with_extension(format!("restore-{}", std::process::id()));
     std::fs::write(&temporary, bytes)
         .with_context(|| format!("failed to write {}", temporary.display()))?;
-    if let Err(error) = std::fs::rename(&temporary, &live) {
+    if let Err(error) = std::fs::rename(&temporary, live) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error).with_context(|| format!("failed to replace {}", live.display()));
     }
@@ -249,6 +334,40 @@ mod tests {
         assert_eq!(
             std::fs::read(config_file(temp.path(), &source)).expect("read live"),
             b"one"
+        );
+    }
+
+    // The revision retains the whole definition set: the root plus every
+    // sibling part, and restore brings the parts back with it.
+    #[test]
+    fn snapshot_and_restore_carry_the_definition_parts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = tkd();
+        std::fs::write(config_file(temp.path(), &source), b"root-one").expect("write live");
+        std::fs::write(temp.path().join("networking.tkd"), b"part-one").expect("write part");
+        std::fs::write(temp.path().join("notes.txt"), b"not a part").expect("write bystander");
+        snapshot(temp.path(), &source, 1).expect("snapshot");
+
+        let revision = revision_root(temp.path(), 1);
+        assert_eq!(
+            std::fs::read(revision.join("networking.tkd")).expect("retained part"),
+            b"part-one"
+        );
+        assert!(
+            !revision.join("notes.txt").exists(),
+            "only part-extension files retain"
+        );
+
+        std::fs::write(config_file(temp.path(), &source), b"root-two").expect("edit root");
+        std::fs::write(temp.path().join("networking.tkd"), b"part-two").expect("edit part");
+        restore(temp.path(), &source, 1).expect("restore");
+        assert_eq!(
+            std::fs::read(config_file(temp.path(), &source)).expect("live root"),
+            b"root-one"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("networking.tkd")).expect("live part"),
+            b"part-one"
         );
     }
 

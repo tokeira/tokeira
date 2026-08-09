@@ -58,7 +58,7 @@ pub(crate) fn check_generated_observability(
     }
 
     let checks = match &ctx.platform_config {
-        PlatformDeploymentConfig::Ecs(config) => ecs_checks(config)?,
+        PlatformDeploymentConfig::Ecs(config) => ecs_checks(config, &ctx.path)?,
         PlatformDeploymentConfig::Local(_) => vec![CheckOutcome {
             name: "local-observability",
             status: CheckStatus::Warn,
@@ -69,7 +69,10 @@ pub(crate) fn check_generated_observability(
     Ok(CheckReport { checks })
 }
 
-fn ecs_checks(config: &tokeira_ecs_deployment::EcsConfig) -> Result<Vec<CheckOutcome>> {
+fn ecs_checks(
+    config: &tokeira_ecs_deployment::EcsConfig,
+    deployment_dir: &std::path::Path,
+) -> Result<Vec<CheckOutcome>> {
     let services = EcsWorkload::build_all(config);
     let observability = EcsWorkload::build_observability(config);
     if services.is_empty() || observability.is_empty() {
@@ -93,7 +96,7 @@ fn ecs_checks(config: &tokeira_ecs_deployment::EcsConfig) -> Result<Vec<CheckOut
         )?;
     }
 
-    let module = ObservabilityModule::new(config.clone());
+    let module = ObservabilityModule::new(config.clone(), deployment_dir.join("observability"));
     let state = tokeira_iac::InfraState::default();
     let extensions = std::collections::HashMap::new();
     let context = ModuleContext::new(&state, &extensions);
@@ -193,11 +196,22 @@ mod tests {
 
     #[test]
     fn ecs_check_validates_generated_artifacts() {
-        let report = check_generated_observability(
-            &context(PlatformDeploymentConfig::Ecs(Box::default())),
-            30,
+        // The artifact half of the check reads the deployment's staged
+        // observability content — a deployment carries dashboards/*.json
+        // plus alerts/observability-alerts.yaml.
+        let deployment = tempfile::tempdir().unwrap();
+        let content = deployment.path().join("observability");
+        std::fs::create_dir_all(content.join("dashboards")).unwrap();
+        std::fs::create_dir_all(content.join("alerts")).unwrap();
+        std::fs::write(content.join("dashboards/engine-health.json"), "{}").unwrap();
+        std::fs::write(
+            content.join("alerts/observability-alerts.yaml"),
+            "groups: []",
         )
         .unwrap();
+        let mut ctx = context(PlatformDeploymentConfig::Ecs(Box::default()));
+        ctx.path = deployment.path().to_path_buf();
+        let report = check_generated_observability(&ctx, 30).unwrap();
 
         assert!(
             report

@@ -13,9 +13,14 @@ use monty_types::{CompileOptions, MontyException, MontyObject, PrintWriter, Reso
 use ruff_text_size::{TextRange, TextSize};
 
 use crate::{
+    facade::FACADE_FILE_NAME,
     program::Program,
     source_map::{LineTable, Mapped, SourceMap},
 };
+
+/// The main program's file name in Monty tracebacks; frames from it map
+/// through the source map to operator positions.
+const TRANSIENT_FILE_NAME: &str = "definition.tkdp.transient";
 
 /// Cap on captured print output attached to failure diagnostics.
 const CAPTURED_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -29,20 +34,36 @@ pub struct RunFailure {
     pub range: Option<TextRange>,
 }
 
-/// Compiles and runs the program; failures translate through the map.
+/// Compiles and runs the program; failures translate through the maps.
 pub fn execute(program: &Program, original: &str) -> Result<MontyObject, RunFailure> {
     let translator = Translator {
-        map: &program.map,
-        transient: LineTable::new(&program.text),
-        transient_text: &program.text,
-        original_table: LineTable::new(original),
-        original,
+        root: FileContext {
+            map: &program.map,
+            lowered_table: LineTable::new(&program.text),
+            lowered_text: &program.text,
+            original_table: LineTable::new(original),
+            original,
+            display: "definition.tkdp",
+        },
+        parts: program
+            .parts
+            .iter()
+            .map(|part| FileContext {
+                map: &part.map,
+                lowered_table: LineTable::new(&part.lowered),
+                lowered_text: &part.lowered,
+                original_table: LineTable::new(&part.original),
+                original: &part.original,
+                display: &part.file_name,
+            })
+            .collect(),
     };
 
-    let runner = MontyRun::new(
+    let runner = MontyRun::new_with_modules(
         program.text.clone(),
-        "definition.tkdp.transient",
+        TRANSIENT_FILE_NAME,
         Vec::new(),
+        program.modules.clone(),
         CompileOptions::default(),
     )
     .map_err(|exc| translator.render(&exc, None))?;
@@ -57,11 +78,21 @@ pub fn execute(program: &Program, original: &str) -> Result<MontyObject, RunFail
 }
 
 struct Translator<'a> {
+    /// The main program: frames from it may carry the diagnostic range.
+    root: FileContext<'a>,
+    /// One context per registered part, keyed by its traceback file name.
+    parts: Vec<FileContext<'a>>,
+}
+
+/// Everything needed to translate one file's Monty positions (over its
+/// lowered text) back into the operator's original coordinates.
+struct FileContext<'a> {
     map: &'a SourceMap,
-    transient: LineTable,
-    transient_text: &'a str,
+    lowered_table: LineTable,
+    lowered_text: &'a str,
     original_table: LineTable,
     original: &'a str,
+    display: &'a str,
 }
 
 impl Translator<'_> {
@@ -73,7 +104,26 @@ impl Translator<'_> {
         let mut message = summary;
         let mut range = None;
         for frame in exc.traceback() {
-            let (line, rendered) = self.render_frame(frame.start.line, frame.start.column);
+            let (line, rendered) = match frame.filename.as_str() {
+                // Main-program frames translate through the root map and may
+                // carry the diagnostic range — ranges are root-source-relative
+                // only.
+                TRANSIENT_FILE_NAME => {
+                    self.root
+                        .render_frame(frame.start.line, frame.start.column, true)
+                }
+                // Facade frames are internal machinery, never operator code.
+                FACADE_FILE_NAME => (None, "  in the tokeira facade (internal)".to_string()),
+                // Part frames translate through the part's own map to its
+                // original coordinates; they contribute text but no range.
+                other => match self.parts.iter().find(|part| part.display == other) {
+                    Some(part) => part.render_frame(frame.start.line, frame.start.column, false),
+                    None => (
+                        None,
+                        format!("  at {other}:{}:{}", frame.start.line, frame.start.column),
+                    ),
+                },
+            };
             message.push('\n');
             message.push_str(&rendered);
             if range.is_none() {
@@ -86,22 +136,30 @@ impl Translator<'_> {
         }
         RunFailure { message, range }
     }
+}
 
+impl FileContext<'_> {
     /// Renders one frame; returns the mapped operator range when the frame
-    /// landed in operator-derived text.
-    fn render_frame(&self, line: u32, column: u32) -> (Option<TextRange>, String) {
-        let offset = self.transient_offset(line, column);
+    /// landed in operator-derived text and this file may carry the range.
+    fn render_frame(
+        &self,
+        line: u32,
+        column: u32,
+        allow_range: bool,
+    ) -> (Option<TextRange>, String) {
+        let offset = self.lowered_offset(line, column);
         match self.map.translate(offset) {
             Some(Mapped::Original { offset, context }) => {
                 let (oline, ocol) = self.original_position(offset);
-                let mut rendered = format!("  at definition.tkdp:{oline}:{ocol}");
+                let mut rendered = format!("  at {}:{oline}:{ocol}", self.display);
                 if let Some(kind) = context {
                     rendered.push_str(&format!(" ({})", kind.describe()));
                 }
                 if let Some(text) = self.original_line_text(oline) {
                     rendered.push_str(&format!("\n    {}", text.trim_end()));
                 }
-                (Some(TextRange::empty(offset)), rendered)
+                let range = allow_range.then_some(TextRange::empty(offset));
+                (range, rendered)
             }
             Some(Mapped::Facade) => (None, "  in the tokeira facade (internal)".to_string()),
             Some(Mapped::Driver) => (None, "  in the tokeira driver (internal)".to_string()),
@@ -109,10 +167,10 @@ impl Translator<'_> {
         }
     }
 
-    /// Transient (1-based line, 1-based char column) → byte offset.
-    fn transient_offset(&self, line: u32, column: u32) -> TextSize {
-        let line_start = self.transient.line_start(line);
-        let line_text = &self.transient_text[usize::from(line_start)..];
+    /// Lowered-text (1-based line, 1-based char column) → byte offset.
+    fn lowered_offset(&self, line: u32, column: u32) -> TextSize {
+        let line_start = self.lowered_table.line_start(line);
+        let line_text = &self.lowered_text[usize::from(line_start)..];
         let line_text = line_text.split('\n').next().unwrap_or("");
         let want = column.saturating_sub(1) as usize;
         let byte_col = line_text

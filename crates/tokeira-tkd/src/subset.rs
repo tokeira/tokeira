@@ -131,6 +131,9 @@ impl<B: HostBridge> Checker<'_, B> {
                     "a part declares no parts — definitions are one level deep",
                 ),
             },
+            // `use` takes are validated (target, pub, acyclicity) at part
+            // load, before this pass runs.
+            Item::Use(_) => {}
             other => self.reject(
                 other.span(),
                 format!("item not allowed in a `.tkd`: `{}`", item_kind(other)),

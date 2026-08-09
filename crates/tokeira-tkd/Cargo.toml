@@ -10,7 +10,6 @@ authors.workspace = true
 [package.metadata.tokeira.definition-frontend]
 format = "tkd"
 source-extension = "tkd"
-default-relative-path = "definition.tkd"
 
 [dependencies]
 tokeira-orchestrator = { path = "../tokeira-orchestrator" }

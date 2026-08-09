@@ -7,8 +7,9 @@
 //!
 //! This command reads the deployment *directory* rather than a parsed
 //! `DeploymentContext`, for two reasons. First, the sources are
-//! platform-shaped: a forwarded deployment is defined by `definition.tkd`,
-//! an in-process one by `deployment.toml`, and both carry a `tokeirad.toml`
+//! platform-shaped: a forwarded deployment is defined by the definition
+//! document its metadata records (a `.tkd` or `.tkdp` source), an
+//! in-process one by `deployment.toml`, and both carry a `tokeirad.toml`
 //! — so parsing one fixed layout hard-fails on the other. Second, showing
 //! configuration must never depend on that configuration being loadable: a
 //! malformed or missing file is precisely when an operator reaches for

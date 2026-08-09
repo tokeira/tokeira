@@ -103,38 +103,47 @@ impl<'a> Scope<'a> {
         self.current.is_some()
     }
 
+    /// The table a type name resolves in, for this scope: the document's
+    /// own types first, then its `use` takes (validated pub at load), then
+    /// — for parts — the root's types as the backdrop. `use` admits no
+    /// renames, so the name is the same in the resolved table.
+    fn type_home(&self, name: &str) -> Option<&'a crate::schema::TypeTable> {
+        let own = &self.tables().types;
+        if own.is_struct(name) || own.is_enum(name) {
+            return Some(own);
+        }
+        if let Some(source) = self.tables().uses.get(name) {
+            return Some(&self.scopes.parts[source].types);
+        }
+        if self.in_part() {
+            let root = &self.scopes.root.types;
+            if root.is_struct(name) || root.is_enum(name) {
+                return Some(root);
+            }
+        }
+        None
+    }
+
     pub fn is_struct(&self, name: &str) -> bool {
-        self.tables().types.is_struct(name)
-            || (self.in_part() && self.scopes.root.types.is_struct(name))
+        self.type_home(name).is_some_and(|t| t.is_struct(name))
     }
 
     pub fn is_enum(&self, name: &str) -> bool {
-        self.tables().types.is_enum(name)
-            || (self.in_part() && self.scopes.root.types.is_enum(name))
+        self.type_home(name).is_some_and(|t| t.is_enum(name))
     }
 
     pub fn enum_has_unit_variant(&self, ty: &str, variant: &str) -> bool {
-        if self.tables().types.is_enum(ty) {
-            return self.tables().types.enum_has_unit_variant(ty, variant);
-        }
-        self.in_part() && self.scopes.root.types.enum_has_unit_variant(ty, variant)
+        self.type_home(ty)
+            .is_some_and(|t| t.enum_has_unit_variant(ty, variant))
     }
 
     pub fn enum_has_variant(&self, ty: &str, variant: &str) -> bool {
-        if self.tables().types.is_enum(ty) {
-            return self.tables().types.enum_has_variant(ty, variant);
-        }
-        self.in_part() && self.scopes.root.types.enum_has_variant(ty, variant)
+        self.type_home(ty)
+            .is_some_and(|t| t.enum_has_variant(ty, variant))
     }
 
     pub fn struct_field_names(&self, name: &str) -> Option<Vec<String>> {
-        if self.tables().types.is_struct(name) {
-            return self.tables().types.struct_field_names(name);
-        }
-        if self.in_part() {
-            return self.scopes.root.types.struct_field_names(name);
-        }
-        None
+        self.type_home(name)?.struct_field_names(name)
     }
 
     /// The current scope's own function, for bare-name calls.

@@ -65,8 +65,6 @@ pub struct FrontendDescriptor {
     pub format: DefinitionFormatId,
     /// Canonical source extension without a leading dot.
     pub source_extension: tokeira_orchestrator::DefinitionSourceExtension,
-    /// Safe default source path inside a deployment and a platform package.
-    pub default_relative_path: tokeira_orchestrator::RelativeDefinitionPath,
     /// Source-specific coordinates retained after admission.
     pub source: FrontendSource,
 }
@@ -109,6 +107,20 @@ pub enum CatalogError {
     NoSource,
 }
 
+/// Renders a declared-roots list for selection errors.
+fn declared_list(
+    candidates: &[(
+        &FrontendDescriptor,
+        &tokeira_orchestrator::RelativeDefinitionPath,
+    )],
+) -> String {
+    candidates
+        .iter()
+        .map(|(frontend, entry)| format!("`{entry}` ({})", frontend.format))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl PlatformCatalog {
     /// Discover and normalize a recognized source workspace.
     pub fn from_workspace(workspace_root: &Path) -> Result<Self, CatalogError> {
@@ -129,7 +141,6 @@ impl PlatformCatalog {
             .map(|descriptor| FrontendDescriptor {
                 format: descriptor.format.clone(),
                 source_extension: descriptor.source_extension.clone(),
-                default_relative_path: descriptor.default_relative_path.clone(),
                 source: FrontendSource::Workspace(descriptor),
             })
             .collect();
@@ -157,7 +168,6 @@ impl PlatformCatalog {
             .map(|descriptor| FrontendDescriptor {
                 format: descriptor.format.clone(),
                 source_extension: descriptor.source_extension.clone(),
-                default_relative_path: descriptor.default_relative_path.clone(),
                 source: FrontendSource::Published(
                     by_format
                         .get(&descriptor.format)
@@ -216,21 +226,6 @@ impl PlatformCatalog {
             return Err(CatalogError::Invalid(format!(
                 "expected at most one default platform; found {default_count}"
             )));
-        }
-        for frontend in &frontends {
-            let extension = frontend
-                .default_relative_path
-                .as_path()
-                .extension()
-                .and_then(|value| value.to_str());
-            if extension != Some(frontend.source_extension.as_str()) {
-                return Err(CatalogError::Invalid(format!(
-                    "default path `{}` for format `{}` must use source extension `.{}`",
-                    frontend.default_relative_path,
-                    frontend.format,
-                    frontend.source_extension.as_str()
-                )));
-            }
         }
         for pair in frontends.windows(2) {
             if pair[0].format == pair[1].format {
@@ -292,7 +287,14 @@ impl PlatformCatalog {
         &self,
         platform: &PlatformDescriptor,
         requested: Option<&DefinitionFormatId>,
-    ) -> Result<(&FrontendDescriptor, PathBuf), CatalogError> {
+    ) -> Result<
+        (
+            &FrontendDescriptor,
+            tokeira_orchestrator::RelativeDefinitionPath,
+            PathBuf,
+        ),
+        CatalogError,
+    > {
         let PlatformSource::Workspace(platform_package) = &platform.source else {
             return Err(CatalogError::Invalid(format!(
                 "platform `{}` is not a source-workspace descriptor",
@@ -306,59 +308,91 @@ impl PlatformCatalog {
             .ok_or_else(|| {
                 CatalogError::Invalid(format!("platform `{}` manifest has no parent", platform.id))
             })?;
-        if let Some(format) = requested {
-            let frontend = self.frontend(format)?;
-            let seed = package_dir.join(frontend.default_relative_path.as_path());
-            if !seed.is_file() {
+        // The platform names its own root documents; each entry's extension
+        // selects the frontend. No engine-side name exists — convention is
+        // the operator's business.
+        let mut candidates = Vec::new();
+        for entry in &platform_package.definitions {
+            let extension = entry
+                .as_path()
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let Some(frontend) = self
+                .frontends
+                .iter()
+                .find(|frontend| frontend.source_extension.as_str() == extension)
+            else {
                 return Err(CatalogError::Invalid(format!(
-                    "platform `{}` supplies no `{}` definition seed at {}",
-                    platform.id,
-                    format,
-                    seed.display()
+                    "platform `{}` declares definition `{entry}` but no frontend handles \
+                     `.{extension}`",
+                    platform.id
                 )));
-            }
-            return Ok((frontend, seed));
+            };
+            candidates.push((frontend, entry));
         }
-        // No requested format: the platform's declared `default-format`
-        // decides. Peer formats are equals, so with several seeds and no
-        // declaration there is no principled winner — the operator selects.
-        if let Some(format) = &platform_package.default_format {
-            let frontend = self.frontend(format)?;
-            let seed = package_dir.join(frontend.default_relative_path.as_path());
-            if !seed.is_file() {
-                return Err(CatalogError::Invalid(format!(
-                    "platform `{}` declares default definition format `{format}` but supplies no \
-                     seed at {}",
-                    platform.id,
-                    seed.display()
-                )));
-            }
-            return Ok((frontend, seed));
-        }
-        let candidates = self
-            .frontends
-            .iter()
-            .filter_map(|frontend| {
-                let seed = package_dir.join(frontend.default_relative_path.as_path());
-                seed.is_file().then_some((frontend, seed))
-            })
-            .collect::<Vec<_>>();
-        match candidates.as_slice() {
-            [(frontend, seed)] => Ok((*frontend, seed.clone())),
-            [] => Err(CatalogError::Invalid(format!(
-                "platform `{}` supplies no recognized definition seed",
+        if candidates.is_empty() {
+            return Err(CatalogError::Invalid(format!(
+                "platform `{}` declares no definitions; name its root documents in the catalog \
+                 descriptor (`definitions = [\"…\"]`)",
                 platform.id
-            ))),
-            many => Err(CatalogError::Invalid(format!(
-                "platform `{}` supplies definition seeds for formats {} and declares no \
-                 `default-format`; select one with `--format`",
-                platform.id,
-                many.iter()
-                    .map(|(frontend, _)| format!("`{}`", frontend.format))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))),
+            )));
         }
+        let (frontend, entry) = if let Some(format) = requested {
+            // Resolve through the frontend inventory first so an unknown
+            // format keeps its own error taxonomy.
+            let _ = self.frontend(format)?;
+            *candidates
+                .iter()
+                .find(|(frontend, _)| &frontend.format == format)
+                .ok_or_else(|| {
+                    CatalogError::Invalid(format!(
+                        "platform `{}` declares no `{format}` definition; declared: {}",
+                        platform.id,
+                        declared_list(&candidates)
+                    ))
+                })?
+        } else if let Some(format) = &platform_package.default_format {
+            // No requested format: the platform's declared `default-format`
+            // decides.
+            *candidates
+                .iter()
+                .find(|(frontend, _)| &frontend.format == format)
+                .ok_or_else(|| {
+                    CatalogError::Invalid(format!(
+                        "platform `{}` declares default definition format `{format}` but no \
+                         matching definition; declared: {}",
+                        platform.id,
+                        declared_list(&candidates)
+                    ))
+                })?
+        } else {
+            // Peer formats are equals, so with several roots and no declared
+            // default there is no principled winner — the operator selects.
+            match candidates.as_slice() {
+                [only] => *only,
+                many => {
+                    return Err(CatalogError::Invalid(format!(
+                        "platform `{}` declares definitions for formats {} and no \
+                         `default-format`; select one with `--format`",
+                        platform.id,
+                        many.iter()
+                            .map(|(frontend, _)| format!("`{}`", frontend.format))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+        };
+        let seed = package_dir.join(entry.as_path());
+        if !seed.is_file() {
+            return Err(CatalogError::Invalid(format!(
+                "platform `{}` declares definition `{entry}` but the file is absent at {}",
+                platform.id,
+                seed.display()
+            )));
+        }
+        Ok((frontend, entry.clone(), seed))
     }
 
     /// Borrow the deterministic admitted platform inventory.
@@ -456,7 +490,7 @@ fn admit_locators(
 mod tests {
     use std::collections::BTreeSet;
 
-    use tokeira_orchestrator::{DefinitionSourceExtension, RelativeDefinitionPath};
+    use tokeira_orchestrator::DefinitionSourceExtension;
     use tokeira_provisioner::{
         BuildProfile, EngineIdentity, PublishedDefinitionFrontendDescriptor,
         PublishedPlatformDescriptor, Sha256Digest,
@@ -484,7 +518,6 @@ mod tests {
             frontends: vec![PublishedDefinitionFrontendDescriptor {
                 format: format.clone(),
                 source_extension: DefinitionSourceExtension::new("tkd").expect("extension"),
-                default_relative_path: RelativeDefinitionPath::new("definition.tkd").expect("path"),
             }],
             locators: vec![PublishedProvisionerLocator {
                 platform,
@@ -525,14 +558,14 @@ mod tests {
 
         // Compose ships peer seeds; no requested format resolves through the
         // platform's declared `default-format`.
-        let (frontend, seed) = catalog
+        let (frontend, _, seed) = catalog
             .workspace_frontend(platform, None)
             .expect("declared default seed");
         assert_eq!(frontend.format, format("tkd"));
-        assert!(seed.ends_with("platforms/compose/definition.tkd"));
+        assert!(seed.ends_with("platforms/compose/deployment.tkd"));
 
         // An explicit format selects its peer seed.
-        let (frontend, seed) = catalog
+        let (frontend, _, seed) = catalog
             .workspace_frontend(platform, Some(&format("tkdp")))
             .expect("requested tkdp seed");
         assert_eq!(frontend.format, format("tkdp"));

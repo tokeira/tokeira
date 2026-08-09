@@ -10,7 +10,6 @@ authors.workspace = true
 [package.metadata.tokeira.definition-frontend]
 format = "tkdp"
 source-extension = "tkdp"
-default-relative-path = "definition.tkdp"
 
 [dependencies]
 monty.workspace = true

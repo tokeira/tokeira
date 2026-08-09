@@ -121,7 +121,7 @@ impl DefinitionFrontend for TkdFrontend {
         let current_config = evaluate_config(current, current_parts, "current")?;
         let current_text = std::str::from_utf8(current.bytes)
             .map_err(|error| vec![format!("current definition is not UTF-8: {error}")])?;
-        crate::retarget_check(current_text, &prior_config, &current_config)
+        crate::retarget_check(current_text, current_parts, &prior_config, &current_config)
     }
 }
 

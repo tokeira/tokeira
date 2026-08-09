@@ -39,9 +39,13 @@ pub struct PlatformPackageDescriptor {
     /// Exact Engine_Version this platform definition composes with.
     pub engine: String,
     /// Definition format seeded when creation names none. Optional for
-    /// single-seed platforms; a platform supplying seeds for more than one
+    /// single-root platforms; a platform declaring roots for more than one
     /// format must declare it or force an explicit format selection.
     pub default_format: Option<DefinitionFormatId>,
+    /// The platform's root documents, one per format — the format found
+    /// through each entry's extension. The platform names its own files;
+    /// no engine-side name exists.
+    pub definitions: Vec<RelativeDefinitionPath>,
     /// Conventional source-library coordinates.
     pub package: PackageCoordinates,
 }
@@ -56,8 +60,6 @@ pub struct DefinitionFrontendPackageDescriptor {
     pub format: DefinitionFormatId,
     /// Seed-materialization source extension.
     pub source_extension: DefinitionSourceExtension,
-    /// Safe default path relative to a deployment directory.
-    pub default_relative_path: RelativeDefinitionPath,
     /// Conventional source-library coordinates.
     pub package: PackageCoordinates,
 }
@@ -103,6 +105,8 @@ struct RawPlatformDescriptor {
     default: bool,
     #[serde(default)]
     default_format: Option<String>,
+    #[serde(default)]
+    definitions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,7 +114,6 @@ struct RawPlatformDescriptor {
 struct RawFrontendDescriptor {
     format: String,
     source_extension: String,
-    default_relative_path: String,
 }
 
 /// Decode recognized package descriptors from one trusted source workspace.
@@ -217,12 +220,48 @@ fn decode_platform(
                 format!("default-format is not a valid definition format: {error}"),
             )
         })?;
+    // The platform names its own root documents — one per format, the
+    // format found through the entry's extension. No engine-side name
+    // exists; convention is the operator's business.
+    let mut definitions = Vec::new();
+    let mut seen_extensions: BTreeSet<String> = BTreeSet::new();
+    for entry in raw.definitions {
+        let path = RelativeDefinitionPath::new(entry)
+            .map_err(|error| invalid(package, "platform", error.to_string()))?;
+        let Some(extension) = path
+            .as_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_string)
+        else {
+            return Err(invalid(
+                package,
+                "platform",
+                format!(
+                    "definition `{}` has no extension; the extension selects the frontend",
+                    path.as_str()
+                ),
+            ));
+        };
+        if !seen_extensions.insert(extension.clone()) {
+            return Err(invalid(
+                package,
+                "platform",
+                format!(
+                    "two definitions carry the `.{extension}` extension; a platform declares \
+                     one root per format"
+                ),
+            ));
+        }
+        definitions.push(path);
+    }
     let coordinates = package_coordinates(package, "platform")?;
     Ok(PlatformPackageDescriptor {
         id,
         is_default: raw.default,
         engine: raw.engine,
         default_format,
+        definitions,
         package: coordinates,
     })
 }
@@ -237,28 +276,10 @@ fn decode_frontend(
         .map_err(|error| invalid(package, "definition-frontend", error.to_string()))?;
     let source_extension = DefinitionSourceExtension::new(raw.source_extension)
         .map_err(|error| invalid(package, "definition-frontend", error.to_string()))?;
-    let default_relative_path = RelativeDefinitionPath::new(raw.default_relative_path)
-        .map_err(|error| invalid(package, "definition-frontend", error.to_string()))?;
-    let path_extension = default_relative_path
-        .as_path()
-        .extension()
-        .and_then(|extension| extension.to_str());
-    if path_extension != Some(source_extension.as_str()) {
-        return Err(invalid(
-            package,
-            "definition-frontend",
-            format!(
-                "default path `{}` must use source extension `.{}`",
-                default_relative_path.as_str(),
-                source_extension.as_str()
-            ),
-        ));
-    }
     let coordinates = package_coordinates(package, "definition-frontend")?;
     Ok(DefinitionFrontendPackageDescriptor {
         format,
         source_extension,
-        default_relative_path,
         package: coordinates,
     })
 }
@@ -406,6 +427,7 @@ id = "compose"
 engine = "0.1.0"
 default = false
 default-format = "tkd"
+definitions = ["deployment.tkd"]
 "#,
             false,
         );
@@ -427,7 +449,6 @@ default = false
 [package.metadata.tokeira.definition-frontend]
 format = "tkd"
 source-extension = "tkd"
-default-relative-path = "definition.tkd"
 "#,
             false,
         );
@@ -445,8 +466,8 @@ default-relative-path = "definition.tkd"
         );
         assert_eq!(discovered.frontends[0].format.as_str(), "tkd");
         assert_eq!(
-            discovered.frontends[0].default_relative_path.as_str(),
-            "definition.tkd"
+            discovered.platforms[1].definitions[0].as_str(),
+            "deployment.tkd"
         );
     }
 
@@ -485,7 +506,6 @@ default-format = "Not A Format!"
 [package.metadata.tokeira.definition-frontend]
 format = "tkd"
 source-extension = "tkd"
-default-relative-path = "definition.tkd"
 "#,
             true,
         );
@@ -516,21 +536,23 @@ default = false
             Err(DiscoveryError::DuplicatePlatform(id)) if id == "compose"
         ));
 
-        let root = workspace(&["frontend"]);
+        // The platform names its roots one per format: two entries sharing
+        // an extension refuse at discovery.
+        let root = workspace(&["dupes"]);
         write_package(
             root.path(),
-            "frontend",
+            "dupes",
             r#"
-[package.metadata.tokeira.definition-frontend]
-format = "tkd"
-source-extension = "tkd"
-default-relative-path = "definition.py"
+[package.metadata.tokeira.platform]
+id = "dupes"
+engine = "0.1.0"
+default = false
+definitions = ["a.tkd", "b.tkd"]
 "#,
             false,
         );
-        let error =
-            discover_workspace_descriptors(root.path()).expect_err("path must match format");
-        assert!(error.to_string().contains("must use source extension"));
+        let error = discover_workspace_descriptors(root.path()).expect_err("one root per format");
+        assert!(error.to_string().contains("one root per format"));
     }
 
     #[test]

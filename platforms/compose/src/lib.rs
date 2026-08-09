@@ -10,10 +10,13 @@
 //!
 //! Compose is five things:
 //!
-//! 1. **The definitions** — `definition.tkd` and its `definition.tkdp` peer,
-//!    the programs that describe the deployment's infrastructure and
-//!    services in terms of the kinds wired below, and author the
-//!    configuration shape (`struct Compose` and friends) exactly once. This
+//! 1. **The definitions** — the `.tkd` set (`deployment.tkd` wiring the
+//!    modules, `platform.tkd` carrying the configuration model,
+//!    `observability.tkd` declaring that module's services) and its
+//!    `definition.tkdp` peer: the programs that describe the deployment's
+//!    infrastructure and services in terms of the kinds wired below, and
+//!    author the configuration shape (`struct Compose` and friends) exactly
+//!    once. This
 //!    crate defines no config types and validates no config values: each
 //!    kind validates its own input where it is authored, and the
 //!    definition's shapes make invalid states unrepresentable.
@@ -87,7 +90,7 @@ pub fn platform() -> PlatformDeclaration {
 // package (`[package.metadata.tokeira.platform]`, declaring `id` and
 // `default-format`); the frontend through its own descriptor, which also
 // names the definition's conventional relative path, co-locating
-// `definition.tkd` in this package. The generated binary's `main` is the
+// the declared root in this package. The generated binary's `main` is the
 // framework's macro, which hands both declarations, with the identity pair
 // the binary is built as, to the framework:
 //

@@ -7,18 +7,21 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# The catalog descriptor: how the build discovers this platform, and the
-# definition format selected when none is requested. The definitions sit
-# beside this file at each frontend's conventional relative path
-# (definition.tkd, definition.tkdp) — catalog convention plus co-location is
-# the whole platform-to-definition association.
+# The catalog descriptor: how the build discovers this platform, the
+# definition format selected when none is requested, and the declared root
+# documents. Each root's remaining parts sit beside it and are found through
+# its `mod` declarations — the descriptor names roots only.
 [package.metadata.tokeira.platform]
 id = "compose"
 engine = "0.1.0"
 default = false
 # Seeded when `deployment create` names no --format; the package supplies
-# peer seeds for both `tkd` and `tkdp`.
+# peer roots for both `tkd` and `tkdp`.
 default-format = "tkd"
+# The platform names its own root documents — one per format, the format
+# found through the extension. Convention is the operator's; no engine-side
+# name exists.
+definitions = ["deployment.tkd", "definition.tkdp"]
 
 # The platform is description plus its own kinds: the definitions, their
 # companion content (observability/), the descriptor above, one exported
@@ -45,6 +48,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokeira-observability = { workspace = true }
+tokeira-tkd = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

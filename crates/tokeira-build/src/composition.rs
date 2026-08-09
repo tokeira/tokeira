@@ -580,14 +580,14 @@ macro_rules! bound_provisioner_main {
                 &root,
                 "frontends/tkd",
                 "tkd-frontend",
-                "[package.metadata.tokeira.definition-frontend]\nformat = \"tkd\"\nsource-extension = \"tkd\"\ndefault-relative-path = \"definition.tkd\"\n",
+                "[package.metadata.tokeira.definition-frontend]\nformat = \"tkd\"\nsource-extension = \"tkd\"\n",
                 "pub fn frontend() {}\n",
             );
             package(
                 &root,
                 "frontends/tkdp",
                 "tkdp-frontend",
-                "[package.metadata.tokeira.definition-frontend]\nformat = \"tkdp\"\nsource-extension = \"tkdp\"\ndefault-relative-path = \"definition.tkdp\"\n",
+                "[package.metadata.tokeira.definition-frontend]\nformat = \"tkdp\"\nsource-extension = \"tkdp\"\n",
                 "pub fn frontend() {}\n",
             );
             package(

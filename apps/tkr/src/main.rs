@@ -1054,7 +1054,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        fs::remove_file(deployments.path("compose-route").join("definition.tkd")).unwrap();
+        fs::remove_file(deployments.path("compose-route").join("deployment.tkd")).unwrap();
         assert!(
             deployments
                 .uses_bound_provisioner(Some("compose-route"))
@@ -1150,7 +1150,7 @@ mod tests {
             panic!("a forwarded deployment must refuse the in-process context");
         };
         let message = err.to_string();
-        assert!(message.contains("definition.tkd"), "unexpected: {message}");
+        assert!(message.contains("deployment.tkd"), "unexpected: {message}");
         assert!(message.contains("tkp"), "unexpected: {message}");
         assert!(
             !message.contains("No such file") && !message.contains("yet"),
@@ -1259,8 +1259,9 @@ mod tests {
 
     #[test]
     fn compose_deployment_seeds_the_tkd_definition() {
-        // Compose is now `.tkd`-defined + tkp-provisioned (forwarded): `create`
-        // seeds `definition.tkd`, not a legacy in-process `deployment.toml`.
+        // Compose is `.tkd`-defined + tkp-provisioned (forwarded): `create`
+        // seeds the declared root and its parts, not a legacy in-process
+        // `deployment.toml`.
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
@@ -1273,10 +1274,17 @@ mod tests {
             .unwrap();
         let dir = deployments.path("test-compose");
 
-        let tkd = fs::read_to_string(dir.join("definition.tkd")).unwrap();
+        let tkd = fs::read_to_string(dir.join("deployment.tkd")).unwrap();
         assert!(
             tkd.contains("fn deployment"),
             "seeds the compose `.tkd` structure"
+        );
+        // The definition set stages whole: the split root's parts land
+        // beside it.
+        assert!(dir.join("platform.tkd").is_file(), "stages the model part");
+        assert!(
+            dir.join("observability.tkd").is_file(),
+            "stages the observability part"
         );
         assert!(
             tkd.contains("Storage::InMemory"),
@@ -1304,7 +1312,7 @@ mod tests {
         let descriptor = catalog
             .platform(&platform("compose"))
             .expect("Compose descriptor");
-        let (frontend, seed) = catalog
+        let (frontend, definition_path, seed) = catalog
             .workspace_frontend(descriptor, None)
             .expect("Compose seed frontend");
         let catalog::PlatformSource::Workspace(platform_package) = &descriptor.source else {
@@ -1324,8 +1332,9 @@ mod tests {
                 Some(deployment_dir::DefinitionSeed {
                     definition: tokeira_provisioner::RecordedDefinition {
                         format: frontend.format.clone(),
-                        path: frontend.default_relative_path.clone(),
+                        path: definition_path,
                     },
+                    parts: deployment_dir::sibling_parts(&seed).expect("platform-owned parts"),
                     bytes: fs::read(seed).expect("platform-owned seed"),
                 }),
             )

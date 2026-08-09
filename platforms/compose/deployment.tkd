@@ -1,0 +1,116 @@
+// The Compose deployment, as the root document of a three-part definition.
+// The name says what it holds: the deployment — its entry points and the
+// wiring of its modules. The configuration model lives in the `platform`
+// part; the observability module and its services live in the
+// `observability` part. Everything the deployment consists of is still
+// stated in these documents, once, and nowhere else.
+
+mod platform;
+mod observability;
+
+use platform::{Aws, Backend, Compose, Grafana, Observability, Storage, Tokeirad};
+
+// The deployment's configuration values. This function is the operator
+// surface: its literals are the defaults a new deployment starts from, and
+// revisions edit them in place.
+fn config() -> Compose {
+    Compose {
+        storage: Storage::InMemory,
+        aws: Aws { region: "eu-west-2".into() },
+        tokeirad: Tokeirad {
+            image: "tokeirad:latest".into(),
+            replicas: 1,
+            grpc_port: 7233,
+            metrics_port: 9090,
+        },
+        observability: Observability {
+            mimir: Backend { image: "grafana/mimir:3.0.6".into(), replicas: 1 },
+            loki: Backend { image: "grafana/loki:3.7.1".into(), replicas: 1 },
+            grafana: Grafana {
+                image: "grafana/grafana-oss:12.4.3".into(),
+                replicas: 1,
+                port: 3000,
+                admin_password: "admin".into(),
+            },
+            alloy: Backend { image: "grafana/alloy:v1.16.0".into(), replicas: 1 },
+        },
+    }
+}
+
+// The deployment graph: the root reads as the wiring diagram. Modules group
+// resources and order coarsely; within a module, a resource's trailing
+// dependency list orders creation exactly.
+fn deployment(cfg: Compose, cx: Context) -> Deployment {
+    let d = Deployment::new(&["default"]);
+
+    // Bootstrap: the deployment's local state root. Everything else stands
+    // on it, so every other module depends on this one.
+    let local_state = d.module("local_state", vec![]);
+    local_state.resource("dir", LocalStateDir {});
+
+    // Durable storage, present only when the configuration selects DSQL.
+    // The writeback entries feed the applied infrastructure's identities
+    // into the server configuration document under `infrastructure.*`.
+    if let Storage::Dsql(storage) = &cfg.storage {
+        let dsql = d.module("dsql", vec![local_state]);
+        let cluster = dsql.resource(
+            "cluster",
+            DsqlCluster {
+                identity: format!("{}-compose", cx.project_name),
+                region: storage.region.clone(),
+                mode: storage.mode.clone(),
+                endpoint: storage.endpoint.clone(),
+                arn: storage.arn.clone(),
+            },
+        );
+        let rate_limiter = dsql.resource(
+            "rate_limiter",
+            DynamoDbTable {
+                table: format!("{}-dsql-rate-limiter", cx.project_name),
+                region: storage.region.clone(),
+                hash_key: "pk".into(),
+                ttl: Some("ttl_epoch".into()),
+            },
+        );
+        let conn_lease = dsql.resource(
+            "conn_lease",
+            DynamoDbTable {
+                table: format!("{}-dsql-conn-lease", cx.project_name),
+                region: storage.region.clone(),
+                hash_key: "pk".into(),
+                ttl: Some("ttl_epoch".into()),
+            },
+        );
+
+        d.writeback("infrastructure.storage", "dsql");
+        d.writeback("infrastructure.dsql.endpoint", cluster.output("cluster_endpoint"));
+        d.writeback("infrastructure.dsql.region", storage.region.clone());
+        d.writeback("infrastructure.dsql.rate_limiter_table", rate_limiter.output("table_name"));
+        d.writeback("infrastructure.dsql.conn_lease_table", conn_lease.output("table_name"));
+    }
+
+    // The engine itself: the recorded server configuration document and the
+    // tokeirad service that mounts it and follows its digest.
+    let runtime = d.module("runtime", vec![local_state]);
+    let server_config = runtime.resource("server_config", ServerConfig {});
+    runtime.resource(
+        "tokeirad",
+        Service {
+            image: cfg.tokeirad.image.clone(),
+            replicas: cfg.tokeirad.replicas,
+            publish: vec![cfg.tokeirad.grpc_port, cfg.tokeirad.metrics_port],
+            aws_region: match &cfg.storage {
+                Storage::Dsql(storage) => Some(storage.region.clone()),
+                _ => None,
+            },
+            ..Service::EMPTY
+        },
+        vec![server_config],
+    );
+
+    // The observability module: declared whole by its own part, against the
+    // same deployment, downstream of the modules it stands on.
+    observability::define(d, cfg, cx, local_state, runtime);
+
+    d
+}

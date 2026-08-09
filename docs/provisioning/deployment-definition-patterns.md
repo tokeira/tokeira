@@ -14,10 +14,10 @@ completed graph and the host-free configuration value.
 
 | Concern | Current example | Source |
 |---|---|---|
-| Separate editable values from deployment structure | `config()` and `deployment()` | [Compose definition](../../platforms/compose/definition.tkd) |
-| Author the configuration shape once, in the definition | `struct Compose` and kind input validation | [Compose definition](../../platforms/compose/definition.tkd) |
+| Separate editable values from deployment structure | `config()` and `deployment()` | [Compose deployment root](../../platforms/compose/deployment.tkd) |
+| Author the configuration shape once, in the definition | `struct Compose` and kind input validation | [Compose platform part](../../platforms/compose/platform.tkd) |
 | Receive platform runtime facts | the framework-supplied evaluation context | [Engine](../../crates/tokeira-provisioner-cli/src/engine.rs) |
-| Select modules from config variants | Conditional DSQL module | [Compose definition](../../platforms/compose/definition.tkd) |
+| Select modules from config variants | Conditional DSQL module | [Compose deployment root](../../platforms/compose/deployment.tkd) |
 | Keep host paths out of source | Logical `Volume` values | [Compose kinds](../../crates/tokeira-compose/src/kinds/mod.rs) |
 | Preserve configuration coupling | Resource dependencies plus content digests | [Compose kinds](../../crates/tokeira-compose/src/kinds/mod.rs) |
 | Decode kinds from the declared vocabulary | `Vocabulary::of` over the declared kind sets | [Platform declaration](../../crates/tokeira-platform/src/declaration.rs) |
@@ -264,6 +264,6 @@ shape mechanically:
 - [The platform provisioner](provisioner.md) — lifecycle seam, state, and transitions.
 - [`tkr` and `tkp`](tkr-and-tkp.md) — construction, identity, placement, and verification.
 - [Extending the IaC framework](../iac/extending.md) — resource and provider seams.
-- [Compose definition](../../platforms/compose/definition.tkd),
+- [Compose definition set](../../platforms/compose/deployment.tkd),
   [kind set](../../crates/tokeira-compose/src/kinds/mod.rs), and
   [provisioner](../../platforms/compose/src/lib.rs) — the complete current Compose path.

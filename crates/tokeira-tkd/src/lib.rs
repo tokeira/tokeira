@@ -35,25 +35,10 @@ pub fn interpret<B: HostBridge>(
 ) -> Result<(B::Output, Value<B::Host>), EvalError> {
     let file = syn::parse_file(src).map_err(|e| EvalError::new(located_parse_error(&e)))?;
     let (types, fns) = schema::collect(&file)?;
-    // Parts load (and subset-check, and shadow-check) before the root's own
-    // subset pass, because admitting the root's `part::fn(...)` calls needs
-    // the loaded part tables.
-    let scopes = parts::load(&file, parts::Tables { types, fns }, bridge, part_sources)?;
-    subset::check(
-        &file,
-        bridge,
-        &scopes.root.types,
-        subset::SubsetScope::Root {
-            parts: &scopes.parts,
-        },
-    )
-    .map_err(|d| {
-        let span = d.0.first().map(|diagnostic| diagnostic.span);
-        EvalError::new(format!(
-            "definition is outside the interpreted subset:\n{d}"
-        ))
-        .with_optional_span(span)
-    })?;
+    // The load owns everything pre-evaluation: part resolution, `use`
+    // validation and acyclicity, every document's subset pass against its
+    // effective types, and the set's merged admission.
+    let scopes = parts::load(&file, types, fns, bridge, part_sources)?;
     let interp = eval::Interp {
         bridge,
         scope: eval::Scope::root(&scopes),
@@ -69,8 +54,7 @@ pub fn interpret<B: HostBridge>(
             "config() must be host-free; an author kind cannot appear in the config surface",
         ));
     }
-    let adm = admission::extract(&file);
-    admission::check_requires(&interp, &adm, &cfg)?;
+    admission::check_requires(&interp, &scopes.admission, &cfg)?;
     let dep = eval_deployment(&interp, cfg.clone())?;
     Ok((dep, cfg))
 }
@@ -84,17 +68,9 @@ pub fn validate<B: HostBridge>(
 ) -> Result<(), Vec<String>> {
     let file = syn::parse_file(src).map_err(|e| vec![located_parse_error(&e)])?;
     let (types, fns) = schema::collect(&file).map_err(|e| vec![e.msg])?;
-    let scopes = parts::load(&file, parts::Tables { types, fns }, bridge, part_sources)
-        .map_err(|e| vec![e.msg])?;
-    subset::check(
-        &file,
-        bridge,
-        &scopes.root.types,
-        subset::SubsetScope::Root {
-            parts: &scopes.parts,
-        },
-    )
-    .map_err(Diagnostics::into_messages)
+    parts::load(&file, types, fns, bridge, part_sources)
+        .map(|_| ())
+        .map_err(|e| vec![e.msg])
 }
 
 /// Locate a parse failure for the operator: syn's message alone ("expected
@@ -113,9 +89,34 @@ pub(crate) fn located_parse_error(e: &syn::Error) -> String {
 /// whether any `#[create]` (create-time-immutable) field changed. The apply layer
 /// calls this against the recorded config before reconciling. Config values are
 /// host-free, so this is independent of the platform host type.
-pub fn retarget_check<H>(src: &str, old: &Value<H>, new: &Value<H>) -> Result<(), Vec<String>> {
+///
+/// `#[create]` may sit in any document of the set — a model part carries the
+/// configuration types — so the annotation scan resolves the root's declared
+/// parts and reads the whole set (a parse-only pass; nothing evaluates).
+pub fn retarget_check<H>(
+    src: &str,
+    part_sources: &dyn tokeira_platform::definition::SourceResolver,
+    old: &Value<H>,
+    new: &Value<H>,
+) -> Result<(), Vec<String>> {
     let file = syn::parse_file(src).map_err(|e| vec![located_parse_error(&e)])?;
-    let adm = admission::extract(&file);
+    let mut adm = admission::extract(&file);
+    for item in &file.items {
+        let syn::Item::Mod(declared) = item else {
+            continue;
+        };
+        let name = declared.ident.to_string();
+        let bytes = part_sources
+            .resolve(&name)
+            .map_err(|e| vec![e.to_string()])?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|e| vec![format!("{name}.tkd: part source is not UTF-8: {e}")])?;
+        let part_file = syn::parse_file(text)
+            .map_err(|e| vec![format!("{name}.tkd: {}", located_parse_error(&e))])?;
+        let part_adm = admission::extract(&part_file);
+        adm.creates.extend(part_adm.creates);
+        adm.requires.extend(part_adm.requires);
+    }
     admission::check_retarget(&adm, old, new).map_err(|e| vec![e.msg])
 }
 

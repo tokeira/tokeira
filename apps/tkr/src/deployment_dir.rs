@@ -61,6 +61,40 @@ pub(crate) const PROVISIONER_BIN: &str = "tkp";
 pub(crate) struct DefinitionSeed {
     pub(crate) definition: RecordedDefinition,
     pub(crate) bytes: Vec<u8>,
+    /// The definition's part files, staged beside the root: every sibling
+    /// carrying the root's extension in the platform package. A part is a
+    /// document of the definition set — without them a split root cannot
+    /// resolve at check or evaluation. Mirrors the retention rule in
+    /// `tokeira-provisioner-cli::config_history`.
+    pub(crate) parts: Vec<(String, Vec<u8>)>,
+}
+
+/// Collect the definition's part files beside the seed: every sibling file
+/// with the root's extension, excluding the root itself, ascending by name.
+pub(crate) fn sibling_parts(seed_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let Some(dir) = seed_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let Some(extension) = seed_path.extension() else {
+        return Ok(Vec::new());
+    };
+    let root_name = seed_path.file_name();
+    let mut parts = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension() == Some(extension) && path.file_name() != root_name && path.is_file() {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("part file {} has a non-UTF-8 name", path.display()))?
+                .to_string();
+            let bytes = fs::read(&path)
+                .with_context(|| format!("failed to read definition part {}", path.display()))?;
+            parts.push((name, bytes));
+        }
+    }
+    parts.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(parts)
 }
 
 /// Incomplete deployment held away from its final name until every staged
@@ -322,9 +356,15 @@ impl DeploymentResolver {
             let definition_path = path.join(seed.definition.path.as_path());
             let definition_parent = definition_path
                 .parent()
-                .expect("a deployment-relative definition has a parent");
-            fs::create_dir_all(definition_parent)?;
+                .expect("a deployment-relative definition has a parent")
+                .to_path_buf();
+            fs::create_dir_all(&definition_parent)?;
             fs::write(definition_path, seed.bytes)?;
+            // The definition set stages whole: parts land beside the root,
+            // where check, evaluation, retention, and retarget resolve them.
+            for (name, bytes) in &seed.parts {
+                fs::write(definition_parent.join(name), bytes)?;
+            }
             fs::write(
                 path.join(TOKEIRAD_TOML),
                 tokeira_config::TokeiraConfig::default().to_toml()?,
@@ -375,12 +415,14 @@ impl DeploymentResolver {
             let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
             let catalog = crate::catalog::PlatformCatalog::from_workspace(&workspace)?;
             let platform_descriptor = catalog.platform(&platform)?;
-            let (frontend, path) = catalog.workspace_frontend(platform_descriptor, None)?;
+            let (frontend, definition_path, path) =
+                catalog.workspace_frontend(platform_descriptor, None)?;
             Some(DefinitionSeed {
                 definition: RecordedDefinition {
                     format: frontend.format.clone(),
-                    path: frontend.default_relative_path.clone(),
+                    path: definition_path,
                 },
+                parts: sibling_parts(&path)?,
                 bytes: fs::read(path)?,
             })
         };

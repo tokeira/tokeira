@@ -8,9 +8,7 @@
 //! authority and integrity admission policy.
 
 use serde::{Deserialize, Serialize};
-use tokeira_orchestrator::{
-    DefinitionFormatId, DefinitionSourceExtension, PlatformId, RelativeDefinitionPath,
-};
+use tokeira_orchestrator::{DefinitionFormatId, DefinitionSourceExtension, PlatformId};
 
 use crate::EngineIdentity;
 
@@ -34,8 +32,6 @@ pub struct PublishedDefinitionFrontendDescriptor {
     pub format: DefinitionFormatId,
     /// Canonical source extension without a leading dot.
     pub source_extension: DefinitionSourceExtension,
-    /// Safe default definition path relative to a deployment directory.
-    pub default_relative_path: RelativeDefinitionPath,
 }
 
 /// Admitted external locations for one platform/format/engine build.
@@ -89,7 +85,6 @@ mod tests {
             frontends: vec![PublishedDefinitionFrontendDescriptor {
                 format: format.clone(),
                 source_extension: DefinitionSourceExtension::new("tkd").expect("extension"),
-                default_relative_path: RelativeDefinitionPath::new("definition.tkd").expect("path"),
             }],
             locators: vec![PublishedProvisionerLocator {
                 platform,
@@ -115,11 +110,6 @@ mod tests {
         let decoded: PublishedProvisionerCatalog =
             serde_json::from_value(encoded.clone()).expect("deserialize");
         assert_eq!(decoded, catalog);
-
-        let mut invalid_path = encoded.clone();
-        invalid_path["frontends"][0]["default_relative_path"] =
-            serde_json::Value::String("../definition.tkd".to_string());
-        assert!(serde_json::from_value::<PublishedProvisionerCatalog>(invalid_path).is_err());
 
         let mut unknown_field = encoded;
         unknown_field["platforms"][0]["crate_path"] =

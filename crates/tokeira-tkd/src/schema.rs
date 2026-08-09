@@ -11,7 +11,7 @@ use crate::value::EvalError;
 /// The `struct`/`enum` types the `.tkd` defines (the config schema). Used to
 /// decide whether a named type is a config type (generic `Value`) or an author
 /// type (routed to the bridge).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypeTable {
     structs: HashMap<String, ItemStruct>,
     enums: HashMap<String, ItemEnum>,
@@ -63,6 +63,51 @@ impl TypeTable {
             _ => Vec::new(),
         })
     }
+
+    /// Whether the named type is declared `pub` — the export gate for
+    /// cross-document `use`.
+    pub fn is_pub_type(&self, name: &str) -> bool {
+        let vis_is_pub = |vis: &syn::Visibility| matches!(vis, syn::Visibility::Public(_));
+        self.structs
+            .get(name)
+            .map(|s| vis_is_pub(&s.vis))
+            .or_else(|| self.enums.get(name).map(|e| vis_is_pub(&e.vis)))
+            .unwrap_or(false)
+    }
+
+    /// Copies the named type from `source` into this table under the same
+    /// name. Returns whether the source had it. Used to build a document's
+    /// effective table (own types plus everything its `use` declarations
+    /// bring in) for the subset pass; `use` admits no renames, so the local
+    /// and source names are always identical and constructed values keep one
+    /// type identity everywhere.
+    pub fn adopt(&mut self, source: &TypeTable, name: &str) -> bool {
+        if let Some(item) = source.structs.get(name) {
+            self.structs.insert(name.to_string(), item.clone());
+            return true;
+        }
+        if let Some(item) = source.enums.get(name) {
+            self.enums.insert(name.to_string(), item.clone());
+            return true;
+        }
+        false
+    }
+
+    /// Copies every type absent from this table in from `source` — the
+    /// root-types backdrop a part's effective table stands on (own-first:
+    /// nothing already present is overwritten).
+    pub fn adopt_missing(&mut self, source: &TypeTable) {
+        for (name, item) in &source.structs {
+            self.structs
+                .entry(name.clone())
+                .or_insert_with(|| item.clone());
+        }
+        for (name, item) in &source.enums {
+            self.enums
+                .entry(name.clone())
+                .or_insert_with(|| item.clone());
+        }
+    }
 }
 
 /// The `.tkd`'s functions (`config`, `deployment`, and any pure helpers).
@@ -98,6 +143,71 @@ pub fn collect(file: &File) -> Result<(TypeTable, FnTable), EvalError> {
         }
     }
     Ok((TypeTable { structs, enums }, FnTable { fns }))
+}
+
+/// One `use` declaration, normalized: `use part::Name;` or
+/// `use part::{A, B};` — a two-level path taking pub types from a declared
+/// part by their own names.
+#[derive(Debug, Clone)]
+pub struct UseDecl {
+    /// The part the names come from.
+    pub part: String,
+    /// The taken names, in source order.
+    pub items: Vec<String>,
+}
+
+/// Collect and normalize the file's `use` declarations. The admitted form
+/// is exactly `use <part>::<Name>;` / `use <part>::{<Name>, …};` — no
+/// renames (`as` would split a type's identity between documents), no
+/// globs (takes are explicit), no deeper paths (definitions are one level
+/// deep).
+pub fn collect_uses(file: &File) -> Result<Vec<UseDecl>, EvalError> {
+    let mut uses = Vec::new();
+    for item in &file.items {
+        let Item::Use(u) = item else { continue };
+        let syn::UseTree::Path(path) = &u.tree else {
+            return Err(EvalError::new(
+                "a `use` names a part and takes items from it: `use part::Name;` or \
+                 `use part::{A, B};`",
+            ));
+        };
+        let part = path.ident.to_string();
+        let mut items = Vec::new();
+        collect_use_leaves(&path.tree, &part, &mut items)?;
+        uses.push(UseDecl { part, items });
+    }
+    Ok(uses)
+}
+
+fn collect_use_leaves(
+    tree: &syn::UseTree,
+    part: &str,
+    items: &mut Vec<String>,
+) -> Result<(), EvalError> {
+    match tree {
+        syn::UseTree::Name(name) => {
+            items.push(name.ident.to_string());
+            Ok(())
+        }
+        syn::UseTree::Group(group) => {
+            for entry in &group.items {
+                collect_use_leaves(entry, part, items)?;
+            }
+            Ok(())
+        }
+        syn::UseTree::Rename(rename) => Err(EvalError::new(format!(
+            "`use {part}::{} as {}` is not allowed: a rename would split the type's \
+             identity between documents — take the name as declared",
+            rename.ident, rename.rename
+        ))),
+        syn::UseTree::Glob(_) => Err(EvalError::new(format!(
+            "`use {part}::*` is not allowed; take names explicitly"
+        ))),
+        syn::UseTree::Path(nested) => Err(EvalError::new(format!(
+            "`use {part}::{}::…` is not allowed; definitions are one level deep",
+            nested.ident
+        ))),
+    }
 }
 
 /// The parameter binding names of a function (`deployment(cfg, cx)` → `[cfg, cx]`).

@@ -66,7 +66,7 @@ pub(crate) async fn run(
             let workspace = crate::bundle_create::workspace_root_from(&cwd)?;
             let catalog = PlatformCatalog::from_workspace(&workspace)?;
             let platform_descriptor = catalog.platform(&platform)?;
-            let (frontend_descriptor, seed_path) =
+            let (frontend_descriptor, definition_path, seed_path) =
                 catalog.workspace_frontend(platform_descriptor, format.as_ref())?;
             let PlatformSource::Workspace(platform_package) = &platform_descriptor.source else {
                 unreachable!("workspace catalog returned published platform coordinates");
@@ -77,11 +77,12 @@ pub(crate) async fn run(
             let seed = DefinitionSeed {
                 definition: RecordedDefinition {
                     format: frontend_descriptor.format.clone(),
-                    path: frontend_descriptor.default_relative_path.clone(),
+                    path: definition_path,
                 },
                 bytes: std::fs::read(&seed_path).with_context(|| {
                     format!("failed to read definition seed {}", seed_path.display())
                 })?,
+                parts: crate::deployment_dir::sibling_parts(&seed_path)?,
             };
             let pending =
                 deployments.begin_create(&resolved_name, platform, storage, region, Some(seed))?;

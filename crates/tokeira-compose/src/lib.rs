@@ -1,18 +1,20 @@
 //! Local Docker Compose provider for the orchestration framework.
 //!
-//! This crate is a concrete specialization of the generic IaC and runtime
-//! traits for local development. [`ComposeService`] implements
-//! [`tokeira_iac::Resource`] so infrastructure apply can create/update/delete a
-//! local service. [`ComposePlatform`] implements
-//! [`tokeira_deploy_engine::Platform`] so runtime apply can reconcile service
-//! manifests against Docker.
+//! This crate is a concrete specialization of the runtime deployment traits
+//! for local development. [`ComposeService`] implements
+//! [`tokeira_deploy_engine::Service`], while [`ComposePlatform`] implements
+//! [`tokeira_deploy_engine::Platform`] and reconciles those service manifests
+//! against Docker. Infrastructure resources in [`kinds`] remain separate and
+//! are owned only by the IaC engine.
 //!
 //! ## Drift detection
 //!
-//! The engine calls `describe()` during `refresh_state` to get live Docker
-//! state via `docker inspect`. The reconstructed `ComposeService` includes
-//! image, ports, volumes, environment, and healthcheck — drift in any of
-//! these fields triggers an update on the next plan/apply.
+//! The Compose implementation of
+//! [`tokeira_deploy_engine::Platform::is_service_current`] reads live Docker
+//! state during a service plan. The reconstructed service helpers include
+//! image, ports, volumes, environment, and healthcheck so richer deploy-plane
+//! drift comparison can remain provider-owned as the deploy engine grows that
+//! reporting surface.
 //!
 //! `depends_on` is a compose-file concept with no Docker runtime equivalent —
 //! it round-trips through the compose-conventional
@@ -20,9 +22,7 @@
 //! `describe`, so ordering drift is real drift (a container created without
 //! it), never a reconstruction artifact.
 //!
-//! A deployment that uses this crate must register a [`ComposePlatform`] on the
-//! infrastructure [`tokeira_iac::ProvisionContext`] before applying modules that
-//! return compose resources. The same platform can be passed to the deploy
+//! A deployment that uses this crate passes a [`ComposePlatform`] to the deploy
 //! facade for runtime service apply.
 
 pub mod execution;
@@ -63,16 +63,17 @@ use thiserror::Error;
 use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac as iac;
 
-/// The Compose provider's complete export, for a platform entry point:
-/// the ops surface, the reachability probe, and the infra constructor
-/// arrive together — using Compose IS this export; no separate wiring act
-/// exists. The kind library is not here: it is the namespace facts in
-/// [`kinds`] ([`kinds::NAMESPACE`], [`kinds::KINDS`], [`kinds::decode`]).
-pub fn provider() -> tokeira_platform::declaration::ProviderExport {
-    tokeira_platform::declaration::ProviderExport {
-        ops: Some(Box::new(ops::DockerOps)),
-        execution: Box::new(execution::ComposeExecution),
-        infra: Some(std::sync::Arc::new(execution::ComposeInfraConstructor)),
+/// The Compose resource namespace exposed to definition frontends.
+///
+/// This value contains authoring facts only. The Compose platform definition
+/// separately integrates live operations, reachability, and the runtime
+/// [`ComposePlatform`].
+pub fn namespace() -> tokeira_platform::definition::Namespace {
+    tokeira_platform::definition::Namespace {
+        name: kinds::NAMESPACE,
+        kinds: kinds::KINDS,
+        defaults: Some(kinds::defaults),
+        decode: kinds::decode,
     }
 }
 
@@ -257,15 +258,6 @@ pub struct ComposeService {
     /// falls back to the service name.
     #[serde(skip)]
     pub module: String,
-    /// Infra-graph-only dependencies (full engine `ResourceId` strings) —
-    /// resources that must exist **before this container is created**, e.g.
-    /// the config-files resource whose outputs this service bind-mounts
-    /// (Docker manufactures a missing bind source as a *directory*, so
-    /// creating the container first poisons the config path). Distinct from
-    /// [`depends_on`](Self::depends_on), which is compose *container start*
-    /// ordering and must stay pure service names; excluded from the manifest.
-    #[serde(skip)]
-    pub resource_dependencies: Vec<String>,
 }
 
 fn default_replicas() -> u32 {
@@ -291,32 +283,29 @@ impl ComposeService {
     }
 }
 
-#[async_trait]
-impl iac::Resource for ComposeService {
-    fn resource_type(&self) -> iac::ResourceType {
-        iac::ResourceType::new(Self::TYPE)
+impl deploy_engine::Service for ComposeService {
+    fn resource_type(&self) -> &'static str {
+        Self::TYPE
     }
 
-    fn resource_id(&self) -> iac::ResourceId {
-        iac::ResourceId(format!("compose/{}", self.name))
+    fn validate_input(&self) -> Result<(), String> {
+        if self.image.is_empty() {
+            return Err("Compose service image cannot be empty".to_string());
+        }
+        if self.replicas == 0 {
+            return Err("Compose service replicas must be greater than zero".to_string());
+        }
+        if self.publish.contains(&0) {
+            return Err("Compose service published ports must be greater than zero".to_string());
+        }
+        Ok(())
     }
 
-    fn dependencies(&self) -> Vec<iac::ResourceId> {
-        self.depends_on
-            .iter()
-            .map(|dep| iac::ResourceId(format!("compose/{dep}")))
-            .chain(
-                self.resource_dependencies
-                    .iter()
-                    .map(|dep| iac::ResourceId(dep.clone())),
-            )
-            .collect()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn module(&self) -> &str {
-        // A recovered service (rebuilt from a recorded manifest) carries no
-        // module; its name is the honest stand-in the recovery path always
-        // used.
         if self.module.is_empty() {
             &self.name
         } else {
@@ -324,229 +313,15 @@ impl iac::Resource for ComposeService {
         }
     }
 
-    fn display_kind(&self) -> Option<&'static str> {
-        Some("service")
+    fn dependencies(&self) -> Vec<&str> {
+        self.depends_on.iter().map(String::as_str).collect()
     }
 
-    async fn create(
+    fn manifests(
         &self,
-        ctx: &iac::ProvisionContext,
-    ) -> Result<iac::ResourceState, iac::IacError> {
-        let platform = ctx.extension::<ComposePlatform>().ok_or_else(|| {
-            iac::IacError::Other(anyhow::anyhow!("ComposePlatform not registered"))
-        })?;
-        platform.reconcile_service(self).await?;
-        Ok(iac::ResourceState {
-            resource_type: iac::ResourceType::new(Self::TYPE),
-            physical_id: self.name.clone(),
-            properties: self.to_manifest(),
-            dependencies: self.dependencies(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            module: self.name.clone(),
-        })
-    }
-
-    async fn update(
-        &self,
-        _current: &iac::ResourceState,
-        ctx: &iac::ProvisionContext,
-    ) -> Result<iac::ResourceState, iac::IacError> {
-        let platform = ctx.extension::<ComposePlatform>().ok_or_else(|| {
-            iac::IacError::Other(anyhow::anyhow!("ComposePlatform not registered"))
-        })?;
-        platform.reconcile_service(self).await?;
-        Ok(iac::ResourceState {
-            resource_type: iac::ResourceType::new(Self::TYPE),
-            physical_id: self.name.clone(),
-            properties: self.to_manifest(),
-            dependencies: self.dependencies(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            module: self.name.clone(),
-        })
-    }
-
-    async fn delete(
-        &self,
-        _current: &iac::ResourceState,
-        ctx: &iac::ProvisionContext,
-    ) -> Result<(), iac::IacError> {
-        let platform = ctx.extension::<ComposePlatform>().ok_or_else(|| {
-            iac::IacError::Other(anyhow::anyhow!("ComposePlatform not registered"))
-        })?;
-        platform.remove_service(&self.name).await?;
-        Ok(())
-    }
-
-    /// What a compose-service change does, established from this crate's own
-    /// provider paths. The load-bearing claim:
-    /// an engine `Update` is *effected* as a replacement — `reconcile_service`
-    /// stops and force-removes the container before creating the new one —
-    /// so `~ compose/grafana` means the service goes away and comes back,
-    /// not an in-place edit. Data rides bind-mounted host paths, which
-    /// neither the removal nor the recreation touches.
-    fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
-        // EngineFacts, cited by module identity — never repo layout — so the
-        // citation stays true wherever this crate is used. Every name below
-        // is a real identifier in this module.
-        const RECONCILE: iac::Citation = iac::Citation::code(concat!(
-            module_path!(),
-            "::ComposePlatform::reconcile_service — stop_container(t: 1) → \
-             remove_container(force: true) → create fresh from the definition"
-        ));
-        const REMOVE: iac::Citation = iac::Citation::code(concat!(
-            module_path!(),
-            "::ComposePlatform::remove_service — stop_container + remove_container \
-             with RemoveContainerOptions { force: true, ..Default::default() } — the \
-             `v` (remove volumes) flag stays false, and bind mounts are host paths"
-        ));
-        use iac::{
-            ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
-            Reversibility,
-        };
-        match ctx.kind {
-            ChangeKind::Create => iac::ChangeSemantics {
-                operation: Confidence::EngineFact {
-                    value: LifecycleOperation::Created,
-                    citation: RECONCILE,
-                },
-                replacement: Confidence::EngineFact {
-                    value: ReplacementPolicy::NotRequired,
-                    citation: RECONCILE,
-                },
-                disruption: Confidence::EngineFact {
-                    value: Disruption::None,
-                    citation: RECONCILE,
-                },
-                data_effect: Confidence::EngineFact {
-                    value: DataEffect::NoDataHeld,
-                    citation: RECONCILE,
-                },
-                reversibility: Confidence::EngineFact {
-                    value: Reversibility::Reversible,
-                    citation: REMOVE,
-                },
-                statement: None,
-                provider_assigned: Vec::new(),
-            },
-            // Update and Replace share one provider path — reconcile — and
-            // therefore one truth: destroy-before-create, unavailable while
-            // it happens, volumes preserved, reversible by re-applying the
-            // prior definition.
-            ChangeKind::Update | ChangeKind::Replace => iac::ChangeSemantics {
-                operation: Confidence::EngineFact {
-                    value: LifecycleOperation::Replaced,
-                    citation: RECONCILE,
-                },
-                replacement: Confidence::EngineFact {
-                    value: ReplacementPolicy::DestroyBeforeCreate,
-                    citation: RECONCILE,
-                },
-                disruption: Confidence::EngineFact {
-                    value: Disruption::UnavailableDuringChange,
-                    citation: RECONCILE,
-                },
-                data_effect: Confidence::EngineFact {
-                    value: DataEffect::Preserved,
-                    citation: REMOVE,
-                },
-                reversibility: Confidence::EngineFact {
-                    value: Reversibility::Reversible,
-                    citation: RECONCILE,
-                },
-                statement: Some(std::borrow::Cow::Borrowed(
-                    "it would be stopped, removed, and recreated from the definition",
-                )),
-                provider_assigned: Vec::new(),
-            },
-            ChangeKind::Delete => iac::ChangeSemantics {
-                operation: Confidence::EngineFact {
-                    value: LifecycleOperation::Deleted,
-                    citation: REMOVE,
-                },
-                replacement: Confidence::EngineFact {
-                    value: ReplacementPolicy::NotRequired,
-                    citation: REMOVE,
-                },
-                disruption: Confidence::EngineFact {
-                    value: Disruption::UnavailableDuringChange,
-                    citation: REMOVE,
-                },
-                data_effect: Confidence::EngineFact {
-                    value: DataEffect::Preserved,
-                    citation: REMOVE,
-                },
-                reversibility: Confidence::EngineFact {
-                    value: Reversibility::Reversible,
-                    citation: RECONCILE,
-                },
-                statement: None,
-                provider_assigned: Vec::new(),
-            },
-            // The engine never asks about NoChange; totality answers anyway,
-            // with nothing.
-            ChangeKind::NoChange => iac::ChangeSemantics::default(),
-        }
-    }
-
-    async fn describe(
-        &self,
-        ctx: &iac::ProvisionContext,
-    ) -> Result<iac::DescribeResult, iac::IacError> {
-        // Without the live ComposePlatform handle we cannot query Docker, so
-        // existence is unknown rather than confirmed absent.
-        let Some(platform) = ctx.extension::<ComposePlatform>() else {
-            return Ok(iac::DescribeResult::Unsupported);
-        };
-        match platform.running_service(&self.name).await? {
-            Some(mut service) => {
-                // Detect image rebuild: if the container's image digest differs
-                // from the local image's current digest for the same tag, report
-                // the running image as the full digest so diff() sees a change.
-                if let Some(stale_digest) = platform
-                    .container_image_stale(&self.name, &service.image)
-                    .await
-                {
-                    service.image = stale_digest;
-                }
-                Ok(iac::DescribeResult::Present(iac::ResourceState {
-                    resource_type: iac::ResourceType::new(Self::TYPE),
-                    physical_id: service.name.clone(),
-                    properties: service.to_manifest(),
-                    dependencies: Vec::new(),
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                    module: self.name.clone(),
-                }))
-            }
-            None => Ok(iac::DescribeResult::Absent),
-        }
-    }
-
-    fn diff(
-        &self,
-        current: &iac::ResourceState,
-        _ctx: &iac::ProvisionContext,
-    ) -> iac::InternalChange {
-        // Compare canonicalized manifests: `ports`/`volumes`/`depends_on` are
-        // sets semantically, but the live reconstruction assembles them from
-        // Docker maps whose iteration order is unstable — ordered comparison
-        // manufactured flapping phantom updates for every multi-port service.
-        let current_manifest = canonicalize_manifest(current.properties.clone());
-        let desired_manifest = canonicalize_manifest(self.to_manifest());
-        let details = manifest_field_diffs(&current_manifest, &desired_manifest);
-        if details.is_empty() {
-            iac::InternalChange::NoChange {
-                resource_id: self.resource_id(),
-            }
-        } else {
-            iac::InternalChange::Update {
-                resource_id: self.resource_id(),
-                resource_type: self.resource_type(),
-                details,
-            }
-        }
+        _ctx: &deploy_engine::ServiceContext,
+    ) -> Result<Vec<serde_json::Value>, deploy_engine::RuntimeError> {
+        Ok(vec![canonicalize_manifest(self.to_manifest())])
     }
 }
 
@@ -573,6 +348,7 @@ pub fn canonicalize_manifest(mut manifest: serde_json::Value) -> serde_json::Val
 /// differing top-level manifest key, values rendered compactly. This is what
 /// `--detail` prints — a bare "configuration changed" is what let the
 /// depends_on/port-order phantoms hide for a day.
+#[cfg(test)]
 fn manifest_field_diffs(
     current: &serde_json::Value,
     desired: &serde_json::Value,
@@ -1427,7 +1203,9 @@ fn lift_from_inspect(
                 sub: sub.display().to_string(),
                 at,
             }));
-        } else if source == server_config_source || source.ends_with(".aws") {
+        } else if source == server_config_source
+            || source.file_name().is_some_and(|name| name == ".aws")
+        {
             // Lowering-injected couplings: represented by their model fields
             // (`server_config_digest`, `aws_region`), not as volumes.
         }
@@ -1512,7 +1290,6 @@ fn lift_from_inspect(
         config_digest,
         // Desired-side declarations, not container facts.
         module: String::new(),
-        resource_dependencies: Vec::new(),
     }
 }
 
@@ -1535,138 +1312,9 @@ pub fn compose_file_path(path: impl AsRef<Path>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use iac::Resource as _;
     use proptest::prelude::*;
 
     use super::*;
-
-    // Golden declarations (operator-explanation Req 4.5): the six scenarios,
-    // asserting classification and confidence — never prose. The pivotal
-    // row: an engine Update is *effected* as a replacement with the service
-    // unavailable — the in-place reading of `~` was wrong, and this is where
-    // it stops.
-    #[test]
-    fn compose_service_declarations_are_the_reconcile_truth() {
-        use iac::{
-            ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
-            Reversibility, SemanticsContext,
-        };
-
-        let service = ComposeService::default();
-        let declared = |kind: ChangeKind, field_diffs: &[iac::FieldDiff]| {
-            service.change_semantics(&SemanticsContext {
-                kind,
-                current: None,
-                field_diffs,
-            })
-        };
-
-        // Creation.
-        let create = declared(ChangeKind::Create, &[]);
-        assert!(matches!(
-            create.operation,
-            Confidence::EngineFact {
-                value: LifecycleOperation::Created,
-                ..
-            }
-        ));
-        assert!(matches!(
-            create.data_effect,
-            Confidence::EngineFact {
-                value: DataEffect::NoDataHeld,
-                ..
-            }
-        ));
-
-        // In-place update and drift-driven update: one provider path, one
-        // truth — replaced, destroy-before-create, unavailable meanwhile.
-        // (Drift is the same declaration: the reconcile does not care why
-        // the container differs.)
-        let definition_update = declared(
-            ChangeKind::Update,
-            &[iac::FieldDiff {
-                field: "image".into(),
-                before: Some("a".into()),
-                after: Some("b".into()),
-            }],
-        );
-        let drift_update = declared(
-            ChangeKind::Update,
-            &[iac::FieldDiff::observation("live container drifted")],
-        );
-        for update in [&definition_update, &drift_update] {
-            assert!(matches!(
-                update.operation,
-                Confidence::EngineFact {
-                    value: LifecycleOperation::Replaced,
-                    ..
-                }
-            ));
-            assert!(matches!(
-                update.replacement,
-                Confidence::EngineFact {
-                    value: ReplacementPolicy::DestroyBeforeCreate,
-                    ..
-                }
-            ));
-            assert!(matches!(
-                update.disruption,
-                Confidence::EngineFact {
-                    value: Disruption::UnavailableDuringChange,
-                    ..
-                }
-            ));
-            assert!(matches!(
-                update.data_effect,
-                Confidence::EngineFact {
-                    value: DataEffect::Preserved,
-                    ..
-                }
-            ));
-            assert!(matches!(
-                update.reversibility,
-                Confidence::EngineFact {
-                    value: Reversibility::Reversible,
-                    ..
-                }
-            ));
-        }
-
-        // Replacement: identical to update — same reconcile path.
-        let replace = declared(ChangeKind::Replace, &[]);
-        assert_eq!(replace, definition_update);
-
-        // Deletion: the service goes away; bind-mounted data does not.
-        let delete = declared(ChangeKind::Delete, &[]);
-        assert!(matches!(
-            delete.operation,
-            Confidence::EngineFact {
-                value: LifecycleOperation::Deleted,
-                ..
-            }
-        ));
-        assert!(matches!(
-            delete.disruption,
-            Confidence::EngineFact {
-                value: Disruption::UnavailableDuringChange,
-                ..
-            }
-        ));
-        assert!(matches!(
-            delete.data_effect,
-            Confidence::EngineFact {
-                value: DataEffect::Preserved,
-                ..
-            }
-        ));
-
-        // Unknown/inapplicable: NoChange declares nothing — the honest
-        // all-Unknown default, not an invented claim.
-        assert_eq!(
-            declared(ChangeKind::NoChange, &[]),
-            iac::ChangeSemantics::default()
-        );
-    }
 
     // The two compose phantom-drift classes, pinned:
     //

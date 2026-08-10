@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tokeira_platform::{
     author::LocatedValue,
     error::KindError,
-    kind::{self, Kind, PlacementContext},
+    kind::{self, DecodedKind, Kind, PlacementContext},
 };
 
 use crate::{ComposeService, Environment, Healthcheck, Volume, config_content_resource_id};
@@ -59,23 +59,6 @@ fn default_replicas() -> u32 {
 }
 
 impl Service {
-    fn validate(&self) -> Result<(), KindError> {
-        if self.image.is_empty() {
-            return Err(KindError::new("Compose service image cannot be empty"));
-        }
-        if self.replicas == 0 {
-            return Err(KindError::new(
-                "Compose service replicas must be greater than zero",
-            ));
-        }
-        if self.publish.contains(&0) {
-            return Err(KindError::new(
-                "Compose service published ports must be greater than zero",
-            ));
-        }
-        Ok(())
-    }
-
     /// Realize the model: authored fields carry over, the name comes from
     /// the logical id, and declared dependencies couple content identities.
     /// A dependency on the server-config node couples its desired-content
@@ -97,12 +80,10 @@ impl Service {
             server_config_digest: None,
             config_digest: None,
             module: placement.module.clone(),
-            resource_dependencies: Vec::new(),
         };
         let server_config_id = server_config_resource_id();
         if let Some(identity) = placement.dependency_content.get(&server_config_id) {
             service.server_config_digest = Some(identity.prefixed_sha256());
-            service.resource_dependencies.push(server_config_id.0);
         }
         let config_id = config_content_resource_id();
         if self
@@ -112,35 +93,14 @@ impl Service {
             && let Some(identity) = placement.dependency_content.get(&config_id)
         {
             service.config_digest = Some(identity.prefixed_sha256());
-            service.resource_dependencies.push(config_id.0);
         }
         service
     }
 }
 
-impl Kind for Service {
-    fn name(&self) -> &'static str {
-        ComposeService::TYPE
-    }
-
-    fn validate_input(&self) -> Result<(), KindError> {
-        self.validate()
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
-        crate::canonicalize_manifest(self.realized(placement).to_manifest())
-    }
-
-    fn realize(
-        &self,
-        placement: &PlacementContext,
-    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
-        self.validate()?;
-        Ok(Box::new(self.realized(placement)))
+impl Kind<ComposeService> for Service {
+    fn realize(&self, placement: &PlacementContext) -> Result<ComposeService, KindError> {
+        Ok(self.realized(placement))
     }
 }
 
@@ -149,31 +109,12 @@ impl Kind for Service {
 #[serde(deny_unknown_fields)]
 pub struct LocalStateDir {}
 
-impl Kind for LocalStateDir {
-    fn name(&self) -> &'static str {
-        LocalStateResource::TYPE
-    }
-
-    fn validate_input(&self) -> Result<(), KindError> {
-        Ok(())
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
-        serde_json::json!({ "path": placement.deployment_dir.join("state") })
-    }
-
-    fn realize(
-        &self,
-        placement: &PlacementContext,
-    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
-        Ok(Box::new(LocalStateResource {
+impl Kind<LocalStateResource> for LocalStateDir {
+    fn realize(&self, placement: &PlacementContext) -> Result<LocalStateResource, KindError> {
+        Ok(LocalStateResource {
             state_dir: placement.deployment_dir.join("state"),
             module: placement.module.clone(),
-        }))
+        })
     }
 }
 
@@ -206,6 +147,10 @@ impl LocalStateResource {
 impl tokeira_iac::Resource for LocalStateResource {
     fn resource_type(&self) -> tokeira_iac::ResourceType {
         tokeira_iac::ResourceType::new(Self::TYPE)
+    }
+
+    fn desired_manifest(&self) -> serde_json::Value {
+        serde_json::json!({ "path": self.state_dir })
     }
 
     fn resource_id(&self) -> tokeira_iac::ResourceId {
@@ -313,45 +258,13 @@ pub fn server_config_resource_id() -> tokeira_iac::ResourceId {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {}
 
-impl Kind for ServerConfig {
-    fn name(&self) -> &'static str {
-        ServerConfigResource::TYPE
-    }
-
-    fn validate_input(&self) -> Result<(), KindError> {
-        Ok(())
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
-        // The definition-source copy first: a retained revision folder holds
-        // the whole desired-source set, so a baseline digests what that
-        // revision applied. Retained history from before server-config
-        // retention falls back to the live file rather than inventing an
-        // edit; an absent file is stated in the manifest and refused at
-        // create, never silently skipped.
-        let content = [&placement.definition_dir, &placement.deployment_dir]
-            .into_iter()
-            .map(|dir| dir.join("tokeirad.toml"))
-            .find_map(|path| std::fs::read(path).ok())
-            .map(|bytes| {
-                tokeira_platform::content::ContentIdentity::new("compose/server-config", &bytes)
-                    .prefixed_sha256()
-            });
-        serde_json::json!({ "path": "tokeirad.toml", "content_digest": content })
-    }
-
-    fn realize(
-        &self,
-        placement: &PlacementContext,
-    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
-        Ok(Box::new(ServerConfigResource {
+impl Kind<ServerConfigResource> for ServerConfig {
+    fn realize(&self, placement: &PlacementContext) -> Result<ServerConfigResource, KindError> {
+        Ok(ServerConfigResource {
             path: placement.deployment_dir.join("tokeirad.toml"),
+            definition_path: placement.definition_dir.join("tokeirad.toml"),
             module: placement.module.clone(),
-        }))
+        })
     }
 }
 
@@ -360,6 +273,8 @@ impl Kind for ServerConfig {
 struct ServerConfigResource {
     /// The live file the containers bind-mount.
     path: PathBuf,
+    /// The interpreted source-set copy used for retained-revision evidence.
+    definition_path: PathBuf,
     module: String,
 }
 
@@ -388,6 +303,19 @@ impl ServerConfigResource {
 impl tokeira_iac::Resource for ServerConfigResource {
     fn resource_type(&self) -> tokeira_iac::ResourceType {
         tokeira_iac::ResourceType::new(Self::TYPE)
+    }
+
+    fn desired_manifest(&self) -> serde_json::Value {
+        // A retained source-set copy wins; history predating companion-file
+        // retention falls back to the live file instead of inventing an edit.
+        let content = [&self.definition_path, &self.path]
+            .into_iter()
+            .find_map(|path| std::fs::read(path).ok())
+            .map(|bytes| {
+                tokeira_platform::content::ContentIdentity::new("compose/server-config", &bytes)
+                    .prefixed_sha256()
+            });
+        serde_json::json!({ "path": "tokeirad.toml", "content_digest": content })
     }
 
     fn resource_id(&self) -> tokeira_iac::ResourceId {
@@ -559,13 +487,67 @@ pub const KINDS: &[&str] = &[
     ComposeService::TYPE,
 ];
 
+/// Authoring-only empty shapes for frontends with explicit struct-update
+/// syntax. The values mirror this kind's Serde defaults; they do not carry
+/// validation, outputs, realization, or lifecycle behaviour.
+pub fn defaults(name: &str) -> Option<LocatedValue> {
+    (name == ComposeService::TYPE).then(|| {
+        LocatedValue::new(tokeira_platform::author::ValueShape::Struct {
+            name: ComposeService::TYPE.to_string(),
+            fields: vec![
+                ("image".to_string(), LocatedValue::string("")),
+                (
+                    "replicas".to_string(),
+                    LocatedValue::new(tokeira_platform::author::ValueShape::Integer(1)),
+                ),
+                (
+                    "publish".to_string(),
+                    LocatedValue::new(tokeira_platform::author::ValueShape::Sequence(Vec::new())),
+                ),
+                (
+                    "volumes".to_string(),
+                    LocatedValue::new(tokeira_platform::author::ValueShape::Sequence(Vec::new())),
+                ),
+                (
+                    "environment".to_string(),
+                    LocatedValue::new(tokeira_platform::author::ValueShape::Sequence(Vec::new())),
+                ),
+                (
+                    "command".to_string(),
+                    LocatedValue::new(tokeira_platform::author::ValueShape::Sequence(Vec::new())),
+                ),
+                (
+                    "depends_on".to_string(),
+                    LocatedValue::new(tokeira_platform::author::ValueShape::Sequence(Vec::new())),
+                ),
+                (
+                    "healthcheck".to_string(),
+                    LocatedValue::new(tokeira_platform::author::ValueShape::Option(None)),
+                ),
+                (
+                    "aws_region".to_string(),
+                    LocatedValue::new(tokeira_platform::author::ValueShape::Option(None)),
+                ),
+            ],
+        })
+    })
+}
+
 /// Decode one authored kind of this namespace; `None` when the name is not
 /// ours.
-pub fn decode(name: &str, value: LocatedValue) -> Option<Result<Box<dyn Kind>, KindError>> {
+pub fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, KindError>> {
     Some(match name {
-        LocalStateResource::TYPE => kind::decode::<LocalStateDir>(value),
-        ServerConfigResource::TYPE => kind::decode::<ServerConfig>(value),
-        ComposeService::TYPE => kind::decode::<Service>(value),
+        LocalStateResource::TYPE => kind::decode_resource::<LocalStateDir, LocalStateResource>(
+            LocalStateResource::TYPE,
+            value,
+        ),
+        ServerConfigResource::TYPE => kind::decode_resource::<ServerConfig, ServerConfigResource>(
+            ServerConfigResource::TYPE,
+            value,
+        ),
+        ComposeService::TYPE => {
+            kind::decode_service::<Service, ComposeService>(ComposeService::TYPE, value)
+        }
         _ => return None,
     })
 }
@@ -574,6 +556,19 @@ pub fn decode(name: &str, value: LocatedValue) -> Option<Result<Box<dyn Kind>, K
 mod kind_inventory_tests {
     use super::*;
     use tokeira_platform::author::ValueShape;
+
+    fn placement() -> PlacementContext {
+        PlacementContext {
+            deployment_id: "demo".to_string(),
+            deployment_dir: PathBuf::from("/deployments/demo"),
+            definition_dir: PathBuf::from("/deployments/demo"),
+            module: "runtime".to_string(),
+            logical_id: "tokeirad".to_string(),
+            dependencies: Vec::new(),
+            dependency_content: Default::default(),
+            tags: Default::default(),
+        }
+    }
 
     // The namespace facts hold together: every listed name decodes here,
     // and an unknown name is refused as not-ours rather than an error.
@@ -606,5 +601,27 @@ mod kind_inventory_tests {
         .expect("Service belongs to this namespace")
         .expect("partial authoring decodes");
         assert_eq!(decoded.name(), ComposeService::TYPE);
+    }
+
+    #[test]
+    fn kinds_realize_their_concrete_resources() {
+        let service = Service {
+            image: "tokeirad:latest".to_string(),
+            replicas: 1,
+            publish: Vec::new(),
+            volumes: Vec::new(),
+            environment: Vec::new(),
+            command: Vec::new(),
+            depends_on: Vec::new(),
+            healthcheck: None,
+            aws_region: None,
+        };
+        let realized: ComposeService = service.realize(&placement()).expect("service realizes");
+        assert_eq!(realized.name, "tokeirad");
+
+        let realized: LocalStateResource = LocalStateDir {}
+            .realize(&placement())
+            .expect("state directory realizes");
+        assert_eq!(realized.state_dir, PathBuf::from("/deployments/demo/state"));
     }
 }

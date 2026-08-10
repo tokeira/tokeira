@@ -17,6 +17,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokeira-iac.workspace = true
+tokeira-deploy-engine = { path = "../tokeira-deploy-engine" }
 tokeira-orchestrator = { path = "../tokeira-orchestrator" }
 uuid.workspace = true
 

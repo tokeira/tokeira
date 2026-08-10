@@ -9,12 +9,19 @@
 //! capability questions. The engine and the shell ask; the platform never
 //! drives anything, and the engine never reads deployment metadata itself.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    path::Path,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
-use tokeira_platform::declaration::{
-    DeploymentRef, InfraConstructor, Ops, PlatformDeclaration, ProviderExecution, Vocabulary,
+use tokeira_platform::{
+    declaration::{
+        DeploymentRef, Ops, PlatformDeclaration, PlatformExecution, PlatformIntegration,
+    },
+    definition::Namespace,
 };
 use tokeira_provisioner::DeploymentBindingMetadata;
 
@@ -49,15 +56,13 @@ impl Admitted {
 
 /// One platform, bound to the identity pair its binary was built as.
 ///
-/// Constructed once at process start. Construction composes the authoring
-/// vocabulary — a kind-name collision between the declared providers
-/// refuses the binary here, naming both providers, before any deployment
-/// is read.
+/// Constructed once at process start. The declaration's namespaces remain
+/// frontend facts; binding verifies that each author-visible kind has one
+/// decoder, but does not compose them into an execution registry.
 pub struct BoundPlatform {
     id: PlatformId,
     format: DefinitionFormatId,
     declaration: PlatformDeclaration,
-    vocabulary: Vocabulary,
 }
 
 impl std::fmt::Debug for BoundPlatform {
@@ -76,12 +81,11 @@ impl BoundPlatform {
         format: &'static str,
         declaration: PlatformDeclaration,
     ) -> Result<Self> {
-        let vocabulary = declaration.vocabulary()?;
+        validate_namespace_kinds(&declaration.namespaces)?;
         Ok(Self {
             id: PlatformId::new(id)?,
             format: DefinitionFormatId::new(format)?,
             declaration,
-            vocabulary,
         })
     }
 
@@ -207,59 +211,78 @@ impl BoundPlatform {
     // refusal for an absent capability; nothing answers "not applicable".
     // ------------------------------------------------------------------
 
-    /// The composed authoring vocabulary the engine evaluates against.
-    pub fn vocabulary(&self) -> &Vocabulary {
-        &self.vocabulary
+    /// Resource namespaces visible to the selected definition frontend.
+    pub fn namespaces(&self) -> &[Namespace] {
+        &self.declaration.namespaces
     }
 
-    /// The provider's execution seam: reachability probe and context
-    /// installation, invoked by the engine.
-    pub fn execution(&self) -> &dyn ProviderExecution {
-        self.declaration.provider.execution.as_ref()
+    /// The platform's reachability seam, invoked by the engine.
+    pub fn execution(&self) -> &dyn PlatformExecution {
+        self.declaration.execution.as_ref()
     }
 
-    /// The provider's ops surface over running deployments (logs, port
+    /// The platform's ops surface over running deployments (logs, port
     /// mappings), when it declares one. The shell calls it directly — these
     /// are questions about live containers, not lifecycle, so the engine is
     /// not in the path.
     pub fn ops(&self) -> Option<&dyn Ops> {
-        self.declaration.provider.ops.as_deref()
+        self.declaration.ops.as_deref()
     }
 
-    /// The declared selections' infra-phase extension constructors, paired
-    /// with each selection's namespace — the provider's first, then
-    /// auxiliaries in declaration order. The deployment runs them inside
-    /// `register_infra_extensions`; a selection without one contributes
-    /// nothing.
-    pub fn infra_constructors(&self) -> Vec<(&'static str, Arc<dyn InfraConstructor>)> {
-        std::iter::once((
-            self.declaration.provider.kinds.provider,
-            self.declaration.provider.infra.clone(),
-        ))
-        .chain(
-            self.declaration
-                .auxiliary
-                .iter()
-                .map(|selection| (selection.provider, selection.infra.clone())),
-        )
-        .filter_map(|(namespace, constructor)| {
-            constructor.map(|constructor| (namespace, constructor))
-        })
-        .collect()
+    /// The platform implementation delegated to by the described deployment.
+    pub fn implementation(&self) -> Arc<dyn PlatformIntegration> {
+        Arc::clone(&self.declaration.implementation)
     }
+
+    /// Construct the platform that applies this deployment's service
+    /// manifests.
+    pub fn service_platform(
+        &self,
+        deployment: &DeploymentRef,
+    ) -> Result<Box<dyn tokeira_deploy_engine::Platform>> {
+        self.declaration.implementation.service_platform(deployment)
+    }
+}
+
+/// Refuse declaration-order dispatch: a kind name must select exactly one
+/// decoder before either frontend sees the namespace list. The map is thrown
+/// away after validation; namespaces remain the sole authoring contract.
+fn validate_namespace_kinds(namespaces: &[Namespace]) -> Result<()> {
+    let mut owners = BTreeMap::new();
+    for namespace in namespaces {
+        for &kind in namespace.kinds {
+            match owners.entry(kind) {
+                Entry::Vacant(owner) => {
+                    owner.insert(namespace.name);
+                }
+                Entry::Occupied(owner) if *owner.get() == namespace.name => {
+                    bail!(
+                        "authoring namespace `{}` advertises resource kind `{kind}` more than once",
+                        namespace.name
+                    );
+                }
+                Entry::Occupied(owner) => {
+                    bail!(
+                        "authoring namespaces `{}` and `{}` both advertise resource kind `{kind}`",
+                        owner.get(),
+                        namespace.name
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use tokeira_platform::declaration::{KindSet, ProviderExport};
-
     use super::*;
 
     #[derive(Debug)]
     struct NoProbe;
 
     #[async_trait::async_trait]
-    impl ProviderExecution for NoProbe {
+    impl PlatformExecution for NoProbe {
         async fn probe(
             &self,
             _deployment: &DeploymentRef,
@@ -268,13 +291,143 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct NoIntegration;
+
+    #[async_trait::async_trait]
+    impl PlatformIntegration for NoIntegration {
+        async fn register_infra_extensions(
+            &self,
+            _deployment: &DeploymentRef,
+            _ctx: &mut tokeira_iac::ProvisionContext,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn register_deploy_extensions(
+            &self,
+            _deployment: &DeploymentRef,
+            _ctx: &mut tokeira_deploy_engine::ServiceContext,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn register_image_extensions(
+            &self,
+            _deployment: &DeploymentRef,
+            _ctx: &mut tokeira_deploy_engine::ImageContext,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn service_platform(
+            &self,
+            _deployment: &DeploymentRef,
+        ) -> anyhow::Result<Box<dyn tokeira_deploy_engine::Platform>> {
+            Ok(Box::new(NoServices))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoServices;
+
+    #[async_trait::async_trait]
+    impl tokeira_deploy_engine::Platform for NoServices {
+        async fn apply_manifests(
+            &self,
+            _manifests: &[serde_json::Value],
+        ) -> std::result::Result<usize, tokeira_deploy_engine::RuntimeError> {
+            unreachable!("the platform test declares no services")
+        }
+    }
+
     fn declaration() -> PlatformDeclaration {
-        PlatformDeclaration::on(ProviderExport {
-            kinds: KindSet::new("test", Vec::new()),
+        declaration_with_namespaces(Vec::new())
+    }
+
+    fn declaration_with_namespaces(namespaces: Vec<Namespace>) -> PlatformDeclaration {
+        PlatformDeclaration {
+            namespaces,
             ops: None,
             execution: Box::new(NoProbe),
-            infra: None,
-        })
+            implementation: Arc::new(NoIntegration),
+        }
+    }
+
+    fn namespace(name: &'static str, kinds: &'static [&'static str]) -> Namespace {
+        Namespace {
+            name,
+            kinds,
+            defaults: None,
+            decode: no_decode,
+        }
+    }
+
+    fn no_decode(
+        _name: &str,
+        _value: tokeira_platform::author::LocatedValue,
+    ) -> Option<
+        std::result::Result<
+            tokeira_platform::kind::DecodedKind,
+            tokeira_platform::error::KindError,
+        >,
+    > {
+        None
+    }
+
+    #[test]
+    fn disjoint_namespace_kinds_bind_in_declaration_order() {
+        let platform = BoundPlatform::bind(
+            "test",
+            "tkd",
+            declaration_with_namespaces(vec![
+                namespace("first", &["Alpha"]),
+                namespace("second", &["Beta"]),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            platform
+                .namespaces()
+                .iter()
+                .map(|namespace| namespace.name)
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn a_kind_advertised_by_two_namespaces_is_refused_naming_all_three() {
+        let error = BoundPlatform::bind(
+            "test",
+            "tkd",
+            declaration_with_namespaces(vec![
+                namespace("first", &["Shared"]),
+                namespace("second", &["Shared"]),
+            ]),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("`Shared`"), "{error}");
+        assert!(error.contains("`first`"), "{error}");
+        assert!(error.contains("`second`"), "{error}");
+    }
+
+    #[test]
+    fn a_kind_repeated_inside_one_namespace_is_refused() {
+        let error = BoundPlatform::bind(
+            "test",
+            "tkd",
+            declaration_with_namespaces(vec![namespace("repeated", &["Shared", "Shared"])]),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("`Shared`"), "{error}");
+        assert!(error.contains("`repeated`"), "{error}");
+        assert!(error.contains("more than once"), "{error}");
     }
 
     fn write_metadata(dir: &Path, platform: &str) {

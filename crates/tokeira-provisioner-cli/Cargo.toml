@@ -20,6 +20,7 @@ tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tokeira-provisioner = { workspace = true }
 tokeira-state = { workspace = true }
 tokeira-build-info = { workspace = true }
+tokeira-aws = { workspace = true }
 tokeira-deploy-engine = { workspace = true }
 tokeira-iac = { workspace = true }
 tokeira-report = { workspace = true }

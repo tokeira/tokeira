@@ -8,10 +8,7 @@
 
 use serde::Serialize;
 use tokeira_orchestrator::RelativeDefinitionPath;
-use tokeira_platform::{
-    declaration::Vocabulary,
-    definition::{DefinitionFrontend, DefinitionSourceName, FrontendSource},
-};
+use tokeira_platform::definition::{DefinitionFrontend, DefinitionSourceName, FrontendSource};
 use tokeira_tkdp::frontend;
 
 #[derive(Debug, Serialize)]
@@ -20,9 +17,8 @@ struct Ctx {
 }
 
 fn failure(source: &str) -> String {
-    // These sources fail before any kind decodes, so the platform is
-    // kind-less: the empty vocabulary.
-    let vocabulary = Vocabulary::of(Vec::new()).expect("the empty vocabulary composes");
+    // These sources fail before any kind decodes, so the platform exposes no
+    // resource namespaces.
     let path = RelativeDefinitionPath::new("definition.tkdp").expect("path");
     let source_name = DefinitionSourceName::DeploymentRelative(path);
     let ctx = Ctx {
@@ -35,7 +31,7 @@ fn failure(source: &str) -> String {
                 bytes: source.as_bytes(),
             },
             &ctx,
-            &vocabulary,
+            &[],
             &tokeira_platform::definition::NoPartSources,
         )
         .expect_err("source must fail")

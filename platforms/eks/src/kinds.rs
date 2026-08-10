@@ -32,8 +32,7 @@ use tokeira_aws::{
             DsqlConnectionEndpoint as AwsDsqlConnectionEndpoint, DsqlConnectionEndpointConfig,
         },
         dynamodb_table::{
-            AttributeType, BillingMode, DynamoDbTable as AwsDynamoDbTable,
-            KeyAttribute, KeyType,
+            AttributeType, BillingMode, DynamoDbTable as AwsDynamoDbTable, KeyAttribute, KeyType,
         },
         ecr_repository::EcrRepository as AwsEcrRepository,
         eks::{EksClusterResource, EksConfig as AwsEksConfig},

@@ -350,6 +350,10 @@ mod tests {
     }
 
     impl Service for MockService {
+        fn resource_type(&self) -> &'static str {
+            "MockService"
+        }
+
         fn name(&self) -> &str {
             self.name
         }

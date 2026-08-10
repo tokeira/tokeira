@@ -8,16 +8,19 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokeira_orchestrator::RelativeDefinitionPath;
 use tokeira_platform::{
-    author::from_located_value,
-    declaration::{KindEntry, KindSet, Vocabulary},
+    author::{LocatedValue, from_located_value},
     definition::{
-        DefinitionFrontend, DefinitionSourceName, FrontendOutput, FrontendSource, NoPartSources,
-        PartResolveError, SourceResolver,
+        DefinitionFrontend, DefinitionSourceName, FrontendOutput, FrontendSource, Namespace,
+        NoPartSources, PartResolveError, SourceResolver,
     },
     error::KindError,
-    kind::{PlacementContext, ProviderKind},
+    kind::{DecodedKind, Kind, PlacementContext},
 };
 use tokeira_tkdp::frontend;
+
+mod support;
+
+use support::{FixtureResource, desired_manifest};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,43 +32,34 @@ struct Store {
 #[derive(Debug, Clone, PartialEq)]
 struct StoreKind(Store);
 
-impl ProviderKind for StoreKind {
-    fn kind_name(&self) -> &'static str {
-        "Store"
-    }
-
-    fn validate_input(&self) -> Result<(), KindError> {
-        Ok(())
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        &["endpoint"]
-    }
-
-    fn desired_manifest(&self, _placement: &PlacementContext) -> serde_json::Value {
-        serde_json::to_value(&self.0).expect("store serializes")
-    }
-
-    fn realize(
-        &self,
-        _placement: &PlacementContext,
-    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
-        Err(KindError::new("not exercised by parts tests"))
+impl Kind<FixtureResource> for StoreKind {
+    fn realize(&self, _placement: &PlacementContext) -> Result<FixtureResource, KindError> {
+        Ok(FixtureResource::new(
+            "Store",
+            &["endpoint"],
+            serde_json::to_value(&self.0).expect("store serializes"),
+        ))
     }
 }
 
-fn vocabulary() -> Vocabulary {
-    let store = KindEntry {
-        name: "Store",
+fn decode_store(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, KindError>> {
+    (name == "Store").then(|| {
+        let range = value.range;
+        from_located_value::<Store>(value)
+            .map(|store| {
+                DecodedKind::resource::<StoreKind, FixtureResource>("Store", StoreKind(store))
+            })
+            .map_err(|error| KindError::new(error.to_string()).at(error.range().or(range)))
+    })
+}
+
+fn namespaces() -> [Namespace; 1] {
+    [Namespace {
+        name: "test",
+        kinds: &["Store"],
         defaults: None,
-        decode: |value| {
-            let range = value.range;
-            from_located_value::<Store>(value)
-                .map(|store| Box::new(StoreKind(store)) as Box<dyn ProviderKind>)
-                .map_err(|error| KindError::new(error.to_string()).at(error.range().or(range)))
-        },
-    };
-    Vocabulary::of(vec![KindSet::new("test", vec![store])]).expect("test vocabulary composes")
+        decode: decode_store,
+    }]
 }
 
 #[derive(Debug, Serialize)]
@@ -99,7 +93,7 @@ fn evaluate(root: &str, parts: &dyn SourceResolver) -> Result<FrontendOutput, St
             &Ctx {
                 project_name: "demo".to_string(),
             },
-            &vocabulary(),
+            &namespaces(),
             parts,
         )
         .map_err(|diagnostic| diagnostic.message)
@@ -138,7 +132,7 @@ def declare(d, cfg, cx, state):
 "#;
 
 // The mechanism, whole: the root wires, the part declares its module and a
-// vocabulary-kind resource against the same deployment, using the same
+// namespace-kind resource against the same deployment, using the same
 // facade class identities.
 #[test]
 fn a_root_and_its_part_build_one_graph() {
@@ -154,6 +148,10 @@ fn a_root_and_its_part_build_one_graph() {
         .map(|module| module.name())
         .collect();
     assert_eq!(modules, ["state", "net"]);
+    assert_eq!(
+        desired_manifest(output.graph.resources()[0].kind()),
+        serde_json::json!({"path": "/var/demo", "replicas": 1})
+    );
 }
 
 #[test]

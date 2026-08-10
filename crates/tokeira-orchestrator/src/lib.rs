@@ -789,6 +789,16 @@ impl<D: Deployment> DeployEngine<D> {
         deployment
             .register_image_extensions(config, &mut image_ctx)
             .await?;
+        // The operator establishes the phase boundary: infrastructure is
+        // applied before services are deployed. Loading that recorded result
+        // here gives service realization the exact substrate outputs from the
+        // preceding phase without making either definition or Kind coordinate
+        // cross-engine execution.
+        let (infra_state, _) = deployment
+            .create_infra_store(config, deployment_dir)
+            .load()
+            .await?;
+        service_ctx.infra_state = infra_state;
         let state_store = deployment.create_deploy_store(config, deployment_dir);
         Ok(Self {
             deployment,
@@ -803,6 +813,7 @@ impl<D: Deployment> DeployEngine<D> {
     /// Plan service changes from desired manifests and persisted runtime state.
     pub async fn plan(&mut self) -> Result<Vec<deploy_engine::ServiceChange>> {
         let (state, _) = self.state_store.load().await?;
+        self.service_ctx.state = state.clone();
         let services = self.deployment.services(&self.config);
         Ok(self
             .engine
@@ -816,6 +827,7 @@ impl<D: Deployment> DeployEngine<D> {
         platform: &dyn deploy_engine::Platform,
     ) -> Result<Vec<deploy_engine::ServiceChange>> {
         let (mut state, version) = self.state_store.load().await?;
+        self.service_ctx.state = state.clone();
         let images = self.deployment.images(&self.config);
         self.engine
             .record_images(&images, &self.image_ctx, &mut state)
@@ -825,6 +837,7 @@ impl<D: Deployment> DeployEngine<D> {
             .engine
             .apply_services(&services, platform, &mut self.service_ctx, &mut state)
             .await?;
+        self.service_ctx.state = state.clone();
         let _ = self.state_store.save(&state, &version).await?;
         Ok(changes)
     }
@@ -1040,6 +1053,10 @@ mod tests {
     struct TestService;
 
     impl deploy_engine::Service for TestService {
+        fn resource_type(&self) -> &'static str {
+            "TestService"
+        }
+
         fn name(&self) -> &str {
             "service"
         }

@@ -4,7 +4,7 @@
 //! realization into one operation's [`ExecutionState`]; the lifecycle verbs
 //! (plan, apply, destroy — probe-first over the infrastructure engine); and
 //! the reads the shell's verbs and causality machinery consume. It holds
-//! the [`BoundPlatform`] and asks it for identity, vocabulary, and
+//! the [`BoundPlatform`] and asks it for identity, namespaces, and
 //! capabilities; it never reads deployment metadata itself and never
 //! answers a platform-identity question.
 
@@ -16,11 +16,11 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokeira_iac::{self as iac, ResourceId};
 use tokeira_orchestrator::InfraEngine;
 use tokeira_platform::{
-    author::{LocatedValue, ValueShape, from_located_value},
+    author::{LocatedValue, from_located_value},
     definition::{
         DefinitionFrontend, DefinitionSource, DefinitionSourceName, DirectoryPartSources,
         EvaluatedDefinition, FrontendSource, RealizedResourceIndex, evaluate_definition,
@@ -41,6 +41,20 @@ use crate::{
 #[derive(Debug, Clone, Serialize)]
 struct EvaluationContext {
     project_name: String,
+}
+
+/// AWS-first configuration projected from the definition only when the
+/// platform declaration includes the AWS namespace.
+#[derive(Debug, Deserialize)]
+struct StandardConfiguration {
+    #[serde(default)]
+    aws: Option<StandardAwsConfiguration>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StandardAwsConfiguration {
+    #[serde(default)]
+    region: Option<String>,
 }
 
 /// The lifecycle engine for one bound platform.
@@ -92,7 +106,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     }
 
     /// Evaluate the admitted deployment's recorded definition against the
-    /// platform's vocabulary. `definition_path` overrides only the file
+    /// platform's namespaces. `definition_path` overrides only the file
     /// read — a retained revision's copy of the same recorded document —
     /// never the recorded identity.
     pub fn evaluate_recorded(
@@ -123,7 +137,7 @@ impl<F: DefinitionFrontend> Engine<F> {
             &EvaluationContext {
                 project_name: admitted.deployment_ref.name.clone(),
             },
-            self.platform.vocabulary(),
+            self.platform.namespaces(),
             &parts,
         )
         .map_err(anyhow::Error::from)
@@ -153,7 +167,7 @@ impl<F: DefinitionFrontend> Engine<F> {
             &self.frontend,
             source,
             &EvaluationContext { project_name },
-            self.platform.vocabulary(),
+            self.platform.namespaces(),
             &parts,
         )
         .map_err(anyhow::Error::from)
@@ -180,7 +194,7 @@ impl<F: DefinitionFrontend> Engine<F> {
             .unwrap_or(deployment_dir)
             .to_path_buf();
         let evaluated = self.evaluate_recorded(admitted, definition_path)?;
-        let verified = verify_definition(&evaluated).map_err(anyhow::Error::from)?;
+        let verified = verify_definition(&evaluated);
         let realized = verified.realize(
             &admitted.deployment_ref.name,
             deployment_dir,
@@ -194,13 +208,15 @@ impl<F: DefinitionFrontend> Engine<F> {
         }
         let manifests = realized.manifests().clone();
         let index = realized.index().clone();
+        let (infra_resources, services) = realized.into_parts();
         let mut resources = BTreeMap::<String, Vec<Arc<dyn iac::Resource>>>::new();
-        for resource in realized.into_resources() {
+        for resource in infra_resources {
             resources
                 .entry(resource.module().to_string())
                 .or_default()
                 .push(Arc::from(resource));
         }
+        let services = services.into_iter().map(Arc::from).collect();
         let modules: Vec<ModuleSpec> = evaluated
             .graph
             .modules()
@@ -208,22 +224,27 @@ impl<F: DefinitionFrontend> Engine<F> {
             .map(ModuleSpec::from)
             .collect();
         let bootstrap = nominate_bootstrap(&modules)?;
-        let attributes = selection_attributes(
-            &evaluated.config,
-            self.platform
-                .infra_constructors()
-                .iter()
-                .map(|(namespace, _)| *namespace),
-        )?;
+        let uses_aws = self
+            .platform
+            .namespaces()
+            .iter()
+            .any(|namespace| namespace.name == tokeira_aws::kinds::NAMESPACE);
+        let aws_region = if uses_aws {
+            authored_platform_aws_region(&evaluated.config)?
+        } else {
+            None
+        };
         Ok(ExecutionState {
+            uses_aws,
+            aws_region,
             modules,
             bootstrap,
             resources,
+            services,
             namespaces: evaluated.graph.namespaces().to_vec(),
             writeback: evaluated.graph.writeback().to_vec(),
             index,
             manifests,
-            attributes,
         })
     }
 
@@ -349,7 +370,7 @@ impl<F: DefinitionFrontend> Engine<F> {
 
     /// Retarget gate: refuse a create-time-immutable change between the
     /// retained prior source and the live one. Delegates to the frontend
-    /// with the platform's vocabulary. Both revisions carry the recorded
+    /// with the platform's namespaces. Both revisions carry the recorded
     /// definition identity — the compare is between two states of the same
     /// definition set, each side resolving its parts through its own
     /// resolver: the retained revision's set for the prior, the live
@@ -380,7 +401,7 @@ impl<F: DefinitionFrontend> Engine<F> {
             &EvaluationContext {
                 project_name: admitted.deployment_ref.name.clone(),
             },
-            self.platform.vocabulary(),
+            self.platform.namespaces(),
             prior_parts,
             current_parts,
         ) {
@@ -422,9 +443,13 @@ impl<F: DefinitionFrontend> Engine<F> {
     ) -> Result<Vec<tokeira_orchestrator::ServiceChange>> {
         let execution = self.execution(admitted, None)?;
         self.refuse_on_issue(admitted).await?;
+        let platform = self
+            .platform
+            .service_platform(&admitted.deployment_ref)
+            .context("failed to construct the service platform")?;
         let mut deploy = self.open_deploy(admitted, &execution).await?;
         deploy
-            .apply(&NoWorkloadApplier)
+            .apply(platform.as_ref())
             .await
             .context("service apply failed")
     }
@@ -436,7 +461,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     ) -> Result<tokeira_orchestrator::DeployEngine<DescribedDeployment>> {
         let described = DescribedDeployment::new(
             admitted.deployment_ref.clone(),
-            self.platform.infra_constructors(),
+            self.platform.implementation(),
         );
         tokeira_orchestrator::DeployEngine::new(described, execution, &admitted.deployment_ref.dir)
             .await
@@ -459,11 +484,11 @@ impl<F: DefinitionFrontend> Engine<F> {
     }
 
     /// Open the infrastructure engine for one operation: the deployment
-    /// built from the admitted coordinates and the declaration's
-    /// constructors — registration runs inside `register_infra_extensions`,
-    /// nowhere else. A failure here after a passing probe is real, or the
-    /// unreachable class arriving in the window; either way it carries the
-    /// provider's typed root.
+    /// built from the admitted coordinates and the platform implementation —
+    /// registration runs inside `register_infra_extensions`, nowhere else. A
+    /// failure here after a passing probe is real, or the unreachable class
+    /// arriving in the window; either way it carries the platform's typed
+    /// root.
     async fn open(
         &self,
         admitted: &Admitted,
@@ -471,7 +496,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     ) -> Result<InfraEngine<DescribedDeployment>> {
         let described = DescribedDeployment::new(
             admitted.deployment_ref.clone(),
-            self.platform.infra_constructors(),
+            self.platform.implementation(),
         );
         InfraEngine::new(described, execution, &admitted.deployment_ref.dir)
             .await
@@ -499,27 +524,6 @@ fn operation_selection(
     }
 }
 
-/// The fail-closed workload applier: the declaration exports no service
-/// applier yet (the plane split delivers it beside the service realizers),
-/// and the service set is empty on this path — so a manifest reaching this
-/// impl is a programming error surfaced loudly, never a silent no-op.
-#[derive(Debug)]
-struct NoWorkloadApplier;
-
-#[async_trait::async_trait]
-impl tokeira_deploy_engine::Platform for NoWorkloadApplier {
-    async fn apply_manifests(
-        &self,
-        _manifests: &[serde_json::Value],
-    ) -> std::result::Result<usize, tokeira_deploy_engine::RuntimeError> {
-        Err(tokeira_deploy_engine::RuntimeError::Platform(
-            "this platform declares no workload applier; the service plane arrives with its \
-             realizers"
-                .to_string(),
-        ))
-    }
-}
-
 /// The bootstrap is nominated by shape, not name: the engine stands it up
 /// before every other module (it provisions the state backend itself), and
 /// the framework knows no module names — so the graph must contain exactly
@@ -542,49 +546,39 @@ fn nominate_bootstrap(modules: &[ModuleSpec]) -> Result<String> {
     }
 }
 
-/// Extract the declared selections' namespace blocks from the evaluated
-/// configuration, as plain JSON: the framework transports them to the
-/// constructors without interpreting a single field.
-fn selection_attributes(
-    config: &LocatedValue,
-    namespaces: impl Iterator<Item = &'static str>,
-) -> Result<BTreeMap<String, serde_json::Value>> {
-    let ValueShape::Struct { fields, .. } = &config.value else {
-        return Ok(BTreeMap::new());
-    };
-    let mut attributes = BTreeMap::new();
-    for namespace in namespaces {
-        if let Some((_, value)) = fields.iter().find(|(name, _)| name == namespace) {
-            let value =
-                from_located_value::<serde_json::Value>(value.clone()).with_context(|| {
-                    format!("the `{namespace}` attribute block does not convert to plain values")
-                })?;
-            attributes.insert(namespace.to_string(), value);
+fn authored_platform_aws_region(configuration: &LocatedValue) -> Result<Option<String>> {
+    let standard: StandardConfiguration = from_located_value(configuration.clone())
+        .context("failed to read the definition's standard AWS configuration")?;
+    match standard.aws.and_then(|aws| aws.region) {
+        Some(region) if region.is_empty() => {
+            bail!("definition configuration `aws.region` is empty")
         }
+        region => Ok(region),
     }
-    Ok(attributes)
 }
 
 /// One operation's realized execution: the graph's modules (with the
 /// shape-nominated bootstrap), the realized resources grouped by module,
 /// namespaces, writeback declarations, the logical-to-engine identity
-/// index, desired manifests, and the declared selections' attribute
-/// blocks.
+/// index, and desired manifests.
 #[derive(Clone)]
 pub struct ExecutionState {
+    /// Whether the platform declaration includes the AWS authoring namespace.
+    pub(crate) uses_aws: bool,
+    /// Definition-authored platform default; absence preserves the SDK chain.
+    pub(crate) aws_region: Option<String>,
     pub(crate) modules: Vec<ModuleSpec>,
     /// The unique dependency-free module: the engine stands it up before
     /// every other module (it provisions the state backend itself), so the
     /// graph must nominate exactly one.
     pub(crate) bootstrap: String,
     pub(crate) resources: BTreeMap<String, Vec<Arc<dyn iac::Resource>>>,
+    /// Realized service resources in definition declaration order.
+    pub(crate) services: Vec<Arc<dyn tokeira_deploy_engine::Service>>,
     pub(crate) namespaces: Vec<String>,
     pub(crate) writeback: Vec<WritebackEntry>,
     pub(crate) index: RealizedResourceIndex,
     pub(crate) manifests: BTreeMap<ResourceId, serde_json::Value>,
-    /// Namespace → plain-JSON attribute block, transported to the
-    /// selections' constructors uninterpreted.
-    pub(crate) attributes: BTreeMap<String, serde_json::Value>,
 }
 
 impl fmt::Debug for ExecutionState {
@@ -593,6 +587,7 @@ impl fmt::Debug for ExecutionState {
             .debug_struct("ExecutionState")
             .field("modules", &self.modules)
             .field("resource_modules", &self.resources.keys())
+            .field("service_count", &self.services.len())
             .field("namespaces", &self.namespaces)
             .finish_non_exhaustive()
     }
@@ -624,10 +619,6 @@ mod tests {
         }
     }
 
-    fn unlocated(value: ValueShape) -> LocatedValue {
-        LocatedValue { value, range: None }
-    }
-
     #[test]
     fn the_bootstrap_is_the_unique_dependency_free_module() {
         let modules = [
@@ -656,26 +647,22 @@ mod tests {
     }
 
     #[test]
-    fn selection_attributes_extracts_declared_namespace_blocks_as_json() {
-        let config = unlocated(ValueShape::Struct {
+    fn the_standard_aws_projection_preserves_the_authored_platform_default() {
+        let configuration = LocatedValue::new(tokeira_platform::author::ValueShape::Struct {
             name: "Compose".to_string(),
-            fields: vec![
-                (
-                    "aws".to_string(),
-                    unlocated(ValueShape::Struct {
-                        name: "Aws".to_string(),
-                        fields: vec![(
-                            "region".to_string(),
-                            unlocated(ValueShape::String("eu-west-2".to_string())),
-                        )],
-                    }),
-                ),
-                ("other".to_string(), unlocated(ValueShape::Bool(true))),
-            ],
+            fields: vec![(
+                "aws".to_string(),
+                LocatedValue::new(tokeira_platform::author::ValueShape::Struct {
+                    name: "Aws".to_string(),
+                    fields: vec![("region".to_string(), LocatedValue::string("eu-west-2"))],
+                }),
+            )],
         });
-        let attributes = selection_attributes(&config, ["aws", "compose"].into_iter()).unwrap();
-        assert_eq!(attributes.len(), 1);
-        assert_eq!(attributes["aws"]["region"], "eu-west-2");
+
+        assert_eq!(
+            authored_platform_aws_region(&configuration).unwrap(),
+            Some("eu-west-2".to_string())
+        );
     }
 
     /// A frontend whose only behaviour is refusing the retarget: the gate
@@ -692,7 +679,7 @@ mod tests {
             &self,
             _source: FrontendSource<'_>,
             _context: &C,
-            _vocabulary: &tokeira_platform::declaration::Vocabulary,
+            _namespaces: &[tokeira_platform::definition::Namespace],
             _parts: &dyn tokeira_platform::definition::SourceResolver,
         ) -> std::result::Result<
             tokeira_platform::definition::FrontendOutput,
@@ -706,7 +693,7 @@ mod tests {
             _prior: FrontendSource<'_>,
             _current: FrontendSource<'_>,
             _context: &C,
-            _vocabulary: &tokeira_platform::declaration::Vocabulary,
+            _namespaces: &[tokeira_platform::definition::Namespace],
             _prior_parts: &dyn tokeira_platform::definition::SourceResolver,
             _current_parts: &dyn tokeira_platform::definition::SourceResolver,
         ) -> std::result::Result<(), Vec<String>> {
@@ -721,7 +708,7 @@ mod tests {
     struct NoProbe;
 
     #[async_trait::async_trait]
-    impl tokeira_platform::declaration::ProviderExecution for NoProbe {
+    impl tokeira_platform::declaration::PlatformExecution for NoProbe {
         async fn probe(
             &self,
             _deployment: &tokeira_platform::declaration::DeploymentRef,
@@ -732,14 +719,12 @@ mod tests {
 
     #[test]
     fn the_retarget_gate_refuses_naming_every_changed_field() {
-        let declaration = tokeira_platform::declaration::PlatformDeclaration::on(
-            tokeira_platform::declaration::ProviderExport {
-                kinds: tokeira_platform::declaration::KindSet::new("test", Vec::new()),
-                ops: None,
-                execution: Box::new(NoProbe),
-                infra: None,
-            },
-        );
+        let declaration = tokeira_platform::declaration::PlatformDeclaration {
+            namespaces: Vec::new(),
+            ops: None,
+            execution: Box::new(NoProbe),
+            implementation: std::sync::Arc::new(crate::testkit::TestIntegration),
+        };
         let platform = BoundPlatform::bind("test", "tkd", declaration).unwrap();
         let frontend =
             RefusingFrontend(tokeira_orchestrator::DefinitionFormatId::new("tkd").unwrap());
@@ -772,12 +757,5 @@ mod tests {
         assert!(error.contains("retarget refused"), "{error}");
         assert!(error.contains("storage.region"), "{error}");
         assert!(error.contains("storage.mode"), "{error}");
-    }
-
-    #[test]
-    fn a_non_struct_configuration_carries_no_attribute_blocks() {
-        let config = unlocated(ValueShape::Unit);
-        let attributes = selection_attributes(&config, ["aws"].into_iter()).unwrap();
-        assert!(attributes.is_empty());
     }
 }

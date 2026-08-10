@@ -72,6 +72,19 @@ impl Default for ServiceContext {
 /// [`manifests`](Self::manifests) to generate provider-specific manifests, and
 /// let the selected [`crate::Platform`] perform the side effects.
 pub trait Service: Debug + Send + Sync {
+    /// Author-visible resource type represented by this service.
+    fn resource_type(&self) -> &'static str;
+
+    /// Validate the complete desired service before an engine sees it.
+    fn validate_input(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Complete output names this service may expose to author references.
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Stable service name.
     fn name(&self) -> &str;
 

@@ -10,13 +10,12 @@ use serde::Serialize;
 use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_platform::{
     author::{LocatedValue, ValueShape, VariantShape},
-    declaration::Vocabulary,
-    definition::{DefinitionFrontend, FrontendOutput, FrontendSource},
+    definition::{DefinitionFrontend, FrontendOutput, FrontendSource, Namespace},
     error::{DiagnosticCategory, FrontendDiagnostic, SourceRange},
     graph::{
         OutputReference, ResourceReference, StructuralGraphBuilder, VerifiedGraph, WritebackValue,
     },
-    kind::ProviderKind,
+    kind::DecodedKind,
 };
 
 use crate::{
@@ -60,7 +59,7 @@ impl DefinitionFrontend for TkdFrontend {
         &self,
         source: FrontendSource<'_>,
         context: &C,
-        vocabulary: &Vocabulary,
+        namespaces: &[Namespace],
         parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<FrontendOutput, FrontendDiagnostic>
     where
@@ -77,7 +76,7 @@ impl DefinitionFrontend for TkdFrontend {
         let source_map = SourceMap::new(source.bytes);
         let context = context_fields(context)
             .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
-        let bridge = FrameworkBridge::new(vocabulary, context);
+        let bridge = FrameworkBridge::new(namespaces, context);
         let (graph, config) = crate::interpret(source_text, &bridge, &(), parts)
             .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
         let config = value_to_located(config)
@@ -90,7 +89,7 @@ impl DefinitionFrontend for TkdFrontend {
         prior: FrontendSource<'_>,
         current: FrontendSource<'_>,
         context: &C,
-        vocabulary: &Vocabulary,
+        namespaces: &[Namespace],
         prior_parts: &dyn tokeira_platform::definition::SourceResolver,
         current_parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<(), Vec<String>>
@@ -112,7 +111,7 @@ impl DefinitionFrontend for TkdFrontend {
             let text = std::str::from_utf8(source.bytes)
                 .map_err(|error| vec![format!("{label} definition is not UTF-8: {error}")])?;
             let fields = context_fields(context).map_err(|error| vec![error.msg.clone()])?;
-            let bridge = FrameworkBridge::new(vocabulary, fields);
+            let bridge = FrameworkBridge::new(namespaces, fields);
             let (_, config) = crate::interpret(text, &bridge, &(), parts)
                 .map_err(|error| vec![format!("{label} definition: {}", error.msg)])?;
             Ok(config)
@@ -130,7 +129,7 @@ enum HostValue {
     Module(String),
     Resource(ResourceReference),
     Output(OutputReference),
-    Kind(Rc<RefCell<Option<Box<dyn ProviderKind>>>>),
+    Kind(Rc<RefCell<Option<DecodedKind>>>),
     Context(FieldMap<HostValue>),
 }
 
@@ -154,30 +153,52 @@ impl fmt::Debug for HostValue {
             Self::Module(value) => f.debug_tuple("Module").field(value).finish(),
             Self::Resource(value) => f.debug_tuple("Resource").field(value).finish(),
             Self::Output(value) => f.debug_tuple("Output").field(value).finish(),
-            Self::Kind(_) => f.write_str("ProviderKind"),
+            Self::Kind(_) => f.write_str("Kind"),
             Self::Context(_) => f.write_str("Context"),
         }
     }
 }
 
 struct FrameworkBridge<'a> {
-    kinds: &'a Vocabulary,
+    namespaces: &'a [Namespace],
     context: FieldMap<HostValue>,
-    graph: RefCell<Option<StructuralGraphBuilder<Box<dyn ProviderKind>>>>,
+    graph: RefCell<Option<StructuralGraphBuilder<DecodedKind>>>,
 }
 
 impl<'a> FrameworkBridge<'a> {
-    fn new(kinds: &'a Vocabulary, context: FieldMap<HostValue>) -> Self {
+    fn new(namespaces: &'a [Namespace], context: FieldMap<HostValue>) -> Self {
         Self {
-            kinds,
+            namespaces,
             context,
             graph: RefCell::new(Some(StructuralGraphBuilder::new())),
         }
     }
 
+    fn contains(&self, name: &str) -> bool {
+        self.namespaces
+            .iter()
+            .any(|namespace| namespace.kinds.contains(&name))
+    }
+
+    fn decode(&self, name: &str, input: LocatedValue) -> Result<DecodedKind, EvalError> {
+        let namespace = self
+            .namespaces
+            .iter()
+            .find(|namespace| namespace.kinds.contains(&name))
+            .ok_or_else(|| EvalError::new(format!("unknown resource kind `{name}`")))?;
+        (namespace.decode)(name, input)
+            .ok_or_else(|| {
+                EvalError::new(format!(
+                    "namespace `{}` advertises resource kind `{name}` but cannot decode it",
+                    namespace.name
+                ))
+            })?
+            .map_err(|error| EvalError::new(error.message))
+    }
+
     fn with_graph<T>(
         &self,
-        action: impl FnOnce(&mut StructuralGraphBuilder<Box<dyn ProviderKind>>) -> Result<T, EvalError>,
+        action: impl FnOnce(&mut StructuralGraphBuilder<DecodedKind>) -> Result<T, EvalError>,
     ) -> Result<T, EvalError> {
         let mut graph = self.graph.borrow_mut();
         let graph = graph
@@ -289,10 +310,10 @@ impl<'a> FrameworkBridge<'a> {
 impl HostBridge for FrameworkBridge<'_> {
     type Host = HostValue;
     type Cx = ();
-    type Output = VerifiedGraph<Box<dyn ProviderKind>>;
+    type Output = VerifiedGraph<DecodedKind>;
 
     fn is_kind(&self, name: &str) -> bool {
-        self.kinds.contains(name)
+        self.contains(name)
     }
 
     fn knows_method(&self, name: &str) -> bool {
@@ -304,7 +325,12 @@ impl HostBridge for FrameworkBridge<'_> {
     }
 
     fn kind_defaults(&self, name: &str) -> Option<FieldMap<Self::Host>> {
-        match located_to_value(self.kinds.defaults(name)?).ok()? {
+        let namespace = self
+            .namespaces
+            .iter()
+            .find(|namespace| namespace.kinds.contains(&name))?;
+        let defaults = (namespace.defaults?)(name)?;
+        match located_to_value(defaults).ok()? {
             Value::Struct { fields, .. } => Some(fields),
             _ => None,
         }
@@ -323,10 +349,7 @@ impl HostBridge for FrameworkBridge<'_> {
                 .map(|(name, value)| value_to_located(value).map(|value| (name, value)))
                 .collect::<Result<_, _>>()?,
         });
-        let kind = self
-            .kinds
-            .decode(name, input)
-            .map_err(|error| EvalError::new(error.message))?;
+        let kind = self.decode(name, input)?;
         Ok(HostValue::Kind(Rc::new(RefCell::new(Some(kind)))))
     }
 
@@ -657,11 +680,10 @@ impl SourceMap {
 mod tests {
     use serde::{Deserialize, Serialize};
     use tokeira_platform::{
-        author::from_located_value,
-        declaration::{KindEntry, KindSet, Vocabulary},
-        definition::{DefinitionFrontend, DefinitionSourceName, FrontendSource},
+        author::{LocatedValue, from_located_value},
+        definition::{DefinitionFrontend, DefinitionSourceName, FrontendSource, Namespace},
         error::KindError,
-        kind::{PlacementContext, ProviderKind},
+        kind::{DecodedKind, Kind, PlacementContext},
     };
 
     use super::TkdFrontend;
@@ -679,41 +701,151 @@ mod tests {
     #[derive(Debug)]
     struct TestKind;
 
-    impl ProviderKind for TestKind {
-        fn kind_name(&self) -> &'static str {
-            "TestResource"
+    impl Kind<TestResource> for TestKind {
+        fn realize(&self, _placement: &PlacementContext) -> Result<TestResource, KindError> {
+            Ok(TestResource)
         }
+    }
 
-        fn validate_input(&self) -> Result<(), KindError> {
-            Ok(())
+    #[derive(Debug)]
+    struct TestResource;
+
+    #[allow(clippy::manual_async_fn)]
+    impl tokeira_iac::Resource for TestResource {
+        fn resource_type(&self) -> tokeira_iac::ResourceType {
+            tokeira_iac::ResourceType::new("TestResource")
         }
 
         fn declared_outputs(&self) -> &'static [&'static str] {
             &["endpoint"]
         }
 
-        fn desired_manifest(&self, _placement: &PlacementContext) -> serde_json::Value {
-            serde_json::json!({})
+        fn resource_id(&self) -> tokeira_iac::ResourceId {
+            tokeira_iac::ResourceId("test-resource".to_string())
         }
 
-        fn realize(
+        fn dependencies(&self) -> Vec<tokeira_iac::ResourceId> {
+            Vec::new()
+        }
+
+        fn module(&self) -> &str {
+            "test"
+        }
+
+        fn create<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _ctx: &'life1 tokeira_iac::ProvisionContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<tokeira_iac::ResourceState, tokeira_iac::IacError>,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { unreachable!("frontend tests never execute resource lifecycle") })
+        }
+
+        fn update<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            _current: &'life1 tokeira_iac::ResourceState,
+            _ctx: &'life2 tokeira_iac::ProvisionContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<tokeira_iac::ResourceState, tokeira_iac::IacError>,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { unreachable!("frontend tests never execute resource lifecycle") })
+        }
+
+        fn delete<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            _current: &'life1 tokeira_iac::ResourceState,
+            _ctx: &'life2 tokeira_iac::ProvisionContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), tokeira_iac::IacError>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { unreachable!("frontend tests never execute resource lifecycle") })
+        }
+
+        fn describe<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _ctx: &'life1 tokeira_iac::ProvisionContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<tokeira_iac::DescribeResult, tokeira_iac::IacError>,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { unreachable!("frontend tests never execute resource lifecycle") })
+        }
+
+        fn diff(
             &self,
-            _placement: &PlacementContext,
-        ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
-            Err(KindError::new("not exercised by frontend evaluation"))
+            _current: &tokeira_iac::ResourceState,
+            _ctx: &tokeira_iac::ProvisionContext,
+        ) -> tokeira_iac::InternalChange {
+            unreachable!("frontend tests never execute resource lifecycle")
+        }
+
+        fn change_semantics(
+            &self,
+            _ctx: &tokeira_iac::SemanticsContext<'_>,
+        ) -> tokeira_iac::ChangeSemantics {
+            tokeira_iac::ChangeSemantics::default()
         }
     }
 
-    fn vocabulary() -> Vocabulary {
-        Vocabulary::of(vec![KindSet::new(
-            "test",
-            vec![KindEntry {
-                name: "TestResource",
-                defaults: None,
-                decode: |_| Ok(Box::new(TestKind)),
-            }],
-        )])
-        .expect("one-entry test vocabulary composes")
+    fn decode_test_resource(
+        name: &str,
+        _value: LocatedValue,
+    ) -> Option<Result<DecodedKind, KindError>> {
+        (name == "TestResource").then(|| {
+            Ok(DecodedKind::resource::<TestKind, TestResource>(
+                "TestResource",
+                TestKind,
+            ))
+        })
+    }
+
+    fn namespaces() -> [Namespace; 1] {
+        [Namespace {
+            name: "test",
+            kinds: &["TestResource"],
+            defaults: None,
+            decode: decode_test_resource,
+        }]
     }
 
     #[test]
@@ -740,7 +872,7 @@ mod tests {
                 &TestContext {
                     project_name: "example".to_string(),
                 },
-                &vocabulary(),
+                &namespaces(),
                 &tokeira_platform::definition::NoPartSources,
             )
             .expect("definition should evaluate");
@@ -791,7 +923,7 @@ mod tests {
                     bytes: &retargeted,
                 },
                 &context,
-                &vocabulary(),
+                &namespaces(),
                 &tokeira_platform::definition::NoPartSources,
                 &tokeira_platform::definition::NoPartSources,
             )
@@ -814,7 +946,7 @@ mod tests {
                     bytes: &reconciled,
                 },
                 &context,
-                &vocabulary(),
+                &namespaces(),
                 &tokeira_platform::definition::NoPartSources,
                 &tokeira_platform::definition::NoPartSources,
             )

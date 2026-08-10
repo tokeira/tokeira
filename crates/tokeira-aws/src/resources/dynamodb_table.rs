@@ -89,12 +89,15 @@ impl DynamoDbTable {
         tags
     }
 
+    fn client(&self, ctx: &ProvisionContext) -> aws_sdk_dynamodb::Client {
+        ctx.extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dynamodb_for(&self.region)
+    }
+
     async fn wait_until_active(&self, ctx: &ProvisionContext) -> Result<(), IacError> {
         let table_name = self.table_name.clone();
-        let dynamodb_client = &ctx
-            .extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .dynamodb;
+        let dynamodb_client = self.client(ctx);
         super::poll_until(
             Duration::from_secs(5),
             Duration::from_secs(300),
@@ -143,10 +146,7 @@ impl DynamoDbTable {
     ) -> Result<(), IacError> {
         let table_name = self.table_name.clone();
         let desired_attribute = desired_attribute.map(str::to_string);
-        let dynamodb_client = &ctx
-            .extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .dynamodb;
+        let dynamodb_client = self.client(ctx);
         let phase = if enable {
             "waiting for TTL enablement to be reflected"
         } else {
@@ -196,10 +196,7 @@ impl DynamoDbTable {
 
     async fn wait_until_deleted(&self, ctx: &ProvisionContext) -> Result<(), IacError> {
         let table_name = self.table_name.clone();
-        let dynamodb_client = &ctx
-            .extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .dynamodb;
+        let dynamodb_client = self.client(ctx);
         super::poll_until(
             Duration::from_secs(5),
             Duration::from_secs(300),
@@ -239,6 +236,44 @@ impl DynamoDbTable {
 impl Resource for DynamoDbTable {
     fn resource_type(&self) -> ResourceType {
         ResourceType::new(Self::TYPE)
+    }
+
+    fn validate_input(&self) -> Result<(), String> {
+        let hash_key = self
+            .key_schema
+            .iter()
+            .find(|attribute| attribute.key_type == KeyType::Hash)
+            .map(|attribute| attribute.name.as_str())
+            .unwrap_or_default();
+        for (field, value) in [
+            ("table", self.table_name.as_str()),
+            ("region", self.region.as_str()),
+            ("hash_key", hash_key),
+        ] {
+            if value.is_empty() {
+                return Err(format!("DynamoDB table {field} cannot be empty"));
+            }
+        }
+        Ok(())
+    }
+
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &["table_name", "table_arn"]
+    }
+
+    fn desired_manifest(&self) -> serde_json::Value {
+        let hash_key = self
+            .key_schema
+            .iter()
+            .find(|attribute| attribute.key_type == KeyType::Hash)
+            .map(|attribute| attribute.name.as_str());
+        serde_json::json!({
+            "table": self.table_name,
+            "region": self.region,
+            "hash_key": hash_key,
+            "ttl": self.ttl_attribute,
+            "module": self.module,
+        })
     }
 
     fn resource_id(&self) -> ResourceId {
@@ -492,10 +527,8 @@ impl Resource for DynamoDbTable {
             .collect::<Result<_, _>>()?;
 
         // dynamodb:CreateTable
-        let adopted_existing = match ctx
-            .extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .dynamodb
+        let adopted_existing = match self
+            .client(ctx)
             .create_table()
             .table_name(name)
             .set_key_schema(Some(key_schema))
@@ -518,10 +551,8 @@ impl Resource for DynamoDbTable {
 
         self.wait_until_active(ctx).await?;
 
-        let table_arn = ctx
-            .extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .dynamodb
+        let table_arn = self
+            .client(ctx)
             .describe_table()
             .table_name(name)
             .send()
@@ -543,10 +574,8 @@ impl Resource for DynamoDbTable {
         if let Some(ttl_attr) = &self.ttl_attribute {
             let mut should_update_ttl = true;
             if adopted_existing {
-                let ttl_desc = ctx
-                    .extension::<crate::AwsClients>()
-                    .expect("AwsClients")
-                    .dynamodb
+                let ttl_desc = self
+                    .client(ctx)
                     .describe_time_to_live()
                     .table_name(name)
                     .send()
@@ -579,9 +608,7 @@ impl Resource for DynamoDbTable {
                     .map_err(|e| {
                         IacError::AwsSdk(format!("dynamodb:UpdateTimeToLive build: {e}"))
                     })?;
-                ctx.extension::<crate::AwsClients>()
-                    .expect("AwsClients")
-                    .dynamodb
+                self.client(ctx)
                     .update_time_to_live()
                     .table_name(name)
                     .time_to_live_specification(ttl_spec)
@@ -601,9 +628,7 @@ impl Resource for DynamoDbTable {
         // dynamodb:TagResource
         let ddb_tags = super::dynamodb_tags(&tags);
         if !table_arn.is_empty() {
-            ctx.extension::<crate::AwsClients>()
-                .expect("AwsClients")
-                .dynamodb
+            self.client(ctx)
                 .tag_resource()
                 .resource_arn(&table_arn)
                 .set_tags(Some(ddb_tags))
@@ -641,9 +666,7 @@ impl Resource for DynamoDbTable {
 
         // dynamodb:TagResource to update tags
         if !current.physical_id.is_empty() {
-            ctx.extension::<crate::AwsClients>()
-                .expect("AwsClients")
-                .dynamodb
+            self.client(ctx)
                 .tag_resource()
                 .resource_arn(&current.physical_id)
                 .set_tags(Some(ddb_tags))
@@ -680,9 +703,7 @@ impl Resource for DynamoDbTable {
                 }
             };
 
-            ctx.extension::<crate::AwsClients>()
-                .expect("AwsClients")
-                .dynamodb
+            self.client(ctx)
                 .update_time_to_live()
                 .table_name(&self.table_name)
                 .time_to_live_specification(ttl_spec)
@@ -726,10 +747,8 @@ impl Resource for DynamoDbTable {
     ) -> Result<(), IacError> {
         let name = &self.table_name;
 
-        match ctx
-            .extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .dynamodb
+        match self
+            .client(ctx)
             .delete_table()
             .table_name(name)
             .send()
@@ -752,10 +771,8 @@ impl Resource for DynamoDbTable {
     async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let name = &self.table_name;
 
-        match ctx
-            .extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .dynamodb
+        match self
+            .client(ctx)
             .describe_table()
             .table_name(name)
             .send()
@@ -781,9 +798,7 @@ impl Resource for DynamoDbTable {
                 let tags = if arn.is_empty() {
                     HashMap::new()
                 } else {
-                    ctx.extension::<crate::AwsClients>()
-                        .expect("AwsClients")
-                        .dynamodb
+                    self.client(ctx)
                         .list_tags_of_resource()
                         .resource_arn(&arn)
                         .send()
@@ -799,10 +814,8 @@ impl Resource for DynamoDbTable {
                         .map(|tag| (tag.key().to_string(), tag.value().to_string()))
                         .collect()
                 };
-                let ttl_attribute = ctx
-                    .extension::<crate::AwsClients>()
-                    .expect("AwsClients")
-                    .dynamodb
+                let ttl_attribute = self
+                    .client(ctx)
                     .describe_time_to_live()
                     .table_name(name)
                     .send()

@@ -25,21 +25,18 @@
 //!    with the definition and resolved against the definition source's own
 //!    directory, so a retained revision renders its own content and a
 //!    dashboard edit is a visible, plannable change to this deployment.
-//! 3. **The provider** — `tokeira_compose::provider()`. Its export brings
-//!    everything "running on Compose" means: the kind library (`Service`,
-//!    `LocalStateDir`, `ServerConfig`), the Docker mechanics behind those
-//!    kinds, the runtime reads (logs, port mappings) that `tkp` surfaces as
-//!    verbs by presence, and the execution installer the framework calls at
-//!    operation start. Being the compose platform is using the compose
-//!    provider; its vocabulary needs no separate wiring act.
+//! 3. **The Compose resources** — `tokeira-compose` supplies its frontend
+//!    namespace, concrete resource/service models, Docker runtime platform,
+//!    reachability, and live operations. This platform definition selects
+//!    and integrates those capabilities; the resource crate does not export
+//!    a preassembled platform.
 //! 4. **The platform's own kinds** — [`observability`]: the
 //!    `ObservabilityConfiguration` bundle that renders the companion
 //!    content. Tokeira-opinionated description and its machinery, owned
-//!    here and contributed to the vocabulary as the platform's own
-//!    selection; the provider keeps only the fencing contract
+//!    here and contributed through the platform's own namespace; the
+//!    Compose resource crate keeps only the fencing contract
 //!    (`config_content_resource_id`) its `Service` consumers key on.
-//!    Auxiliary vocabulary joins the same way — AWS kinds, selected from
-//!    `tokeira_aws::kinds`.
+//!    The AWS resource namespace joins alongside it.
 //! 5. **The entry point** — [`platform`]: the one exported declaration
 //!    `tkp` invokes. There is no binary here; `tkp` is the binary and
 //!    includes the framework for invoking the platform.
@@ -49,41 +46,36 @@
 
 pub mod observability;
 
-use tokeira_aws::{
-    kinds::{DsqlCluster, DynamoDbTable},
-    resources,
-};
-use tokeira_platform::declaration::{PlatformDeclaration, kind};
+use std::sync::Arc;
+
+use tokeira_platform::{declaration::PlatformDeclaration, definition::Namespace};
 
 /// The platform entry point: the one declaration `tkp` invokes.
 ///
-/// The provider brings its vocabulary, runtime reads, and execution
-/// installer; the platform's own observability kind and the auxiliary AWS
-/// kinds are selected explicitly. The authoring vocabulary is exactly the
-/// union of the three — a definition naming any other kind fails at
-/// `definition check` with an unknown-kind error located at the authoring
-/// site, and two selections exporting the same kind name fail composition,
-/// naming both.
+/// The declaration exposes three authoring namespaces: Compose resources,
+/// this platform's observability resource, and the AWS resources used by the
+/// optional DSQL configuration. Operational capabilities are integrated here
+/// rather than exported wholesale by `tokeira-compose`.
 ///
 /// Construction is pure: no filesystem, no network, no Docker. Connections
 /// happen when the framework runs an operation, never when the platform is
 /// declared.
 pub fn platform() -> PlatformDeclaration {
-    PlatformDeclaration::on(tokeira_compose::provider())
-        // The platform's own kind: the observability configuration bundle
-        // rendering the companion content shipped beside the definitions.
-        .kinds(observability::kind_set())
-        // Exactly the AWS kinds the definitions require, selected by type
-        // under the word each resource owns: the vocabulary states its
-        // intent and grows only on purpose — a definition adopting a new
-        // AWS kind names its type here in the same change, and a typo is a
-        // compile error. The provider-tracking alternative (`kinds::all()`)
-        // would widen this platform's vocabulary with every kind the AWS
-        // export gains.
-        .kinds(tokeira_aws::kinds::select(vec![
-            kind::<DsqlCluster>(resources::dsql_cluster::DsqlCluster::TYPE),
-            kind::<DynamoDbTable>(resources::dynamodb_table::DynamoDbTable::TYPE),
-        ]))
+    PlatformDeclaration {
+        namespaces: vec![
+            tokeira_compose::namespace(),
+            observability::namespace(),
+            Namespace {
+                name: tokeira_aws::kinds::NAMESPACE,
+                kinds: tokeira_aws::kinds::KINDS,
+                defaults: None,
+                decode: tokeira_aws::kinds::decode,
+            },
+        ],
+        ops: Some(Box::new(tokeira_compose::ops::DockerOps)),
+        execution: Box::new(tokeira_compose::execution::ComposeExecution),
+        implementation: Arc::new(tokeira_compose::execution::ComposeIntegration),
+    }
 }
 
 // How this entry point reaches an operator.

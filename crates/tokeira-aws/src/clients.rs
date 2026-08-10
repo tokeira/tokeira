@@ -2,6 +2,8 @@
 
 pub(crate) mod ecr;
 
+use tokeira_iac::ProvisionContext;
+
 /// All AWS SDK clients needed by resource implementations.
 ///
 /// Constructed once from a shared `SdkConfig` and registered on
@@ -9,6 +11,7 @@ pub(crate) mod ecr;
 /// Resource implementations retrieve it via `ctx.extension::<AwsClients>()`.
 #[derive(Debug, Clone)]
 pub struct AwsClients {
+    sdk_config: aws_config::SdkConfig,
     pub ec2: aws_sdk_ec2::Client,
     pub eks: aws_sdk_eks::Client,
     pub ecs: aws_sdk_ecs::Client,
@@ -29,6 +32,7 @@ impl AwsClients {
     /// Construct all SDK clients from a shared config.
     pub fn new(sdk_config: &aws_config::SdkConfig) -> Self {
         Self {
+            sdk_config: sdk_config.clone(),
             ec2: aws_sdk_ec2::Client::new(sdk_config),
             eks: aws_sdk_eks::Client::new(sdk_config),
             ecs: aws_sdk_ecs::Client::new(sdk_config),
@@ -44,5 +48,56 @@ impl AwsClients {
             ssm: aws_sdk_ssm::Client::new(sdk_config),
             sts: aws_sdk_sts::Client::new(sdk_config),
         }
+    }
+
+    /// Return a DSQL client using the resource-selected region.
+    pub fn dsql_for(&self, region: &str) -> aws_sdk_dsql::Client {
+        aws_sdk_dsql::Client::new(&self.sdk_config_for(region))
+    }
+
+    /// Return a DynamoDB client using the resource-selected region.
+    pub fn dynamodb_for(&self, region: &str) -> aws_sdk_dynamodb::Client {
+        aws_sdk_dynamodb::Client::new(&self.sdk_config_for(region))
+    }
+
+    fn sdk_config_for(&self, region: &str) -> aws_config::SdkConfig {
+        self.sdk_config
+            .to_builder()
+            .region(aws_config::Region::new(region.to_string()))
+            .build()
+    }
+}
+
+/// Install the shared AWS client bundle, preserving SDK-chain defaults and
+/// applying the platform region when one was authored.
+pub async fn register_infra_extensions(platform_region: Option<&str>, ctx: &mut ProvisionContext) {
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    if let Some(region) = platform_region {
+        loader = loader.region(aws_config::Region::new(region.to_string()));
+    }
+    let sdk_config = loader.load().await;
+    ctx.set_extension(AwsClients::new(&sdk_config));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_region_overrides_the_bundle_default() {
+        let sdk_config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("eu-west-2"))
+            .build();
+        let clients = AwsClients::new(&sdk_config);
+
+        assert_eq!(
+            clients.dsql_for("us-east-1").config().region(),
+            Some(&aws_config::Region::new("us-east-1"))
+        );
+        assert_eq!(
+            clients.dynamodb_for("ap-southeast-2").config().region(),
+            Some(&aws_config::Region::new("ap-southeast-2"))
+        );
     }
 }

@@ -3,7 +3,7 @@
 //!
 //! Pipeline per invocation: UTF-8 admission → preflight (restricted subset,
 //! hygiene, entrypoints, facade import contract) → lowering (match splice,
-//! import blanking) → facade synthesis from the engine kind inventory and the
+//! import blanking) → facade synthesis from the platform namespaces and the
 //! serialized typed context → assembly → Monty execution → structural-result
 //! conversion. Every failure path lands as one [`FrontendDiagnostic`] whose
 //! position, when one exists, is in the operator's `.tkdp` file.
@@ -11,8 +11,7 @@
 use serde::Serialize;
 use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_platform::{
-    declaration::Vocabulary,
-    definition::{DefinitionFrontend, FrontendOutput, FrontendSource},
+    definition::{DefinitionFrontend, FrontendOutput, FrontendSource, Namespace},
     error::{DiagnosticCategory, FrontendDiagnostic, SourceRange},
 };
 
@@ -146,7 +145,7 @@ impl TkdpFrontend {
         &self,
         source: &FrontendSource<'a>,
         context: &C,
-        vocabulary: &Vocabulary,
+        namespaces: &[Namespace],
         parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<Prepared<'a>, FrontendDiagnostic>
     where
@@ -161,7 +160,10 @@ impl TkdpFrontend {
         })?;
 
         let label = source.source_name.to_string();
-        let kind_names: Vec<&str> = vocabulary.names().collect();
+        let kind_names: Vec<&str> = namespaces
+            .iter()
+            .flat_map(|namespace| namespace.kinds.iter().copied())
+            .collect();
         let names = facade::facade_names(&kind_names);
         let pf = preflight(text, &names).map_err(|findings| {
             self.diagnostic(
@@ -202,13 +204,13 @@ impl TkdpFrontend {
         &self,
         source: FrontendSource<'_>,
         context: &C,
-        vocabulary: &Vocabulary,
+        namespaces: &[Namespace],
         parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<Program, FrontendDiagnostic>
     where
         C: Serialize,
     {
-        self.prepare(&source, context, vocabulary, parts)
+        self.prepare(&source, context, namespaces, parts)
             .map(|prepared| prepared.program)
     }
 }
@@ -222,20 +224,20 @@ impl DefinitionFrontend for TkdpFrontend {
         &self,
         source: FrontendSource<'_>,
         context: &C,
-        vocabulary: &Vocabulary,
+        namespaces: &[Namespace],
         parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> Result<FrontendOutput, FrontendDiagnostic>
     where
         C: Serialize,
     {
-        let prepared = self.prepare(&source, context, vocabulary, parts)?;
+        let prepared = self.prepare(&source, context, namespaces, parts)?;
 
         let result = execute(&prepared.program, prepared.text).map_err(|failure| {
             self.diagnostic(&source, failure.range.and_then(to_range), failure.message)
         })?;
 
         let pf = prepared.preflight;
-        convert(result, vocabulary, &pf.call_sites, pf.deployment_range)
+        convert(result, namespaces, &pf.call_sites, pf.deployment_range)
             .map_err(|error| self.diagnostic(&source, to_range(error.range), error.message))
     }
 }

@@ -1,4 +1,4 @@
-//! The Compose provider's execution seam and registration ingredient.
+//! The Compose provider's reachability seam.
 //!
 //! [`ComposeExecution::probe`] answers whether the local Docker daemon can
 //! be reached for this deployment — the degradable answer stated as data:
@@ -7,27 +7,17 @@
 //! the operation's own error path, where
 //! [`ComposeError::DockerNotAvailable`] already maps to the same typed
 //! platform issue (`From<ComposeError> for IacError`).
-//!
-//! [`ComposeInfraConstructor`] is the selection's infra-phase constructor,
-//! run by the deployment's registration seam: it registers what Compose
-//! resources read from the provision context — the Docker-backed
-//! [`ComposePlatform`] (the compose-file ledger lives under the
-//! framework-owned `state/` directory) and the compose-service recovery
-//! hook. Its failures are errors — real ones, and equally a daemon dying
-//! after a passing probe: the error root stays [`ComposeError`], so the
-//! unreachable class renders as the same platform issue rather than a
-//! blended message.
 
-use tokeira_platform::declaration::{DeploymentRef, InfraConstructor, ProviderExecution};
+use tokeira_platform::declaration::{DeploymentRef, PlatformExecution, PlatformIntegration};
 
-use crate::{ComposeError, ComposePlatform, docker_unreachable_issue, service_from_manifest};
+use crate::{ComposeError, ComposePlatform, docker_unreachable_issue};
 
 /// Compose's execution seam implementation.
 #[derive(Debug)]
 pub struct ComposeExecution;
 
 #[async_trait::async_trait]
-impl ProviderExecution for ComposeExecution {
+impl PlatformExecution for ComposeExecution {
     async fn probe(
         &self,
         deployment: &DeploymentRef,
@@ -45,33 +35,52 @@ impl ProviderExecution for ComposeExecution {
     }
 }
 
-/// Compose's infra-phase extension constructor. The provider's own
-/// namespace carries no attribute block — everything it needs is the
-/// deployment's coordinates.
+/// Compose's platform implementation as integrated by a platform definition.
+///
+/// Standard AWS clients are registered by the AWS-first framework before this
+/// seam. Compose needs no additional context extension: its desired resources
+/// and services are complete. Runtime service application is nevertheless
+/// Compose-owned, so this constructs the deployment-scoped [`ComposePlatform`]
+/// that reconciles their manifests against Docker.
 #[derive(Debug)]
-pub struct ComposeInfraConstructor;
+pub struct ComposeIntegration;
 
 #[async_trait::async_trait]
-impl InfraConstructor for ComposeInfraConstructor {
-    async fn construct(
+impl PlatformIntegration for ComposeIntegration {
+    async fn register_infra_extensions(
+        &self,
+        _deployment: &DeploymentRef,
+        _ctx: &mut tokeira_iac::ProvisionContext,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn register_deploy_extensions(
+        &self,
+        _deployment: &DeploymentRef,
+        _ctx: &mut tokeira_deploy_engine::ServiceContext,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn register_image_extensions(
+        &self,
+        _deployment: &DeploymentRef,
+        _ctx: &mut tokeira_deploy_engine::ImageContext,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn service_platform(
         &self,
         deployment: &DeploymentRef,
-        _attributes: Option<&serde_json::Value>,
-        ctx: &mut tokeira_iac::ProvisionContext,
-    ) -> anyhow::Result<()> {
-        // Recovered resources let refresh/destroy reconstruct a live service
-        // from recorded state without the definition in hand.
-        ctx.set_extension(tokeira_iac::ResourceRecovery::new(|state| {
-            (state.resource_type.0 == crate::ComposeService::TYPE)
-                .then(|| service_from_manifest(state.properties.clone()).ok())
-                .flatten()
-                .map(|service| Box::new(service) as Box<dyn tokeira_iac::Resource>)
-        }));
-
+    ) -> anyhow::Result<Box<dyn tokeira_deploy_engine::Platform>> {
         let ledger = deployment.dir.join("state/compose-services.yaml");
-        let platform = ComposePlatform::connect(ledger, &deployment.dir, &deployment.name)?;
-        ctx.set_extension(platform);
-        Ok(())
+        Ok(Box::new(ComposePlatform::connect(
+            ledger,
+            &deployment.dir,
+            &deployment.name,
+        )?))
     }
 }
 

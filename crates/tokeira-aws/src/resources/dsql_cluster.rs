@@ -67,12 +67,54 @@ impl DsqlCluster {
             })
             .or_else(|| self.fallback_identifier.clone())
     }
+
+    fn client(&self, ctx: &ProvisionContext) -> aws_sdk_dsql::Client {
+        ctx.extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dsql_for(&self.region)
+    }
 }
 
 #[async_trait::async_trait]
 impl Resource for DsqlCluster {
     fn resource_type(&self) -> ResourceType {
         ResourceType::new(Self::TYPE)
+    }
+
+    fn validate_input(&self) -> Result<(), String> {
+        if self.identity.is_empty() {
+            return Err("DSQL cluster identity cannot be empty".to_string());
+        }
+        if self.region.is_empty() {
+            return Err("DSQL cluster region cannot be empty".to_string());
+        }
+        match self.mode {
+            DsqlClusterMode::Managed if self.endpoint.is_some() || self.arn.is_some() => {
+                Err("managed DSQL clusters cannot declare an endpoint or ARN".to_string())
+            }
+            DsqlClusterMode::Preexisting if self.endpoint.is_none() || self.arn.is_none() => {
+                Err("preexisting DSQL clusters require both endpoint and ARN".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &["cluster_endpoint", "cluster_arn"]
+    }
+
+    fn desired_manifest(&self) -> serde_json::Value {
+        serde_json::json!({
+            "identity": self.identity,
+            "region": self.region,
+            "mode": match self.mode {
+                DsqlClusterMode::Managed => "managed",
+                DsqlClusterMode::Preexisting => "preexisting",
+            },
+            "endpoint": self.endpoint,
+            "arn": self.arn,
+            "module": self.module,
+        })
     }
 
     fn resource_id(&self) -> ResourceId {
@@ -384,10 +426,8 @@ impl Resource for DsqlCluster {
                 })
             }
             DsqlClusterMode::Managed => {
-                let create = ctx
-                    .extension::<crate::AwsClients>()
-                    .expect("AwsClients")
-                    .dsql
+                let create = self
+                    .client(ctx)
                     .create_cluster()
                     .set_tags(Some(tags.clone()))
                     .deletion_protection_enabled(true)
@@ -400,19 +440,15 @@ impl Resource for DsqlCluster {
                 let cluster_id = create.identifier().to_string();
                 let cluster_arn = create.arn().to_string();
 
-                ctx.extension::<crate::AwsClients>()
-                    .expect("AwsClients")
-                    .dsql
+                self.client(ctx)
                     .wait_until_cluster_active()
                     .identifier(&cluster_id)
                     .wait(Duration::from_secs(900))
                     .await
                     .map_err(|e| IacError::AwsSdk(format!("dsql:WaitUntilClusterActive: {e}")))?;
 
-                let cluster = ctx
-                    .extension::<crate::AwsClients>()
-                    .expect("AwsClients")
-                    .dsql
+                let cluster = self
+                    .client(ctx)
                     .get_cluster()
                     .identifier(&cluster_id)
                     .send()
@@ -459,9 +495,7 @@ impl Resource for DsqlCluster {
                 .unwrap_or_default()
                 .to_string();
             if !cluster_arn.is_empty() {
-                ctx.extension::<crate::AwsClients>()
-                    .expect("AwsClients")
-                    .dsql
+                self.client(ctx)
                     .tag_resource()
                     .resource_arn(&cluster_arn)
                     .set_tags(Some(tags.clone()))
@@ -543,10 +577,8 @@ impl Resource for DsqlCluster {
             &format!("deleting cluster_id '{cluster_id}'"),
         );
 
-        let cluster = match ctx
-            .extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .dsql
+        let cluster = match self
+            .client(ctx)
             .get_cluster()
             .identifier(&cluster_id)
             .send()
@@ -578,9 +610,7 @@ impl Resource for DsqlCluster {
                 &self.resource_type(),
                 "disabling deletion protection before delete",
             );
-            ctx.extension::<crate::AwsClients>()
-                .expect("AwsClients")
-                .dsql
+            self.client(ctx)
                 .update_cluster()
                 .identifier(&cluster_id)
                 .deletion_protection_enabled(false)
@@ -590,10 +620,7 @@ impl Resource for DsqlCluster {
                     IacError::AwsSdk(format!("dsql:UpdateCluster: {}", e.into_service_error()))
                 })?;
 
-            let dsql_client = &ctx
-                .extension::<crate::AwsClients>()
-                .expect("AwsClients")
-                .dsql;
+            let dsql_client = self.client(ctx);
             super::poll_until(
                 Duration::from_secs(5),
                 Duration::from_secs(900),
@@ -630,10 +657,8 @@ impl Resource for DsqlCluster {
             );
         }
 
-        match ctx
-            .extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .dsql
+        match self
+            .client(ctx)
             .delete_cluster()
             .identifier(&cluster_id)
             .send()
@@ -655,10 +680,7 @@ impl Resource for DsqlCluster {
                     );
                 }
 
-                let dsql_client = &ctx
-                    .extension::<crate::AwsClients>()
-                    .expect("AwsClients")
-                    .dsql;
+                let dsql_client = self.client(ctx);
                 super::poll_until(
                     Duration::from_secs(5),
                     Duration::from_secs(900),
@@ -768,10 +790,8 @@ impl Resource for DsqlCluster {
                     return Ok(DescribeResult::Unsupported);
                 };
 
-                let cluster = match ctx
-                    .extension::<crate::AwsClients>()
-                    .expect("AwsClients")
-                    .dsql
+                let cluster = match self
+                    .client(ctx)
                     .get_cluster()
                     .identifier(&cluster_id)
                     .send()

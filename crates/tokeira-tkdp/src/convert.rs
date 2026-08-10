@@ -4,8 +4,7 @@
 //! config value plus the deployment envelope. This module decodes that
 //! `MontyObject` mechanically — dataclasses become `Struct` shapes (the
 //! deserializer's enum-position admission supplies variant semantics when a
-//! decode target expects an enum) — merges provider defaults under authored
-//! kind fields, decodes kinds through the engine functions, and drives
+//! decode target expects an enum) — decodes kinds through their namespaces and drives
 //! `StructuralGraphBuilder` in declaration order.
 //!
 //! Values carry no ranges — Monty objects do not remember construction sites
@@ -19,8 +18,7 @@ use monty_types::MontyObject;
 use ruff_text_size::TextRange;
 use tokeira_platform::{
     author::{LocatedValue, ValueShape},
-    declaration::Vocabulary,
-    definition::FrontendOutput,
+    definition::{FrontendOutput, Namespace},
     error::GraphError,
     graph::{ResourceReference, StructuralGraphBuilder, WritebackValue},
     kind::DecodedKind,
@@ -49,7 +47,7 @@ impl ConvertError {
 /// Decodes the driver's result into the frontend output.
 pub fn convert(
     result: MontyObject,
-    vocabulary: &Vocabulary,
+    namespaces: &[Namespace],
     sites: &[CallSite],
     fallback: TextRange,
 ) -> Result<FrontendOutput, ConvertError> {
@@ -106,7 +104,8 @@ pub fn convert(
         let kind_name = expect_string(take(&mut resource, "kind", range)?, "resource kind", range)?;
         let kwargs = expect_dict(take(&mut resource, "kwargs", range)?, "kind kwargs", range)?;
         // Kwargs become a named struct directly (not a generic map), so the
-        // provider-defaults merge and struct-shaped decode both apply.
+        // resource-kind decoder receives its authored shape without frontend
+        // lifecycle metadata.
         let authored = LocatedValue::new(ValueShape::Struct {
             name: kind_name.clone(),
             fields: kwargs
@@ -117,16 +116,31 @@ pub fn convert(
                 })
                 .collect::<Result<Vec<_>, ConvertError>>()?,
         });
-        let merged = merge_defaults(vocabulary.defaults(&kind_name), authored, &kind_name);
-        let kind = vocabulary.decode(&kind_name, merged).map_err(|error| {
-            ConvertError::new(
-                format!(
-                    "kind `{kind_name}` for resource `{module}/{id}`: {}",
-                    error.message
-                ),
-                range,
-            )
-        })?;
+        let namespace = namespaces
+            .iter()
+            .find(|namespace| namespace.kinds.contains(&kind_name.as_str()))
+            .ok_or_else(|| {
+                ConvertError::new(format!("unknown resource kind `{kind_name}`"), range)
+            })?;
+        let kind = (namespace.decode)(&kind_name, authored)
+            .ok_or_else(|| {
+                ConvertError::new(
+                    format!(
+                        "namespace `{}` advertises resource kind `{kind_name}` but cannot decode it",
+                        namespace.name
+                    ),
+                    range,
+                )
+            })?
+            .map_err(|error| {
+                ConvertError::new(
+                    format!(
+                        "kind `{kind_name}` for resource `{module}/{id}`: {}",
+                        error.message
+                    ),
+                    range,
+                )
+            })?;
         let deps = expect_list(take(&mut resource, "deps", range)?, range)?
             .into_iter()
             .map(|dep| {
@@ -318,50 +332,6 @@ pub fn to_located(value: MontyObject, at: TextRange) -> Result<LocatedValue, Con
         }
     };
     Ok(LocatedValue::new(shape))
-}
-
-/// Provider defaults under authored fields: authored values win, defaulted
-/// fields the author omitted survive, authored-only fields append.
-fn merge_defaults(
-    defaults: Option<LocatedValue>,
-    authored: LocatedValue,
-    kind_name: &str,
-) -> LocatedValue {
-    let Some(LocatedValue {
-        value: ValueShape::Struct {
-            fields: default_fields,
-            ..
-        },
-        ..
-    }) = defaults
-    else {
-        return authored;
-    };
-    let LocatedValue {
-        value: ValueShape::Struct {
-            fields: authored_fields,
-            ..
-        },
-        range,
-    } = authored
-    else {
-        return authored;
-    };
-    let mut merged = default_fields;
-    for (name, value) in authored_fields {
-        if let Some(slot) = merged.iter_mut().find(|(existing, _)| *existing == name) {
-            slot.1 = value;
-        } else {
-            merged.push((name, value));
-        }
-    }
-    LocatedValue {
-        value: ValueShape::Struct {
-            name: kind_name.to_string(),
-            fields: merged,
-        },
-        range,
-    }
 }
 
 fn kind_of(value: &MontyObject) -> String {

@@ -1,84 +1,61 @@
-//! The Compose provider's complete kind export.
+//! The Compose provider's kinds and namespace facts.
 //!
-//! Every authorable Docker/local capability of this provider is a typed
-//! kind selected by type: platforms take the set by value through [`set`]
-//! at their entry point. Platform-owned kinds (the observability
-//! configuration bundle) live with their platforms and join the vocabulary
-//! as the platform's own selections.
+//! Kinds and resources are distinct: each kind here is the authored face of
+//! one resource and realizes it directly — [`Service`] realizes the
+//! [`ComposeService`] model in the crate root; the two local marker kinds
+//! realize their node resources beside them. Each resource owns its one
+//! word as a `TYPE` const; the kinds recover it. The namespace facts at the
+//! bottom — [`NAMESPACE`], [`KINDS`], [`decode`] — are what the assembled
+//! binary lists for the frontend; nothing is registered anywhere else.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
-use crate::ComposeService;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokeira_platform::{
-    author::{LocatedValue, ValueShape},
-    declaration::{AuthorableKind, KindSet, kind},
+    author::LocatedValue,
     error::KindError,
-    kind::{PlacementContext, ProviderKind},
+    kind::{self, Kind, PlacementContext},
 };
 
-/// One environment entry without tuple-shaped author data.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Environment {
-    /// Environment variable name.
-    pub name: String,
-    /// Environment variable value.
-    pub value: String,
-}
+use crate::{ComposeService, Environment, Healthcheck, Volume, config_content_resource_id};
 
-/// Platform-owned logical volume vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub enum Volume {
-    /// Persistent path beneath the deployment's local state root.
-    State(StateVolume),
-    /// Generated path beneath the deployment's configuration root.
-    Config(ConfigVolume),
-    /// Docker daemon socket.
-    DockerSocket,
-}
-
-/// Persistent state mount.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StateVolume {
-    /// Logical state subpath.
-    pub sub: String,
-    /// Container mount target.
-    pub at: String,
-}
-
-/// Generated configuration mount.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfigVolume {
-    /// Logical configuration subpath.
-    pub sub: String,
-    /// Container mount target.
-    pub at: String,
-}
-
-/// Authored Compose service resource.
+/// The authored face of a compose service. Realizes the [`ComposeService`]
+/// model directly: the service name comes from the graph's logical id, and
+/// the content couplings come from declared dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
     /// Image reference.
     pub image: String,
     /// Desired replicas.
+    #[serde(default = "crate::kinds::default_replicas")]
     pub replicas: u32,
     /// Published equal host/container ports.
+    #[serde(default)]
     pub publish: Vec<u16>,
-    /// Platform-resolved volumes.
+    /// Platform-resolved logical volumes.
+    #[serde(default)]
     pub volumes: Vec<Volume>,
     /// Explicit environment entries.
+    #[serde(default)]
     pub environment: Vec<Environment>,
     /// Container command.
+    #[serde(default)]
     pub command: Vec<String>,
     /// Compose service start-order dependencies.
+    #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Optional Docker healthcheck definition.
+    #[serde(default)]
+    pub healthcheck: Option<Healthcheck>,
     /// Add the non-secret AWS runtime selectors for this region.
+    #[serde(default)]
     pub aws_region: Option<String>,
+}
+
+fn default_replicas() -> u32 {
+    1
 }
 
 impl Service {
@@ -99,102 +76,51 @@ impl Service {
         Ok(())
     }
 
-    fn compose_service(&self, placement: &PlacementContext) -> ComposeService {
-        let mut volumes = self
-            .volumes
-            .iter()
-            .map(|volume| match volume {
-                Volume::State(StateVolume { sub, at }) => format!(
-                    "{}:{at}",
-                    placement
-                        .deployment_dir
-                        .join(".tokeira-state")
-                        .join(sub)
-                        .display()
-                ),
-                Volume::Config(ConfigVolume { sub, at }) => format!(
-                    "{}:{at}",
-                    placement.deployment_dir.join("config").join(sub).display()
-                ),
-                Volume::DockerSocket => "/var/run/docker.sock:/var/run/docker.sock".to_string(),
-            })
-            .collect::<Vec<_>>();
-        let mut environment = self
-            .environment
-            .iter()
-            .map(|entry| (entry.name.clone(), entry.value.clone()))
-            .collect::<HashMap<_, _>>();
-
-        // Declared dependency on the server-config node ⇒ mount the live
-        // file and couple to the node's desired-content identity — the same
-        // framework-native coupling the configuration resource uses below.
-        // The identity digests the node's manifest (which digests the source
-        // set's bytes), so a `tokeirad.toml` edit is a manifest diff on this
-        // service: the plan states the update and the apply recreates the
-        // container onto the new content.
+    /// Realize the model: authored fields carry over, the name comes from
+    /// the logical id, and declared dependencies couple content identities.
+    /// A dependency on the server-config node couples its desired-content
+    /// identity, so a `tokeirad.toml` edit is a manifest diff on this
+    /// service; a `Config` volume with the rendered-content dependency
+    /// couples the same way through [`config_content_resource_id`].
+    fn realized(&self, placement: &PlacementContext) -> ComposeService {
+        let mut service = ComposeService {
+            name: placement.logical_id.clone(),
+            image: self.image.clone(),
+            replicas: self.replicas,
+            publish: self.publish.clone(),
+            volumes: self.volumes.clone(),
+            environment: self.environment.clone(),
+            depends_on: self.depends_on.clone(),
+            healthcheck: self.healthcheck.clone(),
+            command: self.command.clone(),
+            aws_region: self.aws_region.clone(),
+            server_config_digest: None,
+            config_digest: None,
+            module: placement.module.clone(),
+            resource_dependencies: Vec::new(),
+        };
         let server_config_id = server_config_resource_id();
-        let mut resource_dependencies = Vec::new();
         if let Some(identity) = placement.dependency_content.get(&server_config_id) {
-            volumes.push(format!(
-                "{}:/etc/tokeira/tokeirad.toml:ro",
-                placement.deployment_dir.join("tokeirad.toml").display()
-            ));
-            environment.insert(
-                "TOKEIRA_CONFIG".to_string(),
-                "/etc/tokeira/tokeirad.toml".to_string(),
-            );
-            environment.insert(
-                "TOKEIRA_SERVER_CONFIG_DIGEST".to_string(),
-                identity.prefixed_sha256(),
-            );
-            resource_dependencies.push(server_config_id.0);
+            service.server_config_digest = Some(identity.prefixed_sha256());
+            service.resource_dependencies.push(server_config_id.0);
         }
-
-        if let Some(region) = &self.aws_region {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            volumes.push(format!("{home}/.aws:/home/nonroot/.aws:ro"));
-            environment.insert("HOME".to_string(), "/home/nonroot".to_string());
-            environment.insert("AWS_REGION".to_string(), region.clone());
-            if let Ok(profile) = std::env::var("AWS_PROFILE") {
-                environment.insert("AWS_PROFILE".to_string(), profile);
-            }
-        }
-
-        let config_id = crate::config_content_resource_id();
+        let config_id = config_content_resource_id();
         if self
             .volumes
             .iter()
             .any(|volume| matches!(volume, Volume::Config(_)))
             && let Some(identity) = placement.dependency_content.get(&config_id)
         {
-            resource_dependencies.push(config_id.0);
-            environment.insert(
-                "TOKEIRA_CONFIG_DIGEST".to_string(),
-                identity.prefixed_sha256(),
-            );
+            service.config_digest = Some(identity.prefixed_sha256());
+            service.resource_dependencies.push(config_id.0);
         }
-
-        ComposeService {
-            name: placement.logical_id.clone(),
-            image: self.image.clone(),
-            ports: self
-                .publish
-                .iter()
-                .map(|port| format!("{port}:{port}"))
-                .collect(),
-            volumes,
-            environment,
-            depends_on: self.depends_on.clone(),
-            healthcheck: None,
-            command: self.command.clone(),
-            resource_dependencies,
-        }
+        service
     }
 }
 
-impl ProviderKind for Service {
-    fn kind_name(&self) -> &'static str {
-        "Service"
+impl Kind for Service {
+    fn name(&self) -> &'static str {
+        ComposeService::TYPE
     }
 
     fn validate_input(&self) -> Result<(), KindError> {
@@ -206,7 +132,7 @@ impl ProviderKind for Service {
     }
 
     fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
-        crate::canonicalize_manifest(self.compose_service(placement).to_manifest())
+        crate::canonicalize_manifest(self.realized(placement).to_manifest())
     }
 
     fn realize(
@@ -214,84 +140,7 @@ impl ProviderKind for Service {
         placement: &PlacementContext,
     ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
         self.validate()?;
-        Ok(Box::new(PlacedService {
-            service: self.compose_service(placement),
-            module: placement.module.clone(),
-        }))
-    }
-}
-
-#[derive(Debug)]
-struct PlacedService {
-    service: ComposeService,
-    module: String,
-}
-
-#[async_trait]
-impl tokeira_iac::Resource for PlacedService {
-    fn resource_type(&self) -> tokeira_iac::ResourceType {
-        tokeira_iac::Resource::resource_type(&self.service)
-    }
-
-    fn resource_id(&self) -> tokeira_iac::ResourceId {
-        tokeira_iac::Resource::resource_id(&self.service)
-    }
-
-    fn dependencies(&self) -> Vec<tokeira_iac::ResourceId> {
-        tokeira_iac::Resource::dependencies(&self.service)
-    }
-
-    fn module(&self) -> &str {
-        &self.module
-    }
-
-    async fn create(
-        &self,
-        context: &tokeira_iac::ProvisionContext,
-    ) -> Result<tokeira_iac::ResourceState, tokeira_iac::IacError> {
-        tokeira_iac::Resource::create(&self.service, context).await
-    }
-
-    async fn update(
-        &self,
-        current: &tokeira_iac::ResourceState,
-        context: &tokeira_iac::ProvisionContext,
-    ) -> Result<tokeira_iac::ResourceState, tokeira_iac::IacError> {
-        tokeira_iac::Resource::update(&self.service, current, context).await
-    }
-
-    async fn delete(
-        &self,
-        current: &tokeira_iac::ResourceState,
-        context: &tokeira_iac::ProvisionContext,
-    ) -> Result<(), tokeira_iac::IacError> {
-        tokeira_iac::Resource::delete(&self.service, current, context).await
-    }
-
-    async fn describe(
-        &self,
-        context: &tokeira_iac::ProvisionContext,
-    ) -> Result<tokeira_iac::DescribeResult, tokeira_iac::IacError> {
-        tokeira_iac::Resource::describe(&self.service, context).await
-    }
-
-    fn diff(
-        &self,
-        current: &tokeira_iac::ResourceState,
-        context: &tokeira_iac::ProvisionContext,
-    ) -> tokeira_iac::InternalChange {
-        tokeira_iac::Resource::diff(&self.service, current, context)
-    }
-
-    fn change_semantics(
-        &self,
-        context: &tokeira_iac::SemanticsContext<'_>,
-    ) -> tokeira_iac::ChangeSemantics {
-        tokeira_iac::Resource::change_semantics(&self.service, context)
-    }
-
-    fn display_kind(&self) -> Option<&'static str> {
-        tokeira_iac::Resource::display_kind(&self.service)
+        Ok(Box::new(self.realized(placement)))
     }
 }
 
@@ -300,9 +149,9 @@ impl tokeira_iac::Resource for PlacedService {
 #[serde(deny_unknown_fields)]
 pub struct LocalStateDir {}
 
-impl ProviderKind for LocalStateDir {
-    fn kind_name(&self) -> &'static str {
-        "LocalStateDir"
+impl Kind for LocalStateDir {
+    fn name(&self) -> &'static str {
+        LocalStateResource::TYPE
     }
 
     fn validate_input(&self) -> Result<(), KindError> {
@@ -328,6 +177,7 @@ impl ProviderKind for LocalStateDir {
     }
 }
 
+/// The state-dir resource the [`LocalStateDir`] kind realizes.
 #[derive(Debug)]
 struct LocalStateResource {
     state_dir: PathBuf,
@@ -335,6 +185,10 @@ struct LocalStateResource {
 }
 
 impl LocalStateResource {
+    /// The resource's one word: engine resource type and author-visible
+    /// name, stated once here.
+    const TYPE: &'static str = "LocalStateDir";
+
     fn state(&self) -> tokeira_iac::ResourceState {
         tokeira_iac::ResourceState {
             resource_type: tokeira_iac::Resource::resource_type(self),
@@ -351,7 +205,7 @@ impl LocalStateResource {
 #[async_trait]
 impl tokeira_iac::Resource for LocalStateResource {
     fn resource_type(&self) -> tokeira_iac::ResourceType {
-        tokeira_iac::ResourceType::new("local_state_dir")
+        tokeira_iac::ResourceType::new(Self::TYPE)
     }
 
     fn resource_id(&self) -> tokeira_iac::ResourceId {
@@ -416,7 +270,7 @@ impl tokeira_iac::Resource for LocalStateResource {
     /// paths. The headline is the delete: it is deliberately a no-op — the
     /// record retires, `<deployment_dir>/state` and everything in it survive
     /// — so a deletion declares its data **preserved**, the opposite of what
-    /// the kind's name suggests.
+    /// the resource's name suggests.
     fn change_semantics(
         &self,
         ctx: &tokeira_iac::SemanticsContext<'_>,
@@ -459,9 +313,9 @@ pub fn server_config_resource_id() -> tokeira_iac::ResourceId {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {}
 
-impl ProviderKind for ServerConfig {
-    fn kind_name(&self) -> &'static str {
-        "ServerConfig"
+impl Kind for ServerConfig {
+    fn name(&self) -> &'static str {
+        ServerConfigResource::TYPE
     }
 
     fn validate_input(&self) -> Result<(), KindError> {
@@ -501,6 +355,7 @@ impl ProviderKind for ServerConfig {
     }
 }
 
+/// The server-config node resource the [`ServerConfig`] kind realizes.
 #[derive(Debug)]
 struct ServerConfigResource {
     /// The live file the containers bind-mount.
@@ -509,6 +364,10 @@ struct ServerConfigResource {
 }
 
 impl ServerConfigResource {
+    /// The resource's one word: engine resource type and author-visible
+    /// name, stated once here.
+    const TYPE: &'static str = "ServerConfig";
+
     fn state(&self) -> tokeira_iac::ResourceState {
         tokeira_iac::ResourceState {
             resource_type: tokeira_iac::Resource::resource_type(self),
@@ -528,7 +387,7 @@ impl ServerConfigResource {
 #[async_trait]
 impl tokeira_iac::Resource for ServerConfigResource {
     fn resource_type(&self) -> tokeira_iac::ResourceType {
-        tokeira_iac::ResourceType::new("server_config")
+        tokeira_iac::ResourceType::new(Self::TYPE)
     }
 
     fn resource_id(&self) -> tokeira_iac::ResourceId {
@@ -603,7 +462,7 @@ impl tokeira_iac::Resource for ServerConfigResource {
     }
 
     /// What a server-config-node change does, read from this file's own
-    /// lifecycle paths. Everything mirrors [`LocalStateResource`]: the node
+    /// lifecycle paths. Everything mirrors [`LocalStateDir`]: the node
     /// records and retires; the operator's `tokeirad.toml` is never written
     /// or removed by any path here.
     fn change_semantics(
@@ -689,148 +548,63 @@ fn local_marker_semantics(
     }
 }
 
-impl AuthorableKind for LocalStateDir {
-    const NAME: &'static str = "LocalStateDir";
-}
+/// The namespace word: the normalized crate name definitions import from.
+pub const NAMESPACE: &str = "tokeira_compose";
 
-impl AuthorableKind for ServerConfig {
-    const NAME: &'static str = "ServerConfig";
-}
+/// The provider's author-visible kind names, each the word its resource
+/// owns.
+pub const KINDS: &[&str] = &[
+    LocalStateResource::TYPE,
+    ServerConfigResource::TYPE,
+    ComposeService::TYPE,
+];
 
-impl AuthorableKind for Service {
-    const NAME: &'static str = "Service";
-
-    fn defaults() -> Option<LocatedValue> {
-        Some(service_defaults())
-    }
-}
-
-/// The provider's complete kind library, for the platform declaration.
-pub fn set() -> KindSet {
-    KindSet::new(
-        "compose",
-        vec![
-            kind::<LocalStateDir>(),
-            kind::<ServerConfig>(),
-            kind::<Service>(),
-        ],
-    )
-}
-
-fn service_defaults() -> LocatedValue {
-    LocatedValue::new(ValueShape::Struct {
-        name: "Service".to_string(),
-        fields: vec![
-            ("image".to_string(), LocatedValue::string("")),
-            (
-                "replicas".to_string(),
-                LocatedValue::new(ValueShape::Integer(0)),
-            ),
-            (
-                "publish".to_string(),
-                LocatedValue::new(ValueShape::Sequence(Vec::new())),
-            ),
-            (
-                "volumes".to_string(),
-                LocatedValue::new(ValueShape::Sequence(Vec::new())),
-            ),
-            (
-                "environment".to_string(),
-                LocatedValue::new(ValueShape::Sequence(Vec::new())),
-            ),
-            (
-                "command".to_string(),
-                LocatedValue::new(ValueShape::Sequence(Vec::new())),
-            ),
-            (
-                "depends_on".to_string(),
-                LocatedValue::new(ValueShape::Sequence(Vec::new())),
-            ),
-            (
-                "aws_region".to_string(),
-                LocatedValue::new(ValueShape::Option(None)),
-            ),
-        ],
+/// Decode one authored kind of this namespace; `None` when the name is not
+/// ours.
+pub fn decode(name: &str, value: LocatedValue) -> Option<Result<Box<dyn Kind>, KindError>> {
+    Some(match name {
+        LocalStateResource::TYPE => kind::decode::<LocalStateDir>(value),
+        ServerConfigResource::TYPE => kind::decode::<ServerConfig>(value),
+        ComposeService::TYPE => kind::decode::<Service>(value),
+        _ => return None,
     })
-}
-
-#[derive(Debug, Serialize)]
-struct InspectionDocument {
-    services: std::collections::BTreeMap<String, InspectionService>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct InspectionService {
-    image: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    ports: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    volumes: Vec<String>,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    environment: std::collections::BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    depends_on: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    command: Vec<String>,
-}
-
-/// Render the deterministic operator-facing Compose inspection projection.
-/// Deterministic operator-facing docker-compose projection of realized
-/// service manifests. Tokeira never reads it back.
-pub fn inspection_bytes(
-    manifests: &std::collections::BTreeMap<tokeira_iac::ResourceId, serde_json::Value>,
-) -> Result<Vec<u8>, serde_yaml::Error> {
-    let services = manifests
-        .iter()
-        .filter(|(id, manifest)| id.0.starts_with("compose/") && manifest.get("image").is_some())
-        .map(|(id, manifest)| {
-            serde_json::from_value::<InspectionService>(manifest.clone()).map(|service| {
-                (
-                    id.0.strip_prefix("compose/")
-                        .expect("the filtered id has a Compose prefix")
-                        .to_string(),
-                    service,
-                )
-            })
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
-        .map_err(|error| <serde_yaml::Error as serde::de::Error>::custom(error.to_string()))?;
-    serde_yaml::to_string(&InspectionDocument { services }).map(String::into_bytes)
 }
 
 #[cfg(test)]
 mod kind_inventory_tests {
     use super::*;
+    use tokeira_platform::author::ValueShape;
 
-    // The set is typed: entry names come from the kind types themselves,
-    // each entry decodes its own input shape, and Service carries the EMPTY
-    // defaults for `..Service::EMPTY` merging.
+    // The namespace facts hold together: every listed name decodes here,
+    // and an unknown name is refused as not-ours rather than an error.
     #[test]
-    fn set_is_typed_and_decodes_each_entry() {
-        let set = set();
-        let names: Vec<&str> = set.entries.iter().map(|entry| entry.name).collect();
-        assert_eq!(names, ["LocalStateDir", "ServerConfig", "Service"]);
-        for entry in &set.entries {
-            let probe = (entry.decode)(LocatedValue::new(ValueShape::Struct {
-                name: entry.name.to_string(),
-                fields: Vec::new(),
-            }));
-            if let Err(error) = probe {
-                assert!(
-                    !error.message.contains("unknown"),
-                    "entry `{}` failed as unknown: {}",
-                    entry.name,
-                    error.message
-                );
-            }
-            if entry.name == "Service" {
-                assert!(
-                    (entry.defaults)().is_some(),
-                    "Service declares EMPTY defaults"
-                );
-            } else {
-                assert!((entry.defaults)().is_none());
-            }
+    fn every_listed_kind_decodes_and_unknown_names_refuse() {
+        for name in KINDS {
+            let probe = decode(
+                name,
+                LocatedValue::new(ValueShape::Struct {
+                    name: (*name).to_string(),
+                    fields: Vec::new(),
+                }),
+            );
+            assert!(probe.is_some(), "kind `{name}` must belong to {NAMESPACE}");
         }
+        assert!(decode("Unknown", LocatedValue::new(ValueShape::Unit)).is_none());
+    }
+
+    // The service decodes partially: omission is the default — an authored
+    // Service stating only its image admits, with replicas defaulting to 1.
+    #[test]
+    fn service_decodes_with_field_defaults() {
+        let decoded = decode(
+            ComposeService::TYPE,
+            LocatedValue::new(ValueShape::Struct {
+                name: ComposeService::TYPE.to_string(),
+                fields: vec![("image".to_string(), LocatedValue::string("tokeirad:latest"))],
+            }),
+        )
+        .expect("Service belongs to this namespace")
+        .expect("partial authoring decodes");
+        assert_eq!(decoded.name(), ComposeService::TYPE);
     }
 }

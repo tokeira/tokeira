@@ -111,21 +111,23 @@ pub struct ProviderExport {
 }
 ```
 
-Kind selection is typed: `kind::<DsqlCluster>()` builds a `KindEntry` from
-the type itself (`AuthorableKind`: `ProviderKind` + deserialize), so a
-selection typo is a compile error and no string routing exists. A `KindSet`
-may carry its own `InfraConstructor` (`.infra(constructor)`), the
-registration ingredient for that selection's provider handles.
+Kind selection is typed: `kind::<K>(name)` builds a `KindEntry` for the
+kind type under the one word its resource owns — the selection site passes
+the resource's `TYPE` const (author-visible kind name and engine resource
+type are the same word, stated once on the resource), so a selection typo
+is a compile error. A `KindSet` may carry its own `InfraConstructor`
+(`.infra(constructor)`), the registration ingredient for that selection's
+provider handles.
 
-The Compose entry point (`platforms/compose/src/lib.rs:65`):
+The Compose entry point (`platforms/compose/src/lib.rs:71`):
 
 ```rust
 pub fn platform() -> PlatformDeclaration {
     PlatformDeclaration::on(tokeira_compose::provider())
         .kinds(observability::kind_set())
         .kinds(tokeira_aws::kinds::select(vec![
-            kind::<DsqlCluster>(),
-            kind::<DynamoDbTable>(),
+            kind::<DsqlCluster>(resources::dsql_cluster::DsqlCluster::TYPE),
+            kind::<DynamoDbTable>(resources::dynamodb_table::DynamoDbTable::TYPE),
         ]))
 }
 ```

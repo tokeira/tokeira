@@ -49,7 +49,10 @@
 
 pub mod observability;
 
-use tokeira_aws::kinds::{DsqlCluster, DynamoDbTable};
+use tokeira_aws::{
+    kinds::{DsqlCluster, DynamoDbTable},
+    resources,
+};
 use tokeira_platform::declaration::{PlatformDeclaration, kind};
 
 /// The platform entry point: the one declaration `tkp` invokes.
@@ -70,15 +73,16 @@ pub fn platform() -> PlatformDeclaration {
         // The platform's own kind: the observability configuration bundle
         // rendering the companion content shipped beside the definitions.
         .kinds(observability::kind_set())
-        // Exactly the AWS kinds the definitions require, selected by type:
-        // the vocabulary states its intent and grows only on purpose — a
-        // definition adopting a new AWS kind names its type here in the
-        // same change, and a typo is a compile error. The provider-tracking
-        // alternative (`kinds::all()`) would widen this platform's
-        // vocabulary with every kind the AWS export gains.
+        // Exactly the AWS kinds the definitions require, selected by type
+        // under the word each resource owns: the vocabulary states its
+        // intent and grows only on purpose — a definition adopting a new
+        // AWS kind names its type here in the same change, and a typo is a
+        // compile error. The provider-tracking alternative (`kinds::all()`)
+        // would widen this platform's vocabulary with every kind the AWS
+        // export gains.
         .kinds(tokeira_aws::kinds::select(vec![
-            kind::<DsqlCluster>(),
-            kind::<DynamoDbTable>(),
+            kind::<DsqlCluster>(resources::dsql_cluster::DsqlCluster::TYPE),
+            kind::<DynamoDbTable>(resources::dynamodb_table::DynamoDbTable::TYPE),
         ]))
 }
 

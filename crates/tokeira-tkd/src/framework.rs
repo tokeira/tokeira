@@ -16,7 +16,7 @@ use tokeira_platform::{
     graph::{
         OutputReference, ResourceReference, StructuralGraphBuilder, VerifiedGraph, WritebackValue,
     },
-    kind::DecodedKind,
+    kind::ProviderKind,
 };
 
 use crate::{
@@ -130,7 +130,7 @@ enum HostValue {
     Module(String),
     Resource(ResourceReference),
     Output(OutputReference),
-    Kind(Rc<RefCell<Option<DecodedKind>>>),
+    Kind(Rc<RefCell<Option<Box<dyn ProviderKind>>>>),
     Context(FieldMap<HostValue>),
 }
 
@@ -163,7 +163,7 @@ impl fmt::Debug for HostValue {
 struct FrameworkBridge<'a> {
     kinds: &'a Vocabulary,
     context: FieldMap<HostValue>,
-    graph: RefCell<Option<StructuralGraphBuilder<DecodedKind>>>,
+    graph: RefCell<Option<StructuralGraphBuilder<Box<dyn ProviderKind>>>>,
 }
 
 impl<'a> FrameworkBridge<'a> {
@@ -177,7 +177,7 @@ impl<'a> FrameworkBridge<'a> {
 
     fn with_graph<T>(
         &self,
-        action: impl FnOnce(&mut StructuralGraphBuilder<DecodedKind>) -> Result<T, EvalError>,
+        action: impl FnOnce(&mut StructuralGraphBuilder<Box<dyn ProviderKind>>) -> Result<T, EvalError>,
     ) -> Result<T, EvalError> {
         let mut graph = self.graph.borrow_mut();
         let graph = graph
@@ -289,7 +289,7 @@ impl<'a> FrameworkBridge<'a> {
 impl HostBridge for FrameworkBridge<'_> {
     type Host = HostValue;
     type Cx = ();
-    type Output = VerifiedGraph<DecodedKind>;
+    type Output = VerifiedGraph<Box<dyn ProviderKind>>;
 
     fn is_kind(&self, name: &str) -> bool {
         self.kinds.contains(name)
@@ -709,7 +709,7 @@ mod tests {
             "test",
             vec![KindEntry {
                 name: "TestResource",
-                defaults: || None,
+                defaults: None,
                 decode: |_| Ok(Box::new(TestKind)),
             }],
         )])

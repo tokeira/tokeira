@@ -3,26 +3,14 @@
 use serde::Deserialize;
 use tokeira_platform::{
     error::KindError,
-    kind::{PlacementContext, ProviderKind},
+    kind::{Kind, PlacementContext},
 };
 
-use crate::{
-    ResourceContext,
-    resources::dsql_cluster::{
-        DsqlCluster as Resource, DsqlClusterConfig, DsqlClusterMode as ResourceMode,
-    },
-};
+use crate::resources::dsql_cluster::{DsqlCluster as Resource, DsqlClusterMode};
 
-/// Lifecycle mode for an authored DSQL cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub enum DsqlClusterMode {
-    /// Create and own the cluster.
-    Managed,
-    /// Adopt an existing cluster without owning its lifecycle.
-    Preexisting,
-}
-
-/// Reusable author input for [`Resource`].
+/// Reusable author input for [`Resource`]. Realizes the resource directly:
+/// authored fields carry over flat, placement supplies project scope and
+/// tags.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DsqlCluster {
@@ -33,8 +21,10 @@ pub struct DsqlCluster {
     /// Managed or adopted lifecycle.
     pub mode: DsqlClusterMode,
     /// Required endpoint for an adopted cluster.
+    #[serde(default)]
     pub endpoint: Option<String>,
     /// Required ARN for an adopted cluster.
+    #[serde(default)]
     pub arn: Option<String>,
 }
 
@@ -58,9 +48,9 @@ impl DsqlCluster {
     }
 }
 
-impl ProviderKind for DsqlCluster {
-    fn kind_name(&self) -> &'static str {
-        "DsqlCluster"
+impl Kind for DsqlCluster {
+    fn name(&self) -> &'static str {
+        Resource::TYPE
     }
 
     fn validate_input(&self) -> Result<(), KindError> {
@@ -90,25 +80,17 @@ impl ProviderKind for DsqlCluster {
         placement: &PlacementContext,
     ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
         self.validate()?;
-        let mode = match self.mode {
-            DsqlClusterMode::Managed => ResourceMode::Managed,
-            DsqlClusterMode::Preexisting => ResourceMode::Preexisting,
-        };
-        Ok(Box::new(Resource::new(
-            self.identity.clone(),
-            DsqlClusterConfig {
-                mode,
-                preexisting_endpoint: self.endpoint.clone(),
-                preexisting_arn: self.arn.clone(),
-                fallback_identifier: None,
-                resource_id: None,
-                module: placement.module.clone(),
-            },
-            &ResourceContext {
-                project: placement.deployment_id.clone(),
-                region: self.region.clone(),
-                tags: placement.tags.clone().into_iter().collect(),
-            },
-        )))
+        Ok(Box::new(Resource {
+            identity: self.identity.clone(),
+            region: self.region.clone(),
+            mode: self.mode,
+            endpoint: self.endpoint.clone(),
+            arn: self.arn.clone(),
+            fallback_identifier: None,
+            resource_id: None,
+            module: placement.module.clone(),
+            project: placement.deployment_id.clone(),
+            tags: placement.tags.clone().into_iter().collect(),
+        }))
     }
 }

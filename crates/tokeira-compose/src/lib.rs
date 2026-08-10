@@ -64,12 +64,12 @@ use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac as iac;
 
 /// The Compose provider's complete export, for a platform entry point:
-/// the kind library, the ops surface, the reachability probe, and the
-/// infra constructor arrive together — using Compose IS this export; no
-/// separate wiring act exists.
+/// the ops surface, the reachability probe, and the infra constructor
+/// arrive together — using Compose IS this export; no separate wiring act
+/// exists. The kind library is not here: it is the namespace facts in
+/// [`kinds`] ([`kinds::NAMESPACE`], [`kinds::KINDS`], [`kinds::decode`]).
 pub fn provider() -> tokeira_platform::declaration::ProviderExport {
     tokeira_platform::declaration::ProviderExport {
-        kinds: kinds::set(),
         ops: Some(Box::new(ops::DockerOps)),
         execution: Box::new(execution::ComposeExecution),
         infra: Some(std::sync::Arc::new(execution::ComposeInfraConstructor)),
@@ -159,25 +159,104 @@ pub struct Healthcheck {
     pub retries: Option<u32>,
 }
 
+/// One environment entry without tuple-shaped author data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Environment {
+    /// Environment variable name.
+    pub name: String,
+    /// Environment variable value.
+    pub value: String,
+}
+
+/// Platform-owned logical volume vocabulary. Host paths never appear here:
+/// lowering to concrete bind strings happens when the platform talks to
+/// Docker, so manifests and their digests stay free of host state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Volume {
+    /// Persistent path beneath the deployment's local state root.
+    State(StateVolume),
+    /// Generated path beneath the deployment's configuration root.
+    Config(ConfigVolume),
+    /// Docker daemon socket.
+    DockerSocket,
+}
+
+/// Persistent state mount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateVolume {
+    /// Logical state subpath.
+    pub sub: String,
+    /// Container mount target.
+    pub at: String,
+}
+
+/// Generated configuration mount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigVolume {
+    /// Logical configuration subpath.
+    pub sub: String,
+    /// Container mount target.
+    pub at: String,
+}
+
+/// The compose service resource: what manifests record and what the engine
+/// executes. Its authored face is the separate [`kinds::Service`] kind,
+/// which realizes this model directly. Fields are logical — no host path or
+/// host environment ever enters this value, so manifests and their digests
+/// are host-independent; lowering to concrete Docker shapes happens inside
+/// [`ComposePlatform`] at apply.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ComposeService {
-    /// Stable service name. Used as the compose service key, Docker label, and
-    /// framework resource ID suffix.
+    /// Stable service name from the graph's logical id. Used as the compose
+    /// service key, Docker label, and framework resource ID suffix.
     pub name: String,
     /// Container image reference to run.
     pub image: String,
-    /// Port mappings in `host:container` form.
-    pub ports: Vec<String>,
-    /// Volume mappings in Docker syntax.
-    pub volumes: Vec<String>,
-    /// Environment variables passed to the container.
-    pub environment: HashMap<String, String>,
+    /// Desired container count. Applied by reconcile: replicas beyond the
+    /// first run as `<name>-<index>` containers.
+    #[serde(default = "default_replicas")]
+    pub replicas: u32,
+    /// Published equal host/container ports.
+    #[serde(default)]
+    pub publish: Vec<u16>,
+    /// Logical volumes; lowered to bind strings at apply.
+    #[serde(default)]
+    pub volumes: Vec<Volume>,
+    /// Explicit environment entries.
+    #[serde(default)]
+    pub environment: Vec<Environment>,
     /// Names of compose services that should exist before this service.
+    #[serde(default)]
     pub depends_on: Vec<String>,
     /// Optional Docker healthcheck definition.
+    #[serde(default)]
     pub healthcheck: Option<Healthcheck>,
     /// Command to run in the container (overrides image CMD).
+    #[serde(default)]
     pub command: Vec<String>,
+    /// Mount the non-secret AWS runtime selectors for this region. The
+    /// host's credential paths and profile are resolved at apply, never
+    /// recorded.
+    #[serde(default)]
+    pub aws_region: Option<String>,
+    /// Desired-content identity of the deployment's server-config node,
+    /// when this service declared a dependency on it. In the manifest so a
+    /// `tokeirad.toml` edit surfaces as a diff on this service.
+    #[serde(default)]
+    pub server_config_digest: Option<String>,
+    /// Desired-content identity of the rendered config-files resource, when
+    /// a `Config` volume couples this service to it. Same contract as
+    /// [`server_config_digest`](Self::server_config_digest).
+    #[serde(default)]
+    pub config_digest: Option<String>,
+    /// Owning logical module. Not part of the manifest: recovery answers
+    /// module questions from the recorded state row, and a recovered value
+    /// falls back to the service name.
+    #[serde(skip)]
+    pub module: String,
     /// Infra-graph-only dependencies (full engine `ResourceId` strings) —
     /// resources that must exist **before this container is created**, e.g.
     /// the config-files resource whose outputs this service bind-mounts
@@ -189,10 +268,18 @@ pub struct ComposeService {
     pub resource_dependencies: Vec<String>,
 }
 
+fn default_replicas() -> u32 {
+    1
+}
+
 /// Incremental Docker log output for one service.
 pub type LogStream = Pin<Box<dyn Stream<Item = Result<String, ComposeError>> + Send>>;
 
 impl ComposeService {
+    /// The resource's one word: engine resource type and author-visible
+    /// name, stated once here.
+    pub const TYPE: &'static str = "Service";
+
     /// Convert the service into the provider-agnostic manifest shape used by
     /// the runtime deploy engine.
     pub fn to_manifest(&self) -> serde_json::Value {
@@ -207,7 +294,7 @@ impl ComposeService {
 #[async_trait]
 impl iac::Resource for ComposeService {
     fn resource_type(&self) -> iac::ResourceType {
-        iac::ResourceType::new("compose_service")
+        iac::ResourceType::new(Self::TYPE)
     }
 
     fn resource_id(&self) -> iac::ResourceId {
@@ -227,7 +314,14 @@ impl iac::Resource for ComposeService {
     }
 
     fn module(&self) -> &str {
-        &self.name
+        // A recovered service (rebuilt from a recorded manifest) carries no
+        // module; its name is the honest stand-in the recovery path always
+        // used.
+        if self.module.is_empty() {
+            &self.name
+        } else {
+            &self.module
+        }
     }
 
     fn display_kind(&self) -> Option<&'static str> {
@@ -243,7 +337,7 @@ impl iac::Resource for ComposeService {
         })?;
         platform.reconcile_service(self).await?;
         Ok(iac::ResourceState {
-            resource_type: iac::ResourceType::new("compose_service"),
+            resource_type: iac::ResourceType::new(Self::TYPE),
             physical_id: self.name.clone(),
             properties: self.to_manifest(),
             dependencies: self.dependencies(),
@@ -263,7 +357,7 @@ impl iac::Resource for ComposeService {
         })?;
         platform.reconcile_service(self).await?;
         Ok(iac::ResourceState {
-            resource_type: iac::ResourceType::new("compose_service"),
+            resource_type: iac::ResourceType::new(Self::TYPE),
             physical_id: self.name.clone(),
             properties: self.to_manifest(),
             dependencies: self.dependencies(),
@@ -417,7 +511,7 @@ impl iac::Resource for ComposeService {
                     service.image = stale_digest;
                 }
                 Ok(iac::DescribeResult::Present(iac::ResourceState {
-                    resource_type: iac::ResourceType::new("compose_service"),
+                    resource_type: iac::ResourceType::new(Self::TYPE),
                     physical_id: service.name.clone(),
                     properties: service.to_manifest(),
                     dependencies: Vec::new(),
@@ -466,7 +560,7 @@ impl iac::Resource for ComposeService {
 /// maintained canonicalizations would drift and manufacture phantom diffs.
 pub fn canonicalize_manifest(mut manifest: serde_json::Value) -> serde_json::Value {
     if let Some(object) = manifest.as_object_mut() {
-        for key in ["ports", "volumes", "depends_on"] {
+        for key in ["publish", "volumes", "environment", "depends_on"] {
             if let Some(array) = object.get_mut(key).and_then(|v| v.as_array_mut()) {
                 array.sort_by_cached_key(std::string::ToString::to_string);
             }
@@ -512,6 +606,10 @@ fn manifest_field_diffs(
 pub struct ComposePlatform {
     docker: Docker,
     compose_file: PathBuf,
+    /// Deployment root: the anchor lowering resolves logical volumes
+    /// against. Empty on the ledger-free ops handle, whose paths never
+    /// lower.
+    deployment_dir: PathBuf,
     project_name: String,
     socket_path: String,
 }
@@ -521,6 +619,7 @@ impl ComposePlatform {
     /// to the supplied file.
     pub fn connect(
         compose_file: impl Into<PathBuf>,
+        deployment_dir: impl Into<PathBuf>,
         project_name: impl Into<String>,
     ) -> Result<Self, ComposeError> {
         let docker = Docker::connect_with_local_defaults().map_err(|error| {
@@ -532,6 +631,7 @@ impl ComposePlatform {
         Ok(Self {
             docker,
             compose_file: compose_file.into(),
+            deployment_dir: deployment_dir.into(),
             project_name: project_name.into(),
             socket_path: "local-default".into(),
         })
@@ -542,12 +642,17 @@ impl ComposePlatform {
     /// path is empty by construction — the ops paths never touch it, and
     /// reconcile/scale/remove must never be called on this handle.
     pub fn ops(project_name: impl Into<String>) -> Result<Self, ComposeError> {
-        Self::connect(std::path::PathBuf::new(), project_name)
+        Self::connect(
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+            project_name,
+        )
     }
 
     /// Connect to Docker through an explicit Unix socket path.
     pub fn connect_with_socket(
         compose_file: impl Into<PathBuf>,
+        deployment_dir: impl Into<PathBuf>,
         project_name: impl Into<String>,
         socket_path: impl Into<String>,
     ) -> Result<Self, ComposeError> {
@@ -560,6 +665,7 @@ impl ComposePlatform {
         Ok(Self {
             docker,
             compose_file: compose_file.into(),
+            deployment_dir: deployment_dir.into(),
             project_name: project_name.into(),
             socket_path,
         })
@@ -655,8 +761,10 @@ impl ComposePlatform {
         }
     }
 
-    /// Reconcile one compose service by updating the compose file and replacing
-    /// the corresponding local container.
+    /// Reconcile one compose service by updating the compose file and
+    /// replacing its local containers. The authored `replicas` count is
+    /// honoured here: the first container runs as `{project}_{name}`,
+    /// further replicas as `{project}_{name}-{index}`.
     pub async fn reconcile_service(&self, service: &ComposeService) -> Result<(), ComposeError> {
         self.ensure_reachable().await?;
         let mut state = self.load_compose_state()?;
@@ -666,23 +774,9 @@ impl ComposePlatform {
         // Ensure the project network exists so containers can resolve each other by name
         self.ensure_network().await?;
 
-        let container_name = service.container_name(&self.project_name);
-        let _ = self
-            .docker
-            .stop_container(&container_name, Some(StopContainerOptions { t: 1 }))
-            .await;
-        let _ = self
-            .docker
-            .remove_container(
-                &container_name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-
-        let config = container_config(service, &self.project_name);
+        // Lowering happens here, at the Docker boundary: host paths and host
+        // environment enter the container config and nothing else.
+        let config = self.lower(service);
 
         // Pull the image if not present locally
         let image_ref = &service.image;
@@ -704,45 +798,75 @@ impl ComposePlatform {
             }
         }
 
-        self.docker
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: container_name.clone(),
-                    platform: None,
-                }),
-                config,
-            )
-            .await
-            .map_err(|error| ComposeError::ContainerFailed {
-                container: container_name.clone(),
-                source: anyhow::anyhow!(error),
-            })?;
-
-        // Connect the container to the project network before starting
-        self.docker
-            .connect_network(
-                &self.network_name(),
-                bollard::network::ConnectNetworkOptions {
-                    container: container_name.clone(),
-                    endpoint_config: bollard::models::EndpointSettings {
-                        aliases: Some(vec![service.name.clone()]),
+        for index in 0..service.replicas {
+            let container_name = if index == 0 {
+                service.container_name(&self.project_name)
+            } else {
+                format!("{}-{index}", service.container_name(&self.project_name))
+            };
+            let _ = self
+                .docker
+                .stop_container(&container_name, Some(StopContainerOptions { t: 1 }))
+                .await;
+            let _ = self
+                .docker
+                .remove_container(
+                    &container_name,
+                    Some(RemoveContainerOptions {
+                        force: true,
                         ..Default::default()
-                    },
-                },
-            )
-            .await
-            .map_err(|error| ComposeError::ContainerFailed {
-                container: container_name.clone(),
-                source: anyhow::anyhow!(error),
-            })?;
+                    }),
+                )
+                .await;
 
-        self.docker
-            .start_container(&container_name, None::<StartContainerOptions<String>>)
-            .await
-            .map_err(|error| ComposeError::ContainerFailed {
-                container: container_name,
-                source: anyhow::anyhow!(error),
-            })?;
+            // Only the first replica publishes host ports — a second binding
+            // of the same host port would refuse at start.
+            let mut config = config.clone();
+            if index > 0
+                && let Some(host_config) = config.host_config.as_mut()
+            {
+                host_config.port_bindings = None;
+            }
+            self.docker
+                .create_container(
+                    Some(CreateContainerOptions {
+                        name: container_name.clone(),
+                        platform: None,
+                    }),
+                    config,
+                )
+                .await
+                .map_err(|error| ComposeError::ContainerFailed {
+                    container: container_name.clone(),
+                    source: anyhow::anyhow!(error),
+                })?;
+
+            // Connect the container to the project network before starting
+            self.docker
+                .connect_network(
+                    &self.network_name(),
+                    bollard::network::ConnectNetworkOptions {
+                        container: container_name.clone(),
+                        endpoint_config: bollard::models::EndpointSettings {
+                            aliases: Some(vec![service.name.clone()]),
+                            ..Default::default()
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| ComposeError::ContainerFailed {
+                    container: container_name.clone(),
+                    source: anyhow::anyhow!(error),
+                })?;
+
+            self.docker
+                .start_container(&container_name, None::<StartContainerOptions<String>>)
+                .await
+                .map_err(|error| ComposeError::ContainerFailed {
+                    container: container_name,
+                    source: anyhow::anyhow!(error),
+                })?;
+        }
         Ok(())
     }
 
@@ -815,6 +939,7 @@ impl ComposePlatform {
                 container: service.to_string(),
                 source: anyhow::anyhow!(error),
             })?;
+        let replica_count = containers.len() as u32;
         let Some(container) = containers.into_iter().next() else {
             return Ok(None);
         };
@@ -829,7 +954,8 @@ impl ComposePlatform {
                 container: service.to_string(),
                 source: anyhow::anyhow!(error),
             })?;
-        let mut live = service_from_inspect(service, &inspect);
+        let mut live = lift_from_inspect(service, &inspect, &self.deployment_dir);
+        live.replicas = replica_count.max(1);
         // A container's inspect env is the MERGE of image-baked vars and what
         // we injected — every image bakes at least PATH, so comparing the
         // merge against the declared env makes every service drift forever.
@@ -840,8 +966,11 @@ impl ComposePlatform {
             && let Ok(image) = self.docker.inspect_image(image_id).await
         {
             let baked: Vec<String> = image.config.and_then(|c| c.env).unwrap_or_default();
-            live.environment
-                .retain(|key, value| !baked.iter().any(|entry| entry == &format!("{key}={value}")));
+            live.environment.retain(|entry| {
+                !baked
+                    .iter()
+                    .any(|baked| baked == &format!("{}={}", entry.name, entry.value))
+            });
         }
         Ok(Some(live))
     }
@@ -889,14 +1018,10 @@ impl ComposePlatform {
         let Some(service) = self.running_service(service).await? else {
             return Ok(None);
         };
-        for mapping in service.ports {
-            if let Some((host, container)) = parse_port_mapping(&mapping)
-                && container == port
-            {
-                return Ok(Some(("127.0.0.1".into(), host)));
-            }
-        }
-        Ok(None)
+        Ok(service
+            .publish
+            .contains(&port)
+            .then(|| ("127.0.0.1".into(), port)))
     }
 
     /// Return every host/container port mapping for a running service.
@@ -908,13 +1033,9 @@ impl ComposePlatform {
             return Ok(Vec::new());
         };
         Ok(service
-            .ports
+            .publish
             .into_iter()
-            .filter_map(|mapping| {
-                parse_port_mapping(&mapping).map(|(host, container)| {
-                    ("127.0.0.1".to_string(), host, container, "tcp".to_string())
-                })
-            })
+            .map(|port| ("127.0.0.1".to_string(), port, port, "tcp".to_string()))
             .collect())
     }
 
@@ -937,7 +1058,12 @@ impl ComposePlatform {
                 .insert(format!("{}-{replica}", instance.name), instance.clone());
             self.save_compose_state(&state)?;
             let container_name = format!("{}_{}-{replica}", self.project_name, service.name);
-            let config = container_config(service, &self.project_name);
+            let mut config = self.lower(service);
+            // Scaled replicas never publish host ports — the primary
+            // container holds the binding.
+            if let Some(host_config) = config.host_config.as_mut() {
+                host_config.port_bindings = None;
+            }
             self.docker
                 .create_container(
                     Some(CreateContainerOptions {
@@ -966,6 +1092,12 @@ impl ComposePlatform {
     /// state — the container configuration a scale-up replicates.
     pub fn recorded_service(&self, name: &str) -> Result<Option<ComposeService>, ComposeError> {
         Ok(self.load_compose_state()?.services.get(name).cloned())
+    }
+
+    /// Lower one logical service to its concrete Docker container config —
+    /// the only place host paths and host environment are resolved.
+    fn lower(&self, service: &ComposeService) -> ContainerConfig<String> {
+        lower_container_config(service, &self.project_name, &self.deployment_dir)
     }
 
     fn load_compose_state(&self) -> Result<ComposeFile, ComposeError> {
@@ -1079,41 +1211,92 @@ fn compose_version() -> String {
     "3.9".into()
 }
 
-fn parse_port_mapping(value: &str) -> Option<(u16, u16)> {
-    let (host, container) = value.split_once(':')?;
-    Some((host.parse().ok()?, container.parse().ok()?))
-}
-
-fn container_config(service: &ComposeService, project_name: &str) -> ContainerConfig<String> {
-    let exposed_ports = if service.ports.is_empty() {
+/// The concrete Docker shapes for one logical service: bind strings, the
+/// environment map, and any host-resolved AWS selector paths. Produced only
+/// inside [`ComposePlatform::lower`] — host state never travels further up.
+fn lower_container_config(
+    service: &ComposeService,
+    project_name: &str,
+    deployment_dir: &Path,
+) -> ContainerConfig<String> {
+    let exposed_ports = if service.publish.is_empty() {
         None
     } else {
         Some(
             service
-                .ports
+                .publish
                 .iter()
-                .filter_map(|mapping| parse_port_mapping(mapping))
-                .map(|(_, container)| (format!("{container}/tcp"), HashMap::new()))
+                .map(|port| (format!("{port}/tcp"), HashMap::new()))
                 .collect(),
         )
     };
-    let port_bindings = if service.ports.is_empty() {
+    let port_bindings = if service.publish.is_empty() {
         None
     } else {
         let mut bindings = HashMap::new();
-        for mapping in &service.ports {
-            if let Some((host, container)) = parse_port_mapping(mapping) {
-                bindings.insert(
-                    format!("{container}/tcp"),
-                    Some(vec![PortBinding {
-                        host_ip: Some("0.0.0.0".into()),
-                        host_port: Some(host.to_string()),
-                    }]),
-                );
-            }
+        for port in &service.publish {
+            bindings.insert(
+                format!("{port}/tcp"),
+                Some(vec![PortBinding {
+                    host_ip: Some("0.0.0.0".into()),
+                    host_port: Some(port.to_string()),
+                }]),
+            );
         }
         Some(bindings)
     };
+
+    let mut volumes: Vec<String> = service
+        .volumes
+        .iter()
+        .map(|volume| match volume {
+            Volume::State(StateVolume { sub, at }) => format!(
+                "{}:{at}",
+                deployment_dir.join(".tokeira-state").join(sub).display()
+            ),
+            Volume::Config(ConfigVolume { sub, at }) => {
+                format!("{}:{at}", deployment_dir.join("config").join(sub).display())
+            }
+            Volume::DockerSocket => "/var/run/docker.sock:/var/run/docker.sock".to_string(),
+        })
+        .collect();
+    let mut environment: HashMap<String, String> = service
+        .environment
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.value.clone()))
+        .collect();
+
+    // The server-config coupling: mount the live file and carry the desired
+    // digest so a `tokeirad.toml` edit recreates the container onto the new
+    // content.
+    if let Some(digest) = &service.server_config_digest {
+        volumes.push(format!(
+            "{}:/etc/tokeira/tokeirad.toml:ro",
+            deployment_dir.join("tokeirad.toml").display()
+        ));
+        environment.insert(
+            "TOKEIRA_CONFIG".to_string(),
+            "/etc/tokeira/tokeirad.toml".to_string(),
+        );
+        environment.insert("TOKEIRA_SERVER_CONFIG_DIGEST".to_string(), digest.clone());
+    }
+    if let Some(digest) = &service.config_digest {
+        environment.insert("TOKEIRA_CONFIG_DIGEST".to_string(), digest.clone());
+    }
+
+    // Host-state resolution happens here and nowhere else: the credential
+    // path and profile are apply-time facts of the operator's machine, never
+    // part of the desired manifest.
+    if let Some(region) = &service.aws_region {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        volumes.push(format!("{home}/.aws:/home/nonroot/.aws:ro"));
+        environment.insert("HOME".to_string(), "/home/nonroot".to_string());
+        environment.insert("AWS_REGION".to_string(), region.clone());
+        if let Ok(profile) = std::env::var("AWS_PROFILE") {
+            environment.insert("AWS_PROFILE".to_string(), profile);
+        }
+    }
+
     let mut label_map = HashMap::from([
         ("com.docker.compose.service".into(), service.name.clone()),
         (
@@ -1145,22 +1328,21 @@ fn container_config(service: &ComposeService, project_name: &str) -> ContainerCo
         } else {
             Some(service.command.clone())
         },
-        env: if service.environment.is_empty() {
+        env: if environment.is_empty() {
             None
         } else {
             Some(
-                service
-                    .environment
+                environment
                     .iter()
                     .map(|(key, value)| format!("{key}={value}"))
                     .collect(),
             )
         },
         host_config: Some(HostConfig {
-            binds: if service.volumes.is_empty() {
+            binds: if volumes.is_empty() {
                 None
             } else {
-                Some(service.volumes.clone())
+                Some(volumes)
             },
             port_bindings,
             ..Default::default()
@@ -1171,13 +1353,23 @@ fn container_config(service: &ComposeService, project_name: &str) -> ContainerCo
     }
 }
 
-fn service_from_inspect(name: &str, inspect: &ContainerInspectResponse) -> ComposeService {
+/// Lift one live container back into the logical model — the inverse of
+/// lowering, so drift compares logical-to-logical. Couplings the lowering
+/// injected (config digests, the AWS selector mounts) fold back into their
+/// model fields; a bind that matches no logical form is dropped, the same
+/// honesty class as the image-baked-environment subtraction: a hand-added
+/// host bind is invisible to drift rather than a permanent phantom.
+fn lift_from_inspect(
+    name: &str,
+    inspect: &ContainerInspectResponse,
+    deployment_dir: &Path,
+) -> ComposeService {
     let image = inspect
         .config
         .as_ref()
         .and_then(|config| config.image.clone())
         .unwrap_or_default();
-    let ports = inspect
+    let mut publish = inspect
         .host_config
         .as_ref()
         .and_then(|host| host.port_bindings.as_ref())
@@ -1185,50 +1377,98 @@ fn service_from_inspect(name: &str, inspect: &ContainerInspectResponse) -> Compo
             bindings
                 .iter()
                 .flat_map(|(container, host_bindings)| {
+                    let container: Option<u16> = container.trim_end_matches("/tcp").parse().ok();
                     host_bindings
                         .clone()
                         .unwrap_or_default()
                         .into_iter()
                         .filter_map(move |binding| {
-                            binding.host_port.map(|host| {
-                                format!("{host}:{}", container.trim_end_matches("/tcp"))
-                            })
+                            // The logical vocabulary publishes equal pairs;
+                            // the host side is the honest lift of anything
+                            // hand-rebound.
+                            binding
+                                .host_port
+                                .and_then(|host| host.parse::<u16>().ok())
+                                .or(container)
                         })
                 })
-                .collect::<Vec<_>>()
-        })
-        .map(|mut ports: Vec<String>| {
-            // Docker hands back a map; its iteration order is not a fact
-            // about the service. Sort so records are stable run-to-run.
-            ports.sort();
-            ports
+                .collect::<Vec<u16>>()
         })
         .unwrap_or_default();
+    // Docker hands back a map; its iteration order is not a fact about the
+    // service. Sort so records are stable run-to-run.
+    publish.sort_unstable();
 
-    let environment = inspect
+    let state_root = deployment_dir.join(".tokeira-state");
+    let config_root = deployment_dir.join("config");
+    let server_config_source = deployment_dir.join("tokeirad.toml");
+    let mut volumes = Vec::new();
+    for bind in inspect
+        .host_config
+        .as_ref()
+        .and_then(|host| host.binds.as_ref())
+        .into_iter()
+        .flatten()
+    {
+        let Some((source, target)) = bind.split_once(':') else {
+            continue;
+        };
+        let at = target.trim_end_matches(":ro").to_string();
+        let source = Path::new(source);
+        if source == Path::new("/var/run/docker.sock") {
+            volumes.push(Volume::DockerSocket);
+        } else if let Ok(sub) = source.strip_prefix(&state_root) {
+            volumes.push(Volume::State(StateVolume {
+                sub: sub.display().to_string(),
+                at,
+            }));
+        } else if let Ok(sub) = source.strip_prefix(&config_root) {
+            volumes.push(Volume::Config(ConfigVolume {
+                sub: sub.display().to_string(),
+                at,
+            }));
+        } else if source == server_config_source || source.ends_with(".aws") {
+            // Lowering-injected couplings: represented by their model fields
+            // (`server_config_digest`, `aws_region`), not as volumes.
+        }
+    }
+
+    let mut aws_region = None;
+    let mut server_config_digest = None;
+    let mut config_digest = None;
+    let mut environment = Vec::new();
+    for entry in inspect
         .config
         .as_ref()
         .and_then(|config| config.env.as_ref())
-        .map(|env_list| {
-            env_list
-                .iter()
-                .filter_map(|entry| {
-                    let (key, value) = entry.split_once('=')?;
-                    Some((key.to_string(), value.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+    {
+        let Some((key, value)) = entry.split_once('=') else {
+            continue;
+        };
+        match key {
+            "TOKEIRA_SERVER_CONFIG_DIGEST" => server_config_digest = Some(value.to_string()),
+            "TOKEIRA_CONFIG_DIGEST" => config_digest = Some(value.to_string()),
+            "AWS_REGION" => aws_region = Some(value.to_string()),
+            // Lowering-injected companions of the couplings above.
+            "TOKEIRA_CONFIG" | "AWS_PROFILE" => {}
+            "HOME" if value == "/home/nonroot" => {}
+            _ => environment.push(Environment {
+                name: key.to_string(),
+                value: value.to_string(),
+            }),
+        }
+    }
 
     ComposeService {
         name: name.to_string(),
         image,
-        ports,
-        volumes: inspect
-            .host_config
-            .as_ref()
-            .and_then(|host| host.binds.clone())
-            .unwrap_or_default(),
+        // The caller owns the live replica count; one container answers for
+        // one replica here.
+        replicas: 1,
+        publish,
+        volumes,
         environment,
         // Start-order round-trips through the compose-conventional label
         // written at create (`dep:condition:restart` triplets) — a container
@@ -1246,10 +1486,6 @@ fn service_from_inspect(name: &str, inspect: &ContainerInspectResponse) -> Compo
                     .collect()
             })
             .unwrap_or_default(),
-        // Infra-graph edges are desired-side declarations, not container
-        // facts — same reasoning as depends_on above (and serde-skipped, so
-        // they never participate in the manifest diff either).
-        resource_dependencies: Vec::new(),
         healthcheck: inspect
             .config
             .as_ref()
@@ -1271,6 +1507,12 @@ fn service_from_inspect(name: &str, inspect: &ContainerInspectResponse) -> Compo
             .as_ref()
             .and_then(|config| config.cmd.clone())
             .unwrap_or_default(),
+        aws_region,
+        server_config_digest,
+        config_digest,
+        // Desired-side declarations, not container facts.
+        module: String::new(),
+        resource_dependencies: Vec::new(),
     }
 }
 
@@ -1435,14 +1677,14 @@ mod tests {
     fn diff_treats_set_valued_fields_as_sets() {
         let desired = serde_json::json!({
             "name": "tokeirad",
-            "ports": ["7233:7233", "9090:9090"],
-            "volumes": ["/a:/a", "/b:/b"],
+            "publish": [7233, 9090],
+            "volumes": [{"State": {"sub": "a", "at": "/a"}}, {"State": {"sub": "b", "at": "/b"}}],
             "depends_on": ["mimir", "loki"],
         });
         let live = serde_json::json!({
             "name": "tokeirad",
-            "ports": ["9090:9090", "7233:7233"],
-            "volumes": ["/b:/b", "/a:/a"],
+            "publish": [9090, 7233],
+            "volumes": [{"State": {"sub": "b", "at": "/b"}}, {"State": {"sub": "a", "at": "/a"}}],
             "depends_on": ["loki", "mimir"],
         });
         let diffs = manifest_field_diffs(
@@ -1484,13 +1726,71 @@ mod tests {
             }),
             ..Default::default()
         };
-        let service = service_from_inspect("grafana", &inspect);
+        let service = lift_from_inspect("grafana", &inspect, Path::new("/deployments/demo"));
         assert_eq!(service.depends_on, vec!["mimir", "loki"]);
 
         // And a container without the label reads as no ordering — honest
         // drift for hand-made containers, not a crash.
         let bare = ContainerInspectResponse::default();
-        assert!(service_from_inspect("grafana", &bare).depends_on.is_empty());
+        assert!(
+            lift_from_inspect("grafana", &bare, Path::new("/deployments/demo"))
+                .depends_on
+                .is_empty()
+        );
+    }
+
+    // The lift is the lowering's inverse: a lowered container inspected back
+    // yields the logical service — host paths, injected couplings, and host
+    // AWS selectors all fold back into their model fields.
+    #[test]
+    fn lift_inverts_lowering() {
+        let deployment_dir = Path::new("/deployments/demo");
+        let service = ComposeService {
+            name: "tokeirad".into(),
+            image: "tokeirad:latest".into(),
+            replicas: 1,
+            publish: vec![7233],
+            volumes: vec![
+                Volume::State(StateVolume {
+                    sub: "data".into(),
+                    at: "/var/lib/tokeira".into(),
+                }),
+                Volume::Config(ConfigVolume {
+                    sub: "alloy.alloy".into(),
+                    at: "/etc/alloy/config.alloy".into(),
+                }),
+                Volume::DockerSocket,
+            ],
+            environment: vec![Environment {
+                name: "RUST_LOG".into(),
+                value: "info".into(),
+            }],
+            aws_region: Some("eu-west-2".into()),
+            server_config_digest: Some("sha256:abc".into()),
+            config_digest: Some("sha256:def".into()),
+            ..Default::default()
+        };
+        let config = lower_container_config(&service, "demo", deployment_dir);
+        let inspect = ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                image: config.image.clone(),
+                env: config.env.clone(),
+                cmd: config.cmd.clone(),
+                labels: config.labels.clone(),
+                ..Default::default()
+            }),
+            host_config: config.host_config.clone().map(|host| HostConfig {
+                binds: host.binds,
+                port_bindings: host.port_bindings,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lifted = lift_from_inspect("tokeirad", &inspect, deployment_dir);
+        let desired = canonicalize_manifest(service.to_manifest());
+        let live = canonicalize_manifest(lifted.to_manifest());
+        let diffs = manifest_field_diffs(&live, &desired);
+        assert!(diffs.is_empty(), "lift must invert lowering: {diffs:?}");
     }
 
     fn arb_identifier() -> impl Strategy<Value = String> {
@@ -1501,7 +1801,8 @@ mod tests {
         (
             arb_identifier(),
             arb_identifier(),
-            prop::collection::vec((1u16..=65535, 1u16..=65535), 0..4),
+            1u32..3,
+            prop::collection::vec(1u16..=65535, 0..4),
             prop::collection::vec(arb_identifier(), 0..3),
             prop::collection::vec((arb_identifier(), arb_identifier()), 0..4),
             prop::collection::vec(arb_identifier(), 0..3),
@@ -1517,7 +1818,8 @@ mod tests {
                 |(
                     name,
                     image_tag,
-                    ports,
+                    replicas,
+                    publish,
                     volumes,
                     environment,
                     depends_on,
@@ -1525,18 +1827,23 @@ mod tests {
                     command,
                 )| {
                     ComposeService {
-                        resource_dependencies: Vec::new(),
                         image: format!("example/{name}:{image_tag}"),
                         name: name.clone(),
-                        ports: ports
-                            .into_iter()
-                            .map(|(host, container)| format!("{host}:{container}"))
-                            .collect(),
+                        replicas,
+                        publish,
                         volumes: volumes
                             .into_iter()
-                            .map(|volume| format!("/tmp/{volume}:/data/{volume}"))
+                            .map(|volume| {
+                                Volume::State(StateVolume {
+                                    sub: volume.clone(),
+                                    at: format!("/data/{volume}"),
+                                })
+                            })
                             .collect(),
-                        environment: environment.into_iter().collect(),
+                        environment: environment
+                            .into_iter()
+                            .map(|(name, value)| Environment { name, value })
+                            .collect(),
                         depends_on,
                         healthcheck: healthcheck.map(|(test, interval, timeout, retries)| {
                             Healthcheck {
@@ -1547,6 +1854,7 @@ mod tests {
                             }
                         }),
                         command,
+                        ..Default::default()
                     }
                 },
             )
@@ -1555,71 +1863,41 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
+        // The manifest round-trip is the serialization-completeness property
+        // now: every logical field survives manifest → recovery, so recorded
+        // state can rebuild the exact service.
         #[test]
-        fn p11_compose_service_serialization_is_complete(service in arb_compose_service()) {
-            let yaml = compose_yaml_fragment(&service).unwrap();
-            let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
-            let rendered = &parsed["services"][&service.name];
-            prop_assert_eq!(rendered["image"].as_str(), Some(service.image.as_str()));
-
-            let rendered_ports = rendered["ports"]
-                .as_sequence()
-                .map(|seq| {
-                    seq.iter()
-                        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            prop_assert_eq!(rendered_ports, service.ports);
-
-            let rendered_volumes = rendered["volumes"]
-                .as_sequence()
-                .map(|seq| {
-                    seq.iter()
-                        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            prop_assert_eq!(rendered_volumes, service.volumes);
-
-            let rendered_depends = rendered["depends_on"]
-                .as_sequence()
-                .map(|seq| {
-                    seq.iter()
-                        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            prop_assert_eq!(rendered_depends, service.depends_on);
-
-            for (key, value) in &service.environment {
-                prop_assert_eq!(rendered["environment"][key].as_str(), Some(value.as_str()));
-            }
-            if let Some(healthcheck) = &service.healthcheck {
-                let rendered_test = rendered["healthcheck"]["test"]
-                    .as_sequence()
-                    .map(|seq| seq.iter().filter_map(|value| value.as_str().map(ToOwned::to_owned)).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                prop_assert_eq!(rendered_test, healthcheck.test.clone());
-            }
-        }
-
-        #[test]
-        fn p12_port_mapping_extraction_round_trips(host in 1u16..=65535, container in 1u16..=65535) {
-            let mapping = format!("{host}:{container}");
-            prop_assert_eq!(parse_port_mapping(&mapping), Some((host, container)));
+        fn p11_compose_service_manifest_round_trips(service in arb_compose_service()) {
+            let recovered = service_from_manifest(service.to_manifest()).unwrap();
+            // `name` rides the manifest for recovery but is refused as
+            // authored input, so it round-trips through the recovery path's
+            // deserialization only via the manifest field.
+            prop_assert_eq!(&recovered.image, &service.image);
+            prop_assert_eq!(recovered.replicas, service.replicas);
+            prop_assert_eq!(&recovered.publish, &service.publish);
+            prop_assert_eq!(&recovered.volumes, &service.volumes);
+            prop_assert_eq!(&recovered.environment, &service.environment);
+            prop_assert_eq!(&recovered.depends_on, &service.depends_on);
+            prop_assert_eq!(&recovered.healthcheck, &service.healthcheck);
+            prop_assert_eq!(&recovered.command, &service.command);
         }
     }
 
     #[test]
     fn serializes_compose_yaml_with_all_fields() {
         let service = ComposeService {
-            resource_dependencies: Vec::new(),
             name: "grafana".into(),
             image: "grafana/grafana-oss:12.4.3".into(),
-            ports: vec!["3000:3000".into()],
-            volumes: vec!["/tmp/data:/var/lib/grafana".into()],
-            environment: HashMap::from([("GF_SECURITY_ADMIN_PASSWORD".into(), "admin".into())]),
+            replicas: 1,
+            publish: vec![3000],
+            volumes: vec![Volume::State(StateVolume {
+                sub: "grafana".into(),
+                at: "/var/lib/grafana".into(),
+            })],
+            environment: vec![Environment {
+                name: "GF_SECURITY_ADMIN_PASSWORD".into(),
+                value: "admin".into(),
+            }],
             depends_on: vec!["mimir".into()],
             healthcheck: Some(Healthcheck {
                 test: vec!["CMD".into(), "curl".into(), "http://localhost:3000".into()],
@@ -1628,18 +1906,20 @@ mod tests {
                 retries: Some(3),
             }),
             command: vec!["run".into(), "--config".into()],
+            ..Default::default()
         };
         let yaml = compose_yaml_fragment(&service).unwrap();
         assert!(yaml.contains("grafana/grafana-oss:12.4.3"));
-        assert!(yaml.contains("3000:3000"));
+        assert!(yaml.contains("3000"));
         assert!(yaml.contains("GF_SECURITY_ADMIN_PASSWORD"));
-        assert!(yaml.contains("/tmp/data:/var/lib/grafana"));
+        assert!(yaml.contains("/var/lib/grafana"));
     }
 
     #[test]
     fn invalid_socket_reports_docker_not_available() {
         let error = ComposePlatform::connect_with_socket(
             "/tmp/compose.yaml",
+            "/tmp",
             "test",
             "/definitely/not/a/docker.sock",
         )
@@ -1665,11 +1945,6 @@ mod tests {
                 "nothing accepted connections at `/var/run/docker.sock` - verify Docker is listening there"
             )
         );
-    }
-
-    #[test]
-    fn extracts_port_mapping() {
-        assert_eq!(parse_port_mapping("3000:3000"), Some((3000, 3000)));
     }
 
     // The direction table admits both spellings of connection-refused and

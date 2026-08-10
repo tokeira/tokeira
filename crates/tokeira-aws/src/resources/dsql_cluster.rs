@@ -8,9 +8,10 @@ use tokeira_iac::{
 };
 
 /// Lifecycle mode for a single DSQL cluster resource.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 pub enum DsqlClusterMode {
     /// Provision and manage the DSQL cluster lifecycle via AWS APIs.
+    #[default]
     Managed,
     /// Adopt an externally managed cluster endpoint/ARN without create/delete.
     Preexisting,
@@ -21,45 +22,36 @@ pub fn effective_managed(config_mode: DsqlClusterMode, state_mode: &str) -> bool
     config_mode == DsqlClusterMode::Managed || state_mode == "managed"
 }
 
-/// Configuration for a single DSQL cluster provider resource.
-#[derive(Debug)]
-pub struct DsqlClusterConfig {
+/// Provider resource that provisions exactly one Aurora DSQL cluster. Its
+/// authored face is the separate [`crate::kinds::DsqlCluster`] kind, which
+/// realizes this resource directly — the cluster's facts are flat fields
+/// here; no configuration middle struct exists.
+#[derive(Debug, Clone, Default)]
+pub struct DsqlCluster {
+    /// Stable AWS cluster identity used in resource ID generation, e.g.
+    /// `proj-monitored`.
+    pub identity: String,
+    /// AWS region.
+    pub region: String,
+    /// Managed or adopted lifecycle.
     pub mode: DsqlClusterMode,
-    pub preexisting_endpoint: Option<String>,
-    pub preexisting_arn: Option<String>,
+    /// Required endpoint for an adopted cluster.
+    pub endpoint: Option<String>,
+    /// Required ARN for an adopted cluster.
+    pub arn: Option<String>,
     /// Fallback cluster identifier when not available from state.
     /// Extracted from config ARN/endpoint by the host application.
     pub fallback_identifier: Option<String>,
     pub resource_id: Option<ResourceId>,
     pub module: String,
-}
-
-/// Generic provider resource that provisions exactly one Aurora DSQL cluster.
-#[derive(Debug)]
-pub struct DsqlCluster {
-    /// Logical identity used in resource ID generation, e.g. `proj-monitored`.
-    pub cluster_identity: String,
-    pub config: DsqlClusterConfig,
     pub project: String,
-    pub region: String,
     pub tags: HashMap<String, String>,
 }
 
 impl DsqlCluster {
-    /// Construct a DsqlCluster resource from project config and per-instance settings.
-    pub fn new(
-        cluster_identity: String,
-        config: DsqlClusterConfig,
-        rctx: &crate::ResourceContext,
-    ) -> Self {
-        Self {
-            cluster_identity,
-            config,
-            project: rctx.project.clone(),
-            region: rctx.region.clone(),
-            tags: rctx.tags.clone(),
-        }
-    }
+    /// The resource's one word: engine resource type and author-visible
+    /// name, stated once here.
+    pub const TYPE: &'static str = "DsqlCluster";
 
     fn resolve_identifier(&self, state: Option<&ResourceState>) -> Option<String> {
         state
@@ -73,21 +65,20 @@ impl DsqlCluster {
                     .filter(|id| !id.is_empty())
                     .map(str::to_string)
             })
-            .or_else(|| self.config.fallback_identifier.clone())
+            .or_else(|| self.fallback_identifier.clone())
     }
 }
 
 #[async_trait::async_trait]
 impl Resource for DsqlCluster {
     fn resource_type(&self) -> ResourceType {
-        ResourceType::new("DsqlCluster")
+        ResourceType::new(Self::TYPE)
     }
 
     fn resource_id(&self) -> ResourceId {
-        self.config
-            .resource_id
+        self.resource_id
             .clone()
-            .unwrap_or_else(|| ResourceId(format!("dsql-{}", self.cluster_identity)))
+            .unwrap_or_else(|| ResourceId(format!("dsql-{}", self.identity)))
     }
 
     fn dependencies(&self) -> Vec<ResourceId> {
@@ -95,7 +86,7 @@ impl Resource for DsqlCluster {
     }
 
     fn module(&self) -> &str {
-        &self.config.module
+        &self.module
     }
 
     fn display_kind(&self) -> Option<&'static str> {
@@ -103,7 +94,7 @@ impl Resource for DsqlCluster {
     }
 
     fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
-        match self.config.mode {
+        match self.mode {
             DsqlClusterMode::Managed => InternalChange::NoChange {
                 resource_id: self.resource_id(),
             },
@@ -118,12 +109,8 @@ impl Resource for DsqlCluster {
                     .get("cluster_arn")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                let desired_endpoint = self
-                    .config
-                    .preexisting_endpoint
-                    .as_deref()
-                    .unwrap_or_default();
-                let desired_arn = self.config.preexisting_arn.as_deref().unwrap_or_default();
+                let desired_endpoint = self.endpoint.as_deref().unwrap_or_default();
+                let desired_arn = self.arn.as_deref().unwrap_or_default();
 
                 if current_endpoint != desired_endpoint || current_arn != desired_arn {
                     InternalChange::Update {
@@ -189,7 +176,7 @@ impl Resource for DsqlCluster {
             "When you restore Aurora DSQL clusters, AWS Backup always creates new \
              clusters to preserve your source data.",
         );
-        let preexisting = self.config.mode == DsqlClusterMode::Preexisting;
+        let preexisting = self.mode == DsqlClusterMode::Preexisting;
         match ctx.kind {
             ChangeKind::Create if preexisting => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -361,12 +348,12 @@ impl Resource for DsqlCluster {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        let tags = ctx.resource_tags(&format!("dsql-{}", self.cluster_identity));
+        let tags = ctx.resource_tags(&format!("dsql-{}", self.identity));
 
-        match self.config.mode {
+        match self.mode {
             DsqlClusterMode::Preexisting => {
-                let endpoint = self.config.preexisting_endpoint.clone().unwrap_or_default();
-                let arn = self.config.preexisting_arn.clone().unwrap_or_default();
+                let endpoint = self.endpoint.clone().unwrap_or_default();
+                let arn = self.arn.clone().unwrap_or_default();
 
                 if endpoint.is_empty() && arn.is_empty() {
                     return Err(IacError::Other(anyhow::anyhow!(
@@ -380,11 +367,11 @@ impl Resource for DsqlCluster {
                     physical_id: if !arn.is_empty() {
                         arn.clone()
                     } else {
-                        format!("dsql-{}-preexisting", self.cluster_identity)
+                        format!("dsql-{}-preexisting", self.identity)
                     },
                     properties: serde_json::json!({
                         "mode": "preexisting",
-                        "cluster_identity": self.cluster_identity,
+                        "cluster_identity": self.identity,
                         "cluster_id": "",
                         "cluster_endpoint": endpoint,
                         "cluster_arn": arn,
@@ -442,7 +429,7 @@ impl Resource for DsqlCluster {
                     physical_id: cluster_id.clone(),
                     properties: serde_json::json!({
                         "mode": "managed",
-                        "cluster_identity": self.cluster_identity,
+                        "cluster_identity": self.identity,
                         "cluster_id": cluster_id,
                         "cluster_endpoint": cluster_endpoint,
                         "cluster_arn": cluster_arn,
@@ -462,9 +449,9 @@ impl Resource for DsqlCluster {
         current: &ResourceState,
         ctx: &ProvisionContext,
     ) -> Result<ResourceState, IacError> {
-        let tags = ctx.resource_tags(&format!("dsql-{}", self.cluster_identity));
+        let tags = ctx.resource_tags(&format!("dsql-{}", self.identity));
 
-        if self.config.mode == DsqlClusterMode::Managed {
+        if self.mode == DsqlClusterMode::Managed {
             let cluster_arn = current
                 .properties
                 .get("cluster_arn")
@@ -486,20 +473,18 @@ impl Resource for DsqlCluster {
             }
         }
 
-        let mode_str = if self.config.mode == DsqlClusterMode::Managed {
+        let mode_str = if self.mode == DsqlClusterMode::Managed {
             "managed"
         } else {
             "preexisting"
         };
         let cluster_id = prop_str(current, "cluster_id").unwrap_or_default();
         let cluster_endpoint = self
-            .config
-            .preexisting_endpoint
+            .endpoint
             .clone()
             .unwrap_or_else(|| prop_str(current, "cluster_endpoint").unwrap_or_default());
         let cluster_arn = self
-            .config
-            .preexisting_arn
+            .arn
             .clone()
             .unwrap_or_else(|| prop_str(current, "cluster_arn").unwrap_or_default());
 
@@ -508,7 +493,7 @@ impl Resource for DsqlCluster {
             physical_id: current.physical_id.clone(),
             properties: serde_json::json!({
                 "mode": mode_str,
-                "cluster_identity": self.cluster_identity,
+                "cluster_identity": self.identity,
                 "cluster_id": cluster_id,
                 "cluster_endpoint": cluster_endpoint,
                 "cluster_arn": cluster_arn,
@@ -531,7 +516,7 @@ impl Resource for DsqlCluster {
             .get("mode")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        if !effective_managed(self.config.mode, state_mode) {
+        if !effective_managed(self.mode, state_mode) {
             tracing::info!(
                 resource = %self.resource_id().0,
                 "preexisting DSQL cluster: skipping delete"
@@ -749,10 +734,10 @@ impl Resource for DsqlCluster {
     }
 
     async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
-        match self.config.mode {
+        match self.mode {
             DsqlClusterMode::Preexisting => {
-                let endpoint = self.config.preexisting_endpoint.clone().unwrap_or_default();
-                let arn = self.config.preexisting_arn.clone().unwrap_or_default();
+                let endpoint = self.endpoint.clone().unwrap_or_default();
+                let arn = self.arn.clone().unwrap_or_default();
                 if endpoint.is_empty() && arn.is_empty() {
                     return Ok(DescribeResult::Unsupported);
                 }
@@ -762,11 +747,11 @@ impl Resource for DsqlCluster {
                     physical_id: if !arn.is_empty() {
                         arn.clone()
                     } else {
-                        format!("dsql-{}-preexisting", self.cluster_identity)
+                        format!("dsql-{}-preexisting", self.identity)
                     },
                     properties: serde_json::json!({
                         "mode": "preexisting",
-                        "cluster_identity": self.cluster_identity,
+                        "cluster_identity": self.identity,
                         "cluster_id": "",
                         "cluster_endpoint": endpoint,
                         "cluster_arn": arn,
@@ -811,7 +796,7 @@ impl Resource for DsqlCluster {
                     physical_id: cluster_id.clone(),
                     properties: serde_json::json!({
                         "mode": "managed",
-                        "cluster_identity": self.cluster_identity,
+                        "cluster_identity": self.identity,
                         "cluster_id": cluster_id,
                         "cluster_endpoint": endpoint,
                         "cluster_arn": arn,
@@ -851,18 +836,12 @@ mod tests {
         };
 
         let cluster = |mode: DsqlClusterMode| DsqlCluster {
-            cluster_identity: "t".into(),
-            config: DsqlClusterConfig {
-                mode,
-                preexisting_endpoint: None,
-                preexisting_arn: None,
-                fallback_identifier: None,
-                resource_id: None,
-                module: "dsql".into(),
-            },
+            identity: "t".into(),
+            mode,
+            module: "dsql".into(),
             project: "p".into(),
             region: "us-east-1".into(),
-            tags: HashMap::new(),
+            ..Default::default()
         };
         let declared = |mode: DsqlClusterMode, kind: ChangeKind| {
             cluster(mode).change_semantics(&SemanticsContext {

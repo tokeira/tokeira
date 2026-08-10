@@ -1351,7 +1351,7 @@ mod tests {
         let service = |module: &str, id: &str, kind: ChangeKind, details: Vec<FieldDiff>| Change {
             module: module.into(),
             resource: id.into(),
-            resource_type: "compose_service".into(),
+            resource_type: "Service".into(),
             kind,
             details,
         };
@@ -1469,7 +1469,7 @@ mod tests {
 
         let manifest = |v: &str| serde_json::json!({ "field": v });
         let state = |id: &str| ResourceState {
-            resource_type: ResourceType::new("compose_service"),
+            resource_type: ResourceType::new("Service"),
             physical_id: id.to_string(),
             properties: serde_json::json!({}),
             dependencies: Vec::new(),
@@ -1678,7 +1678,7 @@ mod tests {
             id: id.to_string(),
             op,
             module: module.to_string(),
-            resource_type: "compose_service".to_string(),
+            resource_type: "Service".to_string(),
             display: Some("service".to_string()),
         };
         let mut committed = vec![
@@ -1700,7 +1700,7 @@ mod tests {
             changes: vec![
                 Change {
                     kind: ChangeKind::Update,
-                    resource_type: "compose_service".to_string(),
+                    resource_type: "Service".to_string(),
                     module: "grafana".to_string(),
                     resource: "compose/grafana".to_string(),
                     details: vec![tokeira_iac::FieldDiff {
@@ -1833,7 +1833,7 @@ mod tests {
                 let resource = format!("compose/r{index}");
                 changes.push(Change {
                     kind,
-                    resource_type: "compose_service".to_string(),
+                    resource_type: "Service".to_string(),
                     module: format!("m{index}"),
                     resource: resource.clone(),
                     details: vec![

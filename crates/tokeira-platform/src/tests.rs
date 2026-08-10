@@ -17,7 +17,7 @@ use crate::{
     error::{GraphError, KindError},
     graph::{StructuralGraphBuilder, WritebackValue},
     inspection::publish_inspection,
-    kind::{PlacementContext, ProviderKind},
+    kind::{PlacementContext, Kind},
 };
 
 /// The evaluated-config placeholder: definitions author the shape and the
@@ -32,8 +32,8 @@ fn test_config_value() -> LocatedValue {
 #[derive(Debug)]
 struct TestKind;
 
-impl ProviderKind for TestKind {
-    fn kind_name(&self) -> &'static str {
+impl Kind for TestKind {
+    fn name(&self) -> &'static str {
         "TestKind"
     }
 
@@ -66,8 +66,8 @@ struct ValidationProbeKind {
     placements: Arc<Mutex<Vec<PlacementContext>>>,
 }
 
-impl ProviderKind for ValidationProbeKind {
-    fn kind_name(&self) -> &'static str {
+impl Kind for ValidationProbeKind {
+    fn name(&self) -> &'static str {
         "ValidationProbe"
     }
 

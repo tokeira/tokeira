@@ -38,39 +38,26 @@ pub struct KeyAttribute {
     pub attribute_type: AttributeType,
 }
 
-/// Configuration for a single DynamoDB table provider resource.
+/// Provider resource that provisions exactly one DynamoDB table. Its
+/// authored face is the separate [`crate::kinds::DynamoDbTable`] kind,
+/// which realizes this resource directly — the table's facts are flat
+/// fields here; no configuration middle struct exists.
 #[derive(Debug)]
-pub struct DynamoDbTableConfig {
+pub struct DynamoDbTable {
+    pub table_name: String,
     pub key_schema: Vec<KeyAttribute>,
     pub billing_mode: BillingMode,
     pub ttl_attribute: Option<String>,
     pub module: String,
-}
-
-/// Generic provider resource that provisions exactly one DynamoDB table.
-#[derive(Debug)]
-pub struct DynamoDbTable {
-    pub table_name: String,
-    pub config: DynamoDbTableConfig,
     pub project: String,
     pub region: String,
     pub tags: HashMap<String, String>,
 }
 
 impl DynamoDbTable {
-    pub fn new(
-        table_name: String,
-        config: DynamoDbTableConfig,
-        rctx: &crate::ResourceContext,
-    ) -> Self {
-        Self {
-            table_name,
-            config,
-            project: rctx.project.clone(),
-            region: rctx.region.clone(),
-            tags: rctx.tags.clone(),
-        }
-    }
+    /// The resource's one word: engine resource type and author-visible
+    /// name, stated once here.
+    pub const TYPE: &'static str = "DynamoDbTable";
 
     fn sdk_key_type(kt: KeyType) -> aws_sdk_dynamodb::types::KeyType {
         match kt {
@@ -251,7 +238,7 @@ impl DynamoDbTable {
 #[async_trait::async_trait]
 impl Resource for DynamoDbTable {
     fn resource_type(&self) -> ResourceType {
-        ResourceType::new("DynamoDbTable")
+        ResourceType::new(Self::TYPE)
     }
 
     fn resource_id(&self) -> ResourceId {
@@ -263,7 +250,7 @@ impl Resource for DynamoDbTable {
     }
 
     fn module(&self) -> &str {
-        &self.config.module
+        &self.module
     }
 
     fn display_kind(&self) -> Option<&'static str> {
@@ -287,7 +274,7 @@ impl Resource for DynamoDbTable {
                 resource_type: self.resource_type(),
                 details: vec![tokeira_iac::FieldDiff::observation("tags changed")],
             }
-        } else if current_ttl_attribute != self.config.ttl_attribute {
+        } else if current_ttl_attribute != self.ttl_attribute {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
@@ -479,7 +466,6 @@ impl Resource for DynamoDbTable {
         let tags = ctx.resource_tags(name);
 
         let key_schema: Vec<aws_sdk_dynamodb::types::KeySchemaElement> = self
-            .config
             .key_schema
             .iter()
             .map(|ka| {
@@ -492,7 +478,6 @@ impl Resource for DynamoDbTable {
             .collect::<Result<_, _>>()?;
 
         let attribute_defs: Vec<aws_sdk_dynamodb::types::AttributeDefinition> = self
-            .config
             .key_schema
             .iter()
             .map(|ka| {
@@ -515,7 +500,7 @@ impl Resource for DynamoDbTable {
             .table_name(name)
             .set_key_schema(Some(key_schema))
             .set_attribute_definitions(Some(attribute_defs))
-            .billing_mode(Self::sdk_billing_mode(self.config.billing_mode))
+            .billing_mode(Self::sdk_billing_mode(self.billing_mode))
             .send()
             .await
         {
@@ -555,7 +540,7 @@ impl Resource for DynamoDbTable {
         // dynamodb:UpdateTimeToLive if TTL configured.
         // For adopted tables, call DescribeTimeToLive first and only issue an
         // update when TTL is not already enabled on the desired attribute.
-        if let Some(ttl_attr) = &self.config.ttl_attribute {
+        if let Some(ttl_attr) = &self.ttl_attribute {
             let mut should_update_ttl = true;
             if adopted_existing {
                 let ttl_desc = ctx
@@ -635,8 +620,8 @@ impl Resource for DynamoDbTable {
             physical_id: table_arn,
             properties: serde_json::json!({
                 "table_name": self.table_name,
-                "billing_mode": format!("{:?}", self.config.billing_mode),
-                "ttl_attribute": self.config.ttl_attribute,
+                "billing_mode": format!("{:?}", self.billing_mode),
+                "ttl_attribute": self.ttl_attribute,
                 "tags": tags,
             }),
             dependencies: vec![],
@@ -674,8 +659,8 @@ impl Resource for DynamoDbTable {
             .get("ttl_attribute")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        if current_ttl_attribute != self.config.ttl_attribute {
-            let ttl_spec = match self.config.ttl_attribute.as_deref() {
+        if current_ttl_attribute != self.ttl_attribute {
+            let ttl_spec = match self.ttl_attribute.as_deref() {
                 Some(attr) => aws_sdk_dynamodb::types::TimeToLiveSpecification::builder()
                     .attribute_name(attr)
                     .enabled(true)
@@ -712,8 +697,8 @@ impl Resource for DynamoDbTable {
 
             self.wait_for_ttl_reflection(
                 ctx,
-                self.config.ttl_attribute.as_deref(),
-                self.config.ttl_attribute.is_some(),
+                self.ttl_attribute.as_deref(),
+                self.ttl_attribute.is_some(),
             )
             .await?;
         }
@@ -723,8 +708,8 @@ impl Resource for DynamoDbTable {
             physical_id: current.physical_id.clone(),
             properties: serde_json::json!({
                 "table_name": self.table_name,
-                "billing_mode": format!("{:?}", self.config.billing_mode),
-                "ttl_attribute": self.config.ttl_attribute,
+                "billing_mode": format!("{:?}", self.billing_mode),
+                "ttl_attribute": self.ttl_attribute,
                 "tags": tags,
             }),
             dependencies: vec![],
@@ -886,12 +871,10 @@ mod tests {
 
         let table = DynamoDbTable {
             table_name: "t".into(),
-            config: DynamoDbTableConfig {
-                key_schema: Vec::new(),
-                billing_mode: BillingMode::OnDemand,
-                ttl_attribute: None,
-                module: "dynamo".into(),
-            },
+            key_schema: Vec::new(),
+            billing_mode: BillingMode::OnDemand,
+            ttl_attribute: None,
+            module: "dynamo".into(),
             project: "p".into(),
             region: "us-east-1".into(),
             tags: HashMap::new(),

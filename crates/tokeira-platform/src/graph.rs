@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::{
     error::{GraphError, GraphFinding},
-    kind::ProviderKind,
+    kind::Kind,
 };
 
 /// Stable logical reference to one declared resource.
@@ -347,7 +347,7 @@ impl<K> StructuralGraphBuilder<K> {
     }
 }
 
-impl<K: ProviderKind> StructuralGraphBuilder<K> {
+impl<K: Kind> StructuralGraphBuilder<K> {
     /// Check and construct an output reference from a resource declared so far.
     pub fn output(
         &self,
@@ -364,7 +364,7 @@ impl<K: ProviderKind> StructuralGraphBuilder<K> {
             })?;
         if !node.kind().declared_outputs().contains(&output) {
             return Err(GraphError::UnknownOutput {
-                kind: node.kind().kind_name().to_string(),
+                kind: node.kind().name().to_string(),
                 output: output.to_string(),
                 supported: node
                     .kind()

@@ -1940,7 +1940,7 @@ mod tests {
             .run(&context_inputs, |(kind, with_state, field_diffs)| {
                 let stub = StubResource::missing("compose/probe", "m");
                 let state = crate::ResourceState {
-                    resource_type: crate::ResourceType("compose_service".into()),
+                    resource_type: crate::ResourceType("Service".into()),
                     physical_id: "p".into(),
                     properties: serde_json::json!({}),
                     dependencies: Vec::new(),

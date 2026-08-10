@@ -281,7 +281,7 @@ mod tests {
     fn destructive_plans_refuse_without_yes() {
         let destructive = vec![tokeira_iac::Change {
             kind: tokeira_iac::ChangeKind::Delete,
-            resource_type: "compose_service".into(),
+            resource_type: "Service".into(),
             module: "grafana".into(),
             resource: "compose/grafana".into(),
             details: Vec::new(),
@@ -298,7 +298,7 @@ mod tests {
 
         let benign = vec![tokeira_iac::Change {
             kind: tokeira_iac::ChangeKind::Update,
-            resource_type: "compose_service".into(),
+            resource_type: "Service".into(),
             module: "tokeirad".into(),
             resource: "compose/tokeirad".into(),
             details: Vec::new(),

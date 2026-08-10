@@ -57,7 +57,7 @@ impl ProviderKind for StoreKind {
 fn vocabulary() -> Vocabulary {
     let store = KindEntry {
         name: "Store",
-        defaults: || None,
+        defaults: None,
         decode: |value| {
             let range = value.range;
             from_located_value::<Store>(value)

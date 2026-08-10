@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tokeira_aws::{
     ResourceContext,
     resources::{
-        dsql_cluster::{DsqlCluster, DsqlClusterConfig, DsqlClusterMode as AwsDsqlClusterMode},
+        dsql_cluster::{DsqlCluster, DsqlClusterMode as AwsDsqlClusterMode},
         dsql_connection_endpoint::{DsqlConnectionEndpoint, DsqlConnectionEndpointConfig},
         iam_role::{IamRole, IamRoleConfig},
         vpc_endpoint::{EndpointType, VpcEndpoint, VpcEndpointConfig},
@@ -52,18 +52,17 @@ impl Module for DsqlModule {
             DsqlClusterMode::Managed => AwsDsqlClusterMode::Managed,
             DsqlClusterMode::Preexisting => AwsDsqlClusterMode::Preexisting,
         };
-        let mut resources: Vec<Box<dyn Resource>> = vec![Box::new(DsqlCluster::new(
-            format!("{}-{}", self.config.project_name, self.config.environment),
-            DsqlClusterConfig {
-                mode,
-                preexisting_endpoint: self.config.dsql.endpoint.clone(),
-                preexisting_arn: None,
-                fallback_identifier: None,
-                resource_id: Some(cluster_id.clone()),
-                module: self.name().to_owned(),
-            },
-            &rctx,
-        ))];
+        let mut resources: Vec<Box<dyn Resource>> = vec![Box::new(DsqlCluster {
+            identity: format!("{}-{}", self.config.project_name, self.config.environment),
+            mode,
+            endpoint: self.config.dsql.endpoint.clone(),
+            resource_id: Some(cluster_id.clone()),
+            module: self.name().to_owned(),
+            project: rctx.project.clone(),
+            region: rctx.region.clone(),
+            tags: rctx.tags.clone(),
+            ..Default::default()
+        })];
 
         match self.config.dsql.mode {
             DsqlClusterMode::Managed => {

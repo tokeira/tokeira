@@ -180,7 +180,7 @@ fn arb_outcome() -> impl Strategy<Value = PlanOutcome> {
                 let resource = format!("compose/r{index}");
                 changes.push(Change {
                     kind,
-                    resource_type: "compose_service".to_string(),
+                    resource_type: "Service".to_string(),
                     module: format!("m{}", index % 3),
                     resource: resource.clone(),
                     details,
@@ -344,7 +344,7 @@ proptest! {
                     _ => CommittedOp::Unchanged,
                 },
                 module: format!("m{index}"),
-                resource_type: "compose_service".to_string(),
+                resource_type: "Service".to_string(),
                 display: None,
             })
             .collect();

@@ -45,7 +45,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokeira_iac as iac;
 use tokeira_platform::{
-    declaration::{AuthorableKind, KindSet, kind},
+    declaration::{KindSet, kind},
     error::KindError,
     kind::{PlacementContext, ProviderKind},
 };
@@ -53,7 +53,6 @@ use tokeira_platform::{
 /// The module that owns the observability config-files resource.
 const MODULE_OBSERVABILITY: &str = "observability";
 
-const CONFIG_RESOURCE_TYPE: &str = "observability_config_files";
 const CONFIG_DIR: &str = "config";
 const ALLOY_CONFIG: &str = "config/alloy.alloy";
 const MIMIR_CONFIG: &str = "config/mimir.yaml";
@@ -209,7 +208,7 @@ impl ObservabilityConfiguration {
 
 impl ProviderKind for ObservabilityConfiguration {
     fn kind_name(&self) -> &'static str {
-        "ObservabilityConfiguration"
+        ObservabilityConfigFilesResource::TYPE
     }
 
     /// Parameter validation only — pure, no filesystem. Content problems
@@ -261,16 +260,15 @@ pub fn configuration_resource_id() -> iac::ResourceId {
     tokeira_compose::config_content_resource_id()
 }
 
-impl AuthorableKind for ObservabilityConfiguration {
-    const NAME: &'static str = "ObservabilityConfiguration";
-}
-
 /// The platform's own kind selection: the observability configuration
-/// bundle, contributed to the authoring vocabulary at the entry point.
+/// bundle, contributed to the authoring vocabulary at the entry point
+/// under the word its resource owns.
 pub fn kind_set() -> KindSet {
     KindSet::new(
         "compose-platform",
-        vec![kind::<ObservabilityConfiguration>()],
+        vec![kind::<ObservabilityConfiguration>(
+            ObservabilityConfigFilesResource::TYPE,
+        )],
     )
 }
 
@@ -486,6 +484,10 @@ pub struct ObservabilityConfigFilesResource {
 }
 
 impl ObservabilityConfigFilesResource {
+    /// The resource's one word: engine resource type and author-visible kind
+    /// name. The kind and the selection entry recover it from here.
+    pub const TYPE: &'static str = "ObservabilityConfiguration";
+
     pub fn new(
         deployment_dir: PathBuf,
         definition_dir: PathBuf,
@@ -539,7 +541,7 @@ impl ObservabilityConfigFilesResource {
 
     fn state_from_files(&self, files: &[RenderedConfigFile]) -> iac::ResourceState {
         iac::ResourceState {
-            resource_type: iac::ResourceType::new(CONFIG_RESOURCE_TYPE),
+            resource_type: iac::ResourceType::new(Self::TYPE),
             physical_id: self.deployment_dir.join(CONFIG_DIR).display().to_string(),
             properties: properties_for_checksums(self.checksums_for_rendered(files), Vec::new()),
             dependencies: Vec::new(),
@@ -627,7 +629,7 @@ impl ObservabilityConfigFilesResource {
 #[async_trait]
 impl iac::Resource for ObservabilityConfigFilesResource {
     fn resource_type(&self) -> iac::ResourceType {
-        iac::ResourceType::new(CONFIG_RESOURCE_TYPE)
+        iac::ResourceType::new(Self::TYPE)
     }
 
     fn resource_id(&self) -> iac::ResourceId {

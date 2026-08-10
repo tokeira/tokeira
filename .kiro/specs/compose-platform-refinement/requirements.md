@@ -43,7 +43,8 @@ document disagree, this document wins.
   `DsqlCluster`, `DynamoDbTable`).
 - **Kind selection**: a `KindSet` added to the declaration — the platform's
   own kinds, or a typed selection from another provider's export
-  (`tokeira_aws::kinds::select(vec![kind::<DsqlCluster>(), …])`).
+  (`tokeira_aws::kinds::select(vec![kind::<DsqlCluster>(…), …])`), each
+  entry selected under the word its resource owns.
 - **Authoring vocabulary**: the union of every declared kind set; a
   definition may name exactly these kinds.
 - **Ops**: the provider's surface over a running deployment — log streams,
@@ -123,15 +124,15 @@ The contract as adopted, by seam:
 
 - `crates/tokeira-platform/src/declaration.rs:30` — `PlatformDeclaration`
   (`on(provider)`, `.kinds(selection)`, `.vocabulary()`); `:85` —
-  `ProviderExport { kinds, ops, execution, infra }`; `:129` — `KindEntry`
-  with `kind::<K>()` typed construction (`AuthorableKind`, `:115`); `:154` —
-  `KindSet::new(provider, entries).infra(constructor)`; `:184` —
-  `Vocabulary::of` with collision refusal; `:287` — `Ops` (log stream, port
-  mappings, scale — required, undefaulted); `:316` — `ProviderExecution`
-  (probe-only, blocked-plan semantics documented); `:353` —
-  `InfraConstructor` (per-selection registration with the selection's
-  namespace attributes).
-- `platforms/compose/src/lib.rs:65` — the entry point:
+  `ProviderExport { kinds, ops, execution, infra }`; `:112` — `KindEntry`
+  with `kind::<K>(name)` typed construction under the word the kind's
+  resource owns (the resource's `TYPE` const); `:152` —
+  `KindSet::new(provider, entries).infra(constructor)`; `:182` —
+  `Vocabulary::of` with collision refusal; `Ops` (log stream, port
+  mappings, scale — required, undefaulted); `ProviderExecution`
+  (probe-only, blocked-plan semantics documented); `InfraConstructor`
+  (per-selection registration with the selection's namespace attributes).
+- `platforms/compose/src/lib.rs:71` — the entry point:
   `PlatformDeclaration::on(tokeira_compose::provider())`, the platform-owned
   `observability::kind_set()`, and the typed AWS selection.
 - `crates/tokeira-provisioner-cli/src/platform.rs` — admission (`Admitted`,
@@ -222,8 +223,9 @@ after the fact.
    library SHALL be part of the authoring vocabulary with no separate wiring
    declaration.
 2. THE auxiliary vocabulary SHALL be selected explicitly at the entry point
-   by kind type (`kind::<DsqlCluster>()`); a selection typo SHALL be a
-   compile error.
+   by kind type, under the word the kind's resource owns
+   (`kind::<DsqlCluster>(…::TYPE)`); a selection typo SHALL be a compile
+   error.
 3. WHEN a definition names a kind outside the composed vocabulary THEN
    `definition check` SHALL refuse with an unknown-kind error located at the
    authoring site.

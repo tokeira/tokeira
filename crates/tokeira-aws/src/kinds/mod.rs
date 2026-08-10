@@ -1,17 +1,24 @@
 //! Reusable, typed author inputs for AWS resources.
 //!
-//! This module is the AWS provider's kind export. Platforms select kinds by
-//! type at their entry point — [`all`] for the complete export, or
-//! [`select`] over `kind::<DsqlCluster>()`-style entries — and the selection
-//! is the whole wiring act: selected kinds are authorable and executable,
-//! unselected kinds are unknown at `definition check`, and a selection typo
-//! is a compile error.
+//! This module is the AWS provider's kind export. Kinds and resources are
+//! distinct: each kind here is the authored face of one resource in
+//! [`crate::resources`] and realizes it directly. The namespace facts —
+//! [`NAMESPACE`], [`KINDS`], [`decode`] — are what the assembled binary
+//! lists for the frontend; nothing is registered anywhere else.
 
 pub mod dsql_cluster;
 pub mod dynamodb_table;
 
-use tokeira_platform::declaration::{
-    AuthorableKind, DeploymentRef, InfraConstructor, KindEntry, KindSet, kind,
+use tokeira_platform::{
+    author::LocatedValue,
+    declaration::{DeploymentRef, InfraConstructor},
+    error::KindError,
+    kind::{self, Kind},
+};
+
+use crate::resources::{
+    dsql_cluster::DsqlCluster as DsqlClusterResource,
+    dynamodb_table::DynamoDbTable as DynamoDbTableResource,
 };
 
 pub use dsql_cluster::DsqlCluster;
@@ -51,25 +58,21 @@ impl InfraConstructor for AwsInfraConstructor {
     }
 }
 
-impl AuthorableKind for DsqlCluster {
-    const NAME: &'static str = "DsqlCluster";
-}
+/// The namespace word: the normalized crate name definitions import from.
+pub const NAMESPACE: &str = "tokeira_aws";
 
-impl AuthorableKind for DynamoDbTable {
-    const NAME: &'static str = "DynamoDbTable";
-}
+/// The provider's author-visible kind names, each the word its resource
+/// owns.
+pub const KINDS: &[&str] = &[DsqlClusterResource::TYPE, DynamoDbTableResource::TYPE];
 
-/// The complete AWS kind selection, for a platform entry point that tracks
-/// the provider: new AWS kinds become authorable without a platform edit.
-pub fn all() -> KindSet {
-    select(vec![kind::<DsqlCluster>(), kind::<DynamoDbTable>()])
-}
-
-/// A typed subset of the AWS kind export, for a platform entry point that
-/// states its vocabulary exactly and grows it only on purpose:
-/// `select(vec![kind::<DsqlCluster>()])`.
-pub fn select(entries: Vec<KindEntry>) -> KindSet {
-    KindSet::new("aws", entries).infra(AwsInfraConstructor)
+/// Decode one authored kind of this namespace; `None` when the name is not
+/// ours.
+pub fn decode(name: &str, value: LocatedValue) -> Option<Result<Box<dyn Kind>, KindError>> {
+    Some(match name {
+        DsqlClusterResource::TYPE => kind::decode::<DsqlCluster>(value),
+        DynamoDbTableResource::TYPE => kind::decode::<DynamoDbTable>(value),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -78,25 +81,25 @@ mod tests {
 
     use super::*;
 
-    // A selection carries exactly the requested kind types, named by the
-    // types themselves; decode admits each entry's own input shape.
+    // The namespace facts hold together: every listed name decodes here
+    // (each entry admits its own input shape), and an unknown name is
+    // refused as not-ours rather than an error.
     #[test]
-    fn selection_is_typed_and_decodes_each_entry() {
-        let selection = all();
-        let names: Vec<&str> = selection.entries.iter().map(|entry| entry.name).collect();
-        assert_eq!(names, ["DsqlCluster", "DynamoDbTable"]);
-        for entry in &selection.entries {
-            let probe = (entry.decode)(LocatedValue::new(
-                tokeira_platform::author::ValueShape::Struct {
-                    name: entry.name.to_string(),
+    fn every_listed_kind_decodes_and_unknown_names_refuse() {
+        assert_eq!(KINDS, ["DsqlCluster", "DynamoDbTable"]);
+        for name in KINDS {
+            let probe = decode(
+                name,
+                LocatedValue::new(tokeira_platform::author::ValueShape::Struct {
+                    name: (*name).to_string(),
                     fields: Vec::new(),
-                },
-            ));
+                }),
+            )
+            .unwrap_or_else(|| panic!("kind `{name}` must belong to {NAMESPACE}"));
             if let Err(error) = probe {
                 assert!(
                     !error.message.contains("unknown"),
-                    "entry `{}` failed as unknown: {}",
-                    entry.name,
+                    "entry `{name}` failed as unknown: {}",
                     error.message
                 );
             }

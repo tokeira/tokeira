@@ -8,14 +8,32 @@ use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 
 use crate::{
     author::LocatedValue,
-    declaration::Vocabulary,
     error::{
-        DefinitionError, FrontendDiagnostic, ProjectionError, VerificationFinding,
+        DefinitionError, FrontendDiagnostic, KindError, ProjectionError, VerificationFinding,
         VerificationReport,
     },
     graph::{VerifiedGraph, WritebackValue},
-    kind::{DecodedKind, PlacementContext, ProviderKind},
+    kind::{Kind, PlacementContext},
 };
+
+/// One provider namespace: the runtime shadow of a crate dependency.
+///
+/// The name is the normalized crate name a definition imports from
+/// (`tokeira_compose`, `tokeira_aws`); the kind names and the decoder are
+/// the crate's own facts, stated next to its resources. A frontend resolves
+/// `use tokeira_aws::DsqlCluster` against the assembled binary's list of
+/// these — there is no composed vocabulary and no registration.
+#[derive(Debug, Clone, Copy)]
+pub struct Namespace {
+    /// The normalized crate name definitions import from.
+    pub name: &'static str,
+    /// Author-visible kind names, for module synthesis and located
+    /// unknown-name errors.
+    pub kinds: &'static [&'static str],
+    /// Decode one authored kind; `None` when the name is not this
+    /// namespace's.
+    pub decode: fn(&str, LocatedValue) -> Option<Result<Box<dyn Kind>, KindError>>,
+}
 
 /// Source identity safe to render in frontend diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,16 +184,15 @@ pub struct FrontendOutput {
     /// Host-free platform configuration value.
     pub config: LocatedValue,
     /// Completed structural graph built inside the frontend evaluator.
-    pub graph: VerifiedGraph<DecodedKind>,
+    pub graph: VerifiedGraph<Box<dyn Kind>>,
 }
 
 /// Statically assembled evaluator for one definition format.
 ///
-/// The frontend receives the composed authoring [`Vocabulary`] by reference:
-/// the kinds a definition may name are exactly the declaration's, and the
-/// frontend needs nothing else — names for enumeration, membership for
-/// unknown-kind refusals, defaults for `<Kind>::EMPTY`, and decoding into
-/// realizable kinds.
+/// The frontend receives the assembled binary's provider [`Namespace`] list
+/// by reference: the kinds a definition may import are exactly those crates'
+/// facts, and the frontend needs nothing else — names for module synthesis
+/// and unknown-name refusals, decoding into realizable resources.
 pub trait DefinitionFrontend: Clone + Send + Sync + 'static {
     /// Open validated format identity embedded in the assembled provisioner.
     fn format(&self) -> &DefinitionFormatId;
@@ -185,7 +202,7 @@ pub trait DefinitionFrontend: Clone + Send + Sync + 'static {
         &self,
         source: FrontendSource<'_>,
         context: &C,
-        vocabulary: &Vocabulary,
+        namespaces: &[Namespace],
         parts: &dyn SourceResolver,
     ) -> Result<FrontendOutput, FrontendDiagnostic>
     where
@@ -205,7 +222,7 @@ pub trait DefinitionFrontend: Clone + Send + Sync + 'static {
         _prior: FrontendSource<'_>,
         _current: FrontendSource<'_>,
         _context: &C,
-        _vocabulary: &Vocabulary,
+        _namespaces: &[Namespace],
         _prior_parts: &dyn SourceResolver,
         _current_parts: &dyn SourceResolver,
     ) -> Result<(), Vec<String>>
@@ -300,15 +317,15 @@ pub struct EvaluatedDefinition<K> {
     pub configuration_identity: ConfigurationIdentity,
 }
 
-/// Evaluate a source against the composed vocabulary; retain no frontend
-/// runtime state.
+/// Evaluate a source against the declared provider namespaces; retain no
+/// frontend runtime state.
 pub fn evaluate_definition<Cx, F>(
     frontend: &F,
     source: DefinitionSource,
     context: &Cx,
-    vocabulary: &Vocabulary,
+    namespaces: &[Namespace],
     parts: &dyn SourceResolver,
-) -> Result<EvaluatedDefinition<DecodedKind>, DefinitionError>
+) -> Result<EvaluatedDefinition<Box<dyn Kind>>, DefinitionError>
 where
     Cx: Serialize,
     F: DefinitionFrontend,
@@ -333,7 +350,7 @@ where
             bytes: source.bytes.as_ref(),
         },
         context,
-        vocabulary,
+        namespaces,
         &recorder,
     )?;
     let served = recorder.served.into_inner();
@@ -370,7 +387,7 @@ impl<'a, K> VerifiedDefinition<'a, K> {
 }
 
 /// Validate every concrete kind input without fabricating invocation facts.
-pub fn verify_definition<K: ProviderKind>(
+pub fn verify_definition<K: Kind>(
     definition: &EvaluatedDefinition<K>,
 ) -> Result<VerifiedDefinition<'_, K>, VerificationReport> {
     let findings =
@@ -382,7 +399,7 @@ pub fn verify_definition<K: ProviderKind>(
                 resource.kind().validate_input().err().map(|error| {
                     VerificationFinding::InvalidInput {
                         resource: format!("{}/{}", resource.module(), resource.logical_id()),
-                        provider_kind: resource.kind().kind_name().to_string(),
+                        provider_kind: resource.kind().name().to_string(),
                         message: error.message,
                     }
                 })
@@ -447,7 +464,7 @@ impl RealizedResources {
     }
 }
 
-impl<K: ProviderKind> VerifiedDefinition<'_, K> {
+impl<K: Kind> VerifiedDefinition<'_, K> {
     /// Realize the verified set once with real invocation identity and placement.
     /// `definition_dir` names where the interpreted source was read from —
     /// the deployment root for a working realization, a retained revision
@@ -519,14 +536,14 @@ impl<K: ProviderKind> VerifiedDefinition<'_, K> {
                 .realize(&placement)
                 .map_err(|error| ProjectionError {
                     resource: format!("{}/{}", node.module(), node.logical_id()),
-                    provider_kind: node.kind().kind_name().to_string(),
+                    provider_kind: node.kind().name().to_string(),
                     message: error.message,
                 })?;
             let resource_id = resource.resource_id();
             content.insert(
                 resource_id.clone(),
                 crate::content::ContentIdentity::new(
-                    &format!("provider-resource/{}", node.kind().kind_name()),
+                    &format!("provider-resource/{}", node.kind().name()),
                     manifest.to_string().as_bytes(),
                 ),
             );
@@ -589,10 +606,7 @@ mod part_tests {
     use serde::Serialize;
 
     use super::*;
-    use crate::{
-        author::ValueShape, declaration::Vocabulary, graph::StructuralGraphBuilder,
-        kind::DecodedKind,
-    };
+    use crate::{author::ValueShape, graph::StructuralGraphBuilder};
 
     /// The smallest frontend that exercises the resolver: unit config, one
     /// module, and the configured part requests in order.
@@ -620,7 +634,7 @@ mod part_tests {
             &self,
             source: FrontendSource<'_>,
             _context: &C,
-            _vocabulary: &Vocabulary,
+            _namespaces: &[Namespace],
             parts: &dyn SourceResolver,
         ) -> Result<FrontendOutput, FrontendDiagnostic> {
             for name in &self.requests {
@@ -632,7 +646,7 @@ mod part_tests {
                     message: error.to_string(),
                 })?;
             }
-            let mut graph = StructuralGraphBuilder::<DecodedKind>::new();
+            let mut graph = StructuralGraphBuilder::<Box<dyn Kind>>::new();
             graph.add_module("state", Vec::new());
             Ok(FrontendOutput {
                 config: LocatedValue {
@@ -677,8 +691,8 @@ mod part_tests {
         }
     }
 
-    fn vocabulary() -> Vocabulary {
-        Vocabulary::of(Vec::new()).expect("empty vocabulary composes")
+    fn namespaces() -> Vec<Namespace> {
+        Vec::new()
     }
 
     // The regression pin: a root that loads no parts keeps the
@@ -691,7 +705,7 @@ mod part_tests {
             &frontend,
             source(b"root"),
             &ctx(),
-            &vocabulary(),
+            &namespaces(),
             &NoPartSources,
         )
         .expect("evaluates");
@@ -712,7 +726,7 @@ mod part_tests {
             &PartRequestingFrontend::new(vec!["b", "a", "b"]),
             source(b"root"),
             &ctx(),
-            &vocabulary(),
+            &namespaces(),
             &parts,
         )
         .expect("evaluates");
@@ -720,7 +734,7 @@ mod part_tests {
             &PartRequestingFrontend::new(vec!["b", "a"]),
             source(b"root"),
             &ctx(),
-            &vocabulary(),
+            &namespaces(),
             &parts,
         )
         .expect("evaluates");
@@ -740,7 +754,7 @@ mod part_tests {
             &PartRequestingFrontend::new(vec!["b", "a"]),
             source(b"root"),
             &ctx(),
-            &vocabulary(),
+            &namespaces(),
             &changed,
         )
         .expect("evaluates");

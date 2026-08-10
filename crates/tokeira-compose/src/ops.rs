@@ -61,7 +61,7 @@ impl Ops for DockerOps {
     /// Returns the number of containers created.
     async fn scale(&self, deployment: &DeploymentRef, specs: &[String]) -> anyhow::Result<usize> {
         let ledger = deployment.dir.join("state/compose-services.yaml");
-        let platform = ComposePlatform::connect(ledger, &deployment.name)?;
+        let platform = ComposePlatform::connect(ledger, &deployment.dir, &deployment.name)?;
         let mut created = 0usize;
         for spec in specs {
             let (service, replicas) = spec

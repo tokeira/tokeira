@@ -62,14 +62,14 @@ impl InfraConstructor for ComposeInfraConstructor {
         // Recovered resources let refresh/destroy reconstruct a live service
         // from recorded state without the definition in hand.
         ctx.set_extension(tokeira_iac::ResourceRecovery::new(|state| {
-            (state.resource_type.0 == "compose_service")
+            (state.resource_type.0 == crate::ComposeService::TYPE)
                 .then(|| service_from_manifest(state.properties.clone()).ok())
                 .flatten()
                 .map(|service| Box::new(service) as Box<dyn tokeira_iac::Resource>)
         }));
 
         let ledger = deployment.dir.join("state/compose-services.yaml");
-        let platform = ComposePlatform::connect(ledger, &deployment.name)?;
+        let platform = ComposePlatform::connect(ledger, &deployment.dir, &deployment.name)?;
         ctx.set_extension(platform);
         Ok(())
     }

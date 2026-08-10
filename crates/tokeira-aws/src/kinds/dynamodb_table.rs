@@ -3,15 +3,11 @@
 use serde::Deserialize;
 use tokeira_platform::{
     error::KindError,
-    kind::{PlacementContext, ProviderKind},
+    kind::{Kind, PlacementContext},
 };
 
-use crate::{
-    ResourceContext,
-    resources::dynamodb_table::{
-        AttributeType, BillingMode, DynamoDbTable as Resource, DynamoDbTableConfig, KeyAttribute,
-        KeyType,
-    },
+use crate::resources::dynamodb_table::{
+    AttributeType, BillingMode, DynamoDbTable as Resource, KeyAttribute, KeyType,
 };
 
 /// Reusable author input for a single-hash-key on-demand DynamoDB table.
@@ -45,9 +41,9 @@ impl DynamoDbTable {
     }
 }
 
-impl ProviderKind for DynamoDbTable {
-    fn kind_name(&self) -> &'static str {
-        "DynamoDbTable"
+impl Kind for DynamoDbTable {
+    fn name(&self) -> &'static str {
+        Resource::TYPE
     }
 
     fn validate_input(&self) -> Result<(), KindError> {
@@ -73,23 +69,19 @@ impl ProviderKind for DynamoDbTable {
         placement: &PlacementContext,
     ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
         self.validate()?;
-        Ok(Box::new(Resource::new(
-            self.table.clone(),
-            DynamoDbTableConfig {
-                key_schema: vec![KeyAttribute {
-                    name: self.hash_key.clone(),
-                    key_type: KeyType::Hash,
-                    attribute_type: AttributeType::String,
-                }],
-                billing_mode: BillingMode::OnDemand,
-                ttl_attribute: self.ttl.clone(),
-                module: placement.module.clone(),
-            },
-            &ResourceContext {
-                project: placement.deployment_id.clone(),
-                region: self.region.clone(),
-                tags: placement.tags.clone().into_iter().collect(),
-            },
-        )))
+        Ok(Box::new(Resource {
+            table_name: self.table.clone(),
+            key_schema: vec![KeyAttribute {
+                name: self.hash_key.clone(),
+                key_type: KeyType::Hash,
+                attribute_type: AttributeType::String,
+            }],
+            billing_mode: BillingMode::OnDemand,
+            ttl_attribute: self.ttl.clone(),
+            module: placement.module.clone(),
+            project: placement.deployment_id.clone(),
+            region: self.region.clone(),
+            tags: placement.tags.clone().into_iter().collect(),
+        }))
     }
 }

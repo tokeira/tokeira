@@ -27,12 +27,12 @@ use std::collections::HashMap;
 use tokeira_aws::{
     ResourceContext,
     resources::{
-        dsql_cluster::{DsqlCluster as AwsDsqlCluster, DsqlClusterConfig, DsqlClusterMode},
+        dsql_cluster::{DsqlCluster as AwsDsqlCluster, DsqlClusterMode},
         dsql_connection_endpoint::{
             DsqlConnectionEndpoint as AwsDsqlConnectionEndpoint, DsqlConnectionEndpointConfig,
         },
         dynamodb_table::{
-            AttributeType, BillingMode, DynamoDbTable as AwsDynamoDbTable, DynamoDbTableConfig,
+            AttributeType, BillingMode, DynamoDbTable as AwsDynamoDbTable,
             KeyAttribute, KeyType,
         },
         ecr_repository::EcrRepository as AwsEcrRepository,
@@ -275,18 +275,18 @@ impl Kind for DsqlCluster {
         } else {
             DsqlClusterMode::Managed
         };
-        Box::new(AwsDsqlCluster::new(
-            cx.project_name.clone(),
-            DsqlClusterConfig {
-                mode,
-                preexisting_endpoint: self.endpoint.clone(),
-                preexisting_arn: self.arn.clone(),
-                fallback_identifier: None,
-                resource_id: None,
-                module: MODULE_FOUNDATION.to_string(),
-            },
-            &aws_ctx(cx),
-        ))
+        let rctx = aws_ctx(cx);
+        Box::new(AwsDsqlCluster {
+            identity: cx.project_name.clone(),
+            mode,
+            endpoint: self.endpoint.clone(),
+            arn: self.arn.clone(),
+            module: MODULE_FOUNDATION.to_string(),
+            project: rctx.project.clone(),
+            region: rctx.region.clone(),
+            tags: rctx.tags.clone(),
+            ..Default::default()
+        })
     }
 }
 
@@ -330,20 +330,21 @@ pub struct DynamoDbTable {
 
 impl Kind for DynamoDbTable {
     fn realize(&self, cx: &Cx) -> Box<dyn iac::Resource> {
-        Box::new(AwsDynamoDbTable::new(
-            self.table.clone(),
-            DynamoDbTableConfig {
-                key_schema: vec![KeyAttribute {
-                    name: self.hash_key.clone(),
-                    key_type: KeyType::Hash,
-                    attribute_type: AttributeType::String,
-                }],
-                billing_mode: BillingMode::OnDemand,
-                ttl_attribute: self.ttl.clone(),
-                module: MODULE_FOUNDATION.to_string(),
-            },
-            &aws_ctx(cx),
-        ))
+        let rctx = aws_ctx(cx);
+        Box::new(AwsDynamoDbTable {
+            table_name: self.table.clone(),
+            key_schema: vec![KeyAttribute {
+                name: self.hash_key.clone(),
+                key_type: KeyType::Hash,
+                attribute_type: AttributeType::String,
+            }],
+            billing_mode: BillingMode::OnDemand,
+            ttl_attribute: self.ttl.clone(),
+            module: MODULE_FOUNDATION.to_string(),
+            project: rctx.project.clone(),
+            region: rctx.region.clone(),
+            tags: rctx.tags.clone(),
+        })
     }
 }
 

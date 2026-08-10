@@ -123,8 +123,8 @@ pub type DesiredSnapshot = std::collections::BTreeMap<tokeira_iac::ResourceId, s
 /// types live with the definition-boundary library and are re-exported here
 /// as the surface platforms speak.
 pub use tokeira_platform::declaration::{
-    AuthorableKind, DeploymentRef, KindEntry, KindSet, Ops, PlatformDeclaration, ProviderExecution,
-    ProviderExport, Vocabulary, kind,
+    DeploymentRef, KindEntry, KindSet, Ops, PlatformDeclaration, ProviderExecution, ProviderExport,
+    Vocabulary, kind,
 };
 
 /// The typed refusal a verb returns after emitting a platform-issue

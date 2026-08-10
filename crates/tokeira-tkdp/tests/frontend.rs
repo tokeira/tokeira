@@ -90,7 +90,7 @@ impl ProviderKind for TestKind {
 fn vocabulary() -> Vocabulary {
     let probe = KindEntry {
         name: "Probe",
-        defaults: || None,
+        defaults: None,
         decode: |value| {
             let range = value.range;
             from_located_value::<Probe>(value)
@@ -100,8 +100,8 @@ fn vocabulary() -> Vocabulary {
     };
     let store = KindEntry {
         name: "Store",
-        defaults: || {
-            Some(LocatedValue::new(ValueShape::Struct {
+        defaults: Some(|| {
+            LocatedValue::new(ValueShape::Struct {
                 name: "Store".to_string(),
                 fields: vec![
                     ("path".to_string(), LocatedValue::string("")),
@@ -110,8 +110,8 @@ fn vocabulary() -> Vocabulary {
                         LocatedValue::new(ValueShape::Integer(1)),
                     ),
                 ],
-            }))
-        },
+            })
+        }),
         decode: |value| {
             let range = value.range;
             from_located_value::<Store>(value)

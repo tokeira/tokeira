@@ -17,7 +17,7 @@ use crate::{
     error::{GraphError, KindError},
     graph::{StructuralGraphBuilder, WritebackValue},
     inspection::publish_inspection,
-    kind::{PlacementContext, Kind},
+    kind::{DecodedKind, Kind, PlacementContext},
 };
 
 /// The evaluated-config placeholder: definitions author the shape and the
@@ -32,31 +32,6 @@ fn test_config_value() -> LocatedValue {
 #[derive(Debug)]
 struct TestKind;
 
-impl Kind for TestKind {
-    fn name(&self) -> &'static str {
-        "TestKind"
-    }
-
-    fn validate_input(&self) -> Result<(), KindError> {
-        Ok(())
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        &["value"]
-    }
-
-    fn desired_manifest(&self, _placement: &PlacementContext) -> serde_json::Value {
-        serde_json::Value::Null
-    }
-
-    fn realize(
-        &self,
-        _placement: &PlacementContext,
-    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
-        Err(KindError::new("test kind is not executed"))
-    }
-}
-
 #[derive(Debug)]
 struct ValidationProbeKind {
     valid: bool,
@@ -66,46 +41,21 @@ struct ValidationProbeKind {
     placements: Arc<Mutex<Vec<PlacementContext>>>,
 }
 
-impl Kind for ValidationProbeKind {
-    fn name(&self) -> &'static str {
-        "ValidationProbe"
-    }
-
-    fn validate_input(&self) -> Result<(), KindError> {
-        self.validations.fetch_add(1, Ordering::SeqCst);
-        if self.valid {
-            Ok(())
-        } else {
-            Err(KindError::new("probe input is invalid"))
-        }
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
-        self.manifests.fetch_add(1, Ordering::SeqCst);
-        serde_json::json!({
-            "deployment": placement.deployment_id,
-            "module": placement.module,
-            "logical_id": placement.logical_id,
-        })
-    }
-
-    fn realize(
-        &self,
-        placement: &PlacementContext,
-    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
+impl Kind<ProbeResource> for ValidationProbeKind {
+    fn realize(&self, placement: &PlacementContext) -> Result<ProbeResource, KindError> {
         self.realizations.fetch_add(1, Ordering::SeqCst);
         self.placements
             .lock()
             .expect("placement capture mutex")
             .push(placement.clone());
-        Ok(Box::new(ProbeResource {
+        Ok(ProbeResource {
             id: tokeira_iac::ResourceId(format!("{}/{}", placement.module, placement.logical_id)),
             module: placement.module.clone(),
-        }))
+            valid: self.valid,
+            validations: Arc::clone(&self.validations),
+            manifests: Arc::clone(&self.manifests),
+            placement: placement.clone(),
+        })
     }
 }
 
@@ -113,6 +63,10 @@ impl Kind for ValidationProbeKind {
 struct ProbeResource {
     id: tokeira_iac::ResourceId,
     module: String,
+    valid: bool,
+    validations: Arc<AtomicUsize>,
+    manifests: Arc<AtomicUsize>,
+    placement: PlacementContext,
 }
 
 impl tokeira_iac::Resource for ProbeResource {
@@ -124,6 +78,24 @@ impl tokeira_iac::Resource for ProbeResource {
     }
     fn resource_type(&self) -> tokeira_iac::ResourceType {
         tokeira_iac::ResourceType::new("ValidationProbe")
+    }
+
+    fn validate_input(&self) -> Result<(), String> {
+        self.validations.fetch_add(1, Ordering::SeqCst);
+        if self.valid {
+            Ok(())
+        } else {
+            Err("probe input is invalid".to_string())
+        }
+    }
+
+    fn desired_manifest(&self) -> serde_json::Value {
+        self.manifests.fetch_add(1, Ordering::SeqCst);
+        serde_json::json!({
+            "deployment": self.placement.deployment_id,
+            "module": self.placement.module,
+            "logical_id": self.placement.logical_id,
+        })
     }
 
     fn resource_id(&self) -> tokeira_iac::ResourceId {
@@ -225,20 +197,23 @@ fn probe_graph(
     manifests: &Arc<AtomicUsize>,
     realizations: &Arc<AtomicUsize>,
     placements: &Arc<Mutex<Vec<PlacementContext>>>,
-) -> crate::graph::VerifiedGraph<ValidationProbeKind> {
+) -> crate::graph::VerifiedGraph<DecodedKind> {
     let mut graph = StructuralGraphBuilder::new();
     graph.add_module("module", Vec::new());
     for (index, valid) in valid.into_iter().enumerate() {
         graph.add_resource(
             "module",
             format!("resource-{index}"),
-            ValidationProbeKind {
-                valid,
-                validations: Arc::clone(validations),
-                manifests: Arc::clone(manifests),
-                realizations: Arc::clone(realizations),
-                placements: Arc::clone(placements),
-            },
+            DecodedKind::resource::<ValidationProbeKind, ProbeResource>(
+                "ValidationProbe",
+                ValidationProbeKind {
+                    valid,
+                    validations: Arc::clone(validations),
+                    manifests: Arc::clone(manifests),
+                    realizations: Arc::clone(realizations),
+                    placements: Arc::clone(placements),
+                },
+            ),
             Vec::new(),
         );
     }
@@ -247,7 +222,7 @@ fn probe_graph(
 
 #[test]
 // Feature: platform-builder-abstraction, Property 2: structural graph completion is exact.
-fn graph_preserves_declaration_order_and_checks_outputs() {
+fn graph_preserves_declaration_order_and_output_references() {
     let mut graph = StructuralGraphBuilder::new();
     graph.add_namespace("default");
     graph.add_module("state", Vec::new());
@@ -316,8 +291,8 @@ proptest! {
             ),
         };
 
-        let verified = verify_definition(&definition).expect("valid probe input");
-        prop_assert_eq!(validations.load(Ordering::SeqCst), resource_count);
+        let verified = verify_definition(&definition);
+        prop_assert_eq!(validations.load(Ordering::SeqCst), 0);
         prop_assert_eq!(manifests.load(Ordering::SeqCst), 0);
         prop_assert_eq!(realizations.load(Ordering::SeqCst), 0);
 
@@ -346,7 +321,7 @@ proptest! {
 }
 
 #[test]
-fn invalid_kind_input_never_reaches_invocation_bound_work() {
+fn invalid_resource_never_reaches_an_engine() {
     let validations = Arc::new(AtomicUsize::new(0));
     let manifests = Arc::new(AtomicUsize::new(0));
     let realizations = Arc::new(AtomicUsize::new(0));
@@ -366,17 +341,21 @@ fn invalid_kind_input_never_reaches_invocation_bound_work() {
         ),
     };
 
-    let report = verify_definition(&definition).expect_err("invalid input must fail");
-    assert_eq!(report.findings.len(), 1);
-    assert_eq!(validations.load(Ordering::SeqCst), 3);
-    assert_eq!(manifests.load(Ordering::SeqCst), 0);
-    assert_eq!(realizations.load(Ordering::SeqCst), 0);
-    assert!(
-        placements
-            .lock()
-            .expect("placement capture mutex")
-            .is_empty()
-    );
+    let verified = verify_definition(&definition);
+    let directory = tempfile::tempdir().expect("deployment directory");
+    let error = verified
+        .realize(
+            "invalid-deployment",
+            directory.path(),
+            directory.path(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect_err("invalid resource must fail realization");
+    assert_eq!(error.message, "probe input is invalid");
+    assert_eq!(validations.load(Ordering::SeqCst), 2);
+    assert_eq!(manifests.load(Ordering::SeqCst), 1);
+    assert_eq!(realizations.load(Ordering::SeqCst), 2);
+    assert_eq!(placements.lock().expect("placement capture mutex").len(), 2);
 }
 
 #[test]

@@ -98,14 +98,10 @@ pub(crate) async fn check<F: DefinitionFrontend>(
     // A failed check IS the report: catch the located error rather than
     // crashing through anyhow (which would double-print and break the
     // `--json`-stdout-purity rule). Deployment mode runs the whole pure
-    // pipeline (evaluate, verify, realize); authoring mode has no placement
-    // facts, so it evaluates and verifies the structure alone.
+    // pipeline (evaluate, realize, resource validation); authoring mode has
+    // no placement facts, so it verifies the frontend structure alone.
     let checked: Result<()> = match source {
-        Some(path) => engine.evaluate_authoring(path).and_then(|evaluated| {
-            tokeira_platform::definition::verify_definition(&evaluated)
-                .map(|_| ())
-                .map_err(anyhow::Error::from)
-        }),
+        Some(path) => engine.evaluate_authoring(path).map(|_| ()),
         None => {
             let admitted = admitted.expect("deployment-mode check admits its deployment");
             engine.execution(admitted, None).map(|_| ())

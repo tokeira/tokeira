@@ -4,8 +4,8 @@
 //! machinery — parameter substitution, content digests, the managed file
 //! tree, drift detection — are the platform's: the bundle is
 //! Tokeira-opinionated deployment description, not Docker capability, so it
-//! lives with the platform and joins the authoring vocabulary as the
-//! platform's own kind selection ([`kind_set`]). The provider contributes
+//! lives with the platform and joins its definition namespace. The Compose
+//! resource crate contributes
 //! only the fencing contract: the well-known resource identity
 //! (`tokeira_compose::config_content_resource_id`) its `Service` consumers
 //! key their `TOKEIRA_CONFIG_DIGEST` on.
@@ -39,16 +39,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokeira_iac as iac;
-use tokeira_platform::{
-    declaration::{KindSet, kind},
-    error::KindError,
-    kind::{PlacementContext, ProviderKind},
-};
+
+mod kind;
+
+pub use kind::{KINDS, NAMESPACE, ObservabilityConfiguration, decode, namespace};
 
 /// The module that owns the observability config-files resource.
 const MODULE_OBSERVABILITY: &str = "observability";
@@ -166,110 +164,10 @@ pub struct ObservabilityParams {
     pub loki_retention_hours: u32,
 }
 
-/// Authored parameters for the ordinary configuration-files resource.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ObservabilityConfiguration {
-    /// Metrics scrape host.
-    pub scrape_host: String,
-    /// Metrics scrape port.
-    pub scrape_port: u16,
-    /// Cluster label.
-    pub cluster: String,
-    /// Deployment label.
-    pub deployment: String,
-    /// Mimir remote-write endpoint.
-    pub mimir_remote_write: String,
-    /// Loki push endpoint.
-    pub loki_push: String,
-    /// Mimir HTTP port.
-    pub mimir_http_port: u16,
-    /// Loki HTTP port.
-    pub loki_http_port: u16,
-    /// Loki retention period.
-    pub retention_hours: u32,
-}
-
-impl ObservabilityConfiguration {
-    fn params(&self) -> ObservabilityParams {
-        ObservabilityParams {
-            metrics_target_host: self.scrape_host.clone(),
-            metrics_target_port: self.scrape_port,
-            cluster: self.cluster.clone(),
-            deployment: self.deployment.clone(),
-            mimir_remote_write_url: self.mimir_remote_write.clone(),
-            loki_push_url: self.loki_push.clone(),
-            mimir_http_port: self.mimir_http_port,
-            loki_http_port: self.loki_http_port,
-            loki_retention_hours: self.retention_hours,
-        }
-    }
-}
-
-impl ProviderKind for ObservabilityConfiguration {
-    fn kind_name(&self) -> &'static str {
-        ObservabilityConfigFilesResource::TYPE
-    }
-
-    /// Parameter validation only — pure, no filesystem. Content problems
-    /// (missing files, unknown placeholders) surface where the content is
-    /// read: the manifest, the diff, and — refusing loudly — create.
-    fn validate_input(&self) -> Result<(), KindError> {
-        validate_params(&self.params()).map_err(|error| KindError::new(error.to_string()))
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    /// The desired file set with content digests, when the companion content
-    /// loads and renders; otherwise the manifest states the problem — the
-    /// definition said this deployment carries observability content, so
-    /// absence is a visible condition, never an empty success.
-    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
-        match desired_files(&placement.definition_dir, &self.params()) {
-            Ok(files) => {
-                let files = files
-                    .iter()
-                    .map(|file| {
-                        (
-                            path_key(&file.relative_path),
-                            file_property(file.contents.as_bytes()),
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                json!({ "files": files })
-            }
-            Err(error) => json!({ "files": {}, "content_error": error.to_string() }),
-        }
-    }
-
-    fn realize(&self, placement: &PlacementContext) -> Result<Box<dyn iac::Resource>, KindError> {
-        self.validate_input()?;
-        Ok(Box::new(ObservabilityConfigFilesResource::new(
-            placement.deployment_dir.clone(),
-            placement.definition_dir.clone(),
-            self.params(),
-        )))
-    }
-}
-
 /// Engine identity of the rendered-configuration resource — the provider's
 /// fencing contract, implemented here.
 pub fn configuration_resource_id() -> iac::ResourceId {
     tokeira_compose::config_content_resource_id()
-}
-
-/// The platform's own kind selection: the observability configuration
-/// bundle, contributed to the authoring vocabulary at the entry point
-/// under the word its resource owns.
-pub fn kind_set() -> KindSet {
-    KindSet::new(
-        "compose-platform",
-        vec![kind::<ObservabilityConfiguration>(
-            ObservabilityConfigFilesResource::TYPE,
-        )],
-    )
 }
 
 impl ObservabilityParams {
@@ -630,6 +528,28 @@ impl ObservabilityConfigFilesResource {
 impl iac::Resource for ObservabilityConfigFilesResource {
     fn resource_type(&self) -> iac::ResourceType {
         iac::ResourceType::new(Self::TYPE)
+    }
+
+    fn validate_input(&self) -> Result<(), String> {
+        validate_params(&self.params).map_err(|error| error.to_string())
+    }
+
+    fn desired_manifest(&self) -> serde_json::Value {
+        match self.desired_files() {
+            Ok(files) => {
+                let files = files
+                    .iter()
+                    .map(|file| {
+                        (
+                            path_key(&file.relative_path),
+                            file_property(file.contents.as_bytes()),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                json!({ "files": files })
+            }
+            Err(error) => json!({ "files": {}, "content_error": error.to_string() }),
+        }
     }
 
     fn resource_id(&self) -> iac::ResourceId {

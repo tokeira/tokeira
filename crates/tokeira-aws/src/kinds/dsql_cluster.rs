@@ -28,59 +28,9 @@ pub struct DsqlCluster {
     pub arn: Option<String>,
 }
 
-impl DsqlCluster {
-    fn validate(&self) -> Result<(), KindError> {
-        if self.identity.is_empty() {
-            return Err(KindError::new("DSQL cluster identity cannot be empty"));
-        }
-        if self.region.is_empty() {
-            return Err(KindError::new("DSQL cluster region cannot be empty"));
-        }
-        match self.mode {
-            DsqlClusterMode::Managed if self.endpoint.is_some() || self.arn.is_some() => Err(
-                KindError::new("managed DSQL clusters cannot declare an endpoint or ARN"),
-            ),
-            DsqlClusterMode::Preexisting if self.endpoint.is_none() || self.arn.is_none() => Err(
-                KindError::new("preexisting DSQL clusters require both endpoint and ARN"),
-            ),
-            _ => Ok(()),
-        }
-    }
-}
-
-impl Kind for DsqlCluster {
-    fn name(&self) -> &'static str {
-        Resource::TYPE
-    }
-
-    fn validate_input(&self) -> Result<(), KindError> {
-        self.validate()
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        &["cluster_endpoint", "cluster_arn"]
-    }
-
-    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
-        serde_json::json!({
-            "identity": self.identity,
-            "region": self.region,
-            "mode": match self.mode {
-                DsqlClusterMode::Managed => "managed",
-                DsqlClusterMode::Preexisting => "preexisting",
-            },
-            "endpoint": self.endpoint,
-            "arn": self.arn,
-            "module": placement.module,
-        })
-    }
-
-    fn realize(
-        &self,
-        placement: &PlacementContext,
-    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
-        self.validate()?;
-        Ok(Box::new(Resource {
+impl Kind<Resource> for DsqlCluster {
+    fn realize(&self, placement: &PlacementContext) -> Result<Resource, KindError> {
+        Ok(Resource {
             identity: self.identity.clone(),
             region: self.region.clone(),
             mode: self.mode,
@@ -91,6 +41,6 @@ impl Kind for DsqlCluster {
             module: placement.module.clone(),
             project: placement.deployment_id.clone(),
             tags: placement.tags.clone().into_iter().collect(),
-        }))
+        })
     }
 }

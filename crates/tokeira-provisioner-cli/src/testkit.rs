@@ -2,12 +2,12 @@
 //! fixture, and an admitted temp deployment — everything a verb test needs
 //! to drive the real engine over a minimal evaluable world.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_platform::{
     author::{LocatedValue, ValueShape},
-    declaration::{DeploymentRef, KindSet, PlatformDeclaration, ProviderExecution, ProviderExport},
+    declaration::{DeploymentRef, PlatformDeclaration, PlatformExecution, PlatformIntegration},
     definition::{DefinitionFrontend, FrontendOutput, FrontendSource},
     error::FrontendDiagnostic,
     graph::StructuralGraphBuilder,
@@ -19,9 +19,9 @@ use crate::{
     platform::{Admitted, BoundPlatform},
 };
 
-/// A frontend whose evaluation is canned: unit config, one empty
-/// dependency-free module (the bootstrap the execution state requires).
-/// Retarget refuses when constructed refusing — the gate tests' fixture.
+/// A frontend whose evaluation is canned: one empty dependency-free module
+/// (the bootstrap the execution state requires). Retarget refuses when
+/// constructed refusing — the gate tests' fixture.
 #[derive(Clone)]
 pub(crate) struct StubFrontend {
     format: DefinitionFormatId,
@@ -53,16 +53,13 @@ impl DefinitionFrontend for StubFrontend {
         &self,
         _source: FrontendSource<'_>,
         _context: &C,
-        _vocabulary: &tokeira_platform::declaration::Vocabulary,
+        _namespaces: &[tokeira_platform::definition::Namespace],
         _parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> std::result::Result<FrontendOutput, FrontendDiagnostic> {
         let mut graph = StructuralGraphBuilder::<DecodedKind>::new();
         graph.add_module("state", Vec::new());
         Ok(FrontendOutput {
-            config: LocatedValue {
-                value: ValueShape::Unit,
-                range: None,
-            },
+            config: LocatedValue::new(ValueShape::Unit),
             graph: graph.finish().expect("the one-module graph verifies"),
         })
     }
@@ -72,7 +69,7 @@ impl DefinitionFrontend for StubFrontend {
         _prior: FrontendSource<'_>,
         _current: FrontendSource<'_>,
         _context: &C,
-        _vocabulary: &tokeira_platform::declaration::Vocabulary,
+        _namespaces: &[tokeira_platform::definition::Namespace],
         _prior_parts: &dyn tokeira_platform::definition::SourceResolver,
         _current_parts: &dyn tokeira_platform::definition::SourceResolver,
     ) -> std::result::Result<(), Vec<String>> {
@@ -90,12 +87,64 @@ impl DefinitionFrontend for StubFrontend {
 pub(crate) struct FixedProbe(pub(crate) Option<tokeira_iac::PlatformIssue>);
 
 #[async_trait::async_trait]
-impl ProviderExecution for FixedProbe {
+impl PlatformExecution for FixedProbe {
     async fn probe(
         &self,
         _deployment: &DeploymentRef,
     ) -> anyhow::Result<Option<tokeira_iac::PlatformIssue>> {
         Ok(self.0.clone())
+    }
+}
+
+/// Platform implementation for definition-driven framework tests: no shared
+/// extensions, and an applier that accepts exactly the manifests supplied.
+#[derive(Debug)]
+pub(crate) struct TestIntegration;
+
+#[async_trait::async_trait]
+impl PlatformIntegration for TestIntegration {
+    async fn register_infra_extensions(
+        &self,
+        _deployment: &DeploymentRef,
+        _ctx: &mut tokeira_iac::ProvisionContext,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn register_deploy_extensions(
+        &self,
+        _deployment: &DeploymentRef,
+        _ctx: &mut tokeira_deploy_engine::ServiceContext,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn register_image_extensions(
+        &self,
+        _deployment: &DeploymentRef,
+        _ctx: &mut tokeira_deploy_engine::ImageContext,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn service_platform(
+        &self,
+        _deployment: &DeploymentRef,
+    ) -> anyhow::Result<Box<dyn tokeira_deploy_engine::Platform>> {
+        Ok(Box::new(TestServicePlatform))
+    }
+}
+
+#[derive(Debug)]
+struct TestServicePlatform;
+
+#[async_trait::async_trait]
+impl tokeira_deploy_engine::Platform for TestServicePlatform {
+    async fn apply_manifests(
+        &self,
+        manifests: &[serde_json::Value],
+    ) -> std::result::Result<usize, tokeira_deploy_engine::RuntimeError> {
+        Ok(manifests.len())
     }
 }
 
@@ -111,12 +160,12 @@ pub(crate) fn unreachable_issue() -> tokeira_iac::PlatformIssue {
 }
 
 fn declaration(probe: FixedProbe) -> PlatformDeclaration {
-    PlatformDeclaration::on(ProviderExport {
-        kinds: KindSet::new("test", Vec::new()),
+    PlatformDeclaration {
+        namespaces: Vec::new(),
         ops: None,
         execution: Box::new(probe),
-        infra: None,
-    })
+        implementation: Arc::new(TestIntegration),
+    }
 }
 
 /// Write the minimal admissible deployment into `dir`: binding metadata plus

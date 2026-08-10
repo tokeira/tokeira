@@ -11,9 +11,8 @@ pub mod dynamodb_table;
 
 use tokeira_platform::{
     author::LocatedValue,
-    declaration::{DeploymentRef, InfraConstructor},
     error::KindError,
-    kind::{self, Kind},
+    kind::{self, DecodedKind},
 };
 
 use crate::resources::{
@@ -24,40 +23,6 @@ use crate::resources::{
 pub use dsql_cluster::DsqlCluster;
 pub use dynamodb_table::DynamoDbTable;
 
-/// The AWS selection's infra-phase extension constructor: the
-/// [`AwsClients`](crate::AwsClients) bundle every AWS resource reads from
-/// the provision context.
-///
-/// The client region resolves by AWS's own precedence over its attribute
-/// levels: the deployment-level `aws` block's `region` when authored,
-/// otherwise the SDK's ambient default chain. Resource-attached regions
-/// live on the resources themselves and are not this constructor's
-/// question.
-#[derive(Debug)]
-pub struct AwsInfraConstructor;
-
-#[async_trait::async_trait]
-impl InfraConstructor for AwsInfraConstructor {
-    async fn construct(
-        &self,
-        _deployment: &DeploymentRef,
-        attributes: Option<&serde_json::Value>,
-        ctx: &mut tokeira_iac::ProvisionContext,
-    ) -> anyhow::Result<()> {
-        let region = attributes
-            .and_then(|block| block.get("region"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-        if let Some(region) = region {
-            loader = loader.region(aws_config::Region::new(region));
-        }
-        let sdk = loader.load().await;
-        ctx.set_extension(crate::AwsClients::new(&sdk));
-        Ok(())
-    }
-}
-
 /// The namespace word: the normalized crate name definitions import from.
 pub const NAMESPACE: &str = "tokeira_aws";
 
@@ -67,10 +32,18 @@ pub const KINDS: &[&str] = &[DsqlClusterResource::TYPE, DynamoDbTableResource::T
 
 /// Decode one authored kind of this namespace; `None` when the name is not
 /// ours.
-pub fn decode(name: &str, value: LocatedValue) -> Option<Result<Box<dyn Kind>, KindError>> {
+pub fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, KindError>> {
     Some(match name {
-        DsqlClusterResource::TYPE => kind::decode::<DsqlCluster>(value),
-        DynamoDbTableResource::TYPE => kind::decode::<DynamoDbTable>(value),
+        DsqlClusterResource::TYPE => kind::decode_resource::<DsqlCluster, DsqlClusterResource>(
+            DsqlClusterResource::TYPE,
+            value,
+        ),
+        DynamoDbTableResource::TYPE => {
+            kind::decode_resource::<DynamoDbTable, DynamoDbTableResource>(
+                DynamoDbTableResource::TYPE,
+                value,
+            )
+        }
         _ => return None,
     })
 }

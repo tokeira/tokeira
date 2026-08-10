@@ -33,9 +33,9 @@ and the retarget gate compares sets.
   source-set formalization; `platform-source-set/requirements.md` is the
   pointer.
 - **Non-goals**: the tkdp vocabulary split (`tokeira_platform` /
-  `tokeira_provisioner` / provider modules as import targets); the service
-  plane's realization (deploy verbs exist and are fail-closed until service
-  nodes fill); any change to Temporal-facing behaviour.
+  `tokeira_provisioner` / provider modules as import targets); service image
+  construction (the current Compose services use authored image references);
+  any change to Temporal-facing behaviour.
 
 ## Architecture
 
@@ -49,11 +49,14 @@ frontend.
 
 Run time: every verb follows one path. The shell admits once per command
 (`Admitted`: verified metadata plus deployment identity), the engine
-evaluates the recorded definition through the frontend against the composed
-vocabulary — resolving parts beside the interpreted document — verifies
-structurally, realizes kinds into resources, and drives the existing
-`InfraEngine` with the framework-owned `DescribedDeployment`. Ops verbs
-exist exactly when the provider export carries an ops surface.
+evaluates the recorded definition through the frontend against the declared
+authoring namespaces — resolving parts beside the interpreted document —
+verifies structurally, and realizes each kind into exactly one infrastructure
+resource or deploy service. `DescribedDeployment` supplies those separate
+planes to `InfraEngine` and `DeployEngine`. The operator orders them: infra
+apply records `InfraState`; a later deploy plan/apply loads that state into
+`ServiceContext`. Ops verbs exist exactly when the declaration carries an
+ops surface.
 
 ```mermaid
 flowchart TD
@@ -64,28 +67,34 @@ flowchart TD
     end
     subgraph decl["Platform: description"]
         ENTRY["platform() -> PlatformDeclaration"]
-        PROV["tokeira_compose::provider()<br/>kinds + ops + probe + infra"]
-        OWN["observability::kind_set()"]
-        AWS["tokeira_aws::kinds::select(<br/>kind::&lt;DsqlCluster&gt;(), …)"]
-        ENTRY --> PROV
+        COMPOSE["tokeira_compose::namespace()"]
+        OWN["observability::namespace()"]
+        AWS["tokeira_aws namespace"]
+        CAP["ops + probe + ComposeIntegration"]
+        ENTRY --> COMPOSE
         ENTRY --> OWN
         ENTRY --> AWS
+        ENTRY --> CAP
     end
     subgraph fw["Framework: tokeira-provisioner-cli + engine crates"]
         ADMIT["Admitted<br/>once per command"]
-        VOC["Vocabulary<br/>union + collision check"]
+        BIND["BoundPlatform<br/>namespace collision check"]
         EVAL["evaluate + verify + realize<br/>parts via SourceResolver"]
+        SPLIT["RealizedResource<br/>Infra | Service"]
         DEP["DescribedDeployment"]
-        ENG["InfraEngine<br/>plan / apply / destroy"]
+        INFRA["InfraEngine<br/>plan / apply / destroy"]
+        DEPLOY["DeployEngine<br/>plan / apply"]
         OPS["ops verbs<br/>logs / port-mappings / scale"]
     end
     MAIN --> ADMIT
-    ENTRY --> VOC
+    ENTRY --> BIND
     ADMIT --> EVAL
-    VOC --> EVAL
-    EVAL --> DEP
-    DEP --> ENG
-    PROV -.->|Option&lt;Ops&gt;| OPS
+    BIND --> EVAL
+    EVAL --> SPLIT
+    SPLIT --> DEP
+    DEP --> INFRA
+    DEP --> DEPLOY
+    CAP -.->|Option&lt;Ops&gt;| OPS
     STAGE -.->|definition set + companions| EVAL
 ```
 
@@ -93,74 +102,98 @@ flowchart TD
 
 ### 1. Platform declaration (`tokeira-platform::declaration`)
 
-The framework defines what it consumes; the platform names values.
+The framework defines what it consumes; the platform integrates values
+owned by its implementation and resource crates.
 
 ```rust
-pub struct PlatformDeclaration { /* provider + selections */ }
-impl PlatformDeclaration {
-    pub fn on(provider: ProviderExport) -> Self;
-    pub fn kinds(self, selection: KindSet) -> Self;
-    pub fn vocabulary(&self) -> Result<Vocabulary, CompositionError>;
+pub struct PlatformDeclaration {
+    pub namespaces: Vec<Namespace>,
+    pub ops: Option<Box<dyn Ops>>,
+    pub execution: Box<dyn PlatformExecution>,
+    pub implementation: Arc<dyn PlatformIntegration>,
 }
 
-pub struct ProviderExport {
-    pub kinds: KindSet,
-    pub ops: Option<Box<dyn Ops>>,
-    pub execution: Box<dyn ProviderExecution>,
-    pub infra: Option<Arc<dyn InfraConstructor>>,
+pub struct Namespace {
+    pub name: &'static str,
+    pub kinds: &'static [&'static str],
+    pub defaults: Option<fn(&str) -> Option<LocatedValue>>,
+    pub decode: fn(&str, LocatedValue)
+        -> Option<Result<DecodedKind, KindError>>,
 }
 ```
 
-Kind selection is typed: `kind::<K>(name)` builds a `KindEntry` for the
-kind type under the one word its resource owns — the selection site passes
-the resource's `TYPE` const (author-visible kind name and engine resource
-type are the same word, stated once on the resource), so a selection typo
-is a compile error. A `KindSet` may carry its own `InfraConstructor`
-(`.infra(constructor)`), the registration ingredient for that selection's
-provider handles.
+`Namespace` is authoring-only. It introduces normalized crate and kind names
+to a frontend and decodes authored values; it has no engine, lifecycle,
+extension callback, or provider constructor. The platform declaration owns
+operational integration separately.
 
 The Compose entry point (`platforms/compose/src/lib.rs:71`):
 
 ```rust
 pub fn platform() -> PlatformDeclaration {
-    PlatformDeclaration::on(tokeira_compose::provider())
-        .kinds(observability::kind_set())
-        .kinds(tokeira_aws::kinds::select(vec![
-            kind::<DsqlCluster>(resources::dsql_cluster::DsqlCluster::TYPE),
-            kind::<DynamoDbTable>(resources::dynamodb_table::DynamoDbTable::TYPE),
-        ]))
+    PlatformDeclaration {
+        namespaces: vec![
+            tokeira_compose::namespace(),
+            observability::namespace(),
+            Namespace { /* tokeira_aws authoring facts */ },
+        ],
+        ops: Some(Box::new(tokeira_compose::ops::DockerOps)),
+        execution: Box::new(tokeira_compose::execution::ComposeExecution),
+        implementation: Arc::new(
+            tokeira_compose::execution::ComposeIntegration,
+        ),
+    }
 }
 ```
 
-Construction is pure. The typed `select` is chosen over provider-tracking
-`all()`: the vocabulary states its intent and grows only on purpose — a
-definition adopting a new AWS kind names its type here in the same change.
+Construction is pure. Namespace inclusion is explicit: a definition may use
+only the kinds introduced by the three namespaces named here.
 
-### 2. Vocabulary composition
+### 2. Namespace binding and typed realization
 
-`Vocabulary::of(kind_sets)` unions the declared sets and refuses a colliding
-kind name, naming both providers. It supplies the frontend contract (names,
-contains, defaults, decode). A kind outside the union is an unknown-kind
-error located at the authoring site; no "known but unwired" state exists and
-no global kind inventory exists anywhere in the engine.
+`BoundPlatform::bind` validates the declared namespaces once. Every advertised
+kind must be accepted by its namespace decoder, and duplicate kind names fail
+binding while naming both namespaces and the collision. Frontends receive the
+namespaces directly. A kind outside them is an unknown-kind error located at
+the authoring site; no "known but unwired" state and no global kind inventory
+exist.
 
-### 3. Providers and platform-owned kinds
+```rust
+pub trait Kind<R>: Debug + Send + Sync {
+    fn realize(&self, placement: &PlacementContext) -> Result<R, KindError>;
+}
 
-- `tokeira_compose::provider() -> ProviderExport` — the compose kind library
-  (`Service`, `LocalStateDir`, `ServerConfig`), `DockerOps` (component 5),
-  the reachability probe, and `ComposeInfraConstructor`, which connects
-  `ComposePlatform` (compose-file ledger under the framework-owned `state/`)
-  and registers the resource-recovery hook at operation start.
+pub enum RealizedResource {
+    Infra(Box<dyn tokeira_iac::Resource>),
+    Service(Box<dyn tokeira_deploy_engine::Service>),
+}
+```
+
+`Kind<R>` ends after construction. `R` owns type identity, validation,
+declared outputs, desired representation, and its engine lifecycle or
+manifest behaviour. `DecodedKind` is only the heterogeneous graph-storage
+boundary; the `R: Resource` or `R: Service` bound assigns the realized value
+to its single engine owner.
+
+### 3. Resource libraries and platform-owned kinds
+
+- `tokeira_compose::namespace()` — the Compose kind library (`Service`,
+  `LocalStateDir`, `ServerConfig`) as frontend facts. `DockerOps`,
+  `ComposeExecution`, and `ComposeIntegration` are selected separately by
+  the platform definition.
 - `platforms/compose/src/observability.rs` — the platform's own kind:
   `ObservabilityConfiguration` renders the companion content; contributed to
-  the vocabulary via `observability::kind_set()`. The provider keeps only
+  the frontend via `observability::namespace()`. The implementation keeps only
   the fencing contract (`config_content_resource_id`) its `Service`
   consumers key on.
-- `tokeira_aws::kinds` — `DsqlCluster`, `DynamoDbTable`, selected by type.
-  `AwsInfraConstructor` (attached to the selection) builds the SDK clients:
-  region from the selection's `aws` block in the evaluated configuration
-  when present, the ambient SDK chain otherwise — the provider owns its
-  precedence rule over its own namespace block.
+- `tokeira_aws::kinds` — the AWS authoring namespace, including
+  `DsqlCluster` and `DynamoDbTable`. Its presence in `PlatformDeclaration` is
+  the AWS-first framework's activation signal. At operation initialization,
+  the framework loads one deployment-scoped `AwsClients` bundle. Region
+  precedence is ambient SDK provider chain, then the definition-authored
+  platform default `aws.region`, then the concrete resource's selected
+  region. A regional service client is derived when that resource performs
+  a lifecycle operation; provisioning volume does not justify a client cache.
 
 ### 4. Admission, engine, and the described deployment (`tokeira-provisioner-cli`)
 
@@ -181,17 +214,16 @@ record — and refuses apply and destroy.
 
 `DescribedDeployment` is the one `orchestrator::Deployment` on the bound
 path: bootstrap nominated by shape (the unique dependency-free module),
-modules and namespaces from the verified graph, infra extensions constructed
-by running each declared selection's `InfraConstructor` with that
-selection's namespace attributes, and writeback collected from declared
-entries against recorded outputs. Resolved writeback **persists** into the
-deployment's server configuration document before recorded state re-stamps —
-at apply, upgrade, revert, and rollback.
+infrastructure modules and services from the realized graph, required
+deployment namespaces, extension registration, images, and writeback.
+Resolved writeback **persists** into the deployment's server configuration
+document before recorded state re-stamps — at apply, upgrade, revert, and
+rollback.
 
-The deploy verbs ride the real deploy engine over the definition's service
-plane. The plane is empty until service nodes exist, and the applier is
-fail-closed (`NoWorkloadApplier`): a non-empty reconciliation refuses rather
-than pretending.
+The deploy verbs ride the real deploy engine over the definition's realized
+services. `ComposeIntegration::service_platform` constructs the
+deployment-scoped `ComposePlatform`, which reconciles their manifests against
+Docker. Infra apply and deploy apply remain separate operator commands.
 
 ### 5. Ops (`tokeira-platform` trait, `tokeira-compose` impl)
 
@@ -203,7 +235,7 @@ pub trait Ops: Send + Sync + fmt::Debug {
     async fn port_mappings(&self, deployment: &DeploymentRef, service: &str)
                         -> Result<Vec<PortMapping>>;
     /// Required, deliberately undefaulted: an ops surface answers every one
-    /// of its verbs in its own words — a provider without a scale dimension
+    /// of its verbs in its own words — a platform without a scale dimension
     /// states its own refusal as the error.
     async fn scale(&self, deployment: &DeploymentRef, specs: &[String])
                         -> Result<usize>;
@@ -214,22 +246,26 @@ pub trait Ops: Send + Sync + fmt::Debug {
 compose service scaling. The framework validates service names against the
 evaluated definition before calling down, refuses unknown names listing the
 actual services, and re-stamps recorded state after a scale. The CLI mounts
-`logs` / `port-mappings` / `scale` iff the export carries ops — capability
+`logs` / `port-mappings` / `scale` iff the declaration carries ops — capability
 by presence, no stub answers.
 
-### 6. Execution probe and infra constructors
+### 6. Execution probe and platform integration
 
-`ProviderExecution::probe(deployment)` answers reachability as data:
+`PlatformExecution::probe(deployment)` answers reachability as data:
 `Ok(None)` reachable, `Ok(Some(issue))` the degradable answer (blocked plan;
 refused apply/destroy), `Err` a non-provider failure. A passing probe is a
 point-in-time answer, not a guarantee; failures after it surface through the
 operation's own error path carrying the same platform-issue evidence.
 
-Registration happens through the deployment's unchanged seam and nowhere
-else: `register_infra_extensions` runs each declared selection's
-`InfraConstructor` with the selection's namespace block from the evaluated
-configuration; constructors put handles into the context, and resources read
-them via `ctx.extension::<T>()` at the mechanics moment.
+Registration happens through the deployment's existing engine seams and
+nowhere else. For infrastructure, `DescribedDeployment` installs standard
+framework extensions first (AWS only when the declaration includes its
+namespace), then delegates additional handles to
+`PlatformIntegration::register_infra_extensions`. Deploy and image contexts
+delegate through their corresponding methods. The integration receives
+deployment identity and the engine context, never authoring namespace
+metadata or the evaluated configuration. Resources and services read typed
+handles via `ctx.extension::<T>()` at the mechanics moment.
 
 ### 7. Observability content
 
@@ -323,12 +359,13 @@ it.
 
 ## Data Models
 
-- **`PlatformDeclaration` / `ProviderExport` / `KindSet` / `KindEntry`** —
-  in `tokeira-platform::declaration`; constructed by platform and provider
-  code; plain data plus three behaviour objects (`Ops`,
-  `ProviderExecution`, `InfraConstructor`). Not serialized.
-- **`Vocabulary`** — name → (provider, entry) map; collision-checked at
-  construction.
+- **`PlatformDeclaration`** — the platform's authoring namespaces, optional
+  `Ops`, `PlatformExecution`, and `PlatformIntegration`; constructed by the
+  platform entry point and not serialized.
+- **`Namespace`** — normalized crate name, advertised kind names, optional
+  authoring defaults, and decoder. Frontend-only and not serialized.
+- **`DecodedKind` / `RealizedResource`** — the temporary heterogeneous
+  storage boundary and its single-owner `Infra` / `Service` hand-off.
 - **`Admitted`** — verified deployment metadata plus `DeploymentRef`;
   produced once per command.
 - **Deployment metadata** (`metadata.json`) — unchanged:
@@ -343,32 +380,33 @@ it.
   in first-request order.
 - **Evaluated configuration** — a `LocatedValue` held by the framework for
   the duration of an operation; never decoded into platform types (none
-  exist).
+  exist). When AWS is declared, the framework projects only the standard
+  optional `aws.region` default needed to construct its execution context.
 
 ## Correctness Properties
 
-Property 1: Vocabulary is exactly the declaration.
-*For any* provider kind set S and selections A with disjoint names, the
-composed vocabulary contains exactly S ∪ A: every name decodes, and
-`contains` is false outside it.
-**Validates: Requirements 3.1, 3.2, 3.5**
+Property 1: Frontend kinds are exactly the declaration.
+*For any* declaration with internally consistent, disjoint namespaces, the
+frontend admits exactly the advertised kind names through their owning
+namespace decoders and treats every other name as unknown.
+**Validates: Requirements 3.1, 3.2, 3.4, 3.5, 3.10**
 
-Property 2: Colliding kind names refuse composition.
-*For any* two kind sets whose name sets intersect, composition fails naming
-the colliding name and both providers.
-**Validates: Requirements 3.4**
+Property 2: Colliding kind names refuse binding.
+*For any* two declared namespaces whose kind-name sets intersect, platform
+binding fails naming the colliding name and both namespaces.
+**Validates: Requirements 3.6**
 
 Property 3: Unknown kinds are located authoring errors.
-*For any* definition naming a kind outside the composed vocabulary,
+*For any* definition naming a kind outside the declared namespaces,
 `definition check` refuses with an unknown-kind error carrying the authoring
-source location, and no provider or filesystem access occurs.
-**Validates: Requirements 3.3, 9.3**
+source location, and no platform substrate access occurs.
+**Validates: Requirements 3.10, 9.3**
 
 Property 4: Declaration construction is pure.
 *For any* invocation of the Compose entry point, no filesystem, network, or
 Docker access occurs, and the returned declaration is structurally equal
 across invocations.
-**Validates: Requirements 1.2, 1.5**
+**Validates: Requirements 1.2, 1.3**
 
 Property 5: Kind input validation refuses invalid inputs with located
 errors.
@@ -376,7 +414,7 @@ errors.
 published port, and *for any* `DsqlCluster` input violating the
 managed/preexisting field rules or with an empty region, validation refuses
 locating the authoring site; *for any* valid input it admits.
-**Validates: Requirements 2.3, 2.4, 2.5**
+**Validates: Requirements 2.4, 2.5**
 
 Property 6: Storage modes preserve the reference graph shape.
 *For any* of the three storage modes applied to the reference definition,
@@ -389,14 +427,14 @@ Property 7: Content edits move every consumer's digest.
 *For any* byte change to observability content or rendering parameter, the
 configuration content digest fencing each consumer differs from the pre-edit
 digest; absent any change, digests are identical across realizations.
-**Validates: Requirements 5.5, 9.2**
+**Validates: Requirements 5.7, 9.2**
 
 Property 8: Companion resolution follows the definition source.
 *For any* retained revision folder holding a definition set plus companions,
 a baseline realization from that folder digests the retained bytes — parts
 included — and a live-tree realization digests the live bytes,
 independently.
-**Validates: Requirements 5.4, 11.4**
+**Validates: Requirements 5.6, 11.7**
 
 Property 9: Definition check is pure.
 *For any* definition source (valid or refused), `definition check` leaves
@@ -407,7 +445,7 @@ Property 10: Inspection is deterministic and non-authoritative.
 *For any* execution, rendering the compose projection twice yields identical
 bytes; editing the published `docker-compose.yml` and re-evaluating yields
 manifests identical to the pre-edit evaluation.
-**Validates: Requirements 9.4**
+**Validates: Requirements 9.4, 9.5**
 
 Property 11: Selection directions are prerequisite-on-apply,
 dependant-on-destroy.
@@ -415,7 +453,7 @@ dependant-on-destroy.
 exactly its transitive prerequisites, and destroy selection exactly its
 transitive dependants; unknown module names are refused listing the graph's
 modules.
-**Validates: Requirements 9.5**
+**Validates: Requirements 9.6, 9.7**
 
 Property 12: Writeback resolves and persists.
 *For any* DSQL-mode execution with applied outputs, resolved writeback pairs
@@ -423,60 +461,77 @@ are exactly the declared entries with literals passed through and output
 references resolved from recorded state, persisted into the server
 configuration document before the envelope re-stamp; entries whose outputs
 are unavailable resolve to nothing rather than partial pairs.
-**Validates: Requirements 6.6, 9.6**
+**Validates: Requirements 6.11, 9.8, 9.9**
 
 Property 13: Ops verbs exist by presence.
-*For any* declaration whose provider carries ops, the CLI mounts `logs`,
+*For any* declaration that carries ops, the CLI mounts `logs`,
 `port-mappings`, and `scale`; *for any* declaration without, those verbs are
 absent from the CLI surface entirely — parsing, help, and dispatch.
-**Validates: Requirements 4.1, 4.2, 8.1**
+**Validates: Requirements 4.1, 4.2, 4.3, 4.4**
 
 Property 14: Service names are validated against the evaluated definition.
 *For any* evaluated definition and any service name, an ops verb proceeds
 iff the name is one of the definition's services; refusals list exactly the
 definition's service set.
-**Validates: Requirements 4.3, 4.5**
+**Validates: Requirements 4.5, 4.6**
 
 Property 15: The bound pair is enforced at admission.
 *For any* deployment metadata whose `{ platform, format }` differs from the
 pair a bound tkp was built as, every verb refuses at admission; matching
 pairs proceed.
-**Validates: Requirements 6.1, 7.3**
+**Validates: Requirements 6.1, 6.2**
 
 Property 16: A root and its parts build one graph, in both frontends.
 *For any* root declaring a part that declares modules and resources, the
 evaluated graph equals the single-document equivalent: the part's modules
-appear with their dependencies, kinds decode through the same vocabulary,
+appear with their dependencies, kinds decode through the same namespaces,
 and (`.tkdp`) class identities match across the boundary.
-**Validates: Requirements 10.1, 10.2, 10.3**
+**Validates: Requirements 10.1, 10.3, 10.4**
 
 Property 17: Part boundary rules refuse by name.
 *For any* source violating a part rule — inline body, nested part, private
 call, shadowed type (`.tkd`); dotted import, shadowed plain import, part
 preflight failure, import cycle (`.tkdp`) — evaluation refuses with the
 named-gap message, and part-file failures carry the part's file name.
-**Validates: Requirements 10.5**
+**Validates: Requirements 10.7**
 
 Property 18: The definition-set identity is order-stable and byte-exact.
 *For any* definition set, the `sha256-set-v1` identity is a pure function of
 the root bytes and the served parts' names and bytes in first-request order;
 a single-document definition's identity is byte-stable against the pinned
 regression value.
-**Validates: Requirements 10.6**
+**Validates: Requirements 10.8**
 
 Property 19: Revisions round-trip the definition set.
 *For any* retained revision, the revision folder holds the root, the sibling
 part files, and the sidecar listing them; restore returns root and parts to
 their retained bytes, and the retarget gate evaluated against the retained
 folder sees the retained set.
-**Validates: Requirements 11.1, 11.2, 11.3**
+**Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
+
+Property 20: Realization preserves single engine ownership and operator
+ordering.
+*For any* verified definition, every realized infrastructure resource appears
+only in `DescribedDeployment::infra_modules`, every realized service appears
+only in `DescribedDeployment::services`, infra apply never deploys services,
+and a later deploy operation receives the recorded `InfraState` through its
+`ServiceContext`.
+**Validates: Requirements 3.8, 3.9, 6.12, 6.13, 6.14, 6.15**
+
+Property 21: AWS context registration and region precedence are stable.
+*For any* declared platform and AWS resource, AWS namespace presence registers
+exactly one deployment-scoped client bundle before platform-specific
+extensions; the platform region resolves from the SDK provider chain and then
+the authored platform default, and the resource-selected region takes final
+precedence.
+**Validates: Requirements 6.16, 6.17, 6.18**
 
 ## Error Handling
 
 | Condition | Internal | Operator surface |
 |---|---|---|
-| Definition names an unknown kind | located `KindError` from `Vocabulary::decode` | `definition check` refusal with source location |
-| Two selections export one kind name | `CompositionError` at composition | bound tkp startup failure naming both providers and the name |
+| Definition names an unknown kind | located `KindError` from declared namespace resolution | `definition check` refusal with source location |
+| Two namespaces advertise one kind name | binding validation error | bound tkp startup failure naming both namespaces and the kind |
 | Invalid `Service` / `DsqlCluster` input | located `KindError` from `validate_input` | check/plan refusal at the authoring site |
 | Provider unreachable at plan | `PlatformIssue` from the probe | plan is blocked: it plans nothing and the issue is the outcome's only content |
 | Provider unreachable at apply/destroy | hard error wrapping the issue evidence | operation refuses with fact + verbatim evidence + direction |
@@ -492,11 +547,13 @@ folder sees the retained set.
 
 ## Testing Strategy
 
-- **Framework and seam suites**: declaration/vocabulary and part-seam tests
-  in `tokeira-platform` (including the `sha256-set-v1` byte-stability
+- **Framework and seam suites**: declaration/namespace binding, typed
+  realization, and part-seam tests in `tokeira-platform` (including the
+  `sha256-set-v1` byte-stability
   regression pin); the shell and engine suites in `tokeira-provisioner-cli`
   (admission, verbs, writeback persistence, `config_history` set
-  retention/restore) over the `testkit` stub frontend.
+  retention/restore, standard AWS registration, and infra/service hand-off)
+  over the `testkit` stub frontend.
 - **Frontend part suites**: `crates/tokeira-tkd/tests/parts.rs` (the `mod`
   mechanism end to end, boundary refusals, directory resolution, the
   set-comparing retarget gate) and `crates/tokeira-tkdp/tests/parts.rs`
@@ -510,5 +567,5 @@ folder sees the retained set.
   shape, digest coupling, pure check, inspection determinism) and each
   platform's own observability style-contract tests.
 - The default suite requires no Docker daemon and no AWS credentials:
-  provider-dependent behaviour is covered at the probe and constructor
-  seams with stubs.
+  provider-dependent behaviour is covered at the probe and context-
+  registration seams with stubs or SDK configuration inspection.

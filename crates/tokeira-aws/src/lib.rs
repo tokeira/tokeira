@@ -22,5 +22,6 @@ pub use clients::{
         ImageTagMutability, RepositoryDescription, decode_authorization_data,
         ensure_ecr_repositories, ensure_ecr_repository,
     },
+    register_infra_extensions,
 };
 pub use context::ResourceContext;

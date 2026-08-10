@@ -456,6 +456,31 @@ pub trait Resource: Send + Sync {
     /// Opaque resource type identifier.
     fn resource_type(&self) -> ResourceType;
 
+    /// Validate the complete desired resource before an engine sees it.
+    ///
+    /// Definition frontends construct resources from authored kinds without
+    /// duplicating provider validation. The definition realization boundary
+    /// calls this method immediately after construction; lifecycle methods are
+    /// never invoked for an invalid resource.
+    fn validate_input(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Complete output names this resource may record for author references.
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Canonical desired representation used for definition evidence.
+    ///
+    /// Ordinary module-built resources need not participate in definition
+    /// snapshots. Resources introduced through a frontend kind override this
+    /// with the desired properties whose movement must be explainable across
+    /// retained definition revisions.
+    fn desired_manifest(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+
     /// Logical resource identifier.
     fn resource_id(&self) -> ResourceId;
 

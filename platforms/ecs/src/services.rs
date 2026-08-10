@@ -218,6 +218,10 @@ impl EcsWorkload {
 }
 
 impl deploy_engine::Service for EcsWorkload {
+    fn resource_type(&self) -> &'static str {
+        "EcsWorkload"
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

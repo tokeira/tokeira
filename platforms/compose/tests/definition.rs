@@ -1,7 +1,7 @@
 //! The shipped definition set, evaluated whole: the split `.tkd` documents
 //! (`deployment.tkd` wiring, `platform.tkd` model, `observability.tkd`
 //! services) resolve as parts beside the root and build the same deployment
-//! the monolithic document did — through the real platform vocabulary, with
+//! the monolithic document did — through the real platform namespaces, with
 //! nothing stubbed.
 
 use std::path::Path;
@@ -18,9 +18,7 @@ struct Ctx {
 
 fn evaluate(root_text: &str) -> Result<FrontendOutput, String> {
     let package = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let vocabulary = tokeira_compose_deployment::platform()
-        .vocabulary()
-        .map_err(|error| error.to_string())?;
+    let platform = tokeira_compose_deployment::platform();
     let parts = DirectoryPartSources::new(package, "tkd");
     let source_name = DefinitionSourceName::AuthoringPath(package.join("deployment.tkd"));
     tokeira_tkd::frontend()
@@ -32,7 +30,7 @@ fn evaluate(root_text: &str) -> Result<FrontendOutput, String> {
             &Ctx {
                 project_name: "demo".to_string(),
             },
-            &vocabulary,
+            &platform.namespaces,
             &parts,
         )
         .map_err(|diagnostic| diagnostic.to_string())

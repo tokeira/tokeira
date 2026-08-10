@@ -5,12 +5,9 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tokeira_platform::{
-    declaration::Vocabulary,
-    definition::{
-        DefinitionFrontend, DefinitionSourceName, FrontendSource, NoPartSources, PartResolveError,
-        SourceResolver,
-    },
+use tokeira_platform::definition::{
+    DefinitionFrontend, DefinitionSourceName, FrontendSource, NoPartSources, PartResolveError,
+    SourceResolver,
 };
 
 #[derive(Serialize)]
@@ -46,7 +43,7 @@ fn evaluate(
             &Ctx {
                 project_name: "demo".to_string(),
             },
-            &Vocabulary::of(Vec::new()).expect("empty vocabulary composes"),
+            &[],
             parts,
         )
         .map_err(|diagnostic| diagnostic.message)
@@ -215,7 +212,7 @@ fn parts_resolve_from_a_directory_beside_the_root() {
             &Ctx {
                 project_name: "demo".to_string(),
             },
-            &Vocabulary::of(Vec::new()).expect("empty vocabulary composes"),
+            &[],
             &resolver,
         )
         .expect("the directory-resolved part evaluates");
@@ -265,7 +262,7 @@ fn the_retarget_gate_compares_part_bearing_definitions() {
             &Ctx {
                 project_name: "demo".to_string(),
             },
-            &Vocabulary::of(Vec::new()).expect("empty vocabulary composes"),
+            &[],
             &parts,
             &parts,
         )
@@ -582,7 +579,7 @@ fn create_annotations_in_a_part_gate_retarget() {
             &Ctx {
                 project_name: "demo".to_string(),
             },
-            &Vocabulary::of(Vec::new()).expect("empty vocabulary composes"),
+            &[],
             &parts,
             &parts,
         )

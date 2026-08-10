@@ -2,10 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::{
-    error::{GraphError, GraphFinding},
-    kind::Kind,
-};
+use crate::error::{GraphError, GraphFinding};
 
 /// Stable logical reference to one declared resource.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,7 +23,10 @@ impl ResourceReference {
     }
 }
 
-/// Checked logical reference to one provider-resource output.
+/// Deferred logical reference to one resource output.
+///
+/// The resource itself supplies its output contract after realization; this
+/// structural handle only proves that the referenced logical resource exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputReference {
     resource: ResourceReference,
@@ -347,31 +347,21 @@ impl<K> StructuralGraphBuilder<K> {
     }
 }
 
-impl<K: Kind> StructuralGraphBuilder<K> {
-    /// Check and construct an output reference from a resource declared so far.
+impl<K> StructuralGraphBuilder<K> {
+    /// Construct an output reference from a resource declared so far.
     pub fn output(
         &self,
         resource: &ResourceReference,
         output: &str,
     ) -> Result<OutputReference, GraphError> {
-        let node = self
+        if !self
             .resources
             .iter()
-            .find(|node| node.reference() == resource)
-            .ok_or_else(|| GraphError::UnknownResource {
+            .any(|node| node.reference() == resource)
+        {
+            return Err(GraphError::UnknownResource {
                 module: resource.module.clone(),
                 resource: resource.logical_id.clone(),
-            })?;
-        if !node.kind().declared_outputs().contains(&output) {
-            return Err(GraphError::UnknownOutput {
-                kind: node.kind().name().to_string(),
-                output: output.to_string(),
-                supported: node
-                    .kind()
-                    .declared_outputs()
-                    .iter()
-                    .map(|value| (*value).to_string())
-                    .collect(),
             });
         }
         Ok(OutputReference {

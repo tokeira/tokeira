@@ -2,12 +2,14 @@
 //!
 //! [`DescribedDeployment`] derives every answer from its inputs — the
 //! execution state (the realized definition), the admitted deployment
-//! coordinates, and the declaration's extension constructors. It owns no
-//! platform knowledge: no module names, no provider handles, no attribute
-//! meanings. Registration happens inside `register_infra_extensions` and
-//! nowhere else — the deployment runs each selection's constructor with
-//! its namespace block, the constructors put handles into the context, and
-//! resources read the context at the mechanics moment.
+//! coordinates, and the declaration's platform implementation. It owns no
+//! platform knowledge beyond the framework's standard AWS execution context:
+//! no module names and no platform-specific attribute meanings. Registration
+//! happens inside `register_infra_extensions` and nowhere else — when the
+//! declaration includes AWS, the framework installs its clients with the
+//! authored platform default, then delegates additional handles to the
+//! platform implementation. Resources read those handles from the context at
+//! the mechanics moment.
 
 use std::{path::Path, sync::Arc};
 
@@ -16,7 +18,7 @@ use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac::{self as iac, ResourceId};
 use tokeira_orchestrator as orchestrator;
 use tokeira_platform::{
-    declaration::{DeploymentRef, InfraConstructor},
+    declaration::{DeploymentRef, PlatformIntegration},
     graph::WritebackValue,
 };
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
@@ -24,22 +26,22 @@ use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 use crate::engine::{ExecutionState, ModuleSpec};
 
 /// The bound path's deployment: graph answers from the execution state,
-/// registration from the declaration's constructors, coordinates from the
+/// registration from the platform implementation, coordinates from the
 /// admitted value.
 #[derive(Debug)]
 pub(crate) struct DescribedDeployment {
     deployment: DeploymentRef,
-    constructors: Vec<(&'static str, Arc<dyn InfraConstructor>)>,
+    implementation: Arc<dyn PlatformIntegration>,
 }
 
 impl DescribedDeployment {
     pub(crate) fn new(
         deployment: DeploymentRef,
-        constructors: Vec<(&'static str, Arc<dyn InfraConstructor>)>,
+        implementation: Arc<dyn PlatformIntegration>,
     ) -> Self {
         Self {
             deployment,
-            constructors,
+            implementation,
         }
     }
 
@@ -99,10 +101,16 @@ impl orchestrator::Deployment for DescribedDeployment {
             .collect()
     }
 
-    // Compose's services realize on the infra plane today; the service
-    // plane's derivations are empty on this path.
-    fn services(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Service>> {
-        Vec::new()
+    fn services(&self, config: &Self::Config) -> Vec<Box<dyn deploy_engine::Service>> {
+        config
+            .services
+            .iter()
+            .map(|service| {
+                Box::new(ConcreteService {
+                    service: Arc::clone(service),
+                }) as Box<dyn deploy_engine::Service>
+            })
+            .collect()
     }
 
     fn images(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>> {
@@ -113,10 +121,11 @@ impl orchestrator::Deployment for DescribedDeployment {
         config.namespaces.clone()
     }
 
-    /// THE registration seam: sets the context's standard fields, then runs
-    /// every declared selection's infra constructor with its namespace
-    /// block. A constructor failure is an error — real, or the unreachable
-    /// class arriving after a passing probe, typed at the error root.
+    /// THE registration seam: when the declaration includes AWS, installs
+    /// its standard clients with the authored platform default, then delegates
+    /// platform-specific extensions. An integration failure is an error —
+    /// real, or the unreachable class arriving after a passing probe, typed at
+    /// the error root.
     async fn register_infra_extensions(
         &self,
         config: &Self::Config,
@@ -125,20 +134,34 @@ impl orchestrator::Deployment for DescribedDeployment {
         ctx.project_name = self.deployment.name.clone();
         // ctx.tags stays default: the definition graph carries no authored
         // tags, and nothing may invent them here.
-        for (namespace, constructor) in &self.constructors {
-            constructor
-                .construct(&self.deployment, config.attributes.get(*namespace), ctx)
-                .await?;
+        if config.uses_aws {
+            tokeira_aws::register_infra_extensions(config.aws_region.as_deref(), ctx).await;
         }
+        self.implementation
+            .register_infra_extensions(&self.deployment, ctx)
+            .await?;
         Ok(())
     }
 
-    // No declared selection carries a deploy-phase constructor.
     async fn register_deploy_extensions(
         &self,
         _config: &Self::Config,
-        _ctx: &mut deploy_engine::ServiceContext,
+        ctx: &mut deploy_engine::ServiceContext,
     ) -> orchestrator::Result<()> {
+        self.implementation
+            .register_deploy_extensions(&self.deployment, ctx)
+            .await?;
+        Ok(())
+    }
+
+    async fn register_image_extensions(
+        &self,
+        _config: &Self::Config,
+        ctx: &mut deploy_engine::ImageContext,
+    ) -> orchestrator::Result<()> {
+        self.implementation
+            .register_image_extensions(&self.deployment, ctx)
+            .await?;
         Ok(())
     }
 
@@ -196,6 +219,50 @@ impl orchestrator::Deployment for DescribedDeployment {
                 Some((entry.key().to_string(), value))
             })
             .collect()
+    }
+}
+
+/// Owned deployment hand-off over a shared definition-realized service.
+///
+/// `Deployment::services` returns owned trait objects while `ExecutionState`
+/// is cloneable and may be opened independently by plan and apply. This
+/// adapter changes neither identity nor lifecycle; it only delegates the
+/// service contract to the exact realized value retained by the definition.
+#[derive(Debug)]
+struct ConcreteService {
+    service: Arc<dyn deploy_engine::Service>,
+}
+
+impl deploy_engine::Service for ConcreteService {
+    fn resource_type(&self) -> &'static str {
+        self.service.resource_type()
+    }
+
+    fn validate_input(&self) -> Result<(), String> {
+        self.service.validate_input()
+    }
+
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        self.service.declared_outputs()
+    }
+
+    fn name(&self) -> &str {
+        self.service.name()
+    }
+
+    fn module(&self) -> &str {
+        self.service.module()
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        self.service.dependencies()
+    }
+
+    fn manifests(
+        &self,
+        ctx: &deploy_engine::ServiceContext,
+    ) -> Result<Vec<serde_json::Value>, deploy_engine::RuntimeError> {
+        self.service.manifests(ctx)
     }
 }
 
@@ -342,9 +409,8 @@ mod tests {
 
     use super::*;
 
-    /// A constructor that records its invocation and drops a marker into
-    /// the context, so the test can see both the call order and the block
-    /// each selection received.
+    /// A platform implementation that records registration and drops a marker
+    /// into the context without receiving frontend namespace data.
     #[derive(Debug)]
     struct Recording {
         namespace: &'static str,
@@ -352,87 +418,107 @@ mod tests {
     }
 
     #[async_trait]
-    impl InfraConstructor for Recording {
-        async fn construct(
+    impl PlatformIntegration for Recording {
+        async fn register_infra_extensions(
             &self,
             deployment: &DeploymentRef,
-            attributes: Option<&serde_json::Value>,
             ctx: &mut iac::ProvisionContext,
         ) -> anyhow::Result<()> {
-            self.log.lock().unwrap().push(format!(
-                "{}:{}:{}",
-                self.namespace,
-                deployment.name,
-                attributes
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string())
-            ));
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:{}", self.namespace, deployment.name));
             ctx.set_extension(Marker);
             Ok(())
+        }
+
+        async fn register_deploy_extensions(
+            &self,
+            _deployment: &DeploymentRef,
+            _ctx: &mut deploy_engine::ServiceContext,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn register_image_extensions(
+            &self,
+            _deployment: &DeploymentRef,
+            _ctx: &mut deploy_engine::ImageContext,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn service_platform(
+            &self,
+            _deployment: &DeploymentRef,
+        ) -> anyhow::Result<Box<dyn deploy_engine::Platform>> {
+            Ok(Box::new(NoServices))
         }
     }
 
     struct Marker;
 
-    fn execution_state(attributes: BTreeMap<String, serde_json::Value>) -> ExecutionState {
+    #[derive(Debug)]
+    struct NoServices;
+
+    #[async_trait]
+    impl deploy_engine::Platform for NoServices {
+        async fn apply_manifests(
+            &self,
+            _manifests: &[serde_json::Value],
+        ) -> Result<usize, deploy_engine::RuntimeError> {
+            unreachable!("the registration test declares no services")
+        }
+    }
+
+    fn execution_state() -> ExecutionState {
         ExecutionState {
+            uses_aws: true,
+            aws_region: Some("eu-west-2".to_string()),
             modules: Vec::new(),
             bootstrap: String::new(),
             resources: BTreeMap::new(),
+            services: Vec::new(),
             namespaces: Vec::new(),
             writeback: Vec::new(),
             index: Default::default(),
             manifests: BTreeMap::new(),
-            attributes,
         }
     }
 
-    // The registration contract: project_name from the admitted
-    // coordinates, every constructor run in declaration order, each
-    // receiving exactly its own namespace block, handles landing in the
-    // extension bag.
+    // The registration contract: standard AWS clients and project identity
+    // arrive before platform-specific registration, without frontend
+    // namespace data crossing the seam.
     #[tokio::test]
-    async fn register_infra_runs_each_constructor_with_its_block() {
+    async fn register_infra_delegates_without_namespace_data() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let described = DescribedDeployment::new(
             DeploymentRef {
                 name: "demo".to_string(),
                 dir: "/tmp/demo".into(),
             },
-            vec![
-                (
-                    "compose",
-                    Arc::new(Recording {
-                        namespace: "compose",
-                        log: log.clone(),
-                    }) as Arc<dyn InfraConstructor>,
-                ),
-                (
-                    "aws",
-                    Arc::new(Recording {
-                        namespace: "aws",
-                        log: log.clone(),
-                    }),
-                ),
-            ],
+            Arc::new(Recording {
+                namespace: "compose",
+                log: log.clone(),
+            }),
         );
-        let config = execution_state(BTreeMap::from([(
-            "aws".to_string(),
-            serde_json::json!({"region": "eu-west-2"}),
-        )]));
+        let config = execution_state();
         let mut ctx = iac::ProvisionContext::default();
         described
             .register_infra_extensions(&config, &mut ctx)
             .await
             .unwrap();
         assert_eq!(ctx.project_name, "demo");
-        assert!(ctx.extension::<Marker>().is_some());
         assert_eq!(
-            *log.lock().unwrap(),
-            vec![
-                "compose:demo:none".to_string(),
-                r#"aws:demo:{"region":"eu-west-2"}"#.to_string(),
-            ]
+            ctx.extension::<tokeira_aws::AwsClients>()
+                .unwrap()
+                .dsql
+                .config()
+                .region()
+                .map(|region| region.as_ref()),
+            Some("eu-west-2")
         );
+        assert!(ctx.extension::<Marker>().is_some());
+        assert_eq!(*log.lock().unwrap(), vec!["compose:demo".to_string()]);
     }
 }

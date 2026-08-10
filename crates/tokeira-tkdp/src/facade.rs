@@ -1,7 +1,7 @@
 //! Synthesis of the in-sandbox authoring facade.
 //!
 //! The facade is derived, never authored: builder classes, one kwargs-shell
-//! constructor per kind name from the engine inventory, and a context class
+//! constructor per kind name from the platform namespaces, and a context class
 //! rendered from the platform's serialized typed context. It accumulates
 //! plain data inside the sandbox and performs no host calls — the whole
 //! structural result crosses to the host once, as the driver's final
@@ -204,7 +204,7 @@ pub fn render(kind_names: &[&str], context: &serde_json::Value) -> String {
 
     // Shells for the complete inventory: a definition can only *reference*
     // what it imported, but the set it may import is the whole engine
-    // vocabulary.
+    // namespace inventory.
     for name in kind_names {
         out.push_str(&format!(
             "class __tokeira_internal_kind_{name}:\n    \

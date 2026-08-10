@@ -1,6 +1,11 @@
 //! Definition source admission, frontend evaluation, and invocation-bound realization.
 
-use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8,12 +13,9 @@ use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 
 use crate::{
     author::LocatedValue,
-    error::{
-        DefinitionError, FrontendDiagnostic, KindError, ProjectionError, VerificationFinding,
-        VerificationReport,
-    },
+    error::{DefinitionError, FrontendDiagnostic, KindError, ProjectionError},
     graph::{VerifiedGraph, WritebackValue},
-    kind::{Kind, PlacementContext},
+    kind::{DecodedKind, PlacementContext, RealizedResource},
 };
 
 /// One provider namespace: the runtime shadow of a crate dependency.
@@ -30,9 +32,12 @@ pub struct Namespace {
     /// Author-visible kind names, for module synthesis and located
     /// unknown-name errors.
     pub kinds: &'static [&'static str],
+    /// Authoring-only empty shapes used by frontends that support explicit
+    /// struct-update defaults such as `.tkd`'s `..Kind::EMPTY`.
+    pub defaults: Option<fn(&str) -> Option<LocatedValue>>,
     /// Decode one authored kind; `None` when the name is not this
     /// namespace's.
-    pub decode: fn(&str, LocatedValue) -> Option<Result<Box<dyn Kind>, KindError>>,
+    pub decode: fn(&str, LocatedValue) -> Option<Result<DecodedKind, KindError>>,
 }
 
 /// Source identity safe to render in frontend diagnostics.
@@ -184,7 +189,7 @@ pub struct FrontendOutput {
     /// Host-free platform configuration value.
     pub config: LocatedValue,
     /// Completed structural graph built inside the frontend evaluator.
-    pub graph: VerifiedGraph<Box<dyn Kind>>,
+    pub graph: VerifiedGraph<DecodedKind>,
 }
 
 /// Statically assembled evaluator for one definition format.
@@ -325,7 +330,7 @@ pub fn evaluate_definition<Cx, F>(
     context: &Cx,
     namespaces: &[Namespace],
     parts: &dyn SourceResolver,
-) -> Result<EvaluatedDefinition<Box<dyn Kind>>, DefinitionError>
+) -> Result<EvaluatedDefinition<DecodedKind>, DefinitionError>
 where
     Cx: Serialize,
     F: DefinitionFrontend,
@@ -366,7 +371,7 @@ where
     })
 }
 
-/// Definition whose complete concrete kind set passed pure input validation.
+/// Structurally admitted definition waiting for invocation-bound resources.
 pub struct VerifiedDefinition<'a, K> {
     definition: &'a EvaluatedDefinition<K>,
 }
@@ -380,39 +385,26 @@ impl<K> fmt::Debug for VerifiedDefinition<'_, K> {
 }
 
 impl<'a, K> VerifiedDefinition<'a, K> {
-    /// Borrow the exact evaluated definition that was validated.
+    /// Borrow the exact evaluated definition that was admitted.
     pub fn definition(&self) -> &'a EvaluatedDefinition<K> {
         self.definition
     }
 }
 
-/// Validate every concrete kind input without fabricating invocation facts.
-pub fn verify_definition<K: Kind>(
-    definition: &EvaluatedDefinition<K>,
-) -> Result<VerifiedDefinition<'_, K>, VerificationReport> {
-    let findings =
-        definition
-            .graph
-            .resources()
-            .iter()
-            .filter_map(|resource| {
-                resource.kind().validate_input().err().map(|error| {
-                    VerificationFinding::InvalidInput {
-                        resource: format!("{}/{}", resource.module(), resource.logical_id()),
-                        provider_kind: resource.kind().name().to_string(),
-                        message: error.message,
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-    if findings.is_empty() {
-        Ok(VerifiedDefinition { definition })
-    } else {
-        Err(VerificationReport { findings })
-    }
+/// Retain the exact structurally verified definition for realization.
+///
+/// Resource validation occurs immediately after each [`Kind`](crate::kind::Kind)
+/// constructs its complete resource. That keeps provider facts on the
+/// resource without fabricating placement here.
+pub fn verify_definition<K>(definition: &EvaluatedDefinition<K>) -> VerifiedDefinition<'_, K> {
+    VerifiedDefinition { definition }
 }
 
-/// Logical-to-engine identity produced by the one execution realization.
+/// Logical-to-infrastructure identity produced by one execution realization.
+///
+/// Only infrastructure resources have identities in [`tokeira_iac::InfraState`]
+/// and may supply writeback outputs. Service realization is intentionally not
+/// projected into this index.
 #[derive(Debug, Clone, Default)]
 pub struct RealizedResourceIndex {
     ids: BTreeMap<(String, String), tokeira_iac::ResourceId>,
@@ -429,6 +421,7 @@ impl RealizedResourceIndex {
 pub struct RealizedResources {
     index: RealizedResourceIndex,
     resources: Vec<Box<dyn tokeira_iac::Resource>>,
+    services: Vec<Box<dyn tokeira_deploy_engine::Service>>,
     manifests: BTreeMap<tokeira_iac::ResourceId, serde_json::Value>,
 }
 
@@ -437,6 +430,7 @@ impl fmt::Debug for RealizedResources {
         f.debug_struct("RealizedResources")
             .field("index", &self.index)
             .field("resource_count", &self.resources.len())
+            .field("service_count", &self.services.len())
             .field("manifest_count", &self.manifests.len())
             .finish()
     }
@@ -453,9 +447,17 @@ impl RealizedResources {
         self.resources.iter().map(Box::as_ref)
     }
 
-    /// Transfer resources to the infrastructure engine.
-    pub fn into_resources(self) -> Vec<Box<dyn tokeira_iac::Resource>> {
-        self.resources
+    /// Transfer resources to their sole owning engines.
+    // The pair is the whole ownership hand-off; naming aliases for two
+    // one-use vectors would add vocabulary without clarifying the boundary.
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<Box<dyn tokeira_iac::Resource>>,
+        Vec<Box<dyn tokeira_deploy_engine::Service>>,
+    ) {
+        (self.resources, self.services)
     }
 
     /// Provider-owned desired manifests keyed by executed resource identity.
@@ -464,7 +466,7 @@ impl RealizedResources {
     }
 }
 
-impl<K: Kind> VerifiedDefinition<'_, K> {
+impl VerifiedDefinition<'_, DecodedKind> {
     /// Realize the verified set once with real invocation identity and placement.
     /// `definition_dir` names where the interpreted source was read from —
     /// the deployment root for a working realization, a retained revision
@@ -481,16 +483,18 @@ impl<K: Kind> VerifiedDefinition<'_, K> {
         let mut index = RealizedResourceIndex::default();
         let mut content = BTreeMap::new();
         let mut manifests = BTreeMap::new();
+        let mut completed = BTreeSet::new();
         let mut pending = (0..nodes.len()).collect::<Vec<_>>();
-        let mut realized = std::iter::repeat_with(|| None)
+        let mut realized_nodes = std::iter::repeat_with(|| None)
             .take(nodes.len())
-            .collect::<Vec<Option<Box<dyn tokeira_iac::Resource>>>>();
+            .collect::<Vec<Option<RealizedResource>>>();
         while !pending.is_empty() {
             let Some(position) = pending.iter().position(|node_index| {
                 nodes[*node_index].dependencies().iter().all(|dependency| {
-                    index
-                        .get(dependency.module(), dependency.logical_id())
-                        .is_some()
+                    completed.contains(&(
+                        dependency.module().to_string(),
+                        dependency.logical_id().to_string(),
+                    ))
                 })
             }) else {
                 return Err(ProjectionError {
@@ -504,13 +508,13 @@ impl<K: Kind> VerifiedDefinition<'_, K> {
             let dependencies: Vec<tokeira_iac::ResourceId> = node
                 .dependencies()
                 .iter()
-                .map(|dependency| {
+                .filter_map(|dependency| {
                     index
                         .get(dependency.module(), dependency.logical_id())
                         .cloned()
-                        .expect("the selected resource has realized dependencies")
                 })
                 .collect();
+            let dependency_count = dependencies.len();
             let dependency_content = dependencies
                 .iter()
                 .filter_map(|id| {
@@ -530,8 +534,7 @@ impl<K: Kind> VerifiedDefinition<'_, K> {
                 dependency_content,
                 tags: tags.clone(),
             };
-            let manifest = node.kind().desired_manifest(&placement);
-            let resource = node
+            let realized = node
                 .kind()
                 .realize(&placement)
                 .map_err(|error| ProjectionError {
@@ -539,29 +542,82 @@ impl<K: Kind> VerifiedDefinition<'_, K> {
                     provider_kind: node.kind().name().to_string(),
                     message: error.message,
                 })?;
-            let resource_id = resource.resource_id();
-            content.insert(
-                resource_id.clone(),
-                crate::content::ContentIdentity::new(
-                    &format!("provider-resource/{}", node.kind().name()),
-                    manifest.to_string().as_bytes(),
-                ),
-            );
-            manifests.insert(resource_id.clone(), manifest);
-            index.ids.insert(
-                (node.module().to_string(), node.logical_id().to_string()),
-                resource_id,
-            );
-            realized[node_index] = Some(resource);
+            for entry in self.definition.graph.writeback() {
+                let WritebackValue::Output(output) = entry.value() else {
+                    continue;
+                };
+                if output.resource() == node.reference()
+                    && !realized.declared_outputs().contains(&output.output())
+                {
+                    return Err(ProjectionError {
+                        resource: format!("{}/{}", node.module(), node.logical_id()),
+                        provider_kind: node.kind().name().to_string(),
+                        message: format!(
+                            "unknown output `{}`; supported outputs: {}",
+                            output.output(),
+                            realized.declared_outputs().join(", ")
+                        ),
+                    });
+                }
+            }
+            match &realized {
+                RealizedResource::Infra(resource) => {
+                    if dependency_count != node.dependencies().len() {
+                        return Err(ProjectionError {
+                            resource: format!("{}/{}", node.module(), node.logical_id()),
+                            provider_kind: node.kind().name().to_string(),
+                            message:
+                                "an infrastructure resource cannot depend on a service resource"
+                                    .to_string(),
+                        });
+                    }
+                    let resource_id = resource.resource_id();
+                    let manifest = resource.desired_manifest();
+                    content.insert(
+                        resource_id.clone(),
+                        crate::content::ContentIdentity::new(
+                            &format!("provider-resource/{}", node.kind().name()),
+                            manifest.to_string().as_bytes(),
+                        ),
+                    );
+                    manifests.insert(resource_id.clone(), manifest);
+                    index.ids.insert(
+                        (node.module().to_string(), node.logical_id().to_string()),
+                        resource_id,
+                    );
+                }
+                RealizedResource::Service(_) => {
+                    if self.definition.graph.writeback().iter().any(|entry| {
+                        matches!(
+                            entry.value(),
+                            WritebackValue::Output(output) if output.resource() == node.reference()
+                        )
+                    }) {
+                        return Err(ProjectionError {
+                            resource: format!("{}/{}", node.module(), node.logical_id()),
+                            provider_kind: node.kind().name().to_string(),
+                            message: "service outputs cannot be written to infrastructure-backed configuration"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            realized_nodes[node_index] = Some(realized);
+            completed.insert((node.module().to_string(), node.logical_id().to_string()));
         }
 
-        let mut resources = Vec::with_capacity(realized.len());
-        for entry in realized {
-            resources.push(entry.expect("every verified resource was realized"));
+        let mut resources = Vec::new();
+        let mut services = Vec::new();
+        for resource in realized_nodes {
+            match resource.expect("every verified resource was realized") {
+                RealizedResource::Infra(resource) => resources.push(resource),
+                RealizedResource::Service(service) => services.push(service),
+            }
         }
         Ok(RealizedResources {
             index,
             resources,
+            services,
             manifests,
         })
     }
@@ -646,7 +702,7 @@ mod part_tests {
                     message: error.to_string(),
                 })?;
             }
-            let mut graph = StructuralGraphBuilder::<Box<dyn Kind>>::new();
+            let mut graph = StructuralGraphBuilder::<DecodedKind>::new();
             graph.add_module("state", Vec::new());
             Ok(FrontendOutput {
                 config: LocatedValue {

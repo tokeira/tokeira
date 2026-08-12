@@ -8,28 +8,11 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-async-trait.workspace = true
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-ecs = "1"
-chrono = { version = "0.4", features = ["serde"] }
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-tokeira-aws = { path = "../../crates/tokeira-aws" }
-tokeira-config.workspace = true
-tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
-tokeira-iac = { path = "../../crates/tokeira-iac" }
-tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
-tokeira-state = { path = "../../crates/tokeira-state" }
+tokeira-ecs = { path = "../../crates/tokeira-ecs" }
 
 [dev-dependencies]
+tokeira-iac = { path = "../../crates/tokeira-iac" }
 tokeira-observability = { workspace = true }
-proptest = "1"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-toml = "0.8"
 
 [lints]
 workspace = true

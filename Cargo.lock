@@ -8657,7 +8657,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokeira-ecs-deployment"
+name = "tokeira-ecs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -8680,6 +8680,15 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+]
+
+[[package]]
+name = "tokeira-ecs-deployment"
+version = "0.1.0"
+dependencies = [
+ "tokeira-ecs",
+ "tokeira-iac",
+ "tokeira-observability",
 ]
 
 [[package]]

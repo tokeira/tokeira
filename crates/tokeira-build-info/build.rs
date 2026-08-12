@@ -67,11 +67,20 @@ fn main() {
 }
 
 fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    manifest_dir()
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("../.."))
+}
+
+fn manifest_dir() -> PathBuf {
+    // Cargo supplies this for every build-script invocation. Reading it at runtime keeps a
+    // cached build-script valid when its workspace is moved without discarding the warm target.
+    PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR")
+            .expect("Cargo must set CARGO_MANIFEST_DIR for build scripts"),
+    )
 }
 
 fn resolve_manifest_path() -> Option<PathBuf> {
@@ -112,7 +121,7 @@ fn parse_manifest(content: &str) -> Result<Manifest, String> {
 
 fn dev_fallback_manifest(root: &Path) -> Result<Manifest, String> {
     let (proto_version, server_compat) =
-        read_pinned_versions(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/pinned.rs"))?;
+        read_pinned_versions(&manifest_dir().join("src/pinned.rs"))?;
 
     Ok(Manifest {
         version: env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0-dev".to_owned()),

@@ -8676,6 +8676,7 @@ dependencies = [
  "tokeira-iac",
  "tokeira-observability",
  "tokeira-orchestrator",
+ "tokeira-platform",
  "tokeira-state",
  "tokio",
  "toml 0.8.23",

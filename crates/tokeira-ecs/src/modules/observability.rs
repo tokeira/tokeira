@@ -429,7 +429,6 @@ fn resource_context(config: &EcsConfig) -> ResourceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokeira_iac::InfraState;
 
     // Content-coupled coverage (loader completeness, dashboard/alert style
     // contracts, resource enumeration over real artifacts) lives with the

@@ -13,6 +13,7 @@
 pub mod config;
 pub mod gates;
 pub mod images;
+pub mod kinds;
 pub mod modules;
 pub mod services;
 

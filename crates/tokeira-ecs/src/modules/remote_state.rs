@@ -47,8 +47,16 @@ impl Module for RemoteStateModule {
 }
 
 #[derive(Debug)]
-struct RemoteStateBucket {
+pub(crate) struct RemoteStateBucket {
     inner: S3Bucket,
+}
+
+impl RemoteStateBucket {
+    /// Wrap an S3 bucket with the remote-state delete policy. The inner
+    /// bucket keeps every other behaviour.
+    pub(crate) fn wrap(inner: S3Bucket) -> Self {
+        Self { inner }
+    }
 }
 
 #[async_trait]
@@ -95,7 +103,13 @@ impl Resource for RemoteStateBucket {
     }
 
     fn resource_type(&self) -> ResourceType {
-        self.inner.resource_type()
+        // "RemoteStateBucket", not the inner "S3Bucket": kind names must
+        // equal the realized resource_type and stay unique across
+        // namespaces, and the generic tokeira_aws namespace owns
+        // "S3Bucket". Existing recorded state that carries the inner
+        // string re-plans as a type change once — accepted for the
+        // definition-driven cutover.
+        ResourceType::new("RemoteStateBucket")
     }
 
     fn resource_id(&self) -> ResourceId {

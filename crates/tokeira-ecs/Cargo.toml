@@ -23,6 +23,7 @@ tokeira-config.workspace = true
 tokeira-deploy-engine = { path = "../tokeira-deploy-engine" }
 tokeira-iac = { path = "../tokeira-iac" }
 tokeira-orchestrator = { path = "../tokeira-orchestrator" }
+tokeira-platform = { path = "../tokeira-platform" }
 tokeira-state = { path = "../tokeira-state" }
 
 [dev-dependencies]

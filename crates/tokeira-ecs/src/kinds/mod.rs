@@ -183,7 +183,14 @@ mod tests {
 
         let workload = workload::Workload {
             service: "tokeira-runtime".into(),
-            config: crate::EcsConfig::default(),
+            environment: "dev".into(),
+            region: "eu-west-2".into(),
+            cluster: "tokeira".into(),
+            service_connect_namespace: "tokeira.internal".into(),
+            image: "tokeirad:latest".into(),
+            replicas: None,
+            cpu: 1024,
+            memory_mb: 2048,
         }
         .realize(&placement(Vec::new()))
         .expect("runtime workload");
@@ -218,7 +225,14 @@ mod tests {
 
         let workload_error = workload::Workload {
             service: "tokeira-unknown".into(),
-            config: crate::EcsConfig::default(),
+            environment: "dev".into(),
+            region: "eu-west-2".into(),
+            cluster: "tokeira".into(),
+            service_connect_namespace: "tokeira.internal".into(),
+            image: "tokeirad:latest".into(),
+            replicas: None,
+            cpu: 1024,
+            memory_mb: 2048,
         }
         .realize(&placement(Vec::new()))
         .expect_err("unknown workload");

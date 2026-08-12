@@ -39,25 +39,37 @@ impl Kind<AdoptedDsqlResource> for AdoptedDsqlEndpoint {
 /// Role provenance: the shape makes the invalid states unrepresentable —
 /// managed roles carry policy facts and need the cluster dependency;
 /// preexisting roles carry exactly an ARN.
+/// A managed role's facts: the platform names the role and scopes its
+/// policy to the declared cluster at create time.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRole {
+    /// AWS region.
+    pub region: String,
+    /// Role name.
+    pub role_name: String,
+    /// Inline policy name.
+    pub policy_name: String,
+    /// DSQL action the policy grants (e.g. `dsql:DbConnect`).
+    pub action: String,
+}
+
+/// An adopted role: exactly an ARN.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreexistingRole {
+    /// The adopted role's ARN.
+    pub role_arn: String,
+}
+
+/// Tuple variants, not struct variants: the definition frontend does not
+/// admit struct enum variants across its boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub enum RoleMode {
-    /// The platform creates and manages the role; its DSQL policy is scoped
-    /// to the declared cluster's ARN at create time.
-    Managed {
-        /// AWS region.
-        region: String,
-        /// Role name.
-        role_name: String,
-        /// Inline policy name.
-        policy_name: String,
-        /// DSQL action the policy grants (e.g. `dsql:DbConnect`).
-        action: String,
-    },
+    /// The platform creates and manages the role.
+    Managed(ManagedRole),
     /// A preexisting role is referenced, never managed.
-    Preexisting {
-        /// The adopted role's ARN.
-        role_arn: String,
-    },
+    Preexisting(PreexistingRole),
 }
 
 /// Reusable author input for one of the platform's DSQL IAM roles.
@@ -73,12 +85,12 @@ pub struct DsqlIamRole {
 impl Kind<DsqlIamRoleResource> for DsqlIamRole {
     fn realize(&self, placement: &PlacementContext) -> Result<DsqlIamRoleResource, KindError> {
         Ok(match &self.mode {
-            RoleMode::Managed {
+            RoleMode::Managed(ManagedRole {
                 region,
                 role_name,
                 policy_name,
                 action,
-            } => {
+            }) => {
                 let cluster = placement
                     .dependencies
                     .iter()
@@ -103,11 +115,13 @@ impl Kind<DsqlIamRoleResource> for DsqlIamRole {
                     },
                 )
             }
-            RoleMode::Preexisting { role_arn } => DsqlIamRoleResource::preexisting(
-                ResourceId(self.id.clone()),
-                role_arn.clone(),
-                placement.module.clone(),
-            ),
+            RoleMode::Preexisting(PreexistingRole { role_arn }) => {
+                DsqlIamRoleResource::preexisting(
+                    ResourceId(self.id.clone()),
+                    role_arn.clone(),
+                    placement.module.clone(),
+                )
+            }
         })
     }
 }

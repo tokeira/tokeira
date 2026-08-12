@@ -16,20 +16,25 @@ pub const TYPE: &str = "SecretsManagerSecret";
 /// Authored secret material source, mirroring the resource's
 /// [`SecretValue`]. Generated material is produced once at first apply and
 /// never recomputed.
+/// Generated secret material: the username recorded beside the generated
+/// password, and the password length.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedPassword {
+    /// Username recorded beside the generated password.
+    pub username: String,
+    /// Generated password length.
+    pub password_length: i32,
+}
+
+/// Tuple variants, not struct variants: the definition frontend does not
+/// admit struct enum variants across its boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub enum SecretSource {
     /// A static value authored in the definition.
-    Static {
-        /// The literal secret value.
-        value: String,
-    },
+    Static(String),
     /// A generated username/password JSON document.
-    GeneratedPasswordJson {
-        /// Username recorded beside the generated password.
-        username: String,
-        /// Generated password length.
-        password_length: i32,
-    },
+    GeneratedPasswordJson(GeneratedPassword),
 }
 
 /// Reusable author input for one managed secret.
@@ -54,14 +59,13 @@ impl Kind<Resource> for SecretsManagerSecret {
             self.name.clone(),
             SecretsManagerSecretConfig {
                 value: match &self.source {
-                    SecretSource::Static { value } => SecretValue::Static(value.clone()),
-                    SecretSource::GeneratedPasswordJson {
-                        username,
-                        password_length,
-                    } => SecretValue::GeneratedPasswordJson {
-                        username: username.clone(),
-                        password_length: *password_length,
-                    },
+                    SecretSource::Static(value) => SecretValue::Static(value.clone()),
+                    SecretSource::GeneratedPasswordJson(generated) => {
+                        SecretValue::GeneratedPasswordJson {
+                            username: generated.username.clone(),
+                            password_length: generated.password_length,
+                        }
+                    }
                 },
                 recovery_window_days: self.recovery_window_days,
                 module: placement.module.clone(),

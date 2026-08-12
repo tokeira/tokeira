@@ -3,17 +3,22 @@
 // connection endpoint, runtime role, admin role — so every consumer and
 // writeback binds the same names in either mode.
 //
-// Writebacks: managed mode declares three of the five DSQL writebacks. The
-// two endpoint-id writebacks require `endpoint_id` in the realized
-// endpoints' declared outputs, and those resources (VpcEndpoint,
-// DsqlConnectionEndpoint in tokeira-aws/src/resources) do not declare
-// outputs yet — a two-line follow-up outside this change's writable scope.
-// Preexisting mode's sources are the platform's own adopters, which declare
-// their outputs, so it writes all five back.
+// The role resources and their writebacks live in the root: their mode
+// carries a tuple-variant payload, and the frontend admits tuple-variant
+// construction in the root document only. This part declares the cluster
+// and endpoint identities and the writebacks they source.
+//
+// Managed mode writes one of the five DSQL writebacks back from here (the
+// cluster endpoint). The two endpoint-id writebacks would need
+// `endpoint_id` in VpcEndpoint's and DsqlConnectionEndpoint's declared
+// outputs (tokeira-aws/src/resources — outside this change's writable
+// scope; the named two-line follow-up). Preexisting mode's sources are the
+// platform's own adopters, which declare their outputs, so all three of
+// its endpoint facts write back from here.
 
-use platform::{Dsql, Ecs};
+use platform::{Dsql, DsqlClusterMode, Ecs, EndpointKind};
 
-pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource, endpoint_sg: Resource) {
+pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource, endpoint_sg: Resource) -> Resource {
     match &cfg.dsql {
         Dsql::Managed => {
             let cluster = dsql.resource(
@@ -45,36 +50,8 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource,
                 },
                 vec![vpc, endpoint_sg, cluster],
             );
-            let runtime_role = dsql.resource(
-                "runtime_role",
-                DsqlIamRole {
-                    id: "dsql:runtime-role".into(),
-                    mode: RoleMode::Managed(ManagedRole {
-                        region: cfg.aws.region.clone(),
-                        role_name: format!("{}-dsql-runtime", cx.project_name),
-                        policy_name: "dsql-runtime".into(),
-                        action: "dsql:DbConnect".into(),
-                    }),
-                },
-                vec![cluster],
-            );
-            let admin_role = dsql.resource(
-                "admin_role",
-                DsqlIamRole {
-                    id: "dsql:admin-role".into(),
-                    mode: RoleMode::Managed(ManagedRole {
-                        region: cfg.aws.region.clone(),
-                        role_name: format!("{}-dsql-admin", cx.project_name),
-                        policy_name: "dsql-admin".into(),
-                        action: "dsql:DbConnectAdmin".into(),
-                    }),
-                },
-                vec![cluster],
-            );
-
             d.writeback("dsql.endpoint", cluster.output("cluster_endpoint"));
-            d.writeback("dsql.runtime_role_arn", runtime_role.output("role_arn"));
-            d.writeback("dsql.admin_role_arn", admin_role.output("role_arn"));
+            cluster
         }
         Dsql::Preexisting(adopted) => {
             let cluster = dsql.resource(
@@ -101,30 +78,10 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource,
                     endpoint_id: adopted.connection_endpoint_id.clone(),
                 },
             );
-            let runtime_role = dsql.resource(
-                "runtime_role",
-                DsqlIamRole {
-                    id: "dsql:runtime-role".into(),
-                    mode: RoleMode::Preexisting(PreexistingRole {
-                        role_arn: adopted.runtime_role_arn.clone(),
-                    }),
-                },
-            );
-            let admin_role = dsql.resource(
-                "admin_role",
-                DsqlIamRole {
-                    id: "dsql:admin-role".into(),
-                    mode: RoleMode::Preexisting(PreexistingRole {
-                        role_arn: adopted.admin_role_arn.clone(),
-                    }),
-                },
-            );
-
             d.writeback("dsql.endpoint", cluster.output("cluster_endpoint"));
             d.writeback("dsql.management_endpoint_id", management.output("endpoint_id"));
             d.writeback("dsql.connection_endpoint_id", connection.output("endpoint_id"));
-            d.writeback("dsql.runtime_role_arn", runtime_role.output("role_arn"));
-            d.writeback("dsql.admin_role_arn", admin_role.output("role_arn"));
+            cluster
         }
     }
 }

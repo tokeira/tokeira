@@ -169,9 +169,9 @@ mod tests {
 
         let preexisting = dsql::DsqlIamRole {
             id: "dsql:runtime-role".into(),
-            mode: dsql::RoleMode::Preexisting {
+            mode: dsql::RoleMode::Preexisting(dsql::PreexistingRole {
                 role_arn: "arn:aws:iam::1:role/adopted".into(),
-            },
+            }),
         }
         .realize(&placement(Vec::new()))
         .expect("preexisting role");
@@ -179,12 +179,12 @@ mod tests {
 
         let managed = dsql::DsqlIamRole {
             id: "dsql:runtime-role".into(),
-            mode: dsql::RoleMode::Managed {
+            mode: dsql::RoleMode::Managed(dsql::ManagedRole {
                 region: "eu-west-2".into(),
                 role_name: "tokeira-dsql-runtime".into(),
                 policy_name: "dsql-connect".into(),
                 action: "dsql:DbConnect".into(),
-            },
+            }),
         }
         .realize(&placement(vec![tokeira_iac::ResourceId(
             "dsql:cluster".into(),
@@ -228,12 +228,12 @@ mod tests {
 
         let role_error = dsql::DsqlIamRole {
             id: "dsql:runtime-role".into(),
-            mode: dsql::RoleMode::Managed {
+            mode: dsql::RoleMode::Managed(dsql::ManagedRole {
                 region: "eu-west-2".into(),
                 role_name: "tokeira-dsql-runtime".into(),
                 policy_name: "dsql-connect".into(),
                 action: "dsql:DbConnect".into(),
-            },
+            }),
         }
         .realize(&placement(Vec::new()))
         .expect_err("no cluster declared");

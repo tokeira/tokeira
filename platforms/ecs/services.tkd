@@ -1,0 +1,30 @@
+// The services module: the Service Connect namespace, the application
+// workloads' task and execution roles (infrastructure), and every workload
+// as a deploy-plane service. Infrastructure apply never deploys a workload:
+// the Workload resources here carry manifests the deploy engine applies in
+// its own `deploy plan`/`deploy apply` pass.
+
+use platform::{DaemonPolicy, Ecs, ReplicaPolicy};
+
+pub fn define(d: Deployment, cfg: Ecs, cx: Context, services: Module, vpc: Resource) {
+    services.resource(
+        "namespace",
+        CloudMapNamespace { name: cfg.cluster.service_connect_namespace.clone() },
+        vec![vpc],
+    );
+
+    services.resource(
+        "tokeira-autoscaler",
+        EcsWorkload {
+            service: "tokeira-autoscaler".into(),
+            environment: cfg.environment.clone(),
+            region: cfg.aws.region.clone(),
+            cluster: cfg.cluster.name.clone(),
+            service_connect_namespace: cfg.cluster.service_connect_namespace.clone(),
+            image: cfg.services.autoscaler.image.clone(),
+            cpu: cfg.services.autoscaler.cpu,
+            memory_mb: cfg.services.autoscaler.memory_mb,
+        },
+    );
+
+}

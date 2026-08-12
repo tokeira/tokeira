@@ -144,10 +144,24 @@ pub struct PreexistingRole {
     pub role_arn: String,
 }
 
-// Role provenance, in the platform kind's vocabulary.
+// Role provenance, in the platform kind's vocabulary. Tuple variants: the
+// definition frontend does not admit struct enum variants.
 pub enum RoleMode {
     Managed(ManagedRole),
     Preexisting(PreexistingRole),
+}
+
+// Generated secret material: a username and the generated password length.
+pub struct GeneratedPassword {
+    pub username: String,
+    pub password_length: i32,
+}
+
+// Secret material source, in the provider kind's vocabulary. Tuple
+// variants: the definition frontend does not admit struct enum variants.
+pub enum SecretSource {
+    Static(String),
+    GeneratedPasswordJson(GeneratedPassword),
 }
 
 // One authored security-group ingress rule, in the provider kind's shape.

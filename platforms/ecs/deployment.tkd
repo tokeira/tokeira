@@ -1,0 +1,277 @@
+// The ECS deployment, as the root document of a nine-part definition. The
+// root reads as the wiring diagram: every module and its dependencies are
+// declared here, along with the resources more than one part stands on —
+// the VPC, the endpoint and runtime security groups. Module contents live
+// in their parts; the configuration model lives in `platform`.
+
+mod platform;
+mod helpers;
+mod remote_state;
+mod images;
+mod networking;
+mod dsql;
+mod cluster;
+mod observability;
+mod services;
+
+use platform::{
+    Alb, AlbProtocol, Autoscaler, Aws, Capacity, CapacityPlane, Cluster, DaemonPolicy, Dsql, Ecs,
+    GeneratedPassword, IngressRule, ManagedRole, Networking, Observability, PreexistingRole,
+    ReplicaPolicy, RoleMode, SecretSource, Services,
+};
+
+// The deployment's configuration values. This function is the operator
+// surface: its literals are the defaults a new deployment starts from, and
+// revisions edit them in place.
+fn config() -> Ecs {
+    Ecs {
+        environment: "dev".into(),
+        aws: Aws { region: "eu-west-2".into() },
+        cluster: Cluster {
+            name: "tokeira".into(),
+            service_connect_namespace: "tokeira.internal".into(),
+        },
+        networking: Networking {
+            vpc_cidr: "10.42.0.0/16".into(),
+            availability_zones: vec!["eu-west-2a".into(), "eu-west-2b".into(), "eu-west-2c".into()],
+            private_dns_zone: "tokeira.internal".into(),
+        },
+        dsql: Dsql::Managed,
+        services: Services {
+            edge_api: ReplicaPolicy { image: "tokeirad:latest".into(), replicas: 2, cpu: 1024, memory_mb: 2048 },
+            edge_poll: ReplicaPolicy { image: "tokeirad:latest".into(), replicas: 2, cpu: 1024, memory_mb: 2048 },
+            runtime: DaemonPolicy { image: "tokeirad:latest".into(), cpu: 2048, memory_mb: 4096 },
+            projection: ReplicaPolicy { image: "tokeirad:latest".into(), replicas: 2, cpu: 1024, memory_mb: 2048 },
+            controller: ReplicaPolicy { image: "tokeirad:latest".into(), replicas: 1, cpu: 512, memory_mb: 1024 },
+            autoscaler: Autoscaler { image: "tokeira-autoscaler:latest".into(), polling_interval_secs: 30, cpu: 256, memory_mb: 512 },
+            admin: ReplicaPolicy { image: "tokeirad:latest".into(), replicas: 1, cpu: 512, memory_mb: 1024 },
+        },
+        capacity: Capacity {
+            edge_api: CapacityPlane { instance_type: "c8g.large".into(), min: 1, desired: 2, max: 8 },
+            edge_poll: CapacityPlane { instance_type: "c8g.large".into(), min: 1, desired: 2, max: 8 },
+            runtime: CapacityPlane { instance_type: "c8g.xlarge".into(), min: 1, desired: 2, max: 8 },
+            projection: CapacityPlane { instance_type: "c8g.large".into(), min: 1, desired: 2, max: 8 },
+            control: CapacityPlane { instance_type: "c8g.large".into(), min: 1, desired: 1, max: 4 },
+            mimir: CapacityPlane { instance_type: "c8g.large".into(), min: 1, desired: 1, max: 1 },
+            loki: CapacityPlane { instance_type: "c8g.large".into(), min: 1, desired: 1, max: 1 },
+            grafana: CapacityPlane { instance_type: "c8g.large".into(), min: 1, desired: 1, max: 1 },
+        },
+        alb: Alb {
+            protocol: AlbProtocol::Http2,
+            health_check_path: "/health".into(),
+            health_check_interval_secs: 30,
+        },
+        observability: Observability {
+            mimir: DaemonPolicy { image: "grafana/mimir:3.0.6".into(), cpu: 1024, memory_mb: 2048 },
+            loki: DaemonPolicy { image: "grafana/loki:3.7.1".into(), cpu: 1024, memory_mb: 2048 },
+            grafana: DaemonPolicy { image: "grafana/grafana-oss:12.4.3".into(), cpu: 512, memory_mb: 1024 },
+            alloy_image: "grafana/alloy:v1.16.0".into(),
+            aws_cli_image: "amazon/aws-cli:2.17.0".into(),
+            busybox_image: "busybox:1.36".into(),
+            retention_days: 14,
+        },
+    }
+}
+
+// The deployment graph. Module dependencies order coarsely; the resources
+// declared here are the ones several parts stand on, passed to each part
+// that needs them.
+fn deployment(cfg: Ecs, cx: Context) -> Deployment {
+    let d = Deployment::new(&["default"]);
+
+    // Bootstrap: the remote-state bucket everything else stands on.
+    let remote_state = d.module("remote_state", vec![]);
+    remote_state::define(d, cfg, cx, remote_state);
+
+    // Image repositories depend on the bootstrap only — the single
+    // dependency-free module is the framework's bootstrap contract.
+    let images = d.module("images", vec![remote_state]);
+    images::define(d, cfg, cx, images);
+
+    // Networking: the VPC and the two cross-part security groups are
+    // declared at the root so downstream parts can depend on them.
+    let networking = d.module("networking", vec![remote_state]);
+    let vpc = networking.resource(
+        "vpc",
+        Vpc {
+            region: cfg.aws.region.clone(),
+            cidr: cfg.networking.vpc_cidr.clone(),
+            availability_zones: cfg.networking.availability_zones.clone(),
+        },
+    );
+    let endpoint_sg = networking.resource(
+        "sg-vpc-endpoints",
+        SecurityGroup {
+            region: cfg.aws.region.clone(),
+            name: "vpc-endpoints".into(),
+            description: "Tokeira ECS VPC endpoints security group".into(),
+            ingress: vec![IngressRule {
+                description: "self VPC endpoints traffic".into(),
+                protocol: "tcp".into(),
+                from_port: 443,
+                to_port: 443,
+                source: "self".into(),
+            }],
+        },
+        vec![vpc],
+    );
+    let runtime_sg = networking.resource(
+        "sg-runtime",
+        SecurityGroup {
+            region: cfg.aws.region.clone(),
+            name: "runtime".into(),
+            description: "Tokeira ECS runtime services security group".into(),
+            ingress: vec![IngressRule {
+                description: "self runtime services traffic".into(),
+                protocol: "tcp".into(),
+                from_port: 7241,
+                to_port: 7241,
+                source: "self".into(),
+            }],
+        },
+        vec![vpc],
+    );
+    helpers::edge_group(networking, vpc, cfg.aws.region.clone(), "edge", "edge services", 7233);
+    helpers::edge_group(networking, vpc, cfg.aws.region.clone(), "projection", "projection services", 7242);
+    helpers::edge_group(networking, vpc, cfg.aws.region.clone(), "control", "control services", 7240);
+    helpers::interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ecs", "ecs");
+    helpers::interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ecs-agent", "ecs-agent");
+    helpers::interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ecs-telemetry", "ecs-telemetry");
+    helpers::interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ecr-api", "ecr.api");
+    helpers::interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ecr-dkr", "ecr.dkr");
+    helpers::interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "autoscaling", "autoscaling");
+    helpers::interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "servicediscovery", "servicediscovery");
+    helpers::interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ssm", "ssm");
+    helpers::interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ssmmessages", "ssmmessages");
+    helpers::interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ec2messages", "ec2messages");
+    networking::define(d, cfg, cx, networking, vpc, endpoint_sg);
+
+    let dsql = d.module("dsql", vec![networking]);
+    let dsql_cluster = dsql::define(d, cfg, cx, dsql, vpc, endpoint_sg);
+    // The DSQL role resources live here, not in the part: their mode
+    // carries a tuple-variant payload, and the frontend admits tuple
+    // construction in the root document only.
+    match &cfg.dsql {
+        Dsql::Managed => {
+            let runtime_role = dsql.resource(
+                "runtime_role",
+                DsqlIamRole {
+                    id: "dsql:runtime-role".into(),
+                    mode: RoleMode::Managed(ManagedRole {
+                        region: cfg.aws.region.clone(),
+                        role_name: format!("{}-dsql-runtime", cx.project_name),
+                        policy_name: "dsql-runtime".into(),
+                        action: "dsql:DbConnect".into(),
+                    }),
+                },
+                vec![dsql_cluster],
+            );
+            let admin_role = dsql.resource(
+                "admin_role",
+                DsqlIamRole {
+                    id: "dsql:admin-role".into(),
+                    mode: RoleMode::Managed(ManagedRole {
+                        region: cfg.aws.region.clone(),
+                        role_name: format!("{}-dsql-admin", cx.project_name),
+                        policy_name: "dsql-admin".into(),
+                        action: "dsql:DbConnectAdmin".into(),
+                    }),
+                },
+                vec![dsql_cluster],
+            );
+            d.writeback("dsql.runtime_role_arn", runtime_role.output("role_arn"));
+            d.writeback("dsql.admin_role_arn", admin_role.output("role_arn"));
+        }
+        Dsql::Preexisting(adopted) => {
+            let runtime_role = dsql.resource(
+                "runtime_role",
+                DsqlIamRole {
+                    id: "dsql:runtime-role".into(),
+                    mode: RoleMode::Preexisting(PreexistingRole {
+                        role_arn: adopted.runtime_role_arn.clone(),
+                    }),
+                },
+            );
+            let admin_role = dsql.resource(
+                "admin_role",
+                DsqlIamRole {
+                    id: "dsql:admin-role".into(),
+                    mode: RoleMode::Preexisting(PreexistingRole {
+                        role_arn: adopted.admin_role_arn.clone(),
+                    }),
+                },
+            );
+            d.writeback("dsql.runtime_role_arn", runtime_role.output("role_arn"));
+            d.writeback("dsql.admin_role_arn", admin_role.output("role_arn"));
+        }
+    }
+
+    // The cluster part declares the cluster itself; its eight capacity
+    // planes are the same assembly wired here, one helper call per plane.
+    let cluster = d.module("cluster", vec![dsql]);
+    let ecs_cluster = cluster::define(d, cfg, cx, cluster);
+    helpers::plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-edge-api", "edge-api", cfg.capacity.edge_api, false);
+    helpers::plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-edge-poll", "edge-poll", cfg.capacity.edge_poll, false);
+    helpers::plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-runtime", "runtime", cfg.capacity.runtime, true);
+    helpers::plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-projection", "projection", cfg.capacity.projection, false);
+    helpers::plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-control", "control", cfg.capacity.control, false);
+    helpers::plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-mimir", "mimir", cfg.capacity.mimir, false);
+    helpers::plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-loki", "loki", cfg.capacity.loki, false);
+    helpers::plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-grafana", "grafana", cfg.capacity.grafana, false);
+
+    let observability = d.module("observability", vec![cluster, images]);
+    observability::define(d, cfg, cx, observability);
+    // The Grafana admin secret lives here for the same tuple-variant
+    // reason as the DSQL roles.
+    observability.resource(
+        "grafana_admin_secret",
+        SecretsManagerSecret {
+            region: cfg.aws.region.clone(),
+            name: "tokeira/grafana/admin".into(),
+            source: SecretSource::GeneratedPasswordJson(GeneratedPassword {
+                username: "admin".into(),
+                password_length: 32,
+            }),
+            recovery_window_days: 7,
+        },
+    );
+    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-edge-api");
+    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-edge-poll");
+    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-runtime");
+    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-projection");
+    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-controller");
+    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-autoscaler");
+    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-admin");
+    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-mimir");
+    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-loki");
+    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-grafana");
+
+    let services = d.module("services", vec![observability, images]);
+    services::define(d, cfg, cx, services, vpc);
+    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-edge-api");
+    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-edge-poll");
+    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-runtime");
+    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-projection");
+    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-controller");
+    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-autoscaler");
+    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-admin");
+    helpers::replica(services, cfg, "tokeira-edge-api", cfg.services.edge_api);
+    helpers::replica(services, cfg, "tokeira-edge-poll", cfg.services.edge_poll);
+    helpers::daemon(services, cfg, "tokeira-runtime", cfg.services.runtime);
+    helpers::replica(services, cfg, "tokeira-projection", cfg.services.projection);
+    helpers::replica(services, cfg, "tokeira-controller", cfg.services.controller);
+    helpers::replica(services, cfg, "tokeira-admin", cfg.services.admin);
+    helpers::daemon(services, cfg, "tokeira-mimir", cfg.observability.mimir);
+    helpers::daemon(services, cfg, "tokeira-loki", cfg.observability.loki);
+    helpers::daemon(services, cfg, "tokeira-grafana", cfg.observability.grafana);
+
+    d
+}

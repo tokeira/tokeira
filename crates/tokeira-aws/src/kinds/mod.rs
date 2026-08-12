@@ -552,10 +552,12 @@ mod tests {
             secrets_manager_secret::SecretsManagerSecret {
                 region: "eu-west-2".into(),
                 name: "tokeira/grafana/admin".into(),
-                source: secrets_manager_secret::SecretSource::GeneratedPasswordJson {
-                    username: "admin".into(),
-                    password_length: 24,
-                },
+                source: secrets_manager_secret::SecretSource::GeneratedPasswordJson(
+                    secrets_manager_secret::GeneratedPassword {
+                        username: "admin".into(),
+                        password_length: 24,
+                    },
+                ),
                 recovery_window_days: None,
             }
             .realize(&no_deps)

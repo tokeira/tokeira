@@ -5,20 +5,13 @@
 // Ports here are the platform's canonical service ports — derived facts of
 // the topology, not operator policy, so they are literals in this document.
 
-use platform::{AlbProtocol, Ecs};
+use platform::{AlbProtocol, Ecs, EndpointKind, IngressRule, ListenerProtocol};
 
-pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module) {
-    let vpc = networking.resource(
-        "vpc",
-        Vpc {
-            region: cfg.aws.region.clone(),
-            cidr: cfg.networking.vpc_cidr.clone(),
-            availability_zones: cfg.networking.availability_zones.clone(),
-        },
-    );
-
+// The VPC and the endpoint security group arrive from the root, which owns
+// the resources several parts stand on. This part declares the rest.
+pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module, vpc: Resource, endpoint_sg: Resource) {
     // The ALB group listens on the listener's own port; the others carry
-    // their family's canonical gRPC port; the endpoint group carries TLS.
+    // their family's canonical gRPC port.
     let listener_port = match &cfg.alb.protocol {
         AlbProtocol::Http2 => 80,
         AlbProtocol::Https(_) => 443,
@@ -41,40 +34,10 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module) {
         vec![vpc],
     );
 
-    edge_group(networking, vpc, cfg.aws.region.clone(), "edge", "edge services", 7233);
-    edge_group(networking, vpc, cfg.aws.region.clone(), "runtime", "runtime services", 7241);
-    edge_group(networking, vpc, cfg.aws.region.clone(), "projection", "projection services", 7242);
-    edge_group(networking, vpc, cfg.aws.region.clone(), "control", "control services", 7240);
-    let endpoint_sg = networking.resource(
-        "sg-vpc-endpoints",
-        SecurityGroup {
-            region: cfg.aws.region.clone(),
-            name: "vpc-endpoints".into(),
-            description: "Tokeira ECS VPC endpoints security group".into(),
-            ingress: vec![IngressRule {
-                description: "self VPC endpoints traffic".into(),
-                protocol: "tcp".into(),
-                from_port: 443,
-                to_port: 443,
-                source: "self".into(),
-            }],
-        },
-        vec![vpc],
-    );
 
     // The private substrate's required AWS endpoints. Interface endpoints
     // attach the endpoint security group; the S3 gateway rides the route
     // tables. DSQL's own endpoints belong to the dsql module.
-    interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ecs", "ecs");
-    interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ecs-agent", "ecs-agent");
-    interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ecs-telemetry", "ecs-telemetry");
-    interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ecr-api", "ecr.api");
-    interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ecr-dkr", "ecr.dkr");
-    interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "autoscaling", "autoscaling");
-    interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "servicediscovery", "servicediscovery");
-    interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ssm", "ssm");
-    interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ssmmessages", "ssmmessages");
-    interface(networking, vpc, endpoint_sg, cfg.aws.region.clone(), "ec2messages", "ec2messages");
     networking.resource(
         "vpce-s3",
         VpcEndpoint {
@@ -129,39 +92,5 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module) {
             edge_poll_target_group: "tokeira-edge-poll".into(),
         },
         vec![alb, edge_api_tg, edge_poll_tg],
-    );
-}
-
-// A workload-family security group on its canonical port.
-pub fn edge_group(networking: Module, vpc: Resource, region: String, name: String, description: String, port: u16) {
-    networking.resource(
-        format!("sg-{}", name),
-        SecurityGroup {
-            region: region,
-            name: name.clone(),
-            description: format!("Tokeira ECS {} security group", description),
-            ingress: vec![IngressRule {
-                description: format!("self {} traffic", description),
-                protocol: "tcp".into(),
-                from_port: port,
-                to_port: port,
-                source: "self".into(),
-            }],
-        },
-        vec![vpc],
-    );
-}
-
-// One interface endpoint for a private AWS service.
-pub fn interface(networking: Module, vpc: Resource, endpoint_sg: Resource, region: String, short: String, service: String) {
-    networking.resource(
-        format!("vpce-{}", short),
-        VpcEndpoint {
-            region: region.clone(),
-            short_name: short,
-            service_name: format!("com.amazonaws.{}.{}", region, service),
-            endpoint_type: EndpointKind::Interface,
-        },
-        vec![vpc, endpoint_sg],
     );
 }

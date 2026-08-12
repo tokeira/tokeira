@@ -11,6 +11,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod config;
+pub mod execution;
 pub mod gates;
 pub mod images;
 pub mod kinds;

@@ -1,8 +1,8 @@
 // The observability module's infrastructure: storage buckets and their
 // scoped roles, the Grafana admin secret, the rendered Alloy sidecar
-// parameters, the shipped artifact tree, and the observability workloads'
-// task and execution roles. The Mimir, Loki, and Grafana workloads
-// themselves are services — the deploy plane owns them (services part).
+// parameters, and the shipped artifact tree. The root retains the three
+// workloads' IAM role handles so their deploy-plane services can depend on
+// them; the roles remain owned by this infrastructure module.
 
 use platform::Ecs;
 
@@ -47,24 +47,5 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, observability: Module) {
         "artifacts",
         ObservabilityArtifacts {},
         vec![artifacts_bucket],
-    );
-
-    // The observability workloads' identity: task roles for all three,
-    // an execution role for Grafana (its container reads the admin secret).
-    observability.resource(
-        "mimir_task_role",
-        EcsTaskRole { service: "tokeira-mimir".into(), region: cfg.aws.region.clone() },
-    );
-    observability.resource(
-        "loki_task_role",
-        EcsTaskRole { service: "tokeira-loki".into(), region: cfg.aws.region.clone() },
-    );
-    observability.resource(
-        "grafana_task_role",
-        EcsTaskRole { service: "tokeira-grafana".into(), region: cfg.aws.region.clone() },
-    );
-    observability.resource(
-        "grafana_execution_role",
-        EcsExecutionRole { service: "tokeira-grafana".into(), region: cfg.aws.region.clone() },
     );
 }

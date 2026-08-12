@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tokeira_deploy_engine as deploy_engine;
+use tokeira_iac::ResourceId;
 
 use crate::config::{
     ALLOY_CONFIG_INIT_CPU, ALLOY_CONFIG_INIT_MEMORY_MB, DaemonServiceConfig, EcsConfig,
@@ -27,6 +28,16 @@ pub struct EcsWorkload {
     pub task_definition: TaskDefinitionSpec,
     pub service_connect: ServiceConnectSpec,
     pub placement_constraints: Vec<PlacementConstraint>,
+    /// Infrastructure identity of the IAM role assumed by the task's
+    /// containers. Definition-realized workloads resolve its provider ARN
+    /// from the recorded infrastructure state when manifests are produced;
+    /// legacy-built workloads leave it absent and retain their existing path.
+    #[serde(skip)]
+    pub(crate) task_role_dependency: Option<ResourceId>,
+    /// Infrastructure identity of the ECS-agent execution role, when the task
+    /// needs agent-side ECR or Secrets Manager access.
+    #[serde(skip)]
+    pub(crate) execution_role_dependency: Option<ResourceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +131,18 @@ pub struct PlacementConstraint {
 }
 
 impl EcsWorkload {
+    /// Bind the infrastructure roles explicitly declared as this workload's
+    /// definition dependencies.
+    pub(crate) fn with_role_dependencies(
+        mut self,
+        task_role: ResourceId,
+        execution_role: Option<ResourceId>,
+    ) -> Self {
+        self.task_role_dependency = Some(task_role);
+        self.execution_role_dependency = execution_role;
+        self
+    }
+
     pub fn build_all(config: &EcsConfig) -> Vec<Self> {
         vec![
             replica_workload(
@@ -250,13 +273,27 @@ impl deploy_engine::Service for EcsWorkload {
 
     fn manifests(
         &self,
-        _ctx: &deploy_engine::ServiceContext,
+        ctx: &deploy_engine::ServiceContext,
     ) -> Result<Vec<serde_json::Value>, deploy_engine::DeployError> {
+        let task_role_arn = role_arn(
+            &ctx.infra_state,
+            self.task_role_dependency.as_ref(),
+            &self.name,
+            "task",
+        )?;
+        let execution_role_arn = role_arn(
+            &ctx.infra_state,
+            self.execution_role_dependency.as_ref(),
+            &self.name,
+            "execution",
+        )?;
         let task_definition = serde_json::json!({
             "kind": "ecs-task-definition",
             "service": self.name,
             "region": self.region,
             "spec": self.task_definition,
+            "task_role_arn": task_role_arn,
+            "execution_role_arn": execution_role_arn,
         });
         let service = serde_json::json!({
             "kind": "ecs-service",
@@ -271,6 +308,35 @@ impl deploy_engine::Service for EcsWorkload {
         });
         Ok(vec![task_definition, service])
     }
+}
+
+fn role_arn(
+    state: &tokeira_iac::InfraState,
+    dependency: Option<&ResourceId>,
+    service: &str,
+    role_class: &str,
+) -> Result<Option<String>, deploy_engine::DeployError> {
+    let Some(dependency) = dependency else {
+        return Ok(None);
+    };
+    let resource = state.resources.get(dependency).ok_or_else(|| {
+        deploy_engine::RuntimeError::Service(format!(
+            "ECS workload `{service}` needs its {role_class} role `{}` in recorded infrastructure state; run `infra apply` before `deploy apply`",
+            dependency.0
+        ))
+    })?;
+    let arn = resource
+        .properties
+        .get("role_arn")
+        .and_then(serde_json::Value::as_str)
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| {
+            deploy_engine::RuntimeError::Service(format!(
+                "ECS workload `{service}` found {role_class} role `{}` without its `role_arn` output in recorded infrastructure state",
+                dependency.0
+            ))
+        })?;
+    Ok(Some(arn.to_owned()))
 }
 
 fn replica_workload(
@@ -443,6 +509,8 @@ fn workload_from_parts(
             r#type: "memberOf".into(),
             expression: format!("attribute:workload == {workload}"),
         }],
+        task_role_dependency: None,
+        execution_role_dependency: None,
     }
 }
 
@@ -644,6 +712,19 @@ mod tests {
 
     use super::*;
     use tokeira_deploy_engine::Service;
+    use tokeira_iac::{ResourceState, ResourceType};
+
+    fn role_state(id: &ResourceId, arn: &str) -> ResourceState {
+        ResourceState {
+            resource_type: ResourceType::new("IamRole"),
+            physical_id: arn.to_owned(),
+            properties: serde_json::json!({ "role_arn": arn }),
+            dependencies: Vec::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            module: id.0.clone(),
+        }
+    }
 
     #[test]
     fn build_all_generates_seven_tokeira_workloads() {
@@ -856,6 +937,58 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true)
         );
+    }
+
+    #[test]
+    fn definition_workload_resolves_role_arns_from_recorded_infrastructure() {
+        let task = ResourceId("iam-role-demo-tokeira-runtime-task".into());
+        let execution = ResourceId("iam-role-demo-tokeira-runtime-execution".into());
+        let workload = EcsWorkload::build_all(&EcsConfig::default())
+            .into_iter()
+            .find(|workload| workload.name == "tokeira-runtime")
+            .expect("runtime workload")
+            .with_role_dependencies(task.clone(), Some(execution.clone()));
+        let mut ctx = deploy_engine::ServiceContext::default();
+        ctx.infra_state.resources.insert(
+            task.clone(),
+            role_state(&task, "arn:aws:iam::1:role/runtime-task"),
+        );
+        ctx.infra_state.resources.insert(
+            execution.clone(),
+            role_state(&execution, "arn:aws:iam::1:role/runtime-execution"),
+        );
+
+        let manifests = workload.manifests(&ctx).expect("role outputs resolve");
+
+        assert_eq!(
+            manifests[0]
+                .get("task_role_arn")
+                .and_then(serde_json::Value::as_str),
+            Some("arn:aws:iam::1:role/runtime-task")
+        );
+        assert_eq!(
+            manifests[0]
+                .get("execution_role_arn")
+                .and_then(serde_json::Value::as_str),
+            Some("arn:aws:iam::1:role/runtime-execution")
+        );
+    }
+
+    #[test]
+    fn definition_workload_refuses_a_missing_recorded_role() {
+        let task = ResourceId("iam-role-demo-tokeira-runtime-task".into());
+        let workload = EcsWorkload::build_all(&EcsConfig::default())
+            .into_iter()
+            .find(|workload| workload.name == "tokeira-runtime")
+            .expect("runtime workload")
+            .with_role_dependencies(task.clone(), None);
+
+        let error = workload
+            .manifests(&deploy_engine::ServiceContext::default())
+            .expect_err("infra apply has not recorded the role");
+
+        assert!(error.to_string().contains(&task.0), "{error}");
+        assert!(error.to_string().contains("infra apply"), "{error}");
     }
 
     #[test]

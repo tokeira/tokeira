@@ -20,10 +20,11 @@ pub const EXECUTION_ROLE_TYPE: &str = "EcsExecutionRole";
 pub const STORAGE_ROLE_TYPE: &str = "ObservabilityStorageRole";
 
 fn base_config(placement: &PlacementContext, region: &str) -> EcsConfig {
-    let mut config = EcsConfig::default();
-    config.project_name = placement.deployment_id.clone();
-    config.region = region.to_string();
-    config
+    EcsConfig {
+        project_name: placement.deployment_id.clone(),
+        region: region.to_string(),
+        ..EcsConfig::default()
+    }
 }
 
 /// Reusable author input for one service's task role: ECS Exec plus Alloy

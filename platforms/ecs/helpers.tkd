@@ -102,16 +102,17 @@ pub fn alloy(observability: Module, region: String, service: String) {
     );
 }
 
-// One application task role.
-pub fn task_role(services: Module, region: String, service: String) {
+// One application task role, returned so the workload can name it as an
+// infrastructure dependency.
+pub fn task_role(services: Module, region: String, service: String) -> Resource {
     services.resource(
         format!("task-role-{}", service),
         EcsTaskRole { service: service, region: region },
-    );
+    )
 }
 
 // One replica-scheduled workload.
-pub fn replica(services: Module, cfg: Ecs, service: String, policy: ReplicaPolicy) {
+pub fn replica(services: Module, cfg: Ecs, service: String, policy: ReplicaPolicy, roles: Vec<Resource>) {
     services.resource(
         service.clone(),
         EcsWorkload {
@@ -125,11 +126,12 @@ pub fn replica(services: Module, cfg: Ecs, service: String, policy: ReplicaPolic
             cpu: policy.cpu,
             memory_mb: policy.memory_mb,
         },
+        roles,
     );
 }
 
 // One daemon-scheduled workload: no replica count to author.
-pub fn daemon(services: Module, cfg: Ecs, service: String, policy: DaemonPolicy) {
+pub fn daemon(services: Module, cfg: Ecs, service: String, policy: DaemonPolicy, roles: Vec<Resource>) {
     services.resource(
         service.clone(),
         EcsWorkload {
@@ -142,5 +144,6 @@ pub fn daemon(services: Module, cfg: Ecs, service: String, policy: DaemonPolicy)
             cpu: policy.cpu,
             memory_mb: policy.memory_mb,
         },
+        roles,
     );
 }

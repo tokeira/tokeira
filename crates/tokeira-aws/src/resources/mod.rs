@@ -17,6 +17,7 @@ pub mod elbv2;
 pub mod iam_instance_profile;
 pub mod iam_role;
 pub mod pod_identity_association;
+pub mod remote_state_bucket;
 pub mod s3_bucket;
 pub mod s3_object;
 pub mod secrets_manager_secret;

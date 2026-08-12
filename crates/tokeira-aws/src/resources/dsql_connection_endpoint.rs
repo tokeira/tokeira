@@ -193,6 +193,10 @@ impl Resource for DsqlConnectionEndpoint {
         ResourceType::new("DsqlConnectionEndpoint")
     }
 
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &["endpoint_id", "private_hostname"]
+    }
+
     fn resource_id(&self) -> ResourceId {
         self.config
             .resource_id

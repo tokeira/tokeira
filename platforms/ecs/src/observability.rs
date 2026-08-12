@@ -270,9 +270,11 @@ pub struct AlloyConfig {
 
 impl Kind<AlloyConfigResource> for AlloyConfig {
     fn realize(&self, placement: &PlacementContext) -> Result<AlloyConfigResource, KindError> {
-        let mut config = tokeira_ecs::EcsConfig::default();
-        config.project_name = placement.deployment_id.clone();
-        config.region = self.region.clone();
+        let config = tokeira_ecs::EcsConfig {
+            project_name: placement.deployment_id.clone(),
+            region: self.region.clone(),
+            ..tokeira_ecs::EcsConfig::default()
+        };
         Ok(AlloyConfigResource {
             inner: SsmParameterResource {
                 name: format!(

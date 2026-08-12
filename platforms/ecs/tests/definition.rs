@@ -2,11 +2,15 @@
 //! documents resolve as parts beside the root and build the deployment
 //! through the real platform namespaces, with nothing stubbed.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use serde::Serialize;
-use tokeira_platform::definition::{
-    DefinitionFrontend, DefinitionSourceName, DirectoryPartSources, FrontendOutput, FrontendSource,
+use tokeira_platform::{
+    definition::{
+        DefinitionFrontend, DefinitionSource, DefinitionSourceName, DirectoryPartSources,
+        EvaluatedDefinition, evaluate_definition, verify_definition,
+    },
+    kind::DecodedKind,
 };
 
 #[derive(Serialize)]
@@ -14,24 +18,26 @@ struct Ctx {
     project_name: String,
 }
 
-fn evaluate(root_text: &str) -> Result<FrontendOutput, String> {
+fn evaluate(root_text: &str) -> Result<EvaluatedDefinition<DecodedKind>, String> {
     let package = Path::new(env!("CARGO_MANIFEST_DIR"));
     let platform = tokeira_ecs_deployment::platform();
     let parts = DirectoryPartSources::new(package, "tkd");
     let source_name = DefinitionSourceName::AuthoringPath(package.join("deployment.tkd"));
-    tokeira_tkd::frontend()
-        .evaluate(
-            FrontendSource {
-                source_name: &source_name,
-                bytes: root_text.as_bytes(),
-            },
-            &Ctx {
-                project_name: "demo".to_string(),
-            },
-            &platform.namespaces,
-            &parts,
-        )
-        .map_err(|diagnostic| diagnostic.to_string())
+    let frontend = tokeira_tkd::frontend();
+    evaluate_definition(
+        &frontend,
+        DefinitionSource {
+            format: frontend.format().clone(),
+            source_name,
+            bytes: Arc::from(root_text.as_bytes()),
+        },
+        &Ctx {
+            project_name: "demo".to_string(),
+        },
+        &platform.namespaces,
+        &parts,
+    )
+    .map_err(|diagnostic| diagnostic.to_string())
 }
 
 fn shipped_root() -> String {
@@ -39,8 +45,24 @@ fn shipped_root() -> String {
         .expect("the shipped root document reads")
 }
 
+#[test]
+fn cluster_uses_the_authored_service_connect_namespace() {
+    let cluster =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("cluster.tkd"))
+            .expect("the shipped cluster part reads");
+
+    assert!(
+        cluster.contains("cfg.cluster.service_connect_namespace.clone()"),
+        "the cluster default must follow the Service Connect setting"
+    );
+    assert!(
+        !cluster.contains("cfg.networking.private_dns_zone.clone()"),
+        "private DNS and Service Connect may be authored independently"
+    );
+}
+
 // The shipped defaults select managed DSQL: seven modules in dependency
-// order, and the managed mode's three writeback declarations.
+// order, and all five DSQL writeback declarations.
 #[test]
 fn the_shipped_set_evaluates_with_managed_defaults() {
     let output = evaluate(&shipped_root()).expect("the shipped definition set evaluates");
@@ -63,9 +85,7 @@ fn the_shipped_set_evaluates_with_managed_defaults() {
         ]
     );
 
-    // Managed mode's writebacks: the cluster endpoint plus the two role
-    // ARNs. The two endpoint-id writebacks await declared outputs on the
-    // provider endpoint resources (the recorded follow-up).
+    // Managed and preexisting modes publish the same complete DSQL surface.
     let mut keys: Vec<&str> = output
         .graph
         .writeback()
@@ -77,18 +97,22 @@ fn the_shipped_set_evaluates_with_managed_defaults() {
         keys,
         [
             "dsql.admin_role_arn",
+            "dsql.connection_endpoint_id",
             "dsql.endpoint",
+            "dsql.management_endpoint_id",
             "dsql.runtime_role_arn"
         ]
     );
 
     assert_dsql_identities(&output);
     assert_plane_separation(&output);
+    assert_workload_role_dependencies(&output);
+    assert_realizes(&output);
 }
 
 /// Both DSQL modes realize the same five well-known identities in the dsql
 /// module — the invariant every consumer and writeback binds against.
-fn assert_dsql_identities(output: &FrontendOutput) {
+fn assert_dsql_identities(output: &EvaluatedDefinition<DecodedKind>) {
     let mut dsql: Vec<&str> = output
         .graph
         .resources()
@@ -113,7 +137,7 @@ fn assert_dsql_identities(output: &FrontendOutput) {
 /// (every EcsWorkload sits in the services module), and no ECS task
 /// definition or ECS service is authored anywhere in the infrastructure
 /// graph — those kinds are not even advertised to the definition.
-fn assert_plane_separation(output: &FrontendOutput) {
+fn assert_plane_separation(output: &EvaluatedDefinition<DecodedKind>) {
     let workloads: Vec<&str> = output
         .graph
         .resources()
@@ -145,6 +169,48 @@ fn assert_plane_separation(output: &FrontendOutput) {
             .any(|namespace| namespace.kinds.contains(&forbidden));
         assert!(!advertised, "{forbidden} must not be advertised");
     }
+}
+
+/// Every deploy-plane workload explicitly stands on its infrastructure-owned
+/// task role; Grafana also stands on the execution role its secret requires.
+/// The definition graph therefore establishes the phase bridge before the
+/// service reads recorded ARNs.
+fn assert_workload_role_dependencies(output: &EvaluatedDefinition<DecodedKind>) {
+    for workload in output
+        .graph
+        .resources()
+        .iter()
+        .filter(|resource| resource.kind().name() == "EcsWorkload")
+    {
+        let mut dependency_kinds = workload
+            .dependencies()
+            .iter()
+            .map(|dependency| {
+                output
+                    .graph
+                    .resources()
+                    .iter()
+                    .find(|resource| resource.reference() == dependency)
+                    .expect("verified dependency exists")
+                    .kind()
+                    .name()
+            })
+            .collect::<Vec<_>>();
+        dependency_kinds.sort_unstable();
+        let expected = if workload.logical_id() == "tokeira-grafana" {
+            vec!["EcsExecutionRole", "EcsTaskRole"]
+        } else {
+            vec!["EcsTaskRole"]
+        };
+        assert_eq!(dependency_kinds, expected, "{}", workload.logical_id());
+    }
+}
+
+fn assert_realizes(output: &EvaluatedDefinition<DecodedKind>) {
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"));
+    verify_definition(output)
+        .realize("demo", package, package, &std::collections::BTreeMap::new())
+        .expect("the verified definition realizes every resource and service");
 }
 
 // Selecting preexisting DSQL in the root's config keeps the same module
@@ -185,4 +251,8 @@ fn selecting_preexisting_dsql_keeps_identities_and_writes_five_back() {
     );
     assert_dsql_identities(&output);
     assert_plane_separation(&output);
+    assert_workload_role_dependencies(&output);
+    // The preexisting configuration currently has no authored cluster ARN,
+    // so its DsqlCluster kind cannot realize. Closing that separate config
+    // contract gap must be an explicit compatibility decision.
 }

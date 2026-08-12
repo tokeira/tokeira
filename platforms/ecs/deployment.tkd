@@ -228,6 +228,22 @@ fn deployment(cfg: Ecs, cx: Context) -> Deployment {
         "cp-grafana", "grafana", cfg.capacity.grafana, false);
 
     let observability = d.module("observability", vec![cluster, images]);
+    let mimir_task_role = observability.resource(
+        "mimir_task_role",
+        EcsTaskRole { service: "tokeira-mimir".into(), region: cfg.aws.region.clone() },
+    );
+    let loki_task_role = observability.resource(
+        "loki_task_role",
+        EcsTaskRole { service: "tokeira-loki".into(), region: cfg.aws.region.clone() },
+    );
+    let grafana_task_role = observability.resource(
+        "grafana_task_role",
+        EcsTaskRole { service: "tokeira-grafana".into(), region: cfg.aws.region.clone() },
+    );
+    let grafana_execution_role = observability.resource(
+        "grafana_execution_role",
+        EcsExecutionRole { service: "tokeira-grafana".into(), region: cfg.aws.region.clone() },
+    );
     observability::define(d, cfg, cx, observability);
     // The Grafana admin secret lives here for the same tuple-variant
     // reason as the DSQL roles.
@@ -256,22 +272,21 @@ fn deployment(cfg: Ecs, cx: Context) -> Deployment {
 
     let services = d.module("services", vec![observability, images]);
     services::define(d, cfg, cx, services, vpc);
-    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-edge-api");
-    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-edge-poll");
-    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-runtime");
-    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-projection");
-    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-controller");
-    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-autoscaler");
-    helpers::task_role(services, cfg.aws.region.clone(), "tokeira-admin");
-    helpers::replica(services, cfg, "tokeira-edge-api", cfg.services.edge_api);
-    helpers::replica(services, cfg, "tokeira-edge-poll", cfg.services.edge_poll);
-    helpers::daemon(services, cfg, "tokeira-runtime", cfg.services.runtime);
-    helpers::replica(services, cfg, "tokeira-projection", cfg.services.projection);
-    helpers::replica(services, cfg, "tokeira-controller", cfg.services.controller);
-    helpers::replica(services, cfg, "tokeira-admin", cfg.services.admin);
-    helpers::daemon(services, cfg, "tokeira-mimir", cfg.observability.mimir);
-    helpers::daemon(services, cfg, "tokeira-loki", cfg.observability.loki);
-    helpers::daemon(services, cfg, "tokeira-grafana", cfg.observability.grafana);
+    let edge_api_task_role = helpers::task_role(services, cfg.aws.region.clone(), "tokeira-edge-api");
+    let edge_poll_task_role = helpers::task_role(services, cfg.aws.region.clone(), "tokeira-edge-poll");
+    let runtime_task_role = helpers::task_role(services, cfg.aws.region.clone(), "tokeira-runtime");
+    let projection_task_role = helpers::task_role(services, cfg.aws.region.clone(), "tokeira-projection");
+    let controller_task_role = helpers::task_role(services, cfg.aws.region.clone(), "tokeira-controller");
+    let admin_task_role = helpers::task_role(services, cfg.aws.region.clone(), "tokeira-admin");
+    helpers::replica(services, cfg, "tokeira-edge-api", cfg.services.edge_api, vec![edge_api_task_role]);
+    helpers::replica(services, cfg, "tokeira-edge-poll", cfg.services.edge_poll, vec![edge_poll_task_role]);
+    helpers::daemon(services, cfg, "tokeira-runtime", cfg.services.runtime, vec![runtime_task_role]);
+    helpers::replica(services, cfg, "tokeira-projection", cfg.services.projection, vec![projection_task_role]);
+    helpers::replica(services, cfg, "tokeira-controller", cfg.services.controller, vec![controller_task_role]);
+    helpers::replica(services, cfg, "tokeira-admin", cfg.services.admin, vec![admin_task_role]);
+    helpers::daemon(services, cfg, "tokeira-mimir", cfg.observability.mimir, vec![mimir_task_role]);
+    helpers::daemon(services, cfg, "tokeira-loki", cfg.observability.loki, vec![loki_task_role]);
+    helpers::daemon(services, cfg, "tokeira-grafana", cfg.observability.grafana, vec![grafana_task_role, grafana_execution_role]);
 
     d
 }

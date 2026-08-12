@@ -7,7 +7,6 @@
 //! platform declaration lists for the frontend.
 
 pub mod dsql;
-pub mod remote_state;
 pub mod roles;
 pub mod workload;
 
@@ -19,10 +18,7 @@ use tokeira_platform::{
 };
 
 use crate::{
-    modules::{
-        dsql::{AdoptedDsqlResource, DsqlIamRoleResource},
-        remote_state::RemoteStateBucket as RemoteStateBucketResource,
-    },
+    modules::dsql::{AdoptedDsqlResource, DsqlIamRoleResource},
     roles::PlatformRoleResource,
     services::EcsWorkload,
 };
@@ -39,7 +35,6 @@ pub const KINDS: &[&str] = &[
     roles::TASK_ROLE_TYPE,
     workload::TYPE,
     roles::STORAGE_ROLE_TYPE,
-    remote_state::TYPE,
 ];
 
 /// Decode one authored kind of this namespace; `None` when the name is not
@@ -56,10 +51,6 @@ pub fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, Kin
         n if n == workload::TYPE => {
             kind::decode_service::<workload::Workload, EcsWorkload>(workload::TYPE, value)
         }
-        n if n == remote_state::TYPE => kind::decode_resource::<
-            remote_state::RemoteStateBucket,
-            RemoteStateBucketResource,
-        >(remote_state::TYPE, value),
         n if n == roles::TASK_ROLE_TYPE => kind::decode_resource::<
             roles::TaskRole,
             PlatformRoleResource,
@@ -107,7 +98,6 @@ mod tests {
                 "EcsTaskRole",
                 "EcsWorkload",
                 "ObservabilityStorageRole",
-                "RemoteStateBucket",
             ]
         );
         for name in KINDS {
@@ -192,15 +182,6 @@ mod tests {
         .expect("managed role");
         assert_eq!(managed.resource_type().0, dsql::ROLE_TYPE);
 
-        let bucket = remote_state::RemoteStateBucket {
-            region: "eu-west-2".into(),
-            bucket: "demo-state-eu-west-2".into(),
-            key_prefix: Some("demo/dev".into()),
-        }
-        .realize(&placement(Vec::new()))
-        .expect("remote state bucket");
-        assert_eq!(bucket.resource_type().0, remote_state::TYPE);
-
         let workload = workload::Workload {
             service: "tokeira-runtime".into(),
             environment: "dev".into(),
@@ -212,7 +193,9 @@ mod tests {
             cpu: 1024,
             memory_mb: 2048,
         }
-        .realize(&placement(Vec::new()))
+        .realize(&placement(vec![tokeira_iac::ResourceId(
+            "iam-role-demo-tokeira-runtime-task".into(),
+        )]))
         .expect("runtime workload");
         assert_eq!(
             tokeira_deploy_engine::Service::resource_type(&workload),
@@ -259,6 +242,25 @@ mod tests {
         assert!(
             workload_error.message.contains("tokeira-runtime"),
             "the refusal lists the buildable set: {}",
+            workload_error.message
+        );
+
+        let workload_error = workload::Workload {
+            service: "tokeira-runtime".into(),
+            environment: "dev".into(),
+            region: "eu-west-2".into(),
+            cluster: "tokeira".into(),
+            service_connect_namespace: "tokeira.internal".into(),
+            image: "tokeirad:latest".into(),
+            replicas: None,
+            cpu: 1024,
+            memory_mb: 2048,
+        }
+        .realize(&placement(Vec::new()))
+        .expect_err("no task role declared");
+        assert!(
+            workload_error.message.contains("EcsTaskRole"),
+            "{}",
             workload_error.message
         );
     }

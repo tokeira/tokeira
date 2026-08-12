@@ -9,7 +9,7 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, cluster: Module) -> Resource
         "cluster",
         EcsCluster {
             name: cfg.cluster.name.clone(),
-            service_connect_namespace: cfg.networking.private_dns_zone.clone(),
+            service_connect_namespace: cfg.cluster.service_connect_namespace.clone(),
         },
     )
 }

@@ -6,7 +6,9 @@ use tokeira_platform::{
     kind::{Kind, PlacementContext},
 };
 
-use crate::{EcsConfig, services::EcsWorkload};
+use crate::{
+    EcsConfig, modules::services::task_definition_needs_execution_role, services::EcsWorkload,
+};
 
 /// Author-visible name of the realized service type.
 pub const TYPE: &str = "EcsWorkload";
@@ -49,9 +51,11 @@ impl Workload {
     /// Apply the authored values onto the default model at the slot the
     /// canonical service owns. Refuses unknown names with the buildable set.
     fn configured(&self) -> Result<EcsConfig, KindError> {
-        let mut config = EcsConfig::default();
-        config.environment = self.environment.clone();
-        config.region = self.region.clone();
+        let mut config = EcsConfig {
+            environment: self.environment.clone(),
+            region: self.region.clone(),
+            ..EcsConfig::default()
+        };
         config.cluster.name = self.cluster.clone();
         config.cluster.service_connect_namespace = self.service_connect_namespace.clone();
 
@@ -141,14 +145,30 @@ impl Workload {
         }
         Ok(config)
     }
+
+    fn role_dependency(
+        &self,
+        placement: &PlacementContext,
+        role_class: &str,
+    ) -> Option<tokeira_iac::ResourceId> {
+        let expected = format!(
+            "iam-role-{}-{}-{role_class}",
+            placement.deployment_id, self.service
+        );
+        placement
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.0 == expected)
+            .cloned()
+    }
 }
 
 impl Kind<EcsWorkload> for Workload {
-    fn realize(&self, _placement: &PlacementContext) -> Result<EcsWorkload, KindError> {
+    fn realize(&self, placement: &PlacementContext) -> Result<EcsWorkload, KindError> {
         let config = self.configured()?;
         let mut workloads = EcsWorkload::build_all(&config);
         workloads.extend(EcsWorkload::build_observability(&config));
-        workloads
+        let workload = workloads
             .iter()
             .position(|workload| workload.name == self.service)
             .map(|index| workloads.swap_remove(index))
@@ -157,6 +177,22 @@ impl Kind<EcsWorkload> for Workload {
                     "workload `{}` did not derive from the configured model",
                     self.service
                 ))
-            })
+            })?;
+        let task_role = self.role_dependency(placement, "task").ok_or_else(|| {
+            KindError::new(format!(
+                "ECS workload `{}` needs its EcsTaskRole declared as a dependency",
+                self.service
+            ))
+        })?;
+        let execution_role = self.role_dependency(placement, "execution");
+        if task_definition_needs_execution_role(&workload.task_definition)
+            && execution_role.is_none()
+        {
+            return Err(KindError::new(format!(
+                "ECS workload `{}` uses ECR or Secrets Manager and needs its EcsExecutionRole declared as a dependency",
+                self.service
+            )));
+        }
+        Ok(workload.with_role_dependencies(task_role, execution_role))
     }
 }

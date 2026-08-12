@@ -8,13 +8,9 @@
 // construction in the root document only. This part declares the cluster
 // and endpoint identities and the writebacks they source.
 //
-// Managed mode writes one of the five DSQL writebacks back from here (the
-// cluster endpoint). The two endpoint-id writebacks would need
-// `endpoint_id` in VpcEndpoint's and DsqlConnectionEndpoint's declared
-// outputs (tokeira-aws/src/resources — outside this change's writable
-// scope; the named two-line follow-up). Preexisting mode's sources are the
-// platform's own adopters, which declare their outputs, so all three of
-// its endpoint facts write back from here.
+// Both provenances write all three endpoint facts back from the same logical
+// identities. Managed resources publish provider-assigned endpoint IDs;
+// preexisting adopters publish the authored IDs.
 
 use platform::{Dsql, DsqlClusterMode, Ecs, EndpointKind};
 
@@ -30,7 +26,7 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource,
                     id: "dsql:cluster".into(),
                 },
             );
-            dsql.resource(
+            let management = dsql.resource(
                 "management_endpoint",
                 VpcEndpoint {
                     region: cfg.aws.region.clone(),
@@ -41,7 +37,7 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource,
                 },
                 vec![vpc, endpoint_sg],
             );
-            dsql.resource(
+            let connection = dsql.resource(
                 "connection_endpoint",
                 DsqlConnectionEndpoint {
                     region: cfg.aws.region.clone(),
@@ -51,6 +47,8 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource,
                 vec![vpc, endpoint_sg, cluster],
             );
             d.writeback("dsql.endpoint", cluster.output("cluster_endpoint"));
+            d.writeback("dsql.management_endpoint_id", management.output("endpoint_id"));
+            d.writeback("dsql.connection_endpoint_id", connection.output("endpoint_id"));
             cluster
         }
         Dsql::Preexisting(adopted) => {

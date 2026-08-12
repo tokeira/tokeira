@@ -8,6 +8,7 @@
 
 pub mod dsql;
 pub mod remote_state;
+pub mod roles;
 pub mod workload;
 
 use tokeira_platform::{
@@ -22,6 +23,7 @@ use crate::{
         dsql::{AdoptedDsqlResource, DsqlIamRoleResource},
         remote_state::RemoteStateBucket as RemoteStateBucketResource,
     },
+    roles::PlatformRoleResource,
     services::EcsWorkload,
 };
 
@@ -33,7 +35,10 @@ pub const NAMESPACE: &str = "tokeira_ecs";
 pub const KINDS: &[&str] = &[
     dsql::ENDPOINT_TYPE,
     dsql::ROLE_TYPE,
+    roles::EXECUTION_ROLE_TYPE,
+    roles::TASK_ROLE_TYPE,
     workload::TYPE,
+    roles::STORAGE_ROLE_TYPE,
     remote_state::TYPE,
 ];
 
@@ -55,6 +60,18 @@ pub fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, Kin
             remote_state::RemoteStateBucket,
             RemoteStateBucketResource,
         >(remote_state::TYPE, value),
+        n if n == roles::TASK_ROLE_TYPE => kind::decode_resource::<
+            roles::TaskRole,
+            PlatformRoleResource,
+        >(roles::TASK_ROLE_TYPE, value),
+        n if n == roles::EXECUTION_ROLE_TYPE => kind::decode_resource::<
+            roles::ExecutionRole,
+            PlatformRoleResource,
+        >(roles::EXECUTION_ROLE_TYPE, value),
+        n if n == roles::STORAGE_ROLE_TYPE => kind::decode_resource::<
+            roles::StorageRole,
+            PlatformRoleResource,
+        >(roles::STORAGE_ROLE_TYPE, value),
         _ => return None,
     })
 }
@@ -86,8 +103,11 @@ mod tests {
             [
                 "DsqlEndpoint",
                 "DsqlIamRole",
+                "EcsExecutionRole",
+                "EcsTaskRole",
                 "EcsWorkload",
-                "RemoteStateBucket"
+                "ObservabilityStorageRole",
+                "RemoteStateBucket",
             ]
         );
         for name in KINDS {

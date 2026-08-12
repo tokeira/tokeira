@@ -16,6 +16,7 @@ pub mod gates;
 pub mod images;
 pub mod kinds;
 pub mod modules;
+mod roles;
 pub mod services;
 
 use std::{

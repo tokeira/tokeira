@@ -265,7 +265,7 @@ fn storage_bucket(name: String, rctx: &ResourceContext, module: &str) -> S3Bucke
     )
 }
 
-fn storage_role(
+pub(crate) fn storage_role(
     role_name: String,
     bucket_name: String,
     rctx: &ResourceContext,
@@ -311,7 +311,7 @@ fn ecs_tasks_assume_role_policy() -> String {
     .to_string()
 }
 
-fn grafana_secret_read_policy(config: &EcsConfig) -> String {
+pub(crate) fn grafana_secret_read_policy(config: &EcsConfig) -> String {
     serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [{

@@ -47,7 +47,7 @@ trust `--help` over any doc, including this one.
 
 ```bash
 devbox site-latency          # pick the site; zrh measured 26 ms p50 from here
-devbox create --name <box> --size m --volume_size_gb 100 \
+devbox create --name <box> --size xl --volume_size_gb 100 \
     --no_checkout --site zrh --image builtin:base --purpose "<why>"
 ```
 
@@ -55,10 +55,10 @@ devbox create --name <box> --size m --volume_size_gb 100 \
   boxes created elsewhere.
 - `--no_checkout` skips the default repo clone: rsync carries the worktree, so no
   GitHub credentials land on the box.
-- Trial-plan quota caps instances at 8x16 (`--size m`); `xl` fails with
-  `ResourceExhausted` — and the failed create still registers the name, leaving a
-  zombie record to remove with `devbox expire <name> --force`. Paid plans and quota
-  raises lift the cap; fleet-wide vCPU concurrency is a separate per-plan limit.
+- A `create` that fails (e.g. against a workspace quota) still registers the name,
+  leaving a record to remove with `devbox expire <name> --force` before the name can
+  be reused. Fleet-wide vCPU concurrency is a separate per-plan limit from instance
+  shape.
 - Boxes pause when idle (configurable `--auto_stop_idle_timeout`), cost $0 paused,
   and resume on the next SSH connect in seconds — onto a fresh instance around the
   same volume. Persistence is whole-disk: the synced tree, remote `target/`,

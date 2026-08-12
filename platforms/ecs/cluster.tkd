@@ -1,0 +1,97 @@
+// The cluster module: the ECS cluster and its eight capacity planes. Every
+// plane is the same four-piece assembly — instance role + profile, launch
+// template, auto-scaling group, capacity provider — differing only in its
+// authored capacity policy, so one helper declares each.
+//
+// Instance-role facts are the platform's, not the operator's: the EC2 trust
+// policy and the two managed policies every ECS container instance needs.
+
+use platform::{CapacityPlane, Ecs};
+
+pub fn define(d: Deployment, cfg: Ecs, cx: Context, cluster: Module, vpc: Resource, runtime_sg: Resource) {
+    let ecs_cluster = cluster.resource(
+        "cluster",
+        EcsCluster {
+            name: cfg.cluster.name.clone(),
+            service_connect_namespace: cfg.networking.private_dns_zone.clone(),
+        },
+    );
+
+    plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-edge-api", "edge-api", cfg.capacity.edge_api, false);
+    plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-edge-poll", "edge-poll", cfg.capacity.edge_poll, false);
+    plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-runtime", "runtime", cfg.capacity.runtime, true);
+    plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-projection", "projection", cfg.capacity.projection, false);
+    plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-control", "control", cfg.capacity.control, false);
+    plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-mimir", "mimir", cfg.capacity.mimir, false);
+    plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-loki", "loki", cfg.capacity.loki, false);
+    plane(cluster, cx, vpc, runtime_sg, ecs_cluster, cfg.aws.region.clone(), cfg.cluster.name.clone(),
+        "cp-grafana", "grafana", cfg.capacity.grafana, false);
+}
+
+// One capacity plane: role, profile, launch template, auto-scaling group,
+// capacity provider. `protect` guards fresh instances from scale-in — the
+// runtime plane's managed-draining policy.
+pub fn plane(cluster: Module, cx: Context, vpc: Resource, runtime_sg: Resource, ecs_cluster: Resource, region: String, cluster_name: String, name: String, workload: String, policy: CapacityPlane, protect: bool) {
+    let profile_name = format!("{}-{}-instance", cx.project_name, name);
+    let role_name = format!("{}-role", profile_name);
+    let role = cluster.resource(
+        format!("role-{}", name),
+        IamRole {
+            region: region.clone(),
+            name: role_name.clone(),
+            trust_policy: ec2_assume_role_policy(),
+            managed_policy_arns: vec![
+                "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role".into(),
+                "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore".into(),
+            ],
+        },
+    );
+    let profile = cluster.resource(
+        format!("profile-{}", name),
+        IamInstanceProfile {
+            region: region.clone(),
+            profile_name: profile_name.clone(),
+            role_name: role_name,
+        },
+        vec![role],
+    );
+    let launch_template = cluster.resource(
+        format!("lt-{}", name),
+        LaunchTemplate {
+            name: name.clone(),
+            cluster_name: cluster_name,
+            instance_type: policy.instance_type.clone(),
+            workload: workload,
+            instance_profile_name: profile_name,
+        },
+        vec![runtime_sg, profile],
+    );
+    let asg = cluster.resource(
+        format!("asg-{}", name),
+        AutoScalingGroup {
+            name: name.clone(),
+            min_size: policy.min,
+            desired_capacity: policy.desired,
+            max_size: policy.max,
+            new_instances_protected_from_scale_in: protect,
+        },
+        vec![launch_template, vpc],
+    );
+    cluster.resource(
+        format!("cp-{}", name),
+        CapacityProvider { name: name },
+        vec![ecs_cluster, asg],
+    );
+}
+
+// The EC2 service trust policy every container-instance role carries.
+fn ec2_assume_role_policy() -> String {
+    "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}".into()
+}

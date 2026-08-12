@@ -17,7 +17,6 @@ pub const TYPE: &str = "SecretsManagerSecret";
 /// [`SecretValue`]. Generated material is produced once at first apply and
 /// never recomputed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SecretSource {
     /// A static value authored in the definition.
     Static {

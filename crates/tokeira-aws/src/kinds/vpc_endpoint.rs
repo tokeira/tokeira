@@ -14,7 +14,6 @@ pub const TYPE: &str = "VpcEndpoint";
 
 /// Authored endpoint flavour, mirroring the resource's [`EndpointType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum EndpointKind {
     /// Interface endpoint (ENI-backed).
     Interface,

@@ -40,7 +40,6 @@ impl Kind<AdoptedDsqlResource> for AdoptedDsqlEndpoint {
 /// managed roles carry policy facts and need the cluster dependency;
 /// preexisting roles carry exactly an ARN.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum RoleMode {
     /// The platform creates and manages the role; its DSQL policy is scoped
     /// to the declared cluster's ARN at create time.

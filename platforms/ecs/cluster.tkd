@@ -1,0 +1,15 @@
+// The cluster module's own resource: the ECS cluster. Its eight capacity
+// planes are the same four-piece assembly repeated, so the root wires them
+// through the shared helper against the handle returned here.
+
+use platform::Ecs;
+
+pub fn define(d: Deployment, cfg: Ecs, cx: Context, cluster: Module) -> Resource {
+    cluster.resource(
+        "cluster",
+        EcsCluster {
+            name: cfg.cluster.name.clone(),
+            service_connect_namespace: cfg.networking.private_dns_zone.clone(),
+        },
+    )
+}

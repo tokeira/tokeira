@@ -26,6 +26,11 @@ pub struct DsqlCluster {
     /// Required ARN for an adopted cluster.
     #[serde(default)]
     pub arn: Option<String>,
+    /// Stable resource-id override for clusters that carry a well-known
+    /// identity (e.g. the ECS platform's `dsql:cluster`); defaults to the
+    /// resource's own convention.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 impl Kind<Resource> for DsqlCluster {
@@ -37,7 +42,7 @@ impl Kind<Resource> for DsqlCluster {
             endpoint: self.endpoint.clone(),
             arn: self.arn.clone(),
             fallback_identifier: None,
-            resource_id: None,
+            resource_id: self.id.clone().map(tokeira_iac::ResourceId),
             module: placement.module.clone(),
             project: placement.deployment_id.clone(),
             tags: placement.tags.clone().into_iter().collect(),

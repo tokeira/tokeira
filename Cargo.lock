@@ -8657,7 +8657,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokeira-ecs-deployment"
+name = "tokeira-ecs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -8676,10 +8676,28 @@ dependencies = [
  "tokeira-iac",
  "tokeira-observability",
  "tokeira-orchestrator",
+ "tokeira-platform",
  "tokeira-state",
  "tokio",
  "toml 0.8.23",
  "tracing",
+]
+
+[[package]]
+name = "tokeira-ecs-deployment"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokeira-aws",
+ "tokeira-ecs",
+ "tokeira-iac",
+ "tokeira-observability",
+ "tokeira-platform",
+ "tokeira-tkd",
 ]
 
 [[package]]

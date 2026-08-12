@@ -1,0 +1,16 @@
+// The remote-state module: the deployment's one bootstrap resource. The
+// bucket name and key prefix are derived, not authored — they follow the
+// platform's state-location convention so every tool finds the same state.
+
+use platform::Ecs;
+
+pub fn define(d: Deployment, cfg: Ecs, cx: Context, remote_state: Module) {
+    remote_state.resource(
+        "bucket",
+        RemoteStateBucket {
+            region: cfg.aws.region.clone(),
+            bucket: format!("{}-state-{}", cx.project_name, cfg.aws.region),
+            key_prefix: format!("{}/{}", cx.project_name, cfg.environment),
+        },
+    );
+}

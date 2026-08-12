@@ -1,0 +1,87 @@
+// The dsql module: workflow storage in both provenances, always realizing
+// the same five well-known identities — cluster, management endpoint,
+// connection endpoint, runtime role, admin role — so every consumer and
+// writeback binds the same names in either mode.
+//
+// The role resources and their writebacks live in the root: their mode
+// carries a tuple-variant payload, and the frontend admits tuple-variant
+// construction in the root document only. This part declares the cluster
+// and endpoint identities and the writebacks they source.
+//
+// Managed mode writes one of the five DSQL writebacks back from here (the
+// cluster endpoint). The two endpoint-id writebacks would need
+// `endpoint_id` in VpcEndpoint's and DsqlConnectionEndpoint's declared
+// outputs (tokeira-aws/src/resources — outside this change's writable
+// scope; the named two-line follow-up). Preexisting mode's sources are the
+// platform's own adopters, which declare their outputs, so all three of
+// its endpoint facts write back from here.
+
+use platform::{Dsql, DsqlClusterMode, Ecs, EndpointKind};
+
+pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource, endpoint_sg: Resource) -> Resource {
+    match &cfg.dsql {
+        Dsql::Managed => {
+            let cluster = dsql.resource(
+                "cluster",
+                DsqlCluster {
+                    identity: format!("{}-{}", cx.project_name, cfg.environment),
+                    region: cfg.aws.region.clone(),
+                    mode: DsqlClusterMode::Managed,
+                    id: "dsql:cluster".into(),
+                },
+            );
+            dsql.resource(
+                "management_endpoint",
+                VpcEndpoint {
+                    region: cfg.aws.region.clone(),
+                    short_name: "dsql-management".into(),
+                    service_name: format!("com.amazonaws.{}.dsql-control", cfg.aws.region),
+                    endpoint_type: EndpointKind::Interface,
+                    id: "dsql:management-endpoint".into(),
+                },
+                vec![vpc, endpoint_sg],
+            );
+            dsql.resource(
+                "connection_endpoint",
+                DsqlConnectionEndpoint {
+                    region: cfg.aws.region.clone(),
+                    identity: format!("{}-connection", cx.project_name),
+                    id: "dsql:connection-endpoint".into(),
+                },
+                vec![vpc, endpoint_sg, cluster],
+            );
+            d.writeback("dsql.endpoint", cluster.output("cluster_endpoint"));
+            cluster
+        }
+        Dsql::Preexisting(adopted) => {
+            let cluster = dsql.resource(
+                "cluster",
+                DsqlCluster {
+                    identity: format!("{}-{}", cx.project_name, cfg.environment),
+                    region: cfg.aws.region.clone(),
+                    mode: DsqlClusterMode::Preexisting,
+                    endpoint: adopted.endpoint.clone(),
+                    id: "dsql:cluster".into(),
+                },
+            );
+            let management = dsql.resource(
+                "management_endpoint",
+                DsqlEndpoint {
+                    id: "dsql:management-endpoint".into(),
+                    endpoint_id: adopted.management_endpoint_id.clone(),
+                },
+            );
+            let connection = dsql.resource(
+                "connection_endpoint",
+                DsqlEndpoint {
+                    id: "dsql:connection-endpoint".into(),
+                    endpoint_id: adopted.connection_endpoint_id.clone(),
+                },
+            );
+            d.writeback("dsql.endpoint", cluster.output("cluster_endpoint"));
+            d.writeback("dsql.management_endpoint_id", management.output("endpoint_id"));
+            d.writeback("dsql.connection_endpoint_id", connection.output("endpoint_id"));
+            cluster
+        }
+    }
+}

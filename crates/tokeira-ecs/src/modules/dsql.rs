@@ -149,14 +149,14 @@ impl Module for DsqlModule {
 }
 
 #[derive(Debug)]
-struct AdoptedDsqlResource {
+pub(crate) struct AdoptedDsqlResource {
     resource_id: ResourceId,
     endpoint_id: String,
     module: String,
 }
 
 impl AdoptedDsqlResource {
-    fn endpoint(resource_id: ResourceId, endpoint_id: String, module: &str) -> Self {
+    pub(crate) fn endpoint(resource_id: ResourceId, endpoint_id: String, module: &str) -> Self {
         Self {
             resource_id,
             endpoint_id,
@@ -231,6 +231,12 @@ impl Resource for AdoptedDsqlResource {
         ResourceType::new("DsqlEndpoint")
     }
 
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        // The adopted endpoint's one fact, sourced by the definition's
+        // DSQL writebacks in preexisting mode.
+        &["endpoint_id"]
+    }
+
     fn resource_id(&self) -> ResourceId {
         self.resource_id.clone()
     }
@@ -290,7 +296,7 @@ impl Resource for AdoptedDsqlResource {
 }
 
 #[derive(Debug)]
-struct DsqlIamRoleResource {
+pub(crate) struct DsqlIamRoleResource {
     resource_id: ResourceId,
     role_name: String,
     policy_name: String,
@@ -302,7 +308,7 @@ struct DsqlIamRoleResource {
 }
 
 impl DsqlIamRoleResource {
-    fn managed(
+    pub(crate) fn managed(
         resource_id: ResourceId,
         role_name: String,
         policy_name: &str,
@@ -323,7 +329,7 @@ impl DsqlIamRoleResource {
         }
     }
 
-    fn preexisting(resource_id: ResourceId, role_arn: String, module: String) -> Self {
+    pub(crate) fn preexisting(resource_id: ResourceId, role_arn: String, module: String) -> Self {
         Self {
             resource_id,
             role_name: role_arn.clone(),
@@ -424,7 +430,18 @@ impl Resource for DsqlIamRoleResource {
     }
 
     fn resource_type(&self) -> ResourceType {
-        ResourceType::new("IamRole")
+        // "DsqlIamRole", not "IamRole": kind names must equal the realized
+        // resource_type and stay unique across namespaces, and the generic
+        // tokeira_aws namespace owns "IamRole". Existing recorded state that
+        // carries the old string re-plans as a type change once — accepted
+        // for the definition-driven cutover.
+        ResourceType::new("DsqlIamRole")
+    }
+
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        // The role's one fact, sourced by the definition's DSQL writebacks
+        // in both managed and preexisting modes.
+        &["role_arn"]
     }
 
     fn resource_id(&self) -> ResourceId {

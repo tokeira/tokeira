@@ -1,0 +1,37 @@
+[package]
+name = "tokeira-ecs"
+publish = false
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-ecs = "1"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokeira-aws = { path = "../tokeira-aws" }
+tokeira-config.workspace = true
+tokeira-deploy-engine = { path = "../tokeira-deploy-engine" }
+tokeira-iac = { path = "../tokeira-iac" }
+tokeira-orchestrator = { path = "../tokeira-orchestrator" }
+tokeira-platform = { path = "../tokeira-platform" }
+tokio = { workspace = true, features = ["sync"] }
+tokeira-state = { path = "../tokeira-state" }
+
+[dev-dependencies]
+tokeira-observability = { workspace = true }
+proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml = "0.8"
+
+[lints]
+workspace = true

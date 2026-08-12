@@ -1,0 +1,206 @@
+// The platform's model of itself: the ECS configuration shape every other
+// document takes its vocabulary from. Fields marked `#[create]` are fixed at
+// deployment creation — an edit that changes one names a different
+// deployment rather than a change to this one.
+
+// The aws provider's deployment-level attributes. The framework reads
+// `aws.region` from this model to install the deployment-scoped client
+// bundle; every authored resource carries the same region explicitly.
+pub struct Aws {
+    pub region: String,
+}
+
+// The ECS cluster's identity coordinates.
+pub struct Cluster {
+    pub name: String,
+    pub service_connect_namespace: String,
+}
+
+// Private networking: the VPC's address plan and the internal DNS zone the
+// ALB listener routes by.
+pub struct Networking {
+    pub vpc_cidr: String,
+    pub availability_zones: Vec<String>,
+    pub private_dns_zone: String,
+}
+
+// An adopted DSQL cluster's complete coordinates. Every field is required:
+// preexisting mode with a missing identity is not a validation error to
+// catch later, it is unrepresentable here.
+pub struct PreexistingDsql {
+    pub endpoint: String,
+    pub management_endpoint_id: String,
+    pub connection_endpoint_id: String,
+    pub runtime_role_arn: String,
+    pub admin_role_arn: String,
+}
+
+// Workflow storage: the platform creates and owns an Aurora DSQL cluster,
+// or adopts one the operator already runs.
+pub enum Dsql {
+    Managed,
+    Preexisting(PreexistingDsql),
+}
+
+// Replica-scheduled service policy: image, capacity, and desired count.
+pub struct ReplicaPolicy {
+    pub image: String,
+    pub replicas: u32,
+    pub cpu: u32,
+    pub memory_mb: u32,
+}
+
+// Daemon-scheduled service policy: image and capacity; one task per
+// eligible container instance, so there is no replica count to author.
+pub struct DaemonPolicy {
+    pub image: String,
+    pub cpu: u32,
+    pub memory_mb: u32,
+}
+
+// The autoscaler's policy: its image and how often it evaluates.
+pub struct Autoscaler {
+    pub image: String,
+    pub polling_interval_secs: u64,
+    pub cpu: u32,
+    pub memory_mb: u32,
+}
+
+// The application services' authored policies.
+pub struct Services {
+    pub edge_api: ReplicaPolicy,
+    pub edge_poll: ReplicaPolicy,
+    pub runtime: DaemonPolicy,
+    pub projection: ReplicaPolicy,
+    pub controller: ReplicaPolicy,
+    pub autoscaler: Autoscaler,
+    pub admin: ReplicaPolicy,
+}
+
+// One capacity plane: the EC2 instance type backing it and its
+// auto-scaling bounds.
+pub struct CapacityPlane {
+    pub instance_type: String,
+    pub min: u32,
+    pub desired: u32,
+    pub max: u32,
+}
+
+// The cluster's eight capacity planes, one per workload family.
+pub struct Capacity {
+    pub edge_api: CapacityPlane,
+    pub edge_poll: CapacityPlane,
+    pub runtime: CapacityPlane,
+    pub projection: CapacityPlane,
+    pub control: CapacityPlane,
+    pub mimir: CapacityPlane,
+    pub loki: CapacityPlane,
+    pub grafana: CapacityPlane,
+}
+
+// Listener protocol: plain HTTP/2, or HTTPS carrying its certificate ARN —
+// HTTPS without a certificate is unrepresentable.
+pub enum AlbProtocol {
+    Http2,
+    Https(String),
+}
+
+// The internal ALB's authored policy.
+pub struct Alb {
+    pub protocol: AlbProtocol,
+    pub health_check_path: String,
+    pub health_check_interval_secs: u64,
+}
+
+// The observability stack's authored policies: the three backends, the
+// collection sidecar images, and metric/log retention.
+pub struct Observability {
+    pub mimir: DaemonPolicy,
+    pub loki: DaemonPolicy,
+    pub grafana: DaemonPolicy,
+    pub alloy_image: String,
+    pub aws_cli_image: String,
+    pub busybox_image: String,
+    pub retention_days: u32,
+}
+
+// Provider vocabulary for the DSQL cluster kind's lifecycle mode.
+pub enum DsqlClusterMode {
+    Managed,
+    Preexisting,
+}
+
+// A managed DSQL IAM role's facts: the platform names the role and scopes
+// its policy to the declared cluster at create time.
+pub struct ManagedRole {
+    pub region: String,
+    pub role_name: String,
+    pub policy_name: String,
+    pub action: String,
+}
+
+// An adopted DSQL IAM role: exactly an ARN.
+pub struct PreexistingRole {
+    pub role_arn: String,
+}
+
+// Role provenance, in the platform kind's vocabulary. Tuple variants: the
+// definition frontend does not admit struct enum variants.
+pub enum RoleMode {
+    Managed(ManagedRole),
+    Preexisting(PreexistingRole),
+}
+
+// Generated secret material: a username and the generated password length.
+pub struct GeneratedPassword {
+    pub username: String,
+    pub password_length: i32,
+}
+
+// Secret material source, in the provider kind's vocabulary. Tuple
+// variants: the definition frontend does not admit struct enum variants.
+pub enum SecretSource {
+    Static(String),
+    GeneratedPasswordJson(GeneratedPassword),
+}
+
+// One authored security-group ingress rule, in the provider kind's shape.
+pub struct IngressRule {
+    pub description: String,
+    pub protocol: String,
+    pub from_port: u16,
+    pub to_port: u16,
+    pub source: String,
+}
+
+// Endpoint flavour, matching the provider kind's vocabulary.
+pub enum EndpointKind {
+    Interface,
+    Gateway,
+}
+
+// Listener protocol in the provider kind's vocabulary (the configuration's
+// own `AlbProtocol` carries the certificate; this one names the mode).
+pub enum ListenerProtocol {
+    Http2,
+    Https,
+}
+
+// The complete ECS configuration — the shape `config()` returns and the
+// value every later revision edits. `aws`, `networking`, and `dsql` are
+// create-time: relocating a deployment's region, re-addressing its VPC, or
+// switching its storage identity is a different deployment.
+pub struct Ecs {
+    pub environment: String,
+    #[create]
+    pub aws: Aws,
+    pub cluster: Cluster,
+    #[create]
+    pub networking: Networking,
+    #[create]
+    pub dsql: Dsql,
+    pub services: Services,
+    pub capacity: Capacity,
+    pub alb: Alb,
+    pub observability: Observability,
+}

@@ -264,6 +264,25 @@ pub(crate) fn execution_role_for_workload(
     })
 }
 
+/// The unconditional execution-role builder for the definition path: the
+/// definition names which services carry one, so no workload inspection
+/// gates construction here (the legacy path keeps the workload-gated
+/// variant above).
+pub(crate) fn execution_role(service_name: &str, config: &EcsConfig, module: &str) -> IamRole {
+    let mut inline_policies = HashMap::new();
+    inline_policies.insert("ecs-agent-access".to_owned(), ecs_agent_access_policy());
+    IamRole::new(
+        service_execution_role_name(service_name, config),
+        IamRoleConfig {
+            trust_policy: ecs_tasks_assume_role_policy(),
+            inline_policies,
+            managed_policy_arns: Vec::new(),
+            module: module.to_owned(),
+        },
+        &resource_context(config),
+    )
+}
+
 pub(crate) fn task_definition_needs_execution_role(spec: &TaskDefinitionSpec) -> bool {
     spec.containers
         .iter()

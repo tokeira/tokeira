@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokeira_deploy_engine as deploy_engine;
 
 use crate::config::{
@@ -6,16 +6,22 @@ use crate::config::{
     ReplicaServiceConfig, WAIT_FOR_CPU, WAIT_FOR_MEMORY_MB,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EcsScheduling {
     Replica { desired_count: u32 },
     Daemon,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EcsWorkload {
     pub name: String,
+    /// AWS region the workload deploys into. Carried on the workload so its
+    /// manifests are self-describing: the deploy platform admits exactly one
+    /// region per deployment from the manifests themselves.
+    pub region: String,
+    /// ECS cluster the service runs on, carried for the same reason.
+    pub cluster: String,
     pub scheduling: EcsScheduling,
     pub capacity_provider: String,
     pub task_definition: TaskDefinitionSpec,
@@ -23,7 +29,7 @@ pub struct EcsWorkload {
     pub placement_constraints: Vec<PlacementConstraint>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDefinitionSpec {
     pub family: String,
     pub cpu: u32,
@@ -32,7 +38,7 @@ pub struct TaskDefinitionSpec {
     pub volumes: Vec<VolumeSpec>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerSpec {
     pub name: String,
     pub image: String,
@@ -50,56 +56,56 @@ pub struct ContainerSpec {
     pub secrets: Vec<SecretEnvVar>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinuxParametersSpec {
     pub init_process_enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentVar {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretEnvVar {
     pub name: String,
     pub value_from: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMappingSpec {
     pub name: String,
     pub container_port: u16,
     pub protocol: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountPointSpec {
     pub source_volume: String,
     pub container_path: String,
     pub read_only: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerDependencySpec {
     pub container_name: String,
     pub condition: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeSpec {
     pub name: String,
     pub host_path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceConnectSpec {
     pub grpc: Option<ServiceConnectPort>,
     pub metrics: ServiceConnectPort,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceConnectPort {
     pub port_name: String,
     pub container_port: u16,
@@ -107,7 +113,7 @@ pub struct ServiceConnectPort {
     pub dns_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementConstraint {
     pub r#type: String,
     pub expression: String,
@@ -249,11 +255,14 @@ impl deploy_engine::Service for EcsWorkload {
         let task_definition = serde_json::json!({
             "kind": "ecs-task-definition",
             "service": self.name,
+            "region": self.region,
             "spec": self.task_definition,
         });
         let service = serde_json::json!({
             "kind": "ecs-service",
             "service": self.name,
+            "region": self.region,
+            "cluster": self.cluster,
             "scheduling": self.scheduling,
             "capacity_provider": self.capacity_provider,
             "service_connect": self.service_connect,
@@ -403,6 +412,8 @@ fn workload_from_parts(
 
     EcsWorkload {
         name: name.to_owned(),
+        region: config.region.clone(),
+        cluster: config.cluster.name.clone(),
         scheduling,
         capacity_provider: capacity_provider.to_owned(),
         task_definition: TaskDefinitionSpec {

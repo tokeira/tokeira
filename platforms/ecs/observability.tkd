@@ -1,0 +1,70 @@
+// The observability module's infrastructure: storage buckets and their
+// scoped roles, the Grafana admin secret, the rendered Alloy sidecar
+// parameters, the shipped artifact tree, and the observability workloads'
+// task and execution roles. The Mimir, Loki, and Grafana workloads
+// themselves are services — the deploy plane owns them (services part).
+
+use platform::Ecs;
+
+pub fn define(d: Deployment, cfg: Ecs, cx: Context, observability: Module) {
+    let mimir_bucket = format!("{}-mimir-data", cx.project_name);
+    let loki_bucket = format!("{}-loki-data", cx.project_name);
+    let artifacts_bucket_name = format!("{}-observability-artifacts", cx.project_name);
+
+    observability.resource(
+        "mimir_data",
+        S3Bucket { region: cfg.aws.region.clone(), bucket: mimir_bucket.clone() },
+    );
+    observability.resource(
+        "loki_data",
+        S3Bucket { region: cfg.aws.region.clone(), bucket: loki_bucket.clone() },
+    );
+    let artifacts_bucket = observability.resource(
+        "artifacts_bucket",
+        S3Bucket { region: cfg.aws.region.clone(), bucket: artifacts_bucket_name.clone() },
+    );
+
+    observability.resource(
+        "mimir_storage_role",
+        ObservabilityStorageRole {
+            name: format!("{}-mimir-storage", cx.project_name),
+            region: cfg.aws.region.clone(),
+            bucket: mimir_bucket,
+        },
+    );
+    observability.resource(
+        "loki_storage_role",
+        ObservabilityStorageRole {
+            name: format!("{}-loki-storage", cx.project_name),
+            region: cfg.aws.region.clone(),
+            bucket: loki_bucket,
+        },
+    );
+
+
+    // The shipped dashboards and alert rules, uploaded as one fenced tree.
+    observability.resource(
+        "artifacts",
+        ObservabilityArtifacts {},
+        vec![artifacts_bucket],
+    );
+
+    // The observability workloads' identity: task roles for all three,
+    // an execution role for Grafana (its container reads the admin secret).
+    observability.resource(
+        "mimir_task_role",
+        EcsTaskRole { service: "tokeira-mimir".into(), region: cfg.aws.region.clone() },
+    );
+    observability.resource(
+        "loki_task_role",
+        EcsTaskRole { service: "tokeira-loki".into(), region: cfg.aws.region.clone() },
+    );
+    observability.resource(
+        "grafana_task_role",
+        EcsTaskRole { service: "tokeira-grafana".into(), region: cfg.aws.region.clone() },
+    );
+    observability.resource(
+        "grafana_execution_role",
+        EcsExecutionRole { service: "tokeira-grafana".into(), region: cfg.aws.region.clone() },
+    );
+}

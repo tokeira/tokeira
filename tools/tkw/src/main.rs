@@ -18,6 +18,7 @@
 
 // CLI: stdout/stderr are the user interface.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+mod devbox;
 mod hook;
 mod includes;
 mod repo;
@@ -77,6 +78,30 @@ enum Command {
     /// Hook entry points invoked by Claude Code / Kiro hook configuration.
     #[command(subcommand)]
     Hook(HookCommand),
+    /// Offload cargo work for the current worktree to a Namespace Devbox
+    /// (see docs/agents/namespace-devboxes.md).
+    Devbox {
+        /// Devbox name; SSH host becomes `<name>.devbox.namespace`.
+        /// Falls back to $TKW_DEVBOX.
+        #[arg(long = "box", value_name = "NAME", global = true)]
+        box_name: Option<String>,
+        #[command(subcommand)]
+        command: DevboxCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevboxCommand {
+    /// Sync the current worktree to the devbox (hygiene excludes enforced).
+    Sync,
+    /// Sync, then run a command in the remote copy, streaming output.
+    Run {
+        /// Command to execute remotely, after `--` (e.g. `-- cargo test --workspace`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Sync, then run the §10.4 bar remotely (fmt in --check form), timing each step.
+    Bar,
 }
 
 #[derive(Subcommand)]
@@ -106,6 +131,19 @@ fn main() -> Result<()> {
                 HookCommand::Stop => hook::stop(),
             };
             std::process::exit(code);
+        }
+        Command::Devbox { box_name, command } => {
+            let code = match command {
+                DevboxCommand::Sync => devbox::sync(box_name.as_deref()).map(|()| 0)?,
+                DevboxCommand::Run { command } => devbox::run(box_name.as_deref(), &command)?,
+                DevboxCommand::Bar => devbox::bar(box_name.as_deref())?,
+            };
+            // The remote command's exit code is the verdict; mirror it so
+            // `tkw devbox run -- cargo test` composes in scripts and CI alike.
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
     }
 }

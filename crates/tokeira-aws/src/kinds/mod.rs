@@ -22,6 +22,7 @@ pub mod dynamodb_table;
 pub mod ecr_repository;
 pub mod ecs_cluster;
 pub mod iam;
+pub mod remote_state_bucket;
 pub mod s3_bucket;
 pub mod s3_object;
 pub mod secrets_manager_secret;
@@ -49,6 +50,7 @@ use crate::resources::{
     elbv2::{AlbListenerResource, AlbResource, AlbTargetGroupResource},
     iam_instance_profile::IamInstanceProfile as IamInstanceProfileResource,
     iam_role::IamRole as IamRoleResource,
+    remote_state_bucket::RemoteStateBucket as RemoteStateBucketResource,
     s3_bucket::S3Bucket as S3BucketResource,
     s3_object::S3Object as S3ObjectResource,
     secrets_manager_secret::SecretsManagerSecret as SecretsManagerSecretResource,
@@ -81,6 +83,7 @@ pub const KINDS: &[&str] = &[
     iam::INSTANCE_PROFILE_TYPE,
     iam::ROLE_TYPE,
     ecs_cluster::LAUNCH_TEMPLATE_TYPE,
+    remote_state_bucket::TYPE,
     s3_bucket::TYPE,
     s3_object::TYPE,
     secrets_manager_secret::TYPE,
@@ -154,6 +157,10 @@ pub fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, Kin
                 value,
             )
         }
+        n if n == remote_state_bucket::TYPE => kind::decode_resource::<
+            remote_state_bucket::RemoteStateBucket,
+            RemoteStateBucketResource,
+        >(remote_state_bucket::TYPE, value),
         n if n == s3_bucket::TYPE => {
             kind::decode_resource::<s3_bucket::S3Bucket, S3BucketResource>(s3_bucket::TYPE, value)
         }
@@ -252,6 +259,7 @@ mod tests {
                 "IamInstanceProfile",
                 "IamRole",
                 "LaunchTemplate",
+                "RemoteStateBucket",
                 "S3Bucket",
                 "S3Object",
                 "SecretsManagerSecret",
@@ -353,6 +361,19 @@ mod tests {
             .resource_type()
             .0,
             vpc_endpoint::TYPE
+        );
+
+        assert_eq!(
+            remote_state_bucket::RemoteStateBucket {
+                region: "eu-west-2".into(),
+                bucket: "demo-state".into(),
+                key_prefix: Some("demo/dev".into()),
+            }
+            .realize(&no_deps)
+            .expect("remote-state bucket")
+            .resource_type()
+            .0,
+            remote_state_bucket::TYPE
         );
 
         assert_eq!(

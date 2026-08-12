@@ -112,6 +112,10 @@ struct TaskDefinitionManifest {
     service: String,
     region: String,
     spec: TaskDefinitionSpec,
+    #[serde(default)]
+    task_role_arn: Option<String>,
+    #[serde(default)]
+    execution_role_arn: Option<String>,
 }
 
 /// The parsed, validated shape of one `ecs-service` manifest.
@@ -412,23 +416,20 @@ impl deploy_engine::Platform for EcsPlatform {
 ///
 /// The SDK call mirrors `TaskDefinitionResource::create` in
 /// `tokeira-aws/src/resources/ecs_service.rs` — the correctness reference —
-/// minus the role-ARN resolution, which reads infrastructure state the
-/// deploy plane deliberately does not hold. The builder helpers below are
-/// mirrored from the same file because they are private there and
-/// `tokeira-aws/src/resources` is outside this change's writable scope;
-/// unifying them is the named follow-up alongside carrying role ARNs in
-/// the manifests.
+/// with role ARNs already resolved from the infrastructure state while the
+/// workload produced this self-describing manifest. The builder helpers below
+/// remain mirrored from the same file because they are private there.
 async fn register_task_definition(
     clients: &tokeira_aws::AwsClients,
     manifest: &TaskDefinitionManifest,
 ) -> Result<(), deploy_engine::RuntimeError> {
     let spec = crate::modules::services::to_aws_task_definition(&manifest.spec, None, None);
-    if requires_execution_role(&spec) {
+    if requires_execution_role(&spec) && manifest.execution_role_arn.is_none() {
         tracing::warn!(
             service = %manifest.service,
             task_definition = %spec.family,
-            "task definition uses ECS-agent-side features but the deploy \
-             manifests carry no execution role yet"
+            "task definition uses ECS-agent-side features but its deploy \
+             manifest carries no execution role"
         );
     }
     let containers = spec
@@ -437,7 +438,7 @@ async fn register_task_definition(
         .map(container_definition)
         .collect::<Result<Vec<_>, _>>()?;
     let volumes = spec.volumes.iter().map(volume).collect::<Vec<_>>();
-    clients
+    let mut request = clients
         .ecs
         .register_task_definition()
         .family(&spec.family)
@@ -446,17 +447,21 @@ async fn register_task_definition(
         .cpu(spec.cpu.to_string())
         .memory(spec.memory_mb.to_string())
         .set_container_definitions(Some(containers))
-        .set_volumes(Some(volumes))
-        .send()
-        .await
-        .map_err(|error| {
-            runtime_error(format!(
-                "ecs:RegisterTaskDefinition for service {} (family {}): {}",
-                manifest.service,
-                spec.family,
-                error.into_service_error()
-            ))
-        })?;
+        .set_volumes(Some(volumes));
+    if let Some(task_role_arn) = &manifest.task_role_arn {
+        request = request.task_role_arn(task_role_arn);
+    }
+    if let Some(execution_role_arn) = &manifest.execution_role_arn {
+        request = request.execution_role_arn(execution_role_arn);
+    }
+    request.send().await.map_err(|error| {
+        runtime_error(format!(
+            "ecs:RegisterTaskDefinition for service {} (family {}): {}",
+            manifest.service,
+            spec.family,
+            error.into_service_error()
+        ))
+    })?;
     Ok(())
 }
 
@@ -646,6 +651,27 @@ mod tests {
             .expect("consistent set");
         assert_eq!(region, "eu-west-2");
         assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn task_definition_manifest_carries_resolved_role_arns() {
+        let mut source = task_definition_manifest("eu-west-2");
+        source["task_role_arn"] = serde_json::json!("arn:aws:iam::1:role/runtime-task");
+        source["execution_role_arn"] = serde_json::json!("arn:aws:iam::1:role/runtime-execution");
+
+        let Manifest::TaskDefinition(manifest) = EcsPlatform::parse(&source).expect("manifest")
+        else {
+            panic!("task definition classified as a service")
+        };
+
+        assert_eq!(
+            manifest.task_role_arn.as_deref(),
+            Some("arn:aws:iam::1:role/runtime-task")
+        );
+        assert_eq!(
+            manifest.execution_role_arn.as_deref(),
+            Some("arn:aws:iam::1:role/runtime-execution")
+        );
     }
 
     // Unknown manifest kinds are refused by name.

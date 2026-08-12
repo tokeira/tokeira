@@ -13,6 +13,13 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, services: Module, vpc: Resou
         vec![vpc],
     );
 
+    let task_role = services.resource(
+        "task-role-tokeira-autoscaler",
+        EcsTaskRole {
+            service: "tokeira-autoscaler".into(),
+            region: cfg.aws.region.clone(),
+        },
+    );
     services.resource(
         "tokeira-autoscaler",
         EcsWorkload {
@@ -25,6 +32,7 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, services: Module, vpc: Resou
             cpu: cfg.services.autoscaler.cpu,
             memory_mb: cfg.services.autoscaler.memory_mb,
         },
+        vec![task_role],
     );
 
 }

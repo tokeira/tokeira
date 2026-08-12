@@ -1,11 +1,85 @@
 //! ECS platform package: description, integration, and the platform-owned
-//! observability content tree.
+//! observability content.
 //!
 //! Realization lives in `tokeira-ecs` (`crates/tokeira-ecs`); this package
-//! re-exports that crate's legacy surface so existing callers keep their
-//! import paths while the definition-driven platform is assembled here.
+//! assembles the definition-driven platform — the shipped `.tkd` documents,
+//! the platform-owned observability kinds, and the one entry point — and
+//! re-exports the implementation crate's legacy surface so existing callers
+//! keep their import paths.
+
+use std::sync::Arc;
+
+use tokeira_platform::{declaration::PlatformDeclaration, definition::Namespace};
+
+pub mod observability;
 
 pub use tokeira_ecs::{EcsConfig, EcsDeployment, config, gates, images, modules, services};
+
+/// The ECS platform declaration.
+///
+/// Construction is pure — no filesystem access, no AWS configuration
+/// loading, no network. The `tokeira_aws` namespace's presence is the
+/// framework's signal to install the deployment-scoped `AwsClients` bundle;
+/// the integration deliberately registers no second bundle.
+pub fn platform() -> PlatformDeclaration {
+    PlatformDeclaration {
+        namespaces: vec![
+            tokeira_ecs::kinds::namespace(),
+            observability::namespace(),
+            Namespace {
+                name: tokeira_aws::kinds::NAMESPACE,
+                kinds: tokeira_aws::kinds::KINDS,
+                defaults: None,
+                decode: tokeira_aws::kinds::decode,
+            },
+        ],
+        // The legacy operational surface needs authored region and cluster
+        // coordinates that `DeploymentRef` does not carry; it stays on the
+        // preserved legacy implementation until that contract is addressed
+        // in its own slice.
+        ops: None,
+        execution: Box::new(tokeira_ecs::execution::EcsExecution),
+        implementation: Arc::new(tokeira_ecs::execution::EcsIntegration),
+    }
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use super::*;
+
+    // The declaration is pure assembly: three namespaces, no ops, and the
+    // execution seams — constructed with no I/O to fail.
+    #[test]
+    fn platform_declares_three_namespaces_and_no_ops() {
+        let declaration = platform();
+        let names: Vec<&str> = declaration
+            .namespaces
+            .iter()
+            .map(|namespace| namespace.name)
+            .collect();
+        assert_eq!(
+            names,
+            ["tokeira_ecs", "tokeira_ecs_deployment", "tokeira_aws"]
+        );
+        assert!(declaration.ops.is_none());
+    }
+
+    // Kind names stay collision-free across the declared namespaces — the
+    // same invariant the bound platform enforces at process start.
+    #[test]
+    fn kind_names_do_not_collide_across_namespaces() {
+        let declaration = platform();
+        let mut seen = std::collections::BTreeSet::new();
+        for namespace in &declaration.namespaces {
+            for kind in namespace.kinds {
+                assert!(
+                    seen.insert(*kind),
+                    "kind `{kind}` advertised by more than one namespace"
+                );
+            }
+        }
+    }
+}
 
 /// Content-coupled tests live beside the content they validate: this package
 /// ships `observability/{dashboards,alerts}`, so it owns the loader-vs-tree

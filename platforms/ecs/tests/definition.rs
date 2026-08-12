@@ -62,7 +62,89 @@ fn the_shipped_set_evaluates_with_managed_defaults() {
             "services",
         ]
     );
-    assert_eq!(output.graph.writeback().len(), 3);
+
+    // Managed mode's writebacks: the cluster endpoint plus the two role
+    // ARNs. The two endpoint-id writebacks await declared outputs on the
+    // provider endpoint resources (the recorded follow-up).
+    let mut keys: Vec<&str> = output
+        .graph
+        .writeback()
+        .iter()
+        .map(|entry| entry.key())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "dsql.admin_role_arn",
+            "dsql.endpoint",
+            "dsql.runtime_role_arn"
+        ]
+    );
+
+    assert_dsql_identities(&output);
+    assert_plane_separation(&output);
+}
+
+/// Both DSQL modes realize the same five well-known identities in the dsql
+/// module — the invariant every consumer and writeback binds against.
+fn assert_dsql_identities(output: &FrontendOutput) {
+    let mut dsql: Vec<&str> = output
+        .graph
+        .resources()
+        .iter()
+        .filter(|resource| resource.module() == "dsql")
+        .map(|resource| resource.logical_id())
+        .collect();
+    dsql.sort_unstable();
+    assert_eq!(
+        dsql,
+        [
+            "admin_role",
+            "cluster",
+            "connection_endpoint",
+            "management_endpoint",
+            "runtime_role",
+        ]
+    );
+}
+
+/// Single-owner split: the deploy plane owns exactly the ten workloads
+/// (every EcsWorkload sits in the services module), and no ECS task
+/// definition or ECS service is authored anywhere in the infrastructure
+/// graph — those kinds are not even advertised to the definition.
+fn assert_plane_separation(output: &FrontendOutput) {
+    let workloads: Vec<&str> = output
+        .graph
+        .resources()
+        .iter()
+        .filter(|resource| resource.kind().name() == "EcsWorkload")
+        .map(|resource| resource.logical_id())
+        .collect();
+    assert_eq!(workloads.len(), 10, "{workloads:?}");
+    assert!(
+        output
+            .graph
+            .resources()
+            .iter()
+            .filter(|resource| resource.kind().name() == "EcsWorkload")
+            .all(|resource| resource.module() == "services")
+    );
+    for forbidden in ["EcsTaskDefinition", "EcsService"] {
+        assert!(
+            !output
+                .graph
+                .resources()
+                .iter()
+                .any(|resource| resource.kind().name() == forbidden),
+            "{forbidden} must not be authored in the infrastructure graph"
+        );
+        let advertised = tokeira_ecs_deployment::platform()
+            .namespaces
+            .iter()
+            .any(|namespace| namespace.kinds.contains(&forbidden));
+        assert!(!advertised, "{forbidden} must not be advertised");
+    }
 }
 
 // Selecting preexisting DSQL in the root's config keeps the same module
@@ -84,5 +166,23 @@ fn selecting_preexisting_dsql_keeps_identities_and_writes_five_back() {
     );
     assert_ne!(root, shipped, "the dsql literal was rewritten");
     let output = evaluate(&root).expect("the preexisting-DSQL set evaluates");
-    assert_eq!(output.graph.writeback().len(), 5);
+    let mut keys: Vec<&str> = output
+        .graph
+        .writeback()
+        .iter()
+        .map(|entry| entry.key())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "dsql.admin_role_arn",
+            "dsql.connection_endpoint_id",
+            "dsql.endpoint",
+            "dsql.management_endpoint_id",
+            "dsql.runtime_role_arn",
+        ]
+    );
+    assert_dsql_identities(&output);
+    assert_plane_separation(&output);
 }

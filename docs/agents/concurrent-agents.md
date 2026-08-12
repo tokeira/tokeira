@@ -281,12 +281,25 @@ against kiro.dev/docs/cli/v3 when upgrading.
 | `tkw clean [--base <ref>]` | Remove tkw worktrees whose branch is fully merged |
 | `tkw tidy` | Periodic hygiene: clean + prune + `cargo sweep` + machete report + `kache gc` |
 | `tkw hook post-edit\|stop` | The hook bodies Claude/Kiro configs invoke |
+| `tkw devbox sync\|run\|bar` | Offload cargo work for the *current worktree* to a Namespace Devbox ([namespace-devboxes.md](namespace-devboxes.md)) |
 
 The ownership rule, enforced in code: tkw only ever **removes** worktrees it created.
 Claude's and the app's worktrees have their own lifecycles; `tkw tidy` will sweep stale
 build artifacts *inside* them (artifact deletion, never worktree deletion) and `tkw ls`
 shows them, but removal is refused. Overrides: `TKW_DIR` (worktree location — keep it on
 the same APFS volume as the store) and `CODEX_HOME` (classification only).
+
+## Remote offload: Namespace Devboxes
+
+Workspace-wide cargo operations (the §10.4 bar, `cargo test --workspace`, workspace
+clippy, doc builds) can run on a Namespace Devbox instead of the local machine:
+`tkw devbox bar` (or `run -- <cmd>`) rsyncs the current worktree — uncommitted state
+included — to the box's persistent volume and executes there, streaming output and
+mirroring the exit code. Remote runs yield **verdicts, not artifacts**: the box is
+Linux, nothing it compiles ever enters a local `target/` or the kache store, and
+kache's `RUSTC_WRAPPER` wiring stays untouched on both sides. Box lifecycle,
+provisioning, hygiene rules, and measured timings:
+[namespace-devboxes.md](namespace-devboxes.md).
 
 ## Completion and integration
 

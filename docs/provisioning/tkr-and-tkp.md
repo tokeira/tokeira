@@ -404,7 +404,7 @@ commands are primarily useful for implementation tests and precise lifecycle dia
   source-backed custom vocabulary and assembly idioms.
 - [Deployment configuration](deployment-configuration.md) — registry and current command
   surfaces.
-- [`tkr` catalog](../../apps/tkr/src/catalog.rs) — normalized workspace and published
+- [`tkr` platform discovery](../../apps/tkr/src/platform_discovery.rs) — normalized workspace
   platform/frontend discovery.
 - [`tkr` deployment construction](../../apps/tkr/src/deployment_dir.rs) — definition
   recording, generated native build, and placement.

@@ -173,7 +173,7 @@ pub(crate) enum DefinitionAction {
         /// authoring mode — the definition needs no deployment to exist yet.
         #[arg(long, alias = "path")]
         definition: Option<std::path::PathBuf>,
-        /// Definition format resolved through the trusted frontend catalog.
+        /// Definition format resolved through trusted frontend discovery.
         #[arg(long, requires = "definition")]
         format: Option<tokeira_orchestrator::DefinitionFormatId>,
         /// Platform whose typed config, context, and kinds admit the source.

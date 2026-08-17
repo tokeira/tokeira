@@ -25,7 +25,7 @@ pub use closure::{
 };
 pub use composition::{
     BoundProvisionerSource, CompositionError, GENERATED_PROVISIONER_BIN,
-    GENERATED_ROOT_RELATIVE_PATH, PROVISIONER_CLI_PACKAGE, assemble_bound_provisioner,
+    GENERATED_ROOT_RELATIVE_PATH, TKP_PACKAGE, assemble_bound_provisioner,
 };
 pub use dagger::{ContainerRef, DaggerClient, DirectoryRef, FileRef, SecretRef};
 pub use dagger_default::DefaultDaggerClient;

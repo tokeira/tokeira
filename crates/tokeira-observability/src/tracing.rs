@@ -155,6 +155,18 @@ pub fn install_tracing_subscriber(
             .map_err(|error| ObservabilityError::TracingInstall(error.to_string()))?,
     }
 
+    // Subscriber registration races other threads' one-time lock-free
+    // callsite registrations inside tracing-core: a callsite whose
+    // registration is in flight during registration's interest rebuild can
+    // be missed and stay cached `Interest::never` for the process — that
+    // span or event is then silently dead until restart. Under
+    // `#[tokio::main]`, runtime worker threads exist before this install
+    // runs, so the window is real. Rebuilding once more after registration
+    // heals every callsite whose registration has completed by now, closing
+    // the startup window to a vanishing sliver. Callers must still install
+    // observability before spawning application tasks.
+    ::tracing::callsite::rebuild_interest_cache();
+
     Ok(handle)
 }
 

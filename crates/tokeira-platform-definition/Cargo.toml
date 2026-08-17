@@ -1,0 +1,68 @@
+[package]
+name = "tokeira-platform-definition"
+publish = false
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# One frontend package, every shipped definition format. Composition selects
+# exactly one format feature per bound `tkp`; discovery reads each entry and
+# its enabling feature.
+[[package.metadata.tokeira.definition-frontend]]
+format = "tkd"
+source-extension = "tkd"
+feature = "tkd"
+
+[[package.metadata.tokeira.definition-frontend]]
+format = "tkdp"
+source-extension = "tkdp"
+feature = "tkdp"
+
+[features]
+# No default: a consumer (or the generated bound-provisioner manifest) names
+# the frontends it compiles, so a `tkd`-only build never carries the
+# Monty/ruff dependency train.
+default = []
+tkd = ["dep:syn", "dep:proc-macro2"]
+tkdp = [
+    "dep:monty",
+    "dep:monty-types",
+    "dep:ruff_python_ast",
+    "dep:ruff_python_parser",
+    "dep:ruff_text_size",
+]
+
+[dependencies]
+tokeira-orchestrator = { path = "../tokeira-orchestrator" }
+tokeira-platform.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# The `.tkd` interpreter front-end: `syn` parses the definition (Rust syntax),
+# the interpreter walks it. `full` is mandatory — default features are
+# derive-input-only and lack ItemFn/Block/Stmt/statement-Expr nodes. We parse +
+# walk, never emit tokens, so `quote` is not needed. `proc-macro2` is needed for
+# `Span` (diagnostics). Hand-pinned (not `cargo add`) to reuse the locked version.
+syn = { version = "2", features = ["full", "extra-traits"], optional = true }
+# `span-locations` gives parse errors a line/column on stable — an operator
+# fixing a 200-line definition needs "line 112", not just "expected `,`".
+proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
+monty = { workspace = true, optional = true }
+monty-types = { workspace = true, optional = true }
+ruff_python_ast = { workspace = true, optional = true }
+ruff_python_parser = { workspace = true, optional = true }
+ruff_text_size = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Self-reference with every frontend enabled: the crate's own test targets
+# always exercise both formats regardless of which features workspace
+# consumers unify onto the library build.
+tokeira-platform-definition = { path = ".", features = ["tkd", "tkdp"] }
+proptest = "1"
+tempfile.workspace = true
+tokeira-iac.workspace = true
+
+[lints]
+workspace = true

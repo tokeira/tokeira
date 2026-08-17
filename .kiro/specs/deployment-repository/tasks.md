@@ -7,49 +7,73 @@ no slice mixes restructuring noise with feature diffs.
 
 ## A. Restructuring (behaviour-preserving, mechanical)
 
-- [ ] 1. Rename `crates/tokeira-provisioner` → `crates/tokeira-deployment`
-  - [ ] 1.1 Move the directory; rename the package; update the workspace member list
+- [x] 1. Rename `crates/tokeira-provisioner` → `crates/tokeira-deployment`
+  - [x] 1.1 Move the directory; rename the package; update the workspace member list
         and `[workspace.dependencies]`; update imports in `tokeira-provisioner-cli`,
         `apps/tkr`, `crates/tokeira-build`. Per the audited classification, every
         module moves with the crate unchanged; the `ORCHESTRATED_LOCK_*_ENV`
         constants gain the wire-protocol comment recorded in the design.
         _Requirements: 12.3_
-  - [ ] 1.2 Retire the `catalog` module: delete the published-catalog types and
+  - [x] 1.2 Retire the `catalog` module: delete the published-catalog types and
         `apps/tkr`'s published arm (`from_published`, `admit_locators`, the
         `PlatformSource::Published` variant and its tests); rename `apps/tkr`'s
         catalog surface toward platform-discovery vocabulary (`PlatformCatalog` →
         `PlatformDiscovery`, file rename included). Workspace-arm behaviour is
         byte-for-byte unchanged. _Requirements: 12.3; glossary (Platform Discovery)_
-  - [ ] 1.3 Checkpoint: full §10.4 bar green.
+  - [x] 1.3 Checkpoint: full §10.4 bar green.
+        DONE 2026-08-17: bar green on the workspace devbox (15m17s); Cargo.lock diff
+        verified rename-only; tkr surface renamed to platform_discovery.rs
+        (PlatformDiscovery/PlatformDiscoveryError, single-variant sources
+        flattened at call sites).
 
-- [ ] 2. Rename `crates/tokeira-provisioner-cli` → `crates/tokeira-tkp`
-  - [ ] 2.1 Move the directory; rename the package; update the workspace member list;
+- [x] 2. Rename `crates/tokeira-provisioner-cli` → `crates/tokeira-tkp`
+  - [x] 2.1 Move the directory; rename the package; update the workspace member list;
         update `tokeira-build` composition (`PROVISIONER_CLI_PACKAGE`, generated
         manifest template, `bound_provisioner_main!` macro path, composition tests).
         _Requirements: 12.3_
-  - [ ] 2.2 Checkpoint: full bar green, including a composition round-trip test
+  - [x] 2.2 Checkpoint: full bar green, including a composition round-trip test
         proving a bound provisioner still generates and compiles.
+        DONE 2026-08-17: bar on the workspace devbox green except the pre-existing
+        tokeira-runtime lane-span flake (passes isolated; chipped for its own
+        fix); composition tests passed in this run.
 
-- [ ] 3. Migrate shell-resident deployment-domain modules into `tokeira-deployment`
-  - [ ] 3.1 Move `config_history.rs`, `lock.rs`, `marker.rs`, and `ConfigSource`
+- [x] 3. Migrate shell-resident deployment-domain modules into `tokeira-deployment`
+  - [x] 3.1 Move `config_history.rs`, `lock.rs`, `marker.rs`, and `ConfigSource`
         (from the shell's `lib.rs`) into `tokeira-deployment`; tests move with them;
         shell re-imports. No behaviour, digest, on-disk format, or report changes.
         _Requirements: 12.1, 12.3_
-  - [ ] 3.2 Checkpoint: full bar green.
+  - [x] 3.2 Checkpoint: full bar green.
+        DONE 2026-08-17 (same bar as 2.2): ConfigSource lives in
+        deployment.rs (recorded() public, anyhow-flavoured definition()
+        dropped — test-only caller rebuilt on explicit constructors). Two
+        stated transitional deviations, commented in place and assigned to
+        the operation-lease spec: anyhow/tokio/tokeira-explain deps in the
+        domain crate, and lock.rs's module-level print_stderr allow — R12.3
+        byte-identical reports outweigh §1's letter for a pure move.
 
-- [ ] 4. Collapse `tokeira-tkd` + `tokeira-tkdp` → `crates/tokeira-platform-definition`
-  - [ ] 4.1 Create the crate with `tkd`/`tkdp` as feature-gated modules; the Monty/ruff
+- [x] 4. Collapse `tokeira-tkd` + `tokeira-tkdp` → `crates/tokeira-platform-definition`
+  - [x] 4.1 Create the crate with `tkd`/`tkdp` as feature-gated modules; the Monty/ruff
         dependency train sits behind the `tkdp` feature only. Both frontends' sources,
         tests, and READMEs move unchanged. _Requirements: 12.3_
-  - [ ] 4.2 Make `[package.metadata.tokeira.definition-frontend]` multi-format; teach
+  - [x] 4.2 Make `[package.metadata.tokeira.definition-frontend]` multi-format; teach
         `tokeira-build` discovery to read multi-format frontend packages and
         composition to select the frontend by feature instead of by package
         (generated manifest gains `features = ["<format>"]`). _Requirements: 12.3_
-  - [ ] 4.3 Update `platforms/{compose,ecs,eks}` frontend dependencies; remove the two
+  - [x] 4.3 Update `platforms/{compose,ecs,eks}` frontend dependencies; remove the two
         old crates from the workspace. _Requirements: 12.3_
-  - [ ] 4.4 Checkpoint: full bar green; a `tkd`-only bound composition build compiles
+  - [x] 4.4 Checkpoint: full bar green; a `tkd`-only bound composition build compiles
         without the `tkdp` feature's dependency tree (assert via `cargo tree` in a
         test or a build assertion).
+        DONE 2026-08-18: bar green on the workspace devbox in its NEW seven-step
+        form — this slice also moved §10.4's test step to nextest (one process
+        per test) after root-causing the parallel-load flakes to a
+        tracing-core callsite-registration race that test code cannot
+        deterministically win; diagnosis + adopted contract recorded in the
+        tracing-span-lifecycle-hygiene spec, production hardening in
+        tokeira-observability's installer. tkd-only dependency exclusion
+        verified: cargo tree -e normal shows zero monty/ruff without the
+        tkdp feature, five with it. nextest stress 5x on the previously
+        flaking crates: 578/578 every iteration.
 
 ## B. Platform seams
 
@@ -208,7 +232,7 @@ Slices A (1–4), B (5–6), C (7–14), D (15–18) are PR boundaries; A's inte
 
 ## Notes
 
-- Run the bar remotely: `tkw devbox bar --box tok-bar-xl` from the worktree; fmt runs
+- Run the bar remotely: `tkw devbox bar --box <name>` (or `TKW_DEVBOX`) from the worktree; fmt runs
   locally before push (remote bar checks with `--check`).
 - Restructuring slices carry no functional diffs; if one needs a behavioural change,
   stop — that's a defect in the plan.

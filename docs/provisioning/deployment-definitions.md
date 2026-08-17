@@ -475,8 +475,8 @@ could accept source the actual engine rejects or assign it a different meaning.
 - [Provisioning overview](README.md) — language/engine binding and provenance.
 - [The platform provisioner](provisioner.md) — lifecycle, state, binding, and transitions.
 - [`tkr` and `tkp`](tkr-and-tkp.md) — engine construction, placement, and verification.
-- [`tokeira-tkd`](../../crates/tokeira-tkd/src/lib.rs) and
-  [`HostBridge`](../../crates/tokeira-tkd/src/bridge.rs) — exact interpreter contracts.
+- [`tokeira-platform-definition` (tkd)](../../crates/tokeira-platform-definition/src/tkd/mod.rs) and
+  [`HostBridge`](../../crates/tokeira-platform-definition/src/tkd/bridge.rs) — exact interpreter contracts.
 
 ## The Python form: `.tkdp`
 

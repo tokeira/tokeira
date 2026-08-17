@@ -44,7 +44,7 @@ fn compose_platform_closure_contains_the_platform_stack() {
     // shell-only change re-keys through the generated closure, never
     // through the platform's.
     assert!(
-        !dirs.iter().any(|d| d == "crates/tokeira-provisioner-cli"),
+        !dirs.iter().any(|d| d == "crates/tokeira-tkp"),
         "the shell must not enter a platform's closure; got {dirs:?}"
     );
 

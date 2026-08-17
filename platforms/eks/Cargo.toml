@@ -12,7 +12,7 @@ authors.workspace = true
 # builder/Cx and delegates parsing/eval to this crate, so there is no direct
 # `syn`/`proc-macro2` dependency here (Requirement 1.4; mirrors the refactored
 # `platforms/compose-syn`).
-tokeira-tkd = { workspace = true }
+tokeira-platform-definition = { workspace = true, features = ["tkd"] }
 # Live Kubernetes apply + shared manifest helpers (the `KubePlatform` handle,
 # `NamespaceResource`, `build_node_pool`, `standard_labels`).
 tokeira-k8s = { workspace = true }

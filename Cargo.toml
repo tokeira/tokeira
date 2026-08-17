@@ -19,8 +19,8 @@ members = [
     "crates/tokeira-chasm",
     "crates/tokeira-chasm-activity",
     "crates/tokeira-state",
-    "crates/tokeira-provisioner",
-    "crates/tokeira-provisioner-cli",
+    "crates/tokeira-deployment",
+    "crates/tokeira-tkp",
     "crates/tokeira-report",
     "crates/tokeira-explain",
     "crates/tokeira-iac",
@@ -32,8 +32,7 @@ members = [
     "crates/tokeira-remote-workstation",
     "crates/tokeira-orchestrator",
     "crates/tokeira-platform",
-    "crates/tokeira-tkd",
-    "crates/tokeira-tkdp",
+    "crates/tokeira-platform-definition",
     "crates/tokeira-k8s",
     "crates/tokeira-compose",
     "crates/tokeira-storage",
@@ -158,8 +157,8 @@ ruff_python_ast = "0.0.3"
 ruff_python_parser = "0.0.3"
 ruff_text_size = "0.0.3"
 tokeira-state = { path = "crates/tokeira-state" }
-tokeira-provisioner = { path = "crates/tokeira-provisioner" }
-tokeira-provisioner-cli = { path = "crates/tokeira-provisioner-cli" }
+tokeira-deployment = { path = "crates/tokeira-deployment" }
+tokeira-tkp = { path = "crates/tokeira-tkp" }
 tokeira-iac = { path = "crates/tokeira-iac" }
 tokeira-report = { path = "crates/tokeira-report" }
 tokeira-explain = { path = "crates/tokeira-explain" }
@@ -167,8 +166,7 @@ tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
 tokeira-config = { path = "crates/tokeira-config" }
 tokeira-aws = { path = "crates/tokeira-aws" }
 tokeira-platform = { path = "crates/tokeira-platform" }
-tokeira-tkd = { path = "crates/tokeira-tkd" }
-tokeira-tkdp = { path = "crates/tokeira-tkdp" }
+tokeira-platform-definition = { path = "crates/tokeira-platform-definition" }
 tokeira-secrets = { path = "crates/tokeira-secrets" }
 tokeira-k8s = { path = "crates/tokeira-k8s" }
 tokeira-observability = { path = "crates/tokeira-observability" }

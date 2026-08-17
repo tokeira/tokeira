@@ -42,7 +42,7 @@ tokeira-local-deployment = { path = "../../platforms/local" }
 tokeira-ecs-deployment = { path = "../../platforms/ecs" }
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
 tokeira-platform.workspace = true
-tokeira-provisioner = { workspace = true }
+tokeira-deployment = { workspace = true }
 tokeira-state = { workspace = true }
 tokeira-storage = { path = "../../crates/tokeira-storage", features = ["dsql"] }
 tokeira-types = { path = "../../crates/tokeira-types" }

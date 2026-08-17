@@ -12,11 +12,10 @@
 //! `deployment destroy` never orphans AWS resources.
 
 use anyhow::{Context, Result, bail};
+use tokeira_deployment::RecordedDefinition;
 use tokeira_orchestrator::StorageKind;
-use tokeira_provisioner::RecordedDefinition;
 
 use crate::{
-    catalog::{FrontendSource, PlatformCatalog, PlatformSource},
     cli::DeploymentAction,
     deployment_dir::{DefinitionSeed, DeploymentResolver, normalize_name},
     deployment_lock, launcher,
@@ -48,7 +47,7 @@ pub(crate) async fn run(
                     bail!("legacy platform `{platform}` does not use a definition frontend");
                 }
                 if bundle {
-                    bail!("`--bundle` applies only to catalog-discovered platforms");
+                    bail!("`--bundle` applies only to discovered platforms");
                 }
                 let pending =
                     deployments.begin_create(&resolved_name, platform, storage, region, None)?;
@@ -59,21 +58,18 @@ pub(crate) async fn run(
 
             if storage != StorageKind::InMemory || region.is_some() {
                 bail!(
-                    "catalog-defined platforms take initial provider choices from their definition seed; create the deployment with defaults, then edit the recorded definition before first apply"
+                    "discovered platforms take initial provider choices from their definition seed; create the deployment with defaults, then edit the recorded definition before first apply"
                 );
             }
             let cwd = std::env::current_dir().context("cannot determine current directory")?;
             let workspace = crate::bundle_create::workspace_root_from(&cwd)?;
-            let catalog = PlatformCatalog::from_workspace(&workspace)?;
-            let platform_descriptor = catalog.platform(&platform)?;
+            let discovery =
+                crate::platform_discovery::PlatformDiscovery::from_workspace(&workspace)?;
+            let platform_descriptor = discovery.platform(&platform)?;
             let (frontend_descriptor, definition_path, seed_path) =
-                catalog.workspace_frontend(platform_descriptor, format.as_ref())?;
-            let PlatformSource::Workspace(platform_package) = &platform_descriptor.source else {
-                unreachable!("workspace catalog returned published platform coordinates");
-            };
-            let FrontendSource::Workspace(frontend_package) = &frontend_descriptor.source else {
-                unreachable!("workspace catalog returned published frontend coordinates");
-            };
+                discovery.workspace_frontend(platform_descriptor, format.as_ref())?;
+            let platform_package = &platform_descriptor.package;
+            let frontend_package = &frontend_descriptor.package;
             let seed = DefinitionSeed {
                 definition: RecordedDefinition {
                     format: frontend_descriptor.format.clone(),

@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use tokeira_provisioner::{AuthorityTier, BundleStore, ProvisionerBundle, Target};
+use tokeira_deployment::{AuthorityTier, BundleStore, ProvisionerBundle, Target};
 
 use crate::{BuildError, DaggerClient};
 
@@ -110,7 +110,7 @@ mod tests {
         path::{Path, PathBuf},
         process::Command,
     };
-    use tokeira_provisioner::{BuildAuthority, BuildProfile, BundleStoreError};
+    use tokeira_deployment::{BuildAuthority, BuildProfile, BundleStoreError};
     use tokeira_state::LocalBackend;
 
     fn git(dir: &Path, args: &[&str]) {

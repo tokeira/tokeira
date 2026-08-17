@@ -21,7 +21,7 @@ fn evaluate(root_text: &str) -> Result<FrontendOutput, String> {
     let platform = tokeira_compose_deployment::platform();
     let parts = DirectoryPartSources::new(package, "tkd");
     let source_name = DefinitionSourceName::AuthoringPath(package.join("deployment.tkd"));
-    tokeira_tkd::frontend()
+    tokeira_platform_definition::tkd::frontend()
         .evaluate(
             FrontendSource {
                 source_name: &source_name,

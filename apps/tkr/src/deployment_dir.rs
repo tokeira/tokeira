@@ -38,10 +38,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
+use tokeira_deployment::RecordedDefinition;
 use tokeira_ecs_deployment::EcsConfig;
 use tokeira_local_deployment::LocalConfig;
 use tokeira_orchestrator::{PlatformId, StorageKind};
-use tokeira_provisioner::RecordedDefinition;
 use uuid::Uuid;
 
 use crate::metadata::{self, DeploymentMetadata, DeploymentStatus};
@@ -65,7 +65,7 @@ pub(crate) struct DefinitionSeed {
     /// carrying the root's extension in the platform package. A part is a
     /// document of the definition set — without them a split root cannot
     /// resolve at check or evaluation. Mirrors the retention rule in
-    /// `tokeira-provisioner-cli::config_history`.
+    /// `tokeira-tkp::config_history`.
     pub(crate) parts: Vec<(String, Vec<u8>)>,
 }
 
@@ -244,7 +244,7 @@ impl DeploymentResolver {
         Ok(metadata.definition.is_some())
     }
 
-    /// Build the catalog-selected composition root and marry its exact `tkp`
+    /// Build the discovery-selected composition root and marry its exact `tkp`
     /// bytes to the staged deployment.
     pub(crate) fn place_provisioner_at(
         &self,
@@ -256,7 +256,7 @@ impl DeploymentResolver {
         let source = Self::build_provisioner_from_workspace(workspace, platform, frontend)?;
         let bytes =
             fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
-        let sha256 = tokeira_provisioner::sha256_hex(&bytes);
+        let sha256 = tokeira_deployment::sha256_hex(&bytes);
         let dest = deployment_dir.join(PROVISIONER_BIN);
         fs::write(&dest, &bytes).with_context(|| format!("failed to place {}", dest.display()))?;
         #[cfg(unix)]
@@ -371,7 +371,7 @@ impl DeploymentResolver {
             )?;
         } else {
             let legacy = crate::legacy::LegacyPlatform::from_id(&platform).ok_or_else(|| {
-                anyhow!("platform `{platform}` has neither a catalog seed nor a legacy adapter")
+                anyhow!("platform `{platform}` has neither a discovered definition seed nor a legacy adapter")
             })?;
             fs::write(
                 path.join(DEPLOYMENT_TOML),
@@ -413,10 +413,11 @@ impl DeploymentResolver {
             None
         } else {
             let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-            let catalog = crate::catalog::PlatformCatalog::from_workspace(&workspace)?;
-            let platform_descriptor = catalog.platform(&platform)?;
+            let discovery =
+                crate::platform_discovery::PlatformDiscovery::from_workspace(&workspace)?;
+            let platform_descriptor = discovery.platform(&platform)?;
             let (frontend, definition_path, path) =
-                catalog.workspace_frontend(platform_descriptor, None)?;
+                discovery.workspace_frontend(platform_descriptor, None)?;
             Some(DefinitionSeed {
                 definition: RecordedDefinition {
                     format: frontend.format.clone(),

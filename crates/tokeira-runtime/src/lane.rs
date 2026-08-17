@@ -2004,8 +2004,18 @@ mod tests {
         state: Arc<Mutex<MockKernelState>>,
     }
 
+    /// Captured spans by creation order, plus a span-id → entry index so
+    /// `on_record` finds its span without any registry lookup. The capture
+    /// deliberately never calls `ctx.span(id)`: that is a sharded-registry
+    /// read whose `None` result this layer used to swallow silently, losing
+    /// a span under rare high-parallelism conditions (the same registry the
+    /// span-lifecycle-hygiene spec tracks for tokeirad). `attrs.metadata()`
+    /// carries everything the capture needs.
     #[derive(Clone, Default)]
-    struct SpanCapture(Arc<Mutex<Vec<(String, HashMap<String, String>)>>>);
+    struct SpanCapture(
+        Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+        Arc<Mutex<HashMap<u64, usize>>>,
+    );
 
     struct FieldRecorder {
         values: HashMap<String, String>,
@@ -2033,39 +2043,54 @@ mod tests {
         }
     }
 
-    impl<S> Layer<S> for SpanCapture
-    where
-        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-    {
-        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+    impl SpanCapture {
+        fn capture_new(&self, attrs: &Attributes<'_>, id: &Id) {
             let mut recorder = FieldRecorder {
                 values: HashMap::new(),
             };
             attrs.record(&mut recorder);
-            if let Some(span) = ctx.span(id) {
-                self.0
-                    .lock()
-                    .expect("0 lock poisoned")
-                    .push((span.metadata().name().to_string(), recorder.values));
-            }
+            let mut captured = self.0.lock().expect("0 lock poisoned");
+            let index = captured.len();
+            captured.push((attrs.metadata().name().to_string(), recorder.values));
+            // Slab ids can be reused after close; last write wins, which is
+            // what "the most recent span with this id" means.
+            self.1
+                .lock()
+                .expect("1 lock poisoned")
+                .insert(id.into_u64(), index);
         }
 
-        fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, ctx: Context<'_, S>) {
+        fn capture_record(&self, id: &Id, values: &tracing::span::Record<'_>) {
             let mut recorder = FieldRecorder {
                 values: HashMap::new(),
             };
             values.record(&mut recorder);
-            if let Some(span) = ctx.span(id) {
-                let span_name = span.metadata().name();
-                let mut captured = self.0.lock().expect("0 lock poisoned");
-                if let Some((_, fields)) = captured
-                    .iter_mut()
-                    .rev()
-                    .find(|(name, _)| name == span_name)
-                {
-                    fields.extend(recorder.values);
-                }
+            let Some(index) = self
+                .1
+                .lock()
+                .expect("1 lock poisoned")
+                .get(&id.into_u64())
+                .copied()
+            else {
+                return;
+            };
+            let mut captured = self.0.lock().expect("0 lock poisoned");
+            if let Some((_, fields)) = captured.get_mut(index) {
+                fields.extend(recorder.values);
             }
+        }
+    }
+
+    impl<S> Layer<S> for SpanCapture
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: Context<'_, S>) {
+            self.capture_new(attrs, id);
+        }
+
+        fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, _ctx: Context<'_, S>) {
+            self.capture_record(id, values);
         }
     }
 
@@ -3038,8 +3063,29 @@ mod tests {
         assert_eq!(handle.queued_depth(), 1);
     }
 
+    /// Serializes the tests that install tracing dispatchers.
+    ///
+    /// Cross-test tracing interference is real but cannot be deterministically
+    /// eliminated from test code: `Dispatch::new` registration races other
+    /// threads' one-time lock-free callsite registrations inside tracing-core,
+    /// and a missed callsite stays cached `Interest::never` for the process
+    /// (diagnosed during the deployment-restructuring slice; a process-global
+    /// test dispatcher was tried and rejected — it changes behaviour for every
+    /// test, e.g. `ChannelTraceContext::capture_current` starts returning
+    /// `Some` everywhere). The §10.4 bar therefore runs tests under nextest's
+    /// per-test process isolation, where no sibling tests exist to race; this
+    /// guard remains so plain `cargo test` stays orderly rather than flaky by
+    /// design. Poisoning is ignored: no shared state outlives a holder.
+    fn tracing_dispatch_guard() -> std::sync::MutexGuard<'static, ()> {
+        static TRACING_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TRACING_DISPATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn lane_processing_span_records_origin_trace_context() {
+        let _tracing = tracing_dispatch_guard();
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
         let tracer = provider.tracer("lane-test");
         let capture = SpanCapture::default();
@@ -3083,6 +3129,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn handle_message_records_kernel_and_storage_span_attributes() {
+        let _tracing = tracing_dispatch_guard();
         let capture = SpanCapture::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         let dispatch = tracing::Dispatch::new(subscriber);
@@ -3931,6 +3978,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_message_uses_kernel_transition_span_name() {
+        let _tracing = tracing_dispatch_guard();
         let run_key = RunKey::new();
         let state = sample_state(run_key);
         let repo = MockRepo::new(LoadedRun::Existing(state), vec![CommitBehavior::Applied]);

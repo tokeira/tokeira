@@ -74,10 +74,34 @@ the trigger is **span volume through the registry**, and it leaves the process o
 each install their **own** subscriber via thread-local `set_default` / `with_default` while other tests
 run under the no-op default. `tracing`'s callsite interest cache and the `DefaultGuard` install/drop
 rebuild are process-global, so concurrently pushing/popping thread-local dispatchers races on shared
-state. This is the exact anti-pattern the *production* code correctly avoids. (An earlier investigation
-mis-attributed the flake to no-op interest poisoning; that hypothesis failed to reproduce —
-`set_default` does rebuild interest — so the real cause is concurrent guard install/drop, not first-hit
-poisoning. Do not re-chase the poisoning theory.)
+state.
+
+### Ground truth (verified 2026-08-17, deployment-restructuring slice)
+
+The dispatcher-churn attribution above is insufficient: fully serializing the subscriber-installing
+tests did not change the observed failure rate (~50% of full-suite runs on a high-core-count Linux
+box; always green on an M-series Mac and in single-test isolation). The verified mechanism is a race
+between **dispatcher registration and one-time callsite registration**: `Dispatch::new` →
+`callsite::register_dispatch` eagerly rebuilds interest for every *registered* callsite
+(`tracing-core-0.1.36/src/callsite.rs:484`), but the callsite list is lock-free and a callsite whose
+first-hit registration is in flight on another thread can be missed; a rebuild that observes no
+interested dispatcher writes `Interest::never` (`rebuild_callsite_interest`,
+`interest.unwrap_or_else(Interest::never)`), and a `never`-cached callsite short-circuits the span
+macro without consulting the current dispatcher — **that span or event is silently dead for the rest
+of the process**. This explains per-run coin-flip behaviour (scheduling order of registration vs.
+first hits) and same-run clustering (several span tests failing together once a shared product
+callsite deadens). A second, independent defect was found in the test capture layer itself:
+`ctx.span(id)` (a sharded-registry read) returning `None` was silently swallowed, losing captured
+spans; the capture is now registry-free.
+
+**Production exposure.** The same registration race exists at process startup: under `#[tokio::main]`,
+runtime worker threads exist before `install_observability` registers the global subscriber, so an
+early-hit callsite can deaden for the process lifetime — silent telemetry/correlation loss (verified
+consumers: outbound context injection in `tokeira-runtime/src/publisher.rs`, log correlation in
+`apps/tokeirad/src/correlation_format.rs`; no control-flow reads span state, so correctness is
+unaffected). Installed heal: `tokeira-observability/src/tracing.rs` rebuilds the interest cache once
+more immediately after subscriber installation, closing the window to registrations still in flight
+at that instant; callers MUST install observability before spawning application tasks.
 
 ### Non-negotiable invariant
 
@@ -181,18 +205,17 @@ boundary in a way that can outlive its close, because that is the canonical clon
 **User story.** As a maintainer, I need `cargo test --workspace` to be deterministic, so span-assertion
 tests are trustworthy CI signal rather than a known flake.
 
-**Acceptance criteria.**
+**Acceptance criteria** (adopted 2026-08-17; the registration race is not deterministically fixable
+from test code — see Ground truth — so isolation is structural):
 
-1. The three subscriber-installing tests in `lane.rs` no longer install competing process-global
-   subscribers concurrently. They adopt one of: the `tracing-test` (`#[traced_test]`) / `tracing-mock`
-   pattern; or `future.with_subscriber(dispatch)` (async-correct — follows the future) combined with
-   serialization of subscriber-installing tests.
-2. The bespoke `SpanCapture` + `set_default` dance is retired or reduced to the idiomatic minimum; the
-   choice mirrors the production principle ("one subscriber; never swap; test via a scoped/attached
-   subscriber, not the global default").
-3. `cargo test --workspace` is deterministic across repeated parallel runs (verify with several
-   consecutive full runs and a `--test-threads=1` run), with the fix *demonstrated* against a
-   reproduction, not asserted.
+1. The §10.4 bar's test step runs under `cargo nextest run --workspace --locked` (one process per
+   test: no sibling tests exist to race global tracing state), with doctests covered by
+   `cargo test --workspace --doc --locked`.
+2. The subscriber-installing tests in `lane.rs` remain serialized behind one guard and use the
+   registry-free `SpanCapture` (no `ctx.span(id)` lookups), so plain `cargo test` stays orderly on
+   low-contention machines even though only nextest isolation is authoritative.
+3. Determinism is demonstrated, not asserted: repeated full-crate stress runs on a high-core-count
+   box under the nextest step, clean.
 
 ---
 

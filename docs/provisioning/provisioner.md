@@ -263,5 +263,5 @@ Compose is the concrete TKP implementation. `ComposeProvisioner`:
   source-backed bridge, adapter, and platform-engine idioms.
 - [`tkr` and `tkp`](tkr-and-tkp.md) — placement, launch classes, and binary handoff.
 - [State and convergence](../iac/state-and-convergence.md) — engine state and CAS behavior.
-- [`ProvisionerPlatform`](../../crates/tokeira-provisioner-cli/src/lib.rs) — exact platform seam.
-- [`DeploymentStateEnvelope`](../../crates/tokeira-provisioner/src/lib.rs) — provisioner domain entry point.
+- [`ProvisionerPlatform`](../../crates/tokeira-tkp/src/lib.rs) — exact platform seam.
+- [`DeploymentStateEnvelope`](../../crates/tokeira-deployment/src/lib.rs) — provisioner domain entry point.

@@ -27,7 +27,7 @@ tokeira-platform = { path = "../../crates/tokeira-platform" }
 
 [dev-dependencies]
 tokeira-observability = { workspace = true }
-tokeira-tkd = { path = "../../crates/tokeira-tkd" }
+tokeira-platform-definition = { workspace = true, features = ["tkd"] }
 
 [lints]
 workspace = true

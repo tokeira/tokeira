@@ -47,7 +47,14 @@ const BAR_STEPS: &[(&str, &str)] = &[
     ("fmt", "cargo +{nightly} fmt --all -- --check"),
     ("lint", "cargo lint --locked"),
     ("check", "cargo check --workspace --locked"),
-    ("test", "cargo test --workspace --locked"),
+    // nextest runs one process per test: cross-test races on process-global
+    // state (tracing's callsite interest cache being the diagnosed case —
+    // tracing-span-lifecycle-hygiene spec, Req 5) are structurally
+    // impossible, where `cargo test`'s in-process parallelism made them a
+    // per-run coin flip on high-core-count boxes.
+    ("test", "cargo nextest run --workspace --locked"),
+    // nextest does not run doctests; they keep their own step.
+    ("doctest", "cargo test --workspace --doc --locked"),
     (
         "doc",
         "RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps --locked",

@@ -40,5 +40,5 @@ pub enum BuildError {
     Validation { reason: String },
 
     #[error("bundle store: {0}")]
-    BundleStore(#[from] tokeira_provisioner::BundleStoreError),
+    BundleStore(#[from] tokeira_deployment::BundleStoreError),
 }

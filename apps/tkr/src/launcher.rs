@@ -24,7 +24,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use tokeira_provisioner::{
+use tokeira_deployment::{
     BinaryStore, BuildMode, DeploymentStateEnvelope, ORCHESTRATED_LOCK_HOLDER_ENV,
     ORCHESTRATED_LOCK_TOKEN_ENV, Target,
 };
@@ -80,7 +80,7 @@ impl TkpBinary {
             return Ok(Self(bound));
         }
         bail!(
-            "deployment has no married provisioner at {}; recreate it through catalog-driven deployment creation",
+            "deployment has no married provisioner at {}; recreate it through discovered deployment creation",
             bound.display()
         )
     }
@@ -270,7 +270,7 @@ const ORCHESTRATION_LOCK_TTL: std::time::Duration = std::time::Duration::from_se
 
 async fn orchestrate_rollback(
     deployment_dir: &Path,
-    identity: &tokeira_provisioner::EngineIdentity,
+    identity: &tokeira_deployment::EngineIdentity,
     lease_envs: &[(&str, String)],
 ) -> Result<()> {
     // Phase 1 — B: verify both, delete what B created, re-pin, stop.
@@ -319,7 +319,7 @@ async fn orchestrate_rollback(
 /// definition change is idempotent; the *binary* advances whenever the
 /// implementation changed):
 ///
-/// 1. resolve the **candidate** from the recorded catalog selection — never the
+/// 1. resolve the **candidate** from the recorded platform selection — never the
 ///    married copy, which is definitionally the engine being upgraded FROM
 ///    (resolving it as its own candidate is how `upgrade` was wedged: A
 ///    evaluated `upgrade(A, A)` and refused forever);
@@ -340,22 +340,16 @@ pub(crate) async fn launch_upgrade(deployment_dir: &Path) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("legacy in-process deployments have no bound upgrade"))?;
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
     let workspace = crate::bundle_create::workspace_root_from(&cwd)?;
-    let catalog = crate::catalog::PlatformCatalog::from_workspace(&workspace)?;
-    let platform = catalog.platform(&metadata.platform)?;
-    let frontend = catalog.frontend(&definition.format)?;
-    let crate::catalog::PlatformSource::Workspace(platform) = &platform.source else {
-        unreachable!("workspace catalog returned published platform coordinates");
-    };
-    let crate::catalog::FrontendSource::Workspace(frontend) = &frontend.source else {
-        unreachable!("workspace catalog returned published frontend coordinates");
-    };
+    let discovery = crate::platform_discovery::PlatformDiscovery::from_workspace(&workspace)?;
+    let platform = &discovery.platform(&metadata.platform)?.package;
+    let frontend = &discovery.frontend(&definition.format)?.package;
     let candidate = crate::deployment_dir::DeploymentResolver::build_provisioner_from_workspace(
         &workspace, platform, frontend,
     )?;
     let candidate_bytes = std::fs::read(&candidate)
         .with_context(|| format!("failed to read the candidate at {}", candidate.display()))?;
     let bound_path = deployment_dir.join(PROVISIONER_BIN);
-    let sha256 = tokeira_provisioner::sha256_hex(&candidate_bytes);
+    let sha256 = tokeira_deployment::sha256_hex(&candidate_bytes);
     if let Ok(bound_bytes) = std::fs::read(&bound_path)
         && bound_bytes == candidate_bytes
     {
@@ -424,15 +418,9 @@ pub(crate) async fn launch_definition_check_at_path(
     }
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
     let workspace = crate::bundle_create::workspace_root_from(&cwd)?;
-    let catalog = crate::catalog::PlatformCatalog::from_workspace(&workspace)?;
-    let platform = catalog.platform(platform)?;
-    let frontend = catalog.frontend(format)?;
-    let crate::catalog::PlatformSource::Workspace(platform) = &platform.source else {
-        unreachable!("workspace catalog returned published platform coordinates");
-    };
-    let crate::catalog::FrontendSource::Workspace(frontend) = &frontend.source else {
-        unreachable!("workspace catalog returned published frontend coordinates");
-    };
+    let discovery = crate::platform_discovery::PlatformDiscovery::from_workspace(&workspace)?;
+    let platform = &discovery.platform(platform)?.package;
+    let frontend = &discovery.frontend(format)?.package;
     let candidate = crate::deployment_dir::DeploymentResolver::build_provisioner_from_workspace(
         &workspace, platform, frontend,
     )?;
@@ -552,7 +540,7 @@ pub(crate) async fn launch_apply(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use tokeira_provisioner::{
+    use tokeira_deployment::{
         BinaryArtifactDescriptor, IntegrityManifest, ProvenanceStamp, Target,
     };
 
@@ -666,7 +654,7 @@ mod tests {
 
     #[test]
     fn verify_matches_recorded_checksum_and_rejects_mismatch() {
-        use tokeira_provisioner::sha256_hex;
+        use tokeira_deployment::sha256_hex;
 
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("tkp");

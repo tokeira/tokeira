@@ -296,17 +296,15 @@ Run before any push or PR. The per-turn hook (`tkw hook stop` → `cargo check
 cargo +nightly fmt --all                                  # CI verifies with --check
 cargo lint --locked                                       # clippy: workspace + all targets
 cargo check --workspace --locked
-cargo nextest run --workspace --locked                    # one process per test — see note
-cargo test --workspace --doc --locked                     # doctests (nextest skips them)
+cargo nextest run --workspace --locked                    # tests; see note
+cargo test --workspace --doc --locked                     # doctests
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 ```
 
 - `cargo lint` builds test targets; `cargo check` alone does not.
-- The test step is nextest **by contract**: one process per test makes cross-test races on
-  process-global state (tracing's callsite interest cache being the diagnosed case — see the
-  tracing-span-lifecycle-hygiene spec) structurally impossible, where in-process `cargo test`
-  parallelism left them a per-run coin flip on high-core-count machines. Plain `cargo test` remains
-  fine for the inner loop; it is not the bar.
+- Tests run under nextest **by contract** — one process per test, so cross-test races on
+  process-global state cannot exist (tracing-span-lifecycle-hygiene spec, Req 5). Plain
+  `cargo test` is inner-loop only.
 - CI (`.github/workflows/ci.yml`) additionally enforces: `cargo-deny`
   bans/licenses/sources (merge-gating; the advisories job is advisory-only, re-run
   weekly), a lychee offline link check over every `*.md` including `.kiro/` (broken

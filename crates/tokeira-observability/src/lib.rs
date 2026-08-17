@@ -175,8 +175,21 @@ mod tests {
 
     use super::*;
 
-    fn reset_installation_for_test() {
+    /// The installation flag is deliberately process-global, so the tests
+    /// that reset and then assert on it must not interleave: under the
+    /// default parallel harness, another reservation between one test's
+    /// reset and its assert flips the outcome (observed as a rare
+    /// high-core-count failure). The guard serializes exactly those tests —
+    /// resetting the flag on acquisition — and leaves every other test
+    /// parallel. Poisoning is ignored: a prior panicking holder cannot
+    /// corrupt an `AtomicBool` we re-reset anyway.
+    fn installation_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static INSTALLATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = INSTALLATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         OBSERVABILITY_INSTALLED.store(false, Ordering::Release);
+        guard
     }
 
     fn test_config() -> ProcessObservabilityConfig {
@@ -199,7 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn manifest_validation_runs_before_install_reservation() {
-        reset_installation_for_test();
+        let _guard = installation_test_guard();
         const INVALID_METRIC: MetricDescriptor = MetricDescriptor {
             name: "bad_counter",
             metric_type: MetricType::Counter,
@@ -226,7 +239,7 @@ mod tests {
 
     #[test]
     fn double_install_reservation_returns_deterministic_error() {
-        reset_installation_for_test();
+        let _guard = installation_test_guard();
         let reservation = InstallationReservation::reserve().unwrap();
 
         let error = InstallationReservation::reserve().unwrap_err();
@@ -234,7 +247,7 @@ mod tests {
         assert!(matches!(error, ObservabilityError::RecorderInstall(_)));
         assert!(error.to_string().contains("already installed"));
         drop(reservation);
-        reset_installation_for_test();
+        OBSERVABILITY_INSTALLED.store(false, Ordering::Release);
     }
 
     #[test]

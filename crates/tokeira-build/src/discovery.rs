@@ -34,7 +34,7 @@ pub struct PackageCoordinates {
 pub struct PlatformPackageDescriptor {
     /// Open platform identity advertised by the package.
     pub id: PlatformId,
-    /// Whether this source entry requests catalog-default status.
+    /// Whether this source entry requests discovery-default status.
     pub is_default: bool,
     /// Exact Engine_Version this platform definition composes with.
     pub engine: String,
@@ -60,6 +60,9 @@ pub struct DefinitionFrontendPackageDescriptor {
     pub format: DefinitionFormatId,
     /// Seed-materialization source extension.
     pub source_extension: DefinitionSourceExtension,
+    /// Cargo feature enabling this frontend in its package; also the module
+    /// path of the frontend's entry (`<crate>::<feature>::frontend`).
+    pub feature: String,
     /// Conventional source-library coordinates.
     pub package: PackageCoordinates,
 }
@@ -79,7 +82,7 @@ pub enum DiscoveryError {
     /// Cargo could not describe the requested workspace.
     #[error("cargo metadata failed: {0}")]
     Metadata(#[from] cargo_metadata::Error),
-    /// A recognized package descriptor violated the private catalog contract.
+    /// A recognized package descriptor violated the private discovery contract.
     #[error("invalid {descriptor} descriptor in package `{package}`: {message}")]
     InvalidDescriptor {
         /// Cargo package carrying the descriptor.
@@ -114,6 +117,7 @@ struct RawPlatformDescriptor {
 struct RawFrontendDescriptor {
     format: String,
     source_extension: String,
+    feature: String,
 }
 
 /// Decode recognized package descriptors from one trusted source workspace.
@@ -157,7 +161,18 @@ pub(crate) fn descriptors_from_metadata(
             .get("tokeira")
             .and_then(|value| value.get("definition-frontend"))
         {
-            frontends.push(decode_frontend(package, value.clone())?);
+            // Multi-format frontend packages declare one entry per format
+            // (`[[package.metadata.tokeira.definition-frontend]]`).
+            let Some(entries) = value.as_array() else {
+                return Err(invalid(
+                    package,
+                    "definition-frontend",
+                    "expected an array of tables (one entry per format)".to_string(),
+                ));
+            };
+            for entry in entries {
+                frontends.push(decode_frontend(package, entry.clone())?);
+            }
         }
     }
 
@@ -277,9 +292,25 @@ fn decode_frontend(
     let source_extension = DefinitionSourceExtension::new(raw.source_extension)
         .map_err(|error| invalid(package, "definition-frontend", error.to_string()))?;
     let coordinates = package_coordinates(package, "definition-frontend")?;
+    if raw.feature.is_empty()
+        || !raw
+            .feature
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(invalid(
+            package,
+            "definition-frontend",
+            format!(
+                "feature `{}` is not a valid cargo feature name",
+                raw.feature
+            ),
+        ));
+    }
     Ok(DefinitionFrontendPackageDescriptor {
         format,
         source_extension,
+        feature: raw.feature,
         package: coordinates,
     })
 }
@@ -446,9 +477,10 @@ default = false
             root.path(),
             "frontend",
             r#"
-[package.metadata.tokeira.definition-frontend]
+[[package.metadata.tokeira.definition-frontend]]
 format = "tkd"
 source-extension = "tkd"
+feature = "tkd"
 "#,
             false,
         );
@@ -503,9 +535,10 @@ default-format = "Not A Format!"
             root.path(),
             "frontend",
             r#"
-[package.metadata.tokeira.definition-frontend]
+[[package.metadata.tokeira.definition-frontend]]
 format = "tkd"
 source-extension = "tkd"
+feature = "tkd"
 "#,
             true,
         );
@@ -565,8 +598,19 @@ definitions = ["a.tkd", "b.tkd"]
             .iter()
             .find(|descriptor| descriptor.format.as_str() == "tkd")
             .expect("tkd descriptor");
-        assert_eq!(frontend.package.package_name, "tokeira-tkd");
-        assert_eq!(frontend.package.library_target, "tokeira_tkd");
+        assert_eq!(frontend.package.package_name, "tokeira-platform-definition");
+        assert_eq!(
+            frontend.package.library_target,
+            "tokeira_platform_definition"
+        );
+        assert_eq!(frontend.feature, "tkd");
+        let tkdp = descriptors
+            .frontends
+            .iter()
+            .find(|descriptor| descriptor.format.as_str() == "tkdp")
+            .expect("tkdp descriptor");
+        assert_eq!(tkdp.package.package_name, "tokeira-platform-definition");
+        assert_eq!(tkdp.feature, "tkdp");
     }
 
     proptest! {

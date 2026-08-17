@@ -21,14 +21,14 @@
 //! The interpreter decides "is this named type a config `Value::Struct` or an
 //! opaque host handle?" via [`HostBridge::is_kind`]. Only the types listed there
 //! are kinds. `ServiceManifest`/`IngressRule` are *config structs* declared in
-//! the `.tkd`: they arrive as [`tokeira_tkd::Value::Struct`] and are decomposed
+//! the `.tkd`: they arrive as [`tokeira_platform_definition::tkd::Value::Struct`] and are decomposed
 //! here into the concrete `manifests::ServiceManifest`/`kinds::IngressRule`. This
 //! is why they must NOT appear in `is_kind` — misclassifying one would route it
 //! through kind construction and fail.
 
 use std::{cell::RefCell, rc::Rc};
 
-use tokeira_tkd::{EvalError, FieldMapExt, HostBridge};
+use tokeira_platform_definition::tkd::{EvalError, FieldMapExt, HostBridge};
 
 use crate::{
     builder::{self, Kind, ModuleRef, Output, ResourceRef, WbValue},
@@ -42,9 +42,9 @@ use crate::{
 };
 
 /// The EKS platform's runtime value type (the shared `Value` over its host).
-type Value = tokeira_tkd::Value<HostObj>;
+type Value = tokeira_platform_definition::tkd::Value<HostObj>;
 /// The EKS platform's evaluated field map.
-type FieldMap = tokeira_tkd::FieldMap<HostObj>;
+type FieldMap = tokeira_platform_definition::tkd::FieldMap<HostObj>;
 
 /// The closed set of opaque author handles the EKS platform exposes. Dispatch
 /// keys on [`HostKind`], so a receiver-type mismatch is structural, never a

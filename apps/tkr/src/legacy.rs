@@ -2,7 +2,7 @@
 //! generated bound provisioners.
 //!
 //! Compose is deliberately absent. Its source, config, and binary are selected
-//! through the trusted catalog. This module exists only to avoid changing the
+//! through platform discovery. This module exists only to avoid changing the
 //! Local and ECS platform crates during the Compose remediation.
 
 use anyhow::Result;

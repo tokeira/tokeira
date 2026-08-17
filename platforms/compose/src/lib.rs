@@ -90,11 +90,11 @@ pub fn platform() -> PlatformDeclaration {
 // framework's macro, which hands both declarations, with the identity pair
 // the binary is built as, to the framework:
 //
-//     tokeira_provisioner_cli::bound_provisioner_main! {
+//     tokeira_tkp::bound_provisioner_main! {
 //         expected_platform: "compose",
 //         platform: tokeira_compose_deployment::platform,
 //         expected_format: "tkd",
-//         frontend: tokeira_tkd::frontend,
+//         frontend: tokeira_platform_definition::tkd::frontend,
 //     }
 //
 // The framework marries platform and frontend; the platform never receives

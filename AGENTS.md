@@ -296,11 +296,15 @@ Run before any push or PR. The per-turn hook (`tkw hook stop` → `cargo check
 cargo +nightly fmt --all                                  # CI verifies with --check
 cargo lint --locked                                       # clippy: workspace + all targets
 cargo check --workspace --locked
-cargo test --workspace --locked
+cargo nextest run --workspace --locked                    # tests; see note
+cargo test --workspace --doc --locked                     # doctests
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 ```
 
 - `cargo lint` builds test targets; `cargo check` alone does not.
+- Tests run under nextest **by contract** — one process per test, so cross-test races on
+  process-global state cannot exist (tracing-span-lifecycle-hygiene spec, Req 5). Plain
+  `cargo test` is inner-loop only.
 - CI (`.github/workflows/ci.yml`) additionally enforces: `cargo-deny`
   bans/licenses/sources (merge-gating; the advisories job is advisory-only, re-run
   weekly), a lychee offline link check over every `*.md` including `.kiro/` (broken
@@ -535,8 +539,9 @@ crates/     engine   types · proto · kernel · chasm{,-derive,-activity} · st
                      runtime · projection · edge · observability · auth
             compat   build-info · compatibility{,-proto,-service} ·
                      conformance{,-proto,-control}
-            deploy   state · iac · deploy-engine · config · orchestrator · tkd · k8s ·
-                     aws · compose · build · provisioner{,-cli} · autoscaler ·
+            deploy   state · iac · deploy-engine · config · orchestrator ·
+                     platform-definition · k8s · aws · compose · build ·
+                     deployment · tkp · autoscaler ·
                      controller · remote-workstation · dagger-client
 platforms/  local · compose · ecs · eks
 tools/      tkw (fleet worktrees) · proto-sync · simulation (excluded)

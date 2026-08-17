@@ -20,7 +20,7 @@
 
 use std::{collections::BTreeSet, path::PathBuf};
 
-use tokeira_provisioner::{
+use tokeira_deployment::{
     BinaryArtifactDescriptor, BuildAuthority, BuildProfile, EngineIdentity, ProvisionerBundle,
     Sha256Digest, Target,
     bundle::{BuildManifest, TestEvidence},
@@ -74,7 +74,7 @@ pub struct ProvisionerBuildRequest {
 /// Build, test, checksum, and package the provisioner. On success the
 /// artifacts are on disk under `output_dir` and the returned bundle's
 /// descriptors attest their exact bytes — ready for
-/// [`BundleStore::publish`](tokeira_provisioner::BundleStore::publish).
+/// [`BundleStore::publish`](tokeira_deployment::BundleStore::publish).
 pub fn build_provisioner(
     request: &ProvisionerBuildRequest,
     dagger: &dyn DaggerClient,

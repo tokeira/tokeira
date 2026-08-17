@@ -1,0 +1,32 @@
+[package]
+name = "tokeira-deployment"
+publish = false
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+tokeira-state = { workspace = true }
+tokeira-build-info = { workspace = true }
+tokeira-orchestrator = { path = "../tokeira-orchestrator" }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
+# Transitional (deployment-repository spec, restructuring slice): the migrated
+# shell modules (config_history, lock, marker) carry their anyhow error chains
+# and tokio-driven lock body so behaviour and reports stay byte-identical; the
+# operation-lease spec retypes them in their new home.
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokeira-explain = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

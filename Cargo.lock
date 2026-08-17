@@ -8218,12 +8218,12 @@ dependencies = [
  "tokeira-compatibility",
  "tokeira-config",
  "tokeira-deploy-engine",
+ "tokeira-deployment",
  "tokeira-ecs-deployment",
  "tokeira-iac",
  "tokeira-local-deployment",
  "tokeira-orchestrator",
  "tokeira-platform",
- "tokeira-provisioner",
  "tokeira-remote-workstation",
  "tokeira-state",
  "tokeira-storage",
@@ -8395,9 +8395,9 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokeira-deployment",
  "tokeira-orchestrator",
  "tokeira-platform",
- "tokeira-provisioner",
  "tokeira-state",
  "tokio",
  "toml 0.8.23",
@@ -8529,7 +8529,7 @@ dependencies = [
  "tokeira-iac",
  "tokeira-observability",
  "tokeira-platform",
- "tokeira-tkd",
+ "tokeira-platform-definition",
  "tracing",
 ]
 
@@ -8657,6 +8657,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-deployment"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokeira-build-info",
+ "tokeira-explain",
+ "tokeira-orchestrator",
+ "tokeira-state",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "tokeira-ecs"
 version = "0.1.0"
 dependencies = [
@@ -8697,7 +8717,7 @@ dependencies = [
  "tokeira-iac",
  "tokeira-observability",
  "tokeira-platform",
- "tokeira-tkd",
+ "tokeira-platform-definition",
 ]
 
 [[package]]
@@ -8768,8 +8788,8 @@ dependencies = [
  "tokeira-iac",
  "tokeira-k8s",
  "tokeira-orchestrator",
+ "tokeira-platform-definition",
  "tokeira-state",
- "tokeira-tkd",
  "tokio",
 ]
 
@@ -8921,6 +8941,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-platform-definition"
+version = "0.1.0"
+dependencies = [
+ "monty",
+ "monty-types",
+ "proc-macro2",
+ "proptest",
+ "ruff_python_ast",
+ "ruff_python_parser",
+ "ruff_text_size",
+ "serde",
+ "serde_json",
+ "syn",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokeira-iac",
+ "tokeira-orchestrator",
+ "tokeira-platform",
+ "tokeira-platform-definition",
+]
+
+[[package]]
 name = "tokeira-projection"
 version = "0.1.0"
 dependencies = [
@@ -8968,52 +9010,6 @@ dependencies = [
  "tonic-build 0.11.0",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "tokeira-provisioner"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "tokeira-build-info",
- "tokeira-orchestrator",
- "tokeira-state",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "tokeira-provisioner-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "clap",
- "futures-util",
- "proptest",
- "serde",
- "serde_json",
- "tempfile",
- "termimad",
- "tokeira-aws",
- "tokeira-build-info",
- "tokeira-deploy-engine",
- "tokeira-explain",
- "tokeira-iac",
- "tokeira-orchestrator",
- "tokeira-platform",
- "tokeira-provisioner",
- "tokeira-report",
- "tokeira-state",
- "tokio",
- "toml 0.8.23",
 ]
 
 [[package]]
@@ -9168,36 +9164,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokeira-tkd"
+name = "tokeira-tkp"
 version = "0.1.0"
 dependencies = [
- "proc-macro2",
- "serde",
- "serde_json",
- "syn",
- "tempfile",
- "tokeira-iac",
- "tokeira-orchestrator",
- "tokeira-platform",
-]
-
-[[package]]
-name = "tokeira-tkdp"
-version = "0.1.0"
-dependencies = [
- "monty",
- "monty-types",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "futures-util",
  "proptest",
- "ruff_python_ast",
- "ruff_python_parser",
- "ruff_text_size",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
+ "termimad",
+ "tokeira-aws",
+ "tokeira-build-info",
+ "tokeira-deploy-engine",
+ "tokeira-deployment",
+ "tokeira-explain",
  "tokeira-iac",
  "tokeira-orchestrator",
  "tokeira-platform",
+ "tokeira-report",
+ "tokeira-state",
+ "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]

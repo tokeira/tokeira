@@ -14,8 +14,8 @@ use std::{
 
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use thiserror::Error;
+use tokeira_deployment::{BoundProvisionerEvidence, Sha256Digest};
 use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
-use tokeira_provisioner::{BoundProvisionerEvidence, Sha256Digest};
 
 use crate::{
     ClosureError, DefinitionFrontendPackageDescriptor, DiscoveryError, PackageCoordinates,
@@ -25,7 +25,7 @@ use crate::{
 };
 
 /// Cargo package containing the generic provisioner shell.
-pub const PROVISIONER_CLI_PACKAGE: &str = "tokeira-provisioner-cli";
+pub const TKP_PACKAGE: &str = "tokeira-tkp";
 
 /// Stable location of the disposable root within a staged source tree.
 pub const GENERATED_ROOT_RELATIVE_PATH: &str = ".tokeira-build/bound-provisioner";
@@ -308,7 +308,7 @@ pub enum CompositionError {
     /// The exact three-root dependency closure could not be resolved.
     #[error(transparent)]
     Closure(#[from] ClosureError),
-    /// Selected catalog data no longer agrees with the recognized workspace.
+    /// Selected discovery data no longer agrees with the recognized workspace.
     #[error("invalid bound-provisioner selection: {0}")]
     InvalidSelection(String),
     /// The admitted workspace lock could not be read for the generated root.
@@ -390,7 +390,7 @@ pub fn assemble_bound_provisioner(
             frontend.format
         )));
     }
-    let cli = find_workspace_package(&metadata, PROVISIONER_CLI_PACKAGE)?;
+    let cli = find_workspace_package(&metadata, TKP_PACKAGE)?;
     let cli_coordinates = package_coordinates(cli, "bound-provisioner shell")?;
 
     // Cargo's own normalized spelling must anchor dependency paths. On macOS
@@ -409,12 +409,13 @@ pub fn assemble_bound_provisioner(
         &platform_path,
         &frontend.package,
         &frontend_path,
+        &frontend.feature,
     );
-    let main_rs = render_main(&platform.id, &frontend.format);
+    let main_rs = render_main(&platform.id, &frontend.format, &frontend.feature);
     let closure = resolve_source_closure_for_packages(
         &workspace_root,
         &[
-            PROVISIONER_CLI_PACKAGE,
+            TKP_PACKAGE,
             platform.package.package_name.as_str(),
             frontend.package.package_name.as_str(),
         ],
@@ -495,11 +496,13 @@ fn render_manifest(
     platform_path: &str,
     frontend: &PackageCoordinates,
     frontend_path: &str,
+    frontend_feature: &str,
 ) -> String {
     format!(
-        "[package]\nname = \"tokeira-bound-provisioner\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[[bin]]\nname = \"{GENERATED_PROVISIONER_BIN}\"\npath = \"src/main.rs\"\n\n[workspace]\n\n[dependencies]\nselected_frontend = {{ package = {}, path = {} }}\nselected_platform = {{ package = {}, path = {} }}\ntokeira_provisioner_cli = {{ package = {}, path = {} }}\n",
+        "[package]\nname = \"tokeira-bound-provisioner\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[[bin]]\nname = \"{GENERATED_PROVISIONER_BIN}\"\npath = \"src/main.rs\"\n\n[workspace]\n\n[dependencies]\nselected_frontend = {{ package = {}, path = {}, features = [{}], default-features = false }}\nselected_platform = {{ package = {}, path = {} }}\ntokeira_tkp = {{ package = {}, path = {} }}\n",
         toml_string(&frontend.package_name),
         toml_string(frontend_path),
+        toml_string(frontend_feature),
         toml_string(&platform.package_name),
         toml_string(platform_path),
         toml_string(&cli.package_name),
@@ -507,11 +510,15 @@ fn render_manifest(
     )
 }
 
-fn render_main(platform: &PlatformId, format: &DefinitionFormatId) -> String {
+fn render_main(
+    platform: &PlatformId,
+    format: &DefinitionFormatId,
+    frontend_module: &str,
+) -> String {
     let platform = serde_json::to_string(platform.as_str()).expect("platform ids serialize");
     let format = serde_json::to_string(format.as_str()).expect("format ids serialize");
     format!(
-        "tokeira_provisioner_cli::bound_provisioner_main!(\n    expected_platform: {platform},\n    platform: selected_platform::platform,\n    expected_format: {format},\n    frontend: selected_frontend::frontend,\n);\n"
+        "tokeira_tkp::bound_provisioner_main!(\n    expected_platform: {platform},\n    platform: selected_platform::platform,\n    expected_format: {format},\n    frontend: selected_frontend::{frontend_module}::frontend,\n);\n"
     )
 }
 
@@ -552,7 +559,7 @@ mod tests {
             package(
                 &root,
                 "crates/cli",
-                PROVISIONER_CLI_PACKAGE,
+                TKP_PACKAGE,
                 "",
                 r#"#[macro_export]
 macro_rules! bound_provisioner_main {
@@ -580,15 +587,15 @@ macro_rules! bound_provisioner_main {
                 &root,
                 "frontends/tkd",
                 "tkd-frontend",
-                "[package.metadata.tokeira.definition-frontend]\nformat = \"tkd\"\nsource-extension = \"tkd\"\n",
-                "pub fn frontend() {}\n",
+                "[[package.metadata.tokeira.definition-frontend]]\nformat = \"tkd\"\nsource-extension = \"tkd\"\nfeature = \"tkd\"\n\n[features]\ntkd = []\n",
+                "#[cfg(feature = \"tkd\")]\npub mod tkd {\n    pub fn frontend() {}\n}\n",
             );
             package(
                 &root,
                 "frontends/tkdp",
                 "tkdp-frontend",
-                "[package.metadata.tokeira.definition-frontend]\nformat = \"tkdp\"\nsource-extension = \"tkdp\"\n",
-                "pub fn frontend() {}\n",
+                "[[package.metadata.tokeira.definition-frontend]]\nformat = \"tkdp\"\nsource-extension = \"tkdp\"\nfeature = \"tkdp\"\n\n[features]\ntkdp = []\n",
+                "#[cfg(feature = \"tkdp\")]\npub mod tkdp {\n    pub fn frontend() {}\n}\n",
             );
             package(
                 &root,
@@ -626,7 +633,7 @@ macro_rules! bound_provisioner_main {
         assert_eq!(first, second);
         assert_eq!(
             first.main_rs,
-            "tokeira_provisioner_cli::bound_provisioner_main!(\n    expected_platform: \"alpha\",\n    platform: selected_platform::platform,\n    expected_format: \"tkd\",\n    frontend: selected_frontend::frontend,\n);\n"
+            "tokeira_tkp::bound_provisioner_main!(\n    expected_platform: \"alpha\",\n    platform: selected_platform::platform,\n    expected_format: \"tkd\",\n    frontend: selected_frontend::tkd::frontend,\n);\n"
         );
         let manifest: toml::Value = toml::from_str(&first.cargo_toml).expect("generated manifest");
         let dependencies = manifest
@@ -635,18 +642,9 @@ macro_rules! bound_provisioner_main {
             .expect("dependency table");
         assert_eq!(
             dependencies.keys().map(String::as_str).collect::<Vec<_>>(),
-            [
-                "selected_frontend",
-                "selected_platform",
-                "tokeira_provisioner_cli"
-            ]
+            ["selected_frontend", "selected_platform", "tokeira_tkp"]
         );
-        assert!(
-            first
-                .closure
-                .crate_names
-                .contains(&PROVISIONER_CLI_PACKAGE.to_string())
-        );
+        assert!(first.closure.crate_names.contains(&TKP_PACKAGE.to_string()));
         assert!(
             first
                 .closure
@@ -737,8 +735,8 @@ macro_rules! bound_provisioner_main {
                 .expect("generated format id is canonical");
             let cli = PackageCoordinates {
                 package_id: "cli-id".to_string(),
-                package_name: PROVISIONER_CLI_PACKAGE.to_string(),
-                library_target: "tokeira_provisioner_cli".to_string(),
+                package_name: TKP_PACKAGE.to_string(),
+                library_target: "tokeira_tkp".to_string(),
                 manifest_path: PathBuf::from("/workspace/crates/cli/Cargo.toml"),
             };
             let platform = PackageCoordinates {
@@ -764,8 +762,9 @@ macro_rules! bound_provisioner_main {
                 &format!("../../platforms/{platform_segment}"),
                 &frontend,
                 &format!("../../frontends/{format_segment}"),
+                &format_segment,
             );
-            let main_rs = render_main(&platform_id, &format_id);
+            let main_rs = render_main(&platform_id, &format_id, &format_segment);
             let source = BoundProvisionerSource {
                 platform: platform_id,
                 format: format_id,
@@ -776,7 +775,7 @@ macro_rules! bound_provisioner_main {
                 closure: ProvisionerClosure {
                     crate_dirs: Vec::new(),
                     crate_names: vec![
-                        PROVISIONER_CLI_PACKAGE.to_string(),
+                        TKP_PACKAGE.to_string(),
                         platform.package_name.clone(),
                         frontend.package_name.clone(),
                     ],
@@ -795,7 +794,7 @@ macro_rules! bound_provisioner_main {
                 .collect::<Vec<_>>();
             prop_assert_eq!(
                 roots,
-                vec!["selected_frontend", "selected_platform", "tokeira_provisioner_cli"]
+                vec!["selected_frontend", "selected_platform", "tokeira_tkp"]
             );
             prop_assert_eq!(source.generated_root_digest(), source.clone().generated_root_digest());
             prop_assert_eq!(source.evidence(&snapshot), source.clone().evidence(&snapshot));
@@ -815,7 +814,11 @@ macro_rules! bound_provisioner_main {
             let mut changed_format = source.clone();
             changed_format.format = DefinitionFormatId::new(format!("{format_segment}-other"))
                 .expect("derived format is canonical");
-            changed_format.main_rs = render_main(&changed_format.platform, &changed_format.format);
+            changed_format.main_rs = render_main(
+                &changed_format.platform,
+                &changed_format.format,
+                changed_format.format.as_str(),
+            );
             prop_assert_ne!(
                 source.generated_root_digest(),
                 changed_format.generated_root_digest()

@@ -16,7 +16,7 @@ completed graph and the host-free configuration value.
 |---|---|---|
 | Separate editable values from deployment structure | `config()` and `deployment()` | [Compose deployment root](../../platforms/compose/deployment.tkd) |
 | Author the configuration shape once, in the definition | `struct Compose` and kind input validation | [Compose platform part](../../platforms/compose/platform.tkd) |
-| Receive platform runtime facts | the framework-supplied evaluation context | [Engine](../../crates/tokeira-provisioner-cli/src/engine.rs) |
+| Receive platform runtime facts | the framework-supplied evaluation context | [Engine](../../crates/tokeira-tkp/src/engine.rs) |
 | Select modules from config variants | Conditional DSQL module | [Compose deployment root](../../platforms/compose/deployment.tkd) |
 | Keep host paths out of source | Logical `Volume` values | [Compose kinds](../../crates/tokeira-compose/src/kinds/mod.rs) |
 | Preserve configuration coupling | Resource dependencies plus content digests | [Compose kinds](../../crates/tokeira-compose/src/kinds/mod.rs) |

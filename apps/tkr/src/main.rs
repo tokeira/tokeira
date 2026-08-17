@@ -27,7 +27,7 @@
 //!   the legacy in-process handlers.
 //! - **`tui`** wires engine progress events to spinners (human mode) or JSON
 //!   lines (`--json` mode).
-//! - **`catalog`** resolves platform/front-end source used to create bound deployments.
+//! - **`platform_discovery`** resolves platform/front-end source used to create bound deployments.
 //!
 //! # Working assumptions
 //!
@@ -44,7 +44,6 @@ use anyhow::Result;
 use clap::Parser;
 
 mod bundle_create;
-pub mod catalog;
 mod cli;
 mod commands;
 mod deployment_dir;
@@ -53,6 +52,7 @@ mod launcher;
 mod legacy;
 mod metadata;
 mod output;
+pub mod platform_discovery;
 mod process;
 mod tui;
 
@@ -85,8 +85,8 @@ async fn main() -> Result<()> {
     // Each arm resolves the deployment context it needs before dispatching.
     // `Image` is the odd one out: `image build` works without any deployment
     // (it operates on the workspace sources directly), while `image
-    // push/mirror/list` need a deployment to look up the platform's image
-    // catalog. The subcommand module handles that split internally; we just
+    // push/mirror/list` need a deployment to look up the platform image
+    // inventory. The subcommand module handles that split internally; we just
     // opportunistically load a context when one could apply.
     match cli.command {
         Command::Dev { action } => commands::dev::run(action),
@@ -1220,7 +1220,7 @@ mod tests {
             name: "dev".into(),
             id: Uuid::nil(),
             platform: platform("compose"),
-            definition: Some(tokeira_provisioner::RecordedDefinition {
+            definition: Some(tokeira_deployment::RecordedDefinition {
                 format: tokeira_orchestrator::DefinitionFormatId::new("tkd").unwrap(),
                 path: tokeira_orchestrator::RelativeDefinitionPath::new("definition.tkd").unwrap(),
             }),
@@ -1306,21 +1306,18 @@ mod tests {
 
     #[tokio::test]
     // Feature: platform-builder-abstraction, Property 23: deployment publication is all-or-nothing.
-    async fn catalog_selection_creates_and_checks_with_the_generated_compose_provisioner() {
+    async fn discovered_selection_creates_and_checks_with_the_generated_compose_provisioner() {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = catalog::PlatformCatalog::from_workspace(&workspace).expect("catalog");
-        let descriptor = catalog
+        let discovery = platform_discovery::PlatformDiscovery::from_workspace(&workspace)
+            .expect("workspace discovery");
+        let descriptor = discovery
             .platform(&platform("compose"))
             .expect("Compose descriptor");
-        let (frontend, definition_path, seed) = catalog
+        let (frontend, definition_path, seed) = discovery
             .workspace_frontend(descriptor, None)
             .expect("Compose seed frontend");
-        let catalog::PlatformSource::Workspace(platform_package) = &descriptor.source else {
-            panic!("expected workspace platform");
-        };
-        let catalog::FrontendSource::Workspace(frontend_package) = &frontend.source else {
-            panic!("expected workspace frontend");
-        };
+        let platform_package = &descriptor.package;
+        let frontend_package = &frontend.package;
         let temp = tempfile::tempdir().expect("deployment root");
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         let pending = deployments
@@ -1330,7 +1327,7 @@ mod tests {
                 StorageKind::InMemory,
                 None,
                 Some(deployment_dir::DefinitionSeed {
-                    definition: tokeira_provisioner::RecordedDefinition {
+                    definition: tokeira_deployment::RecordedDefinition {
                         format: frontend.format.clone(),
                         path: definition_path,
                     },

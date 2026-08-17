@@ -1,4 +1,4 @@
-//! Optional hermetic bundle placement for a catalog-selected provisioner.
+//! Optional hermetic bundle placement for a discovery-selected provisioner.
 //!
 //! The flow snapshots the selected source closure, resolves `EngineIdentity`,
 //! obtains a verified bundle (CAS hit or one Dagger build), retains it in the
@@ -18,7 +18,7 @@ use tokeira_build::{
     ProvisionerBuildRequest, SnapshotRequest, assemble_bound_provisioner, obtain_provisioner,
     snapshot_source_closure,
 };
-use tokeira_provisioner::{
+use tokeira_deployment::{
     AuthorityTier, BUNDLE_MANIFEST_BASENAME, BinaryStore, BuildAuthority, BuildProfile,
     BundleStore, Target,
 };

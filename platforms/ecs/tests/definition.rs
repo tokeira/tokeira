@@ -23,7 +23,7 @@ fn evaluate(root_text: &str) -> Result<EvaluatedDefinition<DecodedKind>, String>
     let platform = tokeira_ecs_deployment::platform();
     let parts = DirectoryPartSources::new(package, "tkd");
     let source_name = DefinitionSourceName::AuthoringPath(package.join("deployment.tkd"));
-    let frontend = tokeira_tkd::frontend();
+    let frontend = tokeira_platform_definition::tkd::frontend();
     evaluate_definition(
         &frontend,
         DefinitionSource {

@@ -48,7 +48,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokeira-observability = { workspace = true }
-tokeira-tkd = { workspace = true }
+tokeira-platform-definition = { workspace = true, features = ["tkd"] }
 tempfile = { workspace = true }
 
 [lints]

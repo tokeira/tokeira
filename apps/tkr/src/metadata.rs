@@ -10,8 +10,8 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tokeira_deployment::RecordedDefinition;
 use tokeira_orchestrator::{PlatformId, StorageKind};
-use tokeira_provisioner::RecordedDefinition;
 use uuid::Uuid;
 
 use crate::deployment_dir::METADATA_JSON;

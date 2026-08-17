@@ -49,7 +49,7 @@ pub(crate) fn fingerprint(meta: &DeploymentMetadata) -> String {
     let canonical = format!("{}|{:?}|{:?}", meta.id, meta.platform, meta.storage);
     format!(
         "sha256:{}",
-        tokeira_provisioner::sha256_hex(canonical.as_bytes())
+        tokeira_deployment::sha256_hex(canonical.as_bytes())
     )
 }
 

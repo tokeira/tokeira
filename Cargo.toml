@@ -56,6 +56,7 @@ members = [
 exclude = [
     "scenarios/worker-versioning",
     "scenarios/standalone-activities",
+    "spikes/dagger-rust-sdk",
     "tools/simulation/engine",
     "tools/simulation/broker",
     "tools/simulation/placement",

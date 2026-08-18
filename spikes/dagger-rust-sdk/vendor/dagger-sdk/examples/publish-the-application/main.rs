@@ -1,0 +1,49 @@
+use dagger_sdk::HostDirectoryOpts;
+use rand::Rng;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let owned = dagger_sdk::connect().await?;
+    let client = owned.query();
+    let output = "examples/publish-the-application/app/build";
+
+    let host_source_dir = client.host().directory_opts(
+        "examples/publish-the-application/app",
+        &HostDirectoryOpts::default().with_exclude(vec!["node_modules", "ci/"]),
+    );
+
+    let source = client
+        .container()
+        .from("node:16")
+        .with_mounted_directory("/src", host_source_dir);
+
+    let runner = source
+        .with_workdir("/src")
+        .with_exec(vec!["npm", "install"]);
+
+    runner
+        .with_exec(vec!["npm", "test", "--", "--watchAll=false"])
+        .sync()
+        .await?;
+
+    runner
+        .with_exec(vec!["npm", "run", "build"])
+        .directory("./build")
+        .export(output)
+        .await?;
+
+    let mut rng = rand::thread_rng();
+
+    let ref_ = client
+        .container()
+        .from("nginx")
+        .with_directory("/usr/share/nginx/html", client.host().directory(output))
+        .publish(format!("ttl.sh/hello-dagger-sdk-{}:1h", rng.r#gen::<u64>()))
+        .await?;
+
+    println!("published image to: {}", ref_);
+
+    owned.close().await?;
+
+    Ok(())
+}

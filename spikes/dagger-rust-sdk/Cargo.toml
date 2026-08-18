@@ -1,0 +1,25 @@
+# Spike: the first-party Dagger Rust SDK (iw/dagger, sdk/rust/v1.0.0-beta.11.rust.1)
+# driving tokeira's two real builds. Workspace-excluded; own lockfile.
+[package]
+name = "dagger-rust-sdk-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+dagger-sdk = { path = "vendor/dagger-sdk" }
+anyhow = "1"
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Honest tkp-build inputs: the same assembly + snapshot machinery the real
+# provisioner pipeline uses.
+tokeira-build = { path = "../../crates/tokeira-build" }
+tokeira-deployment = { path = "../../crates/tokeira-deployment" }
+
+[patch.crates-io]
+dagger-sdk-macros = { path = "vendor/dagger-sdk-macros" }

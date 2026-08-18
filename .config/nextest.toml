@@ -8,10 +8,22 @@
 # are fast — anything hitting this is a hang (deadlock, missed wakeup), not work.
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# The generated-provisioner test runs a full `cargo build` of the bound
+# provisioner inside the test: ~166s even warm, and any Cargo.lock movement
+# recompiles the changed dependency chain cold, pushing it past the default
+# 180s kill. The work is real, not a hang — give it its own ceiling.
+[[profile.default.overrides]]
+filter = 'test(=tests::discovered_selection_creates_and_checks_with_the_generated_compose_provisioner)'
+slow-timeout = { period = "120s", terminate-after = 5 }
+
 [profile.ci]
 retries = 0        # a flaky test is a bug to fix, not to hide
 fail-fast = false  # report every failure in one run
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = 'test(=tests::discovered_selection_creates_and_checks_with_the_generated_compose_provisioner)'
+slow-timeout = { period = "120s", terminate-after = 5 }
 
 [profile.ci.junit]
 path = "junit.xml"

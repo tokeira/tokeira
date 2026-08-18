@@ -1,0 +1,155 @@
+//! Stable abstraction for caller-supplied Dagger engine connections.
+//!
+//! Transferring a boxed [`EngineConnection`] gives the eventual owned client sole
+//! responsibility for graceful close and the non-blocking abort backstop. Implementors
+//! must keep cancellation of one request local to that request and must never include
+//! credentials in ordinary error rendering.
+
+use std::{error::Error, fmt, sync::Arc};
+
+use async_trait::async_trait;
+
+use crate::graphql::{RawRequest, RawResponse};
+
+/// Stable category for a failure returned by an engine connection.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineConnectionErrorKind {
+    /// The underlying transport failed.
+    Transport,
+    /// A protocol invariant was violated.
+    Protocol,
+    /// The selected engine or endpoint is unavailable.
+    Unavailable,
+    /// The connection has already been closed.
+    Closed,
+    /// SDK-owned HTTP connection establishment exceeded its configured bound.
+    ConnectTimeout,
+    /// The loopback endpoint returned a non-success HTTP status.
+    HttpStatus,
+    /// SDK-owned process or background resources failed during shutdown.
+    Shutdown,
+    /// A source-specific failure without a more precise stable category.
+    Other,
+}
+
+impl EngineConnectionErrorKind {
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Transport => "the engine transport failed",
+            Self::Protocol => "the engine protocol failed",
+            Self::Unavailable => "the engine connection is unavailable",
+            Self::Closed => "the engine connection is closed",
+            Self::ConnectTimeout => "the engine HTTP connection timed out",
+            Self::HttpStatus => "the engine returned an unsuccessful HTTP status",
+            Self::Shutdown => "the owned engine session could not be shut down cleanly",
+            Self::Other => "the engine connection failed",
+        }
+    }
+}
+
+/// A typed connection failure which retains, but does not ordinarily render, its cause.
+#[derive(Clone)]
+pub struct EngineConnectionError {
+    kind: EngineConnectionErrorKind,
+    http_status: Option<u16>,
+    response: Option<RawResponse>,
+    source: Option<Arc<dyn Error + Send + Sync + 'static>>,
+}
+
+impl EngineConnectionError {
+    /// Creates a synthetic typed failure without an opaque cause.
+    pub fn new(kind: EngineConnectionErrorKind) -> Self {
+        Self {
+            kind,
+            http_status: None,
+            response: None,
+            source: None,
+        }
+    }
+
+    /// Creates a typed failure while retaining the implementation's original cause.
+    pub fn with_source<E>(kind: EngineConnectionErrorKind, source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            kind,
+            http_status: None,
+            response: None,
+            source: Some(Arc::new(source)),
+        }
+    }
+
+    /// Creates an HTTP-status failure while retaining a successfully decoded body.
+    ///
+    /// Ordinary formatting exposes only the status coordinate. Callers must opt in to
+    /// inspecting the complete response, which can contain engine-authored output.
+    pub fn with_http_response(status: u16, response: Option<RawResponse>) -> Self {
+        Self {
+            kind: EngineConnectionErrorKind::HttpStatus,
+            http_status: Some(status),
+            response,
+            source: None,
+        }
+    }
+
+    /// Returns the stable connection failure category.
+    pub const fn kind(&self) -> EngineConnectionErrorKind {
+        self.kind
+    }
+
+    /// Returns the non-success HTTP status when the transport reached the engine.
+    pub const fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+
+    /// Returns a decoded non-success response without including it in formatting.
+    pub const fn raw_response(&self) -> Option<&RawResponse> {
+        self.response.as_ref()
+    }
+}
+
+impl fmt::Display for EngineConnectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.kind.description())
+    }
+}
+
+impl fmt::Debug for EngineConnectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EngineConnectionError")
+            .field("kind", &self.kind)
+            .field("http_status", &self.http_status)
+            .field("response_present", &self.response.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Error for EngineConnectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn Error + 'static))
+    }
+}
+
+/// A transferred, thread-safe connection used by raw and generated requests.
+///
+/// The client invokes [`EngineConnection::close`] exactly once through its shared
+/// close election. [`EngineConnection::abort`] is a prompt, non-blocking backstop used
+/// when async cleanup cannot be completed; implementations must make it idempotent and
+/// non-panicking. Dropping or cancelling one `execute` future must not invalidate
+/// unrelated requests.
+#[async_trait]
+pub trait EngineConnection: Send + Sync + 'static {
+    /// Executes one complete raw GraphQL request.
+    async fn execute(&self, request: RawRequest) -> Result<RawResponse, EngineConnectionError>;
+
+    /// Gracefully releases every resource owned by this connection.
+    async fn close(&self) -> Result<(), EngineConnectionError>;
+
+    /// Starts the non-blocking emergency cleanup path.
+    fn abort(&self);
+}

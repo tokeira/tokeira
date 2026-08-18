@@ -15,7 +15,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use tokeira_build::{
     DefaultDaggerClient, DefinitionFrontendPackageDescriptor, PlatformPackageDescriptor,
-    ProvisionerBuildRequest, SnapshotRequest, assemble_bound_provisioner, obtain_provisioner,
+    ProvisionerBuildRequest, assemble_bound_provisioner, obtain_provisioner,
     rust_toolchain_version, snapshot_source_closure,
 };
 use tokeira_deployment::{
@@ -42,11 +42,11 @@ pub(crate) async fn place_bundle_provisioner_at(
         .map_err(|e| anyhow!("`--bundle` needs a running Dagger engine: {e}"))?;
     let bound_source = assemble_bound_provisioner(workspace_root, platform, frontend)
         .context("failed to assemble the bound provisioner source")?;
-    let snapshot = snapshot_source_closure(&SnapshotRequest {
-        repo_root: workspace_root.to_path_buf(),
-        closure_paths: bound_source.closure().closure_paths(),
-        include_untracked: false,
-    })
+    let snapshot = snapshot_source_closure(
+        &bound_source
+            .snapshot_request(workspace_root)
+            .context("failed to scope the snapshot request to the closure")?,
+    )
     .context("failed to freeze the source snapshot")?;
 
     let host_target = Target(env!("TKR_TARGET").to_string());
@@ -160,11 +160,11 @@ pub(crate) async fn place_dev_provisioner_at(
 
     let bound_source = assemble_bound_provisioner(workspace_root, platform, frontend)
         .context("failed to assemble the bound provisioner source")?;
-    let snapshot = snapshot_source_closure(&SnapshotRequest {
-        repo_root: workspace_root.to_path_buf(),
-        closure_paths: bound_source.closure().closure_paths(),
-        include_untracked: false,
-    })
+    let snapshot = snapshot_source_closure(
+        &bound_source
+            .snapshot_request(workspace_root)
+            .context("failed to scope the snapshot request to the closure")?,
+    )
     .context("failed to freeze the source snapshot")?;
     let toolchain = rust_toolchain_version(workspace_root)
         .context("failed to resolve the workspace toolchain")?;

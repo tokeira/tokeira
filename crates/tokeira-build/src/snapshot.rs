@@ -1,4 +1,4 @@
-//! Source snapshotting (task 17; Proposal 005 §Source snapshotting).
+//! Source snapshotting.
 //!
 //! Freezes the provisioner source closure into an **immutable,
 //! content-addressed git tree** — the in-process equivalent of a
@@ -16,26 +16,35 @@
 //! are reachable from nothing until the caller records their ids.
 //!
 //! Untracked `.rs` files under the closure are a real build input the
-//! snapshot would silently omit, so they **refuse by default, listed**
-//! (decision 9); [`SnapshotRequest::include_untracked`] opts them in
+//! snapshot would silently omit, so they **refuse by default, listed**;
+//! [`SnapshotRequest::include_untracked`] opts them in
 //! explicitly. Untracked files of other kinds are outside the closure
 //! contract and are ignored. (The scan is a plain filesystem walk: a
 //! `.gitignore`d `.rs` file inside a closure path would be reported as
 //! untracked — acceptable, since ignoring source that would be compiled is
 //! itself a smell; none exist in this workspace.)
 //!
-//! The tree is wrapped in a **deterministic audit commit** (task 17.2): fixed
-//! synthetic identity, fixed timestamps, message derived from the tree — so
-//! the same `(tree, parent)` always yields the same commit oid. The commit is
-//! a reachable *handle* for humans (`git show <oid>`), not the identity key:
+//! [`SnapshotRequest::content_overrides`] freezes caller-supplied bytes for
+//! named tracked paths in place of their worktree bytes. This exists for
+//! exactly one purpose: the workspace `Cargo.toml`/`Cargo.lock` are frozen in
+//! their **closure-scoped** form (members and lock entries reduced to what
+//! the snapshot actually contains), so the frozen tree is a complete, valid
+//! cargo workspace rather than a torn copy of the full one. The override
+//! bytes are derived deterministically from admitted inputs by the caller;
+//! an override that names a path the freeze never visits is refused — it
+//! would mean the scoped file silently failed to enter the identity.
+//!
+//! The tree is wrapped in a **deterministic audit commit**: fixed synthetic
+//! identity, fixed timestamps, message derived from the tree — so the same
+//! `(tree, parent)` always yields the same commit oid. The commit is a
+//! reachable *handle* for humans (`git show <oid>`), not the identity key:
 //! identity keys on the **tree** oid (pure content; a re-snapshot under a new
 //! HEAD re-keys the commit but never the tree). By default only the oids are
 //! recorded — no ref is written; pinning
-//! `refs/tokeira/snapshots/<engine-identity>` is `TrustedCi` policy (decision
-//! 10, task 18).
+//! `refs/tokeira/snapshots/<engine-identity>` is `TrustedCi` policy.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -57,15 +66,19 @@ pub struct SnapshotRequest {
     /// (from [`resolve_source_closure`](crate::resolve_source_closure)).
     pub closure_paths: Vec<PathBuf>,
     /// Stage untracked `.rs` files found under the closure instead of
-    /// refusing (decision 9: inclusion is an explicit operator act).
+    /// refusing (inclusion is an explicit operator act).
     pub include_untracked: bool,
+    /// Bytes to freeze for a repo-relative tracked path instead of its
+    /// worktree bytes (keys use `/` separators). Every override must be
+    /// consumed by the freeze, or the snapshot refuses.
+    pub content_overrides: BTreeMap<String, Vec<u8>>,
 }
 
 /// The frozen closure: content-addressed ids, recorded — not ref-pinned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSnapshot {
     /// The snapshot **tree** oid — the pure-content key `EngineIdentity`'s
-    /// source digest derives from (task 17.2). Hex.
+    /// source digest derives from. Hex.
     pub tree_oid: String,
     /// The deterministic audit commit wrapping the tree. Hex. A handle for
     /// inspection, never an identity input.
@@ -78,7 +91,7 @@ pub struct SourceSnapshot {
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
     /// Untracked `.rs` files inside the closure would be a silently-omitted
-    /// build input — refused unless explicitly included (decision 9).
+    /// build input — refused unless explicitly included.
     #[error(
         "untracked .rs files in the source closure (stage them, or opt in with \
          --include-untracked): {}",
@@ -89,6 +102,13 @@ pub enum SnapshotError {
     /// request (wrong roots, wrong repo), never a valid identity input.
     #[error("the source closure matched no tracked files — nothing to snapshot")]
     EmptyClosure,
+    /// A content override named a path the freeze never visited: the scoped
+    /// bytes would silently miss the identity, so the request is broken.
+    #[error(
+        "content overrides for paths outside the frozen closure: {}",
+        paths.join(", ")
+    )]
+    UnusedOverride { paths: Vec<String> },
     #[error("repository discovery failed: {0}")]
     Discover(#[from] Box<gix::discover::Error>),
     #[error("the repository has no working tree (bare) — nothing to snapshot")]
@@ -168,11 +188,27 @@ pub fn snapshot_source_closure(request: &SnapshotRequest) -> Result<SourceSnapsh
         .edit_tree(empty_tree)
         .map_err(|e| SnapshotError::WriteObject(e.to_string()))?;
     let mut file_count = 0usize;
+    let mut unused_overrides: BTreeSet<&str> = request
+        .content_overrides
+        .keys()
+        .map(String::as_str)
+        .collect();
     for path in &to_freeze {
         // `&str` spelled out: `typed_path` (via `tough`) adds a blanket
         // `AsRef<Utf8Path<_>> for Cow<'_, str>` that makes a bare `as_ref()`
         // ambiguous.
         let relative: &str = &path.to_str_lossy();
+        if let Some(bytes) = request.content_overrides.get(relative) {
+            unused_overrides.remove(relative);
+            let blob = repo
+                .write_blob(bytes)
+                .map_err(|e| SnapshotError::WriteObject(e.to_string()))?;
+            editor
+                .upsert(path.as_bstr(), EntryKind::Blob, blob.detach())
+                .map_err(|e| SnapshotError::WriteObject(e.to_string()))?;
+            file_count += 1;
+            continue;
+        }
         let absolute = workdir.join(relative);
         // Tracked-but-deleted in the worktree: the worktree is the truth the
         // build would see, so an unstaged deletion is simply absent.
@@ -224,6 +260,11 @@ pub fn snapshot_source_closure(request: &SnapshotRequest) -> Result<SourceSnapsh
     if file_count == 0 {
         return Err(SnapshotError::EmptyClosure);
     }
+    if !unused_overrides.is_empty() {
+        return Err(SnapshotError::UnusedOverride {
+            paths: unused_overrides.iter().map(|p| (*p).to_string()).collect(),
+        });
+    }
     let tree_oid = editor
         .write()
         .map_err(|e| SnapshotError::WriteObject(e.to_string()))?
@@ -238,7 +279,7 @@ pub fn snapshot_source_closure(request: &SnapshotRequest) -> Result<SourceSnapsh
     })
 }
 
-/// Wrap `tree` in the deterministic audit commit (task 17.2): fixed synthetic
+/// Wrap `tree` in the deterministic audit commit: fixed synthetic
 /// identity and timestamps, message derived from the tree, parent = the
 /// current `HEAD` commit (parentless on an unborn `HEAD`). Same `(tree,
 /// parent)` → same commit oid; the committer is supplied here, never read
@@ -274,7 +315,7 @@ fn write_audit_commit(
 }
 
 /// Materialize a snapshot **tree** into `dest` — the file set a hermetic
-/// build consumes (task 18.1's "feed the snapshot to the build, never the
+/// build consumes ("feed the snapshot to the build, never the
 /// live tree"). Reads only the object database; the working tree and index
 /// play no part, so a worktree edit after the snapshot cannot leak into the
 /// build. Returns the number of files written.
@@ -340,7 +381,14 @@ fn materialize_tree(
                 materialize_tree(repo, oid, &path, file_count)?;
             }
             gix::object::tree::EntryKind::Blob | gix::object::tree::EntryKind::BlobExecutable => {
-                std::fs::write(&path, read(oid)?).map_err(write_err)?;
+                let bytes = read(oid)?;
+                // Skip identical bytes so a re-materialization into a
+                // persistent staging directory preserves mtimes — cargo's
+                // fingerprints stay valid and incremental builds survive.
+                let unchanged = std::fs::read(&path).is_ok_and(|current| current == bytes);
+                if !unchanged {
+                    std::fs::write(&path, bytes).map_err(write_err)?;
+                }
                 #[cfg(unix)]
                 if kind == gix::object::tree::EntryKind::BlobExecutable {
                     use std::os::unix::fs::PermissionsExt;
@@ -351,16 +399,19 @@ fn materialize_tree(
             }
             gix::object::tree::EntryKind::Link => {
                 let target = read(oid)?;
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(
-                    std::path::Path::new(std::str::from_utf8(&target).map_err(|e| {
-                        SnapshotError::ReadObject(format!("non-utf8 symlink target: {e}"))
-                    })?),
-                    &path,
-                )
-                .map_err(write_err)?;
-                #[cfg(not(unix))]
-                std::fs::write(&path, target).map_err(write_err)?;
+                let target = std::path::Path::new(std::str::from_utf8(&target).map_err(|e| {
+                    SnapshotError::ReadObject(format!("non-utf8 symlink target: {e}"))
+                })?)
+                .to_path_buf();
+                let unchanged = std::fs::read_link(&path).is_ok_and(|current| current == target);
+                if !unchanged {
+                    let _ = std::fs::remove_file(&path);
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&target, &path).map_err(write_err)?;
+                    #[cfg(not(unix))]
+                    std::fs::write(&path, target.as_os_str().as_encoded_bytes())
+                        .map_err(write_err)?;
+                }
                 *file_count += 1;
             }
             gix::object::tree::EntryKind::Commit => {

@@ -1,4 +1,4 @@
-//! The provisioner bundle build (task 18.1; Proposal 005 §Build boundary).
+//! The provisioner bundle build.
 //!
 //! [`build_provisioner`] is the **sole** implementation of building, testing,
 //! hashing, and packaging `tkp` — the same function whether a laptop's local
@@ -6,11 +6,11 @@
 //! [`BuildAuthority`], not a different pipeline).
 //!
 //! The build is **hermetic and cold**: it consumes the materialized source
-//! *snapshot* (task 17 — never the live tree), inside a build container
+//! *snapshot* — never the live tree — inside a build container
 //! pinned **by digest** (a floating tag would poison the identity), with
 //! `--locked` cargo invocations. No incremental `target/` is mounted — a
 //! build that mounts one is not pure w.r.t. its declared inputs, and only a
-//! pure build may be memoised by identity (Proposal 005, guardrail 3; the
+//! pure build may be memoised by identity (the
 //! dev loop uses native cargo instead and never comes through here).
 //!
 //! Artifacts are exported and then hashed/measured **host-side**: the
@@ -38,7 +38,7 @@ use crate::{
 const APT_LINE: &str = "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler libprotobuf-dev ca-certificates && rm -rf /var/lib/apt/lists/*";
 
 /// Everything [`build_provisioner`] consumes. The snapshot and closure come
-/// from tasks 17's freeze/resolve; the request only carries decisions, never
+/// from the freeze/resolve steps; the request only carries decisions, never
 /// live source.
 #[derive(Debug, Clone)]
 pub struct ProvisionerBuildRequest {
@@ -57,8 +57,7 @@ pub struct ProvisionerBuildRequest {
     /// The build container, pinned by digest (`…@sha256:…`). A floating tag
     /// is refused: the container is an identity input (guardrail 2).
     pub build_image: String,
-    /// The frozen source (task 17). The build reads its tree, never the
-    /// worktree.
+    /// The frozen source. The build reads its tree, never the worktree.
     pub snapshot: SourceSnapshot,
     /// The resolved closure (crate names for the test set; canonical lock
     /// bytes for the identity's lock digest).
@@ -124,7 +123,10 @@ pub fn build_provisioner(
         passed: true,
     };
 
-    // Per-target: cross-build, strip, export, and attest host-side.
+    // Per-target: cross-build, strip, export, and attest host-side. The
+    // generated root is an ordinary member of the staged workspace, so the
+    // build is a plain `-p` selection — the same workspace, and the same
+    // lock, the test step just verified.
     let profile_flag = profile_name(request.profile);
     let mut artifacts = Vec::with_capacity(request.targets.len());
     for target in &request.targets {
@@ -138,14 +140,13 @@ pub fn build_provisioner(
             profile_flag.to_string(),
             "--target".into(),
             target.0.clone(),
-            "--manifest-path".into(),
-            format!("/src/{}/Cargo.toml", crate::GENERATED_ROOT_RELATIVE_PATH),
+            "-p".into(),
+            crate::GENERATED_ROOT_PACKAGE.into(),
         ];
         builder = builder.with_exec(&as_strs(&build_args))?;
 
         let built = format!(
-            "/src/{}/target/{}/{}/{}",
-            crate::GENERATED_ROOT_RELATIVE_PATH,
+            "/src/target/{}/{}/{}",
             target.0,
             profile_dir(request.profile),
             crate::GENERATED_PROVISIONER_BIN
@@ -188,7 +189,7 @@ pub fn build_provisioner(
 }
 
 /// The engine identity a request resolves to — computable **without
-/// building** (task 18.3): the CAS is consulted by identity before any build
+/// building**: the CAS is consulted by identity before any build
 /// starts. Validates the request (including the digest-pin) on the way.
 pub fn engine_identity_for(
     request: &ProvisionerBuildRequest,
@@ -319,6 +320,7 @@ mod tests {
                 PathBuf::from("Cargo.lock"),
             ],
             include_untracked: false,
+            content_overrides: std::collections::BTreeMap::new(),
         })
         .expect("snapshot")
     }
@@ -374,8 +376,7 @@ mod tests {
 
         // The artifact attests the EXPORTED bytes (the mock writes
         // deterministic bytes derived from the container path).
-        let built =
-            "/src/.tokeira-build/bound-provisioner/target/aarch64-unknown-linux-gnu/dist/tkp";
+        let built = "/src/target/aarch64-unknown-linux-gnu/dist/tkp";
         assert_eq!(bundle.artifacts.len(), 1);
         assert_eq!(
             bundle.artifacts[0].sha256,
@@ -399,7 +400,8 @@ mod tests {
             "-p".into(),
             "tokeira-alpha".into(),
         ])));
-        // The cross-build targets the generated composition root.
+        // The cross-build selects the generated member of the staged
+        // workspace — no manifest-path special case.
         assert!(calls.contains(&MockCall::WithExec(vec![
             "cargo".into(),
             "build".into(),
@@ -408,8 +410,8 @@ mod tests {
             "dist".into(),
             "--target".into(),
             "aarch64-unknown-linux-gnu".into(),
-            "--manifest-path".into(),
-            "/src/.tokeira-build/bound-provisioner/Cargo.toml".into(),
+            "-p".into(),
+            crate::GENERATED_ROOT_PACKAGE.into(),
         ])));
         assert!(bundle.tests.passed);
         assert_eq!(bundle.build.source_tree_oid, request.snapshot.tree_oid);

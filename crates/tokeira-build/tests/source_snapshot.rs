@@ -1,6 +1,6 @@
-//! Source-snapshot behavior (task 17): content-addressed determinism, the
-//! staged+unstaged capture, the untracked-`.rs` policy, closure scoping, and
-//! the leave-no-trace invariant. Repos are arranged with the real `git`
+//! Source-snapshot behavior: content-addressed determinism, the
+//! staged+unstaged capture, the untracked-`.rs` policy, closure scoping,
+//! content overrides, and the leave-no-trace invariant. Repos are arranged with the real `git`
 //! binary — snapshots must hold against repositories exactly as git creates
 //! them — and snapshot objects are read back with `git cat-file`, proving the
 //! written objects are ordinary, tooling-visible git objects.
@@ -56,6 +56,7 @@ fn request(dir: &Path) -> SnapshotRequest {
         repo_root: dir.to_path_buf(),
         closure_paths: vec![PathBuf::from("crates/alpha")],
         include_untracked: false,
+        content_overrides: std::collections::BTreeMap::new(),
     }
 }
 
@@ -122,7 +123,7 @@ fn untracked_rs_refuses_by_default_and_opts_in_explicitly() {
     )
     .expect("write untracked");
 
-    // Refuse-by-default, with the offending files listed (decision 9).
+    // Refuse-by-default, with the offending files listed.
     let err = snapshot_source_closure(&request(tmp.path())).expect_err("refuses");
     match err {
         SnapshotError::UntrackedSources { files } => {
@@ -204,7 +205,7 @@ fn snapshot_touches_neither_worktree_nor_index_nor_refs() {
     assert_eq!(
         git(tmp.path(), &["for-each-ref"]),
         refs_before,
-        "no ref is written — record-oid-only (decision 10)"
+        "no ref is written — record-oid-only"
     );
 }
 
@@ -244,6 +245,62 @@ fn audit_commit_parents_on_head_and_is_parentless_when_unborn() {
 }
 
 #[test]
+fn content_overrides_freeze_the_supplied_bytes_and_rekey_the_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_repo(tmp.path());
+
+    let plain = snapshot_source_closure(&request(tmp.path())).expect("snapshot");
+    let overridden = snapshot_source_closure(&SnapshotRequest {
+        content_overrides: std::collections::BTreeMap::from([(
+            "crates/alpha/Cargo.toml".to_string(),
+            b"[package]\nname = \"alpha-scoped\"\n".to_vec(),
+        )]),
+        ..request(tmp.path())
+    })
+    .expect("snapshot with override");
+
+    assert_ne!(
+        plain.tree_oid, overridden.tree_oid,
+        "override bytes are an identity input"
+    );
+    let frozen = git(
+        tmp.path(),
+        &[
+            "cat-file",
+            "-p",
+            &format!("{}:crates/alpha/Cargo.toml", overridden.tree_oid),
+        ],
+    );
+    assert_eq!(frozen, "[package]\nname = \"alpha-scoped\"");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("crates/alpha/Cargo.toml")).expect("worktree"),
+        "[package]\nname = \"alpha\"\n",
+        "the worktree file is untouched — only the frozen tree carries the override"
+    );
+}
+
+#[test]
+fn an_unconsumed_override_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_repo(tmp.path());
+
+    let err = snapshot_source_closure(&SnapshotRequest {
+        content_overrides: std::collections::BTreeMap::from([(
+            "Cargo.lock".to_string(),
+            b"version = 4\n".to_vec(),
+        )]),
+        ..request(tmp.path())
+    })
+    .expect_err("an override outside the frozen closure is a broken request");
+    match err {
+        SnapshotError::UnusedOverride { paths } => {
+            assert_eq!(paths, vec!["Cargo.lock".to_string()]);
+        }
+        other => panic!("expected UnusedOverride, got {other}"),
+    }
+}
+
+#[test]
 fn an_empty_closure_is_refused() {
     let tmp = tempfile::tempdir().expect("tempdir");
     seed_repo(tmp.path());
@@ -255,7 +312,7 @@ fn an_empty_closure_is_refused() {
     assert!(matches!(err, SnapshotError::EmptyClosure));
 }
 
-// The freeze → materialize round trip (task 18.1's build input): the
+// The freeze → materialize round trip (the hermetic build's input): the
 // materialized tree carries the frozen worktree bytes — including an
 // unstaged edit — and the executable bit, and reads only the object
 // database (a post-snapshot worktree edit must not leak in).

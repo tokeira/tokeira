@@ -471,7 +471,7 @@ multi-consumer decision) are out of scope.
         --bin tkp-compose`), so "`tkr` compiles `tkp` from `platforms/<platform>`" is literal (Phase 0;
         the hermetic build/obtain supersedes it in tasks 16-18). _Requirements: 14.4, 6.5_
 
-- [x] 16. Engine identity + build authority (Requirement 15; [Proposal 005](./proposals/005-provisioner-bundles-and-binding.md))
+- [x] 16. Engine identity + build authority (Requirement 15)
   - [x] 16.1 Define `EngineIdentity` (**closure-scoped**: provisioner source-closure digest + `Cargo.lock`-
         **closure** digest + toolchain + build-container digest + feature set + profile) and `BuildAuthority`
         (`LocalDeveloper` | `TrustedCi`) in `tokeira-provisioner`. This completes 14.1's narrowing (14.4):

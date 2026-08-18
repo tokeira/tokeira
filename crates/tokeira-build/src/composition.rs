@@ -5,6 +5,16 @@
 //! generic provisioner shell, then becomes a disposable build input. Cargo
 //! metadata supplies every package coordinate; descriptors cannot inject
 //! Rust paths or arbitrary dependencies.
+//!
+//! The generated package is an **ordinary member of the frozen source
+//! workspace** — never a detached island with a private lock. The snapshot's
+//! `Cargo.toml`/`Cargo.lock` are frozen closure-scoped
+//! ([`BoundProvisionerSource::snapshot_request`]): members are exactly the
+//! closure's crates plus the generated root, and the lock keeps exactly the
+//! packages those members reach — a pure text filter of the workspace's own
+//! authoritative lock. Cargo stays the sole dependency resolver; `--locked`
+//! verifies the scoped lock is exact, for the build and the closure tests
+//! alike, in the one shared workspace.
 
 use std::{
     collections::BTreeSet,
@@ -30,6 +40,16 @@ pub const TKP_PACKAGE: &str = "tokeira-tkp";
 /// Stable location of the disposable root within a staged source tree.
 pub const GENERATED_ROOT_RELATIVE_PATH: &str = ".tokeira-build/bound-provisioner";
 
+/// Stable location (workspace-relative, gitignored) of the staged scoped
+/// workspace. One directory serves both the snapshot author and the native
+/// dev build: staging is mtime-preserving, so reuse keeps cargo incremental
+/// and the closure copy is paid once.
+pub const SCOPED_WORKSPACE_RELATIVE_PATH: &str = ".tokeira-build/scoped-workspace";
+
+/// Cargo package name of every statically assembled provisioner root — the
+/// `-p` spec both the hermetic and the native build select.
+pub const GENERATED_ROOT_PACKAGE: &str = "tokeira-bound-provisioner";
+
 /// Cargo binary produced by every statically assembled provisioner root.
 pub const GENERATED_PROVISIONER_BIN: &str = "tkp";
 
@@ -41,7 +61,6 @@ pub struct BoundProvisionerSource {
     engine: String,
     cargo_toml: String,
     main_rs: String,
-    cargo_lock: Vec<u8>,
     closure: ProvisionerClosure,
 }
 
@@ -54,9 +73,8 @@ impl BoundProvisionerSource {
             platform: PlatformId::new("alpha").expect("test platform id"),
             format: DefinitionFormatId::new("tkd").expect("test format id"),
             engine: "0.0.0".to_string(),
-            cargo_toml: "[package]\nname = \"tokeira-bound-provisioner\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n".to_string(),
+            cargo_toml: "[package]\nname = \"tokeira-bound-provisioner\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\n".to_string(),
             main_rs: "fn main() {}\n".to_string(),
-            cargo_lock: b"version = 4\n".to_vec(),
             closure,
         }
     }
@@ -103,14 +121,17 @@ impl BoundProvisionerSource {
     /// Rust source contains only the selected identifiers and conventional
     /// exports. Advancing either private contract must therefore re-key the
     /// engine instead of reusing an artifact assembled under older semantics.
+    ///
+    /// The generated package carries no lock of its own — it resolves inside
+    /// the scoped snapshot workspace, whose `Cargo.lock` is frozen in the
+    /// snapshot tree and therefore already keys the source-closure digest.
     pub fn generated_root_digest(&self) -> Sha256Digest {
-        let mut bytes = b"tokeira-bound-provisioner-root/v3\n".to_vec();
+        let mut bytes = b"tokeira-bound-provisioner-root/v4\n".to_vec();
         framed_field(&mut bytes, "platform", self.platform.as_str().as_bytes());
         framed_field(&mut bytes, "format", self.format.as_str().as_bytes());
         framed_field(&mut bytes, "engine", self.engine.as_bytes());
         framed_field(&mut bytes, "Cargo.toml", self.cargo_toml.as_bytes());
         framed_field(&mut bytes, "src/main.rs", self.main_rs.as_bytes());
-        framed_field(&mut bytes, "Cargo.lock", &self.cargo_lock);
         Sha256Digest::from_bytes(&bytes)
     }
 
@@ -160,132 +181,131 @@ impl BoundProvisionerSource {
         })?;
         write_generated(&root.join("Cargo.toml"), self.cargo_toml.as_bytes())?;
         write_generated(&source_dir.join("main.rs"), self.main_rs.as_bytes())?;
-        write_generated(&root.join("Cargo.lock"), &self.cargo_lock)?;
         Ok(root)
     }
 
-    fn resolve_generated_lock(&mut self, workspace_root: &Path) -> Result<(), CompositionError> {
-        let generated_root = self.materialize_in(workspace_root)?;
-        let workspace_lock = workspace_root.join("Cargo.lock");
-        let mut lock = std::fs::read(&workspace_lock).map_err(|source| {
-            CompositionError::ReadWorkspaceLock {
-                path: workspace_lock.display().to_string(),
-                source,
-            }
-        })?;
-        if !lock.ends_with(b"\n") {
-            lock.push(b'\n');
-        }
-        lock.extend_from_slice(b"\n[[package]]\nname = \"tokeira-bound-provisioner\"\nversion = \"0.0.0\"\ndependencies = [\n");
-        for dependency in generated_dependency_packages(&self.cargo_toml)? {
-            lock.extend_from_slice(format!(" {},\n", toml_string(&dependency)).as_bytes());
-        }
-        lock.extend_from_slice(b"]\n");
-        let generated_lock = generated_root.join("Cargo.lock");
-        write_generated(&generated_lock, &lock)?;
+    /// The snapshot request that freezes this source's closure as a
+    /// **complete, valid cargo workspace**: the closure paths, with the
+    /// workspace `Cargo.toml`/`Cargo.lock` overridden by their closure-scoped
+    /// forms. The scoped bytes are authored by staging the workspace once
+    /// into a throwaway directory ([`stage_native_workspace`](Self::stage_native_workspace))
+    /// — exact scoped-lock membership is cargo's feature unification over
+    /// the scoped member set, which no derivation short of cargo's own
+    /// resolution reproduces. Materializing the resulting tree and overlaying
+    /// [`materialize_in`](Self::materialize_in) yields a workspace plain
+    /// `cargo build`/`cargo test --locked` accept.
+    pub fn snapshot_request(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<crate::SnapshotRequest, CompositionError> {
+        let staging = workspace_root.join(SCOPED_WORKSPACE_RELATIVE_PATH);
+        self.stage_native_workspace(workspace_root, &staging)?;
+        let read = |name: &str| {
+            std::fs::read(staging.join(name)).map_err(|source| {
+                CompositionError::ReadWorkspaceLock {
+                    path: staging.join(name).display().to_string(),
+                    source,
+                }
+            })
+        };
+        let manifest = read("Cargo.toml")?;
+        let lock = read("Cargo.lock")?;
+        Ok(crate::SnapshotRequest {
+            repo_root: workspace_root.to_path_buf(),
+            closure_paths: self.closure.closure_paths(),
+            include_untracked: false,
+            content_overrides: std::collections::BTreeMap::from([
+                ("Cargo.toml".to_string(), manifest),
+                ("Cargo.lock".to_string(), lock),
+            ]),
+        })
+    }
 
-        // Cargo prunes packages unreachable under the selected roots' default
-        // features. Starting from the admitted workspace lock preserves every
-        // selected version; offline metadata can only normalize that locked
-        // graph for this root, never consult a newer registry resolution.
+    /// Stage the **live** closure as the scoped workspace: the closure files
+    /// copied skip-identical (mtimes survive, cargo stays incremental), the
+    /// scoped root manifest, the generated package as an ordinary member, and
+    /// the scoped lock — with strays from prior stagings removed so a
+    /// shrunken closure cannot leave stale source behind. `target/` is
+    /// cargo's and is never touched.
+    ///
+    /// The scoped lock is authored by cargo itself: the staging is seeded
+    /// with the workspace's authoritative `Cargo.lock` and `cargo metadata
+    /// --offline` resolves the staged member set — it can only prune the
+    /// seed, never consult a registry — then the result is validated to
+    /// contain nothing outside the admitted closure
+    /// (`validate_scoped_lock`). Exactness matters because `--locked`
+    /// builds and tests refuse any lock cargo would rewrite.
+    ///
+    /// This also serves the native dev build, which deliberately compiles
+    /// the working tree and must work in trees without `.git`.
+    pub fn stage_native_workspace(
+        &self,
+        workspace_root: &Path,
+        staging: &Path,
+    ) -> Result<PathBuf, CompositionError> {
+        let read = |name: &str| {
+            std::fs::read_to_string(workspace_root.join(name)).map_err(|source| {
+                CompositionError::ReadWorkspaceLock {
+                    path: workspace_root.join(name).display().to_string(),
+                    source,
+                }
+            })
+        };
+        let manifest = scoped_workspace_manifest(&read("Cargo.toml")?, &self.closure)?;
+        let seed_lock = read("Cargo.lock")?;
+
+        let mut kept: BTreeSet<PathBuf> = BTreeSet::new();
+        for relative in self.closure.closure_paths() {
+            // The two scoped files are written below — copying their full
+            // forms first would churn their mtimes every staging.
+            let key = relative.to_string_lossy().replace('\\', "/");
+            if key == "Cargo.toml" || key == "Cargo.lock" {
+                continue;
+            }
+            copy_skip_identical(
+                &workspace_root.join(&relative),
+                &staging.join(&relative),
+                &relative,
+                &mut kept,
+            )?;
+        }
+        write_generated(&staging.join("Cargo.toml"), manifest.as_bytes())?;
+        kept.insert(PathBuf::from("Cargo.toml"));
+        self.materialize_in(staging)?;
+        let generated = Path::new(GENERATED_ROOT_RELATIVE_PATH);
+        kept.insert(generated.join("Cargo.toml"));
+        kept.insert(generated.join("src/main.rs"));
+        prune_strays(staging, Path::new(""), &kept)?;
+
+        // Lock last, after the sweep (the sweep would otherwise treat a
+        // fresh staging's lock as a stray): seed with the authoritative
+        // lock, let cargo prune it to the staged member set, and refuse
+        // anything outside the admitted closure.
+        let staged_lock = staging.join("Cargo.lock");
+        write_generated(&staged_lock, seed_lock.as_bytes())?;
         let status = std::process::Command::new("cargo")
-            .current_dir(workspace_root)
-            .args([
-                "metadata",
-                "--offline",
-                "--format-version",
-                "1",
-                "--manifest-path",
-            ])
-            .arg(generated_root.join("Cargo.toml"))
+            .current_dir(staging)
+            .args(["metadata", "--offline", "--format-version", "1"])
             .stdout(Stdio::null())
             .status()
-            .map_err(|source| CompositionError::ResolveGeneratedLock {
-                path: generated_lock.display().to_string(),
+            .map_err(|source| CompositionError::Stage {
+                path: staged_lock.display().to_string(),
                 source,
             })?;
         if !status.success() {
             return Err(CompositionError::InvalidSelection(format!(
-                "Cargo could not normalize the generated bound-provisioner lock at {}",
-                generated_lock.display()
+                "cargo could not resolve the staged scoped workspace at {}",
+                staging.display()
             )));
         }
-        let resolved = std::fs::read(&generated_lock).map_err(|source| {
+        let resolved = std::fs::read_to_string(&staged_lock).map_err(|source| {
             CompositionError::ReadWorkspaceLock {
-                path: generated_lock.display().to_string(),
+                path: staged_lock.display().to_string(),
                 source,
             }
         })?;
-        self.validate_generated_lock(&resolved)?;
-        self.cargo_lock = resolved;
-        Ok(())
-    }
-
-    fn validate_generated_lock(&self, bytes: &[u8]) -> Result<(), CompositionError> {
-        #[derive(serde::Deserialize)]
-        struct Lockfile {
-            #[serde(default)]
-            package: Vec<LockPackage>,
-        }
-        #[derive(serde::Deserialize)]
-        struct LockPackage {
-            name: String,
-            version: String,
-            #[serde(default)]
-            source: Option<String>,
-            #[serde(default)]
-            checksum: Option<String>,
-        }
-
-        let text = std::str::from_utf8(bytes).map_err(|error| {
-            CompositionError::InvalidSelection(format!(
-                "generated bound-provisioner lock is not UTF-8: {error}"
-            ))
-        })?;
-        let lockfile: Lockfile = toml::from_str(text).map_err(|error| {
-            CompositionError::InvalidSelection(format!(
-                "generated bound-provisioner lock is invalid: {error}"
-            ))
-        })?;
-        let admitted = self.closure.locked.iter().collect::<BTreeSet<_>>();
-        let workspace = self
-            .closure
-            .crate_names
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        let mut found_root = false;
-        for package in lockfile.package {
-            if package.name == "tokeira-bound-provisioner" && package.source.is_none() {
-                found_root = true;
-                continue;
-            }
-            if package.source.is_none() {
-                if workspace.contains(package.name.as_str()) {
-                    continue;
-                }
-            } else {
-                let dependency = crate::LockedDependency {
-                    name: package.name.clone(),
-                    version: package.version.clone(),
-                    source: package.source.clone(),
-                    checksum: package.checksum.clone(),
-                };
-                if admitted.contains(&dependency) {
-                    continue;
-                }
-            }
-            return Err(CompositionError::InvalidSelection(format!(
-                "generated lock contains package `{} {}` outside the admitted source closure",
-                package.name, package.version
-            )));
-        }
-        if !found_root {
-            return Err(CompositionError::InvalidSelection(
-                "generated lock does not contain the bound-provisioner root".to_string(),
-            ));
-        }
-        Ok(())
+        validate_scoped_lock(&resolved, &self.closure)?;
+        Ok(staging.to_path_buf())
     }
 }
 
@@ -296,6 +316,250 @@ fn framed_field(buffer: &mut Vec<u8>, tag: &str, value: &[u8]) {
     buffer.push(b':');
     buffer.extend_from_slice(value);
     buffer.push(b'\n');
+}
+
+/// The workspace root manifest with `members` replaced by exactly the
+/// closure's crate directories plus the generated root. A byte-targeted
+/// splice — every other table (dependency policy, lints, profiles) survives
+/// verbatim — validated by re-parsing the result.
+fn scoped_workspace_manifest(
+    full: &str,
+    closure: &ProvisionerClosure,
+) -> Result<String, CompositionError> {
+    // Line-anchored search: a bare substring match would also hit
+    // `default-members = [`.
+    let start = full
+        .find("\nmembers = [")
+        .map(|at| at + 1)
+        .or_else(|| full.starts_with("members = [").then_some(0))
+        .ok_or_else(|| {
+            CompositionError::InvalidSelection(
+                "workspace manifest has no members array to scope".to_string(),
+            )
+        })?;
+    let open = start + "members = [".len();
+    let close = open
+        + full[open..].find(']').ok_or_else(|| {
+            CompositionError::InvalidSelection(
+                "workspace manifest members array is unterminated".to_string(),
+            )
+        })?;
+
+    let mut members: BTreeSet<String> = closure
+        .crate_dirs
+        .iter()
+        .map(|dir| dir.to_string_lossy().replace('\\', "/"))
+        .collect();
+    members.insert(GENERATED_ROOT_RELATIVE_PATH.to_string());
+    let mut rendered = String::from("\n");
+    for member in &members {
+        rendered.push_str("    ");
+        rendered.push_str(&toml_string(member));
+        rendered.push_str(",\n");
+    }
+
+    let scoped = format!("{}{}{}", &full[..open], rendered, &full[close..]);
+    let parsed: toml::Value = toml::from_str(&scoped).map_err(|error| {
+        CompositionError::InvalidSelection(format!(
+            "scoped workspace manifest does not parse: {error}"
+        ))
+    })?;
+    let spliced: Option<BTreeSet<String>> = parsed
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(toml::Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        });
+    if spliced.as_ref() != Some(&members) {
+        return Err(CompositionError::InvalidSelection(
+            "scoping the workspace members array altered the wrong region".to_string(),
+        ));
+    }
+    Ok(scoped)
+}
+
+/// Refuse a staged scoped lock that strays outside the admitted closure:
+/// every third-party entry must be byte-exact in the closure's locked set
+/// (name/version/source/checksum), every source-less entry must be a closure
+/// member or the generated root, and every closure member and the root must
+/// be present. The offline resolution that produced the lock can only prune
+/// its authoritative seed, so a violation is drift or corruption — never a
+/// legitimate resolution.
+///
+/// The lock may be a *subset* of the closure's locked set: the closure walks
+/// the full workspace's resolve graph, whose feature unification includes
+/// activations contributed by non-closure members. Cargo's resolution of the
+/// scoped member set drops those edges — the direction that only ever
+/// removes dependencies from the built artifact.
+fn validate_scoped_lock(text: &str, closure: &ProvisionerClosure) -> Result<(), CompositionError> {
+    #[derive(serde::Deserialize)]
+    struct Lockfile {
+        #[serde(default)]
+        package: Vec<LockPackage>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LockPackage {
+        name: String,
+        version: String,
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        checksum: Option<String>,
+    }
+
+    let lockfile: Lockfile = toml::from_str(text).map_err(|error| {
+        CompositionError::InvalidSelection(format!("staged scoped lock is invalid: {error}"))
+    })?;
+    let admitted = closure.locked.iter().collect::<BTreeSet<_>>();
+    let members = closure
+        .crate_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut found_root = false;
+    let mut seen_members: BTreeSet<&str> = BTreeSet::new();
+    for package in &lockfile.package {
+        if package.name == GENERATED_ROOT_PACKAGE && package.source.is_none() {
+            found_root = true;
+            continue;
+        }
+        if package.source.is_none() {
+            if let Some(member) = members.get(package.name.as_str()) {
+                seen_members.insert(member);
+                continue;
+            }
+        } else {
+            let dependency = crate::LockedDependency {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                source: package.source.clone(),
+                checksum: package.checksum.clone(),
+            };
+            if admitted.contains(&dependency) {
+                continue;
+            }
+        }
+        return Err(CompositionError::InvalidSelection(format!(
+            "staged scoped lock contains package `{} {}` outside the admitted source closure",
+            package.name, package.version
+        )));
+    }
+    if !found_root {
+        return Err(CompositionError::InvalidSelection(
+            "staged scoped lock does not contain the generated provisioner root".to_string(),
+        ));
+    }
+    if let Some(missing) = members.iter().find(|m| !seen_members.contains(*m)) {
+        return Err(CompositionError::InvalidSelection(format!(
+            "staged scoped lock has no entry for closure member `{missing}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Copy `src` (file, dir, or symlink) to `dst`, writing only when content
+/// differs so an unchanged file keeps its mtime — cargo's fingerprints stay
+/// valid across stagings. Records every staged file (repo-relative) in
+/// `kept` for the stray sweep.
+fn copy_skip_identical(
+    src: &Path,
+    dst: &Path,
+    relative: &Path,
+    kept: &mut BTreeSet<PathBuf>,
+) -> Result<(), CompositionError> {
+    let stage_err = |path: &Path| {
+        let path = path.display().to_string();
+        move |source: std::io::Error| CompositionError::Stage { path, source }
+    };
+    let Ok(metadata) = std::fs::symlink_metadata(src) else {
+        // A closure path may be tracked-but-deleted; absence is the truth.
+        return Ok(());
+    };
+    if metadata.is_dir() {
+        std::fs::create_dir_all(dst).map_err(stage_err(dst))?;
+        let entries = std::fs::read_dir(src).map_err(stage_err(src))?;
+        for entry in entries {
+            let entry = entry.map_err(stage_err(src))?;
+            let name = entry.file_name();
+            copy_skip_identical(
+                &src.join(&name),
+                &dst.join(&name),
+                &relative.join(&name),
+                kept,
+            )?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(stage_err(parent))?;
+    }
+    if metadata.is_symlink() {
+        let target = std::fs::read_link(src).map_err(stage_err(src))?;
+        let unchanged = std::fs::read_link(dst).is_ok_and(|current| current == target);
+        if !unchanged {
+            let _ = std::fs::remove_file(dst);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, dst).map_err(stage_err(dst))?;
+            #[cfg(not(unix))]
+            std::fs::write(dst, target.as_os_str().as_encoded_bytes()).map_err(stage_err(dst))?;
+        }
+    } else {
+        let bytes = std::fs::read(src).map_err(stage_err(src))?;
+        let unchanged = std::fs::read(dst).is_ok_and(|current| current == bytes);
+        if !unchanged {
+            std::fs::write(dst, &bytes).map_err(stage_err(dst))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode();
+            if mode & 0o111 != 0 {
+                std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))
+                    .map_err(stage_err(dst))?;
+            }
+        }
+    }
+    kept.insert(relative.to_path_buf());
+    Ok(())
+}
+
+/// Delete files under `root` that this staging did not produce, so a
+/// shrunken closure cannot leave stale source for cargo to compile.
+/// `target/` belongs to cargo and is never entered.
+fn prune_strays(
+    root: &Path,
+    relative: &Path,
+    kept: &BTreeSet<PathBuf>,
+) -> Result<(), CompositionError> {
+    let stage_err = |path: &Path| {
+        let path = path.display().to_string();
+        move |source: std::io::Error| CompositionError::Stage { path, source }
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry.map_err(stage_err(root))?;
+        let name = entry.file_name();
+        let child_rel = relative.join(&name);
+        if child_rel == Path::new("target") {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(stage_err(&path))?;
+        if file_type.is_dir() {
+            prune_strays(&path, &child_rel, kept)?;
+            // Best-effort: a directory emptied by the sweep is itself a stray.
+            let _ = std::fs::remove_dir(&path);
+        } else if !kept.contains(&child_rel) {
+            std::fs::remove_file(&path).map_err(stage_err(&path))?;
+        }
+    }
+    Ok(())
 }
 
 /// Refusal to assemble or materialize a static provisioner root.
@@ -313,20 +577,13 @@ pub enum CompositionError {
     /// Selected discovery data no longer agrees with the recognized workspace.
     #[error("invalid bound-provisioner selection: {0}")]
     InvalidSelection(String),
-    /// The admitted workspace lock could not be read for the generated root.
-    #[error("failed to read workspace lock file {path}: {source}")]
+    /// A workspace build file (`Cargo.toml`/`Cargo.lock`) could not be read
+    /// for closure scoping.
+    #[error("failed to read workspace file {path}: {source}")]
     ReadWorkspaceLock {
-        /// Workspace lock file whose bytes were required.
+        /// Workspace file whose bytes were required.
         path: String,
         /// Filesystem failure.
-        source: std::io::Error,
-    },
-    /// Cargo could not normalize the generated lock from the admitted one.
-    #[error("failed to resolve generated lock file {path}: {source}")]
-    ResolveGeneratedLock {
-        /// Generated lock whose dependency graph was being normalized.
-        path: String,
-        /// Cargo process launch failure.
         source: std::io::Error,
     },
     /// Generated files could not be staged for compilation.
@@ -337,36 +594,14 @@ pub enum CompositionError {
         /// Filesystem failure.
         source: std::io::Error,
     },
-}
-
-fn generated_dependency_packages(cargo_toml: &str) -> Result<BTreeSet<String>, CompositionError> {
-    let manifest: toml::Value = toml::from_str(cargo_toml).map_err(|error| {
-        CompositionError::InvalidSelection(format!(
-            "generated bound-provisioner manifest is invalid: {error}"
-        ))
-    })?;
-    let dependencies = manifest
-        .get("dependencies")
-        .and_then(toml::Value::as_table)
-        .ok_or_else(|| {
-            CompositionError::InvalidSelection(
-                "generated bound-provisioner manifest has no dependency table".to_string(),
-            )
-        })?;
-    dependencies
-        .values()
-        .map(|dependency| {
-            dependency
-                .get("package")
-                .and_then(toml::Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    CompositionError::InvalidSelection(
-                        "generated bound-provisioner dependency has no package name".to_string(),
-                    )
-                })
-        })
-        .collect()
+    /// The native staging workspace could not be arranged.
+    #[error("failed to stage {path}: {source}")]
+    Stage {
+        /// Staging path whose copy or sweep failed.
+        path: String,
+        /// Filesystem failure.
+        source: std::io::Error,
+    },
 }
 
 /// Assemble one static provisioner from trusted workspace descriptors.
@@ -423,17 +658,14 @@ pub fn assemble_bound_provisioner(
         ],
     )?;
 
-    let mut source = BoundProvisionerSource {
+    Ok(BoundProvisionerSource {
         platform: platform.id.clone(),
         format: frontend.format.clone(),
         engine: platform.engine.clone(),
         cargo_toml,
         main_rs,
-        cargo_lock: Vec::new(),
         closure,
-    };
-    source.resolve_generated_lock(&workspace_root)?;
-    Ok(source)
+    })
 }
 
 fn find_workspace_package<'a>(
@@ -501,7 +733,7 @@ fn render_manifest(
     frontend_feature: &str,
 ) -> String {
     format!(
-        "[package]\nname = \"tokeira-bound-provisioner\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[[bin]]\nname = \"{GENERATED_PROVISIONER_BIN}\"\npath = \"src/main.rs\"\n\n[workspace]\n\n[dependencies]\nselected_frontend = {{ package = {}, path = {}, features = [{}], default-features = false }}\nselected_platform = {{ package = {}, path = {} }}\ntokeira_tkp = {{ package = {}, path = {} }}\n",
+        "[package]\nname = \"{GENERATED_ROOT_PACKAGE}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[[bin]]\nname = \"{GENERATED_PROVISIONER_BIN}\"\npath = \"src/main.rs\"\n\n[dependencies]\nselected_frontend = {{ package = {}, path = {}, features = [{}], default-features = false }}\nselected_platform = {{ package = {}, path = {} }}\ntokeira_tkp = {{ package = {}, path = {} }}\n",
         toml_string(&frontend.package_name),
         toml_string(frontend_path),
         toml_string(frontend_feature),
@@ -529,6 +761,12 @@ fn toml_string(value: &str) -> String {
 }
 
 fn write_generated(path: &Path, bytes: &[u8]) -> Result<(), CompositionError> {
+    // Skip identical bytes: a stable generated file keeps its mtime across
+    // stagings, so cargo's fingerprints stay valid and unchanged inputs
+    // rebuild nothing.
+    if std::fs::read(path).is_ok_and(|current| current == bytes) {
+        return Ok(());
+    }
     std::fs::write(path, bytes).map_err(|source| CompositionError::WriteGenerated {
         path: path.display().to_string(),
         source,
@@ -716,10 +954,6 @@ macro_rules! bound_provisioner_main {
         let mut main = source;
         main.main_rs.push_str("// changed\n");
         assert_ne!(main.generated_root_digest(), digest);
-
-        let mut lock = fixture.assemble("tkd");
-        lock.cargo_lock.extend_from_slice(b"# changed\n");
-        assert_ne!(lock.generated_root_digest(), digest);
     }
 
     proptest! {
@@ -773,7 +1007,6 @@ macro_rules! bound_provisioner_main {
                 engine: "0.1.0".to_string(),
                 cargo_toml,
                 main_rs,
-                cargo_lock: b"version = 4\n".to_vec(),
                 closure: ProvisionerClosure {
                     crate_dirs: Vec::new(),
                     crate_names: vec![
@@ -836,18 +1069,26 @@ macro_rules! bound_provisioner_main {
         }
     }
 
+    // Proves the whole locking model on a real workspace: the scoped
+    // manifest and scoped lock are exact enough for `--locked`, in the one
+    // staged workspace the generated member resolves in.
     #[test]
-    fn materialized_root_compiles_the_conventional_exports() {
+    fn staged_workspace_compiles_the_conventional_exports_under_locked() {
         let fixture = Fixture::new();
         let source = fixture.assemble("tkd");
-        let generated = source
-            .materialize_in(&fixture.root)
-            .expect("materialize generated root");
+        let staging = tempfile::tempdir().expect("staging dir");
+        source
+            .stage_native_workspace(&fixture.root, staging.path())
+            .expect("stage the scoped workspace");
+        assert!(
+            !staging.path().join("crates/unrelated").exists(),
+            "out-of-closure members are not staged"
+        );
 
-        let output = cargo_check(&generated);
+        let output = cargo_check(staging.path());
         assert!(
             output.status.success(),
-            "generated root failed: {}",
+            "staged workspace failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -860,16 +1101,160 @@ macro_rules! bound_provisioner_main {
             &fixture.root.join("platforms/alpha/src/lib.rs"),
             "pub fn differently_named() {}\n",
         );
-        let generated = source
-            .materialize_in(&fixture.root)
-            .expect("materialize generated root");
+        let staging = tempfile::tempdir().expect("staging dir");
+        source
+            .stage_native_workspace(&fixture.root, staging.path())
+            .expect("stage the scoped workspace");
 
-        let output = cargo_check(&generated);
+        let output = cargo_check(staging.path());
         assert!(!output.status.success());
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("provisioner"),
             "unexpected compiler error: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn scoped_manifest_reduces_members_and_preserves_every_other_table() {
+        let fixture = Fixture::new();
+        let source = fixture.assemble("tkd");
+        let full =
+            std::fs::read_to_string(fixture.root.join("Cargo.toml")).expect("fixture manifest");
+
+        let scoped = scoped_workspace_manifest(&full, source.closure()).expect("scoped manifest");
+        let parsed: toml::Value = toml::from_str(&scoped).expect("scoped manifest parses");
+        let members: Vec<&str> = parsed["workspace"]["members"]
+            .as_array()
+            .expect("members array")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert!(members.contains(&GENERATED_ROOT_RELATIVE_PATH));
+        assert!(members.contains(&"crates/cli"));
+        assert!(members.contains(&"platforms/alpha"));
+        assert!(members.contains(&"frontends/tkd"));
+        assert!(!members.contains(&"crates/unrelated"));
+        assert!(!members.contains(&"frontends/tkdp"));
+        // Everything outside the members array survives verbatim.
+        assert_eq!(
+            parsed["workspace"]["resolver"],
+            toml::Value::String("3".to_string())
+        );
+    }
+
+    #[test]
+    fn staged_lock_holds_exactly_the_closure_and_the_generated_root() {
+        let fixture = Fixture::new();
+        let source = fixture.assemble("tkd");
+        let staging = tempfile::tempdir().expect("staging dir");
+        source
+            .stage_native_workspace(&fixture.root, staging.path())
+            .expect("stage the scoped workspace");
+
+        let scoped =
+            std::fs::read_to_string(staging.path().join("Cargo.lock")).expect("staged lock");
+        let parsed: toml::Value = toml::from_str(&scoped).expect("staged lock parses");
+        let names: Vec<&str> = parsed["package"]
+            .as_array()
+            .expect("package entries")
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(toml::Value::as_str))
+            .collect();
+        assert!(names.contains(&GENERATED_ROOT_PACKAGE));
+        assert!(names.contains(&TKP_PACKAGE));
+        assert!(names.contains(&"alpha-platform"));
+        assert!(names.contains(&"tkd-frontend"));
+        assert!(!names.contains(&"unrelated"));
+        assert!(!names.contains(&"tkdp-frontend"));
+
+        // Deterministic: restaging reproduces the same bytes.
+        let staging_again = tempfile::tempdir().expect("staging dir");
+        source
+            .stage_native_workspace(&fixture.root, staging_again.path())
+            .expect("stage again");
+        assert_eq!(
+            scoped,
+            std::fs::read_to_string(staging_again.path().join("Cargo.lock"))
+                .expect("staged lock again")
+        );
+    }
+
+    #[test]
+    fn a_lock_entry_outside_the_admitted_closure_is_refused() {
+        let fixture = Fixture::new();
+        let source = fixture.assemble("tkd");
+        let root =
+            format!("[[package]]\nname = \"{GENERATED_ROOT_PACKAGE}\"\nversion = \"0.0.0\"\n");
+        let members: String = source
+            .closure()
+            .crate_names
+            .iter()
+            .map(|name| format!("[[package]]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n"))
+            .collect();
+
+        let foreign = format!(
+            "version = 4\n\n{members}{root}\n[[package]]\nname = \"foreign\"\nversion = \"9.9.9\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+        );
+        let err = validate_scoped_lock(&foreign, source.closure())
+            .expect_err("a package outside the closure is refused");
+        assert!(
+            err.to_string()
+                .contains("outside the admitted source closure")
+        );
+
+        let missing_member = format!("version = 4\n\n{root}");
+        let err = validate_scoped_lock(&missing_member, source.closure())
+            .expect_err("a lock without the closure members is refused");
+        assert!(err.to_string().contains("no entry for closure member"));
+
+        let missing_root = format!("version = 4\n\n{members}");
+        let err = validate_scoped_lock(&missing_root, source.closure())
+            .expect_err("a lock without the generated root is refused");
+        assert!(err.to_string().contains("generated provisioner root"));
+
+        let exact = format!("version = 4\n\n{members}{root}");
+        validate_scoped_lock(&exact, source.closure()).expect("the exact set is accepted");
+    }
+
+    #[test]
+    fn restaging_prunes_strays_and_preserves_unchanged_mtimes() {
+        let fixture = Fixture::new();
+        let source = fixture.assemble("tkd");
+        let staging = tempfile::tempdir().expect("staging dir");
+        source
+            .stage_native_workspace(&fixture.root, staging.path())
+            .expect("first staging");
+
+        // A stray from a prior (wider) staging, and cargo's own target dir.
+        write(&staging.path().join("crates/cli/src/stale.rs"), "oops\n");
+        std::fs::create_dir_all(staging.path().join("target/debug")).expect("target dir");
+        write(&staging.path().join("target/debug/artifact"), "keep\n");
+        let lib = staging.path().join("crates/cli/src/lib.rs");
+        let mtime_before = std::fs::metadata(&lib)
+            .expect("lib metadata")
+            .modified()
+            .expect("lib mtime");
+
+        source
+            .stage_native_workspace(&fixture.root, staging.path())
+            .expect("second staging");
+
+        assert!(
+            !staging.path().join("crates/cli/src/stale.rs").exists(),
+            "strays are swept"
+        );
+        assert!(
+            staging.path().join("target/debug/artifact").exists(),
+            "target/ is cargo's and is never touched"
+        );
+        assert_eq!(
+            std::fs::metadata(&lib)
+                .expect("lib metadata")
+                .modified()
+                .expect("lib mtime"),
+            mtime_before,
+            "unchanged files keep their mtime — incremental builds survive"
         );
     }
 
@@ -889,15 +1274,15 @@ macro_rules! bound_provisioner_main {
         std::fs::write(path, content).expect("write fixture file");
     }
 
-    fn cargo_check(root: &Path) -> std::process::Output {
+    fn cargo_check(staging: &Path) -> std::process::Output {
         Command::new(env!("CARGO"))
+            .current_dir(staging)
             .args([
                 "check",
                 "--offline",
-                "--manifest-path",
-                root.join("Cargo.toml")
-                    .to_str()
-                    .expect("fixture path is UTF-8"),
+                "--locked",
+                "-p",
+                GENERATED_ROOT_PACKAGE,
             ])
             .output()
             .expect("run cargo check")

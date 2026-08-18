@@ -282,9 +282,15 @@ impl DeploymentResolver {
     ) -> Result<PathBuf> {
         let source = tokeira_build::assemble_bound_provisioner(workspace, platform, frontend)
             .context("failed to assemble the bound provisioner source")?;
-        let generated = source
-            .materialize_in(workspace)
-            .context("failed to materialize the bound provisioner source")?;
+        // The native dev build compiles the live tree through the same
+        // scoped-workspace model as the hermetic build: the closure plus the
+        // generated member, one lock, plain workspace cargo. The staging dir
+        // is stable (and its files staged mtime-preserving) so incremental
+        // builds survive across invocations.
+        let staging = workspace.join(tokeira_build::SCOPED_WORKSPACE_RELATIVE_PATH);
+        source
+            .stage_native_workspace(workspace, &staging)
+            .context("failed to stage the bound provisioner workspace")?;
         eprintln!(
             "provisioner: building generated `{}/{}` root {}…",
             source.platform(),
@@ -292,15 +298,19 @@ impl DeploymentResolver {
             &source.generated_root_digest().to_hex()[..12]
         );
         let status = std::process::Command::new("cargo")
-            .current_dir(workspace)
-            .args(["build", "--locked", "--manifest-path"])
-            .arg(generated.join("Cargo.toml"))
+            .current_dir(&staging)
+            .args([
+                "build",
+                "--locked",
+                "-p",
+                tokeira_build::GENERATED_ROOT_PACKAGE,
+            ])
             .status()
             .context("failed to run Cargo for the generated provisioner")?;
         if !status.success() {
             bail!("the generated bound-provisioner build failed; see Cargo output above");
         }
-        let artifact = generated
+        let artifact = staging
             .join("target/debug")
             .join(tokeira_build::GENERATED_PROVISIONER_BIN);
         if !artifact.is_file() {

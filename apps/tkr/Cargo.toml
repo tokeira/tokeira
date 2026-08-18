@@ -15,6 +15,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-ecs = "1"
+aws-sdk-s3 = "1"
 base64 = "0.22"
 chrono.workspace = true
 clap.workspace = true
@@ -54,6 +55,9 @@ which = "7"
 [dev-dependencies]
 proptest = "1"
 tempfile.workspace = true
+# The offline pipeline fakes (mock Dagger engine) for the repository
+# integration tests; test builds only.
+tokeira-build = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

@@ -102,6 +102,15 @@ pub(crate) async fn apply<F: DefinitionFrontend>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after apply")?;
+    // ── Post-commit publication: a derived projection of the committed
+    // state; its failure reports a remedy and never alters the outcome. ──
+    crate::publication::publish_committed_transition(
+        engine,
+        admitted,
+        tokeira_deployment::repository::claim::Transition::Apply,
+        envelope.config_revision,
+    )
+    .await;
     let mut context = crate::explain_context(engine, admitted, &envelope, "infra apply");
     context.current_revision = from_revision;
     context.proposed_revision = Some(envelope.config_revision);

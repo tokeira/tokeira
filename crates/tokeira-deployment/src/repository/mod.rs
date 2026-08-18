@@ -21,6 +21,7 @@
 //!   [`list`] — deployment enumeration.
 //! - [`error`] — typed refusals with stable names.
 
+pub mod assemble;
 pub mod claim;
 pub mod config;
 pub mod error;
@@ -30,6 +31,7 @@ pub mod list;
 pub mod locator;
 pub mod open;
 pub mod publish;
+pub mod refresh;
 pub mod transport;
 pub mod writer;
 

@@ -8526,6 +8526,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-ecs",
+ "aws-sdk-s3",
  "base64 0.22.1",
  "chrono",
  "clap",

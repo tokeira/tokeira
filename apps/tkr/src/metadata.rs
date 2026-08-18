@@ -31,6 +31,15 @@ pub(crate) enum DeploymentStatus {
     Stopped,
 }
 
+/// The deployment's repository binding: where its publication lineage
+/// lives, and the digest guarding the pinned trust anchor against
+/// accidental replacement (compared on every open before use).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DeploymentRepositoryBinding {
+    pub locator: tokeira_deployment::repository::locator::RepositoryLocator,
+    pub trusted_root_digest: String,
+}
+
 /// Stable JSON shape persisted at `metadata.json`. Changes to the field
 /// set are a breaking change for existing deployments on disk; prefer
 /// additive, optional fields.
@@ -42,6 +51,10 @@ pub(crate) struct DeploymentMetadata {
     /// Format and safe live source path for a bound-provisioner deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<RecordedDefinition>,
+    /// Repository binding, written at create/fetch. Absent on deployments
+    /// that predate the deployment repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_repository: Option<DeploymentRepositoryBinding>,
     pub storage: StorageKind,
     pub status: DeploymentStatus,
     pub created_at: String,

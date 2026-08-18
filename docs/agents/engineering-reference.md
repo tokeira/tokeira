@@ -18,6 +18,15 @@ equally binding.*
   pattern: `config.rs`, `modules.rs`, `services.rs`, `compose.rs`.
 - `tokeira-config` owns the server config model (`TokeiraConfig`) and the generic TOML
   loader (same crate: one consumer today).
+- `tokeira-deployment::repository` owns the Deployment Publication lineage (TUF via
+  `tough`): locator/keys/claim, create-only writer, `publish_transition`, verified
+  `open`, fetch planning, listing, freshness refresh. Publication is a **derived
+  projection** — the deployment-dir rename (create) and the envelope CAS (transitions)
+  stay the sole commit authorities; a publication failure reports `tkr deployment
+  publish` as its remedy and never unwinds a commit. Publishers assemble input through
+  `repository::assemble` (one implementation for create, the `tkp` lifecycle hook, and
+  the repair verb); the shells stay thin: `tkr` owns keys/trust/metadata binding,
+  `tkp` owns only the post-commit hook.
 - `proto/upstream/` is the authoritative wire shape; `tokeira-proto` generates from it.
   Never treat generated output under `target/` as authoritative.
 

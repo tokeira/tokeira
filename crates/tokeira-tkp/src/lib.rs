@@ -38,6 +38,7 @@ mod init;
 
 mod plan;
 pub mod platform;
+mod publication;
 mod render;
 mod revert;
 mod rollback;

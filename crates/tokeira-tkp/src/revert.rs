@@ -102,6 +102,16 @@ pub(crate) async fn revert<F: DefinitionFrontend>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after revert")?;
+    // ── Post-commit publication: a NEW, higher publication whose content
+    // is the reverted-to state (Req 4.3); failure never alters the
+    // committed revert. ──
+    crate::publication::publish_committed_transition(
+        engine,
+        admitted,
+        tokeira_deployment::repository::claim::Transition::Revert,
+        envelope.config_revision,
+    )
+    .await;
     println!(
         "envelope: config_revision now {} (content of revision {to_revision})",
         envelope.config_revision

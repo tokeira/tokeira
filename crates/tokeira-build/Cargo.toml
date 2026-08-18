@@ -8,6 +8,11 @@ license.workspace = true
 authors.workspace = true
 description = "Image build, publish, and mirror pipelines for Tokeira"
 
+[features]
+# Expose the offline fakes (mock Dagger engine, deterministic artifact
+# bytes) to downstream integration tests. Never enabled by shipped code.
+testing = []
+
 [dependencies]
 cargo_metadata.workspace = true
 dagger-client.workspace = true

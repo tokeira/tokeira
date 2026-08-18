@@ -151,7 +151,7 @@ no slice mixes restructuring noise with feature diffs.
 
 - [x] 12. Publish
   - [x] 12.1 Root authoring (v1 + rotation); `PublicationInput`; `publish_transition`
-        with `expected_version`; `retrieval_ref` stamping; mutable heads written last.
+        with `expected_version`; manifest published verbatim; mutable heads written last.
         _Requirements: 2.1, 2.5, 3.1, 3.2, 3.4, 3.5, 7 (authoring), 8.3_
   - [x] 12.2 PBT: monotonic lineage — versions advance by 1 across generated
         transition sequences; revert publishes new-version-old-content; stale
@@ -178,7 +178,7 @@ no slice mixes restructuring noise with feature diffs.
         break-glass; datastore-known newer version refuses older.
         // Feature: deployment-repository, Property P7 _Requirements: 9.1, 9.2_
   - [x] 13.5 PBT: engine agreement — descriptor sha vs TUF hash divergence refuses;
-        `retrieval_ref` must name the target. // Feature: deployment-repository,
+        the derived `tkp-<triple>` target must exist. // Feature: deployment-repository,
         Property P8 _Requirements: 2.5_
   - [x] 13.6 PBT: rotation — online-key rotation via root N+1 verifies from anchor N
         and re-pins. // Feature: deployment-repository, Property P9
@@ -204,46 +204,93 @@ no slice mixes restructuring noise with feature diffs.
 
 ## D. Wiring
 
-- [ ] 15. `tkr deployment create` publishes
-  - [ ] 15.1 Bundle path becomes the default engine obtainment; `--dev-engine`
+- [x] 15. `tkr deployment create` publishes
+  - [x] 15.1 Bundle path becomes the default engine obtainment; `--dev-engine`
         (settled name) local-only, synthesizing the dev-tier single-target bundle
         manifest, tier recorded. _Requirements: 1.1, 1.2_
-  - [ ] 15.2 Create flow: keygen/collect keys, write `publisher.json`, evaluate via
+  - [x] 15.2 Create flow: keygen/collect keys, write `publisher.json`, evaluate via
         extended check report, assemble `PublicationInput` (documents from staging,
         bundle from CAS), birth publication after local commit, trust pin + datastore
         init before rename, `deployment_repository` in `metadata.json`; publication
         failure → created-with-pending report. _Requirements: 1.3, 1.4, 2.1–2.4, 11.2_
-  - [ ] 15.3 Integration tests with `tokeira-build` fake bundles (no Dagger): local
+        DONE 2026-08-18 (slice D): the trust anchor is authored pre-rename
+        via the new `author_trust_anchor` (publish accepts it at
+        expected_version 0), so staging carries keys/publisher.json/anchor/
+        datastore/binding before the atomic rename and only the upload
+        follows the commit. The extended check report arrives over the
+        process boundary: `validate_staged_definition` captures the staged
+        engine's own `--json` check (identity + companions) — `tkr` never
+        recomputes identity. Claim + input assembly live in
+        `repository::assemble`, shared by every publisher. Local keys under
+        `<root>/.repository-keys/<name>/` (outside the dir, so
+        publisher.json paths survive the rename).
+  - [x] 15.3 Integration tests with `tokeira-build` fake bundles (no Dagger): local
         create → local repository; publication content asserted. _Requirements: 2.2_
+        DONE 2026-08-18 (slice D): `tokeira-build`'s mock-Dagger testkit
+        promoted behind a `testing` feature; the test drives the real
+        obtain pipeline → marry → provision → rename → birth publication →
+        verified open, asserting claim fields and byte-identity for every
+        published file.
 
-- [ ] 16. `tkp` lifecycle publications
-  - [ ] 16.1 Post-commit hook in apply/upgrade/revert (after `config_history`
+- [x] 16. `tkp` lifecycle publications
+  - [x] 16.1 Post-commit hook in apply/upgrade/revert (after `config_history`
         snapshot, when `publisher.json` exists): assemble input from the committed
         dir, `publish_transition`; failure reports pending + remedy.
         _Requirements: 4.1–4.5, 12.1, 12.2_
-  - [ ] 16.2 Integration: apply/revert sequences against a local repository —
+  - [x] 16.2 Integration: apply/revert sequences against a local repository —
         transitions and `config_revision` asserted in claims; revert content equals
         reverted-to publication. _Requirements: 4.3_
+        DONE 2026-08-18 (slice D): the hook derives identity + companions
+        from the engine's own evaluation, reads the current version from
+        the repository itself (never mutable local state), and is
+        infallible by contract — every failure is the pending report. The
+        integration test drives init → birth → apply → apply → revert over
+        the stub engine: versions 1→4, final claim `revert`/revision 3,
+        published root equals the reverted-to document.
 
-- [ ] 17. `tkr` repository verbs
-  - [ ] 17.1 `fetch` (materialize via plan inside atomic staging, tkp placement +
+- [x] 17. `tkr` repository verbs
+  - [x] 17.1 `fetch` (materialize via plan inside atomic staging, tkp placement +
         sidecar, trust pin, datastore, metadata binding; refusal before any byte).
         _Requirements: 5.1–5.5_
-  - [ ] 17.2 `list`, `publish` (repair), `refresh`, `inspect` — reports, `--json`,
+  - [x] 17.2 `list`, `publish` (repair), `refresh`, `inspect` — reports, `--json`,
         typed refusals, §4 confirmation on writes. _Requirements: 9.3, 11.1–11.4_
-  - [ ] 17.3 Integration: create → fetch onto a second deployment-dir root →
+        DONE 2026-08-18 (slice D): `refresh` gained its library operation —
+        timestamp.json is the only rewritten object; a snapshot whose
+        expiry falls inside the new freshness window is re-signed as a NEW
+        versioned create-only object over the same targets (the
+        publication-conflict repair contract absorbs the later version
+        collision). Fetch re-pins the caller's own anchor bytes when no
+        root walk happened, keeping binding digests stable across seats.
+  - [x] 17.3 Integration: create → fetch onto a second deployment-dir root →
         byte-identical published files; post-fetch `tkp describe` admission green.
         _Requirements: 2.2, 5.5, 12.4_
+        DONE 2026-08-18 (slice D): byte-identity holds for every
+        materialized file, the manifest sidecar included — publish carries
+        it verbatim, `retrieval_ref` constant (Ian's ruling; Req 2.5
+        amended same day). Describe admission runs against a fetched
+        dev-engine deployment in the generated-provisioner integration
+        test.
 
-- [ ] 18. Retire the spike and close out
-  - [ ] 18.1 Remove `spikes/tuf-platform-definition` + the workspace exclude entry;
+- [x] 18. Retire the spike and close out
+  - [x] 18.1 Remove `spikes/tuf-platform-definition` + the workspace exclude entry;
         disposition map in the PR (golden vectors → task 5.2 tests; transport/testkit
         → tasks 10; README findings → crate docs). _Requirements: 10.1_
-  - [ ] 18.2 Docs: `docs/agents/engineering-reference.md` package boundaries,
+  - [x] 18.2 Docs: `docs/agents/engineering-reference.md` package boundaries,
         AGENTS.md workspace map line (provisioner{,-cli} → deployment/tkp;
         tkd/tkdp → platform-definition), crate-level docs. Shared-file edits are
         named here deliberately (§10.3). _Requirements: intro (crates)_
-  - [ ] 18.3 Final checkpoint: full §10.4 bar; lychee-clean docs.
+        DONE 2026-08-18 (slice D): engineering-reference gains the
+        repository boundary contract (derived projection, envelope/rename
+        authority, one assembly implementation); the AGENTS.md workspace
+        map already carried the slice-A renames — verified current, no
+        edit needed.
+  - [x] 18.3 Final checkpoint: full §10.4 bar; lychee-clean docs.
+        DONE 2026-08-18 (slice D): bar green on the workspace devbox —
+        fmt, lint, check, nextest 2887/2887, doctests, doc -D warnings
+        (6m50s); doc-links (lychee) gate runs in CI on the PR. Includes
+        the same-day retrieval_ref ruling: manifest published verbatim,
+        Req 2.5/P8 amended, byte-identity across create and fetch now
+        exceptionless.
 
 ## Task Dependency Graph
 

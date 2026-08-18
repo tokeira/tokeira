@@ -100,6 +100,7 @@ fn load_bundle_view(deployment_dir: &Path) -> Option<BundleView> {
             request_id: bundle.build.request_id,
             tests_passed: bundle.tests.passed,
             test_command: bundle.tests.command,
+            hermetic: bundle.identity.build_container.is_some(),
         }),
         Err(e) => {
             eprintln!("warning: bundle sidecar unreadable ({e}) — omitting build provenance");
@@ -198,6 +199,10 @@ struct BundleView {
     request_id: String,
     tests_passed: bool,
     test_command: String,
+    /// Whether the engine was built in a pinned container. A non-hermetic
+    /// engine is the dev loop: its build runs no tests, and the tests line
+    /// states the tier instead of pass/fail.
+    hermetic: bool,
 }
 
 #[derive(Serialize)]
@@ -471,11 +476,17 @@ impl DescribeReport {
             println!("  snapshot commit   {}", b.snapshot_commit_oid);
             println!("  toolchain         {}", b.build_toolchain);
             println!("  builder           {}", b.builder);
-            println!(
-                "  tests             {} ({})\n",
-                if b.tests_passed { "passed" } else { "FAILED" },
-                b.test_command
-            );
+            // A dev engine's build runs no tests — the line states the
+            // tier, never a pass/fail that did not happen.
+            if b.hermetic {
+                println!(
+                    "  tests             {} ({})\n",
+                    if b.tests_passed { "passed" } else { "FAILED" },
+                    b.test_command
+                );
+            } else {
+                println!("  tests             {}\n", b.test_command);
+            }
         }
 
         println!("State heads");

@@ -15,8 +15,12 @@ mod toolchain;
 
 pub mod pipelines;
 
-#[cfg(test)]
-pub(crate) mod testing;
+/// Offline fakes (mock Dagger engine, deterministic artifact bytes) for
+/// in-crate unit tests and, behind the `testing` feature, downstream
+/// integration tests that exercise the real pipelines without a Dagger
+/// engine.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use arch::Arch;
 pub use closure::{

@@ -190,9 +190,11 @@ pub fn resolve_source_closure_for_packages(
                 .manifest_path
                 .parent()
                 .expect("a manifest path always has a parent directory");
-            let relative = dir
-                .strip_prefix(workspace_root.to_string_lossy().as_ref())
-                .unwrap_or(dir);
+            // `AsRef::<str>` spelled out: `typed_path` (via `tough`) adds a
+            // blanket `AsRef<Utf8Path<_>> for Cow<'_, str>` that makes a bare
+            // `as_ref()` ambiguous.
+            let root_prefix: &str = &workspace_root.to_string_lossy();
+            let relative = dir.strip_prefix(root_prefix).unwrap_or(dir);
             crate_dirs.push(PathBuf::from(relative.as_str().trim_start_matches('/')));
             crate_names.push(package.name.as_str().to_owned());
         } else {

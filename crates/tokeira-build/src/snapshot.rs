@@ -169,7 +169,11 @@ pub fn snapshot_source_closure(request: &SnapshotRequest) -> Result<SourceSnapsh
         .map_err(|e| SnapshotError::WriteObject(e.to_string()))?;
     let mut file_count = 0usize;
     for path in &to_freeze {
-        let absolute = workdir.join(path.to_str_lossy().as_ref());
+        // `&str` spelled out: `typed_path` (via `tough`) adds a blanket
+        // `AsRef<Utf8Path<_>> for Cow<'_, str>` that makes a bare `as_ref()`
+        // ambiguous.
+        let relative: &str = &path.to_str_lossy();
+        let absolute = workdir.join(relative);
         // Tracked-but-deleted in the worktree: the worktree is the truth the
         // build would see, so an unstaged deletion is simply absent.
         let Ok(metadata) = std::fs::symlink_metadata(&absolute) else {

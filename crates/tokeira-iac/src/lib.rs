@@ -126,6 +126,12 @@ pub struct ResourceState {
 /// (physical id, dependency) is missing from local state. Reserve
 /// [`Absent`](Self::Absent) for a provider query that positively reported the
 /// resource does not exist.
+// `Present` carries `ResourceState` by value: every caller consumes the state
+// immediately, and boxing it would ripple through every provider match. The
+// size gap only crosses clippy's threshold in `--all-targets` builds, where a
+// downstream dev-dependency's feature unification (`serde_json/preserve_order`)
+// enlarges `serde_json::Value`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum DescribeResult {
     /// The provider returned live state for the resource.

@@ -24,9 +24,31 @@ uuid = { workspace = true, features = ["serde"] }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tokeira-explain = { workspace = true }
+# The deployment repository (deployment-repository spec): TUF machinery,
+# S3 residency, KMS-holdable role keys. The mutable timestamp.json breaks
+# tokeira-state's immutable-snapshot contract, which is why the repository
+# layout lives here and not there.
+tough = { workspace = true }
+tough-kms = { workspace = true }
+aws-sdk-s3 = "1"
+aws-lc-rs = { workspace = true }
+jiff = { workspace = true }
+tokeira-platform = { workspace = true }
+async-trait = { workspace = true }
+url = { workspace = true }
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+# Publication staging: the TUF editor takes on-disk roots and target files.
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+proptest = { workspace = true }
+# Offline S3: a closure-backed HTTP client stands in for the endpoint so the
+# whole verification chain runs over the real aws-sdk-s3 request path.
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
+aws-smithy-types = "1"
+aws-credential-types = { version = "1", features = ["test-util"] }
+http = "1"
 
 [lints]
 workspace = true

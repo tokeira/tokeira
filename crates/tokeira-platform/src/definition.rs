@@ -270,11 +270,17 @@ impl ConfigurationIdentity {
     }
 
     /// Compute the identity of a multi-document definition: the root plus
-    /// every part the evaluation loaded, in first-request order. A
+    /// every companion the evaluation loaded, in first-request order. A
     /// single-document definition keeps [`Self::compute`]'s `sha256-v1`
     /// digest byte-for-byte, so recorded identities never move when this
     /// variant is introduced.
-    fn compute_set(
+    ///
+    /// Public so a verifier can recompute the identity over fetched bytes in
+    /// a claimed order and compare it with a recorded one (this is the sole
+    /// implementation — the deployment repository never mirrors it). The
+    /// byte layout is a compatibility surface: length-prefixed,
+    /// domain-separated, order-sensitive; goldens pin it in the tests.
+    pub fn compute_set(
         format: &DefinitionFormatId,
         root: &[u8],
         parts: &[(String, Arc<[u8]>)],
@@ -320,6 +326,12 @@ pub struct EvaluatedDefinition<K> {
     pub graph: VerifiedGraph<K>,
     /// Format-plus-source configuration identity.
     pub configuration_identity: ConfigurationIdentity,
+    /// The companion documents evaluation actually served, in first-request
+    /// order — exactly the set and order `configuration_identity` was
+    /// computed over (empty for a single-document definition). Surfaced so a
+    /// publisher can claim the served order without re-deriving it from
+    /// declarations or the filesystem (deployment-repository spec, Req 1/2).
+    pub served_companions: Vec<(String, Arc<[u8]>)>,
 }
 
 /// Evaluate a source against the declared provider namespaces; retain no
@@ -368,6 +380,7 @@ where
         config: output.config,
         graph: output.graph,
         configuration_identity: identity,
+        served_companions: served,
     })
 }
 
@@ -818,6 +831,115 @@ mod part_tests {
             moved.configuration_identity.digest,
             once.configuration_identity.digest
         );
+    }
+
+    // The digest layouts are a compatibility surface shared with the
+    // deployment repository's verifier; these vectors were computed
+    // independently of this implementation (python hashlib, TUF spike),
+    // so the layout cannot drift together with its own test.
+    #[test]
+    fn identity_layouts_match_independent_golden_vectors() {
+        let format = DefinitionFormatId::new("tkd").unwrap();
+        let single = ConfigurationIdentity::compute(&format, b"x");
+        assert_eq!(single.algorithm(), "sha256-v1");
+        assert_eq!(
+            single.digest,
+            "bb59fa39fd235403f766d2fe91db753b3033fc3df27b6c20146e41d62ac978a1"
+        );
+
+        let set = ConfigurationIdentity::compute_set(
+            &format,
+            b"mod a;\n",
+            &[("a".to_string(), Arc::from(&b"A"[..]))],
+        );
+        assert_eq!(set.algorithm(), "sha256-set-v1");
+        assert_eq!(
+            set.digest,
+            "be9dadaa31447ee1b988535f5add4a582710914db105ed08ebe6b314060ce8ba"
+        );
+    }
+
+    proptest::proptest! {
+        // Feature: deployment-repository, Property P2 (identity layer):
+        // for any definition set and request order, the public
+        // `compute_set` over the recorded served companions equals the
+        // identity `evaluate_definition` computed, and the recorded order
+        // is first-request order with repeats deduplicated.
+        #[test]
+        fn served_companions_recompute_to_the_evaluated_identity(
+            root in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            parts in proptest::collection::btree_map("[a-z]{1,6}", proptest::collection::vec(proptest::prelude::any::<u8>(), 0..32), 0..4),
+            order_seed in proptest::collection::vec(proptest::prelude::any::<proptest::sample::Index>(), 0..8),
+        ) {
+            let names: Vec<String> = parts.keys().cloned().collect();
+            let requests: Vec<&'static str> = order_seed
+                .iter()
+                .filter(|_| !names.is_empty())
+                .map(|index| {
+                    let name = &names[index.index(names.len())];
+                    // Test-only leak: proptest cases are few and names tiny.
+                    Box::leak(name.clone().into_boxed_str()) as &'static str
+                })
+                .collect();
+            let resolver = OwnedMapParts(
+                parts
+                    .iter()
+                    .map(|(name, bytes)| (name.clone(), Arc::from(bytes.as_slice())))
+                    .collect(),
+            );
+            let evaluated = evaluate_definition(
+                &PartRequestingFrontend {
+                    format: DefinitionFormatId::new("tkd").unwrap(),
+                    requests: requests.clone(),
+                },
+                source(&root),
+                &ctx(),
+                &namespaces(),
+                &resolver,
+            )
+            .expect("fixture evaluation cannot fail");
+
+            // First-request order, deduplicated.
+            let mut expected_order = Vec::new();
+            for name in &requests {
+                if !expected_order.contains(&name.to_string()) {
+                    expected_order.push(name.to_string());
+                }
+            }
+            let served_names: Vec<String> = evaluated
+                .served_companions
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            proptest::prop_assert_eq!(&served_names, &expected_order);
+
+            // The public recomputation is the identity's sole implementation.
+            let format = DefinitionFormatId::new("tkd").unwrap();
+            let recomputed = if evaluated.served_companions.is_empty() {
+                ConfigurationIdentity::compute(&format, &root)
+            } else {
+                ConfigurationIdentity::compute_set(&format, &root, &evaluated.served_companions)
+            };
+            proptest::prop_assert_eq!(
+                &recomputed.digest,
+                &evaluated.configuration_identity.digest
+            );
+            proptest::prop_assert_eq!(
+                recomputed.algorithm(),
+                evaluated.configuration_identity.algorithm()
+            );
+        }
+    }
+
+    struct OwnedMapParts(std::collections::BTreeMap<String, Arc<[u8]>>);
+
+    impl SourceResolver for OwnedMapParts {
+        fn resolve(&self, name: &str) -> Result<Arc<[u8]>, PartResolveError> {
+            self.0.get(name).cloned().ok_or_else(|| PartResolveError {
+                name: name.to_string(),
+                reason: "absent from the fixture".to_string(),
+            })
+        }
     }
 
     #[test]

@@ -245,6 +245,12 @@ impl<F: DefinitionFrontend> Engine<F> {
             writeback: evaluated.graph.writeback().to_vec(),
             index,
             manifests,
+            configuration_identity: evaluated.configuration_identity.clone(),
+            served_companions: evaluated
+                .served_companions
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
         })
     }
 
@@ -579,6 +585,12 @@ pub struct ExecutionState {
     pub(crate) writeback: Vec<WritebackEntry>,
     pub(crate) index: RealizedResourceIndex,
     pub(crate) manifests: BTreeMap<ResourceId, serde_json::Value>,
+    /// The evaluated definition's configuration identity — surfaced so the
+    /// check report can state what evaluation actually covered.
+    pub(crate) configuration_identity: tokeira_platform::definition::ConfigurationIdentity,
+    /// Served companion names in first-request order (empty when the
+    /// definition is a single document).
+    pub(crate) served_companions: Vec<String>,
 }
 
 impl fmt::Debug for ExecutionState {

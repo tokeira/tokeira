@@ -483,6 +483,11 @@ mod tests {
             writeback: Vec::new(),
             index: Default::default(),
             manifests: BTreeMap::new(),
+            configuration_identity: tokeira_platform::definition::ConfigurationIdentity::compute(
+                &tokeira_orchestrator::DefinitionFormatId::new("tkd").expect("format"),
+                b"probe",
+            ),
+            served_companions: Vec::new(),
         }
     }
 

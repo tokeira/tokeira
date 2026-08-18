@@ -118,10 +118,6 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: DiagnosticsAction,
     },
-    Workstation {
-        #[command(subcommand)]
-        action: WorkstationAction,
-    },
     /// Run an admin command against the tokeira-admin ECS service.
     ///
     /// Scales the admin service from 0→1, waits for RUNNING, executes the
@@ -479,118 +475,6 @@ pub(crate) enum ObservabilityAction {
     Check {
         #[arg(long, default_value = "30")]
         timeout_seconds: u64,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum WorkstationAction {
-    Up {
-        #[arg(long, default_value = "c8gd-rust")]
-        profile: String,
-        #[arg(long)]
-        workstation: Option<String>,
-        #[arg(long)]
-        cache_volume_gib: Option<u32>,
-        #[arg(long)]
-        repo_volume_gib: Option<u32>,
-        #[arg(long)]
-        root_volume_gib: Option<u32>,
-        #[arg(long)]
-        instance_type: Option<String>,
-        #[arg(long)]
-        region: Option<String>,
-        #[arg(long)]
-        subnet_id: Option<String>,
-    },
-    Stop {
-        #[arg(long)]
-        workstation: Option<String>,
-    },
-    Destroy {
-        #[arg(long)]
-        workstation: Option<String>,
-        #[arg(long)]
-        yes: bool,
-    },
-    Ssh {
-        #[arg(long)]
-        workstation: Option<String>,
-    },
-    RemoteExec {
-        #[arg(long)]
-        workstation: Option<String>,
-        #[arg(long, default_value = "/work/repo/tokeira")]
-        cwd: String,
-        #[arg(long)]
-        yes_secret_in_command: bool,
-        #[arg(trailing_var_arg = true)]
-        command: Vec<String>,
-    },
-    Status {
-        #[arg(long)]
-        workstation: Option<String>,
-    },
-    List,
-    Bootstrap {
-        #[arg(long)]
-        workstation: Option<String>,
-    },
-    Idle {
-        #[arg(long)]
-        workstation: Option<String>,
-        #[arg(long)]
-        defer: Option<humantime::Duration>,
-    },
-    GithubKey {
-        #[command(subcommand)]
-        action: GithubKeyAction,
-    },
-    /// Manage code on the workstation (clone, sync, push).
-    Code {
-        #[command(subcommand)]
-        action: CodeAction,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum CodeAction {
-    /// Clone the repo if missing, or pull latest from origin.
-    Sync {
-        #[arg(long)]
-        workstation: Option<String>,
-        /// Branch to checkout/pull. Defaults to main.
-        #[arg(long)]
-        branch: Option<String>,
-    },
-    /// Push the current branch to origin.
-    Push {
-        #[arg(long)]
-        workstation: Option<String>,
-        /// Branch to push. Defaults to the current branch.
-        #[arg(long)]
-        branch: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum GithubKeyAction {
-    Add {
-        #[arg(long)]
-        workstation: Option<String>,
-        #[arg(long)]
-        repo: Option<String>,
-        #[arg(long)]
-        read_only: bool,
-    },
-    Remove {
-        #[arg(long)]
-        workstation: Option<String>,
-        #[arg(long)]
-        repo: Option<String>,
-    },
-    List {
-        #[arg(long)]
-        workstation: Option<String>,
     },
 }
 

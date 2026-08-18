@@ -29,7 +29,6 @@ members = [
     "crates/tokeira-secrets",
     "crates/tokeira-aws",
     "crates/tokeira-autoscaler",
-    "crates/tokeira-remote-workstation",
     "crates/tokeira-orchestrator",
     "crates/tokeira-platform",
     "crates/tokeira-platform-definition",

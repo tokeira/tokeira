@@ -276,7 +276,6 @@ async fn main() -> Result<()> {
             let ctx = load_context(&deployments, selected)?;
             commands::diagnostics::run(action, ctx, cli.json).await
         }
-        Command::Workstation { action } => commands::workstation::run(action, cli.json).await,
         Command::Admin { command } => {
             let ctx = load_context(&deployments, selected)?;
             commands::admin::run(command, ctx).await

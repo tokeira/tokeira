@@ -19,19 +19,6 @@ substantial, open an issue to discuss the change before writing code.
 See [docs/development.md](docs/development.md) for prerequisites, the build and
 test loop, and the repository layout.
 
-Use `tkr workstation` when local Rust builds are the bottleneck:
-
-```bash
-tkr workstation up
-tkr workstation remote-exec cargo build --workspace
-tkr workstation stop
-```
-
-The workstation is intended for compute-heavy builds and tests. Stop it when
-finished; persistent cache and repository volumes survive `stop`, but
-instance-store build output does not. Full guide:
-[docs/remote-workstation.md](docs/remote-workstation.md).
-
 ## Quality Bar
 
 Run before any push or PR — CI enforces the same set:

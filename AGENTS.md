@@ -542,7 +542,7 @@ crates/     engine   types · proto · kernel · chasm{,-derive,-activity} · st
             deploy   state · iac · deploy-engine · config · orchestrator ·
                      platform-definition · k8s · aws · compose · build ·
                      deployment · tkp · autoscaler ·
-                     controller · remote-workstation · dagger-client
+                     controller · dagger-client
 platforms/  local · compose · ecs · eks
 tools/      tkw (fleet worktrees) · proto-sync · simulation (excluded)
 proto/      upstream/ — vendored Temporal protos (authoritative wire shape, §8)

@@ -20,7 +20,7 @@ Tokeira ships a custom infrastructure-as-code engine that manages resource lifec
 │  CasStore<T>, LocalBackend, S3StateStore<T>             │
 ├─────────────────────────────────────────────────────────┤
 │  Platform Crates                                        │
-│  tokeira-remote-workstation, platforms/compose, etc.    │
+│  platforms/compose, platforms/ecs, etc.                 │
 │  Implement Deployment trait, define Modules + Resources │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -151,64 +151,6 @@ The orchestrator composes modules into an `InfraComposition` with three sets:
 - **active_modules**: which modules are in scope for this operation (for `--module` filtering).
 
 This desired-vs-known model ensures removed modules are properly cleaned up rather than silently orphaned.
-
----
-
-## Remote Workstation Platform
-
-The remote workstation (`crates/tokeira-remote-workstation`) provisions a single Graviton4 EC2 instance with supporting AWS resources for remote Rust builds.
-
-### Deployment Implementation
-
-`WorkstationDeployment` implements the `Deployment` trait with:
-
-- **Config**: `WorkstationConfig` containing `WorkstationModuleConfig` (workstation ID, instance type, AMI, subnet, VPC, AZ, volume sizes, region).
-- **State backend**: `LocalBackend` at `~/.tokeira/workstations/<ws-id>/state/infra/`.
-- **Extensions**: Registers `AwsClients` (EC2, SSM, IAM clients) on the `ProvisionContext`.
-- **Tags**: All resources tagged with `tokeira-workstation=true`, `workstation-id=<id>`, `ManagedBy=tokeira-cli`.
-
-### Module Graph
-
-```
-identity (no deps)     → IamRole + IamInstanceProfile
-network  (no deps)     → SecurityGroup
-storage  (no deps)     → EbsVolume (cache) + EbsVolume (repo)
-compute  (identity, network, storage) → Ec2Instance
-```
-
-The CLI applies these in two phases:
-1. Foundation modules (identity + network + storage) — ensures volume IDs are in persisted state.
-2. Compute module — reads volume IDs from state to render user-data and attach volumes post-launch.
-
-### Resources
-
-| Resource | ResourceId Pattern | Provider Calls |
-|----------|-------------------|----------------|
-| IamRole | `iam-role-tokeira-workstation-<ws-id>-role` | CreateRole, AttachRolePolicy, DeleteRole |
-| IamInstanceProfile | `iam-instance-profile-tokeira-workstation-<ws-id>-profile` | CreateInstanceProfile, AddRoleToInstanceProfile, DeleteInstanceProfile |
-| SecurityGroup | `sg-tokeira-workstation-<ws-id>-sg` | CreateSecurityGroup, DeleteSecurityGroup |
-| EbsVolume (×2) | `ebs-volume-tokeira-ws-<ws-id>-{cache,repo}` | CreateVolume, DeleteVolume |
-| Ec2Instance | `ec2-instance-tokeira-ws-<ws-id>` | RunInstances, TerminateInstances, AttachVolume |
-
-### State-Based Resolution
-
-After provisioning, the engine methods (`status`, `ssh`, `remote-exec`, `github-key`) resolve the instance ID by loading `InfraState` from the local deployment directory and looking up the EC2 instance resource's `physical_id`. No EC2 tag-based discovery is used for operational commands.
-
-### Operational Flow
-
-```
-tkr workstation up
-  → InfraEngine::new(WorkstationDeployment, config, deployment_dir)
-  → engine.compose(ModuleSelection::Only(["identity", "network", "storage"]))
-  → engine.apply(...)  // creates IAM, SG, EBS
-  → engine.compose(ModuleSelection::Only(["compute"]))
-  → engine.apply(...)  // launches EC2 with user-data referencing volume IDs from state
-
-tkr workstation destroy --yes
-  → InfraEngine::new(...)
-  → engine.compose(ModuleSelection::All)
-  → engine.destroy(...)  // terminates instance, deletes volumes, SG, IAM (reverse order)
-```
 
 ---
 

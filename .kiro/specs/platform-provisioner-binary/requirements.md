@@ -41,7 +41,7 @@ rollback (reverting a deployment's recorded version + state to a retained checkp
   deployment's infrastructure. Carries a specialized lifecycle CLI; operators normally reach it through
   `tkr`, which forwards lifecycle verbs to it.
 - **Operator cockpit (`tkr`)** — the global, version-current operator CLI: deployment registry,
-  developer/CI/compatibility/workstation tasks, workspace image builds, and the launcher that resolves
+  developer/CI/compatibility tasks, workspace image builds, and the launcher that resolves
   and executes a deployment's bound provisioner. Never mutates deployment infrastructure directly.
 - **Launcher** — the `tkr` seam that, for a deployment-lifecycle action, resolves the bound provisioner,
   verifies its checksum against the integrity manifest, and executes it.
@@ -71,19 +71,16 @@ rollback (reverting a deployment's recorded version + state to a retained checkp
 - **Rollback checkpoint ([A final])** — the prior state cloned atomically at the start of `upgrade`
   (prior snapshot, provenance, full integrity manifest, config ref) so a later `rollback` can re-pin to
   it and forward-reconcile toward its **configuration revision** (the `config ref`, now load-bearing).
-  Rollback restores by re-applying that retained revision, not by inverting recorded before-images
-  (Proposal 002).
+  Rollback restores by re-applying that retained revision, not by inverting recorded before-images.
 - **Applied delta** — an optional, ids-only **audit** record (`id + op`, no before/after images) of the
-  changes an apply/upgrade committed, kept for observability and richer `plan`/diff. Under Proposal 002
-  it is **not** the rollback mechanism (rollback re-applies the retained configuration revision) and does
+  changes an apply/upgrade committed, kept for observability and richer `plan`/diff. It is **not** the rollback mechanism (rollback re-applies the retained configuration revision) and does
   not carry before-images.
 - **Binding / operation marker** — the binding names the single binary authorized to operate (`A` or `B`,
   flipped atomically, never "pending"); the separate operation marker records an in-flight
   upgrade/rollback (phase + resumable progress) and, until it closes, permits only the in-flight verb
   (re-running it resumes), `rollback`, and `describe`. There is no dedicated `resume` verb.
 - **Rollback** — the deliberate revert to [A final] by **forward reconciliation toward the retained
-  configuration revision**, never by inverting recorded before-images and never a reverse migration
-  (Proposal 002). For an engine-identity upgrade it is two operations: the superseded binary **deletes
+  configuration revision**, never by inverting recorded before-images and never a reverse migration. For an engine-identity upgrade it is two operations: the superseded binary **deletes
   what it created** (`keys(S_B) − keys(S_A)` — it alone can remove resources of kinds it introduced;
   deletion is state-driven), the binding is atomically re-pinned to the prior binary, and that binary
   observes live (`refresh_state`) and re-applies its own configuration revision to reconcile the
@@ -97,7 +94,7 @@ rollback (reverting a deployment's recorded version + state to a retained checkp
   are compositions of Deltas over different `(desired, state, binary)` triples.
 - **Authorship invariant** — no binary computes or applies a Delta over a *state representation* authored
   by a different version; a binary MAY observe shared **live** infrastructure via `describe`/`refresh_state`
-  and reconcile toward its own configuration revision (Proposal 002). Identity-key arithmetic
+  and reconcile toward its own configuration revision. Identity-key arithmetic
   (`keys(S_B) − keys(S_A)`) bounds the resources the superseded binary must delete on rollback.
 - **Engine identity** — the binding `source_tree_hash`, computed over the engine/resource-implementation
   surface only; changes only on a behavioral code change, and is the sole thing requiring `upgrade`.
@@ -208,8 +205,8 @@ migrates state forward, so that upgrades are controlled rather than implicit.
    operation marker.
 6. AS B applies its plan, THEN it MAY record an **applied delta** — an ids-only audit log (`id + op`, no
    before/after images) of the changes it commits, for observability and `plan`/diff. Rollback does not
-   consume it: rollback re-applies the retained prior **configuration revision** (Requirement 9,
-   Proposal 002), not an inverse of recorded before-images.
+   consume it: rollback re-applies the retained prior **configuration revision** (Requirement 9),
+   not an inverse of recorded before-images.
 7. WHERE the running binary, before upgrading, finds live state materially diverged from the recorded
    [A final], THE provisioner MAY refuse-and-surface the drift (an advisory baseline gate); it SHALL NOT
    authoritatively reconcile another version's drift.
@@ -276,7 +273,7 @@ stamped binary married to it, and neither surface carries the other's concerns.
    local dev build) for a `dev` deployment; **rollback** (bound B then retained A) — and execute it; a
    checksum mismatch SHALL abort before execution. `tkr` SHALL NOT itself mutate.
 3. THE `tkp` CLI SHALL be specialized to the deployment lifecycle and SHALL NOT carry the operator/global
-   surface (developer/CI tasks, compatibility, workstation, deployment registry, DSQL `schema`, or **any**
+   surface (developer/CI tasks, compatibility, deployment registry, DSQL `schema`, or **any**
    image operation `build`/`push`/`mirror`); its lifecycle verb structure SHALL align with `tkr`'s so that
    forwarding is transparent.
 4. THE operator surface `tkr` SHALL own **all** image operations — `image build` (workspace sources),
@@ -327,18 +324,18 @@ without reverse migrations.
    (c) the prior (A) binary observes live infrastructure (`refresh_state`) and **runs its ordinary apply
    of the retained prior configuration revision**, reconciling B's remaining updates and re-creations
    from A's own config. Neither binary SHALL reverse a change it did not make nor reinterpret the other
-   binary's recorded state representation (Proposal 002).
+   binary's recorded state representation.
 3. WHEN `tkr deployment rollback` runs, THEN it SHALL verify the checksum of **both** binaries it will
    execute against their integrity manifests before executing either, AND it SHALL refuse if no checkpoint
    exists, either binary is unavailable or checksum-mismatched, or the retained prior **configuration
-   revision** is missing or does not compile under the prior (A) binary (Proposal 002).
+   revision** is missing or does not compile under the prior (A) binary.
 4. THE rollback SHALL NOT run a reverse migration; migrations remain forward-only, and rollback restores
    the retained pre-upgrade checkpoint instead.
 5. WHEN rollback reverts to the checkpoint, THEN it SHALL surface that state recorded after the upgrade is
    not represented, AND that resources recorded in no snapshot (created out-of-band) are not reconciled.
 6. THE upgrade SHALL retain the prior **configuration revision** (Requirement 9.1's config ref) as the
    authoritative before-state for rollback; rollback reconciles forward toward that revision rather than
-   inverting a recorded delta, so recorded before-images are NOT required (Proposal 002).
+   inverting a recorded delta, so recorded before-images are NOT required.
 7. WHEN rollback performs destructive work, THEN preconditions SHALL be exhaustively checked first, the
    whole B-undo → re-pin → A-reconcile sequence SHALL hold the remote operation lock (Requirement 11), and
    progress SHALL be recorded in a durable marker so an interrupted rollback is resumable.
@@ -424,11 +421,12 @@ identity names precisely what it provisions, and "what produced this deployment"
    single multi-platform provisioner (the once-bundled `apps/tkp` is retired).
 2. THE platform-agnostic provisioner surface — lifecycle verbs, binding gate, operation lock, state
    envelope, `describe`, config-revision machinery — SHALL live in a shared library
-   (`tokeira-provisioner-cli`), and **the platform SHALL ship its own provisioner**: the per-platform
-   binary is a bin target of the platform crate (`platforms/compose-syn` → `tkp-compose`,
-   `platforms/local` → `tkp-local`) that injects its realization through the `ProvisionerPlatform` seam
-   (`infra_plan|apply|destroy`, `deploy_plan|apply`, `scale`) and links **only** that platform's crates —
-   no dedicated `apps/tkp-<platform>` crates.
+   (`tokeira-tkp`), and the per-deployment binary SHALL be a **generated composition root**
+   (`tokeira-bound-provisioner`, bin `tkp`) declaring exactly the shell, one selected platform library,
+   and one selected Definition Frontend library, bound explicitly in generated source
+   (`bound_provisioner_main!`) — no per-platform bin targets and no dedicated `apps/tkp-<platform>`
+   crates. Selection SHALL come only from trusted workspace descriptors resolved through cargo metadata;
+   a descriptor SHALL NOT be able to inject Rust paths or arbitrary dependencies.
 3. A deployment's recorded provenance SHALL be exactly three parts: **(a) engine identity** (the IaC engine
    + resource providers, as a source closure), **(b) platform** (kind library + builder vocabulary +
    interpreter), **(c) deployment definition** (the `.tkd`, digested). (a)+(b) are compiled into `tkp` and
@@ -444,7 +442,7 @@ identity names precisely what it provisions, and "what produced this deployment"
 **User Story:** As an operator, I want a deployment's `tkp` produced by one reproducible build that runs
 identically on my machine or in trusted CI, keyed by engine identity so equivalent deployments reuse one
 verified artifact, so that "create a deployment" *requests a provisioner bundle* — reuse, download, or
-build — rather than compiling a unique binary each time. (Rationale: [Proposal 005](./proposals/005-provisioner-bundles-and-binding.md).)
+build — rather than compiling a unique binary each time.
 
 #### Acceptance Criteria
 

@@ -1,4 +1,4 @@
-//! Resolve-or-build (task 18.3; Proposal 005 §Creation flow, Phase 2).
+//! Resolve-or-build.
 //!
 //! The canonical obtain step of `tkr deployment create`:
 //!
@@ -148,6 +148,7 @@ mod tests {
                 PathBuf::from("Cargo.lock"),
             ],
             include_untracked: false,
+            content_overrides: std::collections::BTreeMap::new(),
         })
         .expect("snapshot");
         ProvisionerBuildRequest {

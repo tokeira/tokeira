@@ -28,8 +28,9 @@ pub use closure::{
     resolve_source_closure_for_packages,
 };
 pub use composition::{
-    BoundProvisionerSource, CompositionError, GENERATED_PROVISIONER_BIN,
-    GENERATED_ROOT_RELATIVE_PATH, TKP_PACKAGE, assemble_bound_provisioner,
+    BoundProvisionerSource, CompositionError, GENERATED_PROVISIONER_BIN, GENERATED_ROOT_PACKAGE,
+    GENERATED_ROOT_RELATIVE_PATH, SCOPED_WORKSPACE_RELATIVE_PATH, TKP_PACKAGE,
+    assemble_bound_provisioner,
 };
 pub use dagger::{ContainerRef, DaggerClient, DirectoryRef, FileRef, SecretRef};
 pub use dagger_default::DefaultDaggerClient;

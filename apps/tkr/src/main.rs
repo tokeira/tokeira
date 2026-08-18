@@ -1691,6 +1691,7 @@ mod tests {
                 PathBuf::from("Cargo.lock"),
             ],
             include_untracked: false,
+            content_overrides: std::collections::BTreeMap::new(),
         })
         .expect("snapshot");
         tokeira_build::ProvisionerBuildRequest {

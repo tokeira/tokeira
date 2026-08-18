@@ -99,7 +99,7 @@ pub trait DirectoryRef<'client>: Send + Sync {
 pub trait FileRef<'client>: Send + Sync {
     /// Export this file's bytes to `host_path`.
     ///
-    /// The provisioner pipeline (task 18.1) hashes and measures artifacts
+    /// The provisioner pipeline hashes and measures artifacts
     /// **after** export — the integrity manifest must attest the bytes that
     /// actually left the engine, so checksumming never happens inside the
     /// container.

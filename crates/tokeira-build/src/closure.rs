@@ -1,4 +1,4 @@
-//! Provisioner source-closure resolution (task 17.1's "the closure").
+//! Provisioner source-closure resolution.
 //!
 //! The closure is the union of workspace crates reachable from one or more
 //! provisioner roots, resolved from `cargo metadata` so it cannot rot as
@@ -15,9 +15,9 @@
 //! via the unit graph is a later refinement.
 //!
 //! The same walk yields the **locked third-party set** reachable from the
-//! seed — the `lock_closure` digest input of `EngineIdentity` (task 16.1):
-//! name, version, source, and the `Cargo.lock` checksum, canonically
-//! serialized by [`ProvisionerClosure::canonical_lock_bytes`].
+//! seed — the `lock_closure` digest input of `EngineIdentity`: name, version,
+//! source, and the `Cargo.lock` checksum, canonically serialized by
+//! [`ProvisionerClosure::canonical_lock_bytes`].
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -43,7 +43,7 @@ pub struct ProvisionerClosure {
     /// snapshot's closure paths.
     pub crate_dirs: Vec<PathBuf>,
     /// Package names of the reachable workspace members, sorted — the `-p`
-    /// set a hermetic build tests (task 18.1).
+    /// set a hermetic build tests.
     pub crate_names: Vec<String>,
     /// Workspace-relative build-shaping files that exist in this workspace.
     pub workspace_files: Vec<PathBuf>,
@@ -100,7 +100,7 @@ impl ProvisionerClosure {
     }
 
     /// Canonical serialization of the locked set — the `lock_closure` digest
-    /// input (task 16.1): one `name<SP>version<SP>source<SP>checksum` line per
+    /// input: one `name<SP>version<SP>source<SP>checksum` line per
     /// dependency, sorted, `-` for an absent field. Deterministic for a given
     /// resolved set.
     pub fn canonical_lock_bytes(&self) -> Vec<u8> {

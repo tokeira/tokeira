@@ -161,11 +161,8 @@ Vulnerability reporting and the full posture: [SECURITY.md](SECURITY.md).
 ## Development
 
 Standard cargo workflows on a pinned stable toolchain;
-`cargo test --workspace` needs no AWS credentials and no Docker. When a laptop
-build is too slow, `tkr workstation` provisions a Graviton4 build box with
-cold workspace builds under two minutes. Guides:
-[docs/development.md](docs/development.md) ·
-[docs/remote-workstation.md](docs/remote-workstation.md).
+`cargo test --workspace` needs no AWS credentials and no Docker. Guide:
+[docs/development.md](docs/development.md).
 
 ## Working with Agents
 

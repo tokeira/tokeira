@@ -30,8 +30,7 @@ cargo doc --workspace --no-deps      # API docs
 ```
 
 A cold workspace build takes 10–20 minutes on a laptop; incremental builds are
-typically 10–30 seconds. If cold-build time is blocking your iteration loop,
-use the [remote workstation](remote-workstation.md).
+typically 10–30 seconds.
 
 ### Fast inner loop
 
@@ -63,9 +62,9 @@ crates/       engine   types · proto · kernel · chasm{,-derive,-activity} ·
                        storage · runtime · projection · edge · observability · auth
               compat   build-info · compatibility{,-proto,-service} ·
                        conformance{,-proto,-control}
-              deploy   state · iac · deploy-engine · config · orchestrator · tkd ·
-                       k8s · aws · compose · build · provisioner{,-cli} ·
-                       autoscaler · controller · remote-workstation · dagger-client
+              deploy   state · iac · deploy-engine · config · orchestrator ·
+                       platform-definition · k8s · aws · compose · build ·
+                       deployment · tkp · autoscaler · controller · dagger-client
 platforms/    local · compose · ecs · eks
 tools/        tkw (fleet worktrees) · proto-sync · simulation
 proto/        upstream/ — vendored Temporal protos (the authoritative wire shape)
@@ -80,7 +79,5 @@ The engine's seven core crates are documented in [docs/crates/](crates/README.md
 
 ## See also
 
-- [Remote workstation](remote-workstation.md) — fast Rust builds on a
-  provisioned Graviton4 instance
 - [CONTRIBUTING.md](../CONTRIBUTING.md) — quality bar and PR process
 - [AGENTS.md](../AGENTS.md) — the engineering contract, for humans and agents

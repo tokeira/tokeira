@@ -4421,12 +4421,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaec953f16e5bcf6b8a3cb3aa959b17e5577dbd2693e94554c462c08be22624b"
 
 [[package]]
-name = "humantime"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
-
-[[package]]
 name = "hybrid-array"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8532,11 +8526,9 @@ dependencies = [
  "clap",
  "console",
  "directories",
- "humantime",
  "indicatif",
  "libc",
  "proptest",
- "regex",
  "serde",
  "serde_json",
  "sqlx",
@@ -8554,7 +8546,6 @@ dependencies = [
  "tokeira-local-deployment",
  "tokeira-orchestrator",
  "tokeira-platform",
- "tokeira-remote-workstation",
  "tokeira-state",
  "tokeira-storage",
  "tokeira-types",
@@ -9355,37 +9346,6 @@ dependencies = [
  "tonic-build 0.11.0",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "tokeira-remote-workstation"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-config",
- "aws-sdk-ec2",
- "aws-sdk-iam",
- "aws-sdk-ssm",
- "base64 0.22.1",
- "chrono",
- "dirs",
- "hex",
- "proptest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "shlex",
- "thiserror 2.0.18",
- "tokeira-aws",
- "tokeira-deploy-engine",
- "tokeira-iac",
- "tokeira-orchestrator",
- "tokeira-state",
- "tokio",
- "tracing",
- "uuid",
- "which",
 ]
 
 [[package]]

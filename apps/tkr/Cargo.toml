@@ -23,8 +23,6 @@ console = "0.15"
 directories = "6"
 indicatif = "0.17"
 libc.workspace = true
-humantime = "2"
-regex = "1"
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
@@ -35,7 +33,6 @@ tokeira-config.workspace = true
 tokeira-aws.workspace = true
 tokeira-build-info.workspace = true
 tokeira-compatibility.workspace = true
-tokeira-remote-workstation = { path = "../../crates/tokeira-remote-workstation" }
 tokeira-build.workspace = true
 tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
 tokeira-iac = { path = "../../crates/tokeira-iac" }

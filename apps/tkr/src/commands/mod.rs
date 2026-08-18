@@ -28,7 +28,6 @@ pub(crate) mod port_forward;
 pub(crate) mod scale;
 pub(crate) mod schema;
 pub(crate) mod version;
-pub(crate) mod workstation;
 
 use anyhow::{Result, bail};
 use tokeira_ecs_deployment::{EcsConfig, EcsDeployment};

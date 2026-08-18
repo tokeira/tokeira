@@ -153,7 +153,7 @@ persist a standalone explanation model for plan/apply where supported.
 
 The concise tree below emphasizes deployment operation. `tkr --help` and each
 subcommand's help are authoritative for flags and additional developer, CI,
-compatibility, diagnostics, workstation, image, and observability commands.
+compatibility, diagnostics, image, and observability commands.
 
 ```text
 tkr [--deployment NAME] [--json] [--detail]

@@ -43,7 +43,7 @@ jobs:
           persist-credentials: false # CI is read-only; don't leave the token in .git/config
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # snapshot 2026-03-27
         with:
-          toolchain: "1.96"
+          toolchain: "1.97.1"
           components: rustfmt, clippy
       - run: rustup toolchain install "$NIGHTLY_FMT_TOOLCHAIN" --profile minimal --component rustfmt
       # prost-build compiles the vendored Temporal protos and sources `protoc`
@@ -84,7 +84,7 @@ jobs:
       - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # snapshot 2026-03-27
         with:
-          toolchain: "1.96"
+          toolchain: "1.97.1"
       # prost-build compiles the vendored Temporal protos and sources `protoc`
       # from PATH; the runner image does not ship it.
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

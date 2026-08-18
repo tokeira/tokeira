@@ -68,7 +68,7 @@ Per-crate boundary contracts (state stores, provider-agnosticism, config ownersh
 
 ### §1. Rust standards
 
-- Edition 2024; stable toolchain pinned to 1.96 (`rust-toolchain.toml`). Formatting uses
+- Edition 2024; stable toolchain pinned to 1.97.1 (`rust-toolchain.toml`). Formatting uses
   nightly-only options: run `cargo +nightly fmt --all` — don't check first. (CI pins a
   dated nightly for fmt — advance together.)
 - **The lint wall is compiler-enforced** in `[workspace.lints]` — prose rules drift;

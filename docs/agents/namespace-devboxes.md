@@ -73,7 +73,7 @@ sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     protobuf-compiler cmake clang pkg-config git
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --quiet --default-toolchain 1.96 \
+    sh -s -- -y --quiet --default-toolchain 1.97.1 \
     --component rustfmt --component clippy
 . /usr/local/cargo/env
 rustup toolchain install nightly-2026-06-16 --component rustfmt --profile minimal

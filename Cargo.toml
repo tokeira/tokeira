@@ -180,6 +180,15 @@ tokeira-conformance-control = { path = "crates/tokeira-conformance-control" }
 tokeira-auth = { path = "crates/tokeira-auth" }
 dagger-client = { path = "crates/dagger-client" }
 tokeira-build = { path = "crates/tokeira-build" }
+# Deployment-repository machinery (spec-sanctioned dependency additions):
+# TUF client/authoring, KMS-held role keys, and the timestamp types tough's
+# editor takes. aws-lc-rs is tough's own crypto backend, used only for
+# Ed25519 keygen so key material never ships in the tree.
+tough = "0.24"
+tough-kms = "0.16"
+aws-sdk-kms = "1"
+aws-lc-rs = "1"
+jiff = { version = "0.2", features = ["serde"] }
 
 # Mechanized AGENTS.md rules (§1, §9): prose rules drift under a fluid codebase;
 # compiler-enforced ones survive refactors. Everything here is binding. The one

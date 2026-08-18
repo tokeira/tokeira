@@ -103,85 +103,104 @@ no slice mixes restructuring noise with feature diffs.
 
 ## C. Repository machinery (`tokeira-deployment`, offline-tested)
 
-- [ ] 7. Dependencies and skeleton
-  - [ ] 7.1 Add `tough`, `tough-kms`, `aws-sdk-kms`, `aws-lc-rs`, `jiff` (workspace
+- [x] 7. Dependencies and skeleton
+  - [x] 7.1 Add `tough`, `tough-kms`, `aws-sdk-kms`, `aws-lc-rs`, `jiff` (workspace
         deps; sanctioned by this spec); create the new modules
         (`locator`, `config`, `keys`, `claim`, `publish`, `writer`, `transport`,
         `open`, `fetch`, `list`, `error`) with docs. _Requirements: intro (crates)_
+        DONE 2026-08-18 (slice C): all five workspace deps added; the lock
+        movement bumped the aws-smithy stack, and the test-util dev-dep's
+        feature unification (`serde_json/preserve_order`) grows
+        `serde_json::Value` in `--all-targets` builds — accommodated with a
+        commented `allow(large_enum_variant)` on `tokeira-iac`'s
+        `DescribeResult` rather than a Box API break.
 
-- [ ] 8. Locator, config, keys
-  - [ ] 8.1 `RepositoryLocator`, `RepositoryConfig`, `RoleKeyConfig`,
+- [x] 8. Locator, config, keys
+  - [x] 8.1 `RepositoryLocator`, `RepositoryConfig`, `RoleKeyConfig`,
         `KeySourceConfig` (`deny_unknown_fields` throughout); key-source construction
         (local Ed25519 files via `SharedKeySource`; KMS RSA with the constraint named
         in errors); local keygen under the deployments root.
         _Requirements: 8.1, 8.2, 8.4, 8.5_
-  - [ ] 8.2 Unit tests: serde round-trips, unknown-field rejection, KMS construction
+  - [x] 8.2 Unit tests: serde round-trips, unknown-field rejection, KMS construction
         (not called), key generation + reload. _Requirements: 8.1–8.5_
 
-- [ ] 9. Claim
-  - [ ] 9.1 `DeploymentClaim` + sections + `Transition`; custom-metadata keys; serde
+- [x] 9. Claim
+  - [x] 9.1 `DeploymentClaim` + sections + `Transition`; custom-metadata keys; serde
         shape tests including `build_authority` surfacing. _Requirements: claim table,
         1.2 (recorded tier)_
 
-- [ ] 10. Transport + testkit
-  - [ ] 10.1 `S3Transport` (productionized from the spike); `testkit` module with the
+- [x] 10. Transport + testkit
+  - [x] 10.1 `S3Transport` (productionized from the spike); `testkit` module with the
         in-memory S3 endpoint (closure-backed HTTP client) promoted from the spike.
         _Requirements: 6.1, 6.3_
-  - [ ] 10.2 PBT: absence signal — for any absent key, `FileNotFound`; for any other
+  - [x] 10.2 PBT: absence signal — for any absent key, `FileNotFound`; for any other
         injected failure, never `FileNotFound`; non-s3 schemes refused.
         // Feature: deployment-repository, Property P5 _Requirements: 6.2_
 
-- [ ] 11. Writer
-  - [ ] 11.1 `RepositoryWriter` + local (create_new/rename) and S3 (`If-None-Match:*`)
+- [x] 11. Writer
+  - [x] 11.1 `RepositoryWriter` + local (create_new/rename) and S3 (`If-None-Match:*`)
         implementations; streaming `WriteSource`; byte-verify on collision.
         _Requirements: 6.4, 3.3_
-  - [ ] 11.2 PBT: create-only immutability — shared content `AlreadyPresent`; any
+        DONE 2026-08-18 (slice C): the S3 home reads one object into memory
+        per write (the collision path needs the bytes for verification
+        anyway) — a publication's memory bound is one artifact at a time,
+        never the whole bundle.
+  - [x] 11.2 PBT: create-only immutability — shared content `AlreadyPresent`; any
         differing same-key write refused naming the key; mutable heads unaffected.
         // Feature: deployment-repository, Property P4 _Requirements: 3.3, 3.6_
 
-- [ ] 12. Publish
-  - [ ] 12.1 Root authoring (v1 + rotation); `PublicationInput`; `publish_transition`
+- [x] 12. Publish
+  - [x] 12.1 Root authoring (v1 + rotation); `PublicationInput`; `publish_transition`
         with `expected_version`; `retrieval_ref` stamping; mutable heads written last.
         _Requirements: 2.1, 2.5, 3.1, 3.2, 3.4, 3.5, 7 (authoring), 8.3_
-  - [ ] 12.2 PBT: monotonic lineage — versions advance by 1 across generated
+  - [x] 12.2 PBT: monotonic lineage — versions advance by 1 across generated
         transition sequences; revert publishes new-version-old-content; stale
         `expected_version` refused. // Feature: deployment-repository, Property P3
         _Requirements: 3.2, 4.1, 4.3_
-  - [ ] 12.3 PBT: home equivalence — identical inventories/claims/digests across
+  - [x] 12.3 PBT: home equivalence — identical inventories/claims/digests across
         local and in-memory-S3 homes. // Feature: deployment-repository, Property P11
         _Requirements: 1.6, 4.5_
+        DONE 2026-08-18 (slice C): the testkit endpoint additionally answers
+        ListObjectsV2 (common prefixes) so home equivalence covers listing.
 
-- [ ] 13. Open + verify
-  - [ ] 13.1 `open()` (trust anchor, datastore, expiration enforcement, root walk +
+- [x] 13. Open + verify
+  - [x] 13.1 `open()` (trust anchor, datastore, expiration enforcement, root walk +
         re-pin); `verified_publication()` (exactly-one-claim, claim/target agreement,
         identity recomputation via `tokeira-platform`, engine manifest cross-check);
         typed `Refusal` set per the error table. _Requirements: 5.1, 7.1–7.4, 9.1,
         9.2, 10.1, 10.2, 11.4_
-  - [ ] 13.2 PBT: tamper refusal — any single-byte mutation of any object refuses.
+  - [x] 13.2 PBT: tamper refusal — any single-byte mutation of any object refuses.
         // Feature: deployment-repository, Property P6 _Requirements: 5.4, 10.2_
-  - [ ] 13.3 PBT: identity agreement — permuted companion order / mutated bytes /
+  - [x] 13.3 PBT: identity agreement — permuted companion order / mutated bytes /
         renamed companions refuse with the specific refusal.
         // Feature: deployment-repository, Property P2 _Requirements: 10.2_
-  - [ ] 13.4 PBT: freshness + rollback — expired refuses under Safe, loads under the
+  - [x] 13.4 PBT: freshness + rollback — expired refuses under Safe, loads under the
         break-glass; datastore-known newer version refuses older.
         // Feature: deployment-repository, Property P7 _Requirements: 9.1, 9.2_
-  - [ ] 13.5 PBT: engine agreement — descriptor sha vs TUF hash divergence refuses;
+  - [x] 13.5 PBT: engine agreement — descriptor sha vs TUF hash divergence refuses;
         `retrieval_ref` must name the target. // Feature: deployment-repository,
         Property P8 _Requirements: 2.5_
-  - [ ] 13.6 PBT: rotation — online-key rotation via root N+1 verifies from anchor N
+  - [x] 13.6 PBT: rotation — online-key rotation via root N+1 verifies from anchor N
         and re-pins. // Feature: deployment-repository, Property P9
         _Requirements: 7.2, 7.3_
 
-- [ ] 14. Fetch planning + listing
-  - [ ] 14.1 `MaterializePlan` (placements + host-target engine selection with
+- [x] 14. Fetch planning + listing
+  - [x] 14.1 `MaterializePlan` (placements + host-target engine selection with
         refusal); `list_deployments` for both scopes. _Requirements: 5.2, 11.1_
-  - [ ] 14.2 PBT: round-trip — publish then plan materializes every published file
+  - [x] 14.2 PBT: round-trip — publish then plan materializes every published file
         byte-identically, host artifact selected. // Feature: deployment-repository,
         Property P1 _Requirements: 2.2, 5.2_
-  - [ ] 14.3 PBT: commit authority — injected publication failure leaves committed
+  - [x] 14.3 PBT: commit authority — injected publication failure leaves committed
         input re-publishable to identical content. // Feature: deployment-repository,
         Property P10 _Requirements: 2.4, 4.2_
-  - [ ] 14.4 Checkpoint: `tokeira-deployment` suite green offline (no AWS, no Dagger).
+        DONE 2026-08-18 (slice C): P10 sharpened the repair contract — a torn
+        version's metadata is immutable, so a re-publish at the stale
+        expected version refuses with a conflict NAMING the torn version;
+        retrying with that version as `expected_version` completes the
+        publication at the next version with all content deduping
+        `AlreadyPresent`. The `publication_conflict` remedy text states
+        exactly this.
+  - [x] 14.4 Checkpoint: `tokeira-deployment` suite green offline (no AWS, no Dagger).
 
 ## D. Wiring
 

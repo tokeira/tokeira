@@ -28,6 +28,14 @@ ignore = [
     "RUSTSEC-2026-0098", # rustls-webpki: name constraints for URI names
     "RUSTSEC-2026-0099", # rustls-webpki: name constraints for wildcard certs
     "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+    # h2 0.3.27 is the final release of the EOL 0.3 line (the fix ships only in
+    # 0.4.16+, which the workspace's hyper-1/tonic stack is on). The 0.3 copy
+    # rides the same aws-smithy hyper-0.14 stack as the rustls-webpki ignores
+    # above. The flaw queues peer-sent empty DATA frames without limit — this
+    # stack acts only as an HTTPS client to AWS service endpoints, so the peer
+    # is AWS itself; Tokeira's server surfaces run h2 0.4.16. Same revisit
+    # trigger: the upstream AWS SDK legacy-stack retirement.
+    "RUSTSEC-2026-0258", # h2 0.3: unbounded empty DATA frames (client-only legacy stack)
 ]
 
 [licenses]
@@ -47,9 +55,12 @@ allow = [
 confidence-threshold = 0.9
 # Per-crate license exceptions, each justified, go here as the tree requires them.
 exceptions = [
-    # webpki-roots bundles Mozilla's CA certificate set under the data-only
-    # CDLA-Permissive-2.0 license; the crate's own code is permissive.
+    # webpki-roots and webpki-root-certs bundle Mozilla's CA certificate set
+    # under the data-only CDLA-Permissive-2.0 license; both crates' own code is
+    # permissive. (webpki-root-certs arrives via tough → reqwest →
+    # rustls-platform-verifier.)
     { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+    { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
     # monty's unicode_names2 embeds the Unicode character-name tables under
     # the data-files license predecessor of the already-allowed Unicode-3.0
     # (OSI approved); the crate's own code is MIT OR Apache-2.0.

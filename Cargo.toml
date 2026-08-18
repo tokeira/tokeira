@@ -65,7 +65,7 @@ exclude = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 license = "Apache-2.0"
 authors = ["OpenAI"]
 

@@ -77,6 +77,9 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     --component rustfmt --component clippy
 . /usr/local/cargo/env
 rustup toolchain install nightly-2026-06-16 --component rustfmt --profile minimal
+# The §10.4 bar's test step runs under nextest (root §10.4); prebuilt binary,
+# not `cargo install`, so provisioning stays minutes not tens of minutes.
+curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin
 EOF
 ```
 

@@ -289,6 +289,7 @@ proptest! {
                 &DefinitionFormatId::new("tkd").expect("format"),
                 b"probe",
             ),
+            served_companions: Vec::new(),
         };
 
         let verified = verify_definition(&definition);
@@ -339,6 +340,7 @@ fn invalid_resource_never_reaches_an_engine() {
             &DefinitionFormatId::new("tkd").expect("format"),
             b"invalid-probe",
         ),
+        served_companions: Vec::new(),
     };
 
     let verified = verify_definition(&definition);

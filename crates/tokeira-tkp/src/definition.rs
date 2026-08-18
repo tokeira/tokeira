@@ -30,6 +30,15 @@ struct CheckReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     revision: Option<u64>,
     verifies: bool,
+    /// Format-plus-source configuration identity of the checked definition —
+    /// what evaluation actually covered. Absent when the check failed before
+    /// an identity existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<tokeira_platform::definition::ConfigurationIdentity>,
+    /// Served companion names in first-request order; empty for a
+    /// single-document definition, absent when the check failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    companions: Option<Vec<String>>,
     /// The interpreter's located verdict ("parse error at line 112, …").
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -74,6 +83,18 @@ impl Report for CheckReport {
         if let Some(revision) = self.revision {
             push_fact(out, "revision", &revision.to_string());
         }
+        if let Some(identity) = &self.identity {
+            push_fact(
+                out,
+                "identity",
+                &format!("{}:{}", identity.algorithm(), identity.digest),
+            );
+        }
+        if let Some(companions) = self.companions.as_deref()
+            && !companions.is_empty()
+        {
+            push_fact(out, "companions", &companions.join(", "));
+        }
     }
 }
 
@@ -100,14 +121,35 @@ pub(crate) async fn check<F: DefinitionFrontend>(
     // `--json`-stdout-purity rule). Deployment mode runs the whole pure
     // pipeline (evaluate, realize, resource validation); authoring mode has
     // no placement facts, so it verifies the frontend structure alone.
-    let checked: Result<()> = match source {
-        Some(path) => engine.evaluate_authoring(path).map(|_| ()),
+    let checked: Result<(
+        tokeira_platform::definition::ConfigurationIdentity,
+        Vec<String>,
+    )> = match source {
+        Some(path) => engine.evaluate_authoring(path).map(|evaluated| {
+            (
+                evaluated.configuration_identity.clone(),
+                evaluated
+                    .served_companions
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+            )
+        }),
         None => {
             let admitted = admitted.expect("deployment-mode check admits its deployment");
-            engine.execution(admitted, None).map(|_| ())
+            engine
+                .execution(admitted, None)
+                .map(|state| (state.configuration_identity, state.served_companions))
         }
     };
-    let error = checked.err().map(|e| format!("{e:#}"));
+    let (evaluated_facts, error) = match checked {
+        Ok(facts) => (Some(facts), None),
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
+    let (identity, companions) = match evaluated_facts {
+        Some((identity, companions)) => (Some(identity), Some(companions)),
+        None => (None, None),
+    };
     // Authoring mode (`source`) names the path and no deployment; deployment
     // mode names the deployment, its definition basename, and the revision
     // anchor (read tolerantly — the check's subject is the definition, so an
@@ -130,6 +172,8 @@ pub(crate) async fn check<F: DefinitionFrontend>(
         definition,
         revision,
         verifies: error.is_none(),
+        identity,
+        companions,
         error,
     };
     crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
@@ -144,6 +188,68 @@ pub(crate) async fn check<F: DefinitionFrontend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The identity + companions facts serialize under --json exactly as the
+    // deployment repository's claim consumes them: identity as
+    // {algorithm, digest}, companions as the served-order list; both absent
+    // (not null) when the check failed before an identity existed.
+    #[test]
+    fn check_report_serializes_identity_and_companions() {
+        let format = tokeira_orchestrator::DefinitionFormatId::new("tkd").unwrap();
+        let identity = tokeira_platform::definition::ConfigurationIdentity::compute_set(
+            &format,
+            b"root",
+            &[("platform".to_string(), std::sync::Arc::from(&b"p"[..]))],
+        );
+        let report = CheckReport {
+            deployment: None,
+            definition: "deployment.tkd".to_string(),
+            revision: None,
+            verifies: true,
+            identity: Some(identity.clone()),
+            companions: Some(vec!["platform".to_string()]),
+            error: None,
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["identity"]["algorithm"], "sha256-set-v1");
+        assert_eq!(value["identity"]["digest"], identity.digest.as_str());
+        assert_eq!(value["companions"], serde_json::json!(["platform"]));
+
+        let failed = CheckReport {
+            deployment: None,
+            definition: "deployment.tkd".to_string(),
+            revision: None,
+            verifies: false,
+            identity: None,
+            companions: None,
+            error: Some("parse error".to_string()),
+        };
+        let value = serde_json::to_value(&failed).unwrap();
+        assert!(value.get("identity").is_none(), "absent, not null");
+        assert!(value.get("companions").is_none(), "absent, not null");
+    }
+
+    // A single-document definition reports sha256-v1 with an EMPTY (present)
+    // companion list — distinguishing "evaluated, no companions" from
+    // "never evaluated".
+    #[test]
+    fn single_document_check_reports_empty_companions() {
+        let format = tokeira_orchestrator::DefinitionFormatId::new("tkd").unwrap();
+        let identity =
+            tokeira_platform::definition::ConfigurationIdentity::compute(&format, b"root");
+        let report = CheckReport {
+            deployment: None,
+            definition: "deployment.tkd".to_string(),
+            revision: None,
+            verifies: true,
+            identity: Some(identity),
+            companions: Some(Vec::new()),
+            error: None,
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["identity"]["algorithm"], "sha256-v1");
+        assert_eq!(value["companions"], serde_json::json!([]));
+    }
 
     // A bound platform always interprets: the deployment-mode check runs
     // the whole pure pipeline over the recorded definition and verifies.
@@ -164,6 +270,8 @@ mod tests {
             definition: "definition.tkd".to_string(),
             revision: Some(3),
             verifies: true,
+            identity: None,
+            companions: None,
             error: None,
         };
         let narrative = tokeira_report::render(&report, Mode::resolve(false, false)).unwrap();
@@ -191,6 +299,8 @@ mod tests {
             definition: "./defs/staging.tkd".to_string(),
             revision: None,
             verifies: false,
+            identity: None,
+            companions: None,
             error: Some(
                 "the definition does not verify: parse error at line 112, column 18: expected `,`"
                     .to_string(),

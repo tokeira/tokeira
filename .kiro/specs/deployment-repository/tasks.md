@@ -77,22 +77,29 @@ no slice mixes restructuring noise with feature diffs.
 
 ## B. Platform seams
 
-- [ ] 5. Expose the served set and the identity recomputation
-  - [ ] 5.1 `EvaluatedDefinition` gains `served_companions: Vec<(String, Arc<[u8]>)>`;
+- [x] 5. Expose the served set and the identity recomputation
+  - [x] 5.1 `EvaluatedDefinition` gains `served_companions: Vec<(String, Arc<[u8]>)>`;
         `ConfigurationIdentity::compute_set` becomes public. Digest layouts unchanged.
         _Requirements: 1.5, 10.1, 10.3_
-  - [ ] 5.2 PBT: for any generated (format, root, companions), `compute_set` over the
+  - [x] 5.2 PBT: for any generated (format, root, companions), `compute_set` over the
         recorded served set equals the identity `evaluate_definition` computed; golden
         vectors (independently computed, carried from the spike) pin both layouts.
         // Feature: deployment-repository, Property P2 (identity layer)
         _Requirements: 10.2, 10.3_
 
-- [ ] 6. Emit identity + companions from the check path
-  - [ ] 6.1 `tokeira-tkp` `CheckReport` gains `identity` and `companions` (populated,
+- [x] 6. Emit identity + companions from the check path
+  - [x] 6.1 `tokeira-tkp` `CheckReport` gains `identity` and `companions` (populated,
         not dropped, from the evaluated definition; serialized under `--json`).
         _Requirements: 1.4, 2 (evidence)_
-  - [ ] 6.2 Unit tests: report shape, single-document (no companions) case.
+  - [x] 6.2 Unit tests: report shape, single-document (no companions) case.
         _Requirements: 10.3_
+        DONE 2026-08-18 (slice B): served_companions on EvaluatedDefinition
+        (first-request order, exactly the identity's coverage); compute_set
+        public with layout goldens (independent vectors) + the P2 identity
+        PBT; ExecutionState threads identity+companions so deployment-mode
+        check shares one evaluation; CheckReport emits identity/companions
+        (absent-not-null on failure; empty-present for single documents) in
+        --json and as narrative facts.
 
 ## C. Repository machinery (`tokeira-deployment`, offline-tested)
 

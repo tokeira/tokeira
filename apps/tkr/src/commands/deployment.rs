@@ -37,7 +37,7 @@ pub(crate) async fn run(
             format,
             storage,
             region,
-            bundle,
+            dev_engine,
             build_image,
         } => {
             let resolved_name = name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -46,8 +46,8 @@ pub(crate) async fn run(
                 if format.is_some() {
                     bail!("legacy platform `{platform}` does not use a definition frontend");
                 }
-                if bundle {
-                    bail!("`--bundle` applies only to discovered platforms");
+                if dev_engine || build_image.is_some() {
+                    bail!("legacy platform `{platform}` takes no engine options");
                 }
                 let pending =
                     deployments.begin_create(&resolved_name, platform, storage, region, None)?;
@@ -82,38 +82,88 @@ pub(crate) async fn run(
             };
             let pending =
                 deployments.begin_create(&resolved_name, platform, storage, region, Some(seed))?;
-            {
-                if bundle {
-                    let image = build_image.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "`--bundle` requires `--build-image <image>@sha256:<digest>` (the \
-                             digest-pinned build container is an engine-identity input)"
-                        )
-                    })?;
-                    crate::bundle_create::place_bundle_provisioner_at(
-                        deployments,
-                        pending.path(),
-                        image,
-                        &workspace,
-                        platform_package,
-                        frontend_package,
+            if dev_engine {
+                crate::bundle_create::place_dev_provisioner_at(
+                    pending.path(),
+                    &workspace,
+                    platform_package,
+                    frontend_package,
+                )
+                .await?;
+            } else {
+                let image = build_image.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "deployment create obtains the engine as a verified hermetic bundle and \
+                         needs `--build-image <image>@sha256:<digest>` (the digest-pinned build \
+                         container is an engine-identity input); pass `--dev-engine` for a \
+                         native workspace build (local deployments only)"
                     )
-                    .await?;
-                } else {
-                    deployments.place_provisioner_at(
-                        pending.path(),
-                        &workspace,
-                        platform_package,
-                        frontend_package,
-                    )?;
-                }
-                launcher::validate_staged_definition(pending.path()).await?;
-                launcher::seed_staged_config(pending.path()).await?;
+                })?;
+                crate::bundle_create::place_bundle_provisioner_at(
+                    deployments,
+                    pending.path(),
+                    image,
+                    &workspace,
+                    platform_package,
+                    frontend_package,
+                )
+                .await?;
             }
+            let facts = launcher::validate_staged_definition(pending.path()).await?;
+            let identity = facts.identity.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the staged check verified but reported no configuration identity; \
+                     the deployment cannot claim its definition"
+                )
+            })?;
+            let companions = facts.companions.unwrap_or_default();
+            launcher::seed_staged_config(pending.path()).await?;
+
+            // Repository state lands in the staged dir (Requirement 2.3);
+            // only the upload itself waits for the local commit.
+            let staged_repository = crate::repository_setup::provision_staged(
+                deployments.root(),
+                pending.path(),
+                &resolved_name,
+            )
+            .await?;
             let metadata = pending.publish()?;
+            match crate::repository_setup::publish_birth(
+                &deployments.path(&metadata.name),
+                &staged_repository,
+                identity,
+                companions,
+            )
+            .await
+            {
+                Ok(receipt) => {
+                    println!(
+                        "repository: publication {} written to {}",
+                        receipt.version,
+                        staged_repository.config.locator.display()
+                    );
+                }
+                // The deployment is committed; the publication is repairable
+                // state, never a reason to unwind (Requirement 2.4).
+                Err(error) => {
+                    eprintln!(
+                        "repository: the deployment is created, but its birth publication \
+                         failed and is pending: {error:#}\n\
+                         complete it with `tkr deployment publish`"
+                    );
+                }
+            }
             print_metadata(&metadata, json)?;
         }
-        DeploymentAction::List => {
+        DeploymentAction::List { repositories } => {
+            if let Some(selector) = repositories {
+                return crate::repository_setup::list_repositories(
+                    deployments.root(),
+                    &selector,
+                    json,
+                )
+                .await;
+            }
             let items = deployments.list()?;
             let output = OutputFormatter::new(json);
             if json {
@@ -145,6 +195,27 @@ pub(crate) async fn run(
                     .collect::<Vec<_>>();
                 output.print_table(&rows);
             }
+        }
+        DeploymentAction::Fetch {
+            name,
+            repository,
+            trust_anchor,
+        } => {
+            crate::repository_setup::fetch(deployments, &name, &repository, &trust_anchor).await?;
+        }
+        DeploymentAction::Publish { transition, yes } => {
+            super::require_confirmation(yes, "deployment publish")?;
+            let dir = deployments.resolve_dir(selected)?;
+            crate::repository_setup::publish_repair(&dir, transition.as_deref()).await?;
+        }
+        DeploymentAction::Refresh { yes } => {
+            super::require_confirmation(yes, "deployment refresh")?;
+            let dir = deployments.resolve_dir(selected)?;
+            crate::repository_setup::refresh(&dir).await?;
+        }
+        DeploymentAction::Inspect => {
+            let dir = deployments.resolve_dir(selected)?;
+            crate::repository_setup::inspect(&dir, json).await?;
         }
         DeploymentAction::Use { name } => {
             deployments.mark_latest(&name)?;

@@ -353,9 +353,11 @@ distributable from its first moment.
    SHALL report the deployment as created and the publication as pending, and
    `tkr deployment publish` SHALL complete it — THE local commit SHALL NOT be unwound
    by a publication failure.
-5. WHEN publish assembles a publication, THE `retrieval_ref` of each bundle artifact
-   descriptor SHALL name its engine binary target, and each descriptor's `sha256` SHALL
-   equal the TUF target hash of that binary.
+5. WHEN publish assembles a publication, THE bundle manifest SHALL be published
+   byte-identically as committed — `retrieval_ref` stays the seat-invariant retention
+   key (`binaries/<identity-digest>/<target>`), never rewritten; the engine binary
+   target name is derived from the target triple (`tkp-<triple>`), and each
+   descriptor's `sha256` SHALL equal the TUF target hash of that binary.
 
 ### Requirement 3: The repository is one Deployment's monotonic lineage
 

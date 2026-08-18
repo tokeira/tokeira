@@ -200,19 +200,62 @@ pub(crate) enum DeploymentAction {
         storage: CliStorageKind,
         #[arg(long)]
         region: Option<String>,
-        /// Obtain the provisioner as a verified hermetic bundle (CAS hit or
-        /// one Dagger build) instead of the native dev copy — Phase 2 of
-        /// Proposal 005. Requires a running Dagger engine and the tokeira
-        /// workspace.
+        /// Obtain the engine as the native workspace build instead of the
+        /// default verified hermetic bundle. Local deployments only; the
+        /// publication claim records the dev authority tier.
         #[arg(long)]
-        bundle: bool,
-        /// The digest-pinned build container for `--bundle`
-        /// (`<image>@sha256:<digest>` — a floating tag is refused; the
-        /// container is an engine-identity input).
-        #[arg(long, requires = "bundle")]
+        dev_engine: bool,
+        /// The digest-pinned build container for the default hermetic bundle
+        /// path (`<image>@sha256:<digest>` — a floating tag is refused; the
+        /// container is an engine-identity input). Required unless
+        /// `--dev-engine`.
+        #[arg(long, conflicts_with = "dev_engine")]
         build_image: Option<String>,
     },
-    List,
+    List {
+        /// Enumerate published deployment repositories instead of local
+        /// deployment dirs: `local` (the deployments root's repositories)
+        /// or an `s3://<bucket>/<prefix>` remote deployments base.
+        #[arg(long)]
+        repositories: Option<String>,
+    },
+    /// Materialize a published Deployment into a new deployment dir from a
+    /// repository locator and trust anchor — verified in full before any
+    /// byte is placed.
+    Fetch {
+        /// Name for the materialized deployment.
+        #[arg(long)]
+        name: String,
+        /// Repository locator: a local path or `s3://<bucket>/<prefix>`.
+        #[arg(long)]
+        repository: String,
+        /// The pinned trust anchor (a root.json file) to verify from.
+        #[arg(long)]
+        trust_anchor: PathBuf,
+    },
+    /// Complete a pending Deployment Publication from the committed state
+    /// (the repair verb the "publication pending" report names).
+    Publish {
+        /// The transition the pending publication captures. Defaults to
+        /// `create` when the repository holds no publication yet, `apply`
+        /// otherwise.
+        #[arg(long)]
+        transition: Option<String>,
+        /// Confirm the repository write (§4).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Re-sign the repository's freshness statement (and snapshot, when its
+    /// expiry requires) for the current publication; targets and claim are
+    /// untouched.
+    Refresh {
+        /// Confirm the repository write (§4).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Verify the deployment's repository read-only and report the current
+    /// publication: version, transition, claim, expirations, inventory.
+    Inspect,
     Use {
         name: String,
     },

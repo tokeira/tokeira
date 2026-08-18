@@ -257,8 +257,9 @@ Internals follow the spike's proven sequence: author `N.root.json` only at versi
 `targets = snapshot = timestamp version = expected_version + 1`; sign with the online
 sources; hand the `SignedRepository` + artifact paths to the `RepositoryWriter`, which
 writes every create-only object first and the mutable heads last (Requirement 3.5).
-`retrieval_ref` on each artifact descriptor is set to its engine-binary target name
-before the manifest document is serialized (Requirement 2.5).
+The manifest document is published byte-identically as committed: `retrieval_ref`
+stays the seat-invariant retention key, and each artifact's engine-binary target
+name is derived from its triple (Requirement 2.5).
 
 ### Writing — one trait, two homes
 
@@ -432,8 +433,8 @@ the explicit break-glass flag; *for any* consumer whose datastore has trusted ve
 N, serving any version < N refuses as rollback. **Validates: Requirements 9.1, 9.2**
 
 Property P8 — Engine agreement. *For any* bundle, verification requires every
-manifest artifact descriptor's `sha256` to equal the TUF hash of its named engine
-target and `retrieval_ref` to name that target; any divergence refuses with
+manifest artifact descriptor's `sha256` to equal the TUF hash of its derived engine
+target (`tkp-<triple>`), which must exist; any divergence refuses with
 `engine_artifact_mismatch`. **Validates: Requirements 2.5, 5.2, claim table**
 
 Property P9 — Rotation in place. *For any* online-role rotation published as root

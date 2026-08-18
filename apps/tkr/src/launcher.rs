@@ -456,7 +456,20 @@ pub(crate) async fn launch_definition_check_at_path(
 
 /// Validate a staged deployment through the exact provisioner bytes that will
 /// be published with it. Staging remains invisible if the check fails.
-pub(crate) async fn validate_staged_definition(deployment_dir: &Path) -> Result<()> {
+/// The staged check's identity facts (the extended check report,
+/// Requirement 1.4): what create's birth publication claims. Deserialized
+/// from the engine's own `--json` check report — the engine computes the
+/// identity; `tkr` never recomputes it.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct StagedCheckFacts {
+    pub(crate) verifies: bool,
+    #[serde(default)]
+    pub(crate) identity: Option<tokeira_platform::definition::ConfigurationIdentity>,
+    #[serde(default)]
+    pub(crate) companions: Option<Vec<String>>,
+}
+
+pub(crate) async fn validate_staged_definition(deployment_dir: &Path) -> Result<StagedCheckFacts> {
     let provisioner = deployment_dir.join(crate::deployment_dir::PROVISIONER_BIN);
     if !provisioner.is_file() {
         bail!(
@@ -464,23 +477,32 @@ pub(crate) async fn validate_staged_definition(deployment_dir: &Path) -> Result<
             provisioner.display()
         );
     }
-    let status = tokio::process::Command::new(&provisioner)
+    let output = tokio::process::Command::new(&provisioner)
         .args([
+            "--json",
             "definition",
             "check",
             "--deployment-dir",
             &deployment_dir.display().to_string(),
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .status()
+        .output()
         .await
         .with_context(|| format!("failed to launch staged `{}`", provisioner.display()))?;
-    if !status.success() {
+    if !output.status.success() {
+        // The captured report is the refusal's whole story — surface it
+        // before failing the create.
+        print!("{}", String::from_utf8_lossy(&output.stdout));
         bail!("staged provisioner refused the deployment definition");
     }
-    Ok(())
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "staged provisioner check succeeded but its report does not decode: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
 }
 
 /// Seed the staged deployment's server configuration through the exact

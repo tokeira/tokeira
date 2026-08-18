@@ -123,6 +123,32 @@ impl std::fmt::Debug for VerifiedPublication {
 }
 
 impl OpenRepository {
+    /// The loaded publication version (targets, snapshot, and timestamp
+    /// share it) — what a publisher passes as `expected_version` for the
+    /// next transition.
+    pub fn version(&self) -> u64 {
+        self.repo.targets().signed.version.get()
+    }
+
+    /// The verified TUF repository, for sibling repository operations
+    /// (refresh re-signs freshness from the loaded roles).
+    pub(crate) fn repository(&self) -> &Repository {
+        &self.repo
+    }
+
+    /// The freshness statement's expiration instant, for reports.
+    pub fn timestamp_expires(&self) -> jiff::Timestamp {
+        self.repo.timestamp().signed.expires
+    }
+
+    /// The accepted root's version after any root-version walk — callers
+    /// re-pin their own anchor bytes when this equals the pinned version
+    /// (byte-exact), and fall back to [`trust_anchor`](Self::trust_anchor)'s
+    /// re-serialization only when the chain walked forward.
+    pub fn root_version(&self) -> u64 {
+        self.repo.root().signed.version.get()
+    }
+
     /// The accepted trust-anchor bytes after any root-version walk —
     /// callers re-pin these.
     pub fn trust_anchor(&self) -> Result<Vec<u8>, OpenError> {
@@ -215,19 +241,10 @@ impl OpenRepository {
         let mut artifacts = Vec::new();
         for descriptor in &manifest.artifacts {
             let triple = descriptor.target.0.clone();
+            // The engine target name is derived from the triple, never read
+            // from the manifest: `retrieval_ref` is the seat-invariant
+            // retention key and plays no part in verification.
             let expected_target = engine_target_name(&triple);
-            match &descriptor.retrieval_ref {
-                Some(reference) if reference == &expected_target => {}
-                other => {
-                    return Err(Refusal::EngineArtifactMismatch {
-                        target_triple: triple,
-                        detail: format!(
-                            "retrieval_ref {:?} does not name `{expected_target}`",
-                            other
-                        ),
-                    });
-                }
-            }
             let Some(target) = lookup_target(&repo, &expected_target) else {
                 return Err(Refusal::EngineArtifactMismatch {
                     target_triple: triple,

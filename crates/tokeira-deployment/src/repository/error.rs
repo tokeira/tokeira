@@ -129,7 +129,7 @@ pub enum Refusal {
         manifest: String,
     },
     /// A manifest artifact's digest disagrees with its TUF target hash, or
-    /// its retrieval ref does not name its target.
+    /// its derived engine target is absent from the publication.
     #[error(
         "engine_artifact_mismatch: artifact `{target_triple}` disagrees with the publication \
          ({detail}); the bundle and the repository have diverged"

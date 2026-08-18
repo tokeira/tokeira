@@ -10,17 +10,18 @@
 //! the same [`BundleStore`] over S3 when CI flows land (18.4 skipped by
 //! owner decision; Phase 3).
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokeira_build::{
     DefaultDaggerClient, DefinitionFrontendPackageDescriptor, PlatformPackageDescriptor,
     ProvisionerBuildRequest, SnapshotRequest, assemble_bound_provisioner, obtain_provisioner,
-    snapshot_source_closure,
+    rust_toolchain_version, snapshot_source_closure,
 };
 use tokeira_deployment::{
-    AuthorityTier, BUNDLE_MANIFEST_BASENAME, BinaryStore, BuildAuthority, BuildProfile,
-    BundleStore, Target,
+    AuthorityTier, BUNDLE_MANIFEST_BASENAME, BinaryArtifactDescriptor, BinaryStore, BuildAuthority,
+    BuildManifest, BuildProfile, BundleStore, EngineIdentity, ProvisionerBundle, Sha256Digest,
+    Target, TestEvidence,
 };
 use tokeira_state::LocalBackend;
 
@@ -76,38 +77,8 @@ pub(crate) async fn place_bundle_provisioner_at(
         )
     })?;
 
-    // Retain under the deployment's own state (self-contained rollback,
-    // Proposal 002/005), and record where in the manifest we place.
-    let retention = BinaryStore::new(
-        Box::new(LocalBackend::new(deployment_dir.join("state"))),
-        "binaries",
-    );
-    let retrieval_ref = retention
-        .persist(&obtained.bundle.identity, &host_target, bytes)
-        .await
-        .context("failed to retain the bundle in the deployment")?;
-    // Record the retention ref inside the bundle itself — the sidecar carries
-    // the FULL bundle (task 19.1: describe surfaces identity fields, build
-    // provenance, and test evidence from it; init extracts the integrity
-    // manifest after self-verifying).
-    let mut bundle = obtained.bundle;
-    for artifact in &mut bundle.artifacts {
-        if artifact.target == host_target {
-            artifact.retrieval_ref = Some(retrieval_ref.clone());
-        }
-    }
-
-    // Place the married provisioner + the sidecar `tkp init` records (18.3c).
-    let dest = deployment_dir.join(PROVISIONER_BIN);
-    std::fs::write(&dest, bytes).with_context(|| format!("failed to place {}", dest.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
-    }
-    let sidecar = deployment_dir.join(BUNDLE_MANIFEST_BASENAME);
-    std::fs::write(&sidecar, serde_json::to_vec_pretty(&bundle)?)
-        .with_context(|| format!("failed to write {}", sidecar.display()))?;
+    let (bundle, retrieval_ref) =
+        marry_bundle_at(deployment_dir, obtained.bundle, &host_target, bytes).await?;
 
     println!(
         "provisioner: bundle {} ({}) placed as `tkp` — retained at {}",
@@ -118,6 +89,131 @@ pub(crate) async fn place_bundle_provisioner_at(
             "built hermetically, published"
         },
         retrieval_ref
+    );
+    Ok(())
+}
+
+/// Marry an obtained bundle to the deployment: retain the host artifact
+/// under the deployment's own state (self-contained rollback, Proposal
+/// 002/005), record the retention ref inside the bundle — the sidecar
+/// carries the FULL bundle (describe surfaces identity fields, build
+/// provenance, and test evidence from it; init extracts the integrity
+/// manifest after self-verifying) — then place `tkp` and the sidecar
+/// `tkp init` records.
+pub(crate) async fn marry_bundle_at(
+    deployment_dir: &std::path::Path,
+    mut bundle: tokeira_deployment::ProvisionerBundle,
+    host_target: &Target,
+    bytes: &[u8],
+) -> Result<(tokeira_deployment::ProvisionerBundle, String)> {
+    let retention = BinaryStore::new(
+        Box::new(LocalBackend::new(deployment_dir.join("state"))),
+        "binaries",
+    );
+    let retrieval_ref = retention
+        .persist(&bundle.identity, host_target, bytes)
+        .await
+        .context("failed to retain the bundle in the deployment")?;
+    for artifact in &mut bundle.artifacts {
+        if artifact.target == *host_target {
+            artifact.retrieval_ref = Some(retrieval_ref.clone());
+        }
+    }
+
+    let dest = deployment_dir.join(PROVISIONER_BIN);
+    std::fs::write(&dest, bytes).with_context(|| format!("failed to place {}", dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let sidecar = deployment_dir.join(BUNDLE_MANIFEST_BASENAME);
+    std::fs::write(&sidecar, serde_json::to_vec_pretty(&bundle)?)
+        .with_context(|| format!("failed to write {}", sidecar.display()))?;
+    Ok((bundle, retrieval_ref))
+}
+
+/// Place the native workspace build as the deployment's engine, with a
+/// synthesized dev-tier bundle manifest so publication is uniform across
+/// engine kinds.
+///
+/// The identity is honest about what this tier is: closures computed from
+/// the tracked source snapshot, `build_container: None` (the native dev
+/// loop is non-hermetic by construction — an S3 publication of this engine
+/// refuses on exactly that), `LocalDeveloper` authority, and one artifact
+/// for the host target — fetching a dev publication onto another
+/// architecture refuses with `host_target_unsupported`, which is correct
+/// for a dev artifact.
+pub(crate) async fn place_dev_provisioner_at(
+    deployment_dir: &std::path::Path,
+    workspace_root: &std::path::Path,
+    platform: &PlatformPackageDescriptor,
+    frontend: &DefinitionFrontendPackageDescriptor,
+) -> Result<()> {
+    // The native build assembles the bound source internally; the assembly
+    // below re-derives the same deterministic source, so the evidence and
+    // the placed binary describe the same composition.
+    let artifact =
+        DeploymentResolver::build_provisioner_from_workspace(workspace_root, platform, frontend)?;
+    let bytes = std::fs::read(&artifact)
+        .with_context(|| format!("failed to read {}", artifact.display()))?;
+
+    let bound_source = assemble_bound_provisioner(workspace_root, platform, frontend)
+        .context("failed to assemble the bound provisioner source")?;
+    let snapshot = snapshot_source_closure(&SnapshotRequest {
+        repo_root: workspace_root.to_path_buf(),
+        closure_paths: bound_source.closure().closure_paths(),
+        include_untracked: false,
+    })
+    .context("failed to freeze the source snapshot")?;
+    let toolchain = rust_toolchain_version(workspace_root)
+        .context("failed to resolve the workspace toolchain")?;
+    let identity = EngineIdentity {
+        source_closure: bound_source.source_closure_digest(&snapshot.tree_oid),
+        lock_closure: Sha256Digest::from_bytes(&bound_source.closure().canonical_lock_bytes()),
+        toolchain: toolchain.clone(),
+        build_container: None,
+        features: BTreeSet::new(),
+        profile: BuildProfile::Dev,
+    };
+
+    let host_target = Target(env!("TKR_TARGET").to_string());
+    let synthesized = ProvisionerBundle {
+        identity,
+        bound: None,
+        authority: BuildAuthority::LocalDeveloper,
+        provisioner_version: tokeira_build_info::TOKEIRA_VERSION.to_string(),
+        artifacts: vec![BinaryArtifactDescriptor {
+            target: host_target.clone(),
+            sha256: tokeira_deployment::sha256_hex(&bytes),
+            retrieval_ref: None,
+            size_bytes: bytes.len() as u64,
+        }],
+        // No test step runs at this tier; recording `passed: false` with the
+        // reason keeps the evidence honest rather than claiming a pass that
+        // never happened. The dev bundle never enters the CAS, whose publish
+        // gate is where `passed` is enforced.
+        tests: TestEvidence {
+            command: "dev engine: native workspace build".to_string(),
+            passed: false,
+        },
+        build: BuildManifest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            source_tree_oid: snapshot.tree_oid.clone(),
+            snapshot_commit_oid: snapshot.commit_oid.clone(),
+            toolchain,
+            builder: "native-dev".to_string(),
+        },
+    }
+    .with_bound_evidence(bound_source.evidence(&snapshot.tree_oid))
+    .context("dev engine evidence disagrees with its own identity")?;
+
+    let (bundle, _retrieval_ref) =
+        marry_bundle_at(deployment_dir, synthesized, &host_target, &bytes).await?;
+
+    println!(
+        "provisioner: dev engine {} placed as `tkp` (native workspace build; dev tier)",
+        &bundle.identity_digest().to_hex()[..12],
     );
     Ok(())
 }

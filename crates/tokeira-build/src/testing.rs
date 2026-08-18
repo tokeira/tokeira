@@ -6,7 +6,7 @@ use std::{
 use crate::{BuildError, ContainerRef, DaggerClient, DirectoryRef, FileRef, SecretRef};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MockCall {
+pub enum MockCall {
     HostDirectory(String),
     HostDirectoryFiltered {
         path: String,
@@ -39,7 +39,7 @@ pub(crate) enum MockCall {
 }
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct MockDaggerClient {
+pub struct MockDaggerClient {
     state: Arc<Mutex<MockState>>,
 }
 
@@ -50,11 +50,11 @@ struct MockState {
 }
 
 impl MockDaggerClient {
-    pub(crate) fn calls(&self) -> Vec<MockCall> {
+    pub fn calls(&self) -> Vec<MockCall> {
         self.state.lock().expect("mock state lock").calls.clone()
     }
 
-    pub(crate) fn with_publish_error(self) -> Self {
+    pub fn with_publish_error(self) -> Self {
         self.state.lock().expect("mock state lock").fail_publish = true;
         self
     }
@@ -280,7 +280,7 @@ impl<'client> FileRef<'client> for MockFile {
 
 /// The deterministic bytes [`MockFile::export`] writes for a container path —
 /// tests derive expected checksums from this.
-pub(crate) fn mock_artifact_bytes(source: &str) -> Vec<u8> {
+pub fn mock_artifact_bytes(source: &str) -> Vec<u8> {
     format!("mock-artifact:{source}").into_bytes()
 }
 

@@ -54,6 +54,7 @@ mod metadata;
 mod output;
 pub mod platform_discovery;
 mod process;
+mod repository_setup;
 mod tui;
 
 use cli::{
@@ -575,7 +576,7 @@ mod tests {
                 .unwrap()
                 .command,
             Command::Deployment {
-                action: DeploymentAction::List
+                action: DeploymentAction::List { repositories: None }
             }
         ));
         assert!(matches!(
@@ -1203,6 +1204,7 @@ mod tests {
             id: Uuid::nil(),
             platform: platform("local"),
             definition: None,
+            deployment_repository: None,
             storage: StorageKind::InMemory,
             status: metadata::DeploymentStatus::Created,
             created_at: "now".into(),
@@ -1224,6 +1226,7 @@ mod tests {
                 format: tokeira_orchestrator::DefinitionFormatId::new("tkd").unwrap(),
                 path: tokeira_orchestrator::RelativeDefinitionPath::new("definition.tkd").unwrap(),
             }),
+            deployment_repository: None,
             storage: StorageKind::Dsql,
             status: metadata::DeploymentStatus::Running,
             created_at: "2026-04-24T00:00:00Z".into(),
@@ -1336,6 +1339,11 @@ mod tests {
                 }),
             )
             .expect("stage deployment");
+        // Native build, then marry the real binary under a fixture identity
+        // so the sidecar honestly describes the placed bytes. (The full
+        // `--dev-engine` synthesis derives its identity from a git source
+        // snapshot; the workspace-bar copy of this tree carries no .git, so
+        // the test supplies the identity the snapshot would.)
         deployments
             .place_provisioner_at(
                 pending.path(),
@@ -1344,11 +1352,369 @@ mod tests {
                 frontend_package,
             )
             .expect("generated provisioner compiles and is placed");
-        launcher::validate_staged_definition(pending.path())
+        let engine_bytes = fs::read(pending.path().join("tkp")).expect("placed engine bytes");
+        // Evidence over the real assembly with a fixture tree oid: the
+        // identity's closures are taken FROM the evidence, so the pair
+        // agrees by construction and admission's cross-checks all hold.
+        let bound_source = tokeira_build::assemble_bound_provisioner(
+            &workspace,
+            platform_package,
+            frontend_package,
+        )
+        .expect("bound source assembles");
+        let evidence = bound_source.evidence("test-fixture-tree");
+        let dev_identity = tokeira_deployment::EngineIdentity {
+            source_closure: evidence.source_closure,
+            lock_closure: evidence.lock_closure,
+            toolchain: "rustc test".to_string(),
+            build_container: None,
+            features: std::collections::BTreeSet::new(),
+            profile: tokeira_deployment::BuildProfile::Dev,
+        };
+        let synthesized = tokeira_deployment::ProvisionerBundle {
+            identity: dev_identity,
+            bound: None,
+            authority: tokeira_deployment::BuildAuthority::LocalDeveloper,
+            provisioner_version: "0.0.0-test".to_string(),
+            artifacts: vec![tokeira_deployment::BinaryArtifactDescriptor {
+                target: tokeira_deployment::Target(env!("TKR_TARGET").to_string()),
+                sha256: tokeira_deployment::sha256_hex(&engine_bytes),
+                retrieval_ref: None,
+                size_bytes: engine_bytes.len() as u64,
+            }],
+            tests: tokeira_deployment::TestEvidence {
+                command: "not run (test fixture)".to_string(),
+                passed: false,
+            },
+            build: tokeira_deployment::BuildManifest {
+                request_id: "req-test".to_string(),
+                source_tree_oid: "t".to_string(),
+                snapshot_commit_oid: "c".to_string(),
+                toolchain: "rustc test".to_string(),
+                builder: "test".to_string(),
+            },
+        }
+        .with_bound_evidence(evidence)
+        .expect("fixture evidence agrees with its identity");
+        bundle_create::marry_bundle_at(
+            pending.path(),
+            synthesized,
+            &tokeira_deployment::Target(env!("TKR_TARGET").to_string()),
+            &engine_bytes,
+        )
+        .await
+        .expect("real binary marries under the fixture identity");
+        let facts = launcher::validate_staged_definition(pending.path())
             .await
             .expect("generated provisioner validates its seed");
+        let identity = facts.identity.expect("the check reports the identity");
+        let companions = facts.companions.unwrap_or_default();
+        let staged_repository = repository_setup::provision_staged(
+            deployments.root(),
+            pending.path(),
+            "generated-compose",
+        )
+        .await
+        .expect("staged repository state provisions");
         let metadata = pending.publish().expect("publish checked deployment");
         assert_eq!(metadata.platform.as_str(), "compose");
-        assert!(deployments.path("generated-compose").join("tkp").is_file());
+        let dir = deployments.path("generated-compose");
+        assert!(dir.join("tkp").is_file());
+        repository_setup::publish_birth(&dir, &staged_repository, identity, companions)
+            .await
+            .expect("the birth publication uploads");
+
+        // Fetch onto a second root and prove the fetched seat's admission:
+        // `tkp describe` on the placed bundle succeeds exactly as it does
+        // for a workspace create (Requirements 5.5 / 12.4).
+        let second = tempfile::tempdir().expect("second root");
+        let fetched_resolver = DeploymentResolver::with_root(second.path().to_path_buf());
+        repository_setup::fetch(
+            &fetched_resolver,
+            "generated-compose",
+            &repository_setup::local_repository_home(deployments.root(), "generated-compose")
+                .display()
+                .to_string(),
+            &dir.join("state/repository/root.json"),
+        )
+        .await
+        .expect("fetch materializes the publication");
+        launcher::launch(
+            &fetched_resolver.path("generated-compose"),
+            &["describe"],
+            &[],
+        )
+        .await
+        .expect("post-fetch describe admission is green");
+    }
+
+    /// Task 15.3: local create → local repository, no Dagger. The engine is
+    /// a fake bundle through the REAL obtain pipeline (mock engine); the
+    /// staged self-check is exercised by the discovered-selection test above
+    /// (fake engine bytes cannot exec), so its identity facts are computed
+    /// here with the sole implementation, exactly as the check would.
+    #[tokio::test]
+    async fn create_flow_publishes_a_verifiable_birth_publication_locally() {
+        use tokeira_deployment::repository::{
+            claim::Transition,
+            open::{Freshness, open},
+            publish::engine_target_name,
+        };
+
+        let temp = tempfile::tempdir().expect("deployment root");
+        let deployments = DeploymentResolver::with_root(temp.path().join("deployments"));
+        let format = tokeira_orchestrator::DefinitionFormatId::new("tkd").expect("format");
+        let pending = deployments
+            .begin_create(
+                "dev",
+                platform("compose"),
+                StorageKind::InMemory,
+                None,
+                Some(deployment_dir::DefinitionSeed {
+                    definition: tokeira_deployment::RecordedDefinition {
+                        format: format.clone(),
+                        path: tokeira_orchestrator::RelativeDefinitionPath::new("definition.tkd")
+                            .expect("path"),
+                    },
+                    bytes: b"root-definition".to_vec(),
+                    parts: vec![("platform.tkd".to_string(), b"companion-part".to_vec())],
+                }),
+            )
+            .expect("stage deployment");
+
+        // A fake hermetic bundle through the real obtain pipeline.
+        let repo = tempfile::tempdir().expect("fixture repo");
+        let out = tempfile::tempdir().expect("obtain output");
+        let host = tokeira_deployment::Target(env!("TKR_TARGET").to_string());
+        let request = fake_bundle_request(repo.path(), out.path(), &host);
+        let cas = tokeira_deployment::BundleStore::new(
+            Box::new(tokeira_state::LocalBackend::new(temp.path().join("cas"))),
+            "bundles",
+        );
+        let mock = tokeira_build::testing::MockDaggerClient::default();
+        let obtained = tokeira_build::obtain_provisioner(
+            &request,
+            &mock,
+            &cas,
+            tokeira_deployment::AuthorityTier::LocalDeveloper,
+        )
+        .await
+        .expect("obtains the fake bundle");
+        let engine_bytes = obtained
+            .bytes_by_target
+            .get(&host)
+            .expect("host artifact")
+            .clone();
+        bundle_create::marry_bundle_at(pending.path(), obtained.bundle, &host, &engine_bytes)
+            .await
+            .expect("marries the bundle");
+
+        let identity = tokeira_platform::definition::ConfigurationIdentity::compute_set(
+            &format,
+            b"root-definition",
+            &[(
+                "platform".to_string(),
+                std::sync::Arc::from(&b"companion-part"[..]),
+            )],
+        );
+
+        // Repository state lands in the STAGED dir, before the rename.
+        let staged = repository_setup::provision_staged(deployments.root(), pending.path(), "dev")
+            .await
+            .expect("provisions the staged repository state");
+        for wired in [
+            "state/repository/publisher.json",
+            "state/repository/root.json",
+            "state/repository/datastore",
+        ] {
+            assert!(pending.path().join(wired).exists(), "{wired} staged");
+        }
+        let staged_metadata = metadata::read(pending.path()).expect("staged metadata");
+        let binding = staged_metadata
+            .deployment_repository
+            .expect("staged metadata carries the repository binding");
+        assert_eq!(
+            binding.trusted_root_digest,
+            tokeira_deployment::sha256_hex(&staged.trusted_root)
+        );
+
+        let committed = pending.publish().expect("atomic rename commits");
+        let dir = deployments.path(&committed.name);
+        let receipt = repository_setup::publish_birth(
+            &dir,
+            &staged,
+            identity.clone(),
+            vec!["platform".to_string()],
+        )
+        .await
+        .expect("the birth publication uploads");
+        assert_eq!(receipt.version, 1);
+
+        // Verify exactly as a fetch would: from the pinned anchor.
+        let anchor = fs::read(dir.join("state/repository/root.json")).expect("pinned anchor");
+        let publication = open(
+            &staged.config.locator,
+            &anchor,
+            None,
+            Freshness::Enforced,
+            None,
+        )
+        .await
+        .expect("repository opens from the pinned anchor")
+        .verified_publication()
+        .await
+        .expect("the claim contract holds");
+        let claim = publication.claim();
+        assert_eq!(claim.deployment.name, "dev");
+        assert_eq!(claim.transition, Transition::Create);
+        assert_eq!(claim.config_revision, 0);
+        assert_eq!(claim.definition.identity, identity);
+        assert_eq!(claim.definition.companions, vec!["platform".to_string()]);
+        assert_eq!(claim.engine.build_authority, "local-developer");
+
+        // Byte-identity with the created dir (Requirement 2.2): definition
+        // documents, every config target, and the engine binary.
+        for target in ["definition.tkd", "platform.tkd"] {
+            assert_eq!(
+                publication.read(target).await.expect("published document"),
+                fs::read(dir.join(target)).expect("local copy"),
+                "{target} byte-identical"
+            );
+        }
+        assert!(
+            publication
+                .config_targets()
+                .iter()
+                .any(|target| target == TOKEIRAD_TOML),
+            "the templated config tree is published"
+        );
+        for target in publication.config_targets() {
+            assert_eq!(
+                publication.read(target).await.expect("published config"),
+                fs::read(dir.join(target)).expect("local copy"),
+                "{target} byte-identical"
+            );
+        }
+        assert_eq!(
+            publication
+                .read(&engine_target_name(&host.0))
+                .await
+                .expect("published engine"),
+            fs::read(dir.join("tkp")).expect("placed tkp"),
+            "the engine binary is the placed tkp"
+        );
+
+        // Fetch onto a second deployments root (task 17.3): every
+        // materialized file is byte-identical to the created dir — the
+        // manifest sidecar included, since publish carries it verbatim.
+        let second = tempfile::tempdir().expect("second root");
+        let fetched_resolver = DeploymentResolver::with_root(second.path().to_path_buf());
+        let repo_home = repository_setup::local_repository_home(deployments.root(), "dev");
+        repository_setup::fetch(
+            &fetched_resolver,
+            "dev",
+            &repo_home.display().to_string(),
+            &dir.join("state/repository/root.json"),
+        )
+        .await
+        .expect("fetch materializes the publication");
+        let fetched_dir = fetched_resolver.path("dev");
+        for file in [
+            "definition.tkd",
+            "platform.tkd",
+            TOKEIRAD_TOML,
+            "tkp",
+            tokeira_deployment::BUNDLE_MANIFEST_BASENAME,
+        ] {
+            assert_eq!(
+                fs::read(fetched_dir.join(file)).expect("fetched file"),
+                fs::read(dir.join(file)).expect("created file"),
+                "{file} byte-identical across create and fetch"
+            );
+        }
+        let fetched_metadata = metadata::read(&fetched_dir).expect("fetched metadata");
+        let fetched_binding = fetched_metadata
+            .deployment_repository
+            .expect("fetched metadata carries the repository binding");
+        assert_eq!(
+            fetched_binding.trusted_root_digest,
+            tokeira_deployment::sha256_hex(&anchor),
+            "fetch re-pins the accepted trust anchor"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(fetched_dir.join("tkp"))
+                .expect("fetched tkp")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "fetched tkp is executable");
+        }
+    }
+
+    /// A buildable fake-bundle request over a throwaway git fixture — the
+    /// mock engine exports deterministic bytes for `host`.
+    fn fake_bundle_request(
+        repo: &std::path::Path,
+        out: &std::path::Path,
+        host: &tokeira_deployment::Target,
+    ) -> tokeira_build::ProvisionerBuildRequest {
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t.invalid")
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("platforms/alpha/src")).expect("mkdir");
+        fs::write(
+            repo.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.95\"\n",
+        )
+        .expect("write");
+        fs::write(repo.join("Cargo.lock"), "version = 4\n").expect("write");
+        fs::write(repo.join("platforms/alpha/src/lib.rs"), "pub fn a() {}\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "seed"]);
+        let snapshot = tokeira_build::snapshot_source_closure(&tokeira_build::SnapshotRequest {
+            repo_root: repo.to_path_buf(),
+            closure_paths: vec![
+                PathBuf::from("platforms/alpha"),
+                PathBuf::from("rust-toolchain.toml"),
+                PathBuf::from("Cargo.lock"),
+            ],
+            include_untracked: false,
+        })
+        .expect("snapshot");
+        tokeira_build::ProvisionerBuildRequest {
+            workspace_root: repo.to_path_buf(),
+            bound_source: tokeira_build::BoundProvisionerSource::testing(
+                tokeira_build::ProvisionerClosure {
+                    crate_dirs: vec![PathBuf::from("platforms/alpha")],
+                    crate_names: vec!["tokeira-alpha".into()],
+                    workspace_files: vec![
+                        PathBuf::from("rust-toolchain.toml"),
+                        PathBuf::from("Cargo.lock"),
+                    ],
+                    locked: vec![],
+                },
+            ),
+            targets: vec![host.clone()],
+            profile: tokeira_deployment::BuildProfile::Dist,
+            authority: tokeira_deployment::BuildAuthority::LocalDeveloper,
+            build_image: format!("rust:1.95-slim-bookworm@sha256:{}", "ab".repeat(32)),
+            snapshot,
+            version: "0.1.0".into(),
+            request_id: "req-repo-test".into(),
+            output_dir: out.to_path_buf(),
+        }
     }
 }

@@ -46,8 +46,10 @@ pub struct BoundProvisionerSource {
 }
 
 impl BoundProvisionerSource {
-    #[cfg(test)]
-    pub(crate) fn testing(closure: ProvisionerClosure) -> Self {
+    /// A minimal buildable source for the offline fakes (`testing`
+    /// feature): real generated root, empty engine binding.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing(closure: ProvisionerClosure) -> Self {
         Self {
             platform: PlatformId::new("alpha").expect("test platform id"),
             format: DefinitionFormatId::new("tkd").expect("test format id"),

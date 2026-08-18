@@ -49,8 +49,9 @@ pub struct PublicationInput {
     /// Which documents are config-tree files (by target name); the rest are
     /// definition documents.
     pub config_tree: Vec<String>,
-    /// The committed bundle manifest. Its artifact `retrieval_ref`s are
-    /// rewritten here to name the engine binary targets before serialization.
+    /// The committed bundle manifest, published exactly as committed —
+    /// `retrieval_ref`s stay the seat-invariant retention keys; the engine
+    /// binary target names are derived from the triples.
     pub bundle_manifest: ProvisionerBundle,
     /// Per-target engine binaries: (target triple, path to the bytes).
     /// Streamed, never buffered whole.
@@ -125,13 +126,11 @@ pub async fn publish_transition(
         std::fs::write(&path, bytes).map_err(|error| PublishError::Other(error.to_string()))?;
     }
 
-    // 3. The manifest's artifact descriptors point at their binary targets
-    //    (the concrete meaning of `retrieval_ref`), then the manifest itself
-    //    becomes a target.
-    let mut manifest = input.bundle_manifest;
-    for artifact in &mut manifest.artifacts {
-        artifact.retrieval_ref = Some(engine_target_name(&artifact.target.0));
-    }
+    // 3. The manifest publishes byte-identically as committed: every
+    //    `retrieval_ref` stays the seat-invariant retention key, and the
+    //    engine binary targets are derived from the triples — the sidecar a
+    //    fetch materializes equals the sidecar create placed (Req 2.2/2.5).
+    let manifest = input.bundle_manifest;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| PublishError::Other(format!("serializing bundle manifest: {error}")))?;
     let manifest_path = staging.path().join(&input.claim.engine.manifest);
@@ -310,6 +309,22 @@ pub async fn publish_transition(
         trusted_root: root_bytes,
         outcomes,
     })
+}
+
+/// Author the birth trust anchor — root v1, signed with the configured role
+/// keys — and return its bytes for pinning.
+///
+/// Create pins these into the staged deployment (with the datastore dir and
+/// the `metadata.json` binding) before the atomic rename; the birth
+/// publication then runs against the pinned anchor after the local commit,
+/// so a failed upload leaves a created deployment whose publication is
+/// pending, never a half-created deployment (Requirement 2.3/2.4 ordering).
+pub async fn author_trust_anchor(config: &RepositoryConfig) -> Result<Vec<u8>, PublishError> {
+    let now = Timestamp::now();
+    let expires = now
+        .checked_add(config.lifetimes.root())
+        .map_err(|error| PublishError::Other(error.to_string()))?;
+    Ok(author_root(config, 1, expires).await?.buffer().clone())
 }
 
 /// Author a root at `version` with the configured keys — the online-rotation

@@ -4,10 +4,22 @@
 //! until keys are supplied — read-only by default, ahead of the
 //! operation-lease spec.
 
+use std::path::{Path, PathBuf};
+
 use jiff::Span;
 use serde::{Deserialize, Serialize};
 
-use super::{keys::RoleKeyConfig, locator::RepositoryLocator};
+use super::{error::PublishError, keys::RoleKeyConfig, locator::RepositoryLocator};
+
+/// The publisher configuration, relative to a deployment dir.
+pub const PUBLISHER_JSON: &str = "state/repository/publisher.json";
+
+/// The pinned trust anchor, relative to a deployment dir.
+pub const TRUST_ANCHOR: &str = "state/repository/root.json";
+
+/// The TUF client datastore, relative to a deployment dir — what makes
+/// rollback detection hold across separate loads.
+pub const DATASTORE_DIR: &str = "state/repository/datastore";
 
 /// Everything publish needs: where, signed by what, living how long.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +32,47 @@ pub struct RepositoryConfig {
     /// Role lifetimes; the timestamp lifetime is the freshness window.
     #[serde(default)]
     pub lifetimes: RoleLifetimes,
+}
+
+impl RepositoryConfig {
+    /// The publisher.json path inside `deployment_dir`.
+    pub fn path_in(deployment_dir: &Path) -> PathBuf {
+        deployment_dir.join(PUBLISHER_JSON)
+    }
+
+    /// Load the publisher configuration from a deployment dir; `Ok(None)`
+    /// when the seat has none (fetched read-only seats until keys arrive).
+    pub fn load(deployment_dir: &Path) -> Result<Option<Self>, PublishError> {
+        let path = Self::path_in(deployment_dir);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(PublishError::Other(format!(
+                    "reading {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+            PublishError::Other(format!("{} does not decode: {error}", path.display()))
+        })
+    }
+
+    /// Persist the publisher configuration into a deployment dir (staged or
+    /// committed), creating `state/repository/` as needed.
+    pub fn store(&self, deployment_dir: &Path) -> Result<(), PublishError> {
+        let path = Self::path_in(deployment_dir);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                PublishError::Other(format!("creating {}: {error}", parent.display()))
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| PublishError::Other(format!("serializing publisher.json: {error}")))?;
+        std::fs::write(&path, bytes)
+            .map_err(|error| PublishError::Other(format!("writing {}: {error}", path.display())))
+    }
 }
 
 /// Role lifetimes in whole hours (jiff timestamp arithmetic takes absolute

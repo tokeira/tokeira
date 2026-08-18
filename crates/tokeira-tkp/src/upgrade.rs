@@ -160,6 +160,16 @@ pub(crate) async fn upgrade<F: DefinitionFrontend>(
         .save(&envelope, &version)
         .await
         .context("failed to close the operation marker")?;
+    // ── Post-commit publication: carries the NEW engine binaries and
+    // manifest, claim-bound to the new identity (Req 4.4); failure never
+    // alters the committed upgrade. ──
+    crate::publication::publish_committed_transition(
+        engine,
+        admitted,
+        tokeira_deployment::repository::claim::Transition::Upgrade,
+        envelope.config_revision,
+    )
+    .await;
     emit_upgrade_document(engine, admitted, &envelope, &outcome, mode)?;
     Ok(())
 }

@@ -141,5 +141,7 @@ jobs:
           test -f CLAUDE.md
       - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
-          args: --offline --no-progress --hidden --exclude-path .git --exclude-path target './**/*.md'
+          # Vendored third-party trees carry their upstreams' relative links,
+          # which rightly resolve only in their home repositories.
+          args: --offline --no-progress --hidden --exclude-path .git --exclude-path target --exclude-path spikes/dagger-rust-sdk/vendor './**/*.md'
           fail: true

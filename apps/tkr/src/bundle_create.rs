@@ -14,9 +14,9 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokeira_build::{
-    DefaultDaggerClient, DefinitionFrontendPackageDescriptor, PlatformPackageDescriptor,
-    ProvisionerBuildRequest, assemble_bound_provisioner, obtain_provisioner,
-    rust_toolchain_version, snapshot_source_closure,
+    DefinitionFrontendPackageDescriptor, PlatformPackageDescriptor, ProvisionerBuildRequest,
+    assemble_bound_provisioner, obtain_provisioner, rust_toolchain_version,
+    snapshot_source_closure,
 };
 use tokeira_deployment::{
     AuthorityTier, BUNDLE_MANIFEST_BASENAME, BinaryArtifactDescriptor, BinaryStore, BuildAuthority,
@@ -38,8 +38,9 @@ pub(crate) async fn place_bundle_provisioner_at(
     platform: &PlatformPackageDescriptor,
     frontend: &DefinitionFrontendPackageDescriptor,
 ) -> Result<()> {
-    let dagger = DefaultDaggerClient::from_env()
-        .map_err(|e| anyhow!("`--bundle` needs a running Dagger engine: {e}"))?;
+    let client = crate::commands::image::dagger_session()
+        .await
+        .context("`--bundle` needs a running Dagger engine")?;
     let bound_source = assemble_bound_provisioner(workspace_root, platform, frontend)
         .context("failed to assemble the bound provisioner source")?;
     let snapshot = snapshot_source_closure(
@@ -69,7 +70,7 @@ pub(crate) async fn place_bundle_provisioner_at(
         "bundles",
     );
     let obtained =
-        obtain_provisioner(&request, &dagger, &cas, AuthorityTier::LocalDeveloper).await?;
+        obtain_provisioner(&request, &client, &cas, AuthorityTier::LocalDeveloper).await?;
     let bytes = obtained.bytes_by_target.get(&host_target).ok_or_else(|| {
         anyhow!(
             "the bundle carries no artifact for host target {}",

@@ -1,297 +1,8 @@
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+//! Offline fakes for the pipelines: a scripted wire under the real SDK
+//! client. No Dagger engine is required — and no seam of ours stands
+//! between the pipelines and the client they actually ship with.
 
-use crate::{BuildError, ContainerRef, DaggerClient, DirectoryRef, FileRef, SecretRef};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MockCall {
-    HostDirectory(String),
-    HostDirectoryFiltered {
-        path: String,
-        exclude: Vec<String>,
-        include: Vec<String>,
-    },
-    ContainerFrom(String),
-    SetSecret(String),
-    WithExec(Vec<String>),
-    WithEnv {
-        key: String,
-        value: String,
-    },
-    WithWorkdir(String),
-    WithDirectory(String),
-    WithFile(String),
-    WithEntrypoint(Vec<String>),
-    WithUser(String),
-    WithRegistryAuth {
-        registry: String,
-        username: String,
-    },
-    File(String),
-    ExportImage(String),
-    ExportFile {
-        source: String,
-        host_path: String,
-    },
-    Publish(String),
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct MockDaggerClient {
-    state: Arc<Mutex<MockState>>,
-}
-
-#[derive(Debug, Default)]
-struct MockState {
-    calls: Vec<MockCall>,
-    fail_publish: bool,
-}
-
-impl MockDaggerClient {
-    pub fn calls(&self) -> Vec<MockCall> {
-        self.state.lock().expect("mock state lock").calls.clone()
-    }
-
-    pub fn with_publish_error(self) -> Self {
-        self.state.lock().expect("mock state lock").fail_publish = true;
-        self
-    }
-
-    fn record(&self, call: MockCall) {
-        self.state.lock().expect("mock state lock").calls.push(call);
-    }
-}
-
-impl DaggerClient for MockDaggerClient {
-    fn host_directory<'client>(
-        &'client self,
-        path: &Path,
-    ) -> Result<Box<dyn DirectoryRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::HostDirectory(path.display().to_string()));
-        Ok(Box::new(MockDirectory {
-            state: Arc::clone(&self.state),
-        }))
-    }
-
-    fn host_directory_filtered<'client>(
-        &'client self,
-        path: &Path,
-        exclude: &[&str],
-        include: &[&str],
-    ) -> Result<Box<dyn DirectoryRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::HostDirectoryFiltered {
-            path: path.display().to_string(),
-            exclude: to_strings(exclude),
-            include: to_strings(include),
-        });
-        Ok(Box::new(MockDirectory {
-            state: Arc::clone(&self.state),
-        }))
-    }
-
-    fn container_from<'client>(
-        &'client self,
-        image: &str,
-    ) -> Result<Box<dyn ContainerRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::ContainerFrom(image.to_owned()));
-        Ok(Box::new(MockContainer {
-            state: Arc::clone(&self.state),
-        }))
-    }
-
-    fn set_secret<'client>(
-        &'client self,
-        name: &str,
-        _value: &str,
-    ) -> Result<Box<dyn SecretRef + 'client>, BuildError> {
-        self.record(MockCall::SetSecret(name.to_owned()));
-        Ok(Box::new(MockSecret))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct MockContainer {
-    state: Arc<Mutex<MockState>>,
-}
-
-impl MockContainer {
-    fn record(&self, call: MockCall) {
-        self.state.lock().expect("mock state lock").calls.push(call);
-    }
-}
-
-impl<'client> ContainerRef<'client> for MockContainer {
-    fn clone_ref(&self) -> Result<Box<dyn ContainerRef<'client> + 'client>, BuildError> {
-        Ok(Box::new(self.clone()))
-    }
-
-    fn with_exec(
-        self: Box<Self>,
-        args: &[&str],
-    ) -> Result<Box<dyn ContainerRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::WithExec(to_strings(args)));
-        Ok(self)
-    }
-
-    fn with_env(
-        self: Box<Self>,
-        key: &str,
-        value: &str,
-    ) -> Result<Box<dyn ContainerRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::WithEnv {
-            key: key.to_owned(),
-            value: value.to_owned(),
-        });
-        Ok(self)
-    }
-
-    fn with_workdir(
-        self: Box<Self>,
-        path: &str,
-    ) -> Result<Box<dyn ContainerRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::WithWorkdir(path.to_owned()));
-        Ok(self)
-    }
-
-    fn with_directory(
-        self: Box<Self>,
-        path: &str,
-        _dir: &dyn DirectoryRef<'client>,
-    ) -> Result<Box<dyn ContainerRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::WithDirectory(path.to_owned()));
-        Ok(self)
-    }
-
-    fn with_file(
-        self: Box<Self>,
-        path: &str,
-        _file: &dyn FileRef<'client>,
-    ) -> Result<Box<dyn ContainerRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::WithFile(path.to_owned()));
-        Ok(self)
-    }
-
-    fn with_entrypoint(
-        self: Box<Self>,
-        args: &[&str],
-    ) -> Result<Box<dyn ContainerRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::WithEntrypoint(to_strings(args)));
-        Ok(self)
-    }
-
-    fn with_user(
-        self: Box<Self>,
-        user: &str,
-    ) -> Result<Box<dyn ContainerRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::WithUser(user.to_owned()));
-        Ok(self)
-    }
-
-    fn with_registry_auth(
-        self: Box<Self>,
-        registry: &str,
-        user: &str,
-        _secret: &dyn SecretRef,
-    ) -> Result<Box<dyn ContainerRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::WithRegistryAuth {
-            registry: registry.to_owned(),
-            username: user.to_owned(),
-        });
-        Ok(self)
-    }
-
-    fn file(&self, path: &str) -> Result<Box<dyn FileRef<'client> + 'client>, BuildError> {
-        self.record(MockCall::File(path.to_owned()));
-        Ok(Box::new(MockFile {
-            state: Arc::clone(&self.state),
-            source: path.to_owned(),
-        }))
-    }
-
-    fn export_image(&self, tag: &str) -> Result<(), BuildError> {
-        self.record(MockCall::ExportImage(tag.to_owned()));
-        Ok(())
-    }
-
-    fn publish(&self, remote_ref: &str) -> Result<String, BuildError> {
-        self.record(MockCall::Publish(remote_ref.to_owned()));
-        if self.state.lock().expect("mock state lock").fail_publish {
-            return Err(BuildError::Validation {
-                reason: "mock publish failure".to_owned(),
-            });
-        }
-        Ok(format!("{remote_ref}@sha256:mock"))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct MockDirectory {
-    state: Arc<Mutex<MockState>>,
-}
-
-impl<'client> DirectoryRef<'client> for MockDirectory {
-    fn file(&self, name: &str) -> Result<Box<dyn FileRef<'client> + 'client>, BuildError> {
-        self.state
-            .lock()
-            .expect("mock state lock")
-            .calls
-            .push(MockCall::File(name.to_owned()));
-        Ok(Box::new(MockFile {
-            state: Arc::clone(&self.state),
-            source: name.to_owned(),
-        }))
-    }
-}
-
-/// A mock file that knows the container path it came from; `export` writes
-/// deterministic bytes derived from that path, so pipelines that hash their
-/// exported artifacts (the provisioner build) exercise real host-side
-/// checksumming under the mock.
-#[derive(Debug, Clone)]
-struct MockFile {
-    state: Arc<Mutex<MockState>>,
-    source: String,
-}
-
-impl<'client> FileRef<'client> for MockFile {
-    fn export(&self, host_path: &Path) -> Result<(), BuildError> {
-        self.state
-            .lock()
-            .expect("mock state lock")
-            .calls
-            .push(MockCall::ExportFile {
-                source: self.source.clone(),
-                host_path: host_path.display().to_string(),
-            });
-        if let Some(parent) = host_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| BuildError::Validation {
-                reason: format!("mock export mkdir: {e}"),
-            })?;
-        }
-        std::fs::write(host_path, mock_artifact_bytes(&self.source)).map_err(|e| {
-            BuildError::Validation {
-                reason: format!("mock export write: {e}"),
-            }
-        })
-    }
-}
-
-/// The deterministic bytes [`MockFile::export`] writes for a container path —
-/// tests derive expected checksums from this.
-pub fn mock_artifact_bytes(source: &str) -> Vec<u8> {
-    format!("mock-artifact:{source}").into_bytes()
-}
-
-#[derive(Debug, Clone)]
-struct MockSecret;
-
-impl SecretRef for MockSecret {}
-
-fn to_strings(args: &[&str]) -> Vec<String> {
-    args.iter().map(|arg| (*arg).to_owned()).collect()
-}
+use std::sync::{Arc, Mutex};
 
 /// A canned wire: the SDK's own [`dagger_sdk::EngineConnection`] seam, driven
 /// by tests. Every GraphQL request the client executes is recorded verbatim;
@@ -351,6 +62,20 @@ impl CannedWire {
                 let address = string_argument(query, "publish", "address").unwrap_or_default();
                 serde_json::Value::String(format!("{address}@sha256:canned"))
             }
+            Some("export") => {
+                // A real engine writes the exported file host-side through
+                // the session; the canned wire does the same with
+                // deterministic bytes, so pipelines that hash what they
+                // exported exercise real host-side checksumming.
+                let host_path = string_argument(query, "export", "path").unwrap_or_default();
+                if let Some(parent) = std::path::Path::new(&host_path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(&host_path, canned_artifact_bytes(&host_path))
+                    .expect("canned export writes");
+                serde_json::Value::String(host_path)
+            }
+            Some("stdout" | "stderr") => serde_json::Value::String(String::new()),
             Some("entries") => serde_json::Value::Array(Vec::new()),
             _ => serde_json::Value::Null,
         };
@@ -454,6 +179,12 @@ fn selection_path(query: &str) -> Vec<String> {
         path.push(identifier);
     }
     path
+}
+
+/// The deterministic bytes a [`CannedWire`] export writes for a host path —
+/// tests derive expected checksums from this.
+pub fn canned_artifact_bytes(host_path: &str) -> Vec<u8> {
+    format!("canned-artifact:{host_path}").into_bytes()
 }
 
 /// The string value of `argument` on the selected `field` in a rendered

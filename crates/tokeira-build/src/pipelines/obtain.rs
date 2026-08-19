@@ -18,9 +18,10 @@
 
 use std::collections::BTreeMap;
 
+use dagger_sdk::Client;
 use tokeira_deployment::{AuthorityTier, BundleStore, ProvisionerBundle, Target};
 
-use crate::{BuildError, DaggerClient};
+use crate::BuildError;
 
 use super::provisioner::{ProvisionerBuildRequest, build_provisioner, engine_identity_for};
 
@@ -37,13 +38,13 @@ pub struct ObtainedProvisioner {
 }
 
 /// Resolve a verified bundle for the request's identity from `store`, or
-/// build one via `dagger` and publish it. `floor` is the deployment's
+/// build one through the connected Dagger client and publish it. `floor` is the deployment's
 /// required authority tier; the request's own authority must satisfy it
 /// (building bytes the deployment would immediately refuse is a request
 /// error, surfaced before any work).
 pub async fn obtain_provisioner(
     request: &ProvisionerBuildRequest,
-    dagger: &dyn DaggerClient,
+    client: &Client,
     store: &BundleStore,
     floor: AuthorityTier,
 ) -> Result<ObtainedProvisioner, BuildError> {
@@ -85,7 +86,7 @@ pub async fn obtain_provisioner(
 
     // Miss: one canonical build, published before use so the next create of
     // this identity — any deployment, any agent — hits.
-    let bundle = build_provisioner(request, dagger)?;
+    let bundle = build_provisioner(request, client).await?;
     let mut bytes_by_target = BTreeMap::new();
     for target in &request.targets {
         let path = request.output_dir.join(&target.0).join("tkp");
@@ -105,7 +106,7 @@ pub async fn obtain_provisioner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SnapshotRequest, snapshot_source_closure, testing::MockDaggerClient};
+    use crate::{SnapshotRequest, snapshot_source_closure, testing::canned_client};
     use std::{
         path::{Path, PathBuf},
         process::Command,
@@ -187,28 +188,28 @@ mod tests {
         let request = request(repo.path(), out.path());
 
         // First obtain: an honest miss → build → publish.
-        let mock = MockDaggerClient::default();
-        let first = obtain_provisioner(&request, &mock, &store, AuthorityTier::LocalDeveloper)
+        let (client, wire) = canned_client().await;
+        let first = obtain_provisioner(&request, &client, &store, AuthorityTier::LocalDeveloper)
             .await
             .expect("obtain builds");
         assert!(!first.cache_hit);
-        assert!(!mock.calls().is_empty(), "the engine was exercised");
+        assert!(!wire.requests().is_empty(), "the engine was exercised");
 
         // Second obtain, same identity: a verified CAS hit — ZERO engine calls.
-        let mock2 = MockDaggerClient::default();
+        let (client2, wire2) = canned_client().await;
         let out2 = tempfile::tempdir().expect("tempdir");
         let mut second_request = request.clone();
         second_request.output_dir = out2.path().to_path_buf();
         let second = obtain_provisioner(
             &second_request,
-            &mock2,
+            &client2,
             &store,
             AuthorityTier::LocalDeveloper,
         )
         .await
         .expect("obtain hits");
         assert!(second.cache_hit);
-        assert!(mock2.calls().is_empty(), "a hit builds nothing");
+        assert!(wire2.requests().is_empty(), "a hit builds nothing");
         assert_eq!(second.bundle, first.bundle);
         assert_eq!(second.bytes_by_target, first.bytes_by_target);
     }
@@ -218,19 +219,19 @@ mod tests {
         let repo = tempfile::tempdir().expect("tempdir");
         let out = tempfile::tempdir().expect("tempdir");
         let cas = tempfile::tempdir().expect("tempdir");
-        let mock = MockDaggerClient::default();
+        let (client, wire) = canned_client().await;
         let request = request(repo.path(), out.path());
 
         let err = obtain_provisioner(
             &request,
-            &mock,
+            &client,
             &store(cas.path()),
             AuthorityTier::TrustedCi,
         )
         .await
         .expect_err("a LocalDeveloper build cannot satisfy a TrustedCi floor");
         assert!(matches!(err, BuildError::Validation { .. }));
-        assert!(mock.calls().is_empty());
+        assert!(wire.requests().is_empty());
     }
 
     #[tokio::test]
@@ -241,8 +242,8 @@ mod tests {
         let store = store(cas.path());
         let request = request(repo.path(), out.path());
 
-        let mock = MockDaggerClient::default();
-        let built = obtain_provisioner(&request, &mock, &store, AuthorityTier::LocalDeveloper)
+        let (client, _wire) = canned_client().await;
+        let built = obtain_provisioner(&request, &client, &store, AuthorityTier::LocalDeveloper)
             .await
             .expect("obtain builds");
         // Corrupt the stored artifact behind the store's back.
@@ -256,7 +257,7 @@ mod tests {
         )
         .expect("tamper");
 
-        let err = obtain_provisioner(&request, &mock, &store, AuthorityTier::LocalDeveloper)
+        let err = obtain_provisioner(&request, &client, &store, AuthorityTier::LocalDeveloper)
             .await
             .expect_err("tampering surfaces — no quiet rebuild");
         assert!(matches!(

@@ -75,13 +75,13 @@ impl FunctionCall {
     ) -> Result<(), crate::QueryError> {
         let query = self.selection.select("returnError");
         let query = query.arg_id_input("error", error.into());
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Set the return value of the function call to the provided value.\n\nSelects GraphQL field `returnValue` on `FunctionCall`."]
     pub async fn return_value(&self, value: crate::Json) -> Result<(), crate::QueryError> {
         let query = self.selection.select("returnValue");
         let query = query.arg("value", value);
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
 }
 impl super::Node for FunctionCall {

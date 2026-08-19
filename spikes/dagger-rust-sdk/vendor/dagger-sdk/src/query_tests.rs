@@ -181,3 +181,85 @@ proptest! {
         })?;
     }
 }
+
+/// A connection answering every request with one canned payload — the wire
+/// shapes under test are the fixture, not the transport.
+#[derive(Clone)]
+struct CannedWire {
+    payload: serde_json::Value,
+}
+
+#[async_trait]
+impl EngineConnection for CannedWire {
+    async fn execute(&self, _request: RawRequest) -> Result<RawResponse, EngineConnectionError> {
+        Ok(RawResponse::new(ResponseData::Value(self.payload.clone())))
+    }
+
+    async fn close(&self) -> Result<(), EngineConnectionError> {
+        Ok(())
+    }
+
+    fn abort(&self) {}
+}
+
+async fn canned_client(payload: serde_json::Value) -> crate::Client {
+    let config = ClientConfig::builder()
+        .connection(Box::new(CannedWire { payload }))
+        .build()
+        .expect("valid explicit connection");
+    crate::connect_with(config)
+        .await
+        .expect("explicit connection bypasses source discovery")
+}
+
+// `Void`'s prescribed wire encoding is JSON null — the type's own
+// description and its null literal encoding agree. Exactly null decodes;
+// every other shape refuses loudly, which is what surfaces an engine that
+// deviates from the prescription (the observed `{}` deviation is an engine
+// defect, tracked separately, corrected in the composed engine).
+#[cfg(feature = "gen")]
+#[test]
+fn void_results_decode_null_only_and_refuse_every_other_shape() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let client = canned_client(serde_json::json!({
+            "container": {"from": {"exportImage": null}}
+        }))
+        .await;
+        client
+            .query()
+            .container()
+            .from("alpine:3.22")
+            .export_image("void-wire:probe")
+            .await
+            .expect("the prescribed null decodes");
+        client.close().await.expect("close");
+
+        for refused in [
+            serde_json::json!({}),
+            serde_json::json!({"unexpected": true}),
+            serde_json::json!("done"),
+            serde_json::json!(0),
+        ] {
+            let client = canned_client(serde_json::json!({
+                "container": {"from": {"exportImage": refused}}
+            }))
+            .await;
+            let error = client
+                .query()
+                .container()
+                .from("alpine:3.22")
+                .export_image("void-wire:probe")
+                .await
+                .expect_err("a non-null void result refuses");
+            assert!(
+                matches!(error, crate::QueryError::Decode(_)),
+                "unexpected error class: {error:?}"
+            );
+            client.close().await.expect("close");
+        }
+    });
+}

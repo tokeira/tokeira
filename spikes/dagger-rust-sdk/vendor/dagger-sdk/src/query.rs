@@ -165,6 +165,24 @@ impl Selection {
         self.decode(response)
     }
 
+    /// Executes a selection whose GraphQL type is `Void`.
+    ///
+    /// `Void`'s prescribed wire encoding is JSON null — the type's own
+    /// description ("A Null Void…") and its null literal encoding agree.
+    /// Any other value refuses as a decode error rather than being
+    /// silently discarded; a strict decode is what surfaces an engine
+    /// that deviates from the prescription.
+    pub(crate) async fn execute_void(&self, session: &SessionHandle) -> Result<(), QueryError> {
+        let value: Value = self.execute(session).await?;
+        match &value {
+            Value::Null => Ok(()),
+            _ => Err(QueryError::Decode(ResponseDecodingError::with_source(
+                ResponseDecodingErrorKind::InvalidShape,
+                <serde_json::Error as serde::de::Error>::custom("a Void-typed result must be null"),
+            ))),
+        }
+    }
+
     #[cfg_attr(not(feature = "gen"), allow(dead_code))]
     pub(crate) async fn execute_reentry<T, I>(
         &self,
@@ -506,6 +524,14 @@ impl QueryBuilder {
         T: DeserializeOwned,
     {
         self.selection.execute(&self.session).await
+    }
+
+    /// Executes a selection whose GraphQL type is `Void`.
+    ///
+    /// `Void`'s prescribed wire encoding is JSON null; any other value
+    /// refuses as a decode error.
+    pub async fn execute_void(&self) -> Result<(), QueryError> {
+        self.selection.execute_void(&self.session).await
     }
 
     #[cfg(test)]

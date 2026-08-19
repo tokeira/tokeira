@@ -117,28 +117,15 @@ pub(crate) async fn build(tag: Option<&str>) -> Result<()> {
 
     let export = Instant::now();
     // Engine-side load into the host image store: no tarball, no
-    // `docker load`, one call per tag. KNOWN DEFECT (spike finding): the
-    // beta.11 generated binding decodes `exportImage` as unit while the
-    // engine returns a map — falls back to the tarball export so the probe
-    // still proves the export path end to end.
-    match runtime.export_image(tag).await {
-        Ok(()) => println!("exported image `{tag}` in {:?}", export.elapsed()),
-        Err(error) => {
-            println!("export_image defect (filed as a finding): {error:#}");
-            let tarball = format!("/tmp/{}.oci.tar", tag.replace([':', '/'], "-"));
-            let written = runtime
-                .export(&tarball)
-                .await
-                .context("tarball export fallback")?;
-            let size = std::fs::metadata(&tarball)
-                .map(|meta| meta.len())
-                .unwrap_or(0);
-            println!(
-                "tarball export fallback `{written}` ({size} bytes) in {:?}",
-                export.elapsed()
-            );
-        }
-    }
+    // `docker load`, one call per tag. `exportImage` is Void-typed; the
+    // rust.2 pair (engine encodes Void as JSON null, SDK decodes strictly
+    // null) makes this the whole-stack proof of that fix — a failure here
+    // is a probe failure, never a fallback.
+    runtime
+        .export_image(tag)
+        .await
+        .context("export_image (Void-typed; exercises the rust.2 null encoding end to end)")?;
+    println!("exported image `{tag}` in {:?}", export.elapsed());
 
     client.close().await.context("close")?;
     println!("tokeirad image build complete in {:?}", total.elapsed());

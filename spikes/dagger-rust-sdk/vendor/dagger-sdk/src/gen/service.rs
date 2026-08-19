@@ -233,7 +233,7 @@ impl Service {
     #[doc = "Creates a tunnel that forwards traffic from the caller's network to this service.\n\nSelects GraphQL field `up` on `Service`."]
     pub async fn up(&self) -> Result<(), crate::QueryError> {
         let query = self.selection.select("up");
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Executes GraphQL operation `up` with a borrowed, reusable `ServiceUpOpts` value."]
     pub async fn up_opts(&self, opts: &ServiceUpOpts) -> Result<(), crate::QueryError> {
@@ -248,7 +248,7 @@ impl Service {
         } else {
             query
         };
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Configures a hostname which can be used by clients within the session to reach this container.\n\nSelects GraphQL field `withHostname` on `Service`."]
     #[must_use]

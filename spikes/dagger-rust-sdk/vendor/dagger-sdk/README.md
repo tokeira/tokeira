@@ -11,14 +11,14 @@ loopback-only; downloaded CLI bytes are checksum-verified before use.
 ## Install
 
 The SDK is supplied as two checked repository release artifacts rather than through
-crates.io. Download `dagger-sdk-1.0.0-beta.11.rust.1.crate`,
-`dagger-sdk-macros-1.0.0-beta.11.rust.1.crate`, and `SHA256SUMS` from the same manual
+crates.io. Download `dagger-sdk-1.0.0-beta.11.rust.3.crate`,
+`dagger-sdk-macros-1.0.0-beta.11.rust.3.crate`, and `SHA256SUMS` from the same manual
 GitHub Release, then verify both package checksums before unpacking them:
 
 ```console
 mkdir -p vendor/dagger-sdk vendor/dagger-sdk-macros
-tar -xzf dagger-sdk-1.0.0-beta.11.rust.1.crate -C vendor/dagger-sdk --strip-components=1
-tar -xzf dagger-sdk-macros-1.0.0-beta.11.rust.1.crate -C vendor/dagger-sdk-macros --strip-components=1
+tar -xzf dagger-sdk-1.0.0-beta.11.rust.3.crate -C vendor/dagger-sdk --strip-components=1
+tar -xzf dagger-sdk-macros-1.0.0-beta.11.rust.3.crate -C vendor/dagger-sdk-macros --strip-components=1
 ```
 
 Reference the unpacked SDK and its exact procedural-macro companion from

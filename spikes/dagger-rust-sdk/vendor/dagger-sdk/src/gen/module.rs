@@ -273,7 +273,7 @@ impl Module {
     #[doc = "Serve a module's API in the current session.\n\nNote: this can only be called once per session. In the future, it could return a stream or service to remove the side effect.\n\nSelects GraphQL field `serve` on `Module`."]
     pub async fn serve(&self) -> Result<(), crate::QueryError> {
         let query = self.selection.select("serve");
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Executes GraphQL operation `serve` with a borrowed, reusable `ModuleServeOpts` value."]
     pub async fn serve_opts(&self, opts: &ModuleServeOpts) -> Result<(), crate::QueryError> {
@@ -288,7 +288,7 @@ impl Module {
         } else {
             query
         };
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Return all services defined by the module\n\nSelects GraphQL field `services` on `Module`.\n\n**Experimental:** This API is highly experimental and may be removed or replaced entirely."]
     #[must_use]

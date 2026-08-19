@@ -1553,7 +1553,7 @@ impl Container {
     pub async fn export_image(&self, name: impl Into<String>) -> Result<(), crate::QueryError> {
         let query = self.selection.select("exportImage");
         let query = query.arg("name", name.into());
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Executes GraphQL operation `exportImage` with a borrowed, reusable `ContainerExportImageOpts` value."]
     pub async fn export_image_opts(
@@ -1578,7 +1578,7 @@ impl Container {
         } else {
             query
         };
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Retrieves the list of exposed ports.\n\nThis includes ports already exposed by the image, even if not explicitly added with dagger.\n\nSelects GraphQL field `exposedPorts` on `Container`."]
     pub async fn exposed_ports(&self) -> Result<Vec<super::Port>, crate::QueryError> {
@@ -1917,7 +1917,7 @@ impl Container {
     #[doc = "Starts a Service and creates a tunnel that forwards traffic from the caller's network to that service.\n\nBe sure to set any exposed ports before calling this api.\n\nSelects GraphQL field `up` on `Container`."]
     pub async fn up(&self) -> Result<(), crate::QueryError> {
         let query = self.selection.select("up");
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Executes GraphQL operation `up` with a borrowed, reusable `ContainerUpOpts` value."]
     pub async fn up_opts(&self, opts: &ContainerUpOpts) -> Result<(), crate::QueryError> {
@@ -1962,7 +1962,7 @@ impl Container {
         } else {
             query
         };
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Retrieves the user to be set for all commands.\n\nSelects GraphQL field `user` on `Container`."]
     pub async fn user(&self) -> Result<String, crate::QueryError> {

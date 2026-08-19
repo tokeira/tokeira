@@ -634,7 +634,7 @@ impl Workspace {
     #[doc = "Write this workspace's pending changes to its local Git workspace.\n\nSelects GraphQL field `export` on `Workspace`."]
     pub async fn export(&self) -> Result<(), crate::QueryError> {
         let query = self.selection.select("export");
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Returns a File from the workspace.\n\nRelative paths resolve from the workspace cwd. Absolute paths resolve from the workspace root.\n\nSelects GraphQL field `file` on `Workspace`."]
     #[must_use]

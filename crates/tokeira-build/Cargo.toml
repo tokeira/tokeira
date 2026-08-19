@@ -14,8 +14,10 @@ description = "Image build, publish, and mirror pipelines for Tokeira"
 testing = []
 
 [dependencies]
+async-trait.workspace = true
 cargo_metadata.workspace = true
 dagger-client.workspace = true
+dagger-sdk.workspace = true
 eyre.workspace = true
 gix.workspace = true
 serde.workspace = true

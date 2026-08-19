@@ -1014,6 +1014,7 @@ macro_rules! bound_provisioner_main {
                         platform.package_name.clone(),
                         frontend.package_name.clone(),
                     ],
+                    path_dependency_dirs: Vec::new(),
                     workspace_files: Vec::new(),
                     locked: Vec::new(),
                 },

@@ -1700,6 +1700,7 @@ mod tests {
                 tokeira_build::ProvisionerClosure {
                     crate_dirs: vec![PathBuf::from("platforms/alpha")],
                     crate_names: vec!["tokeira-alpha".into()],
+                    path_dependency_dirs: Vec::new(),
                     workspace_files: vec![
                         PathBuf::from("rust-toolchain.toml"),
                         PathBuf::from("Cargo.lock"),

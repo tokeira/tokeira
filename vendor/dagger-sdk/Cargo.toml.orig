@@ -1,0 +1,98 @@
+[package]
+name = "dagger-sdk"
+description = "A dagger sdk for rust, written in rust"
+publish = true
+readme = "README.md"
+include = ["/src/**", "/examples/**", "!/examples/*/app/**", "/README.md", "/LICENSE"]
+
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dagger-sdk-macros.workspace = true
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_graphql_input = { workspace = true }
+semver.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+futures.workspace = true
+base64.workspace = true
+dirs.workspace = true
+flate2.workspace = true
+hex.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+tracing-opentelemetry.workspace = true
+async-trait.workspace = true
+url.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+loom.workspace = true
+pretty_assertions.workspace = true
+proptest.workspace = true
+rand.workspace = true
+trybuild.workspace = true
+
+[features]
+default = ["gen"]
+gen = []
+
+[[example]]
+name = "build-the-application"
+path = "examples/build-the-application/main.rs"
+required-features = ["gen"]
+
+[[example]]
+name = "caching"
+path = "examples/caching/main.rs"
+required-features = ["gen"]
+
+[[example]]
+name = "existing-dockerfile"
+path = "examples/existing-dockerfile/main.rs"
+required-features = ["gen"]
+
+[[example]]
+name = "first-pipeline"
+path = "examples/first-pipeline/main.rs"
+required-features = ["gen"]
+
+[[example]]
+name = "injected-connection"
+path = "examples/injected_connection.rs"
+required-features = ["gen"]
+
+[[example]]
+name = "logging"
+path = "examples/logging/main.rs"
+required-features = ["gen"]
+
+[[example]]
+name = "multi-stage-build"
+path = "examples/multi-stage-build/main.rs"
+required-features = ["gen"]
+
+[[example]]
+name = "publish-the-application"
+path = "examples/publish-the-application/main.rs"
+required-features = ["gen"]
+
+[[example]]
+name = "test-the-application"
+path = "examples/test-the-application/main.rs"
+required-features = ["gen"]

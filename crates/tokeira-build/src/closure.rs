@@ -47,6 +47,13 @@ pub struct ProvisionerClosure {
     pub crate_names: Vec<String>,
     /// Workspace-relative build-shaping files that exist in this workspace.
     pub workspace_files: Vec<PathBuf>,
+    /// Workspace-relative directories of **non-member path dependencies** the
+    /// scoped workspace must carry, sorted: every `[patch.*]` target (patches
+    /// resolve eagerly, so a dangling patch path fails resolution outright)
+    /// and every reachable source-less non-member package (a vendored crate a
+    /// closure member consumes). These stage and freeze like crate dirs but
+    /// are never workspace members.
+    pub path_dependency_dirs: Vec<PathBuf>,
     /// The locked third-party dependencies reachable from the seed, sorted by
     /// (name, version).
     pub locked: Vec<LockedDependency>,
@@ -82,17 +89,24 @@ pub enum ClosureError {
     },
     #[error("failed to parse Cargo.lock: {0}")]
     LockParse(#[from] toml::de::Error),
+    #[error("failed to parse the workspace manifest: {0}")]
+    ManifestParse(toml::de::Error),
+    /// A path dependency the closure must freeze lies outside the workspace
+    /// — it cannot travel with the frozen source.
+    #[error("path dependency `{package}` at {path} lies outside the workspace")]
+    PathDependencyOutsideWorkspace { package: String, path: String },
 }
 
 impl ProvisionerClosure {
-    /// Every snapshot path: the crate directories plus the workspace build
-    /// files, in one sorted list for
-    /// [`SnapshotRequest::closure_paths`](crate::SnapshotRequest).
+    /// Every snapshot path: the crate directories, the workspace build
+    /// files, and the non-member path-dependency directories, in one sorted
+    /// list for [`SnapshotRequest::closure_paths`](crate::SnapshotRequest).
     pub fn closure_paths(&self) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = self
             .crate_dirs
             .iter()
             .chain(self.workspace_files.iter())
+            .chain(self.path_dependency_dirs.iter())
             .cloned()
             .collect();
         paths.sort();
@@ -175,29 +189,48 @@ pub fn resolve_source_closure_for_packages(
         }
     }
 
-    // Partition: workspace members → crate dirs; the rest → the locked set.
+    // Partition: workspace members → crate dirs; the rest → the locked set,
+    // with source-less (path-dependency) packages also recorded as
+    // directories the scoped workspace must carry.
     let members: BTreeSet<&cargo_metadata::PackageId> = metadata.workspace_members.iter().collect();
     let checksums = lock_checksums(workspace_root)?;
+    // `AsRef::<str>` spelled out: `typed_path` (via `tough`) adds a
+    // blanket `AsRef<Utf8Path<_>> for Cow<'_, str>` that makes a bare
+    // `as_ref()` ambiguous.
+    let root_prefix: &str = &workspace_root.to_string_lossy();
+    let workspace_relative_dir =
+        |package: &cargo_metadata::Package| -> Result<PathBuf, ClosureError> {
+            let dir = package
+                .manifest_path
+                .parent()
+                .expect("a manifest path always has a parent directory");
+            let relative = dir.strip_prefix(root_prefix).map_err(|_| {
+                ClosureError::PathDependencyOutsideWorkspace {
+                    package: package.name.as_str().to_owned(),
+                    path: dir.as_str().to_owned(),
+                }
+            })?;
+            Ok(PathBuf::from(relative.as_str().trim_start_matches('/')))
+        };
     let mut crate_dirs = Vec::new();
     let mut crate_names = Vec::new();
+    let mut path_dependency_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     let mut locked = Vec::new();
     for package in &metadata.packages {
         if !reachable.contains(&package.id) {
             continue;
         }
         if members.contains(&package.id) {
-            let dir = package
-                .manifest_path
-                .parent()
-                .expect("a manifest path always has a parent directory");
-            // `AsRef::<str>` spelled out: `typed_path` (via `tough`) adds a
-            // blanket `AsRef<Utf8Path<_>> for Cow<'_, str>` that makes a bare
-            // `as_ref()` ambiguous.
-            let root_prefix: &str = &workspace_root.to_string_lossy();
-            let relative = dir.strip_prefix(root_prefix).unwrap_or(dir);
-            crate_dirs.push(PathBuf::from(relative.as_str().trim_start_matches('/')));
+            crate_dirs.push(workspace_relative_dir(package)?);
             crate_names.push(package.name.as_str().to_owned());
         } else {
+            if package.source.is_none() {
+                // A reachable non-member without a registry/git source is a
+                // path dependency (a vendored crate): its directory must
+                // stage and freeze with the closure or the scoped workspace
+                // cannot resolve.
+                path_dependency_dirs.insert(workspace_relative_dir(package)?);
+            }
             let version = package.version.to_string();
             let checksum = checksums
                 .get(&(package.name.as_str().to_owned(), version.clone()))
@@ -209,6 +242,12 @@ pub fn resolve_source_closure_for_packages(
                 checksum,
             });
         }
+    }
+    // `[patch.*]` targets resolve eagerly — a dangling patch path fails the
+    // scoped workspace outright, reachable or not — so every patch path
+    // stages unconditionally.
+    for patch_dir in manifest_patch_paths(workspace_root)? {
+        path_dependency_dirs.insert(patch_dir);
     }
     crate_dirs.sort();
     crate_names.sort();
@@ -224,8 +263,44 @@ pub fn resolve_source_closure_for_packages(
         crate_dirs,
         crate_names,
         workspace_files,
+        path_dependency_dirs: path_dependency_dirs.into_iter().collect(),
         locked,
     })
+}
+
+/// Workspace-relative `path` targets of every `[patch.*]` entry in the root
+/// manifest. Patch paths are authored workspace-relative; an absolute or
+/// escaping path is refused — it could not be frozen with the source.
+fn manifest_patch_paths(workspace_root: &Path) -> Result<Vec<PathBuf>, ClosureError> {
+    let path = workspace_root.join("Cargo.toml");
+    let content = std::fs::read_to_string(&path).map_err(|source| ClosureError::ReadFile {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let manifest: toml::Value = content.parse().map_err(ClosureError::ManifestParse)?;
+    let mut paths = Vec::new();
+    let Some(patches) = manifest.get("patch").and_then(toml::Value::as_table) else {
+        return Ok(paths);
+    };
+    for registry in patches.values() {
+        let Some(entries) = registry.as_table() else {
+            continue;
+        };
+        for (name, entry) in entries {
+            let Some(patch_path) = entry.get("path").and_then(toml::Value::as_str) else {
+                continue;
+            };
+            let relative = Path::new(patch_path);
+            if relative.is_absolute() || patch_path.contains("..") {
+                return Err(ClosureError::PathDependencyOutsideWorkspace {
+                    package: name.clone(),
+                    path: patch_path.to_owned(),
+                });
+            }
+            paths.push(relative.to_path_buf());
+        }
+    }
+    Ok(paths)
 }
 
 /// `(name, version) → checksum` from the workspace `Cargo.lock`.

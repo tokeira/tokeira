@@ -143,5 +143,5 @@ jobs:
         with:
           # Vendored third-party trees carry their upstreams' relative links,
           # which rightly resolve only in their home repositories.
-          args: --offline --no-progress --hidden --exclude-path .git --exclude-path target --exclude-path spikes/dagger-rust-sdk/vendor './**/*.md'
+          args: --offline --no-progress --hidden --exclude-path .git --exclude-path target --exclude-path spikes/dagger-rust-sdk/vendor --exclude-path vendor/dagger-sdk --exclude-path vendor/dagger-sdk-macros './**/*.md'
           fail: true

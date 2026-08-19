@@ -4,15 +4,14 @@
 //! because they share Dagger plumbing, the ECR auth path, and the
 //! deployment-config writeback pattern.
 //!
-//! # The Dagger re-exec dance
+//! # The Dagger session
 //!
-//! `build`, `push`, and `mirror` all need a live Dagger session, which
-//! means they need `DAGGER_SESSION_PORT` + `DAGGER_SESSION_TOKEN` in the
-//! environment. Rather than requiring operators to remember `dagger run
-//! tkr image build`, we transparently re-exec this binary under `dagger
-//! run` when those env vars are missing. See [`reexec_under_dagger`].
-//!
-//! `list` does not need Dagger and skips the re-exec path entirely.
+//! `build`, `push`, and `mirror` each own one SDK session:
+//! `dagger_sdk::connect()` provisions and authenticates it in-process —
+//! no `dagger run` wrapper, no session env vars, no re-exec. Engine
+//! selection stays configuration: a pinned engine + CLI pair is chosen
+//! with `_EXPERIMENTAL_DAGGER_RUNNER_HOST` / `_EXPERIMENTAL_DAGGER_CLI_BIN`
+//! exactly as a dev-engine setup documents. `list` needs no engine.
 //!
 //! # Image source types
 //!
@@ -33,22 +32,21 @@
 
 pub(crate) mod local_inspector;
 
-use std::{path::PathBuf, process::Stdio};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use local_inspector::{DockerCliInspector, LocalImageInspector};
 use tokeira_aws::{DefaultEcrClient, EcrClient};
 use tokeira_build::{
-    DefaultDaggerClient, MirrorRequest, PublishRequest, RegistryPassword, TokeiradBuildRequest,
-    build_tokeirad_image, mirror_image, publish_image,
+    MirrorRequest, PublishRequest, RegistryPassword, TokeiradBuildRequest, build_tokeirad_image,
+    mirror_image, publish_image,
 };
 use tokeira_deploy_engine::{Image, ImageContext, ImageSourceType};
 use tokeira_iac::ProvisionContext;
 use tokeira_orchestrator::Deployment;
-use tokio::process::Command;
 
 use crate::{
-    cli::{CliArch, ImageCommand},
+    cli::ImageCommand,
     commands::require_confirmation,
     deployment_dir::{DEPLOYMENT_TOML, DeploymentContext, PlatformDeploymentConfig},
     tui::OutputFormat,
@@ -60,76 +58,44 @@ pub(crate) async fn run(
     format: OutputFormat,
 ) -> Result<()> {
     match command {
-        ImageCommand::Build { arch, tag } => {
-            // Re-exec under `dagger run` when the Dagger session env vars are
-            // absent. The Dagger session is a hard dependency of the Dagger
-            // Rust client used by `build_tokeirad_image` — the SDK reads
-            // `DAGGER_SESSION_PORT` / `DAGGER_SESSION_TOKEN` to connect. If
-            // the user invoked `tkr image build` directly, we transparently
-            // re-invoke ourselves under `dagger run` so the next invocation
-            // sees the session variables. The re-exec path is equivalent to
-            // the EKS `dsqld` convention — see
-            // `temporal-dsql-deploy-eks/crates/cli/src/commands/build.rs:79`.
-            if should_reexec_under_dagger() {
-                return reexec_under_dagger(
-                    &ImageCommand::Build { arch, tag },
-                    deployment.as_ref(),
-                    format,
-                )
-                .await;
-            }
-            // `DefaultDaggerClient` holds a `reqwest::blocking::Client`, whose
-            // internal runtime panics if constructed or dropped inside this
-            // async context ("Cannot drop a runtime where blocking is not
-            // allowed") — run the whole sync build on a blocking thread.
-            tokio::task::spawn_blocking(move || run_build(arch.into(), tag, format))
-                .await
-                .context("the image build thread panicked")?
-        }
+        ImageCommand::Build { arch, tag } => run_build(arch.into(), tag, format).await,
         ImageCommand::List { source_type } => {
             let ctx = deployment.ok_or_else(|| deployment_required("image list"))?;
             run_list(ctx, source_type.map(Into::into), format).await
         }
         ImageCommand::Push { tag, image, yes } => {
             let ctx = deployment.ok_or_else(|| deployment_required("image push"))?;
-            if should_reexec_under_dagger() {
-                return reexec_under_dagger(
-                    &ImageCommand::Push { tag, image, yes },
-                    Some(&ctx),
-                    format,
-                )
-                .await;
-            }
             run_push(ctx, tag, image, yes, format, &DockerCliInspector).await
         }
         ImageCommand::Mirror { image, yes } => {
             let ctx = deployment.ok_or_else(|| deployment_required("image mirror"))?;
-            if should_reexec_under_dagger() {
-                return reexec_under_dagger(
-                    &ImageCommand::Mirror { image, yes },
-                    Some(&ctx),
-                    format,
-                )
-                .await;
-            }
             run_mirror(ctx, image, yes, format).await
         }
     }
 }
 
-pub(crate) fn run_build(
+/// Connect one owned Dagger session for a verb. The SDK provisions and
+/// authenticates in-process; failure names the engine dependency plainly.
+async fn dagger_session() -> Result<dagger_sdk::Client> {
+    dagger_sdk::connect()
+        .await
+        .context("failed to connect a Dagger session (a running Dagger engine is required)")
+}
+
+pub(crate) async fn run_build(
     arch: tokeira_build::Arch,
     tag: Option<String>,
     format: OutputFormat,
 ) -> Result<()> {
     let workspace_root = workspace_root_from_current_dir()?;
-    let dagger = DefaultDaggerClient::from_env()?;
+    let client = dagger_session().await?;
     let request = TokeiradBuildRequest {
         arch,
         tag,
         workspace_root,
     };
-    let result = build_tokeirad_image(&request, &dagger)?;
+    let result = build_tokeirad_image(&request, &client).await?;
+    client.close().await.context("close the Dagger session")?;
     match format {
         OutputFormat::Human => {
             println!(
@@ -184,7 +150,7 @@ async fn run_push(
     }
 
     let provision_ctx = provision_context_for_ecs(config, &deployment).await?;
-    let dagger = DefaultDaggerClient::from_env()?;
+    let client = dagger_session().await?;
     let ecr = default_ecr_client(config).await;
     let auth = ecr.get_authorization_token().await?;
     tokeira_ecs_deployment::images::ensure_ecr_repositories_from_images(
@@ -208,8 +174,9 @@ async fn run_push(
                 username: auth.username.clone(),
                 password: RegistryPassword::new(auth.password.clone()),
             },
-            &dagger,
-        )?;
+            &client,
+        )
+        .await?;
         let effective_ref = effective_ref(&auth.registry_host, &desired.repository, &tag);
         for target in selected_image.writeback_targets(&image_ctx) {
             writebacks.push((target.field.to_owned(), effective_ref.clone()));
@@ -223,6 +190,7 @@ async fn run_push(
         }
     }
 
+    client.close().await.context("close the Dagger session")?;
     write_deployment_writeback(&ctx, &writebacks)?;
     print_json_or_human(
         format,
@@ -259,7 +227,7 @@ async fn run_mirror(
     let selected = validate_image_filter(image.as_deref(), &images, ImageSourceType::Mirror)?;
 
     let provision_ctx = provision_context_for_ecs(config, &deployment).await?;
-    let dagger = DefaultDaggerClient::from_env()?;
+    let client = dagger_session().await?;
     let ecr = default_ecr_client(config).await;
     let auth = ecr.get_authorization_token().await?;
     tokeira_ecs_deployment::images::ensure_ecr_repositories_from_images(
@@ -295,8 +263,9 @@ async fn run_mirror(
                         username: auth.username.clone(),
                         password: RegistryPassword::new(auth.password.clone()),
                     },
-                    &dagger,
-                )?
+                    &client,
+                )
+                .await?
                 .published_ref,
             )
         };
@@ -312,6 +281,7 @@ async fn run_mirror(
         }));
     }
 
+    client.close().await.context("close the Dagger session")?;
     write_deployment_writeback(&ctx, &writebacks)?;
     print_json_or_human(
         format,
@@ -410,15 +380,6 @@ pub(crate) fn validate_image_filter<'a>(
     Ok(selected)
 }
 
-/// Returns `true` when the Dagger session env vars (`DAGGER_SESSION_PORT`,
-/// `DAGGER_SESSION_TOKEN`) are absent. A parent `dagger run` process injects
-/// both variables before spawning the child, so presence of both is the
-/// signal that we are already inside a live Dagger session.
-fn should_reexec_under_dagger() -> bool {
-    std::env::var_os("DAGGER_SESSION_PORT").is_none()
-        || std::env::var_os("DAGGER_SESSION_TOKEN").is_none()
-}
-
 /// Shared error constructor for image subcommands that need a deployment
 /// context to resolve platform images. Points the operator at the global
 /// `--deployment` flag so they do not have to grep the help output.
@@ -427,112 +388,6 @@ fn deployment_required(subcommand: &str) -> anyhow::Error {
         "{subcommand} requires a deployment to resolve its images. \
          pass `tkr --deployment <name> {subcommand}` or run `tkr deployment list` to see what is available"
     )
-}
-
-/// Re-execute this binary under `dagger run` so that the child process
-/// inherits `DAGGER_SESSION_PORT` and `DAGGER_SESSION_TOKEN`. The child
-/// runs the same `tkr image <subcommand>` with the original args,
-/// reconstructed via `reexec_args`.
-///
-/// `dagger run` starts a Dagger session, sets the two env vars, then runs
-/// the given command. On success, this function returns `Ok(())` and the
-/// caller returns immediately — the child process has done the real work.
-async fn reexec_under_dagger(
-    command: &ImageCommand,
-    deployment: Option<&DeploymentContext>,
-    format: OutputFormat,
-) -> Result<()> {
-    if matches!(format, OutputFormat::Human) {
-        eprintln!("starting `dagger run` session for image command...");
-    }
-
-    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let args = reexec_args(command, deployment, format);
-
-    let status = Command::new("dagger")
-        .arg("run")
-        .arg("--")
-        .arg(&current_exe)
-        .args(&args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .context(
-            "failed to launch `dagger run`; install Dagger from https://docs.dagger.io/install",
-        )?;
-
-    if !status.success() {
-        bail!("`dagger run` exited with status {status}");
-    }
-    Ok(())
-}
-
-/// Reconstruct the CLI args for re-executing `tkr image <subcommand>` under
-/// `dagger run`. The args include the global `--deployment` and `--json`
-/// flags when applicable so the child invocation is semantically equivalent
-/// to the original.
-fn reexec_args(
-    command: &ImageCommand,
-    deployment: Option<&DeploymentContext>,
-    format: OutputFormat,
-) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
-
-    if let Some(ctx) = deployment {
-        args.push("--deployment".to_string());
-        args.push(ctx.name.clone());
-    }
-    if matches!(format, OutputFormat::Json) {
-        args.push("--json".to_string());
-    }
-
-    args.push("image".to_string());
-
-    match command {
-        ImageCommand::Build { arch, tag } => {
-            args.push("build".to_string());
-            args.push("--arch".to_string());
-            args.push(
-                match arch {
-                    CliArch::Arm64 => "arm64",
-                    CliArch::Amd64 => "amd64",
-                }
-                .to_string(),
-            );
-            if let Some(tag) = tag {
-                args.push("--tag".to_string());
-                args.push(tag.clone());
-            }
-        }
-        ImageCommand::Push { tag, image, yes } => {
-            args.push("push".to_string());
-            args.push("--tag".to_string());
-            args.push(tag.clone());
-            if let Some(image) = image {
-                args.push("--image".to_string());
-                args.push(image.clone());
-            }
-            if *yes {
-                args.push("--yes".to_string());
-            }
-        }
-        ImageCommand::Mirror { image, yes } => {
-            args.push("mirror".to_string());
-            if let Some(image) = image {
-                args.push("--image".to_string());
-                args.push(image.clone());
-            }
-            if *yes {
-                args.push("--yes".to_string());
-            }
-        }
-        // Not reachable: List does not go through the reexec path.
-        ImageCommand::List { .. } => unreachable!("list does not require a Dagger session"),
-    }
-
-    args
 }
 
 async fn provision_context_for_ecs(

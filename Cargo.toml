@@ -60,6 +60,11 @@ exclude = [
     "tools/simulation/engine",
     "tools/simulation/broker",
     "tools/simulation/placement",
+    # Vendored third-party crates: consumed as path dependencies, never as
+    # members — membership inference would otherwise lint/test the published
+    # artifacts, whose packaging rightly omits their repo-only test inputs.
+    "vendor/dagger-sdk",
+    "vendor/dagger-sdk-macros",
 ]
 
 [workspace.package]
@@ -72,6 +77,9 @@ authors = ["OpenAI"]
 [workspace.dependencies]
 anyhow = "1.0.103"
 async-trait = "0.1"
+# The first-party Dagger Rust SDK, vendored from its release artifacts
+# (vendor/README.md carries the provenance and advance procedure).
+dagger-sdk = { path = "vendor/dagger-sdk" }
 base64 = "0.22"
 bollard = "0.17"
 cargo_metadata = "0.23"
@@ -228,3 +236,8 @@ panic = "abort"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# The SDK's documented install requirement: its exact-version macro
+# companion must resolve to the vendored copy, never a registry lookup.
+[patch.crates-io]
+dagger-sdk-macros = { path = "vendor/dagger-sdk-macros" }

@@ -1,14 +1,17 @@
 use std::path::PathBuf;
 
-use crate::{Arch, BuildError, DaggerClient, rust_toolchain_version};
+use dagger_sdk::{Client, HostDirectoryOpts};
+
+use crate::{Arch, BuildError, rust_toolchain_version};
 
 /// Paths excluded from the workspace upload that feeds the Dagger build.
 ///
-/// The exclude list is deliberately conservative: anything that cargo might
-/// touch during `cargo chef prepare` or `cargo build` stays in the upload.
-/// The removed directories are either build outputs (`target/`), version
-/// control metadata, editor state, or documentation/spec sources that the
-/// Rust toolchain never reads.
+/// The exclude list is deliberately conservative: anything cargo might
+/// touch during `cargo build` stays in the upload — which is why the
+/// vendored SDK crates (`vendor/`) ship: the workspace manifest's path
+/// dependencies must resolve inside the engine. The removed directories
+/// are build outputs (`target/`), version control metadata, editor state,
+/// or documentation/spec sources the Rust toolchain never reads.
 ///
 /// Without this list, Dagger hashes and ships the full `target/` tree
 /// (regularly multi-gigabyte) on every invocation, dominating the cold
@@ -26,6 +29,7 @@ const TOKEIRAD_WORKSPACE_EXCLUDES: &[&str] = &[
     ".vscode",
     ".idea",
     ".kiro",
+    ".claude",
     ".DS_Store",
     "artifacts",
     "dev",
@@ -34,6 +38,7 @@ const TOKEIRAD_WORKSPACE_EXCLUDES: &[&str] = &[
     "ops",
     "schemas",
     "spec",
+    "spikes",
     "tokeira.code-workspace",
     "tokeirad.log",
     "**/*.log",
@@ -54,94 +59,80 @@ pub struct TokeiradBuildResult {
     pub toolchain_version: String,
 }
 
-pub fn build_tokeirad_image(
+/// Build the tokeirad runtime image and load it into the host image store.
+///
+/// Two persistent cache volumes (the cargo registry and a per-target
+/// `target/` dir) replace the old three-stage cargo-chef choreography: a
+/// cold build pays full compilation once, and an incremental rebuild
+/// recompiles only what changed — exactly where chef was weakest. The
+/// built binary is copied out of the cache mount before the image stage,
+/// because cache-mount contents do not survive into container layers.
+pub async fn build_tokeirad_image(
     request: &TokeiradBuildRequest,
-    dagger: &dyn DaggerClient,
+    client: &Client,
 ) -> Result<TokeiradBuildResult, BuildError> {
     let toolchain = rust_toolchain_version(&request.workspace_root)?;
-    // Upload only the sources needed to build `tokeirad`. Without the
-    // exclude list, Dagger hashes and ships the Rust `target/` directory
-    // (multi-GB of build artifacts), `.git/`, and other engine-irrelevant
-    // trees; the upload alone can take 7+ minutes on a warm workspace and
-    // invalidates Dagger's cache on every minor edit.
-    let workspace = dagger.host_directory_filtered(
-        &request.workspace_root,
-        TOKEIRAD_WORKSPACE_EXCLUDES,
-        &[],
-    )?;
+    let query = client.query();
 
-    let chef_base_image = format!("rust:{toolchain}-slim-bookworm");
-    let mut chef = dagger.container_from(&chef_base_image)?;
-    chef = chef.with_exec(&[
-        "sh",
-        "-c",
-        "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler libprotobuf-dev ca-certificates && rm -rf /var/lib/apt/lists/*",
-    ])?;
-    chef = chef.with_exec(&["cargo", "install", "cargo-chef", "--locked"])?;
-    chef = chef.with_workdir("/app")?;
-    chef = chef.with_env("CARGO_TERM_COLOR", "never")?;
-    chef = chef.with_env("RUSTUP_TOOLCHAIN", &toolchain)?;
-    chef = chef.with_exec(&["rustup", "target", "add", request.arch.rust_target()])?;
+    // Upload only the sources needed to build `tokeirad`.
+    let opts = HostDirectoryOpts::default().with_exclude(TOKEIRAD_WORKSPACE_EXCLUDES.to_vec());
+    let workspace = query
+        .host()
+        .directory_opts(request.workspace_root.display().to_string(), &opts);
 
-    let mut planner = chef.clone_ref()?;
-    planner = planner.with_directory("/app", &*workspace)?;
-    planner = planner.with_exec(&["cargo", "chef", "prepare", "--recipe-path", "recipe.json"])?;
-    let recipe = planner.file("/app/recipe.json")?;
+    let rust_target = request.arch.rust_target();
+    let registry_cache = query.cache_volume("tokeira-cargo-registry");
+    // Per-target cache: aarch64 and x86_64 artifacts never invalidate each
+    // other.
+    let target_cache = query.cache_volume(format!("tokeira-build-target-{rust_target}"));
 
-    let mut cacher = chef.clone_ref()?;
-    cacher = cacher.with_file("/app/recipe.json", &*recipe)?;
-    cacher = cacher.with_exec(&[
-        "cargo",
-        "chef",
-        "cook",
-        "--release",
-        "--target",
-        request.arch.rust_target(),
-        "--bin",
-        "tokeirad",
-        "--recipe-path",
-        "recipe.json",
-    ])?;
+    let built_path = format!("target/{rust_target}/release/tokeirad");
+    let builder = query
+        .container()
+        .from(format!("rust:{toolchain}-slim-bookworm"))
+        .with_exec(vec![
+            "sh",
+            "-c",
+            "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler libprotobuf-dev ca-certificates && rm -rf /var/lib/apt/lists/*",
+        ])
+        .with_env_variable("CARGO_TERM_COLOR", "never")
+        .with_env_variable("RUSTUP_TOOLCHAIN", &toolchain)
+        .with_exec(vec!["rustup", "target", "add", rust_target])
+        .with_mounted_cache(registry_cache, "/usr/local/cargo/registry")
+        .with_mounted_cache(target_cache, "/app/target")
+        .with_directory("/app", workspace)
+        .with_workdir("/app")
+        .with_exec(vec![
+            "cargo",
+            "build",
+            "--release",
+            "--target",
+            rust_target,
+            "--bin",
+            "tokeirad",
+            "-p",
+            "tokeirad",
+        ])
+        // The binary must leave the cache mount to survive into the layer.
+        .with_exec(vec!["cp", &built_path, "/tokeirad"])
+        .with_exec(vec!["strip", "/tokeirad"]);
 
-    let mut builder = cacher;
-    builder = builder.with_directory("/app", &*workspace)?;
-    builder = builder.with_exec(&[
-        "cargo",
-        "build",
-        "--release",
-        "--target",
-        request.arch.rust_target(),
-        "--bin",
-        "tokeirad",
-        "-p",
-        "tokeirad",
-    ])?;
-    builder = builder.with_exec(&[
-        "strip",
-        &format!(
-            "/app/target/{}/release/tokeirad",
-            request.arch.rust_target()
-        ),
-    ])?;
-    let binary = builder.file(&format!(
-        "/app/target/{}/release/tokeirad",
-        request.arch.rust_target()
-    ))?;
-
-    let mut runtime = dagger.container_from("cgr.dev/chainguard/glibc-dynamic:latest")?;
-    runtime = runtime.with_file("/usr/local/bin/tokeirad", &*binary)?;
-    runtime = runtime.with_user("nonroot")?;
-    runtime = runtime.with_entrypoint(&["/usr/local/bin/tokeirad"])?;
+    let runtime = query
+        .container()
+        .from("cgr.dev/chainguard/glibc-dynamic:latest")
+        .with_file("/usr/local/bin/tokeirad", builder.file("/tokeirad"))
+        .with_user("nonroot")
+        .with_entrypoint(vec!["/usr/local/bin/tokeirad"]);
 
     let latest_tag = "tokeirad:latest".to_owned();
-    runtime.export_image(&latest_tag)?;
+    runtime.export_image(&latest_tag).await?;
 
     let mut tags = vec![latest_tag];
     if let Some(extra_tag) = request.tag.as_deref()
         && extra_tag != "latest"
     {
         let tag = format!("tokeirad:{extra_tag}");
-        runtime.export_image(&tag)?;
+        runtime.export_image(&tag).await?;
         tags.push(tag);
     }
 
@@ -156,175 +147,130 @@ pub fn build_tokeirad_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{MockCall, MockDaggerClient};
+    use crate::testing::canned_client;
 
-    #[test]
-    fn build_tokeirad_image_records_arm64_sequence() {
+    #[tokio::test]
+    async fn build_tokeirad_image_issues_the_arm64_sequence() {
         let workspace = workspace_with_toolchain("1.95");
-        let mock = MockDaggerClient::default();
+        let (client, wire) = canned_client().await;
         let request = TokeiradBuildRequest {
             arch: Arch::Arm64,
             tag: None,
             workspace_root: workspace.path().to_path_buf(),
         };
 
-        let result = build_tokeirad_image(&request, &mock).expect("build pipeline");
+        let result = build_tokeirad_image(&request, &client)
+            .await
+            .expect("build pipeline");
 
         assert_eq!(result.image_name, "tokeirad");
         assert_eq!(result.tags, vec!["tokeirad:latest"]);
-        let calls = mock.calls();
-        assert_call_order(
-            &calls,
-            &[
-                MockCall::ContainerFrom("rust:1.95-slim-bookworm".to_owned()),
-                MockCall::WithExec(vec![
-                    "sh".to_owned(),
-                    "-c".to_owned(),
-                    "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler libprotobuf-dev ca-certificates && rm -rf /var/lib/apt/lists/*".to_owned(),
-                ]),
-                MockCall::WithExec(vec![
-                    "cargo".to_owned(),
-                    "install".to_owned(),
-                    "cargo-chef".to_owned(),
-                    "--locked".to_owned(),
-                ]),
-                MockCall::WithExec(vec![
-                    "rustup".to_owned(),
-                    "target".to_owned(),
-                    "add".to_owned(),
-                    "aarch64-unknown-linux-gnu".to_owned(),
-                ]),
-                MockCall::WithExec(vec![
-                    "cargo".to_owned(),
-                    "chef".to_owned(),
-                    "prepare".to_owned(),
-                    "--recipe-path".to_owned(),
-                    "recipe.json".to_owned(),
-                ]),
-                MockCall::WithExec(vec![
-                    "cargo".to_owned(),
-                    "chef".to_owned(),
-                    "cook".to_owned(),
-                    "--release".to_owned(),
-                    "--target".to_owned(),
-                    "aarch64-unknown-linux-gnu".to_owned(),
-                    "--bin".to_owned(),
-                    "tokeirad".to_owned(),
-                    "--recipe-path".to_owned(),
-                    "recipe.json".to_owned(),
-                ]),
-                MockCall::WithExec(vec![
-                    "cargo".to_owned(),
-                    "build".to_owned(),
-                    "--release".to_owned(),
-                    "--target".to_owned(),
-                    "aarch64-unknown-linux-gnu".to_owned(),
-                    "--bin".to_owned(),
-                    "tokeirad".to_owned(),
-                    "-p".to_owned(),
-                    "tokeirad".to_owned(),
-                ]),
-                MockCall::WithExec(vec![
-                    "strip".to_owned(),
-                    "/app/target/aarch64-unknown-linux-gnu/release/tokeirad".to_owned(),
-                ]),
-                MockCall::ContainerFrom("cgr.dev/chainguard/glibc-dynamic:latest".to_owned()),
-                MockCall::WithUser("nonroot".to_owned()),
-                MockCall::WithEntrypoint(vec!["/usr/local/bin/tokeirad".to_owned()]),
-                MockCall::ExportImage("tokeirad:latest".to_owned()),
-            ],
-        );
-        assert_eq!(export_count(&calls), 1);
+        assert_eq!(result.toolchain_version, "1.95");
+
+        // Lazy object arguments (the workspace directory, cache volumes, the
+        // built binary) resolve through their own id requests, so the whole
+        // chain — base image, system deps, cache mounts, cross-target build,
+        // cache-mount copy-out, runtime stage, export — is asserted over the
+        // full transcript.
+        let transcript = wire.transcript();
+        for fragment in [
+            "rust:1.95-slim-bookworm",
+            "apt-get update",
+            "tokeira-cargo-registry",
+            "tokeira-build-target-aarch64-unknown-linux-gnu",
+            "rustup",
+            "aarch64-unknown-linux-gnu",
+            "cgr.dev/chainguard/glibc-dynamic:latest",
+            "nonroot",
+            "exportImage",
+            "tokeirad:latest",
+        ] {
+            assert!(
+                transcript.contains(fragment),
+                "pipeline transcript missing `{fragment}`:\n{transcript}"
+            );
+        }
     }
 
-    #[test]
-    fn build_tokeirad_image_exports_extra_tag_after_latest() {
+    #[tokio::test]
+    async fn build_tokeirad_image_exports_extra_tag_after_latest() {
         let workspace = workspace_with_toolchain("1.95");
-        let mock = MockDaggerClient::default();
+        let (client, wire) = canned_client().await;
         let request = TokeiradBuildRequest {
             arch: Arch::Arm64,
             tag: Some("v1.2.3".to_owned()),
             workspace_root: workspace.path().to_path_buf(),
         };
 
-        let result = build_tokeirad_image(&request, &mock).expect("build pipeline");
+        let result = build_tokeirad_image(&request, &client)
+            .await
+            .expect("build pipeline");
 
         assert_eq!(
             result.tags,
             vec!["tokeirad:latest".to_owned(), "tokeirad:v1.2.3".to_owned()]
         );
-        let exports: Vec<_> = mock
-            .calls()
+        let exports: Vec<String> = wire
+            .requests()
             .into_iter()
-            .filter(|call| matches!(call, MockCall::ExportImage(_)))
+            .filter(|query| query.contains("exportImage"))
             .collect();
-        assert_eq!(
-            exports,
-            vec![
-                MockCall::ExportImage("tokeirad:latest".to_owned()),
-                MockCall::ExportImage("tokeirad:v1.2.3".to_owned()),
-            ]
-        );
+        assert_eq!(exports.len(), 2, "one export per tag");
+        assert!(exports[0].contains("tokeirad:latest"));
+        assert!(exports[1].contains("tokeirad:v1.2.3"));
     }
 
-    #[test]
-    fn build_tokeirad_image_uses_amd64_target() {
+    #[tokio::test]
+    async fn build_tokeirad_image_uses_amd64_target() {
         let workspace = workspace_with_toolchain("1.95");
-        let mock = MockDaggerClient::default();
+        let (client, wire) = canned_client().await;
         let request = TokeiradBuildRequest {
             arch: Arch::Amd64,
             tag: None,
             workspace_root: workspace.path().to_path_buf(),
         };
 
-        build_tokeirad_image(&request, &mock).expect("build pipeline");
+        build_tokeirad_image(&request, &client)
+            .await
+            .expect("build pipeline");
 
-        assert!(mock.calls().contains(&MockCall::WithExec(vec![
-            "rustup".to_owned(),
-            "target".to_owned(),
-            "add".to_owned(),
-            "x86_64-unknown-linux-gnu".to_owned(),
-        ])));
+        let transcript = wire.transcript();
+        assert!(transcript.contains("x86_64-unknown-linux-gnu"));
+        assert!(transcript.contains("tokeira-build-target-x86_64-unknown-linux-gnu"));
     }
 
-    #[test]
-    fn build_tokeirad_image_excludes_build_outputs_from_workspace_upload() {
+    #[tokio::test]
+    async fn build_tokeirad_image_excludes_build_outputs_from_workspace_upload() {
         let workspace = workspace_with_toolchain("1.95");
-        let mock = MockDaggerClient::default();
+        let (client, wire) = canned_client().await;
         let request = TokeiradBuildRequest {
             arch: Arch::Arm64,
             tag: None,
             workspace_root: workspace.path().to_path_buf(),
         };
 
-        build_tokeirad_image(&request, &mock).expect("build pipeline");
+        build_tokeirad_image(&request, &client)
+            .await
+            .expect("build pipeline");
 
-        let filtered = mock
-            .calls()
+        let upload = wire
+            .requests()
             .into_iter()
-            .find_map(|call| match call {
-                MockCall::HostDirectoryFiltered {
-                    exclude, include, ..
-                } => Some((exclude, include)),
-                _ => None,
-            })
-            .expect("workspace upload must go through host_directory_filtered");
-
-        let (exclude, include) = filtered;
-        assert!(include.is_empty(), "no include whitelist is expected");
+            .find(|query| query.contains("directory") && query.contains("exclude"))
+            .expect("workspace upload with an exclude filter");
         // The key survival invariant: `target/` MUST be excluded or every
-        // invocation ships multi-GB of Rust build output to the Dagger engine.
+        // invocation ships multi-GB of Rust build output to the engine —
+        // and `vendor/` MUST NOT be, or the workspace's path dependencies
+        // cannot resolve inside it.
+        for fragment in ["target", ".git", "artifacts"] {
+            assert!(
+                upload.contains(fragment),
+                "exclude filter missing `{fragment}`:\n{upload}"
+            );
+        }
         assert!(
-            exclude.iter().any(|pat| pat == "target"),
-            "expected `target` in exclude list, got: {exclude:?}"
-        );
-        assert!(
-            exclude.iter().any(|pat| pat == ".git"),
-            "expected `.git` in exclude list, got: {exclude:?}"
-        );
-        assert!(
-            exclude.iter().any(|pat| pat == "artifacts"),
-            "expected `artifacts` in exclude list, got: {exclude:?}"
+            !upload.contains("\"vendor\""),
+            "the vendored SDK must ship with the workspace:\n{upload}"
         );
     }
 
@@ -336,22 +282,5 @@ mod tests {
         )
         .expect("write toolchain");
         dir
-    }
-
-    fn assert_call_order(calls: &[MockCall], expected: &[MockCall]) {
-        let mut next = 0;
-        for call in calls {
-            if expected.get(next) == Some(call) {
-                next += 1;
-            }
-        }
-        assert_eq!(next, expected.len(), "missing ordered calls in {calls:?}");
-    }
-
-    fn export_count(calls: &[MockCall]) -> usize {
-        calls
-            .iter()
-            .filter(|call| matches!(call, MockCall::ExportImage(_)))
-            .count()
     }
 }

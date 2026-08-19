@@ -41,4 +41,17 @@ pub enum BuildError {
 
     #[error("bundle store: {0}")]
     BundleStore(#[from] tokeira_deployment::BundleStoreError),
+
+    /// A Dagger engine call refused or failed. Boxed: the SDK's typed error
+    /// chain (exec output, decode context, traceparent) is large, and it is
+    /// preserved whole — flattening it to a string was the old client's
+    /// ceiling.
+    #[error("dagger query failed: {0}")]
+    Query(#[source] Box<dagger_sdk::QueryError>),
+}
+
+impl From<dagger_sdk::QueryError> for BuildError {
+    fn from(error: dagger_sdk::QueryError) -> Self {
+        Self::Query(Box::new(error))
+    }
 }

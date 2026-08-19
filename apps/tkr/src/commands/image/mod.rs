@@ -76,7 +76,7 @@ pub(crate) async fn run(
 
 /// Connect one owned Dagger session for a verb. The SDK provisions and
 /// authenticates in-process; failure names the engine dependency plainly.
-async fn dagger_session() -> Result<dagger_sdk::Client> {
+pub(crate) async fn dagger_session() -> Result<dagger_sdk::Client> {
     dagger_sdk::connect()
         .await
         .context("failed to connect a Dagger session (a running Dagger engine is required)")

@@ -1490,10 +1490,10 @@ mod tests {
             Box::new(tokeira_state::LocalBackend::new(temp.path().join("cas"))),
             "bundles",
         );
-        let mock = tokeira_build::testing::MockDaggerClient::default();
+        let (client, _wire) = tokeira_build::testing::canned_client().await;
         let obtained = tokeira_build::obtain_provisioner(
             &request,
-            &mock,
+            &client,
             &cas,
             tokeira_deployment::AuthorityTier::LocalDeveloper,
         )

@@ -140,7 +140,7 @@ impl EngineCache {
     #[doc = "Prune the cache of releaseable entries\n\nSelects GraphQL field `prune` on `EngineCache`."]
     pub async fn prune(&self) -> Result<(), crate::QueryError> {
         let query = self.selection.select("prune");
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "Executes GraphQL operation `prune` with a borrowed, reusable `EngineCachePruneOpts` value."]
     pub async fn prune_opts(&self, opts: &EngineCachePruneOpts) -> Result<(), crate::QueryError> {
@@ -170,7 +170,7 @@ impl EngineCache {
         } else {
             query
         };
-        query.execute(&self.session).await
+        query.execute_void(&self.session).await
     }
     #[doc = "The minimum amount of disk space this policy is guaranteed to retain.\n\nSelects GraphQL field `reservedSpace` on `EngineCache`."]
     pub async fn reserved_space(&self) -> Result<i64, crate::QueryError> {

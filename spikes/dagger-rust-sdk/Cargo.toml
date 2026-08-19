@@ -1,4 +1,4 @@
-# Spike: the first-party Dagger Rust SDK (iw/dagger, sdk/rust/v1.0.0-beta.11.rust.1)
+# Spike: the first-party Dagger Rust SDK (iw/dagger, sdk/rust/v1.0.0-beta.11.rust.3)
 # driving tokeira's two real builds. Workspace-excluded; own lockfile.
 [package]
 name = "dagger-rust-sdk-spike"

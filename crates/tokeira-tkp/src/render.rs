@@ -1590,17 +1590,38 @@ mod tests {
         );
     }
 
+    // Doc-agreement tests assert code↔doc consistency in the full
+    // repository. The hermetic provisioner build tests the frozen source
+    // closure, which deliberately carries no doc trees — absence of the
+    // referenced doc's whole PARENT DIRECTORY marks that context and the
+    // assertion is vacuous there. A missing file under a present directory
+    // stays a hard failure: the doc was deleted or moved, and the
+    // agreement it anchors is broken.
+    fn repo_doc(relative: &str) -> Option<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative);
+        if !path.parent().expect("doc paths have parents").exists() {
+            eprintln!(
+                "doc-agreement assertion for {relative} is vacuous: the doc tree is not part \
+                 of this source (hermetic closure build)"
+            );
+            return None;
+        }
+        Some(std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("referenced doc {relative} is missing from its present tree: {error}")
+        }))
+    }
+
     // The output-templates doc is executable: its reference transcripts ARE
     // the renderer's output for the reference fixture, byte-for-byte — the
     // managed-template guarantee (umbrella D10). A template change is an
     // amendment to the doc first; this test is what makes that mechanical.
     #[test]
     fn the_output_templates_doc_is_executable() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../.kiro/specs/operator-explanation/output-templates.md"
-        );
-        let doc = std::fs::read_to_string(path).expect("output-templates.md exists");
+        let Some(doc) = repo_doc(".kiro/specs/operator-explanation/output-templates.md") else {
+            return;
+        };
         let r = causality_reference_report();
         for (marker, detail) in [
             ("<!-- reference: infra-plan-summary -->", false),
@@ -1647,11 +1668,9 @@ mod tests {
     // fixture, byte-for-byte (umbrella D10).
     #[test]
     fn the_platform_issue_transcript_is_executable() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../.kiro/specs/operator-explanation/output-templates.md"
-        );
-        let doc = std::fs::read_to_string(path).expect("output-templates.md exists");
+        let Some(doc) = repo_doc(".kiro/specs/operator-explanation/output-templates.md") else {
+            return;
+        };
         let r = platform_issue_reference_report();
         let rendered = render(&r, Mode::resolve(false, false)).unwrap();
         let block = fenced_block_after(&doc, "<!-- reference: infra-plan-platform-issue -->")
@@ -1744,11 +1763,9 @@ mod tests {
     // byte-for-byte (umbrella D10).
     #[test]
     fn the_apply_transcripts_are_executable() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../.kiro/specs/operator-explanation/output-templates.md"
-        );
-        let doc = std::fs::read_to_string(path).expect("output-templates.md exists");
+        let Some(doc) = repo_doc(".kiro/specs/operator-explanation/output-templates.md") else {
+            return;
+        };
         for (marker, gated) in [
             ("<!-- reference: infra-apply-after-plan -->", true),
             ("<!-- reference: infra-apply-no-plan -->", false),
@@ -1781,11 +1798,9 @@ mod tests {
 
     #[test]
     fn the_banned_list_matches_the_language_doc() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../docs/platforms/operator-language.md"
-        );
-        let doc = std::fs::read_to_string(path).expect("operator-language.md exists");
+        let Some(doc) = repo_doc("docs/platforms/operator-language.md") else {
+            return;
+        };
         for term in BANNED {
             assert!(
                 doc.contains(*term),

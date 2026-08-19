@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use sha2::Digest as _;
-use tokeira_build::{SnapshotRequest, discover_workspace_descriptors, snapshot_source_closure};
+use tokeira_build::{discover_workspace_descriptors, snapshot_source_closure};
 
 pub(crate) async fn build(build_image: Option<&str>) -> Result<()> {
     let workspace = crate::workspace_root()?;
@@ -37,11 +37,11 @@ pub(crate) async fn build(build_image: Option<&str>) -> Result<()> {
         .find(|frontend| frontend.format.as_str() == "tkd")
         .ok_or_else(|| anyhow!("tkd frontend not discovered"))?;
     let bound_source = tokeira_build::assemble_bound_provisioner(&workspace, platform, frontend)?;
-    let snapshot = snapshot_source_closure(&SnapshotRequest {
-        repo_root: workspace.clone(),
-        closure_paths: bound_source.closure().closure_paths(),
-        include_untracked: false,
-    })?;
+    // The scoped-workspace snapshot request: the frozen tree is a complete,
+    // valid cargo workspace (closure members + the generated root, with the
+    // cargo-authored scoped lock) — the same request the production pipeline
+    // freezes.
+    let snapshot = snapshot_source_closure(&bound_source.snapshot_request(&workspace)?)?;
     let staging = tempfile_dir()?;
     let source_dir = staging.path().join("source");
     tokeira_build::materialize_snapshot(&workspace, &snapshot.tree_oid, &source_dir)?;
@@ -71,41 +71,45 @@ pub(crate) async fn build(build_image: Option<&str>) -> Result<()> {
         .with_workdir("/src")
         .with_directory("/src", source);
 
-    // Test step. SPIKE FINDING: production's per-closure-crate test step
-    // (`cargo test --locked -p <crate>` at the snapshot root) is latently
-    // broken — the snapshot carries the full workspace manifest but only
-    // the closure's member dirs, so root-workspace cargo refuses on the
-    // first missing member. The generated provisioner declares its own
-    // `[workspace]`, so its manifest path is immune; the exec/capture
-    // mechanics under evaluation are identical.
+    // Test step, production shape: the closure's own crates, `--locked`, at
+    // the snapshot root. This is the step the original spike proved
+    // impossible against a torn snapshot — the scoped-workspace freeze makes
+    // it real, and running it here validates that fix hermetically.
     let tests = Instant::now();
-    let test_container = base.clone().with_exec(vec![
-        "cargo",
-        "test",
-        "--locked",
-        "--manifest-path",
-        "/src/.tokeira-build/bound-provisioner/Cargo.toml",
-    ]);
+    let mut test_args: Vec<String> = vec!["cargo".into(), "test".into(), "--locked".into()];
+    for name in &bound_source.closure().crate_names {
+        test_args.push("-p".into());
+        test_args.push(name.clone());
+    }
+    let test_container = base
+        .clone()
+        .with_exec(test_args.iter().map(String::as_str).collect());
     let test_output = match test_container.stdout().await {
         Ok(output) => output,
         Err(error) => {
             // The typed exec error carries the container's own output —
-            // the diagnosis the old client could never produce.
+            // the diagnosis the old client could never produce. Both
+            // streams: cargo narrates compilation on stderr but the test
+            // harness reports names and panics on stdout.
             if let dagger_sdk::QueryError::Exec { error: exec, .. } = &error {
-                let stderr = exec.stderr().unwrap_or("<no stderr captured>");
-                let tail: String = stderr
-                    .lines()
-                    .rev()
-                    .take(40)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let tail = |stream: Option<&str>| -> String {
+                    stream
+                        .unwrap_or("<not captured>")
+                        .lines()
+                        .rev()
+                        .take(60)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 eprintln!(
-                    "test step failed (exit {:?}, command {:?}):\n{tail}",
+                    "test step failed (exit {:?}, command {:?}):\n--- stderr tail:\n{}\n--- stdout tail:\n{}",
                     exec.exit_code(),
-                    exec.command()
+                    exec.command(),
+                    tail(exec.stderr()),
+                    tail(exec.stdout()),
                 );
             }
             return Err(error).context("test step");
@@ -126,13 +130,13 @@ pub(crate) async fn build(build_image: Option<&str>) -> Result<()> {
             "build",
             "--locked",
             "--release",
-            "--manifest-path",
-            "/src/.tokeira-build/bound-provisioner/Cargo.toml",
+            "-p",
+            "tokeira-bound-provisioner",
         ])
         .with_exec(vec![
             "sh",
             "-c",
-            "cp /src/.tokeira-build/bound-provisioner/target/release/tkp /tkp && strip /tkp",
+            "cp /src/target/release/tkp /tkp && strip /tkp",
         ]);
     let out_dir = tempfile_dir()?;
     let out_path = out_dir.path().join("tkp");

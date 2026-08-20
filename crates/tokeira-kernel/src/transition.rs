@@ -81,7 +81,7 @@ pub struct RequestDedupeOp {
 }
 
 /// Mutation to the activity state table.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ActivityOp {
     /// Create or update an activity's durable state.
     Upsert(ActivityState),
@@ -90,7 +90,7 @@ pub enum ActivityOp {
 }
 
 /// Mutation to the timer state table.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TimerOp {
     /// Create or update a timer's durable state.
     Upsert(TimerState),
@@ -104,7 +104,7 @@ pub enum TimerOp {
 /// The kernel produces these but never executes them. The
 /// runtime reads them from the committed transition and
 /// performs the actual I/O.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DispatchOp {
     /// Place a workflow task on the task queue for a worker
     /// to pick up.

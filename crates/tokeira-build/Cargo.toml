@@ -16,7 +16,6 @@ testing = []
 [dependencies]
 async-trait.workspace = true
 cargo_metadata.workspace = true
-dagger-client.workspace = true
 dagger-sdk.workspace = true
 eyre.workspace = true
 gix.workspace = true

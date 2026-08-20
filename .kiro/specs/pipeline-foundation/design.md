@@ -4,18 +4,18 @@
 
 This design turns `requirements.md` into a concrete Rust-native CI substrate. The deliverables are:
 
-1. Two new crates at the workspace level: `tokeira-ci-policy` (shared artifact and exit-code types) and `tokeira-pipeline-runtime` (shared Dagger orchestration helpers built directly on the in-repo `dagger-client` crate).
+1. Two new crates at the workspace level: `tokeira-ci-policy` (shared artifact and exit-code types) and `tokeira-pipeline-runtime` (shared Dagger orchestration helpers built directly on the vendored `dagger-sdk` crate).
 2. A canonical Pipeline_Crate template at `crates/tokeira-pipeline-workspace/` that fully implements the four required subcommands, ships artifacts to S3, and becomes the reference every future pipeline copies.
 3. An `ArtifactBucket` resource in `tokeira-aws` that mirrors the `RemoteStateBucket` shared-bucket pattern with pipeline-specific lifecycle rules.
-4. A `tkr pipeline` command group in `apps/tkr` that shells out to `dagger run -- cargo run -p tokeira-pipeline-{name} -- {subcommand}` and reads artifacts from S3 via `tokeira-ci-policy` helpers.
+4. A `tkr pipeline` command group in `apps/tkr` that shells out to `cargo run -p tokeira-pipeline-{name} -- {subcommand}` and reads artifacts from S3 via `tokeira-ci-policy` helpers.
 5. A Buildkite pipeline (`.buildkite/pipeline.yml`) as the **primary live trigger** targeting Buildkite hosted Linux agents, plus a parity GitHub Actions workflow (`.github/workflows/ci.yml`) that exercises the same pipelines on GHA runners for substrate-independence evidence only.
 6. A separate manually-triggered Buildkite pipeline (`.buildkite/pipeline-features.yml`) for the T1 `temporalio/features` conformance tier, not gating PRs until the maintainer promotes it.
 7. Two CI grep checks (`check-no-wallclock-pipelines.sh`, `check-substrate-leakage.sh`) and a set of property tests that mechanically enforce the substrate independence, no-wall-clock, and subcommand-registration properties.
 
 Guiding principles:
 
-1. **Pipelines are Rust crates, not Dagger modules.** The in-repo `dagger-client` crate is the only Dagger-facing dependency. No `dagger.json`, no `dagger call`, no Dagger SDK drop-in. Pipelines are `cargo` workspace members with a library + binary.
-2. **`tokeira-pipeline-runtime` wraps `dagger-client` directly.** No second trait layer. The runtime exposes free functions that take `&Client` (and `Container<'_>`, `Directory<'_>`, etc.) from `dagger-client` and return the same types. This keeps the abstraction cost at zero — pipeline authors read the `dagger-client` docs and everything composes.
+1. **Pipelines are Rust crates, not Dagger modules.** The vendored `dagger-sdk` crate is the only Dagger-facing dependency. No `dagger.json`, no `dagger call`, no Dagger SDK drop-in. Pipelines are `cargo` workspace members with a library + binary.
+2. **`tokeira-pipeline-runtime` wraps `dagger-sdk` directly.** No second trait layer. The runtime exposes free functions that take `&dagger_sdk::Client` (and `Container`, `Directory`, etc.) and return the same types. This keeps the abstraction cost at zero — pipeline authors read the SDK docs and everything composes.
 3. **Policy crates are synchronous, deterministic, and untouched by I/O.** `tokeira-ci-policy` has no tokio, no HTTP, no S3 SDK. It is pure types, serde, and a tiny reader/writer pair. Future Policy_Crates (`tokeira-build` for images, `tokeira-conformance` for temporal-compatibility) extend this pattern.
 4. **Substrate independence is grep-enforced.** A CI script refuses to land Pipeline_Crate code containing `GITHUB_`, `BUILDKITE_`, `github_script`, or `buildkite_agent`. The one permitted exception is `tokeira-pipeline-runtime/src/ci_context.rs`, which is the canonical resolution point.
 5. **Wall-clock reads live in exactly one place.** `Pipeline_Runtime::ci_context()` calls `time::OffsetDateTime::now_utc()` exactly once per process, stores the result on `CiContext::run_started_at`, and every downstream consumer copies that value. A second grep check fails the build on any other wall-clock call in `tokeira-ci-policy`, `tokeira-pipeline-runtime`, or any `tokeira-pipeline-*` crate.
@@ -32,7 +32,7 @@ graph TD
     end
 
     subgraph "Pipeline Invocation"
-      DaggerRun["dagger run -- cargo run -p tokeira-pipeline-NAME -- SUBCOMMAND --json"]
+      DaggerRun["cargo run -p tokeira-pipeline-NAME -- SUBCOMMAND --json"]
     end
 
     subgraph "Rust Pipeline Crates"
@@ -44,7 +44,7 @@ graph TD
     subgraph "Shared Infrastructure"
       Runtime["tokeira-pipeline-runtime"]
       Policy["tokeira-ci-policy"]
-      DaggerClient["dagger-client"]
+      DaggerSdk["dagger-sdk (vendored)"]
     end
 
     subgraph "Policy Crates"
@@ -92,13 +92,13 @@ graph TD
 | Crate | Dependencies (new) | Role |
 |---|---|---|
 | `tokeira-ci-policy` | `serde`, `serde_json`, `thiserror`, `time` | Shared `CiContext`, `ArtifactEnvelope<T>`, `ExitCode`, artifact read/write. No I/O. |
-| `tokeira-pipeline-runtime` | `dagger-client`, `tokeira-ci-policy`, `tracing`, `aws-sdk-s3`, `aws-config`, `toml`, `regex` | Shared Dagger helpers + CI context + S3 artifact upload. |
-| `tokeira-pipeline-workspace` | `tokeira-pipeline-runtime`, `tokeira-ci-policy`, `dagger-client`, `clap`, `tracing`, `tracing-subscriber`, `serde`, `anyhow` | First Pipeline_Crate, canonical template. |
+| `tokeira-pipeline-runtime` | `dagger-sdk`, `tokeira-ci-policy`, `tracing`, `aws-sdk-s3`, `aws-config`, `toml`, `regex` | Shared Dagger helpers + CI context + S3 artifact upload. |
+| `tokeira-pipeline-workspace` | `tokeira-pipeline-runtime`, `tokeira-ci-policy`, `dagger-sdk`, `clap`, `tracing`, `tracing-subscriber`, `serde`, `anyhow` | First Pipeline_Crate, canonical template. |
 | `apps/tkr` | *(none new — uses existing helpers)* | Adds `pipeline` command group. |
 | `tokeira-aws` | *(none new — already depends on `aws-sdk-s3`)* | Adds `ArtifactBucket` resource. |
 
 Notably **not** changed:
-- `dagger-client` stays as introduced by `image-lifecycle`. No new methods, no new traits on top of it.
+- `dagger-sdk` stays exactly as vendored from its release. No new methods, no traits on top of it.
 - `apps/tokeirad` is untouched. Pipelines verify tokeirad, they do not live inside it.
 - `tokeira-kernel` has no pipeline-foundation dependency.
 
@@ -111,9 +111,9 @@ Operator runs tkr pipeline run workspace
 apps/tkr/commands/pipeline.rs::run()
   │
   ▼  (builds argv + sets stdout/stderr inherit)
-std::process::Command "dagger run --" "cargo run -p tokeira-pipeline-workspace --release -- check --json"
+std::process::Command "cargo run -p tokeira-pipeline-workspace --release -- check --json"
   │
-  ▼  (dagger injects DAGGER_SESSION_PORT / DAGGER_SESSION_TOKEN)
+  ▼  (the binary owns its session: dagger_sdk::connect() provisions in-process)
 tokeira-pipeline-workspace binary main()
   │  ├── clap parses subcommand
   │  ├── tokeira_pipeline_runtime::ci_context() resolves CiContext (one wall-clock read)
@@ -248,7 +248,7 @@ pub enum ArtifactError {
 
 ### 2. `tokeira-pipeline-runtime`
 
-The runtime exposes free functions built directly on the in-repo `dagger-client` types. No second trait layer. This is the key deviation from my first requirements draft: pipelines consume `dagger-client::Client` / `Container<'_>` / `Directory<'_>` directly, and the runtime just provides the common workflows.
+The runtime exposes free functions built directly on the vendored `dagger-sdk` types. No second trait layer. Pipelines consume `dagger_sdk::Client` / `Container` / `Directory` directly, and the runtime just provides the common workflows.
 
 ```rust
 // crates/tokeira-pipeline-runtime/src/lib.rs
@@ -442,9 +442,9 @@ pub fn cargo_doc(ctr: Container<'_>) -> Result<Container<'_>> {
 }
 ```
 
-**Ownership.** `dagger-client`'s `Container` methods take `self` by value and return `Self`, so each helper takes an owned `Container<'c>` and returns an owned `Container<'c>`. Pipelines compose via the builder pattern (see the workspace pipeline in §3).
+**Ownership.** `dagger-sdk`'s `Container` methods take `&self` and return a new handle, so helpers compose freely via the builder pattern (see the workspace pipeline in §3).
 
-**Caching note.** The reference `dagger-client` does not currently expose Dagger cache volumes. Req 2.3 allows the runtime to mount cache volumes, but the minimal change to `dagger-client` to add `with_mounted_cache(path: &str, cache: CacheVolumeId) -> Result<Self>` lands in this spec's tasks (§Task 3 below). Until that lands, builds are still cold but correct.
+**Caching note.** `dagger-sdk` exposes cache volumes natively (`Query::cache_volume` + `Container::with_mounted_cache`); the tokeirad image pipeline already builds on them.
 
 #### `s3.rs`
 
@@ -534,7 +534,7 @@ pub enum UploadError {
 }
 ```
 
-**Synchronous vs async.** `dagger-client` uses `reqwest::blocking` and is synchronous. The S3 SDK is async. Pipelines run the Dagger orchestration to completion, then call `tokio::runtime::Runtime::new()?.block_on(upload_artifact(...))` for the upload. A helper `block_on_upload` in the runtime crate encapsulates this so pipelines do not repeat the pattern.
+**Synchronous vs async.** `dagger-sdk` and the S3 SDK are both async; pipelines run a single tokio runtime end to end — no blocking bridge.
 
 ### 3. `tokeira-pipeline-workspace` — the canonical pipeline
 
@@ -733,7 +733,7 @@ Consumed by the ECS platform's networking/observability module grouping. The buc
 pub enum PipelineCommand {
     /// Enumerate registered Pipeline_Crates.
     List,
-    /// Run a pipeline's subcommand locally under `dagger run`.
+    /// Run a pipeline's subcommand locally against the selected engine.
     Run {
         name: String,
         #[arg(default_value = "check")]
@@ -755,7 +755,7 @@ pub enum PipelineCommand {
 
 **Discovery (`list`).** Walks `crates/tokeira-pipeline-*/`, parses each `Cargo.toml` for the binary name. Invokes each binary with `--help` (inside a cached container? No — locally on the host, since the binary already compiled) to parse subcommands. If the binary has not been built, `list` reports "(not built — run `cargo build` first)" for that pipeline's subcommand list.
 
-**Run.** Shells out to `dagger run -- cargo run -p tokeira-pipeline-{name} --release -- {subcommand} {extra...}`. Inherits stdio. Exit status = child process exit status.
+**Run.** Shells out to `cargo run -p tokeira-pipeline-{name} --release -- {subcommand} {extra...}`. Inherits stdio. Exit status = child process exit status.
 
 **Artifacts.** Uses `tokeira-aws`'s default AWS credentials to list S3 objects under `{project}/pipelines/{name}/` sorted by LastModified descending. `--latest --json` prints the contents of the newest object. `--run-id X` prints the contents of `{project}/pipelines/{name}/*/X.json` (the git SHA is part of the key, so the command globs across SHAs).
 
@@ -768,22 +768,22 @@ agents:
 
 steps:
   - label: ":rust: workspace check"
-    command: dagger run -- cargo run -p tokeira-pipeline-workspace --release -- check --json
+    command: cargo run -p tokeira-pipeline-workspace --release -- check --json
 
   - label: ":rust: workspace test"
-    command: dagger run -- cargo run -p tokeira-pipeline-workspace --release -- test --json
+    command: cargo run -p tokeira-pipeline-workspace --release -- test --json
 
   - label: ":satellite: T0 wire"
-    command: dagger run -- cargo run -p tokeira-pipeline-compatibility --release -- t0 --json
+    command: cargo run -p tokeira-pipeline-compatibility --release -- t0 --json
 
   - label: ":microscope: T3 Tokeira smoke"
-    command: dagger run -- cargo run -p tokeira-pipeline-compatibility --release -- t3 --json
+    command: cargo run -p tokeira-pipeline-compatibility --release -- t3 --json
 
   - wait
 
   - label: ":package: workspace artifact"
     command: |
-      dagger run -- cargo run -p tokeira-pipeline-workspace --release -- artifact --json > artifact.json
+      cargo run -p tokeira-pipeline-workspace --release -- artifact --json > artifact.json
       buildkite-agent artifact upload artifact.json
     if: build.branch == "main"
 ```
@@ -792,7 +792,7 @@ steps:
 
 **Why one step per pipeline-subcommand pair.** Discoverable failure names in the Buildkite UI matter more than DRY YAML. When a PR fails, ":rust: workspace test" is unambiguous; a matrix row like `(workspace, test)` is not.
 
-**Secrets.** Buildkite pipeline-level environment variables disclose secrets only on default-branch runs. The pipeline reads them into Dagger via `SecretRef` so they never appear in logs. Per Req 3.1.8, PR-gating steps (`check`, `test`, `T0`, `T3`) require zero secrets.
+**Secrets.** Buildkite pipeline-level environment variables disclose secrets only on default-branch runs. The pipeline reads them into Dagger as typed secrets so they never appear in logs. Per Req 3.1.8, PR-gating steps (`check`, `test`, `T0`, `T3`) require zero secrets.
 
 **Dagger Cloud off by default.** `DAGGER_CLOUD_TOKEN` is not set on the hosted agent. If a developer enables the free individual Dagger Cloud tier locally, their traces go to their personal Dagger Cloud dashboard and nowhere else. The paid team tier is not enabled per Req 3.1.5.
 
@@ -819,7 +819,7 @@ jobs:
           curl -L https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION=0.20.5 BIN_DIR=$HOME/.local/bin sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Run workspace check
-        run: dagger run -- cargo run -p tokeira-pipeline-workspace --release -- check --json
+        run: cargo run -p tokeira-pipeline-workspace --release -- check --json
 
   workspace-test:
     runs-on: ubuntu-latest
@@ -828,7 +828,7 @@ jobs:
       - name: Install Dagger CLI
         run: curl -L https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION=0.20.5 BIN_DIR=$HOME/.local/bin sh
       - name: Run workspace test
-        run: dagger run -- cargo run -p tokeira-pipeline-workspace --release -- test --json
+        run: cargo run -p tokeira-pipeline-workspace --release -- test --json
 ```
 
 **Parity role.** This workflow exists to demonstrate that the Pipeline_Crate source runs unchanged on a different substrate. It is either disabled (committed but not registered as a required check) or runs in shadow mode (registered but non-blocking for PR merge), per Req 3.2.2. Branch protection rules make Buildkite the gate, not GHA.
@@ -847,7 +847,7 @@ agents:
 steps:
   - label: ":temporal: T1 features (Go SDK)"
     command: |
-      dagger run -- cargo run -p tokeira-pipeline-conformance-features --release -- \
+      cargo run -p tokeira-pipeline-conformance-features --release -- \
         run --lang go --json > t1-features.json
       buildkite-agent artifact upload t1-features.json
     env:
@@ -902,7 +902,7 @@ Example: `tokeira-dev/pipelines/workspace/abc12345/2340981234.json`
 ### Pipeline binary errors
 
 - Subcommand handler returns `eyre::Result` internally; `main()` maps to `ExitCode::Failed` with a one-line stderr message.
-- `Dagger session not available` (env vars missing) → `ExitCode::UsageError` + guidance to run under `dagger run --`.
+- `Dagger engine not reachable` → `ExitCode::UsageError` + guidance to select an engine (the pinned engine + CLI pair).
 - Artifact upload failure → `tracing::warn!` + exit with handler's own result. Upload is advisory; a passing pipeline with failed upload is still green.
 
 ### `tkr pipeline` errors
@@ -914,7 +914,7 @@ Example: `tokeira-dev/pipelines/workspace/abc12345/2340981234.json`
 ### CI substrate errors
 
 - Dagger CLI install step failure → job fails, GHA/Buildkite surfaces the install script's error verbatim.
-- Dagger engine connection timeout → `dagger run` surfaces the error; pipeline binary never starts.
+- Dagger engine connection timeout → `dagger_sdk::connect()` surfaces the typed error before any step runs.
 
 ## Testing Strategy
 
@@ -938,12 +938,12 @@ Example: `tokeira-dev/pipelines/workspace/abc12345/2340981234.json`
 
 ### Integration tests (optional, gated behind `integration-test` feature)
 
-- **Dagger smoke test**: `dagger run -- cargo run -p tokeira-pipeline-workspace -- check` runs end-to-end against the workspace. Not run on every PR (too slow); nightly.
+- **Dagger smoke test**: `cargo run -p tokeira-pipeline-workspace -- check` runs end-to-end against the workspace. Not run on every PR (too slow); nightly.
 - **S3 artifact round-trip**: uses LocalStack to upload an artifact via the runtime and read it back via `tkr pipeline artifacts`. Nightly.
 
 ## Migration Plan
 
-1. **Land `tokeira-ci-policy` + `tokeira-pipeline-runtime` + `tokeira-pipeline-workspace` in a single PR.** No trigger-workflow changes yet. Verify locally that `dagger run -- cargo run -p tokeira-pipeline-workspace -- check` works. Nothing in CI changes — existing (if any) CI runs unchanged.
+1. **Land `tokeira-ci-policy` + `tokeira-pipeline-runtime` + `tokeira-pipeline-workspace` in a single PR.** No trigger-workflow changes yet. Verify locally that `cargo run -p tokeira-pipeline-workspace -- check` works. Nothing in CI changes — existing (if any) CI runs unchanged.
 
 2. **Register the Buildkite Personal organisation and commit `.buildkite/pipeline.yml` + the grep checks in a second PR.** Configure branch protection on `main` to require the Buildkite steps to pass. Until this lands, the workspace has no gating CI; this is the first substrate to gate merges.
 
@@ -965,7 +965,7 @@ Example: `tokeira-dev/pipelines/workspace/abc12345/2340981234.json`
 
 ## Open Questions
 
-- **Caching through `dagger-client`.** The reference client does not expose `cacheVolume`. Adding `Client::cache_volume(key)` → `CacheVolumeId` and `Container::with_mounted_cache(path, cache)` is ~30 lines of GraphQL wrapping. Tasks doc allocates this as a small enhancement to `dagger-client` owned by this spec. Without it, builds are cold-start-every-time but still correct; with it, `check` goes from tens of seconds to single-digit seconds on warm runs.
-- **Async vs sync in the runtime.** `dagger-client` is sync (blocking reqwest). `aws-sdk-s3` is async. The pragmatic split in this design is: Dagger orchestration is sync (blocking), S3 upload is async and wrapped in a single `block_on` at the end of each subcommand. A future refactor could make `dagger-client` async, but that is a larger undertaking and not a requirement here.
+- **Caching.** `dagger-sdk` exposes cache volumes natively; the tokeirad image pipeline's registry + per-target caches are the in-tree reference for warm `check` runs.
+- **Async end to end.** `dagger-sdk` and `aws-sdk-s3` are both async; one tokio runtime serves orchestration and artifact upload alike.
 - **`tkr pipeline list` discovery.** Parsing `crates/tokeira-pipeline-*/Cargo.toml` is easy; parsing each pipeline's subcommands without running the binary is harder (clap's introspection surface is limited). For v1, `tkr pipeline list` invokes each binary's `--help` and parses stdout. A future `tokeira-pipeline-runtime::describe()` function could expose subcommands as a static slice queryable without invoking the binary — flagged for a follow-up.
 - **Release-branch policy**. This spec does not define what "release" means for Tokeira. The workspace pipeline runs on every PR and push to main. The Buildkite template conditions the `artifact` step on `build.branch == "main"`. A future `release-pipeline` spec will introduce versioned tags and gating beyond this substrate.

@@ -385,7 +385,7 @@ edges trimmed; it prints `kache stats` and a `df` so the reclaim is visible. Del
 
 ## Repo-specific notes
 
-- **Environment prerequisites:** toolchain via `rust-toolchain.toml` (stable 1.96); fmt
+- **Environment prerequisites:** toolchain via `rust-toolchain.toml` (stable 1.97.1); fmt
   needs the dated nightly (`NIGHTLY_FMT_TOOLCHAIN` in ci.yml, currently
   `nightly-2026-06-16` — advance with local dev); `protoc` on PATH (prost-build compiles
   `proto/upstream/`; CI installs protobuf-compiler for exactly this); `gh` only at the

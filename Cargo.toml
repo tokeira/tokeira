@@ -50,7 +50,6 @@ members = [
     "apps/tokeira-autoscaler",
     "apps/tokeira-controller",
     "apps/tokeira-bench",
-    "crates/dagger-client",
     "crates/tokeira-build",
 ]
 exclude = [
@@ -185,7 +184,6 @@ tokeira-conformance = { path = "crates/tokeira-conformance" }
 tokeira-conformance-proto = { path = "crates/tokeira-conformance-proto" }
 tokeira-conformance-control = { path = "crates/tokeira-conformance-control" }
 tokeira-auth = { path = "crates/tokeira-auth" }
-dagger-client = { path = "crates/dagger-client" }
 tokeira-build = { path = "crates/tokeira-build" }
 # Deployment-repository machinery (spec-sanctioned dependency additions):
 # TUF client/authoring, KMS-held role keys, and the timestamp types tough's

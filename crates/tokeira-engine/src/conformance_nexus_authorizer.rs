@@ -1,5 +1,8 @@
 //! Conformance-only adapter for Temporal's in-process `SetOnAuthorize` hook.
 //!
+//! Kept with engine construction so embedded and listener-backed stacks use the
+//! same admission policy under the conformance feature.
+//!
 //! The functional corpus installs arbitrary Go closures on its onebox host. An
 //! out-of-process server cannot execute those closures directly, so the harness
 //! exposes a loopback callback server and this adapter sends it only the resolved

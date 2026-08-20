@@ -1,4 +1,4 @@
-//! Same-listener transport adapter for caller-facing Nexus HTTP requests.
+//! Optional listener transport adapter for caller-facing Nexus HTTP requests.
 //!
 //! Tonic owns the public socket and accepts HTTP/1 for gRPC-Web. This tower
 //! layer intercepts only the two Nexus route prefixes, bounds and collects their

@@ -1,3 +1,5 @@
+//! Structured-log formatting shared by the engine-backed daemon.
+
 use std::fmt;
 
 use opentelemetry::trace::TraceContextExt;

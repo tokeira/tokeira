@@ -77,7 +77,7 @@ mod tests {
 ///
 /// Workers poll a named queue; the runtime matches incoming
 /// tasks to waiting pollers by this name.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TaskQueueName(pub String);
 
 /// Self-reported identity string from a worker process.

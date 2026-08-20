@@ -50,7 +50,7 @@ pub fn worker_task_token_digest(token: &[u8]) -> [u8; 32] {
 }
 
 /// Server-authored authorization evidence for one public Worker task token.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTaskProvenance {
     /// Domain-separated digest of the exact public token bytes.
     pub token_digest: [u8; 32],
@@ -202,7 +202,7 @@ pub struct DeploymentName(pub String);
 pub struct BuildId(pub String);
 
 /// Storage key for a Worker Deployment registry record.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DeploymentKey {
     /// Namespace that owns the deployment.
     pub namespace_id: NamespaceId,
@@ -260,7 +260,7 @@ pub enum StoredTaskQueueConfigKind {
 }
 
 /// Durable identity of one task-queue policy record.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StoredTaskQueueConfigKey {
     /// Namespace containing the task queue.
     pub namespace_id: NamespaceId,
@@ -666,7 +666,7 @@ pub trait WorkerDeploymentRepository: Send + Sync {
 /// That is intentionally conservative: it prevents ambiguous duplicate handling
 /// now, and leaves a clear TODO for future refinement when execution-chain
 /// semantics become richer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RequestRecord {
     /// Namespace that owns this workflow.
     pub namespace_id: NamespaceId,
@@ -687,7 +687,7 @@ pub struct RequestRecord {
 /// Production DSQL storage will likely materialize this information across
 /// multiple tables. The dev store keeps an audit-style record so semantic tests
 /// can verify that history and derived ops are all persisted together.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TransitionAuditRecord {
     /// Durable storage key for the run.
     pub run_key: RunKey,
@@ -1124,7 +1124,7 @@ pub trait RunRepository: Send + Sync {
 
 /// A workflow task that is ready for dispatch to a
 /// worker. Produced by [`RunRepository::list_dispatchable_workflow_tasks`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchableWorkflowTask {
     /// Durable storage key for the owning run.
     pub run_key: RunKey,
@@ -1218,7 +1218,7 @@ pub(crate) fn dispatchable_workflow_task(
 
 /// An activity task that is ready for dispatch to a
 /// worker. Produced by [`RunRepository::list_dispatchable_activity_tasks`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchableActivityTask {
     /// Durable storage key for the owning run.
     pub run_key: RunKey,
@@ -1328,7 +1328,7 @@ impl Default for DeliveryOrder {
 /// Tasks land here when no worker is immediately
 /// available. The runtime drains the backlog on the
 /// next sweep cycle.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BacklogEntry {
     /// Durable storage key for the owning run.
     pub run_key: RunKey,
@@ -1959,7 +1959,7 @@ fn projection_context(
 }
 
 /// One row in the projection log, carrying the complete visibility image for a transition.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectionRecord {
     /// Hash-based partition for fan-out distribution.
     pub partition_id: u32,

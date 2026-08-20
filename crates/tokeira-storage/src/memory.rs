@@ -6,6 +6,12 @@
 //! maps `(namespace, workflow_id, run_id)` → `RunKey`, `current_open` tracks
 //! the single open run per workflow, and `current_execution` retains the exact
 //! current pointer after close without falling back to an older surviving run.
+//!
+//! For the embedded tier the store supports snapshot persist/restore: one
+//! consistent, version-stamped cut of the durable-equivalent state
+//! ([`InMemoryStore::snapshot`]) and a boot-only constructor that loads it
+//! ([`InMemoryStore::from_snapshot`]). The format is deliberately unstable
+//! across Tokeira versions — mismatched snapshots are refused, never migrated.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -72,6 +78,9 @@ impl std::fmt::Debug for InMemoryStore {
     }
 }
 
+/// Lease row for one shard/bundle: `(owner, epoch, node_endpoint)`.
+type BundleLeaseRow = (Option<String>, ShardEpoch, Option<String>);
+
 #[derive(Default)]
 struct StoreState {
     /// Current open run per workflow.
@@ -123,7 +132,7 @@ struct StoreState {
     /// Projection records awaiting projection workers.
     projection_log: Vec<ProjectionRecord>,
     /// Shard lease state keyed by shard id.
-    bundle_leases: HashMap<ShardId, (Option<String>, ShardEpoch, Option<String>)>,
+    bundle_leases: HashMap<ShardId, BundleLeaseRow>,
     /// Controller routing generation singleton.
     routing_generation: GenerationCounter,
     /// CAS version for controller connection-budget allocation.
@@ -211,7 +220,7 @@ impl WorkerTaskProvenanceStore for InMemoryStore {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ActivityDispatchEntry {
     task: DispatchableActivityTask,
     schedule_to_close_timeout: Option<time::Duration>,
@@ -266,6 +275,268 @@ impl InMemoryStore {
 
     fn effective_shard_count(store: &StoreState) -> u32 {
         store.shard_count.max(1)
+    }
+
+    /// Serialize the store's durable-equivalent state as one consistent cut.
+    ///
+    /// The whole `StoreState` is captured under a single acquisition of the
+    /// store lock, so the snapshot can never observe a torn or interleaved
+    /// view. Equal states produce byte-identical snapshots: maps are encoded
+    /// in sorted-key order, so the bytes are independent of `HashMap`
+    /// iteration order (the crate's standing determinism hazard).
+    ///
+    /// The format is version-stamped but **unstable**: this is the
+    /// dev/embedded tier, and a snapshot written by one Tokeira version is
+    /// refused — never migrated — by any other (see
+    /// [`InMemoryStore::from_snapshot`]). Test-only hooks (injected OCC
+    /// conflicts, injected conflict policy) are not part of the snapshot.
+    pub async fn snapshot(&self) -> Result<Vec<u8>, SnapshotError> {
+        let doc = {
+            let store = self.inner.lock().await;
+            SnapshotDoc::capture(&store)
+        };
+        let mut bytes =
+            postcard::to_allocvec(&SNAPSHOT_FORMAT_VERSION).map_err(SnapshotError::Encode)?;
+        bytes.extend_from_slice(&postcard::to_allocvec(&doc).map_err(SnapshotError::Encode)?);
+        Ok(bytes)
+    }
+
+    /// Construct a **new** store from bytes produced by
+    /// [`InMemoryStore::snapshot`].
+    ///
+    /// Restore is boot-only by design: there is deliberately no way to load a
+    /// snapshot into a live store, because swapping state under a running
+    /// runtime would violate every lease and fencing assumption built on top
+    /// of the repository. Hand the restored store to a fresh runtime and let
+    /// the normal recovery sweep rebuild derived dispatch state — the result
+    /// is indistinguishable from a process restart against durable storage.
+    ///
+    /// Absolute-time semantics carry over: a timer whose fire time passed
+    /// while the snapshot sat on disk fires immediately once recovery injects
+    /// it. That is correct durable-timer behaviour (a real cluster restarted
+    /// after downtime does the same), not a defect to compensate for.
+    ///
+    /// Test-only hooks are reset: the restored store has no injected OCC
+    /// conflicts and the default [`CurrentExecutionConflictPolicy`].
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::VersionMismatch`] when the version stamp differs from
+    /// [`SNAPSHOT_FORMAT_VERSION`] (checked before any payload decoding);
+    /// [`SnapshotError::Decode`] for truncated or corrupt input;
+    /// [`SnapshotError::TrailingBytes`] when decodable payload is followed by
+    /// leftover bytes. Never panics on any input.
+    pub fn from_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let (found, rest) =
+            postcard::take_from_bytes::<u32>(bytes).map_err(SnapshotError::Decode)?;
+        if found != SNAPSHOT_FORMAT_VERSION {
+            return Err(SnapshotError::VersionMismatch {
+                found,
+                supported: SNAPSHOT_FORMAT_VERSION,
+            });
+        }
+        let (doc, trailing) =
+            postcard::take_from_bytes::<SnapshotDoc>(rest).map_err(SnapshotError::Decode)?;
+        if !trailing.is_empty() {
+            return Err(SnapshotError::TrailingBytes(trailing.len()));
+        }
+        Ok(Self {
+            inner: Arc::new(Mutex::new(doc.into_state())),
+        })
+    }
+}
+
+/// Current snapshot format version.
+///
+/// Bump on ANY change to the snapshot document or a type reachable from it. Old
+/// snapshots are refused with [`SnapshotError::VersionMismatch`], never
+/// migrated — the format is a dev/embedded-tier convenience, not a
+/// compatibility surface.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// Errors from the [`InMemoryStore`] snapshot persist/restore surface.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotError {
+    /// The snapshot was written under a different format version. The format
+    /// is unstable across Tokeira versions; re-snapshot from a live store.
+    #[error(
+        "snapshot format version {found} is not supported (supported: {supported}); \
+         the in-memory snapshot format is unstable across Tokeira versions and old \
+         snapshots cannot be loaded"
+    )]
+    VersionMismatch {
+        /// Version stamped in the provided bytes.
+        found: u32,
+        /// The only version this build can load.
+        supported: u32,
+    },
+    /// The payload failed to decode (truncated or corrupt input).
+    #[error("failed to decode snapshot: {0}")]
+    Decode(postcard::Error),
+    /// Decodable payload followed by leftover bytes — the input is not a
+    /// snapshot this build wrote.
+    #[error("snapshot has {0} trailing bytes after the payload")]
+    TrailingBytes(usize),
+    /// The state failed to encode.
+    #[error("failed to encode snapshot: {0}")]
+    Encode(postcard::Error),
+}
+
+/// Canonical serialization mirror of [`StoreState`].
+///
+/// Every map field becomes a `Vec` of pairs in sorted-key order, which is what
+/// makes snapshot bytes deterministic for a given state (`HashMap` iteration
+/// order is randomized per map instance). `dispatch_backlog` keeps queue
+/// order — its order is meaningful, not incidental. The two test-only
+/// `StoreState` fields (`conflict_injections`, `conflict_policy`) have no
+/// counterpart here and are reset to defaults on restore.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotDoc {
+    current_open: Vec<((NamespaceId, String), RunKey)>,
+    current_execution: Vec<((NamespaceId, String), RunKey)>,
+    execution_index: Vec<((NamespaceId, String, RunId), RunKey)>,
+    runs: Vec<(RunKey, WorkflowState)>,
+    worker_deployments: Vec<(DeploymentKey, StoredWorkerDeployment)>,
+    workflow_rules: Vec<(NamespaceId, Vec<(String, WorkflowRuleRecord)>)>,
+    task_queue_configs: Vec<(StoredTaskQueueConfigKey, StoredTaskQueueConfig)>,
+    worker_task_provenance: Vec<([u8; 32], WorkerTaskProvenance)>,
+    deployment_token_hwm: Vec<(DeploymentKey, u64)>,
+    history: Vec<(RunKey, Vec<tokeira_kernel::HistoryEvent>)>,
+    history_principals: Vec<(RunKey, Vec<Option<tokeira_types::EventPrincipal>>)>,
+    request_dedupe: Vec<((NamespaceId, String, String), RequestRecord)>,
+    transition_audit: Vec<(RunKey, Vec<TransitionAuditRecord>)>,
+    projection_log: Vec<ProjectionRecord>,
+    bundle_leases: Vec<(ShardId, BundleLeaseRow)>,
+    routing_generation: GenerationCounter,
+    budget_version: u64,
+    activity_dispatch: Vec<((RunKey, String), ActivityDispatchEntry)>,
+    dispatch_backlog: Vec<BacklogEntry>,
+    activity_state_table: Vec<((RunKey, String), tokeira_kernel::ActivityState)>,
+    timer_bucket: Vec<((RunKey, String), tokeira_kernel::TimerState)>,
+    run_shard_map: Vec<(RunKey, ShardId)>,
+    shard_count: u32,
+}
+
+/// Clone a map into sorted-key pair order for canonical encoding.
+fn sorted_pairs<K: Ord + Clone, V: Clone>(map: &HashMap<K, V>) -> Vec<(K, V)> {
+    let mut pairs = map
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    // Keys are unique, so sorting on the key alone is a total order.
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
+impl SnapshotDoc {
+    fn capture(state: &StoreState) -> Self {
+        // Exhaustive destructuring, deliberately without a `..` rest pattern:
+        // adding a field to `StoreState` must fail to compile here until the
+        // new field is explicitly classified as persisted (added to the doc)
+        // or test-only/derived (explicitly ignored). This is what keeps the
+        // spec's state-policy table honest over time.
+        let StoreState {
+            current_open,
+            current_execution,
+            execution_index,
+            runs,
+            worker_deployments,
+            workflow_rules,
+            task_queue_configs,
+            worker_task_provenance,
+            deployment_token_hwm,
+            history,
+            history_principals,
+            request_dedupe,
+            transition_audit,
+            projection_log,
+            bundle_leases,
+            routing_generation,
+            budget_version,
+            activity_dispatch,
+            dispatch_backlog,
+            conflict_injections: _,
+            conflict_policy: _,
+            activity_state_table,
+            timer_bucket,
+            run_shard_map,
+            shard_count,
+        } = state;
+        Self {
+            current_open: sorted_pairs(current_open),
+            current_execution: sorted_pairs(current_execution),
+            execution_index: sorted_pairs(execution_index),
+            runs: sorted_pairs(runs),
+            worker_deployments: sorted_pairs(worker_deployments),
+            workflow_rules: {
+                let mut namespaces = workflow_rules
+                    .iter()
+                    .map(|(namespace_id, rules)| {
+                        // The inner `BTreeMap` already iterates in key order.
+                        let rules = rules
+                            .iter()
+                            .map(|(id, record)| (id.clone(), record.clone()))
+                            .collect::<Vec<_>>();
+                        (*namespace_id, rules)
+                    })
+                    .collect::<Vec<_>>();
+                namespaces.sort_unstable_by_key(|entry| entry.0);
+                namespaces
+            },
+            task_queue_configs: sorted_pairs(task_queue_configs),
+            worker_task_provenance: sorted_pairs(worker_task_provenance),
+            deployment_token_hwm: sorted_pairs(deployment_token_hwm),
+            history: sorted_pairs(history),
+            history_principals: sorted_pairs(history_principals),
+            request_dedupe: sorted_pairs(request_dedupe),
+            transition_audit: sorted_pairs(transition_audit),
+            projection_log: projection_log.clone(),
+            bundle_leases: sorted_pairs(bundle_leases),
+            routing_generation: *routing_generation,
+            budget_version: *budget_version,
+            activity_dispatch: sorted_pairs(activity_dispatch),
+            dispatch_backlog: dispatch_backlog.iter().cloned().collect(),
+            activity_state_table: sorted_pairs(activity_state_table),
+            timer_bucket: sorted_pairs(timer_bucket),
+            run_shard_map: sorted_pairs(run_shard_map),
+            shard_count: *shard_count,
+        }
+    }
+
+    fn into_state(self) -> StoreState {
+        StoreState {
+            current_open: self.current_open.into_iter().collect(),
+            current_execution: self.current_execution.into_iter().collect(),
+            execution_index: self.execution_index.into_iter().collect(),
+            runs: self.runs.into_iter().collect(),
+            worker_deployments: self.worker_deployments.into_iter().collect(),
+            workflow_rules: self
+                .workflow_rules
+                .into_iter()
+                .map(|(namespace_id, rules)| (namespace_id, rules.into_iter().collect()))
+                .collect(),
+            task_queue_configs: self.task_queue_configs.into_iter().collect(),
+            worker_task_provenance: self.worker_task_provenance.into_iter().collect(),
+            deployment_token_hwm: self.deployment_token_hwm.into_iter().collect(),
+            history: self.history.into_iter().collect(),
+            history_principals: self.history_principals.into_iter().collect(),
+            request_dedupe: self.request_dedupe.into_iter().collect(),
+            transition_audit: self.transition_audit.into_iter().collect(),
+            projection_log: self.projection_log,
+            bundle_leases: self.bundle_leases.into_iter().collect(),
+            routing_generation: self.routing_generation,
+            budget_version: self.budget_version,
+            activity_dispatch: self.activity_dispatch.into_iter().collect(),
+            dispatch_backlog: self.dispatch_backlog.into(),
+            // Test-only hooks never restore: a snapshot must behave like
+            // durable state, and durable state has no synthetic conflicts.
+            conflict_injections: HashMap::new(),
+            conflict_policy: CurrentExecutionConflictPolicy::default(),
+            activity_state_table: self.activity_state_table.into_iter().collect(),
+            timer_bucket: self.timer_bucket.into_iter().collect(),
+            run_shard_map: self.run_shard_map.into_iter().collect(),
+            shard_count: self.shard_count,
+        }
     }
 }
 
@@ -5314,6 +5585,429 @@ mod tests {
                 }
                 Ok(())
             })?;
+        }
+    }
+
+    /// One generated mutation applied through the public repository surface
+    /// when seeding a store for the snapshot properties.
+    #[derive(Clone, Debug)]
+    enum SnapshotSeedOp {
+        StartRun {
+            workflow_id: String,
+            with_history: bool,
+            with_timer: bool,
+            with_activity: bool,
+            with_dedupe: bool,
+        },
+        PutDeployment {
+            name: String,
+        },
+        PutTaskQueueConfig {
+            queue: String,
+        },
+        PutProvenance {
+            digest_seed: u8,
+        },
+        AcquireLease {
+            shard: u8,
+            owner_seed: u8,
+        },
+    }
+
+    fn snapshot_seed_op() -> impl Strategy<Value = SnapshotSeedOp> {
+        prop_oneof![
+            (
+                "[a-z]{1,8}",
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+            )
+                .prop_map(
+                    |(workflow_id, with_history, with_timer, with_activity, with_dedupe)| {
+                        SnapshotSeedOp::StartRun {
+                            workflow_id,
+                            with_history,
+                            with_timer,
+                            with_activity,
+                            with_dedupe,
+                        }
+                    }
+                ),
+            "[a-z]{1,8}".prop_map(|name| SnapshotSeedOp::PutDeployment { name }),
+            "[a-z]{1,8}".prop_map(|queue| SnapshotSeedOp::PutTaskQueueConfig { queue }),
+            any::<u8>().prop_map(|digest_seed| SnapshotSeedOp::PutProvenance { digest_seed }),
+            (0u8..8, any::<u8>())
+                .prop_map(|(shard, owner_seed)| SnapshotSeedOp::AcquireLease { shard, owner_seed }),
+        ]
+    }
+
+    fn seeded_start_transition(run_key: RunKey, op: &SnapshotSeedOp) -> Transition {
+        let SnapshotSeedOp::StartRun {
+            workflow_id,
+            with_history,
+            with_timer,
+            with_activity,
+            with_dedupe,
+        } = op
+        else {
+            panic!("seeded_start_transition takes a StartRun op");
+        };
+        let mut transition = start_transition(run_key);
+        transition.next_state.workflow_id = WorkflowId(workflow_id.clone());
+        if *with_history {
+            transition.history_events.push(HistoryEvent {
+                event_id: 1,
+                happened_at: fixed_now(),
+                kind: HistoryEventKind::WorkflowTaskScheduled {
+                    logical_seq: LogicalTaskSeq(1),
+                    task_queue: TaskQueueName("queue".into()),
+                    workflow_task_timeout: Duration::seconds(10),
+                    attempt: 1,
+                },
+            });
+            transition.event_principals.push(Some(EventPrincipal {
+                principal_type: "jwt".into(),
+                name: "operator".into(),
+            }));
+        }
+        if *with_timer {
+            transition
+                .timer_ops
+                .push(TimerOp::Upsert(tokeira_kernel::TimerState {
+                    timer_id: "timer-1".into(),
+                    started_event_id: 3,
+                    fire_at: fixed_now(),
+                }));
+        }
+        if *with_activity {
+            transition
+                .activity_ops
+                .push(ActivityOp::Upsert(activity_state("activity-1")));
+            transition
+                .dispatch_ops
+                .push(DispatchOp::EnqueueActivityTask {
+                    queue: QueueKey {
+                        namespace_id: transition.next_state.namespace_id,
+                        task_queue: TaskQueueName("activity-q".into()),
+                        task_kind: TaskKind::Activity,
+                        deployment: None,
+                        build_id: None,
+                    },
+                    activity_id: "activity-1".to_owned(),
+                    input: tokeira_types::Payloads::default(),
+                    schedule_event_id: 7,
+                    attempt: 1,
+                    dispatch_revision: 0,
+                    stamp: 0,
+                    dispatch_at: fixed_now(),
+                    schedule_to_close_timeout: Some(Duration::seconds(30)),
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: Some(Duration::seconds(20)),
+                    heartbeat_timeout: None,
+                    priority: None,
+                });
+        }
+        if *with_dedupe {
+            transition.request_dedupe_ops.push(RequestDedupeOp {
+                request_id: RequestId(format!("req-{workflow_id}")),
+            });
+        }
+        transition
+    }
+
+    async fn apply_snapshot_seed_ops(store: &InMemoryStore, ops: &[SnapshotSeedOp]) {
+        for op in ops {
+            match op {
+                SnapshotSeedOp::StartRun { .. } => {
+                    let run_key = RunKey::new();
+                    store
+                        .commit_transition(
+                            run_key,
+                            seeded_start_transition(run_key, op),
+                            ShardEpoch::ZERO,
+                        )
+                        .await
+                        .unwrap();
+                }
+                SnapshotSeedOp::PutDeployment { name } => {
+                    store
+                        .put_deployment(sample_deployment(NamespaceId::new(), name), None)
+                        .await
+                        .unwrap();
+                }
+                SnapshotSeedOp::PutTaskQueueConfig { queue } => {
+                    store
+                        .compare_and_swap_task_queue_config(
+                            StoredTaskQueueConfig {
+                                namespace_id: NamespaceId::new(),
+                                task_queue: TaskQueueName(queue.clone()),
+                                kind: StoredTaskQueueConfigKind::Workflow,
+                                revision: 0,
+                                queue_rate_limit: Some(7.5),
+                                queue_rate_limit_metadata: None,
+                                fairness_key_rate_limit_default: None,
+                                fairness_key_rate_limit_metadata: None,
+                                fairness_weight_overrides: BTreeMap::new(),
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                SnapshotSeedOp::PutProvenance { digest_seed } => {
+                    let _ = WorkerTaskProvenanceStore::put(
+                        store,
+                        WorkerTaskProvenance {
+                            token_digest: [*digest_seed; 32],
+                            origin: WorkerTaskOrigin {
+                                namespace_id: NamespaceId::new(),
+                                normal_task_queue: TaskQueueName("queue".into()),
+                                task_class: WorkerTaskClass::Workflow,
+                                deployment: DeploymentId("payments".to_owned()),
+                                build_id: BuildId("build-a".to_owned()),
+                            },
+                            expires_at: fixed_now() + Duration::hours(2),
+                            created_at: fixed_now(),
+                        },
+                    )
+                    .await;
+                }
+                SnapshotSeedOp::AcquireLease { shard, owner_seed } => {
+                    store
+                        .try_acquire_bundle(
+                            ShardId(u32::from(*shard)),
+                            format!("owner-{owner_seed}"),
+                            "127.0.0.1:7233".to_owned(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: inmemory-store-snapshots, Property 1: snapshot round-trip identity
+        #[test]
+        fn property_snapshot_round_trip_identity(
+            ops in prop::collection::vec(snapshot_seed_op(), 0..12),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let store = InMemoryStore::default();
+                apply_snapshot_seed_ops(&store, &ops).await;
+                let first = store.snapshot().await.unwrap();
+                // Same store, no writes in between: bytes are deterministic.
+                prop_assert_eq!(&first, &store.snapshot().await.unwrap());
+                // Restored store holds fresh HashMap instances with new random
+                // iteration order; canonical sorted-pair encoding makes byte
+                // identity the state-identity check.
+                let restored = InMemoryStore::from_snapshot(&first).unwrap();
+                prop_assert_eq!(first, restored.snapshot().await.unwrap());
+                Ok(())
+            })?;
+        }
+
+        // Feature: inmemory-store-snapshots, Property 2: malformed input refused
+        #[test]
+        fn property_snapshot_malformed_input_refused(
+            ops in prop::collection::vec(snapshot_seed_op(), 0..4),
+            other_version in any::<u32>(),
+            garbage in prop::collection::vec(any::<u8>(), 0..64),
+            trailing in prop::collection::vec(any::<u8>(), 1..16),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            prop_assume!(other_version != SNAPSHOT_FORMAT_VERSION);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let store = InMemoryStore::default();
+                apply_snapshot_seed_ops(&store, &ops).await;
+                let snapshot = store.snapshot().await.unwrap();
+
+                // (a) Same payload re-stamped with another version: refused by
+                // the version check alone, naming both versions.
+                let (_, payload) = postcard::take_from_bytes::<u32>(&snapshot).unwrap();
+                let mut restamped = postcard::to_allocvec(&other_version).unwrap();
+                restamped.extend_from_slice(payload);
+                match InMemoryStore::from_snapshot(&restamped) {
+                    Err(SnapshotError::VersionMismatch { found, supported }) => {
+                        prop_assert_eq!(found, other_version);
+                        prop_assert_eq!(supported, SNAPSHOT_FORMAT_VERSION);
+                    }
+                    other => prop_assert!(false, "expected VersionMismatch, got {other:?}"),
+                }
+
+                // (b) Any proper prefix fails to decode.
+                let cut_at = cut.index(snapshot.len());
+                prop_assert!(matches!(
+                    InMemoryStore::from_snapshot(&snapshot[..cut_at]),
+                    Err(SnapshotError::Decode(_))
+                ));
+
+                // (c) Trailing bytes after a decodable payload are refused.
+                let mut padded = snapshot.clone();
+                padded.extend_from_slice(&trailing);
+                prop_assert!(matches!(
+                    InMemoryStore::from_snapshot(&padded),
+                    Err(SnapshotError::TrailingBytes(count)) if count == trailing.len()
+                ));
+
+                // (d) Arbitrary bytes never panic (any Result is acceptable).
+                let _ = InMemoryStore::from_snapshot(&garbage);
+                Ok(())
+            })?;
+        }
+
+        // Feature: inmemory-store-snapshots, Property 3: test-only state reset
+        #[test]
+        fn property_test_only_state_never_survives_restore(
+            ops in prop::collection::vec(snapshot_seed_op(), 1..8),
+            injected_conflicts in 1usize..5,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let store = InMemoryStore::default();
+                apply_snapshot_seed_ops(&store, &ops).await;
+                let clean = store.snapshot().await.unwrap();
+
+                let injected_key = RunKey::new();
+                store.inject_conflict(injected_key, injected_conflicts).await;
+                store
+                    .set_conflict_policy(CurrentExecutionConflictPolicy::AllowAfterClose)
+                    .await;
+                let injected = store.snapshot().await.unwrap();
+                // Test-only hooks are invisible in the bytes.
+                prop_assert_eq!(&clean, &injected);
+
+                let restored = InMemoryStore::from_snapshot(&injected).unwrap();
+                {
+                    let state = restored.inner.lock().await;
+                    prop_assert!(state.conflict_injections.is_empty());
+                    prop_assert_eq!(
+                        state.conflict_policy,
+                        CurrentExecutionConflictPolicy::default()
+                    );
+                }
+                // Behavioral check: a commit against the key that had injected
+                // conflicts applies cleanly on the restored store.
+                let result = restored
+                    .commit_transition(
+                        injected_key,
+                        start_transition(injected_key),
+                        ShardEpoch::ZERO,
+                    )
+                    .await
+                    .unwrap();
+                let applied = matches!(result, CommitResult::Applied { .. });
+                prop_assert!(applied);
+                Ok(())
+            })?;
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_store_snapshot_round_trips() {
+        let store = InMemoryStore::default();
+        let snapshot = store.snapshot().await.unwrap();
+        let restored = InMemoryStore::from_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.snapshot().await.unwrap(), snapshot);
+    }
+
+    #[test]
+    fn from_snapshot_refuses_other_format_versions() {
+        let bytes = postcard::to_allocvec(&(SNAPSHOT_FORMAT_VERSION + 1)).unwrap();
+        match InMemoryStore::from_snapshot(&bytes) {
+            Err(SnapshotError::VersionMismatch { found, supported }) => {
+                assert_eq!(found, SNAPSHOT_FORMAT_VERSION + 1);
+                assert_eq!(supported, SNAPSHOT_FORMAT_VERSION);
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_and_padded_snapshots_are_refused() {
+        let store = InMemoryStore::default();
+        let snapshot = store.snapshot().await.unwrap();
+        assert!(matches!(
+            InMemoryStore::from_snapshot(&snapshot[..snapshot.len() - 1]),
+            Err(SnapshotError::Decode(_))
+        ));
+        let mut padded = snapshot.clone();
+        padded.push(0xFF);
+        assert!(matches!(
+            InMemoryStore::from_snapshot(&padded),
+            Err(SnapshotError::TrailingBytes(1))
+        ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_one_consistent_cut_under_concurrent_writes() {
+        let store = InMemoryStore::default();
+        let writer_store = store.clone();
+        let writer = tokio::spawn(async move {
+            for _ in 0..64 {
+                let run_key = RunKey::new();
+                let mut transition = start_transition(run_key);
+                transition.history_events.push(HistoryEvent {
+                    event_id: 1,
+                    happened_at: fixed_now(),
+                    kind: HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq: LogicalTaskSeq(1),
+                        task_queue: TaskQueueName("queue".into()),
+                        workflow_task_timeout: Duration::seconds(10),
+                        attempt: 1,
+                    },
+                });
+                transition.event_principals.push(Some(EventPrincipal {
+                    principal_type: "jwt".into(),
+                    name: "operator".into(),
+                }));
+                writer_store
+                    .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                    .await
+                    .unwrap();
+            }
+        });
+        // No sleeps: interleave snapshots with the writer until it finishes,
+        // yielding so the single-threaded test runtime can advance it.
+        let mut cuts = Vec::new();
+        while !writer.is_finished() {
+            cuts.push(store.snapshot().await.unwrap());
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+        cuts.push(store.snapshot().await.unwrap());
+
+        for cut in cuts {
+            let restored = InMemoryStore::from_snapshot(&cut).unwrap();
+            let state = restored.inner.lock().await;
+            // Each commit writes run state, indexes, history, and the principal
+            // sidecar under one lock acquisition; a torn cut would break these
+            // pairings.
+            for (run_key, history) in &state.history {
+                let principals = state
+                    .history_principals
+                    .get(run_key)
+                    .expect("principal sidecar accompanies every history stream");
+                assert_eq!(principals.len(), history.len());
+            }
+            for run_key in state.current_open.values() {
+                assert!(state.runs.contains_key(run_key));
+            }
+            assert_eq!(state.runs.len(), state.execution_index.len());
         }
     }
 }

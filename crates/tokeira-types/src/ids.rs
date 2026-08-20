@@ -63,7 +63,7 @@ impl TryFrom<&str> for IncarnationId {
 /// display names. A rename of the namespace in the control
 /// plane must not invalidate every row key or token that
 /// references it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NamespaceId(pub Uuid);
 
 impl Default for NamespaceId {
@@ -85,7 +85,7 @@ impl NamespaceId {
 /// logs, APIs, and the Temporal UI. It is always a UUID but
 /// carries no storage-layout semantics — that role belongs to
 /// [`RunKey`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RunId(pub Uuid);
 
 impl Default for RunId {
@@ -108,7 +108,7 @@ impl RunId {
 /// user-visible [`RunId`] to play double duty as a clustering
 /// key. Every persistence operation addresses a run by its
 /// `RunKey`, not its `RunId`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RunKey(pub Uuid);
 
 #[cfg(any(test, feature = "test-support"))]
@@ -234,7 +234,7 @@ mod tests {
 /// placement controller can assign non-overlapping subsets of
 /// runs to lanes. See `docs/architecture/030-runtime-lanes.md`
 /// and `docs/architecture/035-placement-and-membership.md`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ShardId(pub u32);
 
 /// Bundle identifier used by placement and leasing.

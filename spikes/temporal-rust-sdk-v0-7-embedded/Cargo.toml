@@ -1,0 +1,17 @@
+[package]
+name = "tokeira-temporal-sdk-v0-7-spike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[dependencies]
+anyhow = "1.0.103"
+futures = "0.3"
+temporalio-client = { version = "=0.7.0", default-features = false }
+temporalio-common = { version = "=0.7.0", default-features = false }
+temporalio-macros = "=0.7.0"
+temporalio-sdk = { version = "=0.7.0", default-features = false }
+temporalio-workflow = "=0.7.0"
+tokeira-engine = { path = "../../crates/tokeira-engine" }
+tokio = { version = "1.50", features = ["macros", "rt-multi-thread", "time"] }

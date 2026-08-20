@@ -64,6 +64,28 @@ devbox create --name <box> --size xl --volume_size_gb 100 \
   same volume. Persistence is whole-disk: the synced tree, remote `target/`,
   toolchains, and apt packages all survive stop/resume, so provisioning is once-ever.
 
+### Mark long-running tasks
+
+Namespace considers a Devbox active while any file exists under
+[`/.namespace/tasks`](https://namespace.so/docs/devbox/managing#how-idleness-is-detected).
+Before starting a long non-interactive build or test run, create a uniquely named
+marker so the box cannot idle-stop between SSH connections:
+
+```bash
+devbox exec <box> -- touch /.namespace/tasks/<agent>-<task>
+```
+
+Remove exactly that marker as soon as the task is finished, including after a failure.
+A stale marker prevents idle-stop and therefore keeps the box billable:
+
+```bash
+devbox exec <box> -- rm /.namespace/tasks/<agent>-<task>
+```
+
+One Devbox may serve several worktrees, so each active task owns its own marker; never
+remove another task's file. Session creation also suppresses idleness for 15 minutes,
+but a task marker is the explicit lifetime signal for a long cargo run.
+
 Provision (Ubuntu `builtin:base` image):
 
 ```bash

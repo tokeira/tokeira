@@ -20,7 +20,10 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock, Weak},
+    sync::{
+        Arc, RwLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -34,6 +37,8 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use tokio::{
+    fs::{self, OpenOptions},
+    io::AsyncWriteExt as _,
     net::TcpListener,
     sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
@@ -43,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{error, info};
 
 #[cfg(feature = "conformance")]
 mod conformance_grpc_authenticator;
@@ -66,8 +71,8 @@ use tokeira_auth::{
     WorkerScopeRule, WorkerScopeRules,
 };
 use tokeira_chasm::Library as _;
-pub use tokeira_config::TokeiraConfig;
 use tokeira_config::{Cli, ConfigStorageKind};
+pub use tokeira_config::{SnapshotPolicyConfig, TokeiraConfig};
 use tokeira_edge::{
     Authenticator, CacheBackedRouter, CallbackResponse, EdgeInterceptors, EdgeRoutingConfig,
     HistoryNotifyingRepository, HistoryWaitRegistry, HttpApiCatalog, HttpApiPolicy,
@@ -385,12 +390,70 @@ pub struct BootstrapNexusEndpointConfig {
 /// The engine owns the in-memory authoritative store, runtime workers, and edge
 /// services. [`Self::endpoint`] is cloneable and can be adapted directly to the
 /// Temporal Rust SDK's callback transport. Dropping the engine cancels background
-/// work and makes every endpoint clone reject new calls.
+/// work and makes every endpoint clone reject new calls. When snapshot policy is
+/// configured, call [`Self::shutdown`] for the final graceful-shutdown snapshot;
+/// `Drop` cannot perform asynchronous file I/O.
 #[derive(Debug)]
 pub struct Engine {
     endpoint: TemporalEndpoint,
     background_cancel: CancellationToken,
     log_broadcast: broadcast::Sender<LogEvent>,
+    snapshot_policy: Option<EngineSnapshotPolicy>,
+    recovery_task: Option<JoinHandle<Result<()>>>,
+}
+
+#[derive(Debug)]
+struct EngineSnapshotPolicy {
+    store: InMemoryStore,
+    location: PathBuf,
+    periodic_task: Option<JoinHandle<()>>,
+}
+
+static SNAPSHOT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+impl EngineSnapshotPolicy {
+    fn start(
+        store: InMemoryStore,
+        config: SnapshotPolicyConfig,
+        cancel: CancellationToken,
+    ) -> Self {
+        let interval_duration = std::time::Duration::from_millis(config.interval_ms);
+        let location = config.location;
+        let periodic_store = store.clone();
+        let periodic_location = location.clone();
+        // Anchor the cadence before spawning. A busy executor may not poll the
+        // task immediately, but elapsed startup time still counts toward the
+        // operator-configured interval.
+        let first_tick = tokio::time::Instant::now() + interval_duration;
+        let periodic_task = tokio::spawn(async move {
+            // The first capture belongs one complete interval after startup. An
+            // immediate tick would turn "every N milliseconds" into an
+            // undocumented snapshot-at-boot policy and add I/O before any state
+            // could have changed.
+            let mut interval = tokio::time::interval_at(first_tick, interval_duration);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = persist_snapshot(&periodic_store, &periodic_location).await {
+                            error!(
+                                snapshot_path = %periodic_location.display(),
+                                error = %error,
+                                "failed to persist periodic embedded-engine snapshot"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            store,
+            location,
+            periodic_task: Some(periodic_task),
+        }
+    }
 }
 
 /// Cloneable raw-protobuf endpoint for an embedded [`Engine`].
@@ -423,7 +486,12 @@ impl Engine {
     /// ownership and no bound sockets.
     pub async fn start_with_config(config: TokeiraConfig) -> Result<Self> {
         let config = embedded_config(config)?;
-        let stack = build_embedded(Arc::new(config)).await?;
+        let snapshot_config = config.policy.snapshot.clone();
+        let (store, restored) = restore_embedded_store(&config).await?;
+        let stack = build_embedded(Arc::new(config), store.clone(), restored).await?;
+        let snapshot_policy = snapshot_config.map(|config| {
+            EngineSnapshotPolicy::start(store, config, stack.background_cancel.clone())
+        });
         Ok(Self {
             endpoint: TemporalEndpoint {
                 service: stack.service,
@@ -431,6 +499,8 @@ impl Engine {
             },
             background_cancel: stack.background_cancel,
             log_broadcast: stack.log_broadcast,
+            snapshot_policy,
+            recovery_task: stack.recovery_task,
         })
     }
 
@@ -453,15 +523,189 @@ impl Engine {
         self.endpoint.service_override()
     }
 
-    /// Stop accepting calls and cancel every background worker owned by the engine.
-    pub async fn shutdown(self) -> Result<()> {
+    /// Stop accepting calls, cancel background work, and persist the final snapshot.
+    ///
+    /// When snapshot policy is disabled this retains the previous cancellation-only
+    /// behaviour. A configured final snapshot failure is returned to the caller: a
+    /// graceful shutdown must not silently claim durability it did not achieve.
+    pub async fn shutdown(mut self) -> Result<()> {
         self.background_cancel.cancel();
+        let periodic_result = match self
+            .snapshot_policy
+            .as_mut()
+            .and_then(|policy| policy.periodic_task.take())
+        {
+            Some(task) => task
+                .await
+                .context("embedded snapshot task panicked during shutdown"),
+            None => Ok(()),
+        };
+        let recovery_result = match self.recovery_task.take() {
+            Some(task) => task
+                .await
+                .context("embedded snapshot recovery task panicked during shutdown")?,
+            None => Ok(()),
+        };
         // The endpoint observes the same token. Yield once so cancellation-aware
         // workers that are already runnable can leave their select loops before the
-        // caller tears down its surrounding Tokio runtime.
+        // final consistent cut and before the caller tears down its Tokio runtime.
         tokio::task::yield_now().await;
+        let snapshot_result = match self.snapshot_policy.as_ref() {
+            Some(policy) => persist_snapshot(&policy.store, &policy.location)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist final embedded-engine snapshot to {}",
+                        policy.location.display()
+                    )
+                }),
+            None => Ok(()),
+        };
+        periodic_result?;
+        recovery_result?;
+        snapshot_result
+    }
+}
+
+async fn restore_embedded_store(config: &TokeiraConfig) -> Result<(InMemoryStore, bool)> {
+    let Some(snapshot) = config.policy.snapshot.as_ref() else {
+        return Ok((InMemoryStore::default(), false));
+    };
+    match fs::read(&snapshot.location).await {
+        Ok(bytes) => {
+            let store = InMemoryStore::from_snapshot(&bytes).with_context(|| {
+                format!(
+                    "failed to restore embedded-engine snapshot from {}",
+                    snapshot.location.display()
+                )
+            })?;
+            retire_snapshot_leases(&store).await.with_context(|| {
+                format!(
+                    "failed to retire prior embedded-engine leases from {}",
+                    snapshot.location.display()
+                )
+            })?;
+            info!(
+                snapshot_path = %snapshot.location.display(),
+                "restored embedded-engine snapshot"
+            );
+            Ok((store, true))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((InMemoryStore::default(), false))
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to read embedded-engine snapshot from {}",
+                snapshot.location.display()
+            )
+        }),
+    }
+}
+
+async fn retire_snapshot_leases(store: &InMemoryStore) -> Result<()> {
+    for lease in store
+        .list_bundle_leases()
+        .await
+        .context("failed to list embedded snapshot leases")?
+    {
+        let Some(owner) = lease.owner_node_id else {
+            continue;
+        };
+        match store
+            .relinquish_bundle(lease.bundle_id, owner, lease.epoch)
+            .await
+            .context("failed to relinquish an embedded snapshot lease")?
+        {
+            LeaseOutcome::Acquired { .. } => {}
+            LeaseOutcome::Rejected {
+                current_owner,
+                current_epoch,
+            } => {
+                return Err(anyhow!(
+                    "embedded snapshot lease retirement was fenced by owner {current_owner} at epoch {}",
+                    current_epoch.0
+                ));
+            }
+            LeaseOutcome::Renewed { epoch } => {
+                return Err(anyhow!(
+                    "embedded snapshot lease retirement unexpectedly renewed epoch {}",
+                    epoch.0
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn persist_snapshot(store: &InMemoryStore, location: &Path) -> Result<()> {
+    let bytes = store
+        .snapshot()
+        .await
+        .context("failed to capture embedded-engine snapshot")?;
+    write_snapshot_atomically(location, &bytes).await
+}
+
+async fn write_snapshot_atomically(location: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = location
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed to create embedded snapshot directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    // A same-directory temporary keeps rename atomic on the target filesystem.
+    // The process/sequence suffix prevents two embedded engines in one test
+    // process from sharing a staging file even if they target the same snapshot.
+    let sequence = SNAPSHOT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut temporary_name = location.as_os_str().to_os_string();
+    temporary_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+    let temporary = PathBuf::from(temporary_name);
+
+    let write_result: Result<()> = async {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create temporary embedded snapshot {}",
+                    temporary.display()
+                )
+            })?;
+        file.write_all(bytes).await.with_context(|| {
+            format!(
+                "failed to write temporary embedded snapshot {}",
+                temporary.display()
+            )
+        })?;
+        file.sync_all().await.with_context(|| {
+            format!(
+                "failed to sync temporary embedded snapshot {}",
+                temporary.display()
+            )
+        })?;
+        drop(file);
+        fs::rename(&temporary, location).await.with_context(|| {
+            format!("failed to replace embedded snapshot {}", location.display())
+        })?;
         Ok(())
     }
+    .await;
+
+    if write_result.is_err() {
+        // Cleanup is best-effort and intentionally targets only the unique
+        // staging file created above; the prior complete snapshot stays intact.
+        let _ = fs::remove_file(&temporary).await;
+    }
+    write_result
 }
 
 fn embedded_config(mut config: TokeiraConfig) -> Result<TokeiraConfig> {
@@ -1053,6 +1297,7 @@ struct EmbeddedStack {
     service: InProcessGrpcService,
     background_cancel: CancellationToken,
     log_broadcast: broadcast::Sender<LogEvent>,
+    recovery_task: Option<JoinHandle<Result<()>>>,
 }
 
 /// Build the full server stack and start serving on the given address.
@@ -1075,7 +1320,13 @@ async fn build_and_serve(
 ) -> Result<ServerStack> {
     let stack = match effective_config.infrastructure.storage {
         ConfigStorageKind::InMemory => {
-            build_in_memory_stack(StackTransport::Network(addr), effective_config).await
+            build_in_memory_stack(
+                StackTransport::Network(addr),
+                effective_config,
+                InMemoryStore::default(),
+                false,
+            )
+            .await
         }
         ConfigStorageKind::Dsql => {
             let auth = dsql_auth_config(&effective_config)?;
@@ -1128,6 +1379,7 @@ async fn build_and_serve(
                 },
                 Some(endpoint),
                 chasm_node_repo,
+                false,
             )
             .await
         }
@@ -1140,8 +1392,19 @@ async fn build_and_serve(
     }
 }
 
-async fn build_embedded(effective_config: Arc<TokeiraConfig>) -> Result<EmbeddedStack> {
-    match build_in_memory_stack(StackTransport::Embedded, effective_config).await? {
+async fn build_embedded(
+    effective_config: Arc<TokeiraConfig>,
+    store: InMemoryStore,
+    recover_self_assigned_shard: bool,
+) -> Result<EmbeddedStack> {
+    match build_in_memory_stack(
+        StackTransport::Embedded,
+        effective_config,
+        store,
+        recover_self_assigned_shard,
+    )
+    .await?
+    {
         ConstructedStack::Embedded(stack) => Ok(stack),
         ConstructedStack::Network(_) => Err(anyhow!(
             "embedded service construction returned a network stack"
@@ -1152,8 +1415,9 @@ async fn build_embedded(effective_config: Arc<TokeiraConfig>) -> Result<Embedded
 async fn build_in_memory_stack(
     transport: StackTransport,
     effective_config: Arc<TokeiraConfig>,
+    store: InMemoryStore,
+    recover_self_assigned_shard: bool,
 ) -> Result<ConstructedStack> {
-    let store = InMemoryStore::default();
     let visibility_store = InMemoryVisibilityStore::default();
     let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> = Arc::new(store.clone());
     let worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore> = Arc::new(store.clone());
@@ -1176,6 +1440,7 @@ async fn build_in_memory_stack(
         },
         None,
         Arc::new(tokeira_storage::InMemoryChasmNodeStore::new()),
+        recover_self_assigned_shard,
     )
     .await
 }
@@ -1315,6 +1580,7 @@ async fn build_service_stack_with_storage<R, L, S, V, F>(
     projection_sink: F,
     dsql_endpoint: Option<String>,
     chasm_node_repo: Arc<dyn tokeira_storage::ChasmNodeRepository>,
+    recover_self_assigned_shard: bool,
 ) -> Result<ConstructedStack>
 where
     R: LeaseRepository + RunRepository + 'static,
@@ -1372,7 +1638,8 @@ where
         .placement
         .controller_endpoint
         .is_some();
-    let seed_default_shard = dsql_endpoint.is_none()
+    let seed_default_shard = !recover_self_assigned_shard
+        && dsql_endpoint.is_none()
         && effective_config
             .infrastructure
             .placement
@@ -1488,6 +1755,17 @@ where
     ));
     let runtime = Arc::new(runtime);
 
+    let recovered_lease = if recover_self_assigned_shard {
+        let shard_id = ShardId(0);
+        let epoch = runtime
+            .acquire_shard(shard_id)
+            .await
+            .context("failed to recover embedded snapshot shard")?;
+        Some((shard_id, node_id.to_string(), epoch))
+    } else {
+        None
+    };
+
     if dsql_endpoint.is_some()
         && effective_config
             .infrastructure
@@ -1506,6 +1784,37 @@ where
     }
 
     let background_cancel = CancellationToken::new();
+    let recovery_task = recovered_lease.map(|(shard_id, owner, epoch)| {
+        let runtime = runtime.clone();
+        let repo = repo.clone();
+        let cancel = background_cancel.clone();
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            // Drain first so the shard-scoped token stops the lease renewer,
+            // then advance the durable epoch before a graceful snapshot. A
+            // crash may leave an active owner in the last interval snapshot;
+            // boot retires that captured owner before acquiring the new one.
+            runtime.relinquish_shard(shard_id).await;
+            match repo
+                .relinquish_bundle(shard_id, owner, epoch)
+                .await
+                .context("failed to release embedded snapshot recovery lease")?
+            {
+                LeaseOutcome::Acquired { .. } => Ok(()),
+                LeaseOutcome::Rejected {
+                    current_owner,
+                    current_epoch,
+                } => Err(anyhow!(
+                    "embedded snapshot recovery lease was fenced by owner {current_owner} at epoch {}",
+                    current_epoch.0
+                )),
+                LeaseOutcome::Renewed { epoch } => Err(anyhow!(
+                    "embedded snapshot recovery lease unexpectedly renewed at epoch {}",
+                    epoch.0
+                )),
+            }
+        })
+    });
     let _task_queue_config_refresh = task_queue_config_store
         .clone()
         .spawn_refresh(background_cancel.clone());
@@ -1876,6 +2185,7 @@ where
                 service: InProcessGrpcService::new(workflow_grpc, operator_grpc, admin_grpc),
                 background_cancel,
                 log_broadcast,
+                recovery_task,
             }));
         }
         StackTransport::Network(addr) => addr,

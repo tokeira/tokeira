@@ -463,6 +463,22 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         "Enable the experimental remote Worker Compute Controller; configured providers may create billable capacity."
     ),
     field!(
+        "policy.snapshot.location",
+        TokeiraNative,
+        "<unset>",
+        true,
+        None,
+        "Embedded-engine snapshot file; the optional section is disabled when absent."
+    ),
+    field!(
+        "policy.snapshot.interval_ms",
+        TokeiraNative,
+        "<unset>",
+        true,
+        None,
+        "Positive cadence for refreshing the embedded-engine snapshot file."
+    ),
+    field!(
         "policy.nexus_endpoint_limits.name_max_length",
         StockParity,
         "200",
@@ -893,6 +909,11 @@ enable_fairness = false
 [policy.worker_compute]
 # Enabling this can cause configured Nexus providers to create billable capacity.
 enabled = false
+
+[policy.snapshot]
+# The section is optional; when present both fields are required.
+location = "/tmp/tokeira.snapshot"
+interval_ms = 30000
 
 [policy.nexus_endpoint_limits]
 name_max_length = 200

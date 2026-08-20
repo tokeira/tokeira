@@ -1,15 +1,171 @@
 //! Focused lifecycle and SDK-connection coverage for the zero-listener engine.
 
-use std::net::TcpListener;
+use std::{
+    net::TcpListener,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result, bail};
 use http::HeaderMap;
 use prost::Message as _;
 use temporalio_client::{Connection, ConnectionOptions};
-use tokeira_engine::{Engine, InProcessGrpcRequest, TokeiraConfig};
-use tokeira_proto::workflowservice::{GetSystemInfoRequest, GetSystemInfoResponse};
+use tokeira_engine::{
+    Engine, InProcessGrpcRequest, SnapshotPolicyConfig, TemporalEndpoint, TokeiraConfig,
+};
+use tokeira_proto::{
+    common::{WorkflowExecution, WorkflowType},
+    taskqueue::TaskQueue,
+    workflowservice::{
+        DescribeWorkflowExecutionRequest, DescribeWorkflowExecutionResponse, GetSystemInfoRequest,
+        GetSystemInfoResponse, PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse,
+        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
+    },
+};
 
 const WORKFLOW_SERVICE: &str = "temporal.api.workflowservice.v1.WorkflowService";
+static TEST_SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TestSnapshotPath {
+    directory: PathBuf,
+    file: PathBuf,
+}
+
+impl TestSnapshotPath {
+    fn new(label: &str) -> Result<Self> {
+        let sequence = TEST_SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "tokeira-engine-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory)?;
+        let file = directory.join("engine.snapshot");
+        Ok(Self { directory, file })
+    }
+}
+
+impl Drop for TestSnapshotPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn snapshot_config(path: &Path, interval_ms: u64) -> TokeiraConfig {
+    let mut config = TokeiraConfig::default();
+    config.policy.snapshot = Some(SnapshotPolicyConfig {
+        location: path.to_path_buf(),
+        interval_ms,
+    });
+    config
+}
+
+async fn call<Req, Resp>(endpoint: &TemporalEndpoint, rpc: &str, request: Req) -> Result<Resp>
+where
+    Req: prost::Message,
+    Resp: prost::Message + Default,
+{
+    let response = endpoint
+        .call(InProcessGrpcRequest {
+            service: WORKFLOW_SERVICE.to_owned(),
+            rpc: rpc.to_owned(),
+            headers: HeaderMap::new(),
+            proto: request.encode_to_vec().into(),
+        })
+        .await?;
+    Ok(Resp::decode(response.proto.as_slice())?)
+}
+
+async fn start_workflow(engine: &Engine, workflow_id: &str, task_queue: &str) -> Result<()> {
+    let _: StartWorkflowExecutionResponse = call(
+        &engine.endpoint(),
+        "StartWorkflowExecution",
+        StartWorkflowExecutionRequest {
+            namespace: "default".to_owned(),
+            workflow_id: workflow_id.to_owned(),
+            workflow_type: Some(WorkflowType {
+                name: "snapshot-workflow".to_owned(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: task_queue.to_owned(),
+                ..Default::default()
+            }),
+            request_id: format!("start-{workflow_id}"),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn assert_workflow_exists(engine: &Engine, workflow_id: &str) -> Result<()> {
+    let response: DescribeWorkflowExecutionResponse = call(
+        &engine.endpoint(),
+        "DescribeWorkflowExecution",
+        DescribeWorkflowExecutionRequest {
+            namespace: "default".to_owned(),
+            execution: Some(WorkflowExecution {
+                workflow_id: workflow_id.to_owned(),
+                run_id: String::new(),
+            }),
+        },
+    )
+    .await?;
+    let execution = response
+        .workflow_execution_info
+        .and_then(|info| info.execution)
+        .context("restored workflow description omitted execution identity")?;
+    assert_eq!(execution.workflow_id, workflow_id);
+    Ok(())
+}
+
+async fn assert_recovered_workflow_task(engine: &Engine, task_queue: &str) -> Result<()> {
+    let response: PollWorkflowTaskQueueResponse = tokio::time::timeout(
+        Duration::from_secs(5),
+        call(
+            &engine.endpoint(),
+            "PollWorkflowTaskQueue",
+            PollWorkflowTaskQueueRequest {
+                namespace: "default".to_owned(),
+                task_queue: Some(TaskQueue {
+                    name: task_queue.to_owned(),
+                    ..Default::default()
+                }),
+                identity: "snapshot-test-worker".to_owned(),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .context("timed out waiting for the recovery sweep to republish workflow work")??;
+    assert!(
+        !response.task_token.is_empty(),
+        "recovery must republish a durable workflow task"
+    );
+    Ok(())
+}
+
+async fn wait_for_snapshot(path: &Path) -> Result<()> {
+    for _ in 0..10_000 {
+        if tokio::fs::metadata(path).await.is_ok() {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+    bail!("periodic snapshot was not written to {}", path.display())
+}
+
+async fn wait_for_snapshot_change(path: &Path, previous: &[u8]) -> Result<()> {
+    for _ in 0..10_000 {
+        if let Ok(bytes) = tokio::fs::read(path).await
+            && bytes != previous
+        {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+    bail!("periodic snapshot was not refreshed at {}", path.display())
+}
 
 #[tokio::test]
 async fn raw_endpoint_dispatches_get_system_info() -> Result<()> {
@@ -79,6 +235,86 @@ async fn shutdown_closes_existing_endpoint_clones() -> Result<()> {
         .await
         .expect_err("an endpoint clone must reject calls after engine shutdown");
     assert_eq!(status.code(), tonic::Code::Unavailable);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graceful_shutdown_snapshot_restores_state_and_recovery() -> Result<()> {
+    let snapshot = TestSnapshotPath::new("graceful-snapshot")?;
+    let config = snapshot_config(&snapshot.file, 3_600_000);
+    let engine = Engine::start_with_config(config.clone()).await?;
+    start_workflow(&engine, "graceful-workflow", "graceful-queue").await?;
+    assert!(
+        !snapshot.file.exists(),
+        "the interval policy must not take an immediate startup snapshot"
+    );
+
+    engine.shutdown().await?;
+    assert!(
+        snapshot.file.is_file(),
+        "graceful shutdown must persist the final snapshot"
+    );
+
+    let restored = Engine::start_with_config(config.clone()).await?;
+    assert_workflow_exists(&restored, "graceful-workflow").await?;
+    assert_recovered_workflow_task(&restored, "graceful-queue").await?;
+    restored.shutdown().await?;
+
+    // Graceful shutdown retires the recovery lease before the final cut. A
+    // snapshot written after one restored lifecycle must remain bootable again.
+    let restored_again = Engine::start_with_config(config).await?;
+    assert_workflow_exists(&restored_again, "graceful-workflow").await?;
+    restored_again.shutdown().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn interval_snapshot_is_written_before_shutdown_and_restores() -> Result<()> {
+    let snapshot = TestSnapshotPath::new("interval-snapshot")?;
+    let config = snapshot_config(&snapshot.file, 100);
+    let engine = Engine::start_with_config(config.clone()).await?;
+    start_workflow(&engine, "interval-workflow", "interval-queue").await?;
+
+    tokio::time::advance(Duration::from_millis(100)).await;
+    wait_for_snapshot(&snapshot.file).await?;
+    assert!(
+        snapshot.file.is_file(),
+        "the configured interval must persist without waiting for shutdown"
+    );
+
+    engine.shutdown().await?;
+    let before_recovery_interval = tokio::fs::read(&snapshot.file).await?;
+    let restored = Engine::start_with_config(config).await?;
+    assert_workflow_exists(&restored, "interval-workflow").await?;
+
+    // The restored runtime owns a real recovery lease. Capture that live state,
+    // then drop without a final snapshot to model the last interval file after a
+    // process crash. The next boot must retire the captured owner, advance the
+    // fence, and recover normally.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    wait_for_snapshot_change(&snapshot.file, &before_recovery_interval).await?;
+    drop(restored);
+    tokio::task::yield_now().await;
+
+    let after_drop = Engine::start_with_config(snapshot_config(&snapshot.file, 100)).await?;
+    assert_workflow_exists(&after_drop, "interval-workflow").await?;
+    after_drop.shutdown().await?;
+    tokio::time::resume();
+    Ok(())
+}
+
+#[tokio::test]
+async fn corrupt_snapshot_refuses_boot_instead_of_starting_empty() -> Result<()> {
+    let snapshot = TestSnapshotPath::new("corrupt-snapshot")?;
+    std::fs::write(&snapshot.file, b"not a tokeira snapshot")?;
+
+    let error = Engine::start_with_config(snapshot_config(&snapshot.file, 1_000))
+        .await
+        .expect_err("corrupt snapshot must fail startup");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("failed to restore embedded-engine snapshot"),
+        "unexpected startup error: {message}"
+    );
     Ok(())
 }
 

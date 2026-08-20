@@ -9,7 +9,10 @@ pub use overlay::{overlay_document, overlay_document_str, render_document};
 pub use secret::{NoSecretsProvider, Secret, SecretError, SecretRef, SecretsProvider};
 pub use source::{CONFIG_ENV, ConfigSource};
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -231,6 +234,10 @@ pub struct PolicyConfig {
     /// Startup-static Worker Compute Controller policy.
     #[serde(default)]
     pub worker_compute: WorkerComputePolicyConfig,
+    /// Optional persistence policy for the process-local embedded engine.
+    /// Absence leaves the in-memory store ephemeral.
+    #[serde(default)]
+    pub snapshot: Option<SnapshotPolicyConfig>,
     #[serde(default)]
     pub nexus_endpoint_limits: NexusEndpointLimitsConfig,
     #[serde(default)]
@@ -269,6 +276,22 @@ pub struct WorkerComputePolicyConfig {
     /// Start the process-local controller service.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Persistence policy for the process-local embedded engine.
+///
+/// The section is optional because snapshots are a dev/embedded-tier policy,
+/// not a durability promise made by the in-memory repository itself. When it
+/// is present, [`tokeira_engine::Engine`](https://docs.rs/tokeira-engine/latest/tokeira_engine/struct.Engine.html)
+/// restores this file at boot, refreshes it on the configured cadence, and
+/// writes one final snapshot during graceful shutdown.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotPolicyConfig {
+    /// Snapshot file read at boot and atomically replaced after capture.
+    pub location: PathBuf,
+    /// Positive interval between periodic snapshots, in milliseconds.
+    pub interval_ms: u64,
 }
 
 /// Static policy for Temporal's public HTTP/JSON compatibility gateway.
@@ -634,10 +657,8 @@ fn parse_positive_duration(value: &str) -> Option<std::time::Duration> {
         (number, 1.0)
     } else if let Some(number) = value.strip_suffix('m') {
         (number, 60.0)
-    } else if let Some(number) = value.strip_suffix('h') {
-        (number, 3_600.0)
     } else {
-        return None;
+        (value.strip_suffix('h')?, 3_600.0)
     };
     let seconds = number.parse::<f64>().ok()? * multiplier;
     if !seconds.is_finite() || seconds <= 0.0 {
@@ -969,6 +990,7 @@ impl Default for PolicyConfig {
             compatibility: CompatibilityConfig::default(),
             task_queues: TaskQueuePolicyConfig::default(),
             worker_compute: WorkerComputePolicyConfig::default(),
+            snapshot: None,
             nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
             nexus_completion: NexusCompletionConfig::default(),
             http_api: HttpApiPolicyConfig::default(),
@@ -1272,6 +1294,20 @@ impl TokeiraConfig {
                 field: "policy.nexus_completion.retry_backoff_coefficient".to_string(),
                 message: "must be greater than or equal to 1.0".to_string(),
             });
+        }
+        if let Some(snapshot) = self.policy.snapshot.as_ref() {
+            if snapshot.location.as_os_str().is_empty() {
+                errors.push(ValidationError::Field {
+                    field: "policy.snapshot.location".to_string(),
+                    message: "must not be empty".to_string(),
+                });
+            }
+            if snapshot.interval_ms == 0 {
+                errors.push(ValidationError::Field {
+                    field: "policy.snapshot.interval_ms".to_string(),
+                    message: "must be positive".to_string(),
+                });
+            }
         }
         for (index, rule) in self
             .policy
@@ -2174,6 +2210,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn snapshot_policy_is_optional_strict_and_validated() {
+        let defaults: TokeiraConfig = toml::from_str("").expect("default config");
+        assert!(defaults.policy.snapshot.is_none());
+
+        let configured: TokeiraConfig = toml::from_str(
+            "[policy.snapshot]\nlocation = \"state/tokeira.snapshot\"\ninterval_ms = 30000\n",
+        )
+        .expect("snapshot policy");
+        assert_eq!(
+            configured.policy.snapshot,
+            Some(SnapshotPolicyConfig {
+                location: PathBuf::from("state/tokeira.snapshot"),
+                interval_ms: 30_000,
+            })
+        );
+
+        assert!(
+            toml::from_str::<TokeiraConfig>(
+                "[policy.snapshot]\nlocation = \"state/tokeira.snapshot\"\ninterval_ms = 30000\nunknown = true\n"
+            )
+            .is_err(),
+            "strict config must reject unknown snapshot policy fields"
+        );
+
+        let mut invalid = TokeiraConfig::default();
+        invalid.policy.snapshot = Some(SnapshotPolicyConfig {
+            location: PathBuf::new(),
+            interval_ms: 0,
+        });
+        let error = invalid
+            .validate()
+            .expect_err("empty locations and zero intervals must be rejected");
+        let ConfigError::Validation(errors) = error else {
+            panic!("expected validation errors, got {error}");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.to_string().contains("policy.snapshot.location") })
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.to_string().contains("policy.snapshot.interval_ms") })
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -2383,6 +2467,7 @@ mod tests {
                         worker_compute: WorkerComputePolicyConfig {
                             enabled: worker_compute_enabled,
                         },
+                        snapshot: None,
                         nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
                         nexus_completion: NexusCompletionConfig::default(),
                         http_api: HttpApiPolicyConfig::default(),

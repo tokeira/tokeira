@@ -1,5 +1,8 @@
 //! Conformance-only adapter for Temporal's in-process gRPC authorization hooks.
 //!
+//! Kept with engine construction so embedded and listener-backed stacks use the
+//! same admission policy under the conformance feature.
+//!
 //! Shape-2 runs the corpus and `tokeirad` in separate processes, so callbacks
 //! installed through `SetOnGetClaims` and `SetOnAuthorize` cannot otherwise
 //! observe an HTTP request after it has entered the ordinary Tonic service path.

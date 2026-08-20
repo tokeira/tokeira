@@ -152,7 +152,7 @@ impl NexusHttpClient for HttpNexusClient {
             .pop_if_empty()
             .extend([service, operation]);
 
-        let (body, request_content_type) = payload_to_body(input);
+        let (body, request_content_type) = nexus_payload_to_body(input);
 
         let mut request = self.http.post(url);
         request = request.header(HEADER_REQUEST_ID, operation_id);
@@ -513,7 +513,7 @@ impl NexusCompletionClient for HttpNexusCompletionClient {
         let (bytes, content_type) = match completion {
             // Reuse the exact payload→body content-type mapping the start path uses
             // (`payloadSerializer.Serialize @ v1.31.0`).
-            NexusCompletion::Succeeded(payloads) => payload_to_body(&payloads),
+            NexusCompletion::Succeeded(payloads) => nexus_payload_to_body(&payloads),
             // failed/canceled both carry a JSON Nexus failure body.
             NexusCompletion::Failed(json) | NexusCompletion::Canceled(json) => {
                 (json, Some(CONTENT_TYPE_JSON.to_owned()))
@@ -645,7 +645,7 @@ fn format_duration_ms(d: Duration) -> String {
 /// with no metadata) falls back to `application/x-temporal-payload` carrying the
 /// proto-marshalled `Payload`, exactly as the Go serializer does. This is what
 /// lets a handler reconstruct the original payload byte-for-byte.
-fn payload_to_body(input: &Payloads) -> (Vec<u8>, Option<String>) {
+pub fn nexus_payload_to_body(input: &Payloads) -> (Vec<u8>, Option<String>) {
     let Some(payload) = input.0.first() else {
         return (Vec::new(), None);
     };
@@ -1036,14 +1036,14 @@ mod tests {
             metadata: BTreeMap::from([("encoding".to_owned(), "json/plain".to_owned())]),
             external_payloads: Vec::new(),
         }]);
-        let (body, content_type) = payload_to_body(&input);
+        let (body, content_type) = nexus_payload_to_body(&input);
         assert_eq!(body, b"\"input\"");
         assert_eq!(content_type.as_deref(), Some("application/json"));
     }
 
     #[test]
     fn empty_input_is_nil_body() {
-        let (body, content_type) = payload_to_body(&Payloads(Vec::new()));
+        let (body, content_type) = nexus_payload_to_body(&Payloads(Vec::new()));
         assert!(body.is_empty());
         assert!(content_type.is_none());
     }

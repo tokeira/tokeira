@@ -1,3 +1,5 @@
+//! Process observability used by the `tokeirad` binary wrapper.
+
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result};

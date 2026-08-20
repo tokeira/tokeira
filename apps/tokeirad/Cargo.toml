@@ -15,6 +15,7 @@ name = "tokeirad"
 path = "src/main.rs"
 
 [dependencies]
+tokeira-engine = { path = "../../crates/tokeira-engine" }
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
@@ -73,14 +74,7 @@ http = "1"
 # Conformance-only: mounts the dynamic-config control service on a separate
 # loopback listener and enables the runtime's live override reads. Absent from
 # a production build.
-conformance = [
-    "dep:tokeira-conformance-control",
-    "dep:tokeira-conformance",
-    "dep:connectrpc",
-    "dep:reqwest",
-    "tokeira-edge/conformance",
-    "tokeira-runtime/conformance",
-]
+conformance = ["tokeira-engine/conformance"]
 
 [dev-dependencies]
 metrics-util.workspace = true

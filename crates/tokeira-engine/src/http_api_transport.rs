@@ -1,4 +1,4 @@
-//! Same-listener transport adapter for Temporal's public HTTP/JSON API.
+//! Optional listener transport adapter for Temporal's public HTTP/JSON API.
 //!
 //! Descriptor and protobuf semantics live in `tokeira-edge::http_api`. This
 //! layer owns only Hyper body collection and standard unary gRPC framing around

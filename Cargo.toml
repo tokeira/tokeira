@@ -41,6 +41,7 @@ members = [
     "crates/tokeira-projection",
     "crates/tokeira-ecs",
     "crates/tokeira-edge",
+    "crates/tokeira-engine",
     "platforms/local",
     "platforms/compose",
     "platforms/ecs",

@@ -73,7 +73,8 @@ for what tokeira actually does.
 
 ## CI substrate + handoff
 
-`tkr ci check` re-execs under `dagger run` and calls `run_ci_checks(request, dagger) -> CiCheckReport`
+`tkr ci check` connects its own in-process Dagger session (the vendored `dagger-sdk`; no wrapper
+process, no session environment variables) and calls `run_ci_checks(request, client) -> CiCheckReport`
 (serde-serializable). Remote-trigger wiring (GitHub Actions, nightly) is **out of scope** here and owned
 by the `pipeline-foundation` spec, which will call the same `run_ci_checks` so local and remote verdicts
 never diverge.

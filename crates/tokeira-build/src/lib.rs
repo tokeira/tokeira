@@ -6,8 +6,6 @@
 mod arch;
 mod closure;
 mod composition;
-mod dagger;
-mod dagger_default;
 mod discovery;
 mod error;
 mod snapshot;
@@ -32,8 +30,6 @@ pub use composition::{
     GENERATED_ROOT_RELATIVE_PATH, SCOPED_WORKSPACE_RELATIVE_PATH, TKP_PACKAGE,
     assemble_bound_provisioner,
 };
-pub use dagger::{ContainerRef, DaggerClient, DirectoryRef, FileRef, SecretRef};
-pub use dagger_default::DefaultDaggerClient;
 pub use discovery::{
     DefinitionFrontendPackageDescriptor, DiscoveryError, PackageCoordinates,
     PlatformPackageDescriptor, WorkspaceDescriptors, discover_workspace_descriptors,

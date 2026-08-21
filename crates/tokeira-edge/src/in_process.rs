@@ -46,20 +46,43 @@ pub struct InProcessGrpcResponse {
 
 /// Cloneable in-process router over Tokeira's Temporal services.
 ///
-/// Calls execute inline. Dropping a caller's future therefore drops the edge
-/// handler future as well, which is load-bearing for long-poll cancellation and
-/// its RAII admission permits.
+/// ## Execution contract (tokeirad parity)
+///
+/// Every RPC handler future is polled on the **engine-host runtime** — the
+/// Tokio runtime that was current when this service was constructed during
+/// embedded engine initialization. This mirrors the listener-backed server,
+/// where tonic/hyper poll handler futures on the server's own runtime: any
+/// work a handler defers (`tokio::spawn`, timers) inherits the engine's
+/// executor lifetime, never the caller's. Without this, an embedded consumer
+/// that drives calls from its own short-lived runtime (an SDK worker thread)
+/// would silently host engine continuations — e.g. the backoff-delayed
+/// activity-retry publish — and kill them at worker shutdown while the engine,
+/// and the durable work it owes, live on.
+///
+/// Cancellation keeps tonic's semantics: dropping a caller's future aborts the
+/// spawned handler task at its next await point (the same effect as an h2
+/// reset dropping a handler on the network server), releasing long-poll
+/// admission permits and other RAII resources promptly.
 #[derive(Clone, Debug)]
 pub struct InProcessGrpcService {
     // Tonic 0.11's Axum router is Send but not Sync. The mutex exists only to
     // clone its cheap service handles; it is released before any RPC future is
     // polled, so concurrent long polls do not serialize behind one another.
     routes: Arc<Mutex<Routes>>,
+    /// The engine-host runtime handle captured at construction. The embedded
+    /// engine does not construct a Tokio runtime of its own — it borrows the
+    /// runtime its host initialized it on, and this handle pins all handler
+    /// execution to that runtime.
+    handler_runtime: tokio::runtime::Handle,
 }
 
 impl InProcessGrpcService {
     /// Assemble the same Workflow, Operator, and Admin tonic services the network
     /// listener mounts, without constructing or binding a transport.
+    ///
+    /// Must be called on the engine-host runtime (embedded initialization
+    /// already is): the ambient handle is captured here as the executor for
+    /// every subsequent RPC handler future, per the execution contract above.
     pub fn new(
         workflow: WorkflowServiceGrpc,
         operator: OperatorServiceGrpc,
@@ -70,13 +93,15 @@ impl InProcessGrpcService {
             .add_service(admin.into_service());
         Self {
             routes: Arc::new(Mutex::new(routes)),
+            handler_runtime: tokio::runtime::Handle::current(),
         }
     }
 
     /// Dispatch one uncompressed unary call through the assembled tonic router.
     ///
     /// The returned [`Status`] is the edge adapter's original gRPC code, message,
-    /// details, and metadata. No task is spawned around the call.
+    /// details, and metadata. The handler runs as a task on the engine-host
+    /// runtime; the caller's future only awaits (and on drop, aborts) it.
     pub async fn call(
         &self,
         request: InProcessGrpcRequest,
@@ -115,40 +140,112 @@ impl InProcessGrpcService {
         grpc_request.headers_mut().remove("grpc-accept-encoding");
 
         let routes = self.routes.lock().await.clone();
-        let response = routes.oneshot(grpc_request).await.map_err(|error| {
-            Status::internal(format!("in-process gRPC dispatch failed: {error}"))
-        })?;
-        let (parts, mut body) = response.into_parts();
-        let mut framed = Vec::new();
-        while let Some(chunk) = body.data().await {
-            let chunk = chunk.map_err(|error| {
-                Status::internal(format!("failed reading in-process gRPC response: {error}"))
+        // Poll the handler on the engine-host runtime, never inline on the
+        // caller's executor (see the struct-level execution contract). The
+        // guard aborts the handler when the caller's future is dropped, so a
+        // cancelled callback or long-poll releases its admission permit and
+        // other RAII state exactly as an h2 reset does on the network server.
+        let handler = AbortOnDropHandler::new(self.handler_runtime.spawn(async move {
+            let response = routes.oneshot(grpc_request).await.map_err(|error| {
+                Status::internal(format!("in-process gRPC dispatch failed: {error}"))
             })?;
-            framed.extend_from_slice(&chunk);
-        }
-        let trailers = body
-            .trailers()
-            .await
-            .map_err(|error| {
-                Status::internal(format!("failed reading in-process gRPC trailers: {error}"))
-            })?
-            .unwrap_or_default();
+            let (parts, mut body) = response.into_parts();
+            let mut framed = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.map_err(|error| {
+                    Status::internal(format!("failed reading in-process gRPC response: {error}"))
+                })?;
+                framed.extend_from_slice(&chunk);
+            }
+            let trailers = body
+                .trailers()
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("failed reading in-process gRPC trailers: {error}"))
+                })?
+                .unwrap_or_default();
 
-        let mut status_headers = parts.headers.clone();
-        for (name, value) in &trailers {
-            status_headers.append(name, value.clone());
-        }
-        if let Some(status) = Status::from_header_map(&status_headers)
-            && status.code() != Code::Ok
-        {
-            return Err(status);
-        }
+            let mut status_headers = parts.headers.clone();
+            for (name, value) in &trailers {
+                status_headers.append(name, value.clone());
+            }
+            if let Some(status) = Status::from_header_map(&status_headers)
+                && status.code() != Code::Ok
+            {
+                return Err(status);
+            }
 
-        let proto = parse_unary_frame(&framed)?;
-        let mut headers = HeaderMap::new();
-        copy_response_headers(&parts.headers, &mut headers);
-        copy_response_headers(&trailers, &mut headers);
-        Ok(InProcessGrpcResponse { headers, proto })
+            let proto = parse_unary_frame(&framed)?;
+            let mut headers = HeaderMap::new();
+            copy_response_headers(&parts.headers, &mut headers);
+            copy_response_headers(&trailers, &mut headers);
+            Ok(InProcessGrpcResponse { headers, proto })
+        }));
+        match handler.await {
+            Ok(result) => result,
+            // The handler task ended without producing a result. A panic maps
+            // to the same INTERNAL a network server would surface; a
+            // cancellation here means the engine-host runtime itself shut down
+            // under the call (the caller-side drop path never reaches this
+            // arm — dropping the guard abandons the join).
+            Err(join_error) if join_error.is_panic() => Err(Status::internal(
+                "in-process gRPC handler panicked".to_owned(),
+            )),
+            Err(_) => Err(Status::unavailable(
+                "engine-host runtime shut down before the in-process gRPC call completed"
+                    .to_owned(),
+            )),
+        }
+    }
+}
+
+/// Join handle wrapper that aborts the handler task when dropped before
+/// completion.
+///
+/// Polling forwards to the join handle; once the task's result is observed the
+/// guard is disarmed, so a completed call's drop aborts nothing. Dropping the
+/// guard while the task is still running aborts it at its next await point —
+/// the in-process equivalent of a network reset cancelling a server-side
+/// handler — which runs destructors and releases RAII admission state.
+struct AbortOnDropHandler<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropHandler<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+}
+
+impl<T> std::future::Future for AbortOnDropHandler<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let handle = self
+            .handle
+            .as_mut()
+            .expect("AbortOnDropHandler polled after completion");
+        match std::pin::Pin::new(handle).poll(cx) {
+            std::task::Poll::Ready(output) => {
+                // Disarm: the task is finished; drop must not abort.
+                self.handle = None;
+                std::task::Poll::Ready(output)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDropHandler<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
     }
 }
 

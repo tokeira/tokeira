@@ -520,3 +520,187 @@ async fn network_listener_delivers_retry_after_consumer_runtime_death() -> Resul
     anyhow::ensure!(delivered.attempt == 2);
     engine.shutdown().await
 }
+
+/// Cancellation storms on the embedded transport cannot strand a durable
+/// retry. Dropped poll futures (abort-on-drop through the in-process bridge)
+/// race each retry's publication and take, so a cancelled handler may consume
+/// a broker offer anywhere before its `Started` commit; the live scanner's
+/// durable-dispatch reconciliation must redeliver in every case. Each attempt
+/// is received exactly once, in order, and the workflow's activity completes
+/// with the engine never restarted — no shard takeover, no manual republish.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_poll_storms_cannot_strand_durable_retries() -> Result<()> {
+    let engine = Engine::start().await?;
+    let queue = "retry-cancel-storm";
+    let workflow_id = "retry-cancel-storm-canary";
+    let endpoint = engine.endpoint();
+
+    let _: StartWorkflowExecutionResponse = call(
+        &endpoint,
+        "StartWorkflowExecution",
+        start_request(workflow_id, queue),
+    )
+    .await?;
+    let workflow_task: PollWorkflowTaskQueueResponse = call(
+        &endpoint,
+        "PollWorkflowTaskQueue",
+        workflow_poll_request(queue),
+    )
+    .await?;
+    anyhow::ensure!(!workflow_task.task_token.is_empty());
+    // Constant 500ms backoff so every round's publication window is quick and
+    // identical; enough attempts for four failure rounds plus completion.
+    let _: RespondWorkflowTaskCompletedResponse = call(
+        &endpoint,
+        "RespondWorkflowTaskCompleted",
+        RespondWorkflowTaskCompletedRequest {
+            task_token: workflow_task.task_token,
+            identity: WORKER_IDENTITY.to_owned(),
+            commands: vec![Command {
+                command_type: CommandType::ScheduleActivityTask as i32,
+                user_metadata: None,
+                attributes: Some(Attributes::ScheduleActivityTaskCommandAttributes(
+                    ScheduleActivityTaskCommandAttributes {
+                        activity_id: "turn-1".to_owned(),
+                        activity_type: Some(ActivityType {
+                            name: "turn".to_owned(),
+                        }),
+                        task_queue: task_queue(queue),
+                        start_to_close_timeout: Some(proto_duration(Duration::from_secs(30))),
+                        retry_policy: Some(RetryPolicy {
+                            initial_interval: Some(proto_duration(Duration::from_millis(500))),
+                            backoff_coefficient: 1.0,
+                            maximum_interval: Some(proto_duration(Duration::from_millis(500))),
+                            maximum_attempts: 6,
+                            non_retryable_error_types: Vec::new(),
+                        }),
+                        ..Default::default()
+                    },
+                )),
+            }],
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let mut expected_attempt = 1;
+    let mut token = loop {
+        let response: Option<PollActivityTaskQueueResponse> = tokio::time::timeout(
+            Duration::from_secs(5),
+            call(
+                &endpoint,
+                "PollActivityTaskQueue",
+                activity_poll_request(queue),
+            ),
+        )
+        .await
+        .ok()
+        .transpose()?;
+        if let Some(response) = response
+            && !response.task_token.is_empty()
+        {
+            anyhow::ensure!(response.attempt == expected_attempt);
+            break response.task_token;
+        }
+    };
+
+    for round in 0..4 {
+        let _: RespondActivityTaskFailedResponse = call(
+            &endpoint,
+            "RespondActivityTaskFailed",
+            retryable_failure(token.clone()),
+        )
+        .await?;
+
+        // The cancellation storm: staggered aborted polls bracketing the
+        // 500ms publication window, so drops land while parked, around the
+        // wake, and around the broker take.
+        for stagger in 0..6u64 {
+            let cancelled: std::result::Result<Result<PollActivityTaskQueueResponse>, _> =
+                tokio::time::timeout(
+                    Duration::from_millis(40 + stagger * 110),
+                    call(
+                        &endpoint,
+                        "PollActivityTaskQueue",
+                        activity_poll_request(queue),
+                    ),
+                )
+                .await;
+            if let Ok(Ok(response)) = cancelled
+                && !response.task_token.is_empty()
+            {
+                // A storm poll that won the race IS the round's delivery.
+                anyhow::ensure!(response.attempt == expected_attempt + 1);
+                expected_attempt = response.attempt;
+                token = response.task_token;
+                break;
+            }
+        }
+
+        if expected_attempt == round + 2 {
+            continue;
+        }
+        // Otherwise the storm consumed nothing usable: the scanner must
+        // redeliver the durable attempt within its cadence.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "durable attempt {} was stranded by the cancellation storm",
+                round + 2
+            );
+            let response: Option<PollActivityTaskQueueResponse> = tokio::time::timeout(
+                Duration::from_secs(2),
+                call(
+                    &endpoint,
+                    "PollActivityTaskQueue",
+                    activity_poll_request(queue),
+                ),
+            )
+            .await
+            .ok()
+            .transpose()?;
+            if let Some(response) = response
+                && !response.task_token.is_empty()
+            {
+                anyhow::ensure!(
+                    response.attempt == round + 2,
+                    "attempts must be delivered exactly once, in order: expected {}, got {}",
+                    round + 2,
+                    response.attempt
+                );
+                expected_attempt = response.attempt;
+                token = response.task_token;
+                break;
+            }
+        }
+    }
+
+    // The surviving attempt completes; describe agrees it started exactly at
+    // the final attempt and the workflow moves on.
+    assert_eq!(
+        pending_activity(&engine, workflow_id).await?,
+        Some((expected_attempt, PendingActivityState::Started))
+    );
+    let _: tokeira_proto::workflowservice::RespondActivityTaskCompletedResponse = call(
+        &endpoint,
+        "RespondActivityTaskCompleted",
+        tokeira_proto::workflowservice::RespondActivityTaskCompletedRequest {
+            task_token: token,
+            identity: WORKER_IDENTITY.to_owned(),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let next_wft: PollWorkflowTaskQueueResponse = call(
+        &endpoint,
+        "PollWorkflowTaskQueue",
+        workflow_poll_request(queue),
+    )
+    .await?;
+    anyhow::ensure!(
+        !next_wft.task_token.is_empty(),
+        "activity completion must schedule the next workflow task"
+    );
+    engine.shutdown().await
+}

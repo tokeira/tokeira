@@ -25,14 +25,15 @@ use tracing::{Instrument, instrument};
 use uuid::Uuid;
 
 use crate::{
-    ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, BacklogPayload, CommitResult,
-    CompletionCallbackSweepEntry, CurrentExecutionConflictPolicy, DbClass, DeleteRunRequest,
-    DeleteRunResult, DeliveryOrder, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
-    NexusSweepEntry, ProjectionRecord, ReconstructibleNexusDelivery, RequestRecord, RunRepository,
-    TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentVersionKey,
-    WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
-    deleted_workflow_projection_context, dispatchable_workflow_task, metrics,
-    workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
+    ActivityDispatchIdentity, ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry,
+    BacklogPayload, CommitResult, CompletionCallbackSweepEntry, CurrentExecutionConflictPolicy,
+    DbClass, DeleteRunRequest, DeleteRunResult, DeliveryOrder, DispatchableActivityTask,
+    DispatchableWorkflowTask, DueActivityDispatch, DueTimer, NexusSweepEntry, ProjectionRecord,
+    ReconstructibleNexusDelivery, RequestRecord, RunRepository, TransitionAuditRecord,
+    WftTimeoutSweepEntry, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
+    WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
+    dispatchable_workflow_task, metrics, workflow_is_open_and_pinned_to_version,
+    workflow_projection_context_with_previous,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -586,12 +587,30 @@ impl RunRepository for DsqlRunRepository {
         self.do_list_dispatchable_workflow_tasks(queue, limit).await
     }
 
-    async fn list_dispatchable_activity_tasks(
+    async fn list_due_dispatchable_activity_tasks(
+        &self,
+        queue: &QueueKey,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<DispatchableActivityTask>> {
+        self.do_list_due_dispatchable_activity_tasks(queue, now, limit)
+            .await
+    }
+
+    async fn list_all_dispatchable_activity_tasks(
         &self,
         queue: &QueueKey,
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
-        self.do_list_dispatchable_activity_tasks(queue, limit).await
+        self.do_list_all_dispatchable_activity_tasks(queue, limit)
+            .await
+    }
+
+    async fn delete_activity_dispatch_if_matches(
+        &self,
+        candidate: &ActivityDispatchIdentity,
+    ) -> Result<bool> {
+        self.do_delete_activity_dispatch_if_matches(candidate).await
     }
 
     async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
@@ -626,12 +645,13 @@ impl RunRepository for DsqlRunRepository {
             .await
     }
 
-    async fn list_dispatchable_activity_tasks_for_shard(
+    async fn list_due_dispatchable_activity_tasks_for_shard(
         &self,
         shard_id: ShardId,
+        now: OffsetDateTime,
         limit: usize,
-    ) -> Result<Vec<DispatchableActivityTask>> {
-        self.do_list_dispatchable_activity_tasks_for_shard(shard_id, limit)
+    ) -> Result<Vec<DueActivityDispatch>> {
+        self.do_list_due_dispatchable_activity_tasks_for_shard(shard_id, now, limit)
             .await
     }
 
@@ -1476,9 +1496,15 @@ mod tests {
             5,
             codec::encode_payloads(&payloads).unwrap(),
             None,
+            OffsetDateTime::from_unix_timestamp(1_700_000_777).unwrap(),
         );
 
-        let task = activity_dispatch_from_row(row).unwrap();
+        let due = activity_dispatch_from_row(row).unwrap();
+        assert_eq!(
+            due.dispatch_at,
+            OffsetDateTime::from_unix_timestamp(1_700_000_777).unwrap()
+        );
+        let task = due.task;
 
         assert_eq!(task.run_key, run_key);
         assert_eq!(task.activity_id, "activity");
@@ -1639,7 +1665,7 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            repo.list_dispatchable_activity_tasks(&queue, 0)
+            repo.list_all_dispatchable_activity_tasks(&queue, 0)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1657,7 +1683,7 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            repo.list_dispatchable_activity_tasks_for_shard(shard_id, 0)
+            repo.list_due_dispatchable_activity_tasks_for_shard(shard_id, fixed_now(), 0)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1871,6 +1897,7 @@ mod tests {
 
     fn sample_activity_state(seed: u64) -> ActivityState {
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,

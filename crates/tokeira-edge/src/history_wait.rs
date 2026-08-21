@@ -276,13 +276,33 @@ where
             .await
     }
 
-    async fn list_dispatchable_activity_tasks(
+    async fn list_due_dispatchable_activity_tasks(
+        &self,
+        queue: &QueueKey,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<DispatchableActivityTask>> {
+        self.inner
+            .list_due_dispatchable_activity_tasks(queue, now, limit)
+            .await
+    }
+
+    async fn list_all_dispatchable_activity_tasks(
         &self,
         queue: &QueueKey,
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
         self.inner
-            .list_dispatchable_activity_tasks(queue, limit)
+            .list_all_dispatchable_activity_tasks(queue, limit)
+            .await
+    }
+
+    async fn delete_activity_dispatch_if_matches(
+        &self,
+        candidate: &tokeira_storage::ActivityDispatchIdentity,
+    ) -> Result<bool> {
+        self.inner
+            .delete_activity_dispatch_if_matches(candidate)
             .await
     }
 
@@ -308,13 +328,14 @@ where
             .await
     }
 
-    async fn list_dispatchable_activity_tasks_for_shard(
+    async fn list_due_dispatchable_activity_tasks_for_shard(
         &self,
         shard_id: ShardId,
+        now: OffsetDateTime,
         limit: usize,
-    ) -> Result<Vec<DispatchableActivityTask>> {
+    ) -> Result<Vec<tokeira_storage::DueActivityDispatch>> {
         self.inner
-            .list_dispatchable_activity_tasks_for_shard(shard_id, limit)
+            .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, limit)
             .await
     }
 

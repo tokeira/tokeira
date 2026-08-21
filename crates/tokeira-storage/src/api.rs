@@ -851,8 +851,11 @@ pub trait RunRepository: Send + Sync {
                 .list_dispatchable_workflow_tasks(&queue, 1)
                 .await?
                 .is_empty(),
+            // Drainage counts a future-eligible retry as pending work, so this
+            // deliberately uses the all-row inspection query, not the due-only
+            // delivery query.
             TaskKind::Activity => !self
-                .list_dispatchable_activity_tasks(&queue, 1)
+                .list_all_dispatchable_activity_tasks(&queue, 1)
                 .await?
                 .is_empty(),
         };
@@ -995,9 +998,29 @@ pub trait RunRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>>;
 
-    /// Return activity tasks awaiting dispatch for the
-    /// given queue, up to `limit`.
-    async fn list_dispatchable_activity_tasks(
+    /// Return activity tasks whose durable eligibility time (`dispatch_at`)
+    /// is at or before `now` for the given queue, up to `limit`, in
+    /// `(dispatch_at, insertion)` order.
+    ///
+    /// This is the DELIVERY query: a retry attempt inside its backoff window
+    /// is durably present but deliberately not returned, mirroring v1.31.0
+    /// where the retry reaches matching only when its durable retry timer
+    /// fires (`GenerateActivityRetryTasks` → `executeActivityRetryTimerTask`,
+    /// timer_queue_active_task_executor.go:522-620 @ v1.31.0).
+    async fn list_due_dispatchable_activity_tasks(
+        &self,
+        queue: &QueueKey,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<DispatchableActivityTask>>;
+
+    /// Return every activity dispatch row for the queue regardless of
+    /// eligibility time, up to `limit`.
+    ///
+    /// Inspection/drainage only — a future-eligible retry still counts as
+    /// undrained pending work. NEVER use this for delivery; delivery goes
+    /// through [`RunRepository::list_due_dispatchable_activity_tasks`].
+    async fn list_all_dispatchable_activity_tasks(
         &self,
         queue: &QueueKey,
         limit: usize,
@@ -1042,13 +1065,35 @@ pub trait RunRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>>;
 
-    /// List dispatchable activity tasks for a specific
-    /// shard.
-    async fn list_dispatchable_activity_tasks_for_shard(
+    /// List activity dispatch rows due at `now` for a specific shard, in
+    /// `(dispatch_at, insertion)` order, carrying each row's durable
+    /// eligibility time so reconciliation can identify the exact row version
+    /// it observed (see
+    /// [`RunRepository::delete_activity_dispatch_if_matches`]).
+    ///
+    /// Due-only for the same reason as the queue variant: recovery and
+    /// reconciliation must not surface a retry before its backoff elapses.
+    async fn list_due_dispatchable_activity_tasks_for_shard(
         &self,
         shard_id: ShardId,
+        now: OffsetDateTime,
         limit: usize,
-    ) -> Result<Vec<DispatchableActivityTask>>;
+    ) -> Result<Vec<DueActivityDispatch>>;
+
+    /// Delete one activity dispatch row, but only if the durable row still
+    /// matches the exact version `candidate` was observed at.
+    ///
+    /// This is the reconciler's cleanup for rows proven permanently stale
+    /// against authoritative run state. The version comparison (schedule
+    /// event, attempt, stamp, routing revision, and eligibility time) makes
+    /// the delete a no-op when a concurrent retry/options transition has
+    /// already replaced the row with a newer live dispatch — every such
+    /// transition changes at least one compared field. Returns whether a row
+    /// was removed.
+    async fn delete_activity_dispatch_if_matches(
+        &self,
+        candidate: &ActivityDispatchIdentity,
+    ) -> Result<bool>;
 
     /// List due timers for a specific shard.
     async fn list_due_timers_for_shard(
@@ -1217,7 +1262,7 @@ pub(crate) fn dispatchable_workflow_task(
 }
 
 /// An activity task that is ready for dispatch to a
-/// worker. Produced by [`RunRepository::list_dispatchable_activity_tasks`].
+/// worker. Produced by [`RunRepository::list_due_dispatchable_activity_tasks`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchableActivityTask {
     /// Durable storage key for the owning run.
@@ -1248,6 +1293,58 @@ pub struct DispatchableActivityTask {
     pub priority: Option<Priority>,
     /// Runtime-assigned delivery order, preserved across durable backlog parking.
     pub order: Option<DeliveryOrder>,
+}
+
+/// One due activity dispatch row: the deliverable task plus the durable
+/// eligibility time the row was observed with.
+///
+/// `dispatch_at` completes the row-version identity reconciliation needs for
+/// conditional stale cleanup; it is not part of the worker-facing task.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DueActivityDispatch {
+    /// The deliverable task exactly as the broker would publish it.
+    pub task: DispatchableActivityTask,
+    /// The row's durable eligibility time at observation.
+    pub dispatch_at: OffsetDateTime,
+}
+
+impl DueActivityDispatch {
+    /// The exact row version this observation corresponds to, for
+    /// [`RunRepository::delete_activity_dispatch_if_matches`].
+    pub fn identity(&self) -> ActivityDispatchIdentity {
+        ActivityDispatchIdentity {
+            run_key: self.task.run_key,
+            activity_id: self.task.activity_id.clone(),
+            schedule_event_id: self.task.schedule_event_id,
+            attempt: self.task.attempt,
+            stamp: self.task.stamp,
+            dispatch_revision: self.task.dispatch_revision,
+            dispatch_at: self.dispatch_at,
+        }
+    }
+}
+
+/// The observed version of one activity dispatch row.
+///
+/// Every field participates in the conditional-delete comparison: a
+/// retry/options/routing transition that replaces the row changes at least
+/// one of them, so deleting "if matches" can never remove a newer live row.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActivityDispatchIdentity {
+    /// Durable storage key for the owning run.
+    pub run_key: RunKey,
+    /// Application-level activity identifier.
+    pub activity_id: String,
+    /// History event id that scheduled this activity.
+    pub schedule_event_id: i64,
+    /// Attempt the row was written for.
+    pub attempt: u32,
+    /// Activity stamp the row was written with.
+    pub stamp: u64,
+    /// Worker Deployment routing revision stamped on the row.
+    pub dispatch_revision: i64,
+    /// Durable eligibility time stamped on the row.
+    pub dispatch_at: OffsetDateTime,
 }
 
 impl PartialEq for DispatchableActivityTask {
@@ -1427,6 +1524,13 @@ pub struct ActivitySweepEntry {
     pub attempt: u32,
     /// When the activity was originally scheduled.
     pub original_scheduled_at: OffsetDateTime,
+    /// When the CURRENT attempt became (or becomes) dispatchable.
+    ///
+    /// The schedule-to-start anchor for retries: attempt N's
+    /// schedule-to-start clock runs from its own dispatch time, not from the
+    /// original schedule (`original_scheduled_at` stays the schedule-to-close
+    /// anchor spanning the whole retry chain, retry.go:108-110 @ v1.31.0).
+    pub current_attempt_scheduled_at: Option<OffsetDateTime>,
     /// When the activity was started (None if not yet
     /// started).
     pub started_at: Option<OffsetDateTime>,
@@ -2296,13 +2400,33 @@ where
             .await
     }
 
-    async fn list_dispatchable_activity_tasks(
+    async fn list_due_dispatchable_activity_tasks(
+        &self,
+        queue: &QueueKey,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<DispatchableActivityTask>> {
+        (**self)
+            .list_due_dispatchable_activity_tasks(queue, now, limit)
+            .await
+    }
+
+    async fn list_all_dispatchable_activity_tasks(
         &self,
         queue: &QueueKey,
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
         (**self)
-            .list_dispatchable_activity_tasks(queue, limit)
+            .list_all_dispatchable_activity_tasks(queue, limit)
+            .await
+    }
+
+    async fn delete_activity_dispatch_if_matches(
+        &self,
+        candidate: &ActivityDispatchIdentity,
+    ) -> Result<bool> {
+        (**self)
+            .delete_activity_dispatch_if_matches(candidate)
             .await
     }
 
@@ -2339,13 +2463,14 @@ where
             .await
     }
 
-    async fn list_dispatchable_activity_tasks_for_shard(
+    async fn list_due_dispatchable_activity_tasks_for_shard(
         &self,
         shard_id: ShardId,
+        now: OffsetDateTime,
         limit: usize,
-    ) -> Result<Vec<DispatchableActivityTask>> {
+    ) -> Result<Vec<DueActivityDispatch>> {
         (**self)
-            .list_dispatchable_activity_tasks_for_shard(shard_id, limit)
+            .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, limit)
             .await
     }
 

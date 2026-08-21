@@ -355,6 +355,7 @@ fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
     state.activities.insert(
         activity_id.into(),
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -3555,6 +3556,7 @@ proptest! {
         state.activities.insert(
             "activity-2".into(),
             ActivityState {
+                last_attempt_complete_time: None,
                 cancel_requested: false,
                 activity_reset: false,
                 reset_heartbeats: false,
@@ -3782,6 +3784,7 @@ proptest! {
         state.activities.insert(
             "activity-2".into(),
             ActivityState {
+                last_attempt_complete_time: None,
                 cancel_requested: false,
                 activity_reset: false,
                 reset_heartbeats: false,

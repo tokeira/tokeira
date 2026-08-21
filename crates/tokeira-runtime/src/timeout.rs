@@ -9,7 +9,7 @@
 //! is authoritative for whether a run is open and what its timeouts are; this map
 //! exists only so the scanner does not have to re-read the store for every run on
 //! every tick. It is reconstructed from durable history by
-//! [`crate::recovery::sweep_shard`] whenever this node takes over a shard, so
+//! `crate::recovery::sweep_shard` whenever this node takes over a shard, so
 //! losing it to a crash or failover costs a rebuild, never correctness. Entries
 //! are tagged with their `ShardId` so a handoff can drop exactly the runs this
 //! node no longer owns via [`WorkflowTimeoutTrackingState::remove_all_for_shard`]

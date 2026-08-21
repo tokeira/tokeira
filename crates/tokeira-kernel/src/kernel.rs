@@ -4104,6 +4104,7 @@ impl BasicKernel {
                 state.activities.insert(
                     activity_id.clone(),
                     ActivityState {
+                        last_attempt_complete_time: None,
                         cancel_requested: false,
                         activity_reset: false,
                         reset_heartbeats: false,
@@ -4940,6 +4941,7 @@ fn apply_workflow_command(
             });
 
             let activity = ActivityState {
+                last_attempt_complete_time: None,
                 cancel_requested: false,
                 activity_reset: false,
                 reset_heartbeats: false,

@@ -378,6 +378,7 @@ async fn write_transition(
             attempt,
             dispatch_revision,
             stamp,
+            dispatch_at,
             priority,
             ..
         } = op
@@ -395,6 +396,7 @@ async fn write_transition(
                 *attempt,
                 *dispatch_revision,
                 *stamp,
+                *dispatch_at,
                 priority.as_ref(),
             )
             .await?;
@@ -571,6 +573,7 @@ async fn upsert_activity_dispatch_from_dispatch_op(
     attempt: u32,
     dispatch_revision: i64,
     stamp: u64,
+    dispatch_at: OffsetDateTime,
     priority: Option<&tokeira_kernel::Priority>,
 ) -> Result<()> {
     let key = DsqlRunRepository::activity_dispatch_key(run_key, activity_id);
@@ -580,8 +583,8 @@ async fn upsert_activity_dispatch_from_dispatch_op(
         "INSERT INTO activity_dispatch
          (key, run_key, activity_id, shard_id, queue_namespace, queue_name, task_kind,
           deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp, input_data,
-          priority_data, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
+          priority_data, dispatch_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
          ON CONFLICT (key) DO UPDATE SET
              shard_id = EXCLUDED.shard_id,
              queue_namespace = EXCLUDED.queue_namespace,
@@ -594,7 +597,8 @@ async fn upsert_activity_dispatch_from_dispatch_op(
              dispatch_revision = EXCLUDED.dispatch_revision,
              stamp = EXCLUDED.stamp,
              input_data = EXCLUDED.input_data,
-             priority_data = EXCLUDED.priority_data",
+             priority_data = EXCLUDED.priority_data,
+             dispatch_at = EXCLUDED.dispatch_at",
     )
     .bind(key)
     .bind(run_key.0)
@@ -611,6 +615,7 @@ async fn upsert_activity_dispatch_from_dispatch_op(
     .bind(i64::try_from(stamp).unwrap_or(i64::MAX))
     .bind(codec::encode_payloads(input)?)
     .bind(priority.map(codec::encode_priority).transpose()?)
+    .bind(dispatch_at)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -641,7 +646,8 @@ async fn update_existing_activity_dispatch(
              dispatch_revision = $10,
              stamp = $11,
              input_data = $12,
-             priority_data = $13
+             priority_data = $13,
+             dispatch_at = COALESCE($14, activity_dispatch.dispatch_at)
          WHERE key = $1",
     )
     .bind(key)
@@ -671,6 +677,10 @@ async fn update_existing_activity_dispatch(
             .map(codec::encode_priority)
             .transpose()?,
     )
+    // Options/retry updates re-anchor eligibility from the authoritative
+    // attempt schedule; a state without one (legacy/initial) keeps the row's
+    // existing eligibility time via COALESCE.
+    .bind(activity.current_attempt_scheduled_at)
     .execute(&mut **tx)
     .await?;
     Ok(())

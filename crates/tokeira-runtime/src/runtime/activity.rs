@@ -954,9 +954,16 @@ where
             // All delivery shapes converge here: ordinary long-poll and eager claim both call
             // `start_activity_task`. Reading durable rules immediately before Started avoids the
             // frontend gate/poll-admission race and mirrors
-            // `recordactivitytaskstarted/api.go:332-372 @ v1.31.0`.
+            // `recordactivitytaskstarted/api.go:332-372 @ v1.31.0`. The
+            // backoff interval is derived from durable state so a
+            // `BackoffInterval` rule created after publication but before
+            // start is still enforced.
             if self
-                .pause_activity_for_matching_workflow_rule(&state, &current, None)
+                .pause_activity_for_matching_workflow_rule(
+                    &state,
+                    &current,
+                    activity_backoff_interval_seconds(&current)?,
+                )
                 .await?
             {
                 return Ok(None);
@@ -1407,11 +1414,21 @@ where
         next_activity.stamp += 1;
         next_activity.started_at = None;
         next_activity.started_event_id = None;
-        // The next attempt is scheduled AFTER the retry backoff — v1.31.0
-        // advances ScheduledTime to now+backoff and dispatches on a retry
-        // timer, not immediately (`UpdateActivityInfoForRetries`,
-        // activity.go:74 + GenerateActivityRetryTasks @ v1.31.0).
-        let dispatch_at = OffsetDateTime::now_utc() + backoff;
+        // One timestamp per OCC attempt anchors BOTH durable retry-timing
+        // fields, so the attempt's backoff is derivable from durable state
+        // alone (`current_attempt_scheduled_at - last_attempt_complete_time`)
+        // — the way v1.31.0 stamps `LastAttemptCompleteTime` at retry and
+        // derives `BackoffInterval` from mutable state
+        // (mutable_state_impl.go:6338, matcher/activity_evaluator.go:251 @
+        // v1.31.0). The next attempt is scheduled AFTER the retry backoff —
+        // v1.31.0 advances ScheduledTime to now+backoff and dispatches on a
+        // durable retry timer, not immediately
+        // (`UpdateActivityInfoForRetries`, activity.go:74 +
+        // GenerateActivityRetryTasks @ v1.31.0).
+        let completed_at = OffsetDateTime::now_utc();
+        let dispatch_at = completed_at + backoff;
+        next_activity.last_attempt_complete_time = Some(completed_at);
+        next_activity.current_attempt_scheduled_at = Some(dispatch_at);
         // The failed attempt's failure is durable retry bookkeeping,
         // surfaced by Describe as LastFailure and by the next
         // ActivityTaskStarted's last_failure (`RetryLastFailure`,
@@ -1436,85 +1453,61 @@ where
         next_activity.reset_heartbeats = false;
         if next_activity.pause_info.is_none() {
             let rules = deps.repo.list_workflow_rules(state.namespace_id).await?;
+            // The rule evaluator reads the durable interval the new attempt
+            // just recorded, so this evaluation and every later re-evaluation
+            // (delayed publish, reconciliation, start) see the same value.
+            let backoff_interval_seconds = activity_backoff_interval_seconds(&next_activity)?;
             if let Some(rule) = matching_pause_rule(
                 &state,
                 &next_activity,
                 &rules,
-                OffsetDateTime::now_utc(),
-                Some(backoff.whole_seconds()),
+                completed_at,
+                backoff_interval_seconds,
             ) {
                 // Retry preparation knows a next attempt exists, so this is the first retry-rule
                 // evaluation point. Terminal failures never enter this function
                 // (`mutable_state_impl.go:6274 @ v1.31.0`). Persisting the pause in the same
                 // transition prevents any retry dispatch from escaping between the decision and
                 // the state change.
-                next_activity.pause_info =
-                    Some(pause_info_for_rule(rule, OffsetDateTime::now_utc()));
+                next_activity.pause_info = Some(pause_info_for_rule(rule, completed_at));
             }
         }
         let paused = next_activity.pause_info.is_some();
-        next_activity.current_attempt_scheduled_at = (!paused).then_some(dispatch_at);
+        // A paused park has no eligibility time; the unpause transition
+        // re-anchors it (`RetryActivity`, mutable_state_impl.go:6278-6289 @
+        // v1.31.0).
+        if paused {
+            next_activity.current_attempt_scheduled_at = None;
+        }
         next_state
             .activities
             .insert(activity_id.to_string(), next_activity.clone());
 
-        let queue = QueueKey {
-            namespace_id: state.namespace_id,
-            task_queue: next_activity.task_queue.clone(),
-            task_kind: tokeira_types::TaskKind::Activity,
-            deployment: next_activity
-                .deployment
-                .clone()
-                .or_else(|| state.deployment.clone()),
-            build_id: next_activity
-                .build_id
-                .clone()
-                .or_else(|| state.build_id.clone()),
-        };
-        let dispatch_task = (!paused).then(|| DispatchableActivityTask {
-            run_key,
-            queue: queue.clone(),
-            activity_id: next_activity.activity_id.clone(),
-            input: next_activity.input.clone(),
-            schedule_event_id: next_activity.schedule_event_id,
-            attempt: next_activity.attempt,
-            dispatch_revision: state
-                .versioning_info
-                .as_ref()
-                .map(|info| info.revision_number)
-                .unwrap_or_default(),
-            stamp: next_activity.stamp,
-            priority: merge_priority(state.priority.as_ref(), next_activity.priority.as_ref()),
-            order: None,
-        });
-        let dispatch_ops = if paused {
+        let dispatch_task =
+            (!paused).then(|| activity_dispatch_task(run_key, &state, &next_activity));
+        let dispatch_ops = match &dispatch_task {
             // A retryable failure advances and clears the running attempt, but
             // a paused activity is parked without a retry timer or dispatch
             // (`RetryActivity`, mutable_state_impl.go:6278-6289 @ v1.31.0).
-            SmallVec::new()
-        } else {
-            smallvec![DispatchOp::EnqueueActivityTask {
-                queue,
-                activity_id: next_activity.activity_id.clone(),
-                input: next_activity.input.clone(),
-                schedule_event_id: next_activity.schedule_event_id,
-                attempt: next_activity.attempt,
-                dispatch_revision: state
-                    .versioning_info
-                    .as_ref()
-                    .map(|info| info.revision_number)
-                    .unwrap_or_default(),
-                stamp: next_activity.stamp,
-                // The retry path commits directly (bypassing the lane/publisher)
-                // and does its own backoff-delayed publish below, so this only
-                // stamps the durable row; carry the retry time for fidelity.
+            None => SmallVec::new(),
+            Some(task) => smallvec![DispatchOp::EnqueueActivityTask {
+                queue: task.queue.clone(),
+                activity_id: task.activity_id.clone(),
+                input: task.input.clone(),
+                schedule_event_id: task.schedule_event_id,
+                attempt: task.attempt,
+                dispatch_revision: task.dispatch_revision,
+                stamp: task.stamp,
+                // The durable eligibility time: storage keeps the row from the
+                // commit but the delivery queries surface it only once due —
+                // the persisted analog of v1.31.0's retry timer firing time.
                 dispatch_at,
                 schedule_to_close_timeout: next_activity.schedule_to_close_timeout,
                 schedule_to_start_timeout: next_activity.schedule_to_start_timeout,
                 start_to_close_timeout: next_activity.start_to_close_timeout,
                 heartbeat_timeout: next_activity.heartbeat_timeout,
-                priority: merge_priority(state.priority.as_ref(), next_activity.priority.as_ref()),
-            }]
+                priority: task.priority.clone(),
+            }],
         };
         let transition = Transition {
             expected_seq: state.transition_seq,
@@ -1563,13 +1556,15 @@ where
                     return Err(anyhow!("dispatchable activity retry missing after commit"));
                 };
                 if backoff.is_positive() {
-                    // Backoff-delayed dispatch: the commit above already
-                    // recorded the future schedule time durably; the publish
-                    // itself waits out the backoff (v1.31.0 uses a retry
-                    // timer task for this window). Recovery note: a process
-                    // restart inside the window relies on the timeout
-                    // scanner's schedule anchors rather than this in-memory
-                    // timer.
+                    // Backoff-delayed dispatch: the commit above recorded the
+                    // durable eligibility time; this in-memory timer is only
+                    // the LOW-LATENCY publication path. The durable dispatch
+                    // row is the correctness obligation — if this timer is
+                    // lost for any reason, the activity scanner's durable
+                    // reconciliation republishes the row once due, mirroring
+                    // v1.31.0's retried durable retry timer
+                    // (`executeActivityRetryTimerTask`,
+                    // timer_queue_active_task_executor.go:522-620 @ v1.31.0).
                     let timer_deps = deps.clone();
                     let activity_id = activity_id.to_string();
                     let delay = std::time::Duration::from_millis(
@@ -1577,10 +1572,14 @@ where
                     );
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
-                        match prepare_activity_retry_publish(&timer_deps, &dispatch_task, backoff)
-                            .await
+                        match prepare_activity_dispatch_publish(
+                            &timer_deps,
+                            &dispatch_task,
+                            OffsetDateTime::now_utc(),
+                        )
+                        .await
                         {
-                            Ok(Some(dispatch_task)) => {
+                            Ok(ActivityDispatchPreparation::Publish(dispatch_task)) => {
                                 if let Err(error) = timer_deps
                                     .broker
                                     .publish_activity_task(
@@ -1592,18 +1591,23 @@ where
                                     tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish backoff-delayed activity retry");
                                 }
                             }
-                            Ok(None) => {}
+                            Ok(_) => {}
                             Err(error) => {
-                                // Rule evaluation is a correctness gate. On an unavailable
-                                // authoritative read, recovery may reconstruct the durable
-                                // dispatch later; publishing without the check could defeat a
-                                // namespace pause policy.
+                                // Rule evaluation is a correctness gate. The durable
+                                // row stays; the scanner's reconciliation retries the
+                                // publish later. Publishing without the check could
+                                // defeat a namespace pause policy.
                                 tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to evaluate workflow rules for backoff-delayed activity retry");
                             }
                         }
                     });
-                } else if let Some(dispatch_task) =
-                    prepare_activity_retry_publish(deps, &dispatch_task, backoff).await?
+                } else if let ActivityDispatchPreparation::Publish(dispatch_task) =
+                    prepare_activity_dispatch_publish(
+                        deps,
+                        &dispatch_task,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await?
                     && let Err(error) = deps
                         .broker
                         .publish_activity_task(dispatch_task, Some(&deps.delivery_metrics))
@@ -1624,29 +1628,230 @@ where
     }
 }
 
-/// Revalidate a delayed retry and apply any rule created during its backoff.
+/// Build the dispatchable envelope for an activity's current unstarted
+/// attempt exactly as the retry commit publishes it: queue coordinates from
+/// the activity with workflow-level fallback, the workflow's routing
+/// revision, the live stamp, the field-wise merged Priority, and no runtime
+/// delivery order. Shared by the retry commit and durable reconciliation so
+/// envelope construction cannot diverge between them.
+pub(crate) fn activity_dispatch_task(
+    run_key: RunKey,
+    state: &WorkflowState,
+    activity: &tokeira_kernel::ActivityState,
+) -> DispatchableActivityTask {
+    DispatchableActivityTask {
+        run_key,
+        queue: QueueKey {
+            namespace_id: state.namespace_id,
+            task_queue: activity.task_queue.clone(),
+            task_kind: tokeira_types::TaskKind::Activity,
+            deployment: activity
+                .deployment
+                .clone()
+                .or_else(|| state.deployment.clone()),
+            build_id: activity.build_id.clone().or_else(|| state.build_id.clone()),
+        },
+        activity_id: activity.activity_id.clone(),
+        input: activity.input.clone(),
+        schedule_event_id: activity.schedule_event_id,
+        attempt: activity.attempt,
+        dispatch_revision: state
+            .versioning_info
+            .as_ref()
+            .map(|info| info.revision_number)
+            .unwrap_or_default(),
+        stamp: activity.stamp,
+        priority: merge_priority(state.priority.as_ref(), activity.priority.as_ref()),
+        order: None,
+    }
+}
+
+/// The classified outcome of preparing one durable activity dispatch for
+/// broker publication.
+#[derive(Debug)]
+pub(crate) enum ActivityDispatchPreparation {
+    /// Authoritative state accepts the dispatch: publish this routed task.
+    Publish(DispatchableActivityTask),
+    /// A workflow rule paused the activity. The pause transition committed
+    /// (its activity upsert deletes the durable dispatch row) and nothing
+    /// publishes.
+    SuppressedByRule,
+    /// Authoritative state proves the observed dispatch identity can never
+    /// become publishable again: the run is absent or not running, the
+    /// activity is absent, paused, or already started, or its schedule
+    /// event / attempt / stamp / eligibility no longer match. These are
+    /// row-lifecycle invariant violations — the observer may conditionally
+    /// prune the exact observed row version.
+    PermanentlyStale,
+    /// The dispatch is durable and live but must not publish now: its
+    /// eligibility time has not arrived, or a fired schedule deadline is
+    /// owned by timeout processing.
+    NotYetDispatchable,
+}
+
+/// The attempt's backoff interval, derived from durable state alone.
 ///
-/// Temporal evaluates the namespace's current Workflow Rules from its retry-timer path before
-/// adding the activity to matching (`timer_queue_active_task_executor.go:945-977 @ v1.31.0`).
-/// Returning `false` suppresses publication when the retry was superseded or became paused.
-async fn prepare_activity_retry_publish<R>(
+/// `ScheduledTime - LastAttemptCompleteTime`, exactly how v1.31.0 evaluates
+/// `BackoffInterval` rules from mutable state; the first attempt is a
+/// recognized-but-absent value (every `BackoffInterval` predicate is a clean
+/// non-match, `matchActivityBackoffInterval` returns `(false, nil)` before
+/// reading `LastAttemptCompleteTime`, matcher/activity_evaluator.go:245-253
+/// @ v1.31.0). NEVER substitute zero for `None`: `BackoffInterval = 0` would
+/// then incorrectly match. For attempts after the first, a missing durable
+/// timestamp is an invariant failure that prevents publication rather than a
+/// reason to skip the rule.
+pub(crate) fn activity_backoff_interval_seconds(
+    activity: &tokeira_kernel::ActivityState,
+) -> Result<Option<i64>> {
+    if activity.attempt < 2 {
+        return Ok(None);
+    }
+    let scheduled_at = activity
+        .current_attempt_scheduled_at
+        .ok_or_else(|| anyhow!("retry attempt is missing its scheduled time"))?;
+    let completed_at = activity
+        .last_attempt_complete_time
+        .ok_or_else(|| anyhow!("retry attempt is missing its prior completion time"))?;
+    Ok(Some((scheduled_at - completed_at).whole_seconds()))
+}
+
+/// One bounded reconciliation pass over a shard's due durable dispatch rows.
+///
+/// For each row due at `now`: revalidate through the shared preparation gate
+/// and publish accepted tasks (broker dedupe on `(run, activity, attempt,
+/// stamp)` makes a still-parked offer a no-op, and a taken-but-unstarted
+/// offer republishable); conditionally prune rows the gate proves permanently
+/// stale, using the exact observed row version so a concurrently replaced
+/// live row is untouched — pruning is also what keeps a bounded pass making
+/// forward progress instead of re-reading zombie rows forever. Transient
+/// errors and not-yet-dispatchable rows are left intact for a later pass;
+/// publication failure never removes the durable row.
+pub(crate) async fn reconcile_due_activity_dispatches_once<R>(
     deps: &ActivityRetryDeps<R>,
-    task: &DispatchableActivityTask,
-    backoff: time::Duration,
-) -> Result<Option<DispatchableActivityTask>>
+    shard_id: ShardId,
+    now: OffsetDateTime,
+    limit: usize,
+) -> usize
 where
     R: RunRepository + 'static,
 {
+    let due = match deps
+        .repo
+        .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, limit)
+        .await
+    {
+        Ok(due) => due,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                shard_id = shard_id.0,
+                "failed to list due activity dispatches"
+            );
+            return 0;
+        }
+    };
+    reconcile_activity_dispatch_candidates(deps, due, now).await
+}
+
+/// Run listed due rows through the shared gate; returns how many published.
+///
+/// Split from [`reconcile_due_activity_dispatches_once`] so shard recovery
+/// can list with its own error propagation (a failing sweep query aborts the
+/// takeover) while sharing the exact per-candidate semantics.
+pub(crate) async fn reconcile_activity_dispatch_candidates<R>(
+    deps: &ActivityRetryDeps<R>,
+    candidates: Vec<tokeira_storage::DueActivityDispatch>,
+    now: OffsetDateTime,
+) -> usize
+where
+    R: RunRepository + 'static,
+{
+    let mut published = 0usize;
+    for candidate in candidates {
+        match prepare_activity_dispatch_publish(deps, &candidate.task, now).await {
+            Ok(ActivityDispatchPreparation::Publish(task)) => {
+                if let Err(error) = deps
+                    .broker
+                    .publish_activity_task(task, Some(&deps.delivery_metrics))
+                    .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        run_key = ?candidate.task.run_key,
+                        activity_id = candidate.task.activity_id,
+                        "failed to publish reconciled activity dispatch"
+                    );
+                } else {
+                    published += 1;
+                }
+            }
+            Ok(
+                ActivityDispatchPreparation::SuppressedByRule
+                | ActivityDispatchPreparation::NotYetDispatchable,
+            ) => {}
+            Ok(ActivityDispatchPreparation::PermanentlyStale) => {
+                if let Err(error) = deps
+                    .repo
+                    .delete_activity_dispatch_if_matches(&candidate.identity())
+                    .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        run_key = ?candidate.task.run_key,
+                        activity_id = candidate.task.activity_id,
+                        "failed to prune permanently stale activity dispatch row"
+                    );
+                }
+            }
+            Err(error) => {
+                // Transient: authoritative reads and rule evaluation are
+                // correctness gates; the durable row stays for the next pass.
+                tracing::warn!(
+                    ?error,
+                    run_key = ?candidate.task.run_key,
+                    activity_id = candidate.task.activity_id,
+                    "failed to prepare reconciled activity dispatch"
+                );
+            }
+        }
+    }
+    published
+}
+
+/// Revalidate a durable activity dispatch against authoritative state and
+/// apply any workflow rule created since it was recorded.
+///
+/// The shared publication gate for the backoff timer, the scanner's durable
+/// reconciliation, and shard recovery — the local equivalent of v1.31.0's
+/// retry-timer executor, which reloads mutable state, validates stamp, pause,
+/// attempt, `StartedEventId`, and workflow-running state, evaluates current
+/// Workflow Rules, and only then adds the task to matching
+/// (`executeActivityRetryTimerTask`,
+/// timer_queue_active_task_executor.go:522-620,945-977 @ v1.31.0). Errors are
+/// transient: the durable row stays for a later pass, and publication never
+/// proceeds past a failed correctness gate.
+async fn prepare_activity_dispatch_publish<R>(
+    deps: &ActivityRetryDeps<R>,
+    task: &DispatchableActivityTask,
+    now: OffsetDateTime,
+) -> Result<ActivityDispatchPreparation>
+where
+    R: RunRepository + 'static,
+{
+    use ActivityDispatchPreparation as Preparation;
     let mut attempts = 0u32;
     loop {
         let LoadedRun::Existing(state) = deps.repo.load_run(task.run_key).await? else {
-            return Ok(None);
+            return Ok(Preparation::PermanentlyStale);
         };
-        if !state.is_open() {
-            return Ok(None);
+        // Exactly `Running`: `is_open()` also admits `Paused`, and workflow
+        // pause deletes the run's dispatch rows (resume recreates them), so a
+        // row observed against a paused workflow is lifecycle-stale.
+        if state.status != ExecutionStatus::Running {
+            return Ok(Preparation::PermanentlyStale);
         }
         let Some(current) = state.activities.get(&task.activity_id).cloned() else {
-            return Ok(None);
+            return Ok(Preparation::PermanentlyStale);
         };
         if current.attempt != task.attempt
             || current.schedule_event_id != task.schedule_event_id
@@ -1654,13 +1859,35 @@ where
             || current.started_event_id.is_some()
             || current.pause_info.is_some()
         {
-            return Ok(None);
+            return Ok(Preparation::PermanentlyStale);
+        }
+        let Some(dispatch_at) = current.current_attempt_scheduled_at else {
+            // Unstarted, unpaused attempts always carry an eligibility time;
+            // its absence means the row's attempt was superseded mid-read.
+            return Ok(Preparation::PermanentlyStale);
+        };
+        if dispatch_at > now {
+            return Ok(Preparation::NotYetDispatchable);
+        }
+        // Fired schedule deadlines belong to timeout processing; republishing
+        // would race the resolution that must terminally close the attempt.
+        if let Some(timeout) = current.schedule_to_close_timeout
+            && !timeout.is_zero()
+            && current.scheduled_at + timeout <= now
+        {
+            return Ok(Preparation::NotYetDispatchable);
+        }
+        if let Some(timeout) = current.schedule_to_start_timeout
+            && !timeout.is_zero()
+            && dispatch_at + timeout <= now
+        {
+            return Ok(Preparation::NotYetDispatchable);
         }
 
         let rules = deps.repo.list_workflow_rules(state.namespace_id).await?;
-        let now = OffsetDateTime::now_utc();
+        let backoff_interval_seconds = activity_backoff_interval_seconds(&current)?;
         let Some(rule) =
-            matching_pause_rule(&state, &current, &rules, now, Some(backoff.whole_seconds()))
+            matching_pause_rule(&state, &current, &rules, now, backoff_interval_seconds)
         else {
             let registry = deps
                 .worker_deployment_registry
@@ -1677,7 +1904,7 @@ where
             let mut routed = task.clone();
             routed.queue = queue;
             routed.dispatch_revision = dispatch_revision;
-            return Ok(Some(routed));
+            return Ok(Preparation::Publish(routed));
         };
 
         let mut next_state = state.clone();
@@ -1723,7 +1950,7 @@ where
         {
             CommitResult::Applied { .. } => {
                 deps.tracking.remove(task.run_key, &task.activity_id);
-                return Ok(None);
+                return Ok(Preparation::SuppressedByRule);
             }
             CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
                 if attempts >= deps.max_occ_retries {
@@ -1731,7 +1958,7 @@ where
                 }
                 attempts += 1;
             }
-            CommitResult::Duplicate => return Ok(None),
+            CommitResult::Duplicate => return Ok(Preparation::SuppressedByRule),
         }
     }
 }
@@ -2009,6 +2236,7 @@ mod tests {
         let scheduled_at = OffsetDateTime::now_utc();
         let started_at = scheduled_at + Duration::seconds(1);
         let activity = tokeira_kernel::ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -2106,6 +2334,7 @@ mod tests {
         let run_key = state.run_key;
         let scheduled_at = OffsetDateTime::now_utc();
         let activity = tokeira_kernel::ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -2163,9 +2392,25 @@ mod tests {
             history_events: SmallVec::new(),
             event_principals: SmallVec::new(),
             request_dedupe_ops: SmallVec::new(),
-            activity_ops: smallvec![ActivityOp::Upsert(activity)],
+            activity_ops: smallvec![ActivityOp::Upsert(activity.clone())],
             timer_ops: SmallVec::new(),
-            dispatch_ops: SmallVec::new(),
+            // Real schedule transitions always carry the durable dispatch op;
+            // the row is what reconciliation rediscovers after a lost take.
+            dispatch_ops: smallvec![DispatchOp::EnqueueActivityTask {
+                queue: queue.clone(),
+                activity_id: activity.activity_id.clone(),
+                input: activity.input.clone(),
+                schedule_event_id: activity.schedule_event_id,
+                attempt: activity.attempt,
+                dispatch_revision: 0,
+                stamp: activity.stamp,
+                dispatch_at: scheduled_at,
+                schedule_to_close_timeout: activity.schedule_to_close_timeout,
+                schedule_to_start_timeout: activity.schedule_to_start_timeout,
+                start_to_close_timeout: activity.start_to_close_timeout,
+                heartbeat_timeout: activity.heartbeat_timeout,
+                priority: None,
+            }],
             projection_ops: SmallVec::new(),
         };
         repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
@@ -2592,8 +2837,10 @@ mod tests {
             priority: None,
             order: None,
         };
+        // The durable row exists during the backoff window (inspection view)
+        // even though the delivery view withholds it until due.
         assert_eq!(
-            repo.list_dispatchable_activity_tasks(&queue, 10)
+            repo.list_all_dispatchable_activity_tasks(&queue, 10)
                 .await
                 .unwrap()
                 .len(),
@@ -2607,12 +2854,12 @@ mod tests {
         )
         .await
         .expect("store rule during retry backoff");
-        assert!(
-            prepare_activity_retry_publish(&deps, &task, backoff)
+        assert!(matches!(
+            prepare_activity_dispatch_publish(&deps, &task, OffsetDateTime::now_utc() + backoff)
                 .await
-                .expect("evaluate delayed retry")
-                .is_none()
-        );
+                .expect("evaluate delayed retry"),
+            ActivityDispatchPreparation::SuppressedByRule
+        ));
 
         let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {
             panic!("seeded run should exist after timer evaluation");
@@ -2627,7 +2874,7 @@ mod tests {
         );
         assert!(paused.current_attempt_scheduled_at.is_none());
         assert!(
-            repo.list_dispatchable_activity_tasks(&queue, 10)
+            repo.list_all_dispatchable_activity_tasks(&queue, 10)
                 .await
                 .unwrap()
                 .is_empty()
@@ -2932,5 +3179,172 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn backoff_fixture_activity(attempt: u32) -> tokeira_kernel::ActivityState {
+        tokeira_kernel::ActivityState {
+            last_attempt_complete_time: None,
+            cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
+            started_identity: None,
+            retry_last_worker_identity: None,
+            activity_id: "activity-1".into(),
+            activity_type: "activity-type".into(),
+            schedule_event_id: 7,
+            task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
+            input: tokeira_types::Payloads::default(),
+            header: None,
+            last_failure: None,
+            heartbeat_details: None,
+            attempt,
+            retry_policy: None,
+            schedule_to_close_timeout: None,
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+            scheduled_at: now(),
+            current_attempt_scheduled_at: None,
+            started_at: None,
+            started_event_id: None,
+            pause_info: None,
+            stamp: 0,
+            priority: None,
+        }
+    }
+
+    #[test]
+    fn backoff_interval_is_absent_for_first_attempt_and_exact_for_retries() {
+        // v1.31.0 first-attempt semantics: recognized-but-absent, so every
+        // BackoffInterval predicate is a clean non-match — never zero
+        // (matcher/activity_evaluator.go:245-253 @ v1.31.0).
+        let first = backoff_fixture_activity(1);
+        assert_eq!(
+            activity_backoff_interval_seconds(&first).expect("first attempt"),
+            None
+        );
+
+        let mut retry = backoff_fixture_activity(2);
+        retry.last_attempt_complete_time = Some(now());
+        retry.current_attempt_scheduled_at = Some(now() + Duration::seconds(5));
+        assert_eq!(
+            activity_backoff_interval_seconds(&retry).expect("derivable retry"),
+            Some(5)
+        );
+
+        // For attempts after the first, a missing durable timestamp is an
+        // invariant failure that blocks publication, never a skipped rule.
+        let mut missing_completed = backoff_fixture_activity(2);
+        missing_completed.current_attempt_scheduled_at = Some(now());
+        assert!(activity_backoff_interval_seconds(&missing_completed).is_err());
+        let mut missing_scheduled = backoff_fixture_activity(2);
+        missing_scheduled.last_attempt_complete_time = Some(now());
+        assert!(activity_backoff_interval_seconds(&missing_scheduled).is_err());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_prunes_stale_head_and_admits_live_row_under_limit_one() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        // A live scheduled activity whose broker entry is consumed without a
+        // Started commit (the lost-take shape).
+        let (state, queue, _task) = seed_scheduled_activity(&runtime, &repo).await;
+        let offer = runtime
+            .poll_activity_task_offer(
+                queue.clone(),
+                tokeira_types::WorkerIdentity("worker".into()),
+                tokio::time::Duration::from_millis(5),
+            )
+            .await
+            .expect("poll offer")
+            .expect("live offer");
+        drop(offer);
+
+        // A zombie row ordered before the live one: a dispatch op whose
+        // activity does not exist in any run state, eligibility at epoch so it
+        // heads the (dispatch_at, ...) ordering.
+        let zombie_run = RunKey::new();
+        let mut zombie_state = state.clone();
+        zombie_state.run_key = zombie_run;
+        zombie_state.run_id = tokeira_types::RunId::new();
+        zombie_state.workflow_id = WorkflowId("zombie".into());
+        zombie_state.transition_seq = tokeira_types::TransitionSeq(1);
+        zombie_state.activities.clear();
+        let zombie_transition = Transition {
+            expected_seq: tokeira_types::TransitionSeq::ZERO,
+            next_state: zombie_state,
+            history_events: Default::default(),
+            event_principals: Default::default(),
+            request_dedupe_ops: Default::default(),
+            activity_ops: Default::default(),
+            timer_ops: Default::default(),
+            dispatch_ops: smallvec![DispatchOp::EnqueueActivityTask {
+                queue: queue.clone(),
+                activity_id: "zombie".into(),
+                input: tokeira_types::Payloads::default(),
+                schedule_event_id: 3,
+                attempt: 1,
+                dispatch_revision: 0,
+                stamp: 0,
+                dispatch_at: OffsetDateTime::UNIX_EPOCH,
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+                priority: None,
+            }],
+            projection_ops: Default::default(),
+        };
+        repo.commit_transition(zombie_run, zombie_transition, ShardEpoch::ZERO)
+            .await
+            .expect("commit zombie row");
+
+        let deps = runtime.activity_retry_deps();
+        let shard_id = tokeira_types::ShardId(0);
+        let now = OffsetDateTime::now_utc();
+        // Pass 1 (budget one): only the stale head is scanned; it is
+        // conditionally pruned rather than retried forever.
+        let published = reconcile_due_activity_dispatches_once(&deps, shard_id, now, 1).await;
+        assert_eq!(published, 0, "the stale head publishes nothing");
+        assert!(
+            repo.list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .expect("inspect rows")
+                .iter()
+                .all(|task| task.run_key != zombie_run),
+            "the stale head must be pruned"
+        );
+        // Pass 2 (same budget): forward progress — the live row is admitted
+        // and republished into the broker.
+        let due_after_prune = repo
+            .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, 10)
+            .await
+            .expect("list due rows");
+        assert_eq!(
+            due_after_prune
+                .iter()
+                .map(|due| due.task.run_key)
+                .collect::<Vec<_>>(),
+            vec![state.run_key],
+            "after pruning, exactly the live row is due"
+        );
+        let published = reconcile_due_activity_dispatches_once(&deps, shard_id, now, 1).await;
+        assert_eq!(published, 1, "the live row must be admitted after pruning");
+        let redelivered = deps
+            .broker
+            .poll_activity_task(&queue, std::time::Duration::ZERO)
+            .await
+            .expect("poll broker")
+            .expect("republished live offer");
+        assert_eq!(redelivered.0.run_key, state.run_key);
     }
 }

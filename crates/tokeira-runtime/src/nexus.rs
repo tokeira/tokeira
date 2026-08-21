@@ -1979,7 +1979,7 @@ impl NexusCompletionClient for NoopNexusCompletionClient {
 /// pairs the scanner must check. The timeout deadlines, `started`/`started_at`
 /// anchors, and current liveness are read from the durable `PendingNexusOperation`
 /// at scan time (history is authority, AGENTS §3). On shard takeover the index is
-/// rebuilt from durable state by [`crate::recovery::sweep_shard`]; losing it only
+/// rebuilt from durable state by `crate::recovery::sweep_shard`; losing it only
 /// delays firing until the rebuild, never changes the outcome.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NexusTimeoutEntry {
@@ -2051,7 +2051,7 @@ impl NexusTimeoutTrackingState {
 /// *which* `(run, callback_index)` pairs are backing off. The `next_attempt_at`
 /// deadline and current `CallbackState` are read from the durable `CompletionCallback`
 /// at scan time (history is authority, AGENTS §3). On shard takeover the index is
-/// rebuilt from durable state by [`crate::recovery::sweep_shard`]; losing it only
+/// rebuilt from durable state by `crate::recovery::sweep_shard`; losing it only
 /// delays a retry until the rebuild, never changes the outcome.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionCallbackTrackingEntry {

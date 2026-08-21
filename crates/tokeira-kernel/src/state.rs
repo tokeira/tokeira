@@ -781,6 +781,24 @@ pub struct ActivityState {
     /// (`service/history/api/updateactivityoptions/api.go @ v1.31.0`).
     #[serde(default)]
     pub priority: Option<Priority>,
+    /// When the previous attempt reached its retryable completion (failure or
+    /// retryable timeout), stamped by the runtime's retry commit.
+    ///
+    /// Together with `current_attempt_scheduled_at` this makes the attempt's
+    /// backoff derivable from durable state alone —
+    /// `ScheduledTime - LastAttemptCompleteTime`, exactly how v1.31.0 evaluates
+    /// `BackoffInterval` workflow rules from mutable state
+    /// (`RetryActivity` stamps it, mutable_state_impl.go:6338;
+    /// `matcher/activity_evaluator.go:245-253 @ v1.31.0`). `None` for the
+    /// first attempt.
+    ///
+    /// Positional-postcard note: `state_data` rows written before this field
+    /// do NOT decode — postcard cannot default missing trailing data (see the
+    /// documented-failure tests below). Tokeira is pre-baseline, so a fresh
+    /// database is the stated requirement; `#[serde(default)]` covers the
+    /// self-describing formats only.
+    #[serde(default)]
+    pub last_attempt_complete_time: Option<OffsetDateTime>,
 }
 
 /// Metadata recorded when a workflow is paused.
@@ -1744,6 +1762,52 @@ mod tests {
         let error = postcard::from_bytes::<BufferedEvent>(&bytes)
             .expect_err("postcard cannot default a missing trailing sequence element");
 
+        assert!(matches!(error, postcard::Error::DeserializeUnexpectedEnd));
+    }
+
+    #[test]
+    fn legacy_activity_state_postcard_documents_pre_baseline_decode_failure() {
+        // Same pre-baseline posture as the buffered-event test above, pinned
+        // for `last_attempt_complete_time`: an `activity_state.state_data` row
+        // written before the field is exactly today's encoding minus the
+        // trailing one-byte `None` tag, and positional postcard rejects that
+        // prefix rather than defaulting it. A fresh database is the stated
+        // requirement; no migration guarantee is claimed.
+        let activity = ActivityState {
+            last_attempt_complete_time: None,
+            cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
+            started_identity: None,
+            retry_last_worker_identity: None,
+            activity_id: "activity-1".into(),
+            activity_type: "activity-type".into(),
+            schedule_event_id: 7,
+            task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
+            input: Payloads::default(),
+            header: None,
+            last_failure: None,
+            heartbeat_details: None,
+            attempt: 2,
+            retry_policy: None,
+            schedule_to_close_timeout: None,
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: Some(Duration::seconds(20)),
+            heartbeat_timeout: None,
+            scheduled_at: now(),
+            current_attempt_scheduled_at: Some(now()),
+            started_at: None,
+            started_event_id: None,
+            pause_info: None,
+            stamp: 1,
+            priority: None,
+        };
+        let encoded = postcard::to_allocvec(&activity).expect("encode activity state");
+        let legacy = &encoded[..encoded.len() - 1];
+        let error = postcard::from_bytes::<ActivityState>(legacy)
+            .expect_err("postcard cannot default the missing trailing field");
         assert!(matches!(error, postcard::Error::DeserializeUnexpectedEnd));
     }
 }

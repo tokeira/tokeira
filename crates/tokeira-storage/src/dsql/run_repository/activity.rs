@@ -14,18 +14,20 @@ pub(super) type ActivityDispatchRow = (
     i64,
     Vec<u8>,
     Option<Vec<u8>>,
+    OffsetDateTime,
 );
 
 impl DsqlRunRepository {
-    #[instrument(name = "dsql.list_dispatchable_activity_tasks", skip(self), fields(namespace_id = %queue.namespace_id.0, task_queue = %queue.task_queue.0, limit))]
-    pub(super) async fn do_list_dispatchable_activity_tasks(
+    #[instrument(name = "dsql.list_due_dispatchable_activity_tasks", skip(self), fields(namespace_id = %queue.namespace_id.0, task_queue = %queue.task_queue.0, limit))]
+    pub(super) async fn do_list_due_dispatchable_activity_tasks(
         &self,
         queue: &QueueKey,
+        now: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
-        record_dsql_operation!(self, "list_dispatchable_activity_tasks", None, {
+        record_dsql_operation!(self, "list_due_dispatchable_activity_tasks", None, {
             if limit == 0 {
-                metrics::record_dsql_rows_read("list_dispatchable_activity_tasks", 0);
+                metrics::record_dsql_rows_read("list_due_dispatchable_activity_tasks", 0);
                 return Ok(Vec::new());
             }
 
@@ -35,14 +37,60 @@ impl DsqlRunRepository {
             let rows = sqlx::query_as::<_, ActivityDispatchRow>(
                 "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
                     deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
-                    input_data, priority_data
+                    input_data, priority_data, dispatch_at
              FROM activity_dispatch
              WHERE queue_namespace = $1
                AND queue_name = $2
                AND task_kind = $3
                AND deployment IS NOT DISTINCT FROM $4
                AND build_id IS NOT DISTINCT FROM $5
-             ORDER BY created_at ASC
+               AND dispatch_at <= $6
+             ORDER BY dispatch_at ASC, created_at ASC
+             LIMIT $7",
+            )
+            .bind(queue.namespace_id.0)
+            .bind(&queue.task_queue.0)
+            .bind(queue.task_kind.to_db_smallint())
+            .bind(deployment)
+            .bind(build_id)
+            .bind(now)
+            .bind(i64::try_from(limit)?)
+            .fetch_all(permit.connection()?)
+            .await?;
+            metrics::record_dsql_rows_read("list_due_dispatchable_activity_tasks", rows.len());
+
+            rows.into_iter()
+                .map(|row| activity_dispatch_from_row(row).map(|due| due.task))
+                .collect()
+        })
+    }
+
+    #[instrument(name = "dsql.list_all_dispatchable_activity_tasks", skip(self), fields(namespace_id = %queue.namespace_id.0, task_queue = %queue.task_queue.0, limit))]
+    pub(super) async fn do_list_all_dispatchable_activity_tasks(
+        &self,
+        queue: &QueueKey,
+        limit: usize,
+    ) -> Result<Vec<DispatchableActivityTask>> {
+        record_dsql_operation!(self, "list_all_dispatchable_activity_tasks", None, {
+            if limit == 0 {
+                metrics::record_dsql_rows_read("list_all_dispatchable_activity_tasks", 0);
+                return Ok(Vec::new());
+            }
+
+            let mut permit = self.director.acquire(DbClass::Read).await?;
+            let deployment = queue.deployment.as_ref().map(|value| value.0.as_str());
+            let build_id = queue.build_id.as_ref().map(|value| value.0.as_str());
+            let rows = sqlx::query_as::<_, ActivityDispatchRow>(
+                "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
+                    deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
+                    input_data, priority_data, dispatch_at
+             FROM activity_dispatch
+             WHERE queue_namespace = $1
+               AND queue_name = $2
+               AND task_kind = $3
+               AND deployment IS NOT DISTINCT FROM $4
+               AND build_id IS NOT DISTINCT FROM $5
+             ORDER BY dispatch_at ASC, created_at ASC
              LIMIT $6",
             )
             .bind(queue.namespace_id.0)
@@ -53,25 +101,31 @@ impl DsqlRunRepository {
             .bind(i64::try_from(limit)?)
             .fetch_all(permit.connection()?)
             .await?;
-            metrics::record_dsql_rows_read("list_dispatchable_activity_tasks", rows.len());
+            metrics::record_dsql_rows_read("list_all_dispatchable_activity_tasks", rows.len());
 
-            rows.into_iter().map(activity_dispatch_from_row).collect()
+            rows.into_iter()
+                .map(|row| activity_dispatch_from_row(row).map(|due| due.task))
+                .collect()
         })
     }
 
-    #[instrument(name = "dsql.list_dispatchable_activity_tasks_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
-    pub(super) async fn do_list_dispatchable_activity_tasks_for_shard(
+    #[instrument(name = "dsql.list_due_dispatchable_activity_tasks_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
+    pub(super) async fn do_list_due_dispatchable_activity_tasks_for_shard(
         &self,
         shard_id: ShardId,
+        now: OffsetDateTime,
         limit: usize,
-    ) -> Result<Vec<DispatchableActivityTask>> {
+    ) -> Result<Vec<DueActivityDispatch>> {
         record_dsql_operation!(
             self,
-            "list_dispatchable_activity_tasks_for_shard",
+            "list_due_dispatchable_activity_tasks_for_shard",
             Some(shard_id),
             {
                 if limit == 0 {
-                    metrics::record_dsql_rows_read("list_dispatchable_activity_tasks_for_shard", 0);
+                    metrics::record_dsql_rows_read(
+                        "list_due_dispatchable_activity_tasks_for_shard",
+                        0,
+                    );
                     return Ok(Vec::new());
                 }
 
@@ -79,24 +133,59 @@ impl DsqlRunRepository {
                 let rows = sqlx::query_as::<_, ActivityDispatchRow>(
                     "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
                     deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
-                    input_data, priority_data
+                    input_data, priority_data, dispatch_at
              FROM activity_dispatch
              WHERE shard_id = $1
-             ORDER BY created_at ASC
-             LIMIT $2",
+               AND dispatch_at <= $2
+             ORDER BY dispatch_at ASC, created_at ASC
+             LIMIT $3",
                 )
                 .bind(Self::shard_id_to_uuid(shard_id))
+                .bind(now)
                 .bind(i64::try_from(limit)?)
                 .fetch_all(permit.connection()?)
                 .await?;
                 metrics::record_dsql_rows_read(
-                    "list_dispatchable_activity_tasks_for_shard",
+                    "list_due_dispatchable_activity_tasks_for_shard",
                     rows.len(),
                 );
 
                 rows.into_iter().map(activity_dispatch_from_row).collect()
             }
         )
+    }
+
+    #[instrument(name = "dsql.delete_activity_dispatch_if_matches", skip(self, candidate), fields(run_key = %candidate.run_key.0, activity_id = %candidate.activity_id))]
+    pub(super) async fn do_delete_activity_dispatch_if_matches(
+        &self,
+        candidate: &ActivityDispatchIdentity,
+    ) -> Result<bool> {
+        record_dsql_operation!(self, "delete_activity_dispatch_if_matches", None, {
+            let mut permit = self.director.acquire(DbClass::Commit).await?;
+            let key =
+                DsqlRunRepository::activity_dispatch_key(candidate.run_key, &candidate.activity_id);
+            // Conditional on the full observed row version: a concurrent
+            // retry/options transition changes at least one compared column,
+            // so stale cleanup can never remove a replacement live row.
+            let result = sqlx::query(
+                "DELETE FROM activity_dispatch
+             WHERE key = $1
+               AND schedule_event_id = $2
+               AND attempt = $3
+               AND stamp = $4
+               AND dispatch_revision = $5
+               AND dispatch_at = $6",
+            )
+            .bind(key)
+            .bind(candidate.schedule_event_id)
+            .bind(i32::try_from(candidate.attempt)?)
+            .bind(i64::try_from(candidate.stamp).unwrap_or(i64::MAX))
+            .bind(candidate.dispatch_revision)
+            .bind(candidate.dispatch_at)
+            .execute(permit.connection()?)
+            .await?;
+            Ok(result.rows_affected() > 0)
+        })
     }
 
     #[instrument(name = "dsql.list_open_activities_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
@@ -129,9 +218,7 @@ impl DsqlRunRepository {
     }
 }
 
-pub(super) fn activity_dispatch_from_row(
-    row: ActivityDispatchRow,
-) -> Result<DispatchableActivityTask> {
+pub(super) fn activity_dispatch_from_row(row: ActivityDispatchRow) -> Result<DueActivityDispatch> {
     let (
         run_key,
         activity_id,
@@ -146,27 +233,31 @@ pub(super) fn activity_dispatch_from_row(
         stamp,
         input_data,
         priority_data,
+        dispatch_at,
     ) = row;
-    Ok(DispatchableActivityTask {
-        run_key: RunKey(run_key),
-        queue: QueueKey {
-            namespace_id: NamespaceId(queue_namespace),
-            task_queue: TaskQueueName(queue_name),
-            task_kind: TaskKind::try_from(task_kind)?,
-            deployment: deployment.map(DeploymentId),
-            build_id: build_id.map(BuildId),
+    Ok(DueActivityDispatch {
+        task: DispatchableActivityTask {
+            run_key: RunKey(run_key),
+            queue: QueueKey {
+                namespace_id: NamespaceId(queue_namespace),
+                task_queue: TaskQueueName(queue_name),
+                task_kind: TaskKind::try_from(task_kind)?,
+                deployment: deployment.map(DeploymentId),
+                build_id: build_id.map(BuildId),
+            },
+            activity_id,
+            input: codec::decode_payloads(&input_data)?,
+            schedule_event_id,
+            attempt: convert::u32_from_i32(attempt, "activity_dispatch.attempt")?,
+            dispatch_revision,
+            stamp: u64::try_from(stamp).unwrap_or_default(),
+            priority: priority_data
+                .as_deref()
+                .map(codec::decode_priority)
+                .transpose()?,
+            order: None,
         },
-        activity_id,
-        input: codec::decode_payloads(&input_data)?,
-        schedule_event_id,
-        attempt: convert::u32_from_i32(attempt, "activity_dispatch.attempt")?,
-        dispatch_revision,
-        stamp: u64::try_from(stamp).unwrap_or_default(),
-        priority: priority_data
-            .as_deref()
-            .map(codec::decode_priority)
-            .transpose()?,
-        order: None,
+        dispatch_at,
     })
 }
 
@@ -182,6 +273,7 @@ pub(super) fn collect_activity_sweep_entries(
                 schedule_event_id: activity.schedule_event_id,
                 attempt: activity.attempt,
                 original_scheduled_at: activity.scheduled_at,
+                current_attempt_scheduled_at: activity.current_attempt_scheduled_at,
                 started_at: activity.started_at,
                 schedule_to_close_timeout: activity.schedule_to_close_timeout,
                 schedule_to_start_timeout: activity.schedule_to_start_timeout,

@@ -691,6 +691,7 @@ fn make_paused_state_with_activity(id: &str) -> WorkflowState {
     state.activities.insert(
         id.into(),
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -729,6 +730,7 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
     state.activities.insert(
         id.into(),
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -1774,6 +1776,7 @@ fn terminate_with_activities_and_timers() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -1948,6 +1951,7 @@ fn reset_cleans_up_activities_and_timers() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -2123,6 +2127,7 @@ fn pause_workflow_happy_path() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -2257,6 +2262,7 @@ fn unpause_workflow_happy_path() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -3512,6 +3518,7 @@ fn workflow_execution_timed_out_with_entities() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -4380,6 +4387,7 @@ fn reject_duplicate_activity_id() {
     with_activity.activities.insert(
         "dup".into(),
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -5796,6 +5804,7 @@ fn with_pending_activity_started_wft() -> WorkflowState {
     state.activities.insert(
         "activity-1".into(),
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,

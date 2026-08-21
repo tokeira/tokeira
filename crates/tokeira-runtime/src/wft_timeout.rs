@@ -7,7 +7,7 @@
 //!
 //! This state is volatile and derived. The durable transition log is
 //! authoritative for which tasks are started and when; this map is a scan-time
-//! cache rebuilt from durable history by [`crate::recovery::sweep_shard`] on
+//! cache rebuilt from durable history by `crate::recovery::sweep_shard` on
 //! shard takeover, so a crash or failover costs only a rebuild. Entries carry
 //! their `ShardId` so a handoff evicts exactly the runs this node no longer owns.
 //! Keyed by `RunKey` (one started workflow task per run at a time), so completing

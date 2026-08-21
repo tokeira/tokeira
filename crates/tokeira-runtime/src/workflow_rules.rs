@@ -403,6 +403,7 @@ mod tests {
 
     fn activity(activity_type: &str, attempt: u32) -> ActivityState {
         ActivityState {
+            last_attempt_complete_time: None,
             activity_id: "activity-id".to_string(),
             activity_type: activity_type.to_string(),
             schedule_event_id: 1,

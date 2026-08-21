@@ -465,12 +465,26 @@ mod tests {
         ) -> Result<Vec<DispatchableWorkflowTask>> {
             Ok(Vec::new())
         }
-        async fn list_dispatchable_activity_tasks(
+        async fn list_due_dispatchable_activity_tasks(
+            &self,
+            _queue: &QueueKey,
+            _now: time::OffsetDateTime,
+            _limit: usize,
+        ) -> Result<Vec<DispatchableActivityTask>> {
+            Ok(Vec::new())
+        }
+        async fn list_all_dispatchable_activity_tasks(
             &self,
             _queue: &QueueKey,
             _limit: usize,
         ) -> Result<Vec<DispatchableActivityTask>> {
             Ok(Vec::new())
+        }
+        async fn delete_activity_dispatch_if_matches(
+            &self,
+            _candidate: &tokeira_storage::ActivityDispatchIdentity,
+        ) -> Result<bool> {
+            Ok(false)
         }
         async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
             if *self
@@ -516,11 +530,12 @@ mod tests {
         ) -> Result<Vec<DispatchableWorkflowTask>> {
             Ok(Vec::new())
         }
-        async fn list_dispatchable_activity_tasks_for_shard(
+        async fn list_due_dispatchable_activity_tasks_for_shard(
             &self,
             _shard_id: ShardId,
+            _now: time::OffsetDateTime,
             _limit: usize,
-        ) -> Result<Vec<DispatchableActivityTask>> {
+        ) -> Result<Vec<tokeira_storage::DueActivityDispatch>> {
             Ok(Vec::new())
         }
         async fn list_due_timers_for_shard(

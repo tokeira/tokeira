@@ -9,7 +9,7 @@
 //! The ordering in [`acquire_shard`](TokeiraRuntime::acquire_shard) is the
 //! correctness-critical part and is enforced deliberately: a freshly acquired
 //! shard is recorded in `Sweeping`, its volatile delivery state is rebuilt by
-//! [`sweep_shard`], and only *then* is it marked `Active`. This guarantees no
+//! `sweep_shard`, and only *then* is it marked `Active`. This guarantees no
 //! command is admitted against a shard whose in-memory dispatch/timeout state
 //! has not yet been reconstructed from durable history.
 use super::*;
@@ -85,12 +85,10 @@ where
             lost_tx,
         ));
 
-        let deployment_registry = self.deployment_registry();
-        sweep_shard_with_registry(
+        sweep_shard(
             shard_id,
             self.repo.as_ref(),
             &self.broker,
-            &self.activity_broker,
             &self.lanes,
             self.lanes.len(),
             &self.workflow_timeout_tracking,
@@ -98,7 +96,9 @@ where
             &self.activity_tracking,
             &self.nexus_timeout_tracking,
             &self.completion_callback_tracking,
-            deployment_registry.as_ref(),
+            // Activity republication runs through the shared preparation gate
+            // with the runtime's broker and deployment registry.
+            &self.activity_retry_deps(),
         )
         .await?;
 

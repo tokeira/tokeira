@@ -63,7 +63,7 @@ use crate::{
     },
     publisher::{RuntimeDispatchPublisher, run_completion_callback_scanner},
     query::{QueryResult, QueryTask},
-    recovery::{lease_rejected_error, run_lease_renewer, sweep_shard_with_registry},
+    recovery::{lease_rejected_error, run_lease_renewer, sweep_shard},
     retry::{RetryDecision, RetryExhaustedReason, evaluate_activity_retry},
     scanner::{
         TimerScannerConfig, lane_index_for_run_key, pick_lane_for_run_key, run_timer_scanner,
@@ -95,6 +95,7 @@ pub(crate) mod workflow_task;
 
 pub(crate) use activity::{
     ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry, exhausted_reason_to_retry_state,
+    reconcile_activity_dispatch_candidates, reconcile_due_activity_dispatches_once,
 };
 
 /// v1.31.0 default number of consecutive workflow-task problems required
@@ -1448,9 +1449,11 @@ where
     /// Like [`republish_queue`](Self::republish_queue) but
     /// for activity tasks.
     pub async fn republish_activity_queue(&self, queue: QueueKey, limit: usize) -> Result<usize> {
+        // Due-only: a retry inside its backoff window must not be offered
+        // early by an on-demand republish any more than by recovery.
         let tasks = self
             .repo
-            .list_dispatchable_activity_tasks(&queue, limit)
+            .list_due_dispatchable_activity_tasks(&queue, OffsetDateTime::now_utc(), limit)
             .await?;
         let count = tasks.len();
         for task in tasks {
@@ -3747,11 +3750,27 @@ mod tests {
             panic!("unused in timer scanner tests")
         }
 
-        async fn list_dispatchable_activity_tasks(
+        async fn list_due_dispatchable_activity_tasks(
+            &self,
+            _queue: &QueueKey,
+            _now: OffsetDateTime,
+            _limit: usize,
+        ) -> Result<Vec<DispatchableActivityTask>> {
+            panic!("unused in timer scanner tests")
+        }
+
+        async fn list_all_dispatchable_activity_tasks(
             &self,
             _queue: &QueueKey,
             _limit: usize,
         ) -> Result<Vec<DispatchableActivityTask>> {
+            panic!("unused in timer scanner tests")
+        }
+
+        async fn delete_activity_dispatch_if_matches(
+            &self,
+            _candidate: &tokeira_storage::ActivityDispatchIdentity,
+        ) -> Result<bool> {
             panic!("unused in timer scanner tests")
         }
 
@@ -3796,11 +3815,12 @@ mod tests {
             panic!("unused in timer scanner tests")
         }
 
-        async fn list_dispatchable_activity_tasks_for_shard(
+        async fn list_due_dispatchable_activity_tasks_for_shard(
             &self,
             _shard_id: tokeira_types::ShardId,
+            _now: OffsetDateTime,
             _limit: usize,
-        ) -> Result<Vec<DispatchableActivityTask>> {
+        ) -> Result<Vec<tokeira_storage::DueActivityDispatch>> {
             panic!("unused in timer scanner tests")
         }
 

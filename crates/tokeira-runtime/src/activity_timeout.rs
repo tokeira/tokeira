@@ -8,7 +8,7 @@
 //! The tracking state is volatile and derived: the durable transition log is
 //! authoritative for which activities are open and what their timeouts are.
 //! This map is the scan-time cache, rebuilt from durable history by
-//! [`crate::recovery::sweep_shard`] on shard takeover — losing it costs a
+//! `crate::recovery::sweep_shard` on shard takeover — losing it costs a
 //! rebuild, never correctness. Heartbeat timestamps are intentionally *not*
 //! durable: they are reset to `None` on rebuild and on retry, so after a failover
 //! the heartbeat clock restarts from the activity's start rather than firing
@@ -272,6 +272,11 @@ pub struct ActivityTimeoutScannerConfig {
     /// Upper bound on timeouts submitted per scan, bounding the work one tick can
     /// do when many activities expire together.
     pub max_timeouts_per_scan: usize,
+    /// Upper bound on durable dispatch reconciliations per scan.
+    ///
+    /// A separate budget from `max_timeouts_per_scan`: a large population of
+    /// due dispatch rows must not starve timeout resolution, and vice versa.
+    pub max_dispatch_reconciliations_per_scan: usize,
 }
 
 impl Default for ActivityTimeoutScannerConfig {
@@ -279,6 +284,7 @@ impl Default for ActivityTimeoutScannerConfig {
         Self {
             scan_interval: tokio::time::Duration::from_secs(1),
             max_timeouts_per_scan: 100,
+            max_dispatch_reconciliations_per_scan: 100,
         }
     }
 }
@@ -700,6 +706,21 @@ pub(crate) async fn run_activity_timeout_scanner<R>(
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("activity_timeout", shard_id.0);
             scan_activity_timeouts_once(&deps, Some(shard_id), &lanes, lane_count, &config).await;
+            // Durable-dispatch reconciliation runs AFTER timeout processing:
+            // a fired schedule deadline is resolved before its row could be
+            // republished. The durable `activity_dispatch` row is the
+            // discovery source — volatile tracking is only a deadline-clock
+            // optimization — so a lost broker publication or a take that
+            // never reached Started heals here, the local equivalent of
+            // v1.31.0's retried durable ActivityRetryTimerTask
+            // (timer_queue_active_task_executor.go:522-620 @ v1.31.0).
+            crate::runtime::reconcile_due_activity_dispatches_once(
+                &deps,
+                shard_id,
+                OffsetDateTime::now_utc(),
+                config.max_dispatch_reconciliations_per_scan,
+            )
+            .await;
         }
     }
 }
@@ -714,6 +735,7 @@ mod tests {
 
     fn sample_activity() -> ActivityState {
         ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,

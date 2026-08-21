@@ -36,21 +36,21 @@ use tokio::sync::Mutex;
 use crate::DeliveryOrder;
 use crate::{
     api::{
-        ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, BudgetAllocationResult,
-        BundleLease, CommitResult, CompletionCallbackSweepEntry, ConflictToken, ConnectionDirector,
-        ControlRepository, CurrentExecutionConflictPolicy, DbClass, DbPermit, DeleteRunRequest,
-        DeleteRunResult, DeploymentCasResult, DeploymentKey, DeploymentName,
-        DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult,
-        LeaseOutcome, LeaseRepository, NexusSweepEntry, ProjectionBatch, ProjectionLog,
-        ProjectionRecord, ProvenancePut, ReconstructibleNexusDelivery, RequestRecord,
-        RunRepository, StoredTaskQueueConfig, StoredTaskQueueConfigKey, StoredWorkerDeployment,
-        TaskQueueConfigCasResult, TaskQueueConfigRepository, TransitionAuditRecord,
-        WftTimeoutSweepEntry, WorkerDeploymentRepository, WorkerDeploymentVersionKey,
-        WorkerTaskProvenance, WorkerTaskProvenanceError, WorkerTaskProvenanceStore,
-        WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
-        deleted_workflow_projection_context, dispatchable_workflow_task,
-        reconstructible_nexus_deliveries, workflow_is_open_and_pinned_to_version,
-        workflow_projection_context_with_previous,
+        ActivityDispatchIdentity, ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry,
+        BudgetAllocationResult, BundleLease, CommitResult, CompletionCallbackSweepEntry,
+        ConflictToken, ConnectionDirector, ControlRepository, CurrentExecutionConflictPolicy,
+        DbClass, DbPermit, DeleteRunRequest, DeleteRunResult, DeploymentCasResult, DeploymentKey,
+        DeploymentName, DispatchableActivityTask, DispatchableWorkflowTask, DueActivityDispatch,
+        DueTimer, GenerationAdvanceResult, LeaseOutcome, LeaseRepository, NexusSweepEntry,
+        ProjectionBatch, ProjectionLog, ProjectionRecord, ProvenancePut,
+        ReconstructibleNexusDelivery, RequestRecord, RunRepository, StoredTaskQueueConfig,
+        StoredTaskQueueConfigKey, StoredWorkerDeployment, TaskQueueConfigCasResult,
+        TaskQueueConfigRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
+        WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkerTaskProvenance,
+        WorkerTaskProvenanceError, WorkerTaskProvenanceStore, WorkflowRuleCreateResult,
+        WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
+        dispatchable_workflow_task, reconstructible_nexus_deliveries,
+        workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
     },
     metrics as storage_metrics,
 };
@@ -223,6 +223,10 @@ impl WorkerTaskProvenanceStore for InMemoryStore {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ActivityDispatchEntry {
     task: DispatchableActivityTask,
+    /// Durable eligibility time: the row exists from commit, but delivery
+    /// queries surface it only once `dispatch_at <= now` — the persisted
+    /// analog of v1.31.0's activity retry timer firing time.
+    dispatch_at: OffsetDateTime,
     schedule_to_close_timeout: Option<time::Duration>,
     schedule_to_start_timeout: Option<time::Duration>,
     start_to_close_timeout: Option<time::Duration>,
@@ -352,7 +356,9 @@ impl InMemoryStore {
 /// snapshots are refused with [`SnapshotError::VersionMismatch`], never
 /// migrated — the format is a dev/embedded-tier convenience, not a
 /// compatibility surface.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+// v2: `ActivityDispatchEntry.dispatch_at` and
+// `ActivityState.last_attempt_complete_time` (durable activity dispatch).
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// Errors from the [`InMemoryStore`] snapshot persist/restore surface.
 #[derive(Debug, thiserror::Error)]
@@ -1018,6 +1024,12 @@ impl RunRepository for InMemoryStore {
                         entry.task.stamp = activity.stamp;
                         entry.task.priority =
                             merge_priority(state.priority.as_ref(), activity.priority.as_ref());
+                        // Options/retry updates re-anchor eligibility from the
+                        // authoritative attempt schedule; a state without one
+                        // (legacy/initial) keeps the row's existing time.
+                        entry.dispatch_at = activity
+                            .current_attempt_scheduled_at
+                            .unwrap_or(entry.dispatch_at);
                         entry.schedule_to_close_timeout = activity.schedule_to_close_timeout;
                         entry.schedule_to_start_timeout = activity.schedule_to_start_timeout;
                         entry.start_to_close_timeout = activity.start_to_close_timeout;
@@ -1057,8 +1069,7 @@ impl RunRepository for InMemoryStore {
                 attempt,
                 dispatch_revision,
                 stamp,
-                // Delivery timing is not durable; the row is written immediately.
-                dispatch_at: _,
+                dispatch_at,
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
                 start_to_close_timeout,
@@ -1084,6 +1095,7 @@ impl RunRepository for InMemoryStore {
                             priority: priority.clone(),
                             order: None,
                         },
+                        dispatch_at: *dispatch_at,
                         schedule_to_close_timeout: *schedule_to_close_timeout,
                         schedule_to_start_timeout: *schedule_to_start_timeout,
                         start_to_close_timeout: *start_to_close_timeout,
@@ -1449,19 +1461,75 @@ impl RunRepository for InMemoryStore {
         Ok(out)
     }
 
-    async fn list_dispatchable_activity_tasks(
+    async fn list_due_dispatchable_activity_tasks(
+        &self,
+        queue: &QueueKey,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<DispatchableActivityTask>> {
+        let store = self.inner.lock().await;
+        // Sorted before truncation: `HashMap` iteration order must not decide
+        // which due rows a bounded query returns (crate determinism rule).
+        let mut due = store
+            .activity_dispatch
+            .values()
+            .filter(|entry| &entry.task.queue == queue && entry.dispatch_at <= now)
+            .cloned()
+            .collect::<Vec<_>>();
+        due.sort_by(|a, b| {
+            (a.dispatch_at, a.task.run_key, &a.task.activity_id).cmp(&(
+                b.dispatch_at,
+                b.task.run_key,
+                &b.task.activity_id,
+            ))
+        });
+        due.truncate(limit);
+        Ok(due.into_iter().map(|entry| entry.task).collect())
+    }
+
+    async fn list_all_dispatchable_activity_tasks(
         &self,
         queue: &QueueKey,
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
         let store = self.inner.lock().await;
-        Ok(store
+        let mut rows = store
             .activity_dispatch
             .values()
             .filter(|entry| &entry.task.queue == queue)
-            .take(limit)
-            .map(|entry| entry.task.clone())
-            .collect())
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| {
+            (a.dispatch_at, a.task.run_key, &a.task.activity_id).cmp(&(
+                b.dispatch_at,
+                b.task.run_key,
+                &b.task.activity_id,
+            ))
+        });
+        rows.truncate(limit);
+        Ok(rows.into_iter().map(|entry| entry.task).collect())
+    }
+
+    async fn delete_activity_dispatch_if_matches(
+        &self,
+        candidate: &ActivityDispatchIdentity,
+    ) -> Result<bool> {
+        let mut store = self.inner.lock().await;
+        let key = (candidate.run_key, candidate.activity_id.clone());
+        // Compare the full observed row version under the store lock so a
+        // concurrently replaced row (new attempt/stamp/eligibility/revision)
+        // is never removed by stale-cleanup.
+        let matches = store.activity_dispatch.get(&key).is_some_and(|entry| {
+            entry.task.schedule_event_id == candidate.schedule_event_id
+                && entry.task.attempt == candidate.attempt
+                && entry.task.stamp == candidate.stamp
+                && entry.task.dispatch_revision == candidate.dispatch_revision
+                && entry.dispatch_at == candidate.dispatch_at
+        });
+        if matches {
+            store.activity_dispatch.remove(&key);
+        }
+        Ok(matches)
     }
 
     async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
@@ -1600,18 +1668,39 @@ impl RunRepository for InMemoryStore {
         Ok(out)
     }
 
-    async fn list_dispatchable_activity_tasks_for_shard(
+    async fn list_due_dispatchable_activity_tasks_for_shard(
         &self,
         shard_id: ShardId,
+        now: OffsetDateTime,
         limit: usize,
-    ) -> Result<Vec<DispatchableActivityTask>> {
+    ) -> Result<Vec<DueActivityDispatch>> {
         let store = self.inner.lock().await;
-        Ok(store
+        let mut due = store
             .activity_dispatch
             .values()
-            .filter(|entry| store.run_shard_map.get(&entry.task.run_key) == Some(&shard_id))
-            .take(limit)
-            .map(|entry| entry.task.clone())
+            .filter(|entry| {
+                store.run_shard_map.get(&entry.task.run_key) == Some(&shard_id)
+                    && entry.dispatch_at <= now
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        // Sorted before truncation (determinism rule); `dispatch_at` first so
+        // a bounded reconciliation pass sees the longest-overdue rows and a
+        // pruned stale head admits later rows next pass.
+        due.sort_by(|a, b| {
+            (a.dispatch_at, a.task.run_key, &a.task.activity_id).cmp(&(
+                b.dispatch_at,
+                b.task.run_key,
+                &b.task.activity_id,
+            ))
+        });
+        due.truncate(limit);
+        Ok(due
+            .into_iter()
+            .map(|entry| DueActivityDispatch {
+                dispatch_at: entry.dispatch_at,
+                task: entry.task,
+            })
             .collect())
     }
 
@@ -1723,6 +1812,7 @@ impl RunRepository for InMemoryStore {
                 schedule_event_id: activity.schedule_event_id,
                 attempt: activity.attempt,
                 original_scheduled_at: activity.scheduled_at,
+                current_attempt_scheduled_at: activity.current_attempt_scheduled_at,
                 started_at: activity.started_at,
                 schedule_to_close_timeout: activity.schedule_to_close_timeout,
                 schedule_to_start_timeout: activity.schedule_to_start_timeout,
@@ -2933,6 +3023,7 @@ mod tests {
 
     fn activity_state(activity_id: &str) -> tokeira_kernel::ActivityState {
         tokeira_kernel::ActivityState {
+            last_attempt_complete_time: None,
             cancel_requested: false,
             activity_reset: false,
             reset_heartbeats: false,
@@ -2962,6 +3053,239 @@ mod tests {
             stamp: 0,
             priority: None,
         }
+    }
+
+    /// Commit one dispatch row for `activity-1` at `dispatch_at`, returning
+    /// the run key and its queue.
+    async fn seed_dispatch_row(
+        store: &InMemoryStore,
+        dispatch_at: OffsetDateTime,
+        attempt: u32,
+        stamp: u64,
+    ) -> (RunKey, QueueKey) {
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        let queue = QueueKey {
+            namespace_id: transition.next_state.namespace_id,
+            task_queue: TaskQueueName("activity-q".into()),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        };
+        let mut activity = activity_state("activity-1");
+        activity.attempt = attempt;
+        activity.stamp = stamp;
+        activity.current_attempt_scheduled_at = Some(dispatch_at);
+        transition
+            .activity_ops
+            .push(ActivityOp::Upsert(activity.clone()));
+        transition
+            .next_state
+            .activities
+            .insert(activity.activity_id.clone(), activity);
+        transition
+            .dispatch_ops
+            .push(DispatchOp::EnqueueActivityTask {
+                queue: queue.clone(),
+                activity_id: "activity-1".to_owned(),
+                input: tokeira_types::Payloads::default(),
+                schedule_event_id: 7,
+                attempt,
+                dispatch_revision: 4,
+                stamp,
+                dispatch_at,
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+                priority: None,
+            });
+        store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+        (run_key, queue)
+    }
+
+    #[tokio::test]
+    async fn activity_dispatch_due_queries_respect_eligibility_time() {
+        let store = InMemoryStore::default();
+        let dispatch_at = fixed_now() + Duration::seconds(60);
+        let (run_key, queue) = seed_dispatch_row(&store, dispatch_at, 2, 5).await;
+
+        // Before eligibility: durable (inspection view) but not deliverable.
+        assert!(
+            store
+                .list_due_dispatchable_activity_tasks(&queue, fixed_now(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), fixed_now(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // At/after eligibility both due views return the row with its
+        // identity fields intact.
+        let due = store
+            .list_due_dispatchable_activity_tasks(&queue, dispatch_at, 10)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].run_key, run_key);
+        assert_eq!(due[0].attempt, 2);
+        assert_eq!(due[0].stamp, 5);
+        assert_eq!(due[0].dispatch_revision, 4);
+        let due_for_shard = store
+            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), dispatch_at, 10)
+            .await
+            .unwrap();
+        assert_eq!(due_for_shard.len(), 1);
+        assert_eq!(due_for_shard[0].dispatch_at, dispatch_at);
+        assert_eq!(due_for_shard[0].task.run_key, run_key);
+    }
+
+    #[tokio::test]
+    async fn activity_upsert_reanchors_dispatch_eligibility() {
+        let store = InMemoryStore::default();
+        let first_due = fixed_now() + Duration::seconds(10);
+        let (run_key, queue) = seed_dispatch_row(&store, first_due, 2, 5).await;
+
+        // An options/retry update re-anchors the row's eligibility from the
+        // authoritative attempt schedule (and keeps stamp/attempt in step).
+        let later_due = fixed_now() + Duration::seconds(120);
+        let mut updated = activity_state("activity-1");
+        updated.attempt = 2;
+        updated.stamp = 6;
+        updated.current_attempt_scheduled_at = Some(later_due);
+        let mut update = start_transition(run_key);
+        update.expected_seq = TransitionSeq(1);
+        update.next_state.transition_seq = TransitionSeq(2);
+        update.next_state.namespace_id = queue.namespace_id;
+        update
+            .next_state
+            .activities
+            .insert(updated.activity_id.clone(), updated.clone());
+        update.activity_ops.push(ActivityOp::Upsert(updated));
+        store
+            .commit_transition(run_key, update, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .list_due_dispatchable_activity_tasks(&queue, first_due, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the old eligibility time no longer surfaces the row"
+        );
+        let due = store
+            .list_due_dispatchable_activity_tasks(&queue, later_due, 10)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].stamp, 6, "the row's stamp follows the update");
+    }
+
+    #[tokio::test]
+    async fn conditional_dispatch_delete_matches_exact_row_version_only() {
+        let store = InMemoryStore::default();
+        let first_due = fixed_now() + Duration::seconds(5);
+        let (run_key, queue) = seed_dispatch_row(&store, first_due, 2, 5).await;
+        let observed = store
+            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), first_due, 10)
+            .await
+            .unwrap()
+            .remove(0)
+            .identity();
+
+        // A concurrent retry replaces the row (new attempt/stamp/eligibility)
+        // through the same enqueue upsert path.
+        let replaced_due = fixed_now() + Duration::seconds(30);
+        let mut replace = start_transition(run_key);
+        replace.expected_seq = TransitionSeq(1);
+        replace.next_state.transition_seq = TransitionSeq(2);
+        replace.next_state.namespace_id = queue.namespace_id;
+        let mut next_attempt = activity_state("activity-1");
+        next_attempt.attempt = 3;
+        next_attempt.stamp = 6;
+        next_attempt.current_attempt_scheduled_at = Some(replaced_due);
+        replace
+            .next_state
+            .activities
+            .insert(next_attempt.activity_id.clone(), next_attempt.clone());
+        replace.activity_ops.push(ActivityOp::Upsert(next_attempt));
+        replace.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+            queue: queue.clone(),
+            activity_id: "activity-1".to_owned(),
+            input: tokeira_types::Payloads::default(),
+            schedule_event_id: 7,
+            attempt: 3,
+            dispatch_revision: 4,
+            stamp: 6,
+            dispatch_at: replaced_due,
+            schedule_to_close_timeout: None,
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+            priority: None,
+        });
+        store
+            .commit_transition(run_key, replace, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        // Stale cleanup with the OLD observed version must not remove the
+        // replacement row.
+        assert!(
+            !store
+                .delete_activity_dispatch_if_matches(&observed)
+                .await
+                .unwrap(),
+            "a superseded observation deletes nothing"
+        );
+        let current = store
+            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), replaced_due, 10)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(current.task.attempt, 3);
+
+        // The exact current version deletes exactly once.
+        let current_identity = current.identity();
+        assert!(
+            store
+                .delete_activity_dispatch_if_matches(&current_identity)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .delete_activity_dispatch_if_matches(&current_identity)
+                .await
+                .unwrap(),
+            "a second conditional delete finds nothing"
+        );
+        assert!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3017,7 +3341,7 @@ mod tests {
             .unwrap();
 
         let tasks = store
-            .list_dispatchable_activity_tasks(&queue, 10)
+            .list_all_dispatchable_activity_tasks(&queue, 10)
             .await
             .unwrap();
         assert!(tasks.is_empty());
@@ -3081,13 +3405,13 @@ mod tests {
         };
         assert!(
             store
-                .list_dispatchable_activity_tasks(&old_queue, 10)
+                .list_all_dispatchable_activity_tasks(&old_queue, 10)
                 .await
                 .unwrap()
                 .is_empty()
         );
         let tasks = store
-            .list_dispatchable_activity_tasks(&new_queue, 10)
+            .list_all_dispatchable_activity_tasks(&new_queue, 10)
             .await
             .unwrap();
         assert_eq!(tasks.len(), 1);
@@ -3151,7 +3475,7 @@ mod tests {
             .unwrap();
 
         let tasks = store
-            .list_dispatchable_activity_tasks(&queue, 10)
+            .list_all_dispatchable_activity_tasks(&queue, 10)
             .await
             .unwrap();
         assert!(tasks.is_empty());
@@ -3213,7 +3537,7 @@ mod tests {
             .unwrap();
 
         let tasks = store
-            .list_dispatchable_activity_tasks(&queue, 10)
+            .list_all_dispatchable_activity_tasks(&queue, 10)
             .await
             .unwrap();
         assert!(tasks.is_empty());
@@ -3274,7 +3598,7 @@ mod tests {
             .unwrap();
 
         let tasks = store
-            .list_dispatchable_activity_tasks(&queue, 10)
+            .list_all_dispatchable_activity_tasks(&queue, 10)
             .await
             .unwrap();
         assert_eq!(tasks.len(), 1);
@@ -3360,7 +3684,7 @@ mod tests {
 
                 let result = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
                 assert!(matches!(result, CommitResult::Applied { .. }));
-                let tasks = store.list_dispatchable_activity_tasks(&queue, 10).await.unwrap();
+                let tasks = store.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
                 assert_eq!(tasks.len(), 1);
                 assert_eq!(tasks[0].run_key, run_key);
                 assert_eq!(tasks[0].activity_id, activity_id);
@@ -3423,7 +3747,7 @@ mod tests {
                     .push(ActivityOp::Delete { activity_id: activity_id.clone() });
                 let _ = store.commit_transition(run_key, delete_transition, ShardEpoch::ZERO).await.unwrap();
 
-                let tasks = store.list_dispatchable_activity_tasks(&queue, 10).await.unwrap();
+                let tasks = store.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
                 assert!(tasks.is_empty());
             });
         }
@@ -3461,7 +3785,7 @@ mod tests {
                 });
                 first.activity_ops.push(ActivityOp::Upsert(activity_state(&activity_id)));
                 let _ = store.commit_transition(run_key, first, ShardEpoch::ZERO).await.unwrap();
-                let before = store.list_dispatchable_activity_tasks(&queue, 10).await.unwrap();
+                let before = store.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
 
                 store.inject_conflict(run_key, 1).await;
                 let mut conflict = Transition {
@@ -3495,7 +3819,7 @@ mod tests {
                 let result = store.commit_transition(run_key, conflict, ShardEpoch::ZERO).await.unwrap();
                 assert!(matches!(result, CommitResult::Conflict { .. }));
 
-                let after = store.list_dispatchable_activity_tasks(&queue, 10).await.unwrap();
+                let after = store.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
                 assert_eq!(before, after);
             });
         }
@@ -3530,7 +3854,7 @@ mod tests {
                     let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
                 }
 
-                let tasks = store.list_dispatchable_activity_tasks(&activity_queue, limit).await.unwrap();
+                let tasks = store.list_all_dispatchable_activity_tasks(&activity_queue, limit).await.unwrap();
                 assert!(tasks.len() <= limit);
                 assert!(tasks.iter().all(|task| task.queue == activity_queue));
             });
@@ -3972,7 +4296,7 @@ mod tests {
         let store = InMemoryStore::default();
         assert!(
             store
-                .list_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10,)
+                .list_all_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10,)
                 .await
                 .unwrap()
                 .is_empty()
@@ -4146,7 +4470,7 @@ mod tests {
             .unwrap();
 
         let tasks_before = store
-            .list_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10)
+            .list_all_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10)
             .await
             .unwrap();
 
@@ -4178,7 +4502,7 @@ mod tests {
         assert!(matches!(result, CommitResult::Duplicate));
 
         let tasks_after = store
-            .list_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10)
+            .list_all_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10)
             .await
             .unwrap();
         assert_eq!(tasks_before, tasks_after);
@@ -4753,6 +5077,7 @@ mod tests {
 
                     let act_id = format!("act-{idx}");
                     let act = tokeira_kernel::ActivityState {
+                        last_attempt_complete_time: None,
                         cancel_requested: false,
                         activity_reset: false,
                         reset_heartbeats: false,
@@ -4882,8 +5207,9 @@ mod tests {
                     }
 
                     let act_tasks = store
-                        .list_dispatchable_activity_tasks_for_shard(
+                        .list_due_dispatchable_activity_tasks_for_shard(
                             sid,
+                            OffsetDateTime::now_utc(),
                             usize::MAX,
                         )
                         .await
@@ -4895,7 +5221,7 @@ mod tests {
                     for task in &act_tasks {
                         assert!(
                             expected_runs
-                                .contains(&task.run_key),
+                                .contains(&task.task.run_key),
                         );
                     }
 

@@ -4,7 +4,7 @@
 //! delivery and timeout state that lives only in memory — republished workflow
 //! and activity tasks, due timers, and the workflow/WFT/activity/Nexus timeout
 //! tracking sets — from the durable transition log, which is the sole authority.
-//! [`sweep_shard`] performs that rebuild; [`run_lease_renewer`] keeps the shard's
+//! `sweep_shard` performs that rebuild; [`run_lease_renewer`] keeps the shard's
 //! durable lease alive for as long as this node owns it.
 //!
 //! Crash-safety and idempotency. The sweep reads durable state and reconstructs
@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use time::OffsetDateTime;
-use tokeira_kernel::{Command, LoadedRun};
+use tokeira_kernel::Command;
 use tokeira_storage::{LeaseOutcome, LeaseRepository, RunRepository};
 use tokeira_types::{ShardEpoch, ShardId};
 use tokio::sync::oneshot;
@@ -42,14 +42,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     activity_timeout::{ActivityTrackingEntry, ActivityTrackingState},
-    broker::{InMemoryActivityBroker, InMemoryBroker},
-    deployment_registry::DeploymentRegistry,
+    broker::InMemoryBroker,
     lane::LaneHandle,
     nexus::{
         CompletionCallbackTrackingEntry, CompletionCallbackTrackingState, NexusTimeoutEntry,
         NexusTimeoutTrackingState,
     },
-    runtime::workflow_task::route_activity_task_queue,
+    runtime::{ActivityRetryDeps, reconcile_activity_dispatch_candidates},
     scanner::pick_lane_for_run_key,
     timeout::{WorkflowTimeoutEntry, WorkflowTimeoutTrackingState},
     wft_timeout::{WftTimeoutEntry, WftTimeoutKind, WftTimeoutTrackingState},
@@ -84,11 +83,10 @@ pub struct SweepResult {
 /// into memory, so it is safe to run on every shard takeover and to re-run after
 /// a crash (see module docs). Must finish before the shard is marked `Active`, so
 /// no command is admitted against a partially-rebuilt view.
-pub async fn sweep_shard<R>(
+pub(crate) async fn sweep_shard<R, S>(
     shard_id: ShardId,
     repo: &R,
     broker: &InMemoryBroker,
-    activity_broker: &InMemoryActivityBroker,
     lanes: &[LaneHandle],
     lane_count: usize,
     workflow_timeout_tracking: &WorkflowTimeoutTrackingState,
@@ -96,49 +94,11 @@ pub async fn sweep_shard<R>(
     activity_tracking: &ActivityTrackingState,
     nexus_timeout_tracking: &NexusTimeoutTrackingState,
     completion_callback_tracking: &CompletionCallbackTrackingState,
+    retry_deps: &ActivityRetryDeps<S>,
 ) -> Result<SweepResult>
 where
     R: RunRepository + ?Sized,
-{
-    sweep_shard_with_registry(
-        shard_id,
-        repo,
-        broker,
-        activity_broker,
-        lanes,
-        lane_count,
-        workflow_timeout_tracking,
-        wft_timeout_tracking,
-        activity_tracking,
-        nexus_timeout_tracking,
-        completion_callback_tracking,
-        None,
-    )
-    .await
-}
-
-/// Reconstruct one shard while re-deriving deployment-aware activity queues.
-///
-/// A fully wired runtime supplies its shared deployment registry so physical
-/// queue coordinates stored before a routing change never regain correctness
-/// weight during recovery. Callers without Worker Deployment routing use the
-/// public [`sweep_shard`] wrapper.
-pub(crate) async fn sweep_shard_with_registry<R>(
-    shard_id: ShardId,
-    repo: &R,
-    broker: &InMemoryBroker,
-    activity_broker: &InMemoryActivityBroker,
-    lanes: &[LaneHandle],
-    lane_count: usize,
-    workflow_timeout_tracking: &WorkflowTimeoutTrackingState,
-    wft_timeout_tracking: &WftTimeoutTrackingState,
-    activity_tracking: &ActivityTrackingState,
-    nexus_timeout_tracking: &NexusTimeoutTrackingState,
-    completion_callback_tracking: &CompletionCallbackTrackingState,
-    deployment_registry: Option<&DeploymentRegistry>,
-) -> Result<SweepResult>
-where
-    R: RunRepository + ?Sized,
+    S: RunRepository + 'static,
 {
     let mut result = SweepResult::default();
     let now = OffsetDateTime::now_utc();
@@ -154,26 +114,19 @@ where
         result.workflow_tasks_republished += 1;
     }
 
-    for mut task in repo
-        .list_dispatchable_activity_tasks_for_shard(shard_id, usize::MAX)
-        .await?
-    {
-        if deployment_registry.is_some()
-            && let LoadedRun::Existing(state) = repo.load_run(task.run_key).await?
-        {
-            let (queue, dispatch_revision) = route_activity_task_queue(
-                deployment_registry,
-                &state,
-                task.queue,
-                task.dispatch_revision,
-            )
-            .await?;
-            task.queue = queue;
-            task.dispatch_revision = dispatch_revision;
-        }
-        activity_broker.publish_activity_task(task, None).await?;
-        result.activity_tasks_republished += 1;
-    }
+    // Only rows due at the sweep's `now` republish — a retry inside its
+    // backoff window stays durable and is picked up by the scanner's
+    // continuous reconciliation once due (v1.31.0 dispatches retries when
+    // their durable retry timer fires, never early). Each due row passes the
+    // same authoritative preparation/rule/routing gate as every other
+    // publication path (via `retry_deps`: the runtime's activity broker,
+    // deployment registry, and tracking), and permanently stale rows are
+    // conditionally pruned while transient failures stay retriable.
+    let due_activity_dispatches = repo
+        .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, usize::MAX)
+        .await?;
+    result.activity_tasks_republished +=
+        reconcile_activity_dispatch_candidates(retry_deps, due_activity_dispatches, now).await;
 
     for due in repo
         .list_due_timers_for_shard(shard_id, now, usize::MAX)
@@ -229,16 +182,21 @@ where
         .await?
     {
         // Heartbeat history is volatile and not durable: on rebuild the heartbeat
-        // clock restarts (`last_heartbeat_at: None`) and schedule-to-start is
-        // re-anchored at the original schedule time. Restarting the heartbeat
+        // clock restarts (`last_heartbeat_at: None`). Restarting the heartbeat
         // clock from takeover avoids spuriously timing out an activity whose last
-        // heartbeat predated the failover.
+        // heartbeat predated the failover. Schedule-to-start re-anchors at the
+        // CURRENT attempt's durable dispatch time — a retry's s2s clock runs
+        // from its own dispatch, not from the original schedule, which stays
+        // the schedule-to-close anchor spanning the whole retry chain
+        // (retry.go:108-110 @ v1.31.0).
         activity_tracking.insert(ActivityTrackingEntry {
             run_key: entry.run_key,
             shard_id,
             activity_id: entry.activity_id,
             original_scheduled_at: entry.original_scheduled_at,
-            last_dispatched_at: entry.original_scheduled_at,
+            last_dispatched_at: entry
+                .current_attempt_scheduled_at
+                .unwrap_or(entry.original_scheduled_at),
             started_at: entry.started_at,
             last_heartbeat_at: None,
             cancel_requested: false,
@@ -362,7 +320,7 @@ mod tests {
     use std::sync::RwLock;
     use time::Duration;
     use tokeira_kernel::{
-        ActivityOp, ActivityState, BasicKernel, DispatchOp, PendingNexusOperation,
+        ActivityOp, ActivityState, BasicKernel, DispatchOp, LoadedRun, PendingNexusOperation,
         PendingWorkflowTask, Priority, TimerOp, TimerState, Transition, WorkflowState,
     };
     use tokeira_storage::{CommitResult, InMemoryStore};
@@ -371,6 +329,25 @@ mod tests {
         SearchAttributes, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
         WorkerIdentity, WorkflowId, WorkflowType,
     };
+
+    /// Retry/reconciliation deps over the SAME store the sweep reads, with
+    /// the activity broker the test polls. No placement controller, no
+    /// deployment registry — mirroring the sweep tests' epoch-zero setup.
+    fn sweep_retry_deps(
+        store: &InMemoryStore,
+        activity_broker: &InMemoryActivityBroker,
+    ) -> ActivityRetryDeps<InMemoryStore> {
+        ActivityRetryDeps {
+            repo: Arc::new(store.clone()),
+            shard_owner: Arc::new(RwLock::new(ShardOwner::new(4))),
+            controller_managed_placement: false,
+            max_occ_retries: 3,
+            broker: activity_broker.clone(),
+            delivery_metrics: crate::DeliveryMetrics::new(),
+            tracking: ActivityTrackingState::default(),
+            worker_deployment_registry: Arc::new(RwLock::new(None)),
+        }
+    }
 
     #[derive(Clone)]
     struct NoopPublisher;
@@ -552,7 +529,6 @@ mod tests {
             shard_id,
             &store,
             &broker,
-            &activity_broker,
             &lanes,
             lane_count,
             &wts,
@@ -560,6 +536,7 @@ mod tests {
             &ats,
             &nts,
             &CompletionCallbackTrackingState::default(),
+            &sweep_retry_deps(&store, &activity_broker),
         )
         .await
         .unwrap();
@@ -639,7 +616,6 @@ mod tests {
                     shard_id,
                     &store,
                     &broker,
-                    &activity_broker,
                     &lanes,
                     lane_count,
                     &wts,
@@ -647,6 +623,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
+                    &sweep_retry_deps(&store, &activity_broker),
                 )
                 .await
                 .unwrap();
@@ -725,6 +702,46 @@ mod tests {
                         deployment: None,
                         build_id: None,
                     };
+                    // The dispatch row's authoritative twin: the preparation
+                    // gate republishes only rows whose run state still holds a
+                    // matching unstarted, unpaused attempt.
+                    let act = ActivityState {
+                        last_attempt_complete_time: None,
+                        cancel_requested: false,
+                        activity_reset: false,
+                        reset_heartbeats: false,
+                        started_identity: None,
+                        retry_last_worker_identity: None,
+                        activity_id: act_id.clone(),
+                        activity_type: "activity-type".into(),
+                        schedule_event_id: idx as i64,
+                        task_queue: TaskQueueName("q".into()),
+                        deployment: None,
+                        build_id: None,
+                        input: Payloads::default(),
+                        header: None,
+                        last_failure: None,
+                        heartbeat_details: None,
+                        attempt: 1,
+                        retry_policy: None,
+                        schedule_to_close_timeout: None,
+                        schedule_to_start_timeout: None,
+                        start_to_close_timeout: None,
+                        heartbeat_timeout: None,
+                        scheduled_at: fixed_now(),
+                        current_attempt_scheduled_at:
+                            Some(OffsetDateTime::UNIX_EPOCH),
+                        started_at: None,
+                        started_event_id: None,
+                        pause_info: None,
+                        stamp: 0,
+                        priority: None,
+                    };
+                    t.activity_ops
+                        .push(ActivityOp::Upsert(act.clone()));
+                    t.next_state
+                        .activities
+                        .insert(act_id.clone(), act);
                     t.dispatch_ops.push(
                         DispatchOp::EnqueueActivityTask {
                             queue,
@@ -776,7 +793,6 @@ mod tests {
                     shard_id,
                     &store,
                     &broker,
-                    &activity_broker,
                     &lanes,
                     lane_count,
                     &wts,
@@ -784,6 +800,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
+                    &sweep_retry_deps(&store, &activity_broker),
                 )
                 .await
                 .unwrap();
@@ -860,6 +877,48 @@ mod tests {
                     .as_mut()
                     .expect("fixture pending workflow task")
                     .logical_seq = LogicalTaskSeq(logical_seq);
+                // The dispatch row's authoritative twin: a retry attempt with
+                // its durable timing pair, as the preparation gate requires
+                // (attempt >= 2 without both timestamps is an invariant
+                // failure that blocks publication).
+                let act = ActivityState {
+                    last_attempt_complete_time: Some(
+                        OffsetDateTime::UNIX_EPOCH - Duration::seconds(1),
+                    ),
+                    cancel_requested: false,
+                    activity_reset: false,
+                    reset_heartbeats: false,
+                    started_identity: None,
+                    retry_last_worker_identity: None,
+                    activity_id: "activity".into(),
+                    activity_type: "activity-type".into(),
+                    schedule_event_id: 7,
+                    task_queue: TaskQueueName("q".into()),
+                    deployment: None,
+                    build_id: None,
+                    input: Payloads::default(),
+                    header: None,
+                    last_failure: None,
+                    heartbeat_details: None,
+                    attempt: 2,
+                    retry_policy: None,
+                    schedule_to_close_timeout: None,
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                    scheduled_at: OffsetDateTime::UNIX_EPOCH - Duration::seconds(2),
+                    current_attempt_scheduled_at: Some(OffsetDateTime::UNIX_EPOCH),
+                    started_at: None,
+                    started_event_id: None,
+                    pause_info: None,
+                    stamp: activity_stamp,
+                    priority: activity_priority.clone(),
+                };
+                transition.activity_ops.push(ActivityOp::Upsert(act.clone()));
+                transition
+                    .next_state
+                    .activities
+                    .insert("activity".into(), act);
                 transition.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
                     queue: QueueKey {
                         namespace_id,
@@ -894,7 +953,6 @@ mod tests {
                         shard_id,
                         &store,
                         &workflow_broker,
-                        &activity_broker,
                         &lanes,
                         lane_count,
                         &WorkflowTimeoutTrackingState::default(),
@@ -902,6 +960,7 @@ mod tests {
                         &ActivityTrackingState::default(),
                         &NexusTimeoutTrackingState::default(),
                         &CompletionCallbackTrackingState::default(),
+                        &sweep_retry_deps(&store, &activity_broker),
                     )
                     .await
                     .unwrap();
@@ -1029,7 +1088,6 @@ mod tests {
                     shard_id,
                     &store,
                     &broker,
-                    &activity_broker,
                     &lanes,
                     lane_count,
                     &wts,
@@ -1037,6 +1095,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
+                    &sweep_retry_deps(&store, &activity_broker),
                 )
                 .await
                 .unwrap();
@@ -1118,7 +1177,6 @@ mod tests {
                     shard_id,
                     &store,
                     &broker,
-                    &activity_broker,
                     &lanes,
                     lane_count,
                     &wts,
@@ -1126,6 +1184,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
+                    &sweep_retry_deps(&store, &activity_broker),
                 )
                 .await
                 .unwrap();
@@ -1197,6 +1256,7 @@ mod tests {
 
                 let mut t = start_transition(run_key);
                 let act = ActivityState {
+                    last_attempt_complete_time: None,
                     cancel_requested: false,
                     activity_reset: false,
                     reset_heartbeats: false,
@@ -1274,7 +1334,6 @@ mod tests {
                     shard_id,
                     &store,
                     &broker,
-                    &activity_broker,
                     &lanes,
                     lane_count,
                     &wts,
@@ -1282,6 +1341,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
+                    &sweep_retry_deps(&store, &activity_broker),
                 )
                 .await
                 .unwrap();
@@ -1291,6 +1351,12 @@ mod tests {
                 let entry = &entries[0];
                 prop_assert_eq!(
                     entry.original_scheduled_at,
+                    act.scheduled_at,
+                );
+                // No current-attempt anchor on this fixture: schedule-to-start
+                // falls back to the original schedule.
+                prop_assert_eq!(
+                    entry.last_dispatched_at,
                     act.scheduled_at,
                 );
                 prop_assert_eq!(
@@ -1312,6 +1378,83 @@ mod tests {
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
+    }
+
+    #[tokio::test]
+    async fn recovered_retry_tracking_anchors_schedule_to_start_at_current_attempt() {
+        // A retry attempt's schedule-to-start clock runs from its own durable
+        // dispatch time, not the original schedule (retry.go:108-110 @
+        // v1.31.0 keeps the original as the schedule-to-close anchor only).
+        let store = InMemoryStore::with_shard_count(1);
+        let shard_id = ShardId(0);
+        let run_key = RunKey::new();
+        let mut t = start_transition(run_key);
+        let original = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let retry_dispatch = original + Duration::seconds(45);
+        let act = ActivityState {
+            last_attempt_complete_time: Some(retry_dispatch - Duration::seconds(5)),
+            cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
+            started_identity: None,
+            retry_last_worker_identity: None,
+            activity_id: "act-retry".into(),
+            activity_type: "activity-type".into(),
+            schedule_event_id: 7,
+            task_queue: TaskQueueName("q".into()),
+            deployment: None,
+            build_id: None,
+            input: Payloads::default(),
+            header: None,
+            last_failure: None,
+            heartbeat_details: None,
+            attempt: 2,
+            retry_policy: None,
+            schedule_to_close_timeout: Some(Duration::minutes(10)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+            scheduled_at: original,
+            current_attempt_scheduled_at: Some(retry_dispatch),
+            started_at: None,
+            started_event_id: None,
+            pause_info: None,
+            stamp: 1,
+            priority: None,
+        };
+        t.activity_ops.push(ActivityOp::Upsert(act.clone()));
+        t.next_state
+            .activities
+            .insert(act.activity_id.clone(), act.clone());
+        store
+            .commit_transition(run_key, t, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let (lanes, lane_count) = make_lanes(&store);
+        let ats = ActivityTrackingState::default();
+        let _ = sweep_shard(
+            shard_id,
+            &store,
+            &broker,
+            &lanes,
+            lane_count,
+            &WorkflowTimeoutTrackingState::default(),
+            &WftTimeoutTrackingState::default(),
+            &ats,
+            &NexusTimeoutTrackingState::default(),
+            &CompletionCallbackTrackingState::default(),
+            &sweep_retry_deps(&store, &activity_broker),
+        )
+        .await
+        .unwrap();
+
+        let entries = ats.snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].original_scheduled_at, original);
+        assert_eq!(entries[0].last_dispatched_at, retry_dispatch);
     }
 
     // ── Property 10: Workflow timeout tracking
@@ -1374,7 +1517,6 @@ mod tests {
                     shard_id,
                     &store,
                     &broker,
-                    &activity_broker,
                     &lanes,
                     lane_count,
                     &wts,
@@ -1382,6 +1524,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
+                    &sweep_retry_deps(&store, &activity_broker),
                 )
                 .await
                 .unwrap();
@@ -1494,7 +1637,6 @@ mod tests {
                     shard_id,
                     &store,
                     &broker,
-                    &activity_broker,
                     &lanes,
                     lane_count,
                     &wts,
@@ -1502,6 +1644,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
+                    &sweep_retry_deps(&store, &activity_broker),
                 )
                 .await
                 .unwrap();

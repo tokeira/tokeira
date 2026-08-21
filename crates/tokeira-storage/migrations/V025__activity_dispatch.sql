@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS activity_dispatch (
     priority_data BYTEA,
     dispatch_revision BIGINT NOT NULL DEFAULT 0,
     stamp BIGINT NOT NULL DEFAULT 0,
+    dispatch_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (key)
 );

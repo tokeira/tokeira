@@ -789,3 +789,462 @@ fn payloads(value: &str) -> Payloads {
         external_payloads: Vec::new(),
     }])
 }
+
+/// Runtime with an aggressive activity scanner so durable-dispatch
+/// reconciliation is observable within test time, and a reconciliation
+/// budget the starvation test can pin to one row per pass.
+fn reconciling_runtime(
+    store: Arc<InMemoryStore>,
+    max_dispatch_reconciliations_per_scan: usize,
+) -> TokeiraRuntime<InMemoryStore> {
+    TokeiraRuntime::new_with_nexus(
+        store,
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+        tokeira_runtime::ActivityTimeoutScannerConfig {
+            scan_interval: tokio::time::Duration::from_millis(50),
+            max_timeouts_per_scan: 100,
+            max_dispatch_reconciliations_per_scan,
+        },
+        tokeira_runtime::NexusTimeoutScannerConfig::default(),
+        tokeira_runtime::NexusEndpointRegistry::default(),
+        Arc::new(tokeira_runtime::NoopNexusHttpClient),
+        tokeira_runtime::NexusCompletionDeps::default(),
+    )
+}
+
+/// Poll until an activity task arrives; scanner-observable synchronization
+/// with a bounded ceiling that protects the suite, not the ordering.
+async fn poll_activity_until_delivered(
+    runtime: &TokeiraRuntime<InMemoryStore>,
+    queue: &QueueKey,
+    ceiling: tokio::time::Duration,
+) -> Result<Option<tokeira_runtime::StartedActivityTask>> {
+    let deadline = tokio::time::Instant::now() + ceiling;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(started) = runtime
+            .poll_activity_task(
+                queue.clone(),
+                WorkerIdentity("worker-b".to_string()),
+                tokio::time::Duration::from_millis(50),
+            )
+            .await?
+        {
+            return Ok(Some(started));
+        }
+    }
+    Ok(None)
+}
+
+fn activity_pause_rule(id: &str, predicate: &str) -> tokeira_types::WorkflowRuleRecord {
+    tokeira_types::WorkflowRuleRecord {
+        id: id.to_string(),
+        create_time: OffsetDateTime::UNIX_EPOCH,
+        created_by_identity: "rule-owner".to_string(),
+        description: "policy pause".to_string(),
+        trigger: tokeira_types::WorkflowRuleTrigger::ActivityStart {
+            predicate: predicate.to_string(),
+        },
+        visibility_query: String::new(),
+        actions: vec![tokeira_types::WorkflowRuleAction::ActivityPause],
+        expiration_time: None,
+    }
+}
+
+/// Feature: durable-activity-dispatch — the focused loss regression. An offer
+/// removed from the broker whose caller vanishes before `Started` commits must
+/// be rediscovered from the durable dispatch row by the live scanner, without
+/// shard takeover or a manual republish. Fails on the pre-fix engine: nothing
+/// republishes and the poll ceiling below expires empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_offer_is_rediscovered_by_durable_dispatch_reconciliation() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = reconciling_runtime(store.clone(), 100);
+    let namespace_id = NamespaceId::new();
+    let run_key = start_and_schedule_activity(
+        &runtime,
+        namespace_id,
+        WorkflowId("dropped-offer".to_string()),
+        "activity-1",
+        None,
+    )
+    .await?;
+
+    let offer = runtime
+        .poll_activity_task_offer(
+            activity_queue(namespace_id),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("scheduled activity must be offerable");
+    let offered_attempt = offer.task.attempt;
+    // The caller disappears between broker take and durable start.
+    drop(offer);
+
+    let started = poll_activity_until_delivered(
+        &runtime,
+        &activity_queue(namespace_id),
+        tokio::time::Duration::from_secs(10),
+    )
+    .await?
+    .expect("durable dispatch row must be republished by the live scanner");
+    // Same attempt, and the Started commit's stamp fence accepted it — the
+    // republished offer carried the identical `(attempt, stamp)` identity.
+    assert_eq!(started.run_key, run_key);
+    assert_eq!(started.attempt, offered_attempt);
+
+    runtime
+        .complete_activity_task(
+            started.token,
+            payloads("done"),
+            None,
+            RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+        )
+        .await?;
+
+    // Workflow progress: completion schedules the next workflow task.
+    let next_wft = runtime
+        .poll_workflow_task(
+            workflow_queue(namespace_id),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_secs(5),
+        )
+        .await?;
+    assert!(
+        next_wft.is_some(),
+        "completion must schedule a workflow task"
+    );
+
+    // Exactly one Started transition materialized.
+    let history = store.read_history(run_key, 0, 128).await?;
+    let started_events = history
+        .iter()
+        .filter(|event| matches!(event.kind, HistoryEventKind::ActivityTaskStarted { .. }))
+        .count();
+    assert_eq!(started_events, 1, "recovered offer must start exactly once");
+
+    // No later usable duplicate: the scanner keeps ticking and must not
+    // republish the completed attempt.
+    let duplicate = poll_activity_until_delivered(
+        &runtime,
+        &activity_queue(namespace_id),
+        tokio::time::Duration::from_millis(500),
+    )
+    .await?;
+    assert!(duplicate.is_none(), "no duplicate offer may remain usable");
+    Ok(())
+}
+
+/// A retry inside its backoff window is durably present but not deliverable:
+/// neither the reconciler nor a shard-recovery sweep publishes it early, and
+/// once due it arrives through the live scanner with no takeover involved.
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_backoff_is_respected_by_reconciliation_and_recovery() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = reconciling_runtime(store.clone(), 100);
+    let namespace_id = NamespaceId::new();
+    let policy = RetryPolicy {
+        initial_interval: Duration::seconds(2),
+        backoff_coefficient: 2.0,
+        maximum_interval: Some(Duration::seconds(10)),
+        maximum_attempts: 3,
+        non_retryable_error_types: vec![],
+    };
+    let run_key = start_and_schedule_activity(
+        &runtime,
+        namespace_id,
+        WorkflowId("backoff-respected".to_string()),
+        "activity-1",
+        Some(policy),
+    )
+    .await?;
+
+    let first = runtime
+        .poll_activity_task(
+            activity_queue(namespace_id),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("first attempt should be pollable");
+    runtime
+        .fail_activity_task(
+            first.token,
+            Payload::new(b"boom".to_vec()),
+            Some("retryable".to_string()),
+            false,
+            None,
+            RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+        )
+        .await?;
+
+    // The durable row exists immediately (inspection view) but delivery
+    // withholds it: several scanner ticks pass within this window and none
+    // may surface the future retry.
+    assert_eq!(
+        store
+            .list_all_dispatchable_activity_tasks(&activity_queue(namespace_id), 10)
+            .await?
+            .len(),
+        1
+    );
+    let early = poll_activity_until_delivered(
+        &runtime,
+        &activity_queue(namespace_id),
+        tokio::time::Duration::from_millis(600),
+    )
+    .await?;
+    assert!(
+        early.is_none(),
+        "a retry must not be delivered inside its backoff"
+    );
+
+    // A shard-recovery sweep during the window must not publish it either.
+    let recovered = TokeiraRuntime::new_with_nexus_and_shards(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+        tokeira_runtime::ActivityTimeoutScannerConfig {
+            scan_interval: tokio::time::Duration::from_millis(50),
+            max_timeouts_per_scan: 100,
+            max_dispatch_reconciliations_per_scan: 100,
+        },
+        tokeira_runtime::NexusTimeoutScannerConfig::default(),
+        tokeira_runtime::NexusEndpointRegistry::default(),
+        Arc::new(tokeira_runtime::NoopNexusHttpClient),
+        tokeira_runtime::NexusCompletionDeps::default(),
+        1,
+        "backoff-restart-owner".to_string(),
+        false,
+    );
+    recovered.acquire_shard(tokeira_types::ShardId(0)).await?;
+    let immediately_after_recovery = recovered
+        .poll_activity_task(
+            activity_queue(namespace_id),
+            WorkerIdentity("worker-b".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?;
+    assert!(
+        immediately_after_recovery.is_none(),
+        "recovery must not publish a retry before its backoff elapses"
+    );
+
+    // Once due, the recovered node's LIVE scanner delivers it — no second
+    // takeover, no manual republish.
+    let second = poll_activity_until_delivered(
+        &recovered,
+        &activity_queue(namespace_id),
+        tokio::time::Duration::from_secs(10),
+    )
+    .await?
+    .expect("due retry must be delivered by the live scanner");
+    assert_eq!(second.run_key, run_key);
+    assert_eq!(second.attempt, 2);
+    Ok(())
+}
+
+/// Repeated reconciliation while an offer is parked in the broker is
+/// suppressed by delivery dedupe: after several scanner passes there is
+/// exactly one usable offer, and starting it exactly one Started transition.
+#[tokio::test(flavor = "multi_thread")]
+async fn parked_offer_is_not_duplicated_by_reconciliation() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = reconciling_runtime(store.clone(), 100);
+    let namespace_id = NamespaceId::new();
+    let run_key = start_and_schedule_activity(
+        &runtime,
+        namespace_id,
+        WorkflowId("parked-dedupe".to_string()),
+        "activity-1",
+        None,
+    )
+    .await?;
+
+    // Let several reconciliation passes run against the parked offer before
+    // any poller shows up (scanner ticks every 50ms).
+    tokio::time::timeout(
+        tokio::time::Duration::from_millis(400),
+        std::future::pending::<()>(),
+    )
+    .await
+    .ok();
+
+    let started = poll_activity_until_delivered(
+        &runtime,
+        &activity_queue(namespace_id),
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?
+    .expect("parked offer must be deliverable");
+    assert_eq!(started.run_key, run_key);
+    let duplicate = poll_activity_until_delivered(
+        &runtime,
+        &activity_queue(namespace_id),
+        tokio::time::Duration::from_millis(500),
+    )
+    .await?;
+    assert!(
+        duplicate.is_none(),
+        "reconciliation of a parked offer must dedupe, not duplicate"
+    );
+    let history = store.read_history(run_key, 0, 128).await?;
+    let started_events = history
+        .iter()
+        .filter(|event| matches!(event.kind, HistoryEventKind::ActivityTaskStarted { .. }))
+        .count();
+    assert_eq!(started_events, 1);
+    Ok(())
+}
+
+/// A `BackoffInterval` workflow rule installed AFTER the retry publication but
+/// BEFORE start is still enforced at the start gate, evaluated from the
+/// durable `dispatch_at - last_attempt_complete_time` interval.
+#[tokio::test(flavor = "multi_thread")]
+async fn backoff_interval_rule_between_publication_and_start_pauses_durably() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = reconciling_runtime(store.clone(), 100);
+    let namespace_id = NamespaceId::new();
+    let policy = RetryPolicy {
+        initial_interval: Duration::seconds(1),
+        backoff_coefficient: 2.0,
+        maximum_interval: Some(Duration::seconds(10)),
+        maximum_attempts: 5,
+        non_retryable_error_types: vec![],
+    };
+    let run_key = start_and_schedule_activity(
+        &runtime,
+        namespace_id,
+        WorkflowId("rule-before-start".to_string()),
+        "activity-1",
+        Some(policy),
+    )
+    .await?;
+    let first = runtime
+        .poll_activity_task(
+            activity_queue(namespace_id),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("first attempt");
+    runtime
+        .fail_activity_task(
+            first.token,
+            Payload::new(b"boom".to_vec()),
+            Some("retryable".to_string()),
+            false,
+            None,
+            RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+        )
+        .await?;
+
+    // Take the published attempt-2 offer WITHOUT starting it, then install
+    // the rule — the exact window between publication and Started.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let offer = loop {
+        if let Some(offer) = runtime
+            .poll_activity_task_offer(
+                activity_queue(namespace_id),
+                WorkerIdentity("worker-a".to_string()),
+                tokio::time::Duration::from_millis(50),
+            )
+            .await?
+        {
+            break offer;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "attempt 2 offer must publish after its backoff"
+        );
+    };
+    assert_eq!(offer.task.attempt, 2);
+    store
+        .create_workflow_rule(
+            namespace_id,
+            activity_pause_rule("backoff-gate", "BackoffInterval >= 1"),
+            10,
+        )
+        .await?;
+
+    let started = runtime
+        .start_activity_task_offer(offer, WorkerIdentity("worker-a".to_string()))
+        .await?;
+    assert!(
+        started.is_none(),
+        "the start gate must enforce the rule installed after publication"
+    );
+    let LoadedRun::Existing(state) = store.load_run(run_key).await? else {
+        panic!("run must exist");
+    };
+    let activity = &state.activities["activity-1"];
+    assert_eq!(
+        activity
+            .pause_info
+            .as_ref()
+            .and_then(|pause| pause.rule_id.as_deref()),
+        Some("backoff-gate")
+    );
+    // The stamp advanced, fencing the taken offer's identity.
+    assert!(activity.stamp > 0);
+    assert!(
+        store
+            .list_all_dispatchable_activity_tasks(&activity_queue(namespace_id), 10)
+            .await?
+            .is_empty(),
+        "a durably paused activity leaves no dispatch row"
+    );
+    let after = poll_activity_until_delivered(
+        &runtime,
+        &activity_queue(namespace_id),
+        tokio::time::Duration::from_millis(500),
+    )
+    .await?;
+    assert!(
+        after.is_none(),
+        "no usable offer may remain after the pause"
+    );
+    Ok(())
+}
+
+/// Pinned v1.31.0 first-attempt semantics: every `BackoffInterval` predicate —
+/// including equality with zero — is a clean non-match on attempt one, so the
+/// first attempt starts normally under such a rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn backoff_interval_rule_is_clean_non_match_for_first_attempt() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = reconciling_runtime(store.clone(), 100);
+    let namespace_id = NamespaceId::new();
+    store
+        .create_workflow_rule(
+            namespace_id,
+            activity_pause_rule("zero-backoff", "BackoffInterval = 0"),
+            10,
+        )
+        .await?;
+    let run_key = start_and_schedule_activity(
+        &runtime,
+        namespace_id,
+        WorkflowId("first-attempt-non-match".to_string()),
+        "activity-1",
+        None,
+    )
+    .await?;
+    let started = poll_activity_until_delivered(
+        &runtime,
+        &activity_queue(namespace_id),
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?
+    .expect("attempt one must start: BackoffInterval is absent, not zero");
+    assert_eq!(started.run_key, run_key);
+    assert_eq!(started.attempt, 1);
+    Ok(())
+}

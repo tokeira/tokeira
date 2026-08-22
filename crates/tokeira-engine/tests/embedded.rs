@@ -312,7 +312,7 @@ async fn corrupt_snapshot_refuses_boot_instead_of_starting_empty() -> Result<()>
         .expect_err("corrupt snapshot must fail startup");
     let message = format!("{error:#}");
     assert!(
-        message.contains("failed to restore embedded-engine snapshot"),
+        message.contains("failed to restore engine snapshot"),
         "unexpected startup error: {message}"
     );
     Ok(())
@@ -334,4 +334,78 @@ async fn unknown_rpc_preserves_unimplemented_status() -> Result<()> {
 
     assert_eq!(status.code(), tonic::Code::Unimplemented);
     engine.shutdown().await
+}
+
+/// The listener-backed in-memory server applies the SAME snapshot policy as
+/// the embedded facade: graceful shutdown persists the final cut and the next
+/// listener boot restores from it, including republishing the recoverable
+/// workflow task.
+#[tokio::test]
+async fn served_in_memory_snapshot_round_trips_across_listener_restarts() -> Result<()> {
+    use tokeira_proto::workflowservice::workflow_service_client::WorkflowServiceClient;
+
+    let snapshot = TestSnapshotPath::new("served-snapshot")?;
+    let config = snapshot_config(&snapshot.file, 3_600_000);
+
+    let first = tokeira_engine::TokeiradHandle::start_in_memory_with_config(
+        "127.0.0.1:0".parse()?,
+        config.clone(),
+    )
+    .await?;
+    let mut client =
+        WorkflowServiceClient::connect(format!("http://{}", first.bound_addr())).await?;
+    let _ = client
+        .start_workflow_execution(StartWorkflowExecutionRequest {
+            namespace: "default".to_owned(),
+            workflow_id: "served-snapshot-workflow".to_owned(),
+            workflow_type: Some(WorkflowType {
+                name: "snapshot-workflow".to_owned(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: "served-snapshot-queue".to_owned(),
+                ..Default::default()
+            }),
+            request_id: "start-served-snapshot".to_owned(),
+            ..Default::default()
+        })
+        .await?;
+    first.shutdown().await?;
+    assert!(
+        snapshot.file.is_file(),
+        "listener shutdown must persist the final snapshot"
+    );
+
+    let second =
+        tokeira_engine::TokeiradHandle::start_in_memory_with_config("127.0.0.1:0".parse()?, config)
+            .await?;
+    let mut client =
+        WorkflowServiceClient::connect(format!("http://{}", second.bound_addr())).await?;
+    let described = client
+        .describe_workflow_execution(DescribeWorkflowExecutionRequest {
+            namespace: "default".to_owned(),
+            execution: Some(WorkflowExecution {
+                workflow_id: "served-snapshot-workflow".to_owned(),
+                run_id: String::new(),
+            }),
+        })
+        .await?
+        .into_inner();
+    assert!(described.workflow_execution_info.is_some());
+    let task = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.poll_workflow_task_queue(PollWorkflowTaskQueueRequest {
+            namespace: "default".to_owned(),
+            task_queue: Some(TaskQueue {
+                name: "served-snapshot-queue".to_owned(),
+                ..Default::default()
+            }),
+            identity: "served-snapshot-worker".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .context("recovery must republish the workflow task on the listener boot")??
+    .into_inner();
+    assert!(!task.task_token.is_empty());
+    second.shutdown().await
 }

@@ -5,9 +5,11 @@
 This feature adds snapshot persist/restore to the in-memory storage backend
 (`InMemoryStore`, `crates/tokeira-storage/src/memory.rs`): a way to capture the store's
 full durable-equivalent state as one opaque byte string, and to construct a new store
-from such a byte string at boot. It is the mechanism half of embedded-tier persistence —
+from such a byte string at boot. It is the mechanism half of in-memory persistence —
 the consumer that decides *when* to snapshot (interval policy, snapshot-on-shutdown)
-is the embedded-engine slice (T2) and is explicitly out of scope here.
+is `tokeira-engine`, which applies one snapshot policy to both of its serving modes
+(the embedded facade and the listener-backed in-memory daemon), and is explicitly out
+of scope here.
 
 This is a Tokeira-internal mechanism with no Temporal wire surface, so the behaviour
 authority is not the targeted Temporal release; it is the store's own repository
@@ -64,8 +66,9 @@ Supported after this feature:
 Explicitly out of scope:
 
 - **Scheduling policy.** No interval snapshots, no snapshot-on-shutdown, no file I/O.
-  This slice delivers bytes-out/construct-from-bytes-in only; policy belongs to the
-  embedded-engine slice (T2).
+  This spec covers bytes-out/construct-from-bytes-in only; policy belongs to
+  `tokeira-engine`, for both the embedded facade and the listener-backed in-memory
+  daemon.
 - **Format stability.** The snapshot format is NOT a compatibility surface. It is the
   dev/embedded tier; the version stamp exists to *refuse* old snapshots, not to
   migrate them. No cross-version decode is ever attempted.
@@ -244,7 +247,7 @@ lockfile untouched.
 
 - Design constraints fixed with Ian before this spec: single-lock consistent cut;
   boot-only constructor restore; version-stamp-and-refuse; test-only state reset;
-  postcard from the workspace; mechanism-only (policy is T2); past-due timers firing
+  postcard from the workspace; mechanism-only (policy is `tokeira-engine`'s); past-due timers firing
   on restore is correct and documented.
 - Serde derive coverage of every type reachable from `StoreState` was verified
   against the source (2026-08-20): eleven types lack `Serialize`/`Deserialize` (seven

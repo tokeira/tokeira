@@ -20,8 +20,10 @@ crate's existing postcard persistence precedent (`dsql/codec.rs:48-62`,
 
 ### Owning relationships
 
-- **Slice T2 (embedded engine)** consumes this mechanism and owns all scheduling
-  policy: when to snapshot, where bytes go, shutdown hooks.
+- **`tokeira-engine`** consumes this mechanism and owns all scheduling policy —
+  when to snapshot, where bytes go, shutdown hooks — identically for both of its
+  serving modes: the embedded facade (`Engine`) and the listener-backed in-memory
+  daemon (`tokeirad` / `TokeiradHandle`).
 - **`tokeira-runtime` recovery** (`sweep_shard`, `recovery.rs:87`) is unchanged; it is
   the proof surface — a restored store must be a drop-in repository for it.
 - **`tokeira-kernel`** and **`tokeira-types`** receive derive-only additions
@@ -30,7 +32,7 @@ crate's existing postcard persistence precedent (`dsql/codec.rs:48-62`,
 
 ### Non-goals
 
-- Snapshot scheduling, file I/O, shutdown integration (T2).
+- Snapshot scheduling, file I/O, shutdown integration (`tokeira-engine`).
 - Cross-version snapshot migration; the version stamp refuses, never migrates.
 - Hot restore into a live store.
 - Any change to DSQL backend behaviour or a Temporal-facing surface.

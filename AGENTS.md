@@ -27,7 +27,7 @@ This is a product-from-scratch. The architecture is informed by Temporal but the
   [codex-chatgpt-worktrees.md](docs/agents/codex-chatgpt-worktrees.md). Task-specific
   reference contracts and recipes (equally binding):
   [engineering-reference.md](docs/agents/engineering-reference.md). Design:
-  [docs/architecture/000-overview.md](docs/architecture/000-overview.md), `docs/adr/`.
+  [docs/architecture/000-overview.md](docs/architecture/000-overview.md).
 - **Harness reality:** Kiro reads this file natively; Claude Code only via the root
   `CLAUDE.md` `@AGENTS.md` import (§12.1); Codex concatenates global → root → cwd
   `AGENTS.md` under `project_doc_max_bytes` and silently truncates overflow — the
@@ -50,8 +50,7 @@ abstraction, and config option must earn its place (§1).
 ## Architecture
 
 Three planes — details in
-[docs/architecture/000-overview.md](docs/architecture/000-overview.md), decisions in
-`docs/adr/`:
+[docs/architecture/000-overview.md](docs/architecture/000-overview.md):
 
 - **Compatibility edge** (`tokeira-edge`, `tokeira-proto`, `tokeira-types`) — admits and
   translates requests. Owns no workflow semantics.

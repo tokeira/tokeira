@@ -131,4 +131,3 @@ older `deployment.toml` deployment as an operator recipe for this path.
 - [`tkr` and `tkp`](../../provisioning/tkr-and-tkp.md) — forwarding, launch trust,
   upgrade, and rollback
 - [Production observability](../observability.md) — what the stack collects and alerts on
-- [Compose + DSQL performance analysis](../../compose-dsql-performance.md)

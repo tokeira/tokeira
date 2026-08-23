@@ -1,6 +1,6 @@
 # Release / Infrastructure — Delivery Readiness
 
-> Sibling of [`delivery.md`](./delivery.md). The tokeira **release process** direction: build
+> The tokeira **release process** direction: build
 > provenance, version/proto/compat pinning, the compatibility-claim bump workflow, and the CI
 > substrate. This is a **summary**; the authoritative spec for this work is
 > [`.kiro/specs/release-process/`](../../.kiro/specs/release-process/requirements.md) (requirements +

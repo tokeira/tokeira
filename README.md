@@ -101,9 +101,8 @@ Tokeira is organized into three planes:
   correctness path.
 
 Design documents live in
-[docs/architecture/](docs/architecture/000-overview.md), decision records in
-[docs/adr/](docs/adr/), and a navigable reference for the seven engine crates
-in [docs/crates/](docs/crates/README.md).
+[docs/architecture/](docs/architecture/000-overview.md), with a navigable
+reference for the seven engine crates in [docs/crates/](docs/crates/README.md).
 
 ## Quick Start
 

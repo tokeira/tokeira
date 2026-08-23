@@ -10,8 +10,8 @@ ground-truthed to v1.31.0 (cite path + tag inline).
 > **Status: COMPLETE (2026-06-12).** Implemented by Codex per this plan; verified (see Notes). Task 9
 > (operator-run acceptance) passed live as part of the `agentic-walking-skeleton` durability proof —
 > `get_turn_state` against a quiescent workflow resolves instead of timing out, and the sticky→live
-> fallback held across a hard worker kill mid-turn. Evidence:
-> `.kiro/specs/agentic-orchestration/reference/openai-sandbox-gap.md` (Next actions).
+> fallback held across a hard worker kill mid-turn. Evidence recorded
+> in the pre-campaign orchestration notes (retired from this tree).
 
 ## Tasks
 
@@ -84,7 +84,7 @@ ground-truthed to v1.31.0 (cite path + tag inline).
 
 - [x] 9. Acceptance (operator-run, not a unit test)
   - Boot `tokeirad`, run the OpenAI Agents SDK sandbox sample (local backend) + TUI; confirm a turn
-    completes and `get_turn_state` polling no longer times out. (Owned by `agentic-orchestration`.)
+    completes and `get_turn_state` polling no longer times out.
     **Passed live 2026-06-12** during the walking-skeleton durability proof.
 
 ## Notes

@@ -7,3 +7,6 @@
 .env.local
 # Machine-local Claude Code grants (absolute-path allow rules survive into worktrees)
 .claude/settings.local.json
+# Machine-local Claude Code imports (e.g. the operator's private-ops pointer);
+# copied so fresh worktrees inherit the operator's local file.
+CLAUDE.local.md

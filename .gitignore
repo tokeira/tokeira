@@ -72,3 +72,7 @@ AGENTS.override.md
 .claude/worktrees/
 .claude/launch.json
 .claude/wf-*.js
+
+# Machine-local Claude Code imports (the operator's private pointers); carried
+# into worktrees by .worktreeinclude, never committed.
+CLAUDE.local.md

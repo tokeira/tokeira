@@ -16,6 +16,10 @@ const SOURCE_TREE_HASH_KEY: &str = "TOKEIRA_BUILD_INFO_SOURCE_TREE_HASH";
 const FEATURE_MATRIX_DIGEST_KEY: &str = "TOKEIRA_BUILD_INFO_FEATURE_MATRIX_DIGEST";
 const SDK_MATRIX_DIGEST_KEY: &str = "TOKEIRA_BUILD_INFO_SDK_MATRIX_DIGEST";
 const BUILD_MODE_KEY: &str = "TOKEIRA_BUILD_INFO_BUILD_MODE";
+const SCHEMA_MIN_SUPPORTED_VERSION_KEY: &str = "TOKEIRA_BUILD_INFO_SCHEMA_MIN_SUPPORTED_VERSION";
+const SCHEMA_TARGET_VERSION_KEY: &str = "TOKEIRA_BUILD_INFO_SCHEMA_TARGET_VERSION";
+const SCHEMA_MAX_READABLE_VERSION_KEY: &str = "TOKEIRA_BUILD_INFO_SCHEMA_MAX_READABLE_VERSION";
+const SCHEMA_MIGRATION_SET_DIGEST_KEY: &str = "TOKEIRA_BUILD_INFO_SCHEMA_MIGRATION_SET_DIGEST";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Manifest {
@@ -28,6 +32,14 @@ struct Manifest {
     feature_matrix_digest: String,
     sdk_matrix_digest: String,
     build_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaContractMetadata {
+    minimum_supported_version: u32,
+    target_version: u32,
+    maximum_readable_version: u32,
+    migration_set_digest: String,
 }
 
 fn main() {
@@ -43,6 +55,8 @@ fn main() {
         root.join("Cargo.toml").display()
     );
     println!("cargo:rerun-if-changed=src/pinned.rs");
+    let schema_contract_path = root.join("crates/tokeira-storage/schema-contract.toml");
+    println!("cargo:rerun-if-changed={}", schema_contract_path.display());
 
     let manifest = match resolve_manifest_path() {
         Some(path) => {
@@ -63,7 +77,15 @@ fn main() {
             .unwrap_or_else(|error| panic!("failed to derive development build metadata: {error}")),
     };
 
+    let schema_contract = read_schema_contract(&schema_contract_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read schema compatibility contract at {}: {error}",
+            schema_contract_path.display()
+        )
+    });
+
     emit_manifest(&manifest);
+    emit_schema_contract(&schema_contract);
 }
 
 fn workspace_root() -> PathBuf {
@@ -170,6 +192,67 @@ fn read_rust_toolchain(path: &Path) -> Result<String, String> {
         .ok_or_else(|| "rust-toolchain.toml missing [toolchain].channel".to_owned())
 }
 
+fn read_schema_contract(path: &Path) -> Result<SchemaContractMetadata, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let value = content
+        .parse::<Value>()
+        .map_err(|error| format!("failed to parse schema-contract.toml: {error}"))?;
+    let integer = |key: &str| -> Result<u32, String> {
+        let raw = value
+            .get(key)
+            .and_then(Value::as_integer)
+            .ok_or_else(|| format!("schema contract missing integer {key}"))?;
+        u32::try_from(raw).map_err(|_| format!("schema contract {key} is out of range"))
+    };
+    let string = |key: &str| -> Result<String, String> {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("schema contract missing string {key}"))
+    };
+
+    if integer("format_version")? != 1 {
+        return Err("schema contract format_version must be 1".to_owned());
+    }
+    let release = string("tokeira_release")?;
+    let package_version = env::var("CARGO_PKG_VERSION")
+        .map_err(|error| format!("CARGO_PKG_VERSION is unavailable: {error}"))?;
+    if release != package_version {
+        return Err(format!(
+            "schema contract release {release} does not match package version {package_version}"
+        ));
+    }
+    let minimum_supported_version = integer("minimum_supported_version")?;
+    let target_version = integer("target_version")?;
+    let maximum_readable_version = integer("maximum_readable_version")?;
+    if minimum_supported_version == 0
+        || minimum_supported_version > target_version
+        || target_version > maximum_readable_version
+    {
+        return Err("schema versions must satisfy 0 < minimum <= target <= maximum".to_owned());
+    }
+    let migration_set_digest = string("migration_set_digest")?;
+    let Some(hex) = migration_set_digest.strip_prefix("sha256:") else {
+        return Err("schema migration-set digest must use the sha256: prefix".to_owned());
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("schema migration-set digest must be lowercase SHA-256".to_owned());
+    }
+
+    Ok(SchemaContractMetadata {
+        minimum_supported_version,
+        target_version,
+        maximum_readable_version,
+        migration_set_digest,
+    })
+}
+
 fn git_sha(root: &Path) -> String {
     let output = Command::new("git")
         .arg("-C")
@@ -197,6 +280,25 @@ fn emit_manifest(manifest: &Manifest) {
     emit(FEATURE_MATRIX_DIGEST_KEY, &manifest.feature_matrix_digest);
     emit(SDK_MATRIX_DIGEST_KEY, &manifest.sdk_matrix_digest);
     emit(BUILD_MODE_KEY, &manifest.build_mode);
+}
+
+fn emit_schema_contract(contract: &SchemaContractMetadata) {
+    emit(
+        SCHEMA_MIN_SUPPORTED_VERSION_KEY,
+        &contract.minimum_supported_version.to_string(),
+    );
+    emit(
+        SCHEMA_TARGET_VERSION_KEY,
+        &contract.target_version.to_string(),
+    );
+    emit(
+        SCHEMA_MAX_READABLE_VERSION_KEY,
+        &contract.maximum_readable_version.to_string(),
+    );
+    emit(
+        SCHEMA_MIGRATION_SET_DIGEST_KEY,
+        &contract.migration_set_digest,
+    );
 }
 
 fn emit(key: &str, value: &str) {

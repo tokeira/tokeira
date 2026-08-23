@@ -388,15 +388,24 @@ service errors, and documented conflicts are retryable only inside `StartupDeadl
 bounded and jittered in production; tests inject a deterministic clock/sleeper and never
 sleep.
 
-### 3. Connection coordination (`crates/tokeira-storage/src/dsql`)
+### 3. Connection-foundation isolation (`crates/tokeira-storage/src/dsql`)
 
-The reservoir currently depends on concrete DynamoDB coordinators. Replace that coupling
-with one storage-local interface while preserving the ordering invariant: local in-flight
-permit → slot → rate token → physical connection.
+Initial-launch embedded support does not refactor the established distributed reservoir.
+The distributed path continues to construct `DistributedTokenBucket`, validate its
+DynamoDB table, start `SlotBlockManager`, and pass both concrete components directly to
+`Reservoir::start`. The implementation in `reservoir.rs` retains one refiller task, its
+existing immediate empty-reservoir backpressure, its existing acquire/release ordering,
+and its existing DynamoDB shutdown path. `distributed_bucket.rs` and
+`slot_block_manager.rs` are unchanged by this feature.
+
+Embedded mode instead owns a separate `EmbeddedReservoir` and a private
+`EmbeddedConnectionCoordinator`. This keeps its bounded parallel creation,
+deadline-aware warmup, cancellation-safe pending slot charge, ready-channel waiting, and
+draining shutdown out of `tokeirad`'s distributed connection mechanics.
 
 ```rust
 #[async_trait]
-pub trait ConnectionCoordinator: Send + Sync + Debug {
+pub(crate) trait EmbeddedConnectionCoordinator: Send + Sync + Debug {
     async fn validate(&self) -> anyhow::Result<()>;
     async fn acquire_slot(&self) -> anyhow::Result<()>;
     async fn acquire_creation_token(&self) -> anyhow::Result<()>;
@@ -404,15 +413,12 @@ pub trait ConnectionCoordinator: Send + Sync + Debug {
     async fn shutdown(&self) -> anyhow::Result<()>;
 }
 
-pub struct DistributedConnectionCoordinator {
-    bucket: DistributedTokenBucket,
-    slots: SlotBlockManager,
-}
-
-pub struct ProcessLocalConnectionCoordinator<C = SystemMonotonicClock> {
+pub(crate) struct ProcessLocalConnectionCoordinator<C = SystemMonotonicClock> {
     bucket: ProcessLocalTokenBucket<C>,
     slots: AtomicSlotBudget,
 }
+
+pub(crate) struct EmbeddedReservoir { /* embedded-only lifecycle state */ }
 
 impl DsqlStore {
     pub async fn connect_distributed(
@@ -429,24 +435,47 @@ impl DsqlStore {
 }
 ```
 
-`connect_distributed` preserves the current DynamoDB validation and slot-block behaviour.
 `connect_embedded` constructs no AWS DynamoDB config, client, or table names. The engine
 passes the remaining startup budget as `WarmupDeadline`, so waking an inactive cluster is
-bounded by the host deadline rather than the current fixed reservoir warmup constant. Its
-local token bucket starts with the configured burst, replenishes from a monotonic clock,
-and uses `Notify` to wake waiters. Its atomic slot counter is capped at
-`max_connections`. Every failure and retirement path releases exactly one slot; shutdown
-closes admission, aborts refillers, retires ready connections, waits for checked-out
-permits up to the engine deadline, and closes the coordinator.
+bounded by the host deadline. The local token bucket starts with the configured burst,
+replenishes from a monotonic clock, and uses `Notify` to wake waiters. Its atomic slot
+counter is capped at `max_connections`, which also equals the embedded ready-channel
+capacity and maximum idle count. That cap prevents multiple embedded refillers from
+creating `target + in-flight` physical connections.
 
-The same `DsqlConnectionDirector`, five `DbClass` semaphores, leak tracker, connection
-lifetime policy, and repositories are used in both modes. The embedded reservoir target
-and maximum idle count both equal `max_connections`. `DsqlPoolConfig` gains an internal
-checkout policy: distributed mode retains today's immediate empty-reservoir backpressure,
-while embedded mode waits on the bounded ready channel after obtaining its class permit.
-That wait is cancellation-aware and ends on shutdown; it never opens a connection outside
-the refiller, and the number of admitted ready-channel waiters is bounded by the class
-permits.
+The repository implementations, five `DbClass` budgets, connection-lifetime policy, and
+permit API remain shared. The connection director selects one of two reservoir variants:
+its distributed branch performs the pre-feature immediate checkout and concrete
+`SlotBlockManager` return; its embedded branch waits on the bounded embedded channel and
+drains checked-out permits during shutdown. This dispatch does not adapt the distributed
+DynamoDB primitives behind a new interface.
+
+#### Deferred post-launch shared-reservoir proposal
+
+A shared-reservoir redesign is explicitly outside the initial public launch and requires
+a separate consent-gated specification. The future design should evaluate the complete
+distributed concurrency model rather than enabling additional refill workers in
+isolation:
+
+- Account atomically for ready, creating, checked-out, and retiring connections so a
+  refill target is also a provable physical-connection bound.
+- Couple slot-block allocation to the cluster's effective concurrent-connection quota,
+  serialize process-local block expansion, and avoid deterministic low-block probing
+  during fleet cold starts.
+- Separate the distributed token bucket's monotonic CAS revision from its wall-clock
+  refill timestamp and use jittered conflict/throttling retries.
+- Model the single global rate row under the documented 100-connections/second and
+  1,000-connection burst limits, including the DynamoDB capacity consumed by failed
+  conditional writes and hot-key contention.
+- Require deterministic concurrency properties plus multi-process cold-start,
+  cancellation, throttling, and scale-to-zero recovery tests before changing
+  `tokeirad` defaults.
+
+The relevant service boundaries are the current
+[Aurora DSQL quotas](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html),
+[DynamoDB partition-key limits](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html),
+and [conditional-write capacity rules](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/WorkingWithItems.html).
+Recording these questions is not approval to implement the redesign in this feature.
 
 ### 4. Schema contract and build metadata
 

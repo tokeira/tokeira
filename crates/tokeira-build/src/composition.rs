@@ -1095,6 +1095,33 @@ macro_rules! bound_provisioner_main {
     }
 
     #[test]
+    fn staged_workspace_carries_the_storage_schema_contract() {
+        let fixture = Fixture::new();
+        let contract = fixture
+            .root
+            .join("crates/tokeira-storage/schema-contract.toml");
+        std::fs::create_dir_all(contract.parent().expect("contract has a parent"))
+            .expect("create storage crate directory");
+        write(&contract, "target_version = 67\n");
+        let source = fixture.assemble("tkd");
+        let staging = tempfile::tempdir().expect("staging dir");
+
+        source
+            .stage_native_workspace(&fixture.root, staging.path())
+            .expect("stage the scoped workspace");
+
+        assert_eq!(
+            std::fs::read_to_string(
+                staging
+                    .path()
+                    .join("crates/tokeira-storage/schema-contract.toml")
+            )
+            .expect("read staged schema contract"),
+            "target_version = 67\n"
+        );
+    }
+
+    #[test]
     fn compilation_rejects_a_missing_conventional_export() {
         let fixture = Fixture::new();
         let source = fixture.assemble("tkd");

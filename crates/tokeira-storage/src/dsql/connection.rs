@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use sqlx::PgConnection;
 use tokeira_observability::DbClassLabel;
 use tokio::{
-    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinHandle,
 };
 
@@ -28,10 +28,13 @@ use crate::{ConnectionDirector, DbClass, metrics};
 
 use super::{
     DsqlPoolConfig, Reservoir, ReservoirEntry, ReturnedConnection, config::ReservoirConfig,
+    connection_coordinator::EmbeddedConnectionCoordinator, embedded_reservoir,
+    embedded_reservoir::EmbeddedReservoir,
 };
 
 const LEAK_SUSPECT_AFTER: StdDuration = StdDuration::from_secs(30);
 const LEAK_SCAN_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const EMBEDDED_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[derive(Debug)]
 pub struct ClassBudgets {
@@ -97,6 +100,13 @@ impl ClassBudgets {
         Ok(())
     }
 
+    async fn close(&self) {
+        let budgets = self.budgets.read().await;
+        for semaphore in budgets.values() {
+            semaphore.close();
+        }
+    }
+
     pub fn total_budget(&self) -> usize {
         self.total_budget.load(Ordering::Acquire)
     }
@@ -131,14 +141,46 @@ impl ClassBudgets {
     }
 }
 
+/// Selects an unchanged distributed reservoir or the isolated embedded pool.
+///
+/// Keeping the variants separate prevents embedded lifecycle and refill
+/// mechanics from changing the DynamoDB-backed `tokeirad` path.
+#[derive(Debug)]
+enum ReservoirController {
+    Distributed(Reservoir),
+    Embedded(EmbeddedReservoir),
+}
+
+impl ReservoirController {
+    fn ready_count(&self) -> usize {
+        match self {
+            Self::Distributed(reservoir) => reservoir.ready_count(),
+            Self::Embedded(reservoir) => reservoir.ready_count(),
+        }
+    }
+
+    fn config(&self) -> &ReservoirConfig {
+        match self {
+            Self::Distributed(reservoir) => reservoir.config(),
+            Self::Embedded(reservoir) => reservoir.config(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DsqlConnectionDirector {
     /// Warm physical connections managed independently of operation class.
-    reservoir: Arc<Reservoir>,
+    reservoir: Arc<ReservoirController>,
     /// Logical admission limits layered on top of the reservoir.
     class_budgets: Arc<ClassBudgets>,
     /// Number of permits currently holding a physical connection.
     in_flight: Arc<AtomicUsize>,
+    /// Embedded-only drain notification; distributed shutdown ignores it.
+    in_flight_changed: Arc<Notify>,
+    /// Embedded-only admission state; distributed acquisition retains its
+    /// established immediate-checkout behavior.
+    accepting: AtomicBool,
+    admission_lock: AsyncMutex<()>,
     /// Tracks long-lived checkouts without using stack traces or raw call-site
     /// strings as labels. The call-site dimension is derived from `DbClass`.
     leak_tracker: Arc<CheckoutLeakTracker>,
@@ -150,9 +192,10 @@ pub struct DsqlConnectionDirector {
 impl DsqlConnectionDirector {
     /// Start the background connection reservoir and class-budget controller.
     pub fn start(config: DsqlPoolConfig, reservoir: Reservoir) -> Result<Self> {
-        let reservoir = Arc::new(reservoir);
+        let reservoir = Arc::new(ReservoirController::Distributed(reservoir));
         let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(&config.reservoir))?);
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let in_flight_changed = Arc::new(Notify::new());
         let leak_tracker = Arc::new(CheckoutLeakTracker::default());
         let reporter_handle = spawn_periodic_reporter(
             Arc::clone(&class_budgets),
@@ -164,6 +207,38 @@ impl DsqlConnectionDirector {
             reservoir,
             class_budgets,
             in_flight,
+            in_flight_changed,
+            accepting: AtomicBool::new(true),
+            admission_lock: AsyncMutex::new(()),
+            leak_tracker,
+            reporter_handle,
+            leak_detector_handle,
+        })
+    }
+
+    /// Start the embedded-only pool without changing distributed reservoir mechanics.
+    pub(crate) fn start_embedded(
+        config: &ReservoirConfig,
+        reservoir: EmbeddedReservoir,
+    ) -> Result<Self> {
+        let reservoir = Arc::new(ReservoirController::Embedded(reservoir));
+        let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(config))?);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let in_flight_changed = Arc::new(Notify::new());
+        let leak_tracker = Arc::new(CheckoutLeakTracker::default());
+        let reporter_handle = spawn_periodic_reporter(
+            Arc::clone(&class_budgets),
+            Arc::clone(&reservoir),
+            Arc::clone(&in_flight),
+        );
+        let leak_detector_handle = spawn_leak_detector(Arc::clone(&leak_tracker));
+        Ok(Self {
+            reservoir,
+            class_budgets,
+            in_flight,
+            in_flight_changed,
+            accepting: AtomicBool::new(true),
+            admission_lock: AsyncMutex::new(()),
             leak_tracker,
             reporter_handle,
             leak_detector_handle,
@@ -178,9 +253,72 @@ impl DsqlConnectionDirector {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        match self.reservoir.as_ref() {
+            ReservoirController::Distributed(reservoir) => {
+                // Preserve the pre-embedded distributed shutdown path exactly:
+                // stop diagnostics, then let the original reservoir release its
+                // DynamoDB slot blocks.
+                self.reporter_handle.abort();
+                self.leak_detector_handle.abort();
+                reservoir.shutdown().await
+            }
+            ReservoirController::Embedded(_) => {
+                self.shutdown_with_deadline(Instant::now() + EMBEDDED_SHUTDOWN_TIMEOUT)
+                    .await
+            }
+        }
+    }
+
+    /// Close and drain only the embedded pool within a caller-owned deadline.
+    pub async fn shutdown_with_deadline(&self, deadline: Instant) -> Result<()> {
+        let ReservoirController::Embedded(reservoir) = self.reservoir.as_ref() else {
+            self.reporter_handle.abort();
+            self.leak_detector_handle.abort();
+            let ReservoirController::Distributed(reservoir) = self.reservoir.as_ref() else {
+                unreachable!("reservoir controller variant changed during shutdown");
+            };
+            return reservoir.shutdown().await;
+        };
+
+        {
+            let _guard = self.admission_lock.lock().await;
+            self.accepting.store(false, Ordering::Release);
+        }
+        self.class_budgets.close().await;
         self.reporter_handle.abort();
         self.leak_detector_handle.abort();
-        self.reservoir.shutdown().await
+        reservoir.begin_shutdown();
+
+        while self.in_flight.load(Ordering::Acquire) != 0 {
+            let notified = self.in_flight_changed.notified();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline
+                || tokio::time::timeout(deadline.saturating_duration_since(now), notified)
+                    .await
+                    .is_err()
+            {
+                reservoir.abort_return_processing();
+                bail!(
+                    "timed out draining {} checked-out embedded DSQL connections",
+                    self.in_flight.load(Ordering::Acquire)
+                );
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            reservoir.abort_return_processing();
+            bail!("timed out shutting down embedded DSQL connection resources");
+        }
+        tokio::time::timeout(
+            deadline.saturating_duration_since(now),
+            reservoir.finish_shutdown(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out shutting down embedded DSQL resources"))?
     }
 }
 
@@ -189,23 +327,83 @@ impl ConnectionDirector for DsqlConnectionDirector {
     type Permit = DsqlPermit;
 
     async fn acquire(&self, class: DbClass) -> Result<DsqlPermit> {
+        match self.reservoir.as_ref() {
+            ReservoirController::Distributed(reservoir) => {
+                self.acquire_distributed(class, reservoir).await
+            }
+            ReservoirController::Embedded(reservoir) => {
+                self.acquire_embedded(class, reservoir).await
+            }
+        }
+    }
+}
+
+impl DsqlConnectionDirector {
+    async fn acquire_distributed(
+        &self,
+        class: DbClass,
+        reservoir: &Reservoir,
+    ) -> Result<DsqlPermit> {
+        // This is the pre-embedded `tokeirad` acquisition sequence: class
+        // permit, immediate checkout, and the existing slot-block-backed permit.
         let started = Instant::now();
         let class_guard = self.class_budgets.acquire(class).await?;
-        let entry = self.reservoir.checkout()?;
+        let entry = reservoir.checkout()?;
         // From this point until `DsqlPermit::drop`, the connection is out of
         // the ready reservoir but still owns exactly one slot reservation.
         let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
         metrics::record_dsql_pool_checkout_duration(db_class_label(class), started.elapsed());
         metrics::set_dsql_reservoir_in_flight(in_flight);
-        metrics::set_dsql_reservoir_utilization_ratio(in_flight, self.reservoir.ready_count());
+        metrics::set_dsql_reservoir_utilization_ratio(in_flight, reservoir.ready_count());
         let leak_checkout = self.leak_tracker.track(class, Instant::now());
         Ok(DsqlPermit::new(
             class,
             entry,
             class_guard,
-            self.reservoir.return_sender(),
-            self.reservoir.slot_manager(),
+            reservoir.return_sender(),
+            reservoir.slot_manager(),
             Arc::clone(&self.in_flight),
+            Arc::clone(&self.leak_tracker),
+            leak_checkout,
+        ))
+    }
+
+    async fn acquire_embedded(
+        &self,
+        class: DbClass,
+        reservoir: &EmbeddedReservoir,
+    ) -> Result<DsqlPermit> {
+        if !self.accepting.load(Ordering::Acquire) {
+            bail!("embedded DSQL connection director is closed");
+        }
+        let started = Instant::now();
+        let class_guard = self.class_budgets.acquire(class).await?;
+        let entry = reservoir.checkout_wait().await?;
+        let admission_guard = self.admission_lock.lock().await;
+        if !self.accepting.load(Ordering::Acquire) {
+            reservoir.coordinator().release_slot();
+            drop(entry);
+            bail!("embedded DSQL connection director is closed");
+        }
+        let Some(return_sender) = reservoir.return_sender() else {
+            reservoir.coordinator().release_slot();
+            drop(entry);
+            bail!("embedded DSQL return path is closed");
+        };
+        let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+        drop(admission_guard);
+        metrics::record_dsql_pool_checkout_duration(db_class_label(class), started.elapsed());
+        metrics::set_dsql_reservoir_in_flight(in_flight);
+        metrics::set_dsql_reservoir_utilization_ratio(in_flight, reservoir.ready_count());
+        let leak_checkout = self.leak_tracker.track(class, Instant::now());
+        Ok(DsqlPermit::new_embedded(
+            class,
+            entry,
+            class_guard,
+            return_sender,
+            reservoir.coordinator(),
+            Arc::clone(&self.in_flight),
+            Arc::clone(&self.in_flight_changed),
             Arc::clone(&self.leak_tracker),
             leak_checkout,
         ))
@@ -324,16 +522,37 @@ pub struct DsqlPermit {
     max_lifetime: std::time::Duration,
     /// Semaphore permit enforcing operation-class admission.
     _class_guard: OwnedSemaphorePermit,
-    /// Synchronous return path into the reservoir return processor.
-    reservoir_return: tokio::sync::mpsc::UnboundedSender<ReturnedConnection>,
-    /// Slot accounting owner for discard paths that bypass the return processor.
-    slot_manager: Arc<super::SlotBlockManager>,
+    /// Mode-specific return and slot-accounting path. The distributed variant
+    /// retains the original DynamoDB slot manager; embedded uses only local state.
+    reservoir_return: PermitReturn,
     /// Shared in-flight counter owned by the director.
     director_in_flight: Arc<AtomicUsize>,
+    in_flight_changed: Option<Arc<Notify>>,
     leak_tracker: Arc<CheckoutLeakTracker>,
     leak_checkout: CheckoutLeak,
     /// Caller-set flag that causes return processing to discard the connection.
     marked_bad: bool,
+}
+
+#[derive(Debug)]
+enum PermitReturn {
+    Distributed {
+        sender: tokio::sync::mpsc::UnboundedSender<ReturnedConnection>,
+        slot_manager: Arc<super::SlotBlockManager>,
+    },
+    Embedded {
+        sender: tokio::sync::mpsc::UnboundedSender<embedded_reservoir::ReturnedConnection>,
+        coordinator: Arc<dyn EmbeddedConnectionCoordinator>,
+    },
+}
+
+impl PermitReturn {
+    fn release_slot(&self) {
+        match self {
+            Self::Distributed { slot_manager, .. } => slot_manager.release_slot(),
+            Self::Embedded { coordinator, .. } => coordinator.release_slot(),
+        }
+    }
 }
 
 impl DsqlPermit {
@@ -353,9 +572,43 @@ impl DsqlPermit {
             created_at: entry.created_at,
             max_lifetime: entry.max_lifetime,
             _class_guard: class_guard,
-            reservoir_return,
-            slot_manager,
+            reservoir_return: PermitReturn::Distributed {
+                sender: reservoir_return,
+                slot_manager,
+            },
             director_in_flight,
+            in_flight_changed: None,
+            leak_tracker,
+            leak_checkout,
+            marked_bad: false,
+        }
+    }
+
+    fn new_embedded(
+        class: DbClass,
+        entry: embedded_reservoir::ReservoirEntry,
+        class_guard: OwnedSemaphorePermit,
+        reservoir_return: tokio::sync::mpsc::UnboundedSender<
+            embedded_reservoir::ReturnedConnection,
+        >,
+        coordinator: Arc<dyn EmbeddedConnectionCoordinator>,
+        director_in_flight: Arc<AtomicUsize>,
+        in_flight_changed: Arc<Notify>,
+        leak_tracker: Arc<CheckoutLeakTracker>,
+        leak_checkout: CheckoutLeak,
+    ) -> Self {
+        Self {
+            class,
+            connection: Some(entry.connection),
+            created_at: entry.created_at,
+            max_lifetime: entry.max_lifetime,
+            _class_guard: class_guard,
+            reservoir_return: PermitReturn::Embedded {
+                sender: reservoir_return,
+                coordinator,
+            },
+            director_in_flight,
+            in_flight_changed: Some(in_flight_changed),
             leak_tracker,
             leak_checkout,
             marked_bad: false,
@@ -381,6 +634,9 @@ impl Drop for DsqlPermit {
     fn drop(&mut self) {
         let previous = self.director_in_flight.fetch_sub(1, Ordering::AcqRel);
         metrics::set_dsql_reservoir_in_flight(previous.saturating_sub(1));
+        if let Some(changed) = &self.in_flight_changed {
+            changed.notify_waiters();
+        }
         self.leak_tracker.complete(self.leak_checkout);
         // Dropping the permit is the storage-layer "return connection" API.
         // Expired connections are intentionally discarded here because handing
@@ -388,25 +644,36 @@ impl Drop for DsqlPermit {
         // failures that are hard to diagnose.
         if let Some(connection) = self.connection.take() {
             if self.created_at.elapsed() <= self.max_lifetime {
-                if self
-                    .reservoir_return
-                    .send(ReturnedConnection {
-                        entry: ReservoirEntry {
-                            connection,
-                            created_at: self.created_at,
-                            max_lifetime: self.max_lifetime,
-                        },
-                        marked_bad: self.marked_bad,
-                    })
-                    .is_err()
-                {
-                    self.slot_manager.release_slot();
+                let return_failed = match &self.reservoir_return {
+                    PermitReturn::Distributed { sender, .. } => sender
+                        .send(ReturnedConnection {
+                            entry: ReservoirEntry {
+                                connection,
+                                created_at: self.created_at,
+                                max_lifetime: self.max_lifetime,
+                            },
+                            marked_bad: self.marked_bad,
+                        })
+                        .is_err(),
+                    PermitReturn::Embedded { sender, .. } => sender
+                        .send(embedded_reservoir::ReturnedConnection {
+                            entry: embedded_reservoir::ReservoirEntry {
+                                connection,
+                                created_at: self.created_at,
+                                max_lifetime: self.max_lifetime,
+                            },
+                            marked_bad: self.marked_bad,
+                        })
+                        .is_err(),
+                };
+                if return_failed {
+                    self.reservoir_return.release_slot();
                     metrics::record_dsql_pool_connection_retired("return_channel_closed");
                 }
             } else {
                 metrics::record_dsql_reservoir_connection_age("expired", self.created_at.elapsed());
                 metrics::record_dsql_pool_connection_retired("expired");
-                self.slot_manager.release_slot();
+                self.reservoir_return.release_slot();
             }
         }
     }
@@ -414,7 +681,7 @@ impl Drop for DsqlPermit {
 
 fn spawn_periodic_reporter(
     class_budgets: Arc<ClassBudgets>,
-    reservoir: Arc<Reservoir>,
+    reservoir: Arc<ReservoirController>,
     in_flight: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -597,9 +864,12 @@ mod tests {
             created_at: std::time::Instant::now(),
             max_lifetime: std::time::Duration::from_secs(60),
             _class_guard: class_guard,
-            reservoir_return: return_tx,
-            slot_manager: crate::dsql::SlotBlockManager::local_for_tests(1),
+            reservoir_return: PermitReturn::Distributed {
+                sender: return_tx,
+                slot_manager: crate::dsql::SlotBlockManager::local_for_tests(1),
+            },
             director_in_flight: Arc::clone(&in_flight),
+            in_flight_changed: None,
             leak_tracker: Arc::clone(&leak_tracker),
             leak_checkout,
             marked_bad: false,

@@ -1,4 +1,4 @@
-CREATE TABLE task_queue_config (
+CREATE TABLE IF NOT EXISTS task_queue_config (
     namespace_id UUID NOT NULL,
     task_queue TEXT NOT NULL,
     task_kind SMALLINT NOT NULL,

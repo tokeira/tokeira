@@ -14,15 +14,12 @@ the schema.
 This file is the **canonical** home of the root heading *Adding or Changing a DSQL
 Migration* (the root keeps the name and points here). The rules:
 
-- **Build phase (now): no `ALTER TABLE`.** Fold a new column/constraint into the
-  table's base `CREATE TABLE` migration and let its checksum change. Do not add a
-  follow-up `ALTER`. (This flips to strictly forward-only once a baseline is cut;
-  removing the build-phase rule from this file is itself the signal the baseline
-  exists.)
-- **Contiguous versions.** No gaps, no duplicate `VNNN`. Deleting the highest migration
-  is acceptable during the build phase; editing an applied one after baseline is not —
-  each post-baseline change is a new `VNNN` (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
-  included).
+- **Strictly forward-only.** The baseline is cut through V067. Never edit, rename,
+  reorder, or delete a baseline-locked migration; `schema-baseline.lock` makes such a
+  change a build failure. Every schema change is a new migration above the current
+  head, including any supported, idempotent `ALTER TABLE` operation.
+- **Contiguous versions.** No gaps or duplicate `VNNN`; the next schema change after
+  the baseline starts at V068.
 - **DSQL DDL subset always.** One statement per file; secondary indexes created `ASYNC`;
   no `CHECK` constraints (validate in the application); no `BIGSERIAL` (generate IDs
   in-app). `src/dsql/validation.rs` (`DdlValidator`) enforces the safe subset — if it

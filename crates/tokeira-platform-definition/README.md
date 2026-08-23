@@ -137,7 +137,7 @@ loudly rather than miscompiling definitions.
 - Monty reports 1-based character columns; translation converts through the
   line content, so non-ASCII lines map correctly.
 
-## Adoption path (if Monty becomes strategic)
+## Adoption path
 
 1. The source rewrite in this crate is the product mechanism while the
    subset stays small; the lowered form is canonical and deterministic.

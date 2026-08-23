@@ -159,6 +159,14 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         "Provisioned DynamoDB table for distributed connection-slot leases."
     ),
     field!(
+        "infrastructure.dsql.migration_policy",
+        Infrastructure,
+        "<unset>",
+        false,
+        None,
+        "Explicit automatic or validate-only schema policy required at DSQL startup."
+    ),
+    field!(
         "infrastructure.placement.controller_endpoint",
         Infrastructure,
         "<unset>",
@@ -848,6 +856,7 @@ runtime_role_arn = "arn:aws:iam::123456789012:role/runtime"
 readonly_role_arn = "arn:aws:iam::123456789012:role/readonly"
 rate_limiter_table = "rate-limiter"
 conn_lease_table = "connection-leases"
+migration_policy = "validate_only"
 
 [infrastructure.placement]
 controller_endpoint = "http://127.0.0.1:8080"

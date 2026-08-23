@@ -26,6 +26,7 @@ members = [
     "crates/tokeira-iac",
     "crates/tokeira-deploy-engine",
     "crates/tokeira-config",
+    "crates/tokeira-managed-dsql",
     "crates/tokeira-secrets",
     "crates/tokeira-aws",
     "crates/tokeira-autoscaler",
@@ -172,6 +173,7 @@ tokeira-report = { path = "crates/tokeira-report" }
 tokeira-explain = { path = "crates/tokeira-explain" }
 tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
 tokeira-config = { path = "crates/tokeira-config" }
+tokeira-managed-dsql = { path = "crates/tokeira-managed-dsql" }
 tokeira-aws = { path = "crates/tokeira-aws" }
 tokeira-platform = { path = "crates/tokeira-platform" }
 tokeira-platform-definition = { path = "crates/tokeira-platform-definition" }

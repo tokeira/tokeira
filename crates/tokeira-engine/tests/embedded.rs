@@ -185,7 +185,8 @@ async fn raw_endpoint_dispatches_get_system_info() -> Result<()> {
         decoded.capabilities.is_some(),
         "the embedded endpoint must expose Tokeira's real system capabilities"
     );
-    engine.shutdown().await
+    engine.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -202,7 +203,8 @@ async fn temporal_client_connects_through_service_override() -> Result<()> {
         "Connection::connect must complete GetSystemInfo through the override"
     );
     drop(connection);
-    engine.shutdown().await
+    engine.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -216,7 +218,8 @@ async fn embedded_start_does_not_bind_configured_listeners() -> Result<()> {
     // Construction would fail with AddressInUse if either the Temporal or Nexus
     // callback transport were still an implicit part of engine startup.
     let engine = Engine::start_with_config(config).await?;
-    engine.shutdown().await
+    engine.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -264,7 +267,8 @@ async fn graceful_shutdown_snapshot_restores_state_and_recovery() -> Result<()> 
     // snapshot written after one restored lifecycle must remain bootable again.
     let restored_again = Engine::start_with_config(config).await?;
     assert_workflow_exists(&restored_again, "graceful-workflow").await?;
-    restored_again.shutdown().await
+    restored_again.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test(start_paused = true)]
@@ -333,7 +337,8 @@ async fn unknown_rpc_preserves_unimplemented_status() -> Result<()> {
         .expect_err("the tonic router must reject an unknown method");
 
     assert_eq!(status.code(), tonic::Code::Unimplemented);
-    engine.shutdown().await
+    engine.shutdown().await?;
+    Ok(())
 }
 
 /// The listener-backed in-memory server applies the SAME snapshot policy as
@@ -407,5 +412,6 @@ async fn served_in_memory_snapshot_round_trips_across_listener_restarts() -> Res
     .context("recovery must republish the workflow task on the listener boot")??
     .into_inner();
     assert!(!task.task_token.is_empty());
-    second.shutdown().await
+    second.shutdown().await?;
+    Ok(())
 }

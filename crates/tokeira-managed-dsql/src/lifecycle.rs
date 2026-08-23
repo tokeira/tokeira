@@ -552,6 +552,21 @@ pub enum ManagedDsqlError {
         "managed Aurora DSQL descriptor is a destroyed tombstone; explicit new create intent is required"
     )]
     DestroyedTombstone,
+    /// An administrative operation requires an existing descriptor.
+    #[error("managed Aurora DSQL cluster descriptor is missing")]
+    MissingDescriptor,
+    /// Destruction cannot target a create operation that has not recorded an identity.
+    #[error("managed Aurora DSQL cluster descriptor is not ready for destruction")]
+    DescriptorNotReady,
+    /// The supplied confirmation was not derived from the exact observed plan.
+    #[error("explicit confirmation of the current destruction plan is required")]
+    ConfirmationRequired,
+    /// Descriptor revision or canonical identity changed after planning.
+    #[error("managed Aurora DSQL destruction plan is stale; create and confirm a new plan")]
+    StalePlan,
+    /// AWS still reports protection after the explicit disable operation.
+    #[error("Aurora DSQL deletion protection remains enabled")]
+    DeletionProtectionStillEnabled,
     /// AWS status cannot safely enter connection/schema work.
     #[error("Aurora DSQL cluster {identity:?} has unsupported startup status {status:?}")]
     UnsupportedStatus {

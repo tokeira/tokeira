@@ -53,6 +53,7 @@ tokeira-build-info = { path = "../tokeira-build-info", version = "0.1.0" }
 tokeira-chasm = { path = "../tokeira-chasm", version = "0.1.0" }
 tokeira-chasm-activity = { path = "../tokeira-chasm-activity", version = "0.1.0" }
 tokeira-kernel = { path = "../tokeira-kernel", version = "0.1.0" }
+tokeira-managed-dsql = { path = "../tokeira-managed-dsql", version = "0.1.0" }
 tokeira-observability = { path = "../tokeira-observability", version = "0.1.0" }
 tokeira-proto = { path = "../tokeira-proto", version = "0.1.0" }
 tokeira-projection = { path = "../tokeira-projection", version = "0.1.0", features = ["dsql"] }

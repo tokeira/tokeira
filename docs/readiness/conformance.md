@@ -1,6 +1,6 @@
 # Conformance Readiness — Temporal v1.31.0
 
-> Sibling of [`delivery.md`](./delivery.md). **This is the single status surface for how far tokeira
+> **This is the single status surface for how far tokeira
 > has progressed toward Temporal v1.31.0 compliance.** It is the *numerator*. The *denominator* — what
 > full v1.31.0 compliance **means** — is defined in [`../conformance/v1.31.0/`](../conformance/v1.31.0/README.md).
 >

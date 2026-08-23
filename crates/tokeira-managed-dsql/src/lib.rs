@@ -4,12 +4,17 @@
 //! the durable creation token and canonical cluster identity, while deliberately
 //! excluding engine, storage, runtime, CLI, and kernel concerns.
 
+mod admin;
 mod aws;
 mod control;
 mod descriptor;
 mod identity;
 mod lifecycle;
 
+pub use admin::{
+    AdminDeadline, DestroyOutcome, DestroyPlan, DestroyReport, ExplicitConfirmation,
+    ManagedDsqlAdmin,
+};
 pub use aws::AwsDsqlControlPlane;
 pub use control::{
     ClusterObservation, ClusterStatus, CreateClusterRequest, DeleteClusterRequest,

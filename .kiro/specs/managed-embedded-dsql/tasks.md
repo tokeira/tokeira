@@ -253,71 +253,71 @@
     build rejects an intentionally altered baseline fixture.
   - _Requirements: 4.1–7.9, 13.7–13.13_
 
-- [ ] 11. Wire managed and existing DSQL into embedded engine startup
-  - [ ] 11.1 Add `Engine::start_with_embedded_config` and typed startup reports/errors
+- [x] 11. Wire managed and existing DSQL into embedded engine startup
+  - [x] 11.1 Add `Engine::start_with_embedded_config` and typed startup reports/errors
     - Keep old start methods in-memory compatible; make durable startup explicit; map
       configuration migration policy into storage policy exhaustively; and share one
       bounded deadline across lifecycle, warmup, schema, ownership, and stack phases.
     - _Requirements: 1.1–1.6, 5.1–5.3, 8.1–8.14_
-  - [ ] 11.2 Factor the current DSQL path into reusable transport-neutral construction
+  - [x] 11.2 Factor the current DSQL path into reusable transport-neutral construction
     - Preserve distributed mode's concrete token-bucket, slot-manager, and reservoir
       construction; make embedded mode pass its isolated process-local pool into the
       same repositories/runtime stack.
     - Ensure embedded DSQL returns `ConstructedStack::Embedded` and binds no gRPC, Nexus,
       callback, metrics, control, or other Tokeira listener.
     - _Requirements: 1.5, 1.7–1.10, 6.3–6.4, 10.5, 14.7_
-  - [ ] 11.3 Implement the ordered managed/existing startup phases
+  - [x] 11.3 Implement the ordered managed/existing startup phases
     - Resolve cluster, build/wake pool, assess/apply schema policy, acquire embedded owner,
       restore runtime state, self-assign existing shard leases, then open in-process
       admission; do not return a handle before every phase succeeds.
     - _Requirements: 3.5–3.16, 5.1–5.13, 7.1–7.7, 8.1–8.5_
-  - [ ] 11.4 Add failure-atomic rollback and the redacted startup report
+  - [x] 11.4 Add failure-atomic rollback and the redacted startup report
     - Unwind completed resources in reverse order, conditionally release ownership, close
       the pool on later failure, and report storage/cluster/schema/ownership outcomes
       without paths, tokens, credentials, SQL, or payloads.
     - _Requirements: 8.6–8.14, 12.5–12.8_
-  - [ ] 11.5 Add engine startup and structural boundary unit tests
+  - [x] 11.5 Add engine startup and structural boundary unit tests
     - Inject a failure at every phase; verify exact ordering, no leaked endpoint, reverse
       unwind, report contents/redaction, no listener, no DynamoDB in embedded DSQL, and
       no new `tokeira-kernel` dependency or feature.
     - _Requirements: 1.6–1.10, 6.3–6.4, 8.1–8.14, 13.10, 14.1–14.8_
-  - [ ] 11.6 Property test: Property 12 — startup is prefix-safe and failure-atomic
+  - [x] 11.6 Property test: Property 12 — startup is prefix-safe and failure-atomic
     - Generate startup outcomes and one injected failure boundary for at least 100 cases
       against an ordered-phase/rollback reference model.
     - Tag: `// Feature: managed-embedded-dsql, Property 12: startup is prefix-safe and failure-atomic`
     - _Requirements: 8.1–8.14, 1.6_
 
-- [ ] 12. Implement in-process drain, runtime task ownership, and shutdown
-  - [ ] 12.1 Add admission and in-flight drain to `InProcessGrpcService`
+- [x] 12. Implement in-process drain, runtime task ownership, and shutdown
+  - [x] 12.1 Add admission and in-flight drain to `InProcessGrpcService`
     - Give every handler a cancellation-safe decrement guard; make `begin_shutdown`
       synchronous; drain with `Notify` and a deadline; return `UNAVAILABLE` after close
       or owner fencing.
     - _Requirements: 7.7–7.8, 8.5, 10.8–10.9, 13.21_
-  - [ ] 12.2 Consolidate runtime cancellation and join ownership
+  - [x] 12.2 Consolidate runtime cancellation and join ownership
     - Add a non-kernel `RuntimeShutdownHandle`; track engine refresh, repair, renewal,
       cleanup, and scanner tasks with `TaskTracker`; close the tracker after startup and
       await it after cancellation.
     - _Requirements: 10.8–10.10, 11.10–11.11, 13.21, 14.2–14.6_
-  - [ ] 12.3 Add `EmbeddedShutdownCoordinator`, explicit shutdown, and safe `Drop`
+  - [x] 12.3 Add `EmbeddedShutdownCoordinator`, explicit shutdown, and safe `Drop`
     - Preserve the director after `DsqlStore::into_parts`; close admission, cancel, drain
       and join, finish owned telemetry, release shard leases, conditionally release owner,
       and close storage in the approved order while aggregating independent failures.
     - Make `Drop` only close admission and cancel synchronously; it must never disable
       deletion protection, delete the cluster, or block on AWS.
     - _Requirements: 6.17–6.18, 7.7–7.9, 9.1–9.4, 10.8–10.10, 13.14, 13.21_
-  - [ ] 12.4 Property test: Property 19 — shutdown establishes the host flush boundary
+  - [x] 12.4 Property test: Property 19 — shutdown establishes the host flush boundary
     - Generate admitted-call/task completion and shutdown interleavings for at least 100
       cases against an ordering model, including independent cleanup failures.
     - Tag: `// Feature: managed-embedded-dsql, Property 19: shutdown establishes the host flush boundary`
     - _Requirements: 6.17–6.18, 7.8, 10.8–10.10, 13.21_
-  - [ ] 12.5 Add fixed shutdown/drop tests
+  - [x] 12.5 Add fixed shutdown/drop tests
     - Prove cancellation-safe handler counts, bounded drain, all cleanup attempts after an
       earlier failure, conditional owner release, pool closure, zero AWS mutation from
       normal shutdown/drop, and continued usability of the host telemetry provider.
     - _Requirements: 6.17–6.18, 7.7–7.9, 9.1–9.4, 10.8–10.10, 13.14, 13.21_
 
-- [ ] 13. Add library-only explicit managed-cluster destruction
-  - [ ] 13.1 Implement `ManagedDsqlAdmin` plan, confirmation, and apply
+- [x] 13. Add library-only explicit managed-cluster destruction
+  - [x] 13.1 Implement `ManagedDsqlAdmin` plan, confirmation, and apply
     - Keep planning read-only and bind the plan digest to descriptor revision, canonical
       ID/ARN/Region, and observed protection; reject absent/mismatched confirmation or a
       stale descriptor before any AWS mutation.
@@ -326,18 +326,18 @@
       Derive separate retry-stable operation tokens from plan digest and operation name.
     - Expose no `tkr` or `tkp` command/deployment adapter in this feature.
     - _Requirements: 9.4–9.11_
-  - [ ] 13.2 Property test: Property 13 — destruction is explicit, bound, and idempotent
+  - [x] 13.2 Property test: Property 13 — destruction is explicit, bound, and idempotent
     - Generate engine lifecycle sequences, stale/current plans, confirmation values, AWS
       retry schedules, and plan replays for at least 100 cases with fake AWS and storage.
     - Tag: `// Feature: managed-embedded-dsql, Property 13: destruction is explicit, bound, and idempotent`
     - _Requirements: 9.1–9.11, 13.14_
-  - [ ] 13.3 Add fixed administrative destruction tests
+  - [x] 13.3 Add fixed administrative destruction tests
     - Cover plan content, confirmation binding, stale revision/identity, protection-before-
       delete ordering, separate idempotency tokens, retries, deleted/not-found success,
       tombstone persistence, and redacted output/errors.
     - _Requirements: 9.5–9.11_
 
-- [ ] 14. Checkpoint: embedded lifecycle is green
+- [x] 14. Checkpoint: embedded lifecycle is green
   - Run formatting plus focused check, clippy, nextest, and doctests for managed DSQL,
     storage, engine, runtime, and edge; confirm Properties 12, 13, and 19 pass and all
     engine lifecycle tests make zero destructive AWS calls.

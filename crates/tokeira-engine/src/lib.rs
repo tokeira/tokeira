@@ -18,12 +18,15 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
+    future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc, RwLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration as StdDuration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -72,7 +75,10 @@ use tokeira_auth::{
 };
 use tokeira_chasm::Library as _;
 use tokeira_config::{Cli, ConfigStorageKind};
-pub use tokeira_config::{SnapshotPolicyConfig, TokeiraConfig};
+pub use tokeira_config::{
+    DsqlMigrationPolicy, EmbeddedEngineConfig, EmbeddedStorageConfig, SnapshotPolicyConfig,
+    TokeiraConfig,
+};
 use tokeira_edge::{
     Authenticator, CacheBackedRouter, CallbackResponse, EdgeInterceptors, EdgeRoutingConfig,
     HistoryNotifyingRepository, HistoryWaitRegistry, HttpApiCatalog, HttpApiPolicy,
@@ -228,6 +234,11 @@ async fn build_authorization_stack(config: &TokeiraConfig) -> Result<Authorizati
     })
 }
 use tokeira_kernel::{Link, LoadedRun};
+use tokeira_managed_dsql::{
+    AwsDsqlControlPlane, CanonicalClusterIdentity, ClusterAction, CreateOrRecoverRequest,
+    LocalClusterDescriptorStore, ManagedDsqlLifecycle, Readiness, ResolvedCluster, StartupDeadline,
+    SystemLifecycleEnvironment,
+};
 use tokeira_projection::{
     DsqlVisibilityStore, InMemoryVisibilityStore, ProjectionSink, ProjectionWorker, SearchAttrType,
     VisibilityQueryService, VisibilitySink, VisibilityStore,
@@ -240,21 +251,28 @@ use tokeira_runtime::{
     NexusCompletionDeps, NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusEndpointSpec,
     NexusEndpointSpecTarget, NexusEndpointStore, NexusNamespaceResolver,
     NexusWorkerComputeProvider, OBSERVATION_CHANNEL_CAPACITY, RECONCILE_CHANNEL_CAPACITY,
-    RepositoryBackedTaskQueueConfigStore, RuntimeConfig, ScheduleEngineConfig, ScheduleStore,
-    SystemWorkerComputeClock, TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime,
-    WorkerComputeControllerService, WorkerComputeOutbox, WorkerComputeReconciler,
+    RepositoryBackedTaskQueueConfigStore, RuntimeConfig, RuntimeShutdownHandle,
+    ScheduleEngineConfig, ScheduleStore, SystemWorkerComputeClock, TEMPORAL_CALLBACK_TOKEN_HEADER,
+    TokeiraRuntime, WorkerComputeControllerService, WorkerComputeOutbox, WorkerComputeReconciler,
     WorkflowTaskReportedProblem, nexus_payload_to_body, reported_problem_from_state,
     run_schedule_engine, system_callback_post_url,
 };
 use tokeira_storage::{
-    InMemoryStore, InMemoryWorkerComputeRepository, LeaseOutcome, LeaseRepository, ProjectionLog,
-    RunRepository, TaskQueueConfigRepository, WorkerComputeRepository, WorkerDeploymentRepository,
-    WorkerTaskProvenanceStore,
-    dsql::{DsqlAuthConfig, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore},
+    ConnectionDirector, DbClass, InMemoryStore, InMemoryWorkerComputeRepository, LeaseOutcome,
+    LeaseRepository, ProjectionLog, RunRepository, TaskQueueConfigRepository,
+    WorkerComputeRepository, WorkerDeploymentRepository, WorkerTaskProvenanceStore,
+    dsql::{
+        ConnectionControlLeaseRepository, ControlLeaseAcquireOutcome, ControlLeaseAcquireRequest,
+        ControlLeaseClusterIdentity, ControlLeaseError, ControlLeaseGuard, DsqlAuthConfig,
+        DsqlConnectionDirector, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore,
+        EmbeddedDsqlPoolConfig, MigrationRunner, OWNER_ADMISSION_MARGIN, OWNER_LEASE_DURATION,
+        OWNER_RENEW_INTERVAL, OwnershipAdmissionGate, OwnershipAdmissionState, SchemaDecision,
+        SchemaMigrationPolicy, WarmupDeadline,
+    },
 };
 use tokeira_types::{
     ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, ProjectionCursor,
-    SearchAttrValue, ShardId, WorkflowId,
+    SearchAttrValue, ShardEpoch, ShardId, WorkflowId,
 };
 
 /// Nexus-endpoint bootstrap target used by the dev startup path. Kept in the
@@ -400,6 +418,255 @@ pub struct Engine {
     log_broadcast: broadcast::Sender<LogEvent>,
     snapshot_policy: Option<EngineSnapshotPolicy>,
     recovery_task: Option<JoinHandle<Result<()>>>,
+    startup_report: EngineStartupReport,
+    shutdown_coordinator: Option<EmbeddedShutdownCoordinator>,
+}
+
+/// Storage mode selected by the explicit embedded startup boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedStorageMode {
+    /// Ephemeral process-local authoritative storage.
+    InMemory,
+    /// Dedicated cluster created or recovered by the managed lifecycle.
+    ManagedDsql,
+    /// Canonical operator-supplied DSQL identity.
+    ExistingDsql,
+}
+
+/// Complete redacted report returned by a successful embedded startup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineStartupReport {
+    /// Explicit storage mode that reached admission-open.
+    pub storage_mode: EmbeddedStorageMode,
+    /// Canonical cluster observation for a durable mode.
+    pub cluster: Option<ClusterStartupReport>,
+    /// Release-pinned schema outcome for a durable mode.
+    pub schema: Option<SchemaStartupReport>,
+    /// Exclusive embedded ownership outcome for a durable mode.
+    pub ownership: Option<OwnershipStartupReport>,
+}
+
+impl EngineStartupReport {
+    fn in_memory() -> Self {
+        Self {
+            storage_mode: EmbeddedStorageMode::InMemory,
+            cluster: None,
+            schema: None,
+            ownership: None,
+        }
+    }
+}
+
+/// Canonical cluster fields safe for host diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClusterStartupReport {
+    /// AWS Region used by lifecycle and IAM signing.
+    pub region: String,
+    /// Canonical AWS DSQL cluster ID.
+    pub cluster_id: String,
+    /// Canonical AWS DSQL cluster ARN.
+    pub cluster_arn: String,
+    /// Current connection locator, never used as identity.
+    pub endpoint: String,
+    /// Whether startup created, recovered, or validated the cluster.
+    pub action: ClusterAction,
+}
+
+/// Schema migration work completed during startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaStartupOutcome {
+    /// The database already satisfied the release contract.
+    Compatible,
+    /// A previously empty database received the complete Tokeira schema.
+    Initialized,
+    /// A verified older schema advanced to the target version.
+    Migrated,
+    /// Legacy compatibility metadata was backfilled without schema DDL.
+    MetadataBackfilled,
+}
+
+/// Redacted release/schema compatibility evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaStartupReport {
+    /// Highest observed migration version after policy application.
+    pub observed_version: u32,
+    /// Oldest schema version this release may read.
+    pub minimum_supported_version: u32,
+    /// Automatic migration target for this release.
+    pub target_version: u32,
+    /// Newest schema version this release may read.
+    pub maximum_readable_version: u32,
+    /// Release-pinned migration-set digest; never migration SQL.
+    pub migration_set_digest: String,
+    /// Startup migration outcome.
+    pub outcome: SchemaStartupOutcome,
+}
+
+/// Exclusive ownership acquisition evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnershipStartupReport {
+    /// Whether the claim was clean or replaced an expired owner.
+    pub outcome: ControlLeaseAcquireOutcome,
+    /// Database-issued monotonic fence token.
+    pub fence_token: i64,
+}
+
+/// Ordered startup phase used by typed, redacted failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedStartupPhase {
+    /// Validate explicit storage intent and ordinary server policy.
+    Configuration,
+    /// Create, recover, or validate the canonical cluster identity.
+    ClusterResolution,
+    /// Establish and warm the bounded process-local DSQL pool.
+    ConnectionWarmup,
+    /// Assess and apply the release-pinned schema policy.
+    Schema,
+    /// Acquire the exclusive embedded owner claim.
+    Ownership,
+    /// Reconstruct runtime state and acquire self-assigned shard leases.
+    RuntimeRestore,
+}
+
+impl std::fmt::Display for EmbeddedStartupPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Configuration => "configuration validation",
+            Self::ClusterResolution => "cluster resolution",
+            Self::ConnectionWarmup => "DSQL connection warmup",
+            Self::Schema => "schema compatibility",
+            Self::Ownership => "embedded ownership",
+            Self::RuntimeRestore => "runtime restoration",
+        })
+    }
+}
+
+/// Redacted failure from explicit embedded startup.
+#[derive(Debug)]
+pub enum EmbeddedEngineStartError {
+    /// Configuration failed before any external resource was touched.
+    InvalidConfiguration(tokeira_config::EmbeddedConfigError),
+    /// One startup phase failed; details remain in host-controlled telemetry.
+    Phase {
+        /// Phase that did not complete.
+        phase: EmbeddedStartupPhase,
+    },
+    /// The one host-configured startup budget elapsed in the named phase.
+    DeadlineExceeded {
+        /// Phase active when the shared deadline elapsed.
+        phase: EmbeddedStartupPhase,
+    },
+}
+
+impl std::fmt::Display for EmbeddedEngineStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfiguration(error) => {
+                write!(formatter, "invalid embedded engine configuration: {error}")
+            }
+            Self::Phase { phase } => {
+                write!(formatter, "embedded engine startup failed during {phase}")
+            }
+            Self::DeadlineExceeded { phase } => {
+                write!(
+                    formatter,
+                    "embedded engine startup deadline exceeded during {phase}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EmbeddedEngineStartError {}
+
+impl From<tokeira_config::EmbeddedConfigError> for EmbeddedEngineStartError {
+    fn from(error: tokeira_config::EmbeddedConfigError) -> Self {
+        Self::InvalidConfiguration(error)
+    }
+}
+
+/// Independent cleanup stage that failed during explicit shutdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedShutdownFailure {
+    /// In-process handlers did not drain by the deadline.
+    RpcDrain,
+    /// Runtime or engine-owned tasks did not join by the deadline.
+    RuntimeTasks,
+    /// A self-assigned shard lease could not be relinquished.
+    ShardRelease,
+    /// The conditional embedded-owner release failed.
+    OwnershipRelease,
+    /// Embedded DSQL pool drain/closure failed.
+    Storage,
+    /// Final in-memory snapshot persistence failed.
+    Snapshot,
+}
+
+/// Aggregated explicit-shutdown failure.
+#[derive(Debug)]
+pub struct EmbeddedEngineShutdownError {
+    failures: Vec<EmbeddedShutdownFailure>,
+}
+
+impl std::fmt::Display for EmbeddedEngineShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "embedded engine shutdown completed with {} cleanup failure(s)",
+            self.failures.len()
+        )
+    }
+}
+
+impl std::error::Error for EmbeddedEngineShutdownError {}
+
+impl EmbeddedEngineShutdownError {
+    /// Ordered cleanup stages that failed; later cleanup was still attempted.
+    pub fn failures(&self) -> &[EmbeddedShutdownFailure] {
+        &self.failures
+    }
+}
+
+type CleanupFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+type CleanupAction = Box<dyn FnOnce(Instant) -> CleanupFuture + Send>;
+
+#[derive(Clone)]
+struct EmbeddedOwnership {
+    repository: ConnectionControlLeaseRepository,
+    guard: Arc<tokio::sync::Mutex<Option<ControlLeaseGuard>>>,
+    gate: OwnershipAdmissionGate,
+}
+
+impl std::fmt::Debug for EmbeddedOwnership {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddedOwnership")
+            .field("gate", &self.gate)
+            .finish_non_exhaustive()
+    }
+}
+
+struct EmbeddedShutdownCoordinator {
+    service: InProcessGrpcService,
+    runtime_tasks: RuntimeShutdownHandle,
+    engine_tasks: RuntimeShutdownHandle,
+    shard_cleanup: Option<CleanupAction>,
+    director: Option<Arc<DsqlConnectionDirector>>,
+    ownership: Option<EmbeddedOwnership>,
+}
+
+impl std::fmt::Debug for EmbeddedShutdownCoordinator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddedShutdownCoordinator")
+            .field("service", &self.service)
+            .field("runtime_tasks", &self.runtime_tasks)
+            .field("engine_tasks", &self.engine_tasks)
+            .field("has_shard_cleanup", &self.shard_cleanup.is_some())
+            .field("has_director", &self.director.is_some())
+            .field("ownership", &self.ownership)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -492,6 +759,15 @@ impl Engine {
         let snapshot_policy = snapshot_config.map(|config| {
             EngineSnapshotPolicy::start(store, config, stack.background_cancel.clone())
         });
+        stack.engine_tasks.close_registration();
+        let shutdown_coordinator = EmbeddedShutdownCoordinator {
+            service: stack.service.clone(),
+            runtime_tasks: stack.runtime_tasks,
+            engine_tasks: stack.engine_tasks,
+            shard_cleanup: stack.shard_cleanup,
+            director: None,
+            ownership: None,
+        };
         Ok(Self {
             endpoint: TemporalEndpoint {
                 service: stack.service,
@@ -501,7 +777,40 @@ impl Engine {
             log_broadcast: stack.log_broadcast,
             snapshot_policy,
             recovery_task: stack.recovery_task,
+            startup_report: EngineStartupReport::in_memory(),
+            shutdown_coordinator: Some(shutdown_coordinator),
         })
+    }
+
+    /// Start a zero-listener engine from an explicit embedded storage decision.
+    ///
+    /// The legacy [`Self::start`] and [`Self::start_with_config`] methods remain
+    /// in-memory only. This is the sole engine boundary that may create or
+    /// recover managed Aurora DSQL infrastructure.
+    pub async fn start_with_embedded_config(
+        config: EmbeddedEngineConfig,
+    ) -> Result<Self, EmbeddedEngineStartError> {
+        if !matches!(config.storage, EmbeddedStorageConfig::InMemory)
+            && config.server.policy.snapshot.is_some()
+        {
+            return Err(EmbeddedEngineStartError::Phase {
+                phase: EmbeddedStartupPhase::Configuration,
+            });
+        }
+        config.validate()?;
+        if matches!(config.storage, EmbeddedStorageConfig::InMemory) {
+            return Self::start_with_config(config.server).await.map_err(|_| {
+                EmbeddedEngineStartError::Phase {
+                    phase: EmbeddedStartupPhase::RuntimeRestore,
+                }
+            });
+        }
+        start_embedded_dsql(config).await
+    }
+
+    /// Return the complete redacted report for the startup that produced this engine.
+    pub fn startup_report(&self) -> &EngineStartupReport {
+        &self.startup_report
     }
 
     /// Return a cloneable raw-protobuf endpoint for this engine.
@@ -528,21 +837,688 @@ impl Engine {
     /// When snapshot policy is disabled this retains the previous cancellation-only
     /// behaviour. A configured final snapshot failure is returned to the caller: a
     /// graceful shutdown must not silently claim durability it did not achieve.
-    pub async fn shutdown(mut self) -> Result<()> {
-        self.background_cancel.cancel();
-        let recovery_result = match self.recovery_task.take() {
-            Some(task) => task
-                .await
-                .context("embedded snapshot recovery task panicked during shutdown")?,
-            None => Ok(()),
-        };
-        let snapshot_result = match self.snapshot_policy.take() {
-            Some(policy) => finish_snapshot_policy(policy).await,
-            None => Ok(()),
-        };
-        recovery_result?;
-        snapshot_result
+    pub async fn shutdown(mut self) -> Result<(), EmbeddedEngineShutdownError> {
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        let mut failures = Vec::new();
+        if let Some(mut coordinator) = self.shutdown_coordinator.take() {
+            coordinator.begin_shutdown();
+            coordinator.shutdown(deadline, &mut failures).await;
+        } else {
+            self.background_cancel.cancel();
+        }
+        if let Some(task) = self.recovery_task.take()
+            && task.await.is_err()
+        {
+            failures.push(EmbeddedShutdownFailure::ShardRelease);
+        }
+        if let Some(policy) = self.snapshot_policy.take()
+            && finish_snapshot_policy(policy).await.is_err()
+        {
+            failures.push(EmbeddedShutdownFailure::Snapshot);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(EmbeddedEngineShutdownError { failures })
+        }
     }
+}
+
+impl EmbeddedShutdownCoordinator {
+    fn begin_shutdown(&self) {
+        self.service.begin_shutdown();
+        if let Some(ownership) = &self.ownership {
+            ownership.gate.begin_closing();
+        }
+        self.engine_tasks.begin_shutdown();
+        self.runtime_tasks.begin_shutdown();
+    }
+
+    async fn shutdown(&mut self, deadline: Instant, failures: &mut Vec<EmbeddedShutdownFailure>) {
+        if self.service.drain(deadline).await.is_err() {
+            failures.push(EmbeddedShutdownFailure::RpcDrain);
+        }
+        if self.engine_tasks.wait(deadline).await.is_err() {
+            failures.push(EmbeddedShutdownFailure::RuntimeTasks);
+        }
+        if self.runtime_tasks.wait(deadline).await.is_err() {
+            failures.push(EmbeddedShutdownFailure::RuntimeTasks);
+        }
+        if let Some(cleanup) = self.shard_cleanup.take()
+            && cleanup(deadline).await.is_err()
+        {
+            failures.push(EmbeddedShutdownFailure::ShardRelease);
+        }
+        if let (Some(ownership), Some(director)) = (&self.ownership, &self.director) {
+            let now = Instant::now();
+            let ownership_drained = now < deadline
+                && tokio::time::timeout(
+                    deadline.saturating_duration_since(now),
+                    ownership.gate.wait_for_drain(),
+                )
+                .await
+                .is_ok();
+            if ownership_drained {
+                let now = Instant::now();
+                let release_result = if now < deadline {
+                    tokio::time::timeout(
+                        deadline.saturating_duration_since(now),
+                        release_embedded_ownership(ownership, director),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("embedded ownership release deadline elapsed"))
+                    .and_then(|result| result)
+                } else {
+                    Err(anyhow!("embedded ownership release deadline elapsed"))
+                };
+                if release_result.is_err() {
+                    failures.push(EmbeddedShutdownFailure::OwnershipRelease);
+                }
+            } else {
+                // Releasing while a checkout still uses the claim would let a
+                // clean takeover overlap prior database work. Leave the claim
+                // to expire instead and report the incomplete cleanup.
+                failures.push(EmbeddedShutdownFailure::OwnershipRelease);
+            }
+        }
+        if let Some(director) = &self.director
+            && director.shutdown_with_deadline(deadline).await.is_err()
+        {
+            failures.push(EmbeddedShutdownFailure::Storage);
+        }
+    }
+}
+
+async fn start_embedded_dsql(
+    config: EmbeddedEngineConfig,
+) -> Result<Engine, EmbeddedEngineStartError> {
+    let deadline = Instant::now() + StdDuration::from_millis(config.startup_timeout_ms);
+    let storage_mode = match &config.storage {
+        EmbeddedStorageConfig::ManagedDsql(_) => EmbeddedStorageMode::ManagedDsql,
+        EmbeddedStorageConfig::ExistingDsql(_) => EmbeddedStorageMode::ExistingDsql,
+        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
+    };
+    let region = match &config.storage {
+        EmbeddedStorageConfig::ManagedDsql(managed) => managed.region.clone(),
+        EmbeddedStorageConfig::ExistingDsql(existing) => existing.region.clone(),
+        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
+    };
+    let control = startup_infallible_phase(
+        deadline,
+        EmbeddedStartupPhase::ClusterResolution,
+        AwsDsqlControlPlane::from_region(region.clone()),
+    )
+    .await?;
+    let lifecycle_deadline = StartupDeadline::at(deadline);
+    let resolved = match &config.storage {
+        EmbeddedStorageConfig::ManagedDsql(managed) => {
+            let lifecycle = ManagedDsqlLifecycle::new(
+                control.clone(),
+                LocalClusterDescriptorStore::new(&managed.descriptor_path),
+                SystemLifecycleEnvironment,
+            );
+            startup_phase(
+                deadline,
+                EmbeddedStartupPhase::ClusterResolution,
+                lifecycle.create_or_recover(
+                    CreateOrRecoverRequest {
+                        region: managed.region.clone(),
+                        tags: managed.tags.clone(),
+                    },
+                    lifecycle_deadline,
+                ),
+            )
+            .await?
+        }
+        EmbeddedStorageConfig::ExistingDsql(existing) => {
+            // `resolve_existing` cannot touch the descriptor seam. The inert
+            // path is never opened and exists only to satisfy the lifecycle's
+            // generic state-store type without adding another public adapter.
+            let unused_descriptor = LocalClusterDescriptorStore::new(PathBuf::new());
+            let lifecycle = ManagedDsqlLifecycle::new(
+                control.clone(),
+                unused_descriptor,
+                SystemLifecycleEnvironment,
+            );
+            let identity = CanonicalClusterIdentity::new(
+                &existing.region,
+                &existing.cluster_id,
+                &existing.cluster_arn,
+            )
+            .map_err(|_| EmbeddedEngineStartError::Phase {
+                phase: EmbeddedStartupPhase::ClusterResolution,
+            })?;
+            startup_phase(
+                deadline,
+                EmbeddedStartupPhase::ClusterResolution,
+                lifecycle.resolve_existing(identity, lifecycle_deadline),
+            )
+            .await?
+        }
+        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
+    };
+    let readiness = refresh_cluster_until_storage_handoff(
+        &config.storage,
+        control.clone(),
+        resolved,
+        lifecycle_deadline,
+        deadline,
+    )
+    .await?;
+    let cluster = match &readiness {
+        Readiness::Active(usable) => usable.resolved().clone(),
+        Readiness::WakeRequired(cluster) => cluster.clone(),
+    };
+
+    let migration_policy = config
+        .effective_migration_policy()
+        .expect("durable embedded mode always has a migration policy");
+    let mut server = config.server;
+    server.infrastructure.storage = ConfigStorageKind::Dsql;
+    server.infrastructure.placement.controller_endpoint = None;
+    server.infrastructure.dsql.endpoint = Some(cluster.endpoint.clone());
+    server.infrastructure.dsql.region = Some(cluster.identity.region.clone());
+    server
+        .validate()
+        .map_err(|_| EmbeddedEngineStartError::Phase {
+            phase: EmbeddedStartupPhase::Configuration,
+        })?;
+
+    let limits = match &config.storage {
+        EmbeddedStorageConfig::ManagedDsql(managed) => &managed.limits,
+        EmbeddedStorageConfig::ExistingDsql(existing) => &existing.limits,
+        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
+    };
+    let mut pool_config = EmbeddedDsqlPoolConfig::with_limits(
+        limits.max_connections,
+        limits.concurrent_connection_creations,
+        limits.connection_rate_per_second,
+        limits.connection_burst,
+    );
+    pool_config.shard_count = server.infrastructure.placement.shard_count;
+    pool_config.projection_partition_count = server.infrastructure.placement.partition_count;
+    let auth = DsqlAuthConfig {
+        endpoint: cluster.endpoint.clone(),
+        region: Some(cluster.identity.region.clone()),
+        admin_role_arn: server.infrastructure.dsql.admin_role_arn.clone(),
+        runtime_role_arn: server.infrastructure.dsql.runtime_role_arn.clone(),
+        readonly_role_arn: server.infrastructure.dsql.readonly_role_arn.clone(),
+    };
+    let dsql_store = startup_phase(
+        deadline,
+        EmbeddedStartupPhase::ConnectionWarmup,
+        DsqlStore::connect_embedded(auth, pool_config, WarmupDeadline::new(deadline)),
+    )
+    .await?;
+    let director = dsql_store.connection_director_arc();
+
+    let cluster = if matches!(readiness, Readiness::WakeRequired(_)) {
+        match refresh_cluster_after_wake(
+            &config.storage,
+            control,
+            cluster,
+            lifecycle_deadline,
+            deadline,
+        )
+        .await
+        {
+            Ok(cluster) => cluster,
+            Err(error) => {
+                let _ = director.shutdown_with_deadline(deadline).await;
+                return Err(error);
+            }
+        }
+    } else {
+        cluster
+    };
+
+    let schema = match startup_phase(
+        deadline,
+        EmbeddedStartupPhase::Schema,
+        apply_embedded_schema(
+            director.clone(),
+            &cluster,
+            schema_migration_policy(migration_policy),
+            deadline,
+        ),
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = director.shutdown_with_deadline(deadline).await;
+            return Err(error);
+        }
+    };
+
+    let (ownership, ownership_report) = match startup_phase(
+        deadline,
+        EmbeddedStartupPhase::Ownership,
+        acquire_embedded_ownership(director.clone(), &cluster, deadline),
+    )
+    .await
+    {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            let _ = director.shutdown_with_deadline(deadline).await;
+            return Err(error);
+        }
+    };
+    if director
+        .install_ownership_gate(ownership.gate.clone())
+        .is_err()
+    {
+        rollback_embedded_dsql(&ownership, &director, deadline).await;
+        return Err(EmbeddedEngineStartError::Phase {
+            phase: EmbeddedStartupPhase::Ownership,
+        });
+    }
+
+    let stack = match startup_phase(
+        deadline,
+        EmbeddedStartupPhase::RuntimeRestore,
+        build_dsql_stack(
+            StackTransport::Embedded,
+            Arc::new(server),
+            dsql_store,
+            cluster.endpoint.clone(),
+        ),
+    )
+    .await
+    {
+        Ok(ConstructedStack::Embedded(stack)) => stack,
+        Ok(ConstructedStack::Network(_)) => {
+            rollback_embedded_dsql(&ownership, &director, deadline).await;
+            return Err(EmbeddedEngineStartError::Phase {
+                phase: EmbeddedStartupPhase::RuntimeRestore,
+            });
+        }
+        Err(error) => {
+            rollback_embedded_dsql(&ownership, &director, deadline).await;
+            return Err(error);
+        }
+    };
+
+    spawn_ownership_renewal(
+        &stack.engine_tasks,
+        director.clone(),
+        ownership.clone(),
+        stack.service.clone(),
+    );
+    stack.engine_tasks.close_registration();
+    let report = EngineStartupReport {
+        storage_mode,
+        cluster: Some(ClusterStartupReport {
+            region: cluster.identity.region.clone(),
+            cluster_id: cluster.identity.cluster_id.clone(),
+            cluster_arn: cluster.identity.cluster_arn.clone(),
+            endpoint: cluster.endpoint.clone(),
+            action: cluster.action,
+        }),
+        schema: Some(schema),
+        ownership: Some(ownership_report),
+    };
+    let coordinator = EmbeddedShutdownCoordinator {
+        service: stack.service.clone(),
+        runtime_tasks: stack.runtime_tasks,
+        engine_tasks: stack.engine_tasks,
+        shard_cleanup: stack.shard_cleanup,
+        director: Some(director),
+        ownership: Some(ownership),
+    };
+    Ok(Engine {
+        endpoint: TemporalEndpoint {
+            service: stack.service,
+            shutdown: stack.background_cancel.clone(),
+        },
+        background_cancel: stack.background_cancel,
+        log_broadcast: stack.log_broadcast,
+        snapshot_policy: None,
+        recovery_task: stack.recovery_task,
+        startup_report: report,
+        shutdown_coordinator: Some(coordinator),
+    })
+}
+
+async fn refresh_cluster_until_storage_handoff(
+    storage: &EmbeddedStorageConfig,
+    control: AwsDsqlControlPlane,
+    cluster: ResolvedCluster,
+    lifecycle_deadline: StartupDeadline,
+    deadline: Instant,
+) -> Result<Readiness, EmbeddedEngineStartError> {
+    match storage {
+        EmbeddedStorageConfig::ManagedDsql(managed) => {
+            let lifecycle = ManagedDsqlLifecycle::new(
+                control,
+                LocalClusterDescriptorStore::new(&managed.descriptor_path),
+                SystemLifecycleEnvironment,
+            );
+            startup_phase(
+                deadline,
+                EmbeddedStartupPhase::ClusterResolution,
+                lifecycle.refresh_until_usable(cluster, lifecycle_deadline),
+            )
+            .await
+        }
+        EmbeddedStorageConfig::ExistingDsql(_) => {
+            let lifecycle = ManagedDsqlLifecycle::new(
+                control,
+                LocalClusterDescriptorStore::new(PathBuf::new()),
+                SystemLifecycleEnvironment,
+            );
+            startup_phase(
+                deadline,
+                EmbeddedStartupPhase::ClusterResolution,
+                lifecycle.refresh_until_usable(cluster, lifecycle_deadline),
+            )
+            .await
+        }
+        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
+    }
+}
+
+async fn refresh_cluster_after_wake(
+    storage: &EmbeddedStorageConfig,
+    control: AwsDsqlControlPlane,
+    cluster: ResolvedCluster,
+    lifecycle_deadline: StartupDeadline,
+    deadline: Instant,
+) -> Result<ResolvedCluster, EmbeddedEngineStartError> {
+    let usable = match storage {
+        EmbeddedStorageConfig::ManagedDsql(managed) => {
+            let lifecycle = ManagedDsqlLifecycle::new(
+                control,
+                LocalClusterDescriptorStore::new(&managed.descriptor_path),
+                SystemLifecycleEnvironment,
+            );
+            startup_phase(
+                deadline,
+                EmbeddedStartupPhase::ConnectionWarmup,
+                lifecycle.refresh_after_wake(cluster, lifecycle_deadline),
+            )
+            .await?
+        }
+        EmbeddedStorageConfig::ExistingDsql(_) => {
+            let lifecycle = ManagedDsqlLifecycle::new(
+                control,
+                LocalClusterDescriptorStore::new(PathBuf::new()),
+                SystemLifecycleEnvironment,
+            );
+            startup_phase(
+                deadline,
+                EmbeddedStartupPhase::ConnectionWarmup,
+                lifecycle.refresh_after_wake(cluster, lifecycle_deadline),
+            )
+            .await?
+        }
+        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
+    };
+    Ok(usable.into_resolved())
+}
+
+fn schema_migration_policy(policy: DsqlMigrationPolicy) -> SchemaMigrationPolicy {
+    match policy {
+        DsqlMigrationPolicy::Automatic => SchemaMigrationPolicy::Automatic,
+        DsqlMigrationPolicy::ValidateOnly => SchemaMigrationPolicy::ValidateOnly,
+    }
+}
+
+async fn apply_embedded_schema(
+    director: Arc<DsqlConnectionDirector>,
+    cluster: &ResolvedCluster,
+    policy: SchemaMigrationPolicy,
+    deadline: Instant,
+) -> Result<SchemaStartupReport> {
+    let runner = MigrationRunner::embedded();
+    let contract = MigrationRunner::compatibility_contract();
+    let leases = ConnectionControlLeaseRepository::new();
+    let mut permit = director.acquire(DbClass::Control).await?;
+    let decision = runner
+        .assess_connection(permit.connection()?, &contract, policy)
+        .await?;
+    let outcome = match &decision {
+        SchemaDecision::Compatible {
+            legacy_backfill: false,
+            ..
+        } => SchemaStartupOutcome::Compatible,
+        SchemaDecision::Compatible {
+            legacy_backfill: true,
+            ..
+        } => SchemaStartupOutcome::MetadataBackfilled,
+        SchemaDecision::Initialize { .. } => SchemaStartupOutcome::Initialized,
+        SchemaDecision::Migrate { .. } => SchemaStartupOutcome::Migrated,
+        SchemaDecision::MigrationRequired { current, target } => {
+            return Err(anyhow!(
+                "schema migration required from V{current} to V{target}"
+            ));
+        }
+        SchemaDecision::Reject(_) => return Err(anyhow!("schema compatibility rejected")),
+    };
+    if !matches!(outcome, SchemaStartupOutcome::Compatible) {
+        runner
+            .bootstrap_migration_coordination(permit.connection()?, &decision)
+            .await?;
+        leases.bootstrap(permit.connection()?).await?;
+        let migration_guard = leases
+            .acquire(
+                permit.connection()?,
+                &ControlLeaseAcquireRequest {
+                    claim_name: "schema-migration".to_owned(),
+                    cluster: control_lease_identity(cluster),
+                    owner_id: format!("schema-{}", IncarnationId::new()),
+                    lease_duration: OWNER_LEASE_DURATION,
+                    admission_margin: OWNER_ADMISSION_MARGIN,
+                    acquire_deadline: deadline,
+                },
+            )
+            .await?;
+        let migration_gate = OwnershipAdmissionGate::for_guard(&migration_guard);
+        let apply_result = runner
+            .apply_decision(permit.connection()?, &decision, &migration_guard)
+            .await;
+        let release_result = leases
+            .release(permit.connection()?, &migration_guard, &migration_gate)
+            .await;
+        apply_result?;
+        release_result?;
+    }
+    let final_decision = runner
+        .assess_connection(
+            permit.connection()?,
+            &contract,
+            SchemaMigrationPolicy::ValidateOnly,
+        )
+        .await?;
+    let observed_version = match final_decision {
+        SchemaDecision::Compatible { current, .. } => current,
+        _ => return Err(anyhow!("schema did not converge to a readable version")),
+    };
+    Ok(SchemaStartupReport {
+        observed_version,
+        minimum_supported_version: contract.minimum_supported_version,
+        target_version: contract.target_version,
+        maximum_readable_version: contract.maximum_readable_version,
+        migration_set_digest: contract.migration_set_digest,
+        outcome,
+    })
+}
+
+async fn acquire_embedded_ownership(
+    director: Arc<DsqlConnectionDirector>,
+    cluster: &ResolvedCluster,
+    deadline: Instant,
+) -> Result<(EmbeddedOwnership, OwnershipStartupReport)> {
+    let repository = ConnectionControlLeaseRepository::new();
+    let mut permit = director.acquire(DbClass::Control).await?;
+    repository.bootstrap(permit.connection()?).await?;
+    let guard = repository
+        .acquire(
+            permit.connection()?,
+            &ControlLeaseAcquireRequest {
+                claim_name: "embedded-owner".to_owned(),
+                cluster: control_lease_identity(cluster),
+                owner_id: format!("engine-{}", IncarnationId::new()),
+                lease_duration: OWNER_LEASE_DURATION,
+                admission_margin: OWNER_ADMISSION_MARGIN,
+                acquire_deadline: deadline,
+            },
+        )
+        .await?;
+    let gate = OwnershipAdmissionGate::for_guard(&guard);
+    if let Some(quiescence_deadline) = guard.quiescence_deadline() {
+        let now = Instant::now();
+        if now >= deadline || quiescence_deadline > deadline {
+            return Err(anyhow!("expired owner quiescence exceeds startup deadline"));
+        }
+        tokio::time::sleep_until(tokio::time::Instant::from_std(quiescence_deadline)).await;
+        gate.finish_quiescence(&guard, Instant::now())?;
+    }
+    let report = OwnershipStartupReport {
+        outcome: guard.outcome(),
+        fence_token: guard.fence_token(),
+    };
+    Ok((
+        EmbeddedOwnership {
+            repository,
+            guard: Arc::new(tokio::sync::Mutex::new(Some(guard))),
+            gate,
+        },
+        report,
+    ))
+}
+
+fn spawn_ownership_renewal(
+    tasks: &RuntimeShutdownHandle,
+    director: Arc<DsqlConnectionDirector>,
+    ownership: EmbeddedOwnership,
+    service: InProcessGrpcService,
+) {
+    let cancel = tasks.cancellation_token();
+    let _renewal = tasks.spawn(async move {
+        let interval_duration =
+            StdDuration::try_from(OWNER_RENEW_INTERVAL).expect("positive owner renewal interval");
+        let mut interval = tokio::time::interval(interval_duration);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let mut guard_slot = ownership.guard.lock().await;
+                    let Some(guard) = guard_slot.as_mut() else {
+                        break;
+                    };
+                    let result = match director.acquire(DbClass::Control).await {
+                        Ok(mut permit) => match permit.connection() {
+                            Ok(connection) => ownership.repository.renew(
+                                    connection,
+                                    guard,
+                                    OWNER_LEASE_DURATION,
+                                    OWNER_ADMISSION_MARGIN,
+                                    &ownership.gate,
+                                )
+                                .await
+                                .map_err(anyhow::Error::from),
+                            Err(error) => Err(error),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        if matches!(
+                            error.downcast_ref::<ControlLeaseError>(),
+                            Some(ControlLeaseError::Fenced)
+                        ) {
+                            ownership.gate.fence();
+                        } else {
+                            guard.enforce_admission_deadline(Instant::now(), &ownership.gate);
+                        }
+                    }
+                    if ownership.gate.state() != OwnershipAdmissionState::Open {
+                        service.begin_shutdown();
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn control_lease_identity(cluster: &ResolvedCluster) -> ControlLeaseClusterIdentity {
+    ControlLeaseClusterIdentity {
+        cluster_id: cluster.identity.cluster_id.clone(),
+        cluster_arn: cluster.identity.cluster_arn.clone(),
+    }
+}
+
+async fn rollback_embedded_dsql(
+    ownership: &EmbeddedOwnership,
+    director: &Arc<DsqlConnectionDirector>,
+    deadline: Instant,
+) {
+    ownership.gate.begin_closing();
+    let now = Instant::now();
+    if now < deadline {
+        let _ = tokio::time::timeout(
+            deadline.saturating_duration_since(now),
+            release_embedded_ownership(ownership, director),
+        )
+        .await;
+    }
+    let _ = director.shutdown_with_deadline(deadline).await;
+}
+
+async fn release_embedded_ownership(
+    ownership: &EmbeddedOwnership,
+    director: &Arc<DsqlConnectionDirector>,
+) -> Result<()> {
+    // Ordinary owner admission is closed here. This shutdown-only director
+    // seam still consumes the Control budget and one bounded physical slot.
+    let mut permit = director.acquire_shutdown_control().await?;
+    let mut guard = ownership.guard.lock().await;
+    if let Some(guard) = guard.take() {
+        ownership
+            .repository
+            .release(permit.connection()?, &guard, &ownership.gate)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn startup_phase<T, E, F>(
+    deadline: Instant,
+    phase: EmbeddedStartupPhase,
+    future: F,
+) -> Result<T, EmbeddedEngineStartError>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(EmbeddedEngineStartError::DeadlineExceeded { phase });
+    }
+    match tokio::time::timeout(deadline.saturating_duration_since(now), future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(EmbeddedEngineStartError::Phase { phase }),
+        Err(_) => Err(EmbeddedEngineStartError::DeadlineExceeded { phase }),
+    }
+}
+
+async fn startup_infallible_phase<T, F>(
+    deadline: Instant,
+    phase: EmbeddedStartupPhase,
+    future: F,
+) -> Result<T, EmbeddedEngineStartError>
+where
+    F: Future<Output = T>,
+{
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(EmbeddedEngineStartError::DeadlineExceeded { phase });
+    }
+    tokio::time::timeout(deadline.saturating_duration_since(now), future)
+        .await
+        .map_err(|_| EmbeddedEngineStartError::DeadlineExceeded { phase })
 }
 
 /// Drain a cancelled snapshot policy: await its periodic task, then persist
@@ -726,6 +1702,9 @@ fn embedded_config(mut config: TokeiraConfig) -> Result<TokeiraConfig> {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        if let Some(coordinator) = &self.shutdown_coordinator {
+            coordinator.begin_shutdown();
+        }
         self.background_cancel.cancel();
     }
 }
@@ -1375,12 +2354,66 @@ enum ConstructedStack {
     Embedded(EmbeddedStack),
 }
 
-#[derive(Debug)]
 struct EmbeddedStack {
     service: InProcessGrpcService,
     background_cancel: CancellationToken,
     log_broadcast: broadcast::Sender<LogEvent>,
     recovery_task: Option<JoinHandle<Result<()>>>,
+    runtime_tasks: RuntimeShutdownHandle,
+    engine_tasks: RuntimeShutdownHandle,
+    shard_cleanup: Option<CleanupAction>,
+}
+
+struct StackStartupGuard {
+    runtime_tasks: RuntimeShutdownHandle,
+    engine_tasks: RuntimeShutdownHandle,
+    armed: bool,
+}
+
+impl StackStartupGuard {
+    fn new(runtime_tasks: RuntimeShutdownHandle, engine_tasks: RuntimeShutdownHandle) -> Self {
+        Self {
+            runtime_tasks,
+            engine_tasks,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StackStartupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Async cleanup is owned by the caller's pool rollback, but every
+            // background loop must first observe cancellation so it cannot
+            // retain the partially constructed stack indefinitely.
+            self.engine_tasks.begin_shutdown();
+            self.runtime_tasks.begin_shutdown();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SelfAssignedShardLease {
+    shard_id: ShardId,
+    owner: String,
+    epoch: ShardEpoch,
+}
+
+impl std::fmt::Debug for EmbeddedStack {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddedStack")
+            .field("service", &self.service)
+            .field("background_cancel", &self.background_cancel)
+            .field("runtime_tasks", &self.runtime_tasks)
+            .field("engine_tasks", &self.engine_tasks)
+            .field("has_shard_cleanup", &self.shard_cleanup.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Build the full server stack and start serving on the given address.
@@ -1437,51 +2470,11 @@ async fn build_and_serve(
             let dsql_store = DsqlStore::connect(auth, pool_config, ddb_client)
                 .await
                 .context("failed to connect DSQL storage backend")?;
-            let (
-                director,
-                run_repository,
-                projection_log,
-                worker_deployment_repository,
-                _migration_runner,
-            ) = dsql_store.into_parts();
-            // The CHASM node store shares the same connection director as the rest
-            // of the DSQL backend, so standalone-activity node state is durable on
-            // the same cluster.
-            let chasm_node_repo = Arc::new(tokeira_storage::dsql::DsqlChasmNodeRepository::new(
-                director.clone(),
-            ));
-            let task_queue_config_repository: Arc<dyn TaskQueueConfigRepository> = Arc::new(
-                tokeira_storage::dsql::DsqlTaskQueueConfigRepository::new(director.clone()),
-            );
-            let worker_compute_repository =
-                effective_config.policy.worker_compute.enabled.then(|| {
-                    Arc::new(tokeira_storage::dsql::DsqlWorkerComputeRepository::new(
-                        director.clone(),
-                    )) as Arc<dyn WorkerComputeRepository>
-                });
-            let worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore> = Arc::new(
-                tokeira_storage::dsql::DsqlWorkerTaskProvenanceStore::new(director.clone()),
-            );
-            let visibility_store = DsqlVisibilityStore::new(director);
-            let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
-                Arc::new(worker_deployment_repository);
-            build_service_stack_with_storage(
+            build_dsql_stack(
                 StackTransport::Network(addr),
                 effective_config,
-                Arc::new(run_repository),
-                worker_deployment_repository,
-                worker_compute_repository,
-                task_queue_config_repository,
-                worker_task_provenance,
-                projection_log,
-                visibility_store.clone(),
-                {
-                    let visibility_store = visibility_store.clone();
-                    move || visibility_store.clone()
-                },
-                Some(endpoint),
-                chasm_node_repo,
-                false,
+                dsql_store,
+                endpoint,
             )
             .await
         }
@@ -1499,6 +2492,55 @@ async fn build_and_serve(
             "network service construction returned an embedded stack"
         )),
     }
+}
+
+async fn build_dsql_stack(
+    transport: StackTransport,
+    effective_config: Arc<TokeiraConfig>,
+    dsql_store: DsqlStore,
+    endpoint: String,
+) -> Result<ConstructedStack> {
+    let (director, run_repository, projection_log, worker_deployment_repository, _migration_runner) =
+        dsql_store.into_parts();
+    // Every repository and visibility surface shares this exact director. The
+    // embedded caller retains another Arc solely for ordered pool shutdown;
+    // no second pool or DynamoDB coordinator is constructed here.
+    let chasm_node_repo = Arc::new(tokeira_storage::dsql::DsqlChasmNodeRepository::new(
+        director.clone(),
+    ));
+    let task_queue_config_repository: Arc<dyn TaskQueueConfigRepository> = Arc::new(
+        tokeira_storage::dsql::DsqlTaskQueueConfigRepository::new(director.clone()),
+    );
+    let worker_compute_repository = effective_config.policy.worker_compute.enabled.then(|| {
+        Arc::new(tokeira_storage::dsql::DsqlWorkerComputeRepository::new(
+            director.clone(),
+        )) as Arc<dyn WorkerComputeRepository>
+    });
+    let worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore> = Arc::new(
+        tokeira_storage::dsql::DsqlWorkerTaskProvenanceStore::new(director.clone()),
+    );
+    let visibility_store = DsqlVisibilityStore::new(director);
+    let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
+        Arc::new(worker_deployment_repository);
+    build_service_stack_with_storage(
+        transport,
+        effective_config,
+        Arc::new(run_repository),
+        worker_deployment_repository,
+        worker_compute_repository,
+        task_queue_config_repository,
+        worker_task_provenance,
+        projection_log,
+        visibility_store.clone(),
+        {
+            let visibility_store = visibility_store.clone();
+            move || visibility_store.clone()
+        },
+        Some(endpoint),
+        chasm_node_repo,
+        false,
+    )
+    .await
 }
 
 async fn build_embedded(
@@ -1566,10 +2608,11 @@ const WORKER_TASK_PROVENANCE_CLEANUP_INTERVAL: std::time::Duration =
 const WORKER_TASK_PROVENANCE_CLEANUP_BATCH: usize = 256;
 
 fn spawn_worker_task_provenance_cleanup(
+    tasks: &RuntimeShutdownHandle,
     store: Arc<dyn WorkerTaskProvenanceStore>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut interval = tokio::time::interval(WORKER_TASK_PROVENANCE_CLEANUP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1611,6 +2654,7 @@ fn worker_task_provenance_cleanup_error_kind(
 /// today); other archetypes are skipped. Runs immediately, then on an interval, until
 /// `cancel` fires.
 fn spawn_visibility_repair(
+    tasks: &RuntimeShutdownHandle,
     nodes: Arc<dyn tokeira_storage::ChasmNodeRepository>,
     sink: Arc<dyn tokeira_projection::ProjectionSink>,
     activity_archetype: Option<u32>,
@@ -1627,7 +2671,7 @@ fn spawn_visibility_repair(
         });
     let scanner =
         tokeira_runtime::chasm::VisibilityRepairScanner::new(nodes, sink, rebuild, partition_count);
-    tokio::spawn(async move {
+    let _repair = tasks.spawn(async move {
         let mut interval = tokio::time::interval(VISIBILITY_REPAIR_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1657,12 +2701,13 @@ const CHASM_TIMER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// history-authority invariants hold. Runs until `cancel` fires. Gated on standalone
 /// activities being enabled, since only they arm activity timers today.
 fn spawn_chasm_timer_sweeper(
+    tasks: &RuntimeShutdownHandle,
     engine: Arc<tokeira_runtime::chasm::ChasmEngine>,
     evaluator: Arc<dyn tokeira_runtime::chasm::TimeoutEvaluator>,
     cancel: CancellationToken,
 ) {
     let sweeper = tokeira_runtime::chasm::ChasmTimerSweeper::new(engine, evaluator);
-    tokio::spawn(async move {
+    let _sweeper = tasks.spawn(async move {
         let mut interval = tokio::time::interval(CHASM_TIMER_SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1863,6 +2908,10 @@ where
         ),
     ));
     let runtime = Arc::new(runtime);
+    let runtime_tasks = runtime.shutdown_handle();
+    let engine_tasks = RuntimeShutdownHandle::new();
+    let mut startup_guard = StackStartupGuard::new(runtime_tasks.clone(), engine_tasks.clone());
+    let background_cancel = engine_tasks.cancellation_token();
 
     let recovered_lease = if recover_self_assigned_shard {
         let shard_id = ShardId(0);
@@ -1875,24 +2924,25 @@ where
         None
     };
 
-    if dsql_endpoint.is_some()
+    if matches!(transport, StackTransport::Network(_))
+        && dsql_endpoint.is_some()
         && effective_config
             .infrastructure
             .placement
             .controller_endpoint
             .is_none()
     {
-        self_assign_dsql_shards(
+        let _leases = self_assign_dsql_shards(
             runtime.as_ref(),
             repo.as_ref(),
             effective_config.infrastructure.placement.shard_count,
             &node_id,
             &node_endpoint,
+            false,
         )
         .await?;
     }
 
-    let background_cancel = CancellationToken::new();
     let recovery_task = recovered_lease.map(|(shard_id, owner, epoch)| {
         let runtime = runtime.clone();
         let repo = repo.clone();
@@ -1924,10 +2974,12 @@ where
             }
         })
     });
-    let _task_queue_config_refresh = task_queue_config_store
+    let task_queue_config_refresh = task_queue_config_store
         .clone()
         .spawn_refresh(background_cancel.clone());
+    let _task_queue_config_refresh = engine_tasks.track_join(task_queue_config_refresh);
     let _worker_task_provenance_cleanup = spawn_worker_task_provenance_cleanup(
+        &engine_tasks,
         worker_task_provenance.clone(),
         background_cancel.clone(),
     );
@@ -1993,7 +3045,7 @@ where
             reconcile_receiver,
         );
         let service_cancel = background_cancel.clone();
-        Some(tokio::spawn(async move {
+        Some(engine_tasks.spawn(async move {
             if let Err(error) = service.run(service_cancel).await {
                 tracing::warn!(?error, "worker-compute controller service exited");
             }
@@ -2002,7 +3054,7 @@ where
         None
     };
 
-    let _membership_client = effective_config
+    let membership_client = effective_config
         .infrastructure
         .placement
         .controller_endpoint
@@ -2019,12 +3071,16 @@ where
                 background_cancel.clone(),
             )
         });
-    let _schedule_engine = run_schedule_engine(
+    if let Some(membership_client) = membership_client {
+        let _membership_client = engine_tasks.track_join(membership_client);
+    }
+    let schedule_engine = run_schedule_engine(
         schedule_store.clone(),
         runtime.clone(),
         ScheduleEngineConfig::default(),
         background_cancel.clone(),
     );
+    let _schedule_engine = engine_tasks.track_join(schedule_engine);
 
     let authorization = build_authorization_stack(&effective_config).await?;
     let interceptors = Arc::new(EdgeInterceptors::configured(
@@ -2049,7 +3105,7 @@ where
         };
         let subscription_cache = routing_cache.clone();
         let subscription_cancel = background_cancel.clone();
-        let _routing_subscription = tokio::spawn(async move {
+        let _routing_subscription = engine_tasks.spawn(async move {
             if let Err(error) =
                 run_routing_subscription(subscription_cache, routing_config, subscription_cancel)
                     .await
@@ -2097,7 +3153,7 @@ where
             batch_size: 256,
         };
         let projection_cancel = background_cancel.clone();
-        tokio::spawn(async move {
+        let _projection_worker = engine_tasks.spawn(async move {
             if let Err(error) = projection_worker
                 .run_from_cursor(
                     projection_cancel,
@@ -2257,6 +3313,7 @@ where
         // the AGENTS-3 sweeper shape (derived effect reconstructed from authoritative
         // state), the durability backstop for the best-effort post-commit write (24.2).
         spawn_visibility_repair(
+            &engine_tasks,
             repair_nodes,
             Arc::new(projection_sink()),
             repair_archetype,
@@ -2270,6 +3327,7 @@ where
         // the configured gate and pays no idle sweep cost.
         if standalone_enabled || cfg!(feature = "conformance") {
             spawn_chasm_timer_sweeper(
+                &engine_tasks,
                 sweeper_engine,
                 activity_bridge.clone(),
                 background_cancel.clone(),
@@ -2282,6 +3340,36 @@ where
     let admin_grpc = AdminServiceGrpc::new(workflow_service);
     let operator_grpc = OperatorServiceGrpc::new(operator_service);
 
+    // Embedded startup defers self-assignment until every other fallible stack
+    // construction step has completed. Admission is not opened until all
+    // configured leases are held, and the returned cleanup owns the exact
+    // `(shard, owner, epoch)` tuples needed for conditional release.
+    let shard_cleanup = if matches!(transport, StackTransport::Embedded)
+        && dsql_endpoint.is_some()
+        && effective_config
+            .infrastructure
+            .placement
+            .controller_endpoint
+            .is_none()
+    {
+        let leases = self_assign_dsql_shards(
+            runtime.as_ref(),
+            repo.as_ref(),
+            effective_config.infrastructure.placement.shard_count,
+            &node_id,
+            &node_endpoint,
+            true,
+        )
+        .await?;
+        Some(self_assigned_shard_cleanup(
+            runtime.clone(),
+            repo.clone(),
+            leases,
+        ))
+    } else {
+        None
+    };
+
     match dsql_endpoint {
         Some(endpoint) => info!(%endpoint, "storage backend: dsql"),
         None => info!("storage backend: in-memory"),
@@ -2290,11 +3378,15 @@ where
     let log_broadcast = broadcast::Sender::<LogEvent>::new(LOG_BROADCAST_CAPACITY);
     let addr = match transport {
         StackTransport::Embedded => {
+            startup_guard.disarm();
             return Ok(ConstructedStack::Embedded(EmbeddedStack {
                 service: InProcessGrpcService::new(workflow_grpc, operator_grpc, admin_grpc),
                 background_cancel,
                 log_broadcast,
                 recovery_task,
+                runtime_tasks,
+                engine_tasks,
+                shard_cleanup,
             }));
         }
         StackTransport::Network(addr) => addr,
@@ -2408,6 +3500,7 @@ where
         }
     }
 
+    startup_guard.disarm();
     Ok(ConstructedStack::Network((
         server_task,
         bound_addr,
@@ -2723,7 +3816,8 @@ async fn self_assign_dsql_shards<R>(
     shard_count: u32,
     node_id: &IncarnationId,
     node_endpoint: &NodeEndpoint,
-) -> Result<()>
+    require_all: bool,
+) -> Result<Vec<SelfAssignedShardLease>>
 where
     R: LeaseRepository + RunRepository + 'static,
 {
@@ -2739,21 +3833,33 @@ where
         }
     }
 
-    let mut acquired = 0u32;
+    let mut acquired = Vec::new();
+    let owner = node_id.to_string();
     for shard_index in 0..shard_count {
         let shard_id = ShardId(shard_index);
         match lease_repository
-            .try_acquire_bundle(shard_id, node_id.to_string(), node_endpoint.as_authority())
+            .try_acquire_bundle(shard_id, owner.clone(), node_endpoint.as_authority())
             .await
         {
             Ok(LeaseOutcome::Acquired { epoch } | LeaseOutcome::Renewed { epoch }) => {
                 runtime.record_self_assigned_shard(shard_id, epoch);
-                acquired += 1;
+                acquired.push(SelfAssignedShardLease {
+                    shard_id,
+                    owner: owner.clone(),
+                    epoch,
+                });
             }
             Ok(LeaseOutcome::Rejected {
                 current_owner,
                 current_epoch,
             }) => {
+                if require_all {
+                    rollback_self_assigned_shards(runtime, lease_repository, &acquired).await;
+                    return Err(anyhow!(
+                        "embedded DSQL shard {shard_index} is held by owner {current_owner} at epoch {}",
+                        current_epoch.0
+                    ));
+                }
                 tracing::warn!(
                     shard_index,
                     %current_owner,
@@ -2762,15 +3868,86 @@ where
                 );
             }
             Err(error) => {
+                if require_all {
+                    rollback_self_assigned_shards(runtime, lease_repository, &acquired).await;
+                    return Err(error).context(format!(
+                        "failed to self-assign embedded DSQL shard {shard_index}"
+                    ));
+                }
                 tracing::warn!(shard_index, ?error, "failed to self-assign shard");
             }
         }
     }
     info!(
-        acquired,
+        acquired = acquired.len(),
         shard_count, "self-assigned DSQL shards (no controller)"
     );
-    Ok(())
+    Ok(acquired)
+}
+
+async fn rollback_self_assigned_shards<R>(
+    runtime: &TokeiraRuntime<R>,
+    lease_repository: &R,
+    leases: &[SelfAssignedShardLease],
+) where
+    R: LeaseRepository + RunRepository + 'static,
+{
+    for lease in leases.iter().rev() {
+        runtime.relinquish_shard(lease.shard_id).await;
+        let _ = lease_repository
+            .relinquish_bundle(lease.shard_id, lease.owner.clone(), lease.epoch)
+            .await;
+    }
+}
+
+fn self_assigned_shard_cleanup<R>(
+    runtime: Arc<TokeiraRuntime<R>>,
+    lease_repository: Arc<R>,
+    leases: Vec<SelfAssignedShardLease>,
+) -> CleanupAction
+where
+    R: LeaseRepository + RunRepository + 'static,
+{
+    Box::new(move |deadline| {
+        Box::pin(async move {
+            let mut first_error = None;
+            for lease in leases.into_iter().rev() {
+                runtime.relinquish_shard(lease.shard_id).await;
+                let now = Instant::now();
+                if now >= deadline {
+                    first_error.get_or_insert_with(|| {
+                        anyhow!("deadline elapsed while relinquishing embedded DSQL shards")
+                    });
+                    continue;
+                }
+                let release = tokio::time::timeout(
+                    deadline.saturating_duration_since(now),
+                    lease_repository.relinquish_bundle(lease.shard_id, lease.owner, lease.epoch),
+                )
+                .await;
+                match release {
+                    Ok(Ok(LeaseOutcome::Acquired { .. })) => {}
+                    Ok(Ok(outcome)) => {
+                        first_error.get_or_insert_with(|| {
+                            anyhow!("embedded DSQL shard release was fenced: {outcome:?}")
+                        });
+                    }
+                    Ok(Err(error)) => {
+                        first_error.get_or_insert(error);
+                    }
+                    Err(_) => {
+                        first_error.get_or_insert_with(|| {
+                            anyhow!("deadline elapsed while relinquishing embedded DSQL shard")
+                        });
+                    }
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
+    })
 }
 
 fn configured_node_endpoint(config: &TokeiraConfig, listen_addr: SocketAddr) -> NodeEndpoint {
@@ -3147,9 +4324,274 @@ pub fn __cli_parse() -> Cli {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     // Endpoint target/config types are referenced only by the Nexus endpoint store
     // tests below; importing them here (not at crate scope) keeps the lib build clean.
     use tokeira_runtime::{EndpointTarget, NexusEndpointConfig};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StartupModelPhase {
+        Cluster,
+        Pool,
+        Schema,
+        Ownership,
+        Runtime,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StartupModelEvent {
+        Attempt(StartupModelPhase),
+        Complete(StartupModelPhase),
+        ReleaseOwnership,
+        ClosePool,
+        ReturnHandle,
+    }
+
+    const STARTUP_MODEL_PHASES: [StartupModelPhase; 5] = [
+        StartupModelPhase::Cluster,
+        StartupModelPhase::Pool,
+        StartupModelPhase::Schema,
+        StartupModelPhase::Ownership,
+        StartupModelPhase::Runtime,
+    ];
+
+    fn startup_model(failure_boundary: Option<usize>) -> Vec<StartupModelEvent> {
+        let mut events = Vec::new();
+        let mut pool_open = false;
+        let mut ownership_held = false;
+        for (index, phase) in STARTUP_MODEL_PHASES.into_iter().enumerate() {
+            events.push(StartupModelEvent::Attempt(phase));
+            if failure_boundary == Some(index) {
+                if ownership_held {
+                    events.push(StartupModelEvent::ReleaseOwnership);
+                }
+                if pool_open {
+                    events.push(StartupModelEvent::ClosePool);
+                }
+                return events;
+            }
+            events.push(StartupModelEvent::Complete(phase));
+            pool_open |= phase == StartupModelPhase::Pool;
+            ownership_held |= phase == StartupModelPhase::Ownership;
+        }
+        events.push(StartupModelEvent::ReturnHandle);
+        events
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ShutdownModelEvent {
+        CloseAdmission,
+        CancelTasks,
+        CallsComplete,
+        DrainComplete,
+        TasksComplete,
+        JoinComplete,
+        FinishTelemetry,
+        AttemptShardRelease,
+        AttemptOwnershipRelease,
+        AttemptPoolClose,
+        ReturnToHost,
+    }
+
+    fn shutdown_model(calls_pending: bool, tasks_pending: bool) -> Vec<ShutdownModelEvent> {
+        let mut events = vec![
+            ShutdownModelEvent::CloseAdmission,
+            ShutdownModelEvent::CancelTasks,
+        ];
+        if calls_pending {
+            events.push(ShutdownModelEvent::CallsComplete);
+        }
+        events.push(ShutdownModelEvent::DrainComplete);
+        if tasks_pending {
+            events.push(ShutdownModelEvent::TasksComplete);
+        }
+        events.extend([
+            ShutdownModelEvent::JoinComplete,
+            ShutdownModelEvent::FinishTelemetry,
+            ShutdownModelEvent::AttemptShardRelease,
+            ShutdownModelEvent::AttemptOwnershipRelease,
+            ShutdownModelEvent::AttemptPoolClose,
+            ShutdownModelEvent::ReturnToHost,
+        ]);
+        events
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Feature: managed-embedded-dsql, Property 12: startup is prefix-safe and failure-atomic
+        #[test]
+        fn startup_is_prefix_safe_and_failure_atomic(
+            failure_boundary in prop::option::of(0usize..STARTUP_MODEL_PHASES.len()),
+        ) {
+            let events = startup_model(failure_boundary);
+            let attempted = events.iter().filter_map(|event| match event {
+                StartupModelEvent::Attempt(phase) => Some(*phase),
+                _ => None,
+            }).collect::<Vec<_>>();
+            let completed = events.iter().filter_map(|event| match event {
+                StartupModelEvent::Complete(phase) => Some(*phase),
+                _ => None,
+            }).collect::<Vec<_>>();
+
+            prop_assert_eq!(attempted.as_slice(), &STARTUP_MODEL_PHASES[..attempted.len()]);
+            prop_assert_eq!(completed.as_slice(), &STARTUP_MODEL_PHASES[..completed.len()]);
+            if let Some(boundary) = failure_boundary {
+                prop_assert!(!events.contains(&StartupModelEvent::ReturnHandle));
+                let rollback = events.iter().filter(|event| matches!(
+                    event,
+                    StartupModelEvent::ReleaseOwnership | StartupModelEvent::ClosePool
+                )).copied().collect::<Vec<_>>();
+                let expected = match boundary {
+                    0 | 1 => Vec::new(),
+                    2 | 3 => vec![StartupModelEvent::ClosePool],
+                    _ => vec![
+                        StartupModelEvent::ReleaseOwnership,
+                        StartupModelEvent::ClosePool,
+                    ],
+                };
+                prop_assert_eq!(rollback, expected);
+            } else {
+                prop_assert_eq!(completed.len(), STARTUP_MODEL_PHASES.len());
+                prop_assert_eq!(events.last(), Some(&StartupModelEvent::ReturnHandle));
+            }
+        }
+
+        // Feature: managed-embedded-dsql, Property 19: shutdown establishes the host flush boundary
+        #[test]
+        fn shutdown_establishes_the_host_flush_boundary(
+            calls_pending in any::<bool>(),
+            tasks_pending in any::<bool>(),
+            independent_failure_mask in 0u8..8,
+        ) {
+            let events = shutdown_model(calls_pending, tasks_pending);
+            prop_assert_eq!(events.first(), Some(&ShutdownModelEvent::CloseAdmission));
+            prop_assert_eq!(events.get(1), Some(&ShutdownModelEvent::CancelTasks));
+            prop_assert_eq!(events.last(), Some(&ShutdownModelEvent::ReturnToHost));
+            for cleanup in [
+                ShutdownModelEvent::AttemptShardRelease,
+                ShutdownModelEvent::AttemptOwnershipRelease,
+                ShutdownModelEvent::AttemptPoolClose,
+            ] {
+                prop_assert!(events.contains(&cleanup));
+            }
+            let failures = (0..3)
+                .filter(|bit| independent_failure_mask & (1 << bit) != 0)
+                .count();
+            prop_assert_eq!(failures, independent_failure_mask.count_ones() as usize);
+            prop_assert!(
+                events.iter().position(|event| *event == ShutdownModelEvent::FinishTelemetry)
+                    < events.iter().position(|event| *event == ShutdownModelEvent::ReturnToHost)
+            );
+        }
+    }
+
+    #[test]
+    fn every_startup_failure_boundary_rolls_back_without_returning_a_handle() {
+        for boundary in 0..STARTUP_MODEL_PHASES.len() {
+            let events = startup_model(Some(boundary));
+            assert!(!events.contains(&StartupModelEvent::ReturnHandle));
+        }
+    }
+
+    #[test]
+    fn durable_startup_report_exposes_only_approved_evidence() {
+        let report = EngineStartupReport {
+            storage_mode: EmbeddedStorageMode::ManagedDsql,
+            cluster: Some(ClusterStartupReport {
+                region: "eu-west-1".to_owned(),
+                cluster_id: "cluster-1".to_owned(),
+                cluster_arn: "arn:aws:dsql:eu-west-1:123456789012:cluster/cluster-1".to_owned(),
+                endpoint: "cluster-1.dsql.eu-west-1.on.aws".to_owned(),
+                action: ClusterAction::Recovered,
+            }),
+            schema: Some(SchemaStartupReport {
+                observed_version: 1,
+                minimum_supported_version: 1,
+                target_version: 1,
+                maximum_readable_version: 1,
+                migration_set_digest: "release-digest".to_owned(),
+                outcome: SchemaStartupOutcome::Compatible,
+            }),
+            ownership: Some(OwnershipStartupReport {
+                outcome: ControlLeaseAcquireOutcome::Clean,
+                fence_token: 7,
+            }),
+        };
+        let diagnostic = format!("{report:?}");
+        assert!(!diagnostic.contains("descriptor-path-secret"));
+        assert!(!diagnostic.contains("create-token-secret"));
+        assert!(!diagnostic.contains("credential-secret"));
+    }
+
+    #[tokio::test]
+    async fn explicit_in_memory_start_preserves_legacy_mode_and_shuts_down_cleanly() {
+        let engine = Engine::start_with_embedded_config(EmbeddedEngineConfig::default())
+            .await
+            .expect("explicit in-memory startup succeeds");
+        assert_eq!(engine.startup_report(), &EngineStartupReport::in_memory());
+        engine.shutdown().await.expect("tracked shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn invalid_explicit_config_fails_before_startup() {
+        let config = EmbeddedEngineConfig {
+            startup_timeout_ms: 0,
+            ..EmbeddedEngineConfig::default()
+        };
+        assert!(matches!(
+            Engine::start_with_embedded_config(config).await,
+            Err(EmbeddedEngineStartError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_conflict_fails_before_descriptor_or_aws_work() {
+        let descriptor_path = std::env::temp_dir().join(format!(
+            "tokeira-managed-dsql-preflight-{}.json",
+            IncarnationId::new()
+        ));
+        let mut config = EmbeddedEngineConfig::default();
+        config.server.policy.snapshot = Some(SnapshotPolicyConfig {
+            location: descriptor_path.with_extension("snapshot"),
+            interval_ms: 1_000,
+        });
+        config.storage =
+            EmbeddedStorageConfig::ManagedDsql(tokeira_config::ManagedEmbeddedDsqlConfig {
+                intent: tokeira_config::ManagedClusterIntent::CreateOrRecover,
+                descriptor_path: descriptor_path.clone(),
+                region: "eu-west-2".to_owned(),
+                migration_policy: None,
+                limits: tokeira_config::EmbeddedDsqlLimits::default(),
+                tags: std::collections::BTreeMap::new(),
+            });
+
+        assert!(matches!(
+            Engine::start_with_embedded_config(config).await,
+            Err(EmbeddedEngineStartError::Phase {
+                phase: EmbeddedStartupPhase::Configuration
+            })
+        ));
+        assert!(!descriptor_path.exists());
+    }
+
+    #[tokio::test]
+    async fn drop_synchronously_closes_endpoint_admission() {
+        let engine = Engine::start().await.expect("engine starts");
+        let endpoint = engine.endpoint();
+        drop(engine);
+
+        let error = endpoint
+            .call(InProcessGrpcRequest {
+                service: "temporal.api.workflowservice.v1.WorkflowService".to_owned(),
+                rpc: "GetSystemInfo".to_owned(),
+                headers: http::HeaderMap::new(),
+                proto: Bytes::new(),
+            })
+            .await
+            .expect_err("dropped engine rejects endpoint clones");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+    }
 
     #[tokio::test]
     async fn snapshot_policy_over_dsql_storage_is_rejected() {

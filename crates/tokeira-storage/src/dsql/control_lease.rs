@@ -15,7 +15,7 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use sqlx::PgPool;
+use sqlx::{Connection as _, PgConnection, PgPool};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Notify;
 
@@ -226,6 +226,178 @@ pub struct ControlLeaseRepository {
     pool: PgPool,
     clock: Arc<dyn MonotonicClock>,
     max_occ_retries: u32,
+}
+
+/// Control-lease operations over a caller-admitted DSQL connection.
+///
+/// Embedded mode obtains this connection from [`DsqlConnectionDirector`](super::DsqlConnectionDirector),
+/// so schema and ownership coordination consume the same bounded pool and do
+/// not construct an unaccounted `PgPool` beside it.
+#[derive(Clone, Debug)]
+pub struct ConnectionControlLeaseRepository {
+    clock: Arc<dyn MonotonicClock>,
+    max_occ_retries: u32,
+}
+
+impl ConnectionControlLeaseRepository {
+    /// Construct a connection-scoped repository with system monotonic time.
+    pub fn new() -> Self {
+        Self {
+            clock: Arc::new(SystemMonotonicClock),
+            max_occ_retries: DEFAULT_MAX_OCC_RETRIES,
+        }
+    }
+
+    /// Create the idempotent bootstrap table on an admitted connection.
+    pub async fn bootstrap(&self, connection: &mut PgConnection) -> Result<(), ControlLeaseError> {
+        sqlx::query(control_lease_bootstrap_sql())
+            .execute(&mut *connection)
+            .await?;
+        Ok(())
+    }
+
+    /// Acquire a claim without opening any connection outside the director.
+    pub async fn acquire(
+        &self,
+        connection: &mut PgConnection,
+        request: &ControlLeaseAcquireRequest,
+    ) -> Result<ControlLeaseGuard, ControlLeaseError> {
+        let timing = validate_request(request)?;
+        sqlx::query(INSERT_CLAIM_SQL)
+            .bind(&request.claim_name)
+            .bind(&request.cluster.cluster_id)
+            .bind(&request.cluster.cluster_arn)
+            .execute(&mut *connection)
+            .await?;
+
+        let mut conflicts = 0;
+        loop {
+            if self.clock.now() >= request.acquire_deadline {
+                return Err(ControlLeaseError::DeadlineElapsed);
+            }
+            match acquire_once_connection(self.clock.as_ref(), connection, request, timing).await {
+                Ok(guard) => return Ok(guard),
+                Err(error) if error.is_occ_conflict() && conflicts < self.max_occ_retries => {
+                    conflicts += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Renew a guard through one director-admitted control connection.
+    pub async fn renew(
+        &self,
+        connection: &mut PgConnection,
+        guard: &mut ControlLeaseGuard,
+        lease_duration: Duration,
+        admission_margin: Duration,
+        gate: &OwnershipAdmissionGate,
+    ) -> Result<(), ControlLeaseError> {
+        let timing = validate_timing(lease_duration, admission_margin)?;
+        guard.enforce_admission_deadline(self.clock.now(), gate);
+        let renewed = sqlx::query_scalar::<_, OffsetDateTime>(RENEW_CLAIM_SQL)
+            .bind(&guard.claim_name)
+            .bind(&guard.owner_id)
+            .bind(guard.fence_token)
+            .bind(timing.lease_millis)
+            .fetch_optional(&mut *connection)
+            .await?;
+        let database_expires_at = require_conditional_match(renewed, gate)?;
+        guard.database_expires_at = database_expires_at;
+        guard.local_admission_deadline = self.clock.now() + timing.admission_duration;
+        Ok(())
+    }
+
+    /// Conditionally release a guard through the bounded control class.
+    pub async fn release(
+        &self,
+        connection: &mut PgConnection,
+        guard: &ControlLeaseGuard,
+        gate: &OwnershipAdmissionGate,
+    ) -> Result<(), ControlLeaseError> {
+        gate.begin_closing();
+        let result = sqlx::query(RELEASE_CLAIM_SQL)
+            .bind(&guard.claim_name)
+            .bind(&guard.owner_id)
+            .bind(guard.fence_token)
+            .execute(&mut *connection)
+            .await?;
+        require_conditional_match((result.rows_affected() > 0).then_some(()), gate)?;
+        Ok(())
+    }
+}
+
+impl Default for ConnectionControlLeaseRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+async fn acquire_once_connection(
+    clock: &dyn MonotonicClock,
+    connection: &mut PgConnection,
+    request: &ControlLeaseAcquireRequest,
+    timing: ValidatedLeaseTiming,
+) -> Result<ControlLeaseGuard, ControlLeaseError> {
+    // Every 40001 retry re-enters here with a fresh transaction and therefore
+    // a fresh DSQL repeatable-read snapshot.
+    let mut transaction = connection.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *transaction)
+        .await?;
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Option<String>,
+            i64,
+            OffsetDateTime,
+            OffsetDateTime,
+        ),
+    >(LOCK_CLAIM_SQL)
+    .bind(&request.claim_name)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let snapshot = LeaseSnapshot {
+        cluster: ControlLeaseClusterIdentity {
+            cluster_id: row.0,
+            cluster_arn: row.1,
+        },
+        owner_id: row.2,
+        fence_token: row.3,
+        expires_at: row.4,
+    };
+    let outcome = acquisition_outcome(&snapshot, &request.cluster, row.5)?;
+    let next_fence = snapshot
+        .fence_token
+        .checked_add(1)
+        .ok_or_else(|| ControlLeaseError::InvalidRequest("fence token exhausted".to_owned()))?;
+    let database_expires_at = sqlx::query_scalar::<_, OffsetDateTime>(ACQUIRE_CLAIM_SQL)
+        .bind(&request.claim_name)
+        .bind(&request.owner_id)
+        .bind(next_fence)
+        .bind(timing.lease_millis)
+        .bind(snapshot.fence_token)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(ControlLeaseError::Fenced)?;
+    transaction.commit().await?;
+
+    let confirmed_at = clock.now();
+    let quiescence_deadline = (outcome == ControlLeaseAcquireOutcome::ExpiredTakeover)
+        .then(|| confirmed_at + timing.quiescence);
+    Ok(ControlLeaseGuard {
+        claim_name: request.claim_name.clone(),
+        cluster: request.cluster.clone(),
+        owner_id: request.owner_id.clone(),
+        fence_token: next_fence,
+        database_expires_at,
+        local_admission_deadline: confirmed_at + timing.admission_duration,
+        quiescence_deadline,
+        outcome,
+    })
 }
 
 impl ControlLeaseRepository {

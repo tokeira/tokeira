@@ -7,13 +7,19 @@
 //! edge preserves admission, authorization, tracing, and status mapping without
 //! coupling the engine to a particular SDK or tonic generation.
 
-use std::sync::Arc;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use http_body_legacy::Body as _;
 use hyper_legacy::{Body, Request, Version};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tonic::{Code, Status, transport::server::Routes};
 use tower::ServiceExt as _;
 
@@ -74,6 +80,7 @@ pub struct InProcessGrpcService {
     /// runtime its host initialized it on, and this handle pins all handler
     /// execution to that runtime.
     handler_runtime: tokio::runtime::Handle,
+    admission: InProcessAdmission,
 }
 
 impl InProcessGrpcService {
@@ -94,7 +101,26 @@ impl InProcessGrpcService {
         Self {
             routes: Arc::new(Mutex::new(routes)),
             handler_runtime: tokio::runtime::Handle::current(),
+            admission: InProcessAdmission::new(),
         }
+    }
+
+    /// Synchronously reject every subsequent call while admitted handlers drain.
+    ///
+    /// This operation is safe from [`Drop`]: it performs no I/O, takes no async
+    /// lock, and wakes a pending drain immediately when there are no handlers.
+    pub fn begin_shutdown(&self) {
+        self.admission.begin_shutdown();
+    }
+
+    /// Await every previously admitted handler within the caller's absolute deadline.
+    pub async fn drain(&self, deadline: Instant) -> Result<(), InProcessDrainError> {
+        self.admission.drain(deadline).await
+    }
+
+    /// Return the current admitted-handler count for bounded diagnostics.
+    pub fn in_flight_calls(&self) -> usize {
+        self.admission.in_flight()
     }
 
     /// Dispatch one uncompressed unary call through the assembled tonic router.
@@ -108,6 +134,9 @@ impl InProcessGrpcService {
     ) -> Result<InProcessGrpcResponse, Status> {
         validate_method_name(&request.service, "service")?;
         validate_method_name(&request.rpc, "rpc")?;
+        let admission = self.admission.admit().map_err(|()| {
+            Status::unavailable("embedded Tokeira engine is not admitting new calls")
+        })?;
 
         let path = format!("/{}/{}", request.service, request.rpc);
         let mut frame = Vec::with_capacity(request.proto.len() + 5);
@@ -146,6 +175,10 @@ impl InProcessGrpcService {
         // cancelled callback or long-poll releases its admission permit and
         // other RAII state exactly as an h2 reset does on the network server.
         let handler = AbortOnDropHandler::new(self.handler_runtime.spawn(async move {
+            // The guard deliberately lives inside the spawned handler. Caller
+            // cancellation aborts this task and drops the guard before the
+            // join reports completion, matching transport-level handler drain.
+            let _admission = admission;
             let response = routes.oneshot(grpc_request).await.map_err(|error| {
                 Status::internal(format!("in-process gRPC dispatch failed: {error}"))
             })?;
@@ -196,6 +229,104 @@ impl InProcessGrpcService {
                     .to_owned(),
             )),
         }
+    }
+}
+
+/// Failure to drain admitted in-process handlers by the shutdown deadline.
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InProcessDrainError {
+    /// At least one admitted handler remained live at the absolute deadline.
+    #[error("timed out draining {in_flight} in-process gRPC handlers")]
+    DeadlineExceeded {
+        /// Handler count observed when the deadline elapsed.
+        in_flight: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct InProcessAdmission {
+    inner: Arc<InProcessAdmissionInner>,
+}
+
+#[derive(Debug)]
+struct InProcessAdmissionInner {
+    accepting: AtomicBool,
+    in_flight: AtomicUsize,
+    drained: Notify,
+}
+
+impl InProcessAdmission {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(InProcessAdmissionInner {
+                accepting: AtomicBool::new(true),
+                in_flight: AtomicUsize::new(0),
+                drained: Notify::new(),
+            }),
+        }
+    }
+
+    fn admit(&self) -> Result<InProcessAdmissionGuard, ()> {
+        if !self.inner.accepting.load(Ordering::Acquire) {
+            return Err(());
+        }
+        self.inner.in_flight.fetch_add(1, Ordering::AcqRel);
+        // The recheck closes the admit-vs-shutdown race: either shutdown sees
+        // this count, or the losing caller decrements before returning.
+        if !self.inner.accepting.load(Ordering::Acquire) {
+            release_admission(&self.inner);
+            return Err(());
+        }
+        Ok(InProcessAdmissionGuard {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    fn begin_shutdown(&self) {
+        self.inner.accepting.store(false, Ordering::Release);
+        if self.in_flight() == 0 {
+            self.inner.drained.notify_waiters();
+        }
+    }
+
+    async fn drain(&self, deadline: Instant) -> Result<(), InProcessDrainError> {
+        loop {
+            let notified = self.inner.drained.notified();
+            if self.in_flight() == 0 {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline
+                || tokio::time::timeout(deadline.saturating_duration_since(now), notified)
+                    .await
+                    .is_err()
+            {
+                return Err(InProcessDrainError::DeadlineExceeded {
+                    in_flight: self.in_flight(),
+                });
+            }
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.inner.in_flight.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct InProcessAdmissionGuard {
+    inner: Arc<InProcessAdmissionInner>,
+}
+
+impl Drop for InProcessAdmissionGuard {
+    fn drop(&mut self) {
+        release_admission(&self.inner);
+    }
+}
+
+fn release_admission(inner: &InProcessAdmissionInner) {
+    if inner.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+        inner.drained.notify_waiters();
     }
 }
 
@@ -353,5 +484,27 @@ mod tests {
         );
         assert!(!modern.contains_key("content-type"));
         assert!(!modern.contains_key("grpc-status"));
+    }
+
+    #[tokio::test]
+    async fn admission_guards_are_cancellation_safe_and_shutdown_is_bounded() {
+        let admission = InProcessAdmission::new();
+        let first = admission.admit().expect("first call admitted");
+        let second = admission.admit().expect("second call admitted");
+        admission.begin_shutdown();
+        assert!(admission.admit().is_err());
+        assert_eq!(admission.in_flight(), 2);
+
+        drop(first);
+        let deadline = Instant::now();
+        assert_eq!(
+            admission.drain(deadline).await,
+            Err(InProcessDrainError::DeadlineExceeded { in_flight: 1 })
+        );
+        drop(second);
+        admission
+            .drain(Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .expect("last cancelled handler released its guard");
     }
 }

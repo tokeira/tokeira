@@ -306,7 +306,8 @@ async fn replacement_worker_receives_durable_activity_retry() -> Result<()> {
         Some((2, PendingActivityState::Started)),
         "delivered attempt must be durably started"
     );
-    engine.shutdown().await
+    engine.shutdown().await?;
+    Ok(())
 }
 
 /// The reproducer's executor shape: the failing worker drives its RPCs from a
@@ -385,7 +386,8 @@ async fn retry_committed_from_dying_consumer_runtime_still_delivers() -> Result<
             "attempt 2 must not be delivered twice"
         ),
     }
-    engine.shutdown().await
+    engine.shutdown().await?;
+    Ok(())
 }
 
 /// Cancellation contract: dropping a caller's poll future must abort the
@@ -440,7 +442,8 @@ async fn dropped_long_polls_abort_handlers_and_release_matching() -> Result<()> 
         Some((2, PendingActivityState::Started)),
         "delivered attempt must be durably started"
     );
-    engine.shutdown().await
+    engine.shutdown().await?;
+    Ok(())
 }
 
 /// Transport parity: the identical dying-consumer sequence over the network
@@ -518,7 +521,8 @@ async fn network_listener_delivers_retry_after_consumer_runtime_death() -> Resul
     }
     let delivered = delivered.context("network transport failed to deliver the durable retry")?;
     anyhow::ensure!(delivered.attempt == 2);
-    engine.shutdown().await
+    engine.shutdown().await?;
+    Ok(())
 }
 
 /// Cancellation storms on the embedded transport cannot strand a durable
@@ -702,5 +706,6 @@ async fn cancelled_poll_storms_cannot_strand_durable_retries() -> Result<()> {
         !next_wft.task_token.is_empty(),
         "activity completion must schedule the next workflow task"
     );
-    engine.shutdown().await
+    engine.shutdown().await?;
+    Ok(())
 }

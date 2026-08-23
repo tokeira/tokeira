@@ -3145,6 +3145,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    // The process-global tracing dispatcher fixture is intentionally serialized
+    // across the awaited operation so another test cannot replace it mid-span.
+    #[allow(clippy::await_holding_lock)]
     async fn handle_message_records_kernel_and_storage_span_attributes() {
         let _tracing = tracing_dispatch_guard();
         let capture = SpanCapture::default();
@@ -3994,6 +3997,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The process-global tracing dispatcher fixture is intentionally serialized
+    // across the awaited operation so another test cannot replace it mid-span.
+    #[allow(clippy::await_holding_lock)]
     async fn handle_message_uses_kernel_transition_span_name() {
         let _tracing = tracing_dispatch_guard();
         let run_key = RunKey::new();

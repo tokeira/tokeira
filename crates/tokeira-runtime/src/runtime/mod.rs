@@ -70,6 +70,7 @@ use crate::{
     },
     schedule::cron_initial_backoff,
     shard::{ShardOwner, shard_for},
+    shutdown::RuntimeShutdownHandle,
     timeout::{
         WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
         run_workflow_timeout_scanner,
@@ -303,6 +304,8 @@ pub struct TokeiraRuntime<R> {
     owner_identity: String,
     /// Endpoint persisted with lease rows for controller-sourced routing.
     node_endpoint: String,
+    /// Cancellation and join boundary shared by every runtime scanner.
+    runtime_shutdown: RuntimeShutdownHandle,
 }
 
 // Manual impl: the runtime root aggregates trait-object stores and the
@@ -310,6 +313,12 @@ pub struct TokeiraRuntime<R> {
 impl<R> std::fmt::Debug for TokeiraRuntime<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokeiraRuntime").finish_non_exhaustive()
+    }
+}
+
+impl<R> Drop for TokeiraRuntime<R> {
+    fn drop(&mut self) {
+        self.runtime_shutdown.begin_shutdown();
     }
 }
 
@@ -768,8 +777,10 @@ where
             let _ = owner.record_acquired(shard_id, ShardEpoch::ZERO);
             owner.mark_active(shard_id);
         }
+        let runtime_shutdown = RuntimeShutdownHandle::new();
         let timer_scanner_cancel = CancellationToken::new();
-        let timer_scanner_handle = Some(tokio::spawn(run_timer_scanner(
+        runtime_shutdown.register_cancellation(timer_scanner_cancel.clone());
+        let timer_scanner_handle = Some(runtime_shutdown.spawn(run_timer_scanner(
             repo.clone(),
             lanes.clone(),
             lane_count,
@@ -778,17 +789,20 @@ where
             timer_scanner_cancel.clone(),
         )));
         let workflow_timeout_scanner_cancel = CancellationToken::new();
-        let workflow_timeout_scanner_handle = Some(tokio::spawn(run_workflow_timeout_scanner(
-            repo.clone(),
-            workflow_timeout_tracking.clone(),
-            lanes.clone(),
-            lane_count,
-            shard_owner.clone(),
-            workflow_timeout_config,
-            workflow_timeout_scanner_cancel.clone(),
-        )));
+        runtime_shutdown.register_cancellation(workflow_timeout_scanner_cancel.clone());
+        let workflow_timeout_scanner_handle =
+            Some(runtime_shutdown.spawn(run_workflow_timeout_scanner(
+                repo.clone(),
+                workflow_timeout_tracking.clone(),
+                lanes.clone(),
+                lane_count,
+                shard_owner.clone(),
+                workflow_timeout_config,
+                workflow_timeout_scanner_cancel.clone(),
+            )));
         let wft_timeout_scanner_cancel = CancellationToken::new();
-        let wft_timeout_scanner_handle = Some(tokio::spawn(run_wft_timeout_scanner(
+        runtime_shutdown.register_cancellation(wft_timeout_scanner_cancel.clone());
+        let wft_timeout_scanner_handle = Some(runtime_shutdown.spawn(run_wft_timeout_scanner(
             wft_timeout_tracking.clone(),
             lanes.clone(),
             lane_count,
@@ -797,24 +811,27 @@ where
             wft_timeout_scanner_cancel.clone(),
         )));
         let activity_timeout_scanner_cancel = CancellationToken::new();
-        let activity_timeout_scanner_handle = Some(tokio::spawn(run_activity_timeout_scanner(
-            ActivityRetryDeps {
-                repo: repo.clone(),
-                shard_owner: shard_owner.clone(),
-                controller_managed_placement: config.controller_managed_placement,
-                max_occ_retries: config.max_occ_retries,
-                broker: activity_broker.clone(),
-                delivery_metrics: delivery_metrics.clone(),
-                tracking: activity_tracking.clone(),
-                worker_deployment_registry: worker_deployment_registry.clone(),
-            },
-            lanes.clone(),
-            lane_count,
-            activity_timeout_config,
-            activity_timeout_scanner_cancel.clone(),
-        )));
+        runtime_shutdown.register_cancellation(activity_timeout_scanner_cancel.clone());
+        let activity_timeout_scanner_handle =
+            Some(runtime_shutdown.spawn(run_activity_timeout_scanner(
+                ActivityRetryDeps {
+                    repo: repo.clone(),
+                    shard_owner: shard_owner.clone(),
+                    controller_managed_placement: config.controller_managed_placement,
+                    max_occ_retries: config.max_occ_retries,
+                    broker: activity_broker.clone(),
+                    delivery_metrics: delivery_metrics.clone(),
+                    tracking: activity_tracking.clone(),
+                    worker_deployment_registry: worker_deployment_registry.clone(),
+                },
+                lanes.clone(),
+                lane_count,
+                activity_timeout_config,
+                activity_timeout_scanner_cancel.clone(),
+            )));
         let grace_scanner_cancel = CancellationToken::new();
-        let grace_scanner_handle = Some(tokio::spawn(run_grace_scanner(
+        runtime_shutdown.register_cancellation(grace_scanner_cancel.clone());
+        let grace_scanner_handle = Some(runtime_shutdown.spawn(run_grace_scanner(
             broker.clone(),
             activity_broker.clone(),
             repo.clone(),
@@ -822,7 +839,8 @@ where
             grace_scanner_cancel.clone(),
         )));
         let drain_loop_cancel = CancellationToken::new();
-        let drain_loop_handle = Some(tokio::spawn(run_drain_loop(
+        runtime_shutdown.register_cancellation(drain_loop_cancel.clone());
+        let drain_loop_handle = Some(runtime_shutdown.spawn(run_drain_loop(
             broker.clone(),
             activity_broker.clone(),
             repo.clone(),
@@ -832,18 +850,24 @@ where
             drain_loop_cancel.clone(),
         )));
         let control_loop_cancel = CancellationToken::new();
-        let control_loop_handle = Some(tokio::spawn(run_control_loop(
+        runtime_shutdown.register_cancellation(control_loop_cancel.clone());
+        let control_loop_handle = Some(runtime_shutdown.spawn(run_control_loop(
             delivery_metrics.clone(),
             fairness_state.clone(),
             control_loop_cancel.clone(),
         )));
         let heartbeat_maintenance_cancel = CancellationToken::new();
-        let heartbeat_maintenance_handle = Some(spawn_heartbeat_maintenance(
+        runtime_shutdown.register_cancellation(heartbeat_maintenance_cancel.clone());
+        let heartbeat_maintenance_task = spawn_heartbeat_maintenance(
             heartbeat_store.clone(),
             heartbeat_maintenance_cancel.clone(),
-        ));
+        );
+        let heartbeat_maintenance_handle = Some(runtime_shutdown.spawn(async move {
+            let _ = heartbeat_maintenance_task.await;
+        }));
         let nexus_timeout_scanner_cancel = CancellationToken::new();
-        let nexus_timeout_scanner_handle = Some(tokio::spawn(run_nexus_timeout_scanner(
+        runtime_shutdown.register_cancellation(nexus_timeout_scanner_cancel.clone());
+        let nexus_timeout_scanner_handle = Some(runtime_shutdown.spawn(run_nexus_timeout_scanner(
             repo.clone(),
             nexus_timeout_tracking.clone(),
             lanes.clone(),
@@ -875,8 +899,9 @@ where
         .with_namespace_resolver(namespace_resolver.clone())
         .with_worker_deployment_registry(worker_deployment_registry.clone());
         let completion_callback_scanner_cancel = CancellationToken::new();
+        runtime_shutdown.register_cancellation(completion_callback_scanner_cancel.clone());
         let completion_callback_scanner_handle =
-            Some(tokio::spawn(run_completion_callback_scanner(
+            Some(runtime_shutdown.spawn(run_completion_callback_scanner(
                 repo.clone(),
                 completion_callback_tracking.clone(),
                 completion_scanner_publisher,
@@ -884,6 +909,7 @@ where
                 completion_callback_scanner_config,
                 completion_callback_scanner_cancel.clone(),
             )));
+        runtime_shutdown.close_registration();
         Self {
             repo,
             broker,
@@ -931,6 +957,7 @@ where
             runtime_drain,
             owner_identity,
             node_endpoint,
+            runtime_shutdown,
             worker_deployment_repository: None,
             worker_deployment_registry,
         }
@@ -981,6 +1008,14 @@ where
         self.broker.set_delivery_mode_provider(provider.clone());
         self.activity_broker.set_delivery_mode_provider(provider);
         self
+    }
+
+    /// Clone the scanner cancellation-and-join boundary.
+    ///
+    /// Embedded shutdown awaits this handle before returning control to a host
+    /// that may flush telemetry. Runtime drop performs only synchronous cancel.
+    pub fn shutdown_handle(&self) -> RuntimeShutdownHandle {
+        self.runtime_shutdown.clone()
     }
 
     /// Return a clone of the workflow-task broker.

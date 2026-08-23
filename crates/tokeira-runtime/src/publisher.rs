@@ -5,13 +5,17 @@
 //! child-workflow orchestration, external signal/cancel delivery, and Nexus
 //! operation scheduling.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex, RwLock},
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use opentelemetry::{
     KeyValue,
     propagation::{Injector, TextMapPropagator},
+    trace::TraceContextExt as _,
 };
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
@@ -23,6 +27,7 @@ use tokeira_kernel::{
     NexusCancellationAttemptedRequest, PendingNexusOperation, SignalRequest, StartRequest,
     TerminateRequest, WorkerDeploymentVersionRef, callback_completion_outcome,
 };
+use tokeira_observability::ChannelTraceContext;
 use tokeira_proto::{
     conversions::common::{failure_to_payload, payloads_from_domain},
     public::temporal::api::failure::v1 as failure_proto,
@@ -58,7 +63,36 @@ use crate::{
         resolve_child_versioning, resolve_workflow_task_target_version, route_activity_task_queue,
     },
 };
+use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// Spawn a derived fanout effect with a data-only link to its scheduling span.
+///
+/// Tokio tasks do not inherit a caller's tracing context. Capturing the W3C
+/// identifiers before the spawn and rebuilding a link inside the task keeps
+/// fanout topology observable without moving a subscriber-owned span handle or
+/// making telemetry part of delivery correctness.
+fn spawn_dispatch<F>(operation: &'static str, run_key: RunKey, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let trace_context = ChannelTraceContext::capture_current();
+    tokio::spawn(async move {
+        let span = tracing::info_span!(
+            "runtime.dispatch",
+            tokeira.operation = operation,
+            tokeira.run_key = %run_key.0,
+        );
+        if let Some(context) = trace_context {
+            let parent = context.as_remote_parent();
+            let parent_span = parent.span();
+            if parent_span.span_context().is_valid() {
+                span.add_link(parent_span.span_context().clone());
+            }
+        }
+        future.instrument(span).await;
+    });
+}
 
 /// Owned child-start parameters carried from a `DispatchOp::StartChildWorkflow`
 /// into the spawned orchestration task — the parent linkage plus the child
@@ -2171,7 +2205,7 @@ where
                             let broker = self.activity_broker.clone();
                             let metrics = self.delivery_metrics.clone();
                             let activity_id = activity_id.clone();
-                            tokio::spawn(async move {
+                            spawn_dispatch("activity_delay", run_key, async move {
                                 tokio::time::sleep(std::time::Duration::from_millis(
                                     delay.whole_milliseconds().max(0) as u64,
                                 ))
@@ -2245,7 +2279,8 @@ where
                         reuse_policy: *reuse_policy,
                         priority: priority.clone(),
                     };
-                    tokio::spawn(async move {
+                    let handoff_run_key = spec.parent_run_key;
+                    spawn_dispatch("start_child_workflow", handoff_run_key, async move {
                         publisher.handle_start_child_workflow(spec).await;
                     });
                 }
@@ -2260,7 +2295,7 @@ where
                     let child_workflow_id = child_workflow_id.clone();
                     let child_run_id = *child_run_id;
                     let reason = reason.clone();
-                    tokio::spawn(async move {
+                    spawn_dispatch("terminate_child_workflow", run_key, async move {
                         publisher
                             .handle_terminate_child(
                                 namespace_id,
@@ -2282,7 +2317,7 @@ where
                     let child_workflow_id = child_workflow_id.clone();
                     let child_run_id = *child_run_id;
                     let reason = reason.clone();
-                    tokio::spawn(async move {
+                    spawn_dispatch("cancel_child_workflow", run_key, async move {
                         publisher
                             .handle_cancel_child(
                                 namespace_id,
@@ -2312,7 +2347,7 @@ where
                     let originator_run_key = *originator_run_key;
                     let namespace_id = *namespace_id;
                     let initiated_event_id = *initiated_event_id;
-                    tokio::spawn(async move {
+                    spawn_dispatch("signal_external_workflow", originator_run_key, async move {
                         publisher
                             .handle_signal_external_workflow(
                                 target_workflow_id,
@@ -2348,7 +2383,7 @@ where
                     let namespace_id = *namespace_id;
                     let initiated_event_id = *initiated_event_id;
                     let reason = reason.clone();
-                    tokio::spawn(async move {
+                    spawn_dispatch("cancel_external_workflow", originator_run_key, async move {
                         publisher
                             .handle_cancel_external_workflow(
                                 target_workflow_id,
@@ -2408,7 +2443,7 @@ where
                         self.nexus_delivery_version(originator_run_key).await?;
                     let scheduled_event_id = *scheduled_event_id;
                     let scheduled_at = *scheduled_at;
-                    tokio::spawn(async move {
+                    spawn_dispatch("schedule_nexus_operation", originator_run_key, async move {
                         publisher
                             .handle_schedule_nexus_operation(
                                 operation_id,
@@ -2442,7 +2477,7 @@ where
                     let service = service.clone();
                     let scheduled_event_id = *scheduled_event_id;
                     let requested_event_id = *requested_event_id;
-                    tokio::spawn(async move {
+                    spawn_dispatch("cancel_nexus_operation", originator_run_key, async move {
                         publisher
                             .handle_cancel_nexus_operation(
                                 originator_run_key,
@@ -2467,7 +2502,7 @@ where
                     let callback_index = *callback_index;
                     let callback = callback.clone();
                     let outcome = outcome.clone();
-                    tokio::spawn(async move {
+                    spawn_dispatch("completion_callback", run_key, async move {
                         publisher
                             .deliver_completion_callback(
                                 run_key,
@@ -2603,7 +2638,7 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
         let publisher = RuntimeDispatchPublisher::clone(publisher);
         let run_key = entry.run_key;
         let callback_index = entry.callback_index;
-        tokio::spawn(async move {
+        spawn_dispatch("completion_callback_retry", run_key, async move {
             publisher
                 .deliver_completion_callback(run_key, callback_index, &callback, &outcome)
                 .await;

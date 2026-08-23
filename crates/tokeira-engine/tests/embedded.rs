@@ -211,12 +211,14 @@ async fn temporal_client_connects_through_service_override() -> Result<()> {
 async fn embedded_start_does_not_bind_configured_listeners() -> Result<()> {
     let occupied_grpc = TcpListener::bind("127.0.0.1:0")?;
     let occupied_nexus = TcpListener::bind("127.0.0.1:0")?;
+    let occupied_metrics = TcpListener::bind("127.0.0.1:0")?;
     let mut config = TokeiraConfig::default();
     config.infrastructure.network.grpc_addr = occupied_grpc.local_addr()?.to_string();
+    config.infrastructure.network.metrics_addr = occupied_metrics.local_addr()?.to_string();
     config.policy.nexus_completion.http_addr = occupied_nexus.local_addr()?.to_string();
 
-    // Construction would fail with AddressInUse if either the Temporal or Nexus
-    // callback transport were still an implicit part of engine startup.
+    // Construction would fail with AddressInUse if the Temporal, Nexus, or
+    // process-metrics transport were still an implicit part of engine startup.
     let engine = Engine::start_with_config(config).await?;
     engine.shutdown().await?;
     Ok(())

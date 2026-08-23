@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use opentelemetry::KeyValue;
+use opentelemetry::{KeyValue, trace::TracerProvider as _};
 use proptest::prelude::*;
 use time::OffsetDateTime;
 use tokeira_kernel::{
@@ -33,6 +33,7 @@ use tokeira_types::{
     SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 use tokio::{runtime::Runtime, sync::Barrier};
+use tracing_subscriber::layer::SubscriberExt as _;
 use uuid::Uuid;
 
 /// Build a store-backed [`NexusEndpointRegistry`] seeded with `(name, target)` pairs.
@@ -77,6 +78,7 @@ struct MockNexusClient {
 struct MockNexusClientState {
     start_result: NexusStartResult,
     cancel_ok: bool,
+    start_trace_headers: Vec<Vec<KeyValue>>,
     start_calls: Vec<(
         String,
         String,
@@ -94,6 +96,7 @@ impl MockNexusClient {
             state: Arc::new(Mutex::new(MockNexusClientState {
                 start_result,
                 cancel_ok,
+                start_trace_headers: Vec::new(),
                 start_calls: Vec::new(),
                 cancel_calls: Vec::new(),
             })),
@@ -103,6 +106,10 @@ impl MockNexusClient {
     fn snapshot(&self) -> (usize, usize) {
         let state = self.state.lock().unwrap();
         (state.start_calls.len(), state.cancel_calls.len())
+    }
+
+    fn start_trace_headers(&self) -> Vec<Vec<KeyValue>> {
+        self.state.lock().unwrap().start_trace_headers.clone()
     }
 }
 
@@ -116,9 +123,10 @@ impl NexusHttpClient for MockNexusClient {
         operation: &str,
         input: &Payloads,
         schedule_to_close_timeout: Option<time::Duration>,
-        _trace_headers: &[KeyValue],
+        trace_headers: &[KeyValue],
     ) -> Result<NexusStartResult> {
         let mut state = self.state.lock().unwrap();
+        state.start_trace_headers.push(trace_headers.to_vec());
         state.start_calls.push((
             address.to_string(),
             operation_id.to_string(),
@@ -153,8 +161,15 @@ impl NexusHttpClient for MockNexusClient {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn nexus_schedule_sync_complete_delivers_completed_resolution() -> Result<()> {
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let tracer = provider.tracer("runtime-nexus-test");
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _default = tracing::dispatcher::set_default(&dispatch);
+
     let store = Arc::new(InMemoryStore::default());
     let client = Arc::new(MockNexusClient::new(
         NexusStartResult::SyncCompleted {
@@ -220,6 +235,18 @@ async fn nexus_schedule_sync_complete_delivers_completed_resolution() -> Result<
     .await?;
 
     assert_eq!(client.snapshot(), (1, 0));
+    let trace_headers = client.start_trace_headers();
+    let traceparent = trace_headers
+        .first()
+        .and_then(|headers| {
+            headers
+                .iter()
+                .find(|header| header.key.as_str() == "traceparent")
+        })
+        .map(|header| header.value.as_str())
+        .expect("outbound Nexus dispatch injects the current W3C traceparent");
+    assert!(traceparent.starts_with("00-"));
+    assert_eq!(traceparent.len(), 55);
     runtime.shutdown_timer_scanner().await?;
     runtime.shutdown_workflow_timeout_scanner().await?;
     runtime.shutdown_nexus_timeout_scanner().await?;

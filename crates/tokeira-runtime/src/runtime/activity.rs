@@ -23,6 +23,7 @@ use crate::runtime::workflow_task::{
 };
 use tokeira_observability::OutcomeLabel;
 use tokeira_types::{TaskKind, WorkerTaskClass, WorkerTaskOrigin};
+use tracing::Instrument as _;
 
 const ACTIVITY_BACKLOG_REPROCESS_BATCH: usize = 100;
 
@@ -908,6 +909,34 @@ where
     /// is republished to the broker (reject-and-reschedule) rather than dropped,
     /// so the task is not lost when contention is high.
     async fn start_activity_task(
+        &self,
+        task: &DispatchableActivityTask,
+        entered_at: tokio::time::Instant,
+        worker_identity: &WorkerIdentity,
+    ) -> Result<Option<StartedActivityTask>> {
+        let span = tracing::info_span!(
+            "activity_task.process",
+            tokeira.run_key = %task.run_key.0,
+            tokeira.workflow_id = tracing::field::Empty,
+            tokeira.run_id = tracing::field::Empty,
+            tokeira.activity_id = task.activity_id.as_str(),
+            tokeira.activity_type = tracing::field::Empty,
+            tokeira.task_queue = %task.queue.task_queue.0,
+            tokeira.attempt = i64::from(task.attempt),
+        );
+        let result = self
+            .start_activity_task_inner(task, entered_at, worker_identity)
+            .instrument(span.clone())
+            .await;
+        if let Ok(Some(started)) = &result {
+            span.record("tokeira.workflow_id", started.workflow_id.as_str());
+            span.record("tokeira.run_id", started.run_id.0.to_string());
+            span.record("tokeira.activity_type", started.activity_type.as_str());
+        }
+        result
+    }
+
+    async fn start_activity_task_inner(
         &self,
         task: &DispatchableActivityTask,
         entered_at: tokio::time::Instant,

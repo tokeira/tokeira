@@ -40,21 +40,23 @@ pub use config::{
 };
 pub use http::{ConfigSnapshot, ObservabilityHttpState, spawn_observability_server};
 pub use labels::{
-    AutoscalerLoopLabel, BoundedLabel, ControllerCasOutcomeLabel, DbClassLabel,
-    NominationOutcomeLabel, NotShardOwnerOperationLabel, OutcomeLabel, ProjectionErrorKindLabel,
+    AutoscalerLoopLabel, BoundedLabel, ClusterStatusLabel, ControllerCasOutcomeLabel, DbClassLabel,
+    EmbeddedOperationLabel, EmbeddedStorageModeLabel, ErrorClassLabel, NominationOutcomeLabel,
+    NotShardOwnerOperationLabel, OutcomeLabel, OwnershipOutcomeLabel, ProjectionErrorKindLabel,
     ProjectionOutcomeLabel, QueryBufferOutcomeLabel, QueryDispatchOutcomeLabel,
-    QueryDispatchPathLabel, RetryOutcomeLabel, ScalingDirectionLabel, ServiceLabel,
-    StorageOperationLabel, bounded_metric_label,
+    QueryDispatchPathLabel, RetryOutcomeLabel, ScalingDirectionLabel, SchemaOutcomeLabel,
+    ServiceLabel, StorageOperationLabel, bounded_metric_label,
 };
 pub use manifest::{
-    LANE_ID_LABEL, LabelCardinality, LabelDescriptor, ManifestError, MetricDescriptor, MetricLabel,
-    MetricManifest, MetricType, MetricUnit, NAMESPACE_LABEL, PARTITION_ID_LABEL, SHARD_ID_LABEL,
-    TASK_QUEUE_LABEL, WORKER_INSTANCE_KEY_LABEL, all_metric_names, validate_manifest,
-    validate_manifests,
+    FORBIDDEN_METRIC_LABEL_NAMES, LANE_ID_LABEL, LabelCardinality, LabelDescriptor, ManifestError,
+    MetricDescriptor, MetricLabel, MetricManifest, MetricType, MetricUnit, NAMESPACE_LABEL,
+    PARTITION_ID_LABEL, SHARD_ID_LABEL, TASK_QUEUE_LABEL, WORKER_INSTANCE_KEY_LABEL,
+    all_metric_names, is_forbidden_metric_label, validate_manifest, validate_manifests,
 };
 pub use metrics::{
-    BUILD_INFO, PROCESS_METRIC_MANIFEST, PROCESS_START_TIME_SECONDS, install_prometheus_recorder,
-    record_process_metadata,
+    BUILD_INFO, EMBEDDED_LIFECYCLE_OPERATIONS_TOTAL, EMBEDDED_METRIC_MANIFEST,
+    PROCESS_METRIC_MANIFEST, PROCESS_START_TIME_SECONDS, install_prometheus_recorder,
+    record_embedded_lifecycle, record_process_metadata,
 };
 pub use readiness::{
     ReadinessCheck, ReadinessCheckResult, ReadinessHandle, ReadinessRegistry, ReadinessResult,
@@ -210,8 +212,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn manifest_validation_runs_before_install_reservation() {
+    #[test]
+    fn manifest_validation_runs_before_install_reservation() {
         let _guard = installation_test_guard();
         const INVALID_METRIC: MetricDescriptor = MetricDescriptor {
             name: "bad_counter",
@@ -225,12 +227,15 @@ mod tests {
             metrics: &[INVALID_METRIC],
         };
 
-        let result = install_observability(
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("observability test runtime");
+        let result = runtime.block_on(install_observability(
             test_config(),
             &[&INVALID_MANIFEST],
             ReadinessRegistry::empty(),
-        )
-        .await;
+        ));
 
         assert!(matches!(result, Err(ObservabilityError::Manifest(_))));
         let reservation = InstallationReservation::reserve().unwrap();

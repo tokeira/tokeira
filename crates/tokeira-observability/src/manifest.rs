@@ -112,6 +112,40 @@ pub const LANE_ID_LABEL: LabelDescriptor = LabelDescriptor {
     description: "runtime lane; bounded by configured lane count",
 };
 
+/// Label names that must never appear on metrics.
+///
+/// Stable execution identifiers belong on spans/events. Content, credentials,
+/// and tokens belong nowhere in Tokeira telemetry by default.
+pub const FORBIDDEN_METRIC_LABEL_NAMES: &[&str] = &[
+    "workflow_id",
+    "run_id",
+    "request_id",
+    "trace_id",
+    "span_id",
+    "activity_id",
+    "activity_type",
+    "prompt",
+    "tool_input",
+    "tool_output",
+    "payload",
+    "credential",
+    "credentials",
+    "authorization",
+    "token",
+    "auth_token",
+    "client_token",
+    "creation_client_token",
+    "password",
+    "connection_string",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
+    "raw_sql",
+    "raw_error",
+    "node_endpoint",
+    "task_arn",
+];
+
 /// One metric descriptor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetricDescriptor {
@@ -250,7 +284,8 @@ fn validate_label(metric: &'static str, label: &LabelDescriptor) -> Result<(), M
             label: label.name,
         });
     }
-    if label.cardinality == LabelCardinality::UnboundedForbidden || forbidden_label_name(label.name)
+    if label.cardinality == LabelCardinality::UnboundedForbidden
+        || is_forbidden_metric_label(label.name)
     {
         return Err(ManifestError::ForbiddenLabel {
             metric,
@@ -275,18 +310,9 @@ fn is_snake_case(value: &str) -> bool {
             .all(|byte| byte == b'_' || byte.is_ascii_lowercase() || byte.is_ascii_digit())
 }
 
-fn forbidden_label_name(value: &str) -> bool {
-    matches!(
-        value,
-        "workflow_id"
-            | "run_id"
-            | "request_id"
-            | "trace_id"
-            | "raw_sql"
-            | "raw_error"
-            | "node_endpoint"
-            | "task_arn"
-    )
+/// Return whether a metric label would violate cardinality or content policy.
+pub fn is_forbidden_metric_label(value: &str) -> bool {
+    FORBIDDEN_METRIC_LABEL_NAMES.contains(&value)
 }
 
 impl fmt::Display for MetricUnit {
@@ -361,6 +387,13 @@ mod tests {
                 label: "run_id"
             })
         ));
+    }
+
+    #[test]
+    fn classifies_every_forbidden_high_cardinality_or_sensitive_label() {
+        for &name in FORBIDDEN_METRIC_LABEL_NAMES {
+            assert!(is_forbidden_metric_label(name), "{name}");
+        }
     }
 
     #[test]

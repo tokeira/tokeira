@@ -7,12 +7,14 @@
 //! Runtime channel dispatch must not carry `tracing::Span` handles through
 //! envelopes. Spans have subscriber-owned lifecycle state, and holding or
 //! entering them across asynchronous cancellation points can couple unrelated
-//! tasks. Channel correlation should instead carry raw origin trace/span IDs as
-//! data attributes and create a fresh receiving span.
+//! tasks. Channel correlation instead carries the immutable W3C span context as
+//! data and creates a fresh receiving span with an explicit remote parent.
 
 use opentelemetry::{
-    global,
-    trace::{TraceContextExt, TracerProvider as _},
+    Context, global,
+    trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider as _,
+    },
 };
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
@@ -30,15 +32,22 @@ use crate::{
 
 pub type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
-/// Raw trace/span identifiers safe to carry through Tokio channels.
+/// Serializable W3C span context safe to carry through process-local channels.
 ///
-/// This is data, not a subscriber handle. Receivers should create their own
-/// spans and record these IDs as correlation attributes instead of entering the
-/// originating span across `.await` boundaries.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// This is data, not a subscriber handle. Receivers rebuild a remote parent and
+/// create their own span instead of entering the originating span across
+/// `.await` boundaries. It is transient execution context and must never be
+/// added to workflow history or another authoritative record.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChannelTraceContext {
-    pub origin_trace_id: [u8; 16],
-    pub origin_span_id: [u8; 8],
+    /// W3C trace identifier.
+    pub trace_id: [u8; 16],
+    /// W3C parent span identifier.
+    pub span_id: [u8; 8],
+    /// W3C trace flags, including the sampled bit.
+    pub trace_flags: u8,
+    /// Ordered W3C vendor trace state.
+    pub trace_state: String,
 }
 
 /// Bounded operational failures that should bias trace capture.
@@ -82,22 +91,47 @@ impl ChannelTraceContext {
         let span_context = span.span_context();
         if span_context.is_valid() {
             Some(Self {
-                origin_trace_id: span_context.trace_id().to_bytes(),
-                origin_span_id: span_context.span_id().to_bytes(),
+                trace_id: span_context.trace_id().to_bytes(),
+                span_id: span_context.span_id().to_bytes(),
+                trace_flags: span_context.trace_flags().to_u8(),
+                trace_state: span_context.trace_state().header(),
             })
         } else {
             None
         }
     }
 
-    /// Hex-encoded trace ID for span attributes and log fields.
-    pub fn origin_trace_id_hex(self) -> String {
-        hex_bytes(&self.origin_trace_id)
+    /// Rebuild this data as a remote OpenTelemetry parent.
+    ///
+    /// Invalid IDs or tracestate produce an empty context. Channel data may be
+    /// deserialized from an untrusted or older process, and invalid telemetry
+    /// must start a root rather than affect execution.
+    pub fn as_remote_parent(&self) -> Context {
+        let Ok(trace_state) = self.trace_state.parse::<TraceState>() else {
+            return Context::new();
+        };
+        let span_context = SpanContext::new(
+            TraceId::from_bytes(self.trace_id),
+            SpanId::from_bytes(self.span_id),
+            TraceFlags::new(self.trace_flags),
+            true,
+            trace_state,
+        );
+        if span_context.is_valid() {
+            Context::new().with_remote_span_context(span_context)
+        } else {
+            Context::new()
+        }
     }
 
-    /// Hex-encoded span ID for span attributes and log fields.
-    pub fn origin_span_id_hex(self) -> String {
-        hex_bytes(&self.origin_span_id)
+    /// Hex-encoded trace ID for stable correlation attributes and log fields.
+    pub fn trace_id_hex(&self) -> String {
+        hex_bytes(&self.trace_id)
+    }
+
+    /// Hex-encoded span ID for stable correlation attributes and log fields.
+    pub fn span_id_hex(&self) -> String {
+        hex_bytes(&self.span_id)
     }
 }
 
@@ -216,7 +250,14 @@ fn hex_bytes(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use opentelemetry::trace::TracerProvider;
+    use std::collections::HashMap;
+
+    use opentelemetry::{
+        propagation::{Extractor, Injector, TextMapPropagator},
+        trace::TracerProvider,
+    };
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use proptest::prelude::*;
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
@@ -224,15 +265,37 @@ mod tests {
     #[test]
     fn channel_trace_context_formats_origin_ids() {
         let context = ChannelTraceContext {
-            origin_trace_id: [1; 16],
-            origin_span_id: [2; 8],
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            trace_flags: TraceFlags::SAMPLED.to_u8(),
+            trace_state: "vendor=value".to_owned(),
         };
 
+        assert_eq!(context.trace_id_hex(), "01010101010101010101010101010101");
+        assert_eq!(context.span_id_hex(), "0202020202020202");
+        let parent = context.as_remote_parent();
+        let parent_span = parent.span();
+        assert!(parent_span.span_context().is_remote());
         assert_eq!(
-            context.origin_trace_id_hex(),
-            "01010101010101010101010101010101"
+            parent_span.span_context().trace_flags(),
+            TraceFlags::SAMPLED
         );
-        assert_eq!(context.origin_span_id_hex(), "0202020202020202");
+        assert_eq!(
+            parent_span.span_context().trace_state().header(),
+            "vendor=value"
+        );
+    }
+
+    #[test]
+    fn invalid_channel_context_rebuilds_as_root() {
+        let context = ChannelTraceContext {
+            trace_id: [0; 16],
+            span_id: [0; 8],
+            trace_flags: 0,
+            trace_state: "not-valid-tracestate".to_owned(),
+        };
+
+        assert!(!context.as_remote_parent().span().span_context().is_valid());
     }
 
     #[test]
@@ -250,6 +313,159 @@ mod tests {
         });
 
         assert!(captured.is_some());
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Boundary {
+        Service,
+        DirectChannel,
+        WorkflowTask,
+        ActivityTask,
+        Outbound,
+        Handoff,
+        Restart,
+    }
+
+    fn boundary_strategy() -> impl Strategy<Value = Boundary> {
+        prop_oneof![
+            Just(Boundary::Service),
+            Just(Boundary::DirectChannel),
+            Just(Boundary::WorkflowTask),
+            Just(Boundary::ActivityTask),
+            Just(Boundary::Outbound),
+            Just(Boundary::Handoff),
+            Just(Boundary::Restart),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Feature: managed-embedded-dsql, Property 16: transient context and durable identifiers compose
+        #[test]
+        fn transient_context_and_durable_identifiers_compose(
+            trace_id in any::<[u8; 16]>(),
+            span_id in any::<[u8; 8]>(),
+            sampled in any::<bool>(),
+            boundaries in prop::collection::vec(boundary_strategy(), 1..32),
+            workflow_id in "[a-zA-Z0-9_-]{1,32}",
+            run_id in "[a-zA-Z0-9-]{1,36}",
+            activity_id in "[a-zA-Z0-9_-]{1,32}",
+            attempt in 1u32..1000,
+        ) {
+            prop_assume!(trace_id.iter().any(|byte| *byte != 0));
+            prop_assume!(span_id.iter().any(|byte| *byte != 0));
+            let initial = ChannelTraceContext {
+                trace_id,
+                span_id,
+                trace_flags: if sampled { TraceFlags::SAMPLED.to_u8() } else { 0 },
+                trace_state: "host=tokeira".to_owned(),
+            };
+            let mut live_context = Some(initial.clone());
+            let mut observed_relationships = Vec::new();
+            let durable_ids = serde_json::json!({
+                "workflow_id": workflow_id.clone(),
+                "run_id": run_id.clone(),
+                "activity_id": activity_id.clone(),
+                "attempt": attempt,
+            });
+
+            for boundary in boundaries {
+                match boundary {
+                    Boundary::Restart => live_context = None,
+                    Boundary::Handoff => {
+                        observed_relationships.push(("link", live_context.clone()));
+                    }
+                    Boundary::Service
+                    | Boundary::DirectChannel
+                    | Boundary::WorkflowTask
+                    | Boundary::ActivityTask
+                    | Boundary::Outbound => {
+                        observed_relationships.push(("parent", live_context.clone()));
+                    }
+                }
+            }
+
+            for (_, context) in &observed_relationships {
+                if let Some(context) = context {
+                    let remote = context.as_remote_parent();
+                    let remote_span = remote.span();
+                    prop_assert_eq!(remote_span.span_context().trace_id(), TraceId::from_bytes(trace_id));
+                    prop_assert_eq!(remote_span.span_context().span_id(), SpanId::from_bytes(span_id));
+                }
+            }
+            let authoritative_history = serde_json::to_vec(&durable_ids).expect("durable ids serialize");
+            let transient = serde_json::to_vec(&initial).expect("trace context serializes");
+            prop_assert!(!authoritative_history.windows(trace_id.len()).any(|window| window == trace_id));
+            prop_assert!(!String::from_utf8_lossy(&authoritative_history).contains("trace_state"));
+            prop_assert_ne!(authoritative_history, transient);
+            prop_assert_eq!(durable_ids["workflow_id"].as_str(), Some(workflow_id.as_str()));
+            prop_assert_eq!(durable_ids["run_id"].as_str(), Some(run_id.as_str()));
+            prop_assert_eq!(durable_ids["activity_id"].as_str(), Some(activity_id.as_str()));
+            prop_assert_eq!(durable_ids["attempt"].as_u64(), Some(u64::from(attempt)));
+        }
+    }
+
+    #[derive(Default)]
+    struct HostCarrier(HashMap<String, String>);
+
+    impl Injector for HostCarrier {
+        fn set(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+    }
+
+    impl Extractor for HostCarrier {
+        fn get(&self, key: &str) -> Option<&str> {
+            self.0.get(key).map(String::as_str)
+        }
+
+        fn keys(&self) -> Vec<&str> {
+            self.0.keys().map(String::as_str).collect()
+        }
+    }
+
+    #[test]
+    fn host_owned_provider_mcp_and_handoff_carriers_compose() {
+        let context = ChannelTraceContext {
+            trace_id: [7; 16],
+            span_id: [9; 8],
+            trace_flags: TraceFlags::SAMPLED.to_u8(),
+            trace_state: "host=fixture".to_owned(),
+        };
+        let propagator = TraceContextPropagator::new();
+        let stable_ids = [
+            ("tokeira.workflow_id", "workflow-fixture"),
+            ("tokeira.run_id", "run-fixture"),
+            ("tokeira.activity_id", "activity-fixture"),
+        ];
+
+        let mut provider = HostCarrier::default();
+        propagator.inject_context(&context.as_remote_parent(), &mut provider);
+        let provider_context = propagator.extract(&provider);
+        let mut mcp_tool = HostCarrier::default();
+        propagator.inject_context(&provider_context, &mut mcp_tool);
+        let tool_context = propagator.extract(&mcp_tool);
+        let mut handoff = HostCarrier::default();
+        propagator.inject_context(&tool_context, &mut handoff);
+        for (key, value) in stable_ids {
+            handoff.0.insert(key.to_owned(), value.to_owned());
+        }
+
+        let extracted = propagator.extract(&handoff);
+        let extracted_span = extracted.span();
+        assert_eq!(
+            extracted_span.span_context().trace_id(),
+            TraceId::from_bytes(context.trace_id)
+        );
+        assert_eq!(
+            extracted_span.span_context().span_id(),
+            SpanId::from_bytes(context.span_id)
+        );
+        assert_eq!(
+            handoff.0.get("tokeira.workflow_id").map(String::as_str),
+            Some("workflow-fixture")
+        );
     }
 
     #[test]

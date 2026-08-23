@@ -26,6 +26,7 @@ use tokeira_storage::{
     DeploymentKey, DeploymentName, StoredRoutingConfig, WorkerDeploymentVersionKey,
 };
 use tokeira_types::{WorkerTaskClass, WorkerTaskOrigin, WorkflowId};
+use tracing::Instrument as _;
 
 use crate::timeout::WorkflowTimeoutEntry;
 
@@ -1632,6 +1633,33 @@ where
 
     /// Atomically transition a polled workflow task into the Started state.
     async fn start_polled_workflow_task(
+        &self,
+        offered: DispatchableWorkflowTask,
+        entered_at: tokio::time::Instant,
+        worker_identity: WorkerIdentity,
+    ) -> Result<StartedWorkflowTask> {
+        let span = tracing::info_span!(
+            "workflow_task.process",
+            tokeira.run_key = %offered.run_key.0,
+            tokeira.workflow_id = tracing::field::Empty,
+            tokeira.run_id = tracing::field::Empty,
+            tokeira.task_queue = %offered.queue.task_queue.0,
+            tokeira.workflow_task_sequence = offered.logical_seq.0,
+            tokeira.attempt = tracing::field::Empty,
+        );
+        let result = self
+            .start_polled_workflow_task_inner(offered, entered_at, worker_identity)
+            .instrument(span.clone())
+            .await;
+        if let Ok(started) = &result {
+            span.record("tokeira.workflow_id", started.workflow_id.0.as_str());
+            span.record("tokeira.run_id", started.run_id.0.to_string());
+            span.record("tokeira.attempt", i64::from(started.token.attempt));
+        }
+        result
+    }
+
+    async fn start_polled_workflow_task_inner(
         &self,
         offered: DispatchableWorkflowTask,
         entered_at: tokio::time::Instant,

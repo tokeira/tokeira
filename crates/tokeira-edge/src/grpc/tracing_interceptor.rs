@@ -84,9 +84,13 @@ mod tests {
 
     use opentelemetry::{
         propagation::{Injector, TextMapPropagator},
-        trace::{TraceContextExt, TracerProvider},
+        trace::{SpanId, TraceContextExt, TraceId, TracerProvider},
     };
-    use proptest::prelude::*;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{Sampler, SpanData, SpanExporter},
+    };
+    use proptest::{prelude::*, test_runner::TestRunner};
     use tracing::{
         Subscriber,
         field::{Field, Visit},
@@ -157,6 +161,22 @@ mod tests {
         values: HashMap<String, String>,
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct TestSpanExporter(Arc<Mutex<Vec<SpanData>>>);
+
+    impl TestSpanExporter {
+        fn finished_spans(&self) -> Vec<SpanData> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl SpanExporter for TestSpanExporter {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
     impl Injector for HeaderInjector {
         fn set(&mut self, key: &str, value: String) {
             self.values.insert(key.to_string(), value);
@@ -167,29 +187,101 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    proptest! {
-        #[test]
-        fn property_trace_context_round_trip(trace_id in any::<[u8; 16]>(), span_id in any::<[u8; 8]>(), sampled in any::<bool>()) {
-            prop_assume!(trace_id.iter().any(|byte| *byte != 0));
-            prop_assume!(span_id.iter().any(|byte| *byte != 0));
-            let flags = if sampled { 0x01 } else { 0x00 };
-            let mut headers = HeaderMap::new();
-            let traceparent = format!("00-{}-{}-{:02x}", hex(trace_id), hex(span_id), flags);
-            headers.insert("traceparent", traceparent.parse().unwrap());
+    #[test]
+    fn service_override_preserves_w3c_parentage() {
+        let exporter = TestSpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            // Export every generated child so the property can inspect both
+            // sampled and unsampled incoming W3C flags. Sampling policy is a
+            // host choice and is not what this boundary test exercises.
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("service-override-property");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("property runtime");
+        let mut runner = TestRunner::new(ProptestConfig::with_cases(128));
 
-            let extracted = extract_trace_context(&headers);
-            let extracted_span = extracted.span();
-            let extracted_context = extracted_span.span_context();
-            prop_assert!(extracted_context.is_valid());
-            prop_assert_eq!(extracted_context.trace_id().to_string(), hex(trace_id));
-            prop_assert_eq!(extracted_context.span_id().to_string(), hex(span_id));
+        // Feature: managed-embedded-dsql, Property 15: service_override preserves W3C parentage
+        runner
+            .run(
+                &(
+                    0u8..3,
+                    any::<[u8; 16]>(),
+                    any::<[u8; 8]>(),
+                    any::<bool>(),
+                    "[a-z]{1,8}",
+                    "[a-z0-9]{1,12}",
+                ),
+                |(kind, trace_id, span_id, sampled, state_key, state_value)| {
+                    prop_assume!(trace_id.iter().any(|byte| *byte != 0));
+                    prop_assume!(span_id.iter().any(|byte| *byte != 0));
+                    let flags = if sampled { 0x01 } else { 0x00 };
+                    let mut headers = HeaderMap::new();
+                    if kind == 0 {
+                        let traceparent =
+                            format!("00-{}-{}-{flags:02x}", hex(trace_id), hex(span_id));
+                        headers.insert("traceparent", traceparent.parse().expect("valid header"));
+                        let tracestate = format!("{state_key}={state_value}");
+                        headers.insert("tracestate", tracestate.parse().expect("valid header"));
+                    } else if kind == 1 {
+                        headers.insert("traceparent", "malformed".parse().expect("literal header"));
+                    }
 
-            let mut injector = HeaderInjector { values: HashMap::new() };
-            TraceContextPropagator::new().inject_context(&extracted, &mut injector);
-            let reinjected = injector.values.get("traceparent").cloned().unwrap_or_default();
-            prop_assert!(reinjected.contains(&hex(trace_id)));
-            prop_assert!(reinjected.contains(&hex(span_id)));
-        }
+                    let extracted = extract_trace_context(&headers);
+                    let extracted_span = extracted.span();
+                    let extracted_context = extracted_span.span_context();
+                    prop_assert_eq!(extracted_context.is_valid(), kind == 0);
+
+                    let result = tracing::dispatcher::with_default(&dispatch, || {
+                        runtime.block_on(instrument_grpc_call(
+                            &headers,
+                            "test_operation",
+                            Some("default"),
+                            Some("workflow-a"),
+                            async { 41_u64 },
+                        ))
+                    });
+                    prop_assert_eq!(result, 41);
+
+                    let spans = exporter.finished_spans();
+                    let recorded = spans.last().expect("server span exported");
+                    if kind == 0 {
+                        prop_assert_eq!(
+                            recorded.span_context.trace_id(),
+                            TraceId::from_bytes(trace_id)
+                        );
+                        prop_assert_eq!(recorded.parent_span_id, SpanId::from_bytes(span_id));
+                        prop_assert!(recorded.parent_span_is_remote);
+                        prop_assert_eq!(
+                            recorded.span_context.trace_state().header(),
+                            format!("{state_key}={state_value}")
+                        );
+
+                        let mut injector = HeaderInjector {
+                            values: HashMap::new(),
+                        };
+                        TraceContextPropagator::new().inject_context(&extracted, &mut injector);
+                        let reinjected = injector
+                            .values
+                            .get("traceparent")
+                            .cloned()
+                            .unwrap_or_default();
+                        prop_assert!(reinjected.contains(&hex(trace_id)));
+                        prop_assert!(reinjected.contains(&hex(span_id)));
+                    } else {
+                        prop_assert_eq!(recorded.parent_span_id, SpanId::INVALID);
+                        prop_assert!(!recorded.parent_span_is_remote);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("W3C parentage property");
     }
 
     #[tokio::test]

@@ -71,6 +71,12 @@ tonic-sdk = { package = "tonic", version = "0.14", default-features = false, opt
 [features]
 default = ["temporalio-client"]
 temporalio-client = ["dep:temporalio-client", "dep:tonic-sdk"]
+# Opt-in SQL integration boundary shared with storage and projection. The live
+# managed-cluster test adds a second explicit acknowledgement before AWS mutation.
+dsql-integration = [
+    "tokeira-projection/dsql-integration",
+    "tokeira-storage/dsql-integration",
+]
 # Conformance-only: mounts the dynamic-config control service on a separate
 # loopback listener and enables the runtime's live override reads.
 conformance = [

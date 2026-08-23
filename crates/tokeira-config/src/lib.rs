@@ -1,9 +1,15 @@
 pub mod documentation;
+pub mod embedded;
 pub mod loader;
 pub mod overlay;
 pub mod secret;
 pub mod source;
 pub use documentation::{CONFIG_FIELD_CATALOG, ConfigFieldClass, ConfigFieldDocumentation};
+pub use embedded::{
+    DsqlMigrationPolicy, EmbeddedConfigError, EmbeddedDsqlLimits, EmbeddedEngineConfig,
+    EmbeddedStorageConfig, EmbeddedValidationError, ExistingEmbeddedDsqlConfig,
+    ManagedClusterIntent, ManagedEmbeddedDsqlConfig,
+};
 pub use loader::{ConfigLoaderError, load_config, load_config_from_source, write_config_toml};
 pub use overlay::{overlay_document, overlay_document_str, render_document};
 pub use secret::{NoSecretsProvider, Secret, SecretError, SecretRef, SecretsProvider};
@@ -135,6 +141,9 @@ pub struct DsqlInfraConfig {
     /// Written back by `tkr infra apply --module dsql`.
     #[serde(default)]
     pub conn_lease_table: Option<String>,
+    /// Explicit schema policy for listener-backed distributed DSQL startup.
+    #[serde(default)]
+    pub migration_policy: Option<DsqlMigrationPolicy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

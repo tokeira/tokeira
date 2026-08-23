@@ -8,10 +8,10 @@ use serde_json::Value;
 use tokeira_config::{LogFormatConfig, OtlpProtocol, TokeiraConfig};
 use tokeira_edge::metrics as edge_metrics;
 use tokeira_observability::{
-    LogFormat, MetricManifest, ObservabilityRuntime, OtlpMetricsConfig, PROCESS_METRIC_MANIFEST,
-    ProcessObservabilityConfig, ReadinessHandle, ReadinessRegistry, ReadinessStatus, ServiceName,
-    TraceExportConfig, install_observability, install_prometheus_recorder,
-    install_tracing_subscriber,
+    EMBEDDED_METRIC_MANIFEST, LogFormat, MetricManifest, ObservabilityRuntime, OtlpMetricsConfig,
+    PROCESS_METRIC_MANIFEST, ProcessObservabilityConfig, ReadinessHandle, ReadinessRegistry,
+    ReadinessStatus, ServiceName, TraceExportConfig, install_observability,
+    install_prometheus_recorder, install_tracing_subscriber,
 };
 use tokeira_projection::metrics as projection_metrics;
 use tokeira_runtime::metrics as runtime_metrics;
@@ -21,7 +21,8 @@ use tracing_subscriber::{EnvFilter, reload};
 
 pub type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
-static PROCESS_MANIFESTS: &[&MetricManifest] = &[&PROCESS_METRIC_MANIFEST];
+static PROCESS_MANIFESTS: &[&MetricManifest] =
+    &[&PROCESS_METRIC_MANIFEST, &EMBEDDED_METRIC_MANIFEST];
 
 #[derive(Clone, Debug)]
 pub(crate) struct TokeiradReadiness {
@@ -181,6 +182,12 @@ pub(crate) fn process_metric_names() -> Vec<(&'static str, MetricType)> {
     names.extend_from_slice(projection_metrics::METRIC_NAMES);
     names.extend(
         PROCESS_METRIC_MANIFEST
+            .metrics
+            .iter()
+            .map(|metric| (metric.name, metric.metric_type)),
+    );
+    names.extend(
+        EMBEDDED_METRIC_MANIFEST
             .metrics
             .iter()
             .map(|metric| (metric.name, metric.metric_type)),

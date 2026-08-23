@@ -91,6 +91,91 @@ label_enum! {
 }
 
 label_enum! {
+    /// Explicit embedded storage modes.
+    pub enum EmbeddedStorageModeLabel {
+        InMemory => "in_memory",
+        ManagedDsql => "managed_dsql",
+        ExistingDsql => "existing_dsql",
+    }
+}
+
+label_enum! {
+    /// Bounded Aurora DSQL lifecycle states.
+    pub enum ClusterStatusLabel {
+        NotApplicable => "not_applicable",
+        Creating => "creating",
+        Active => "active",
+        Idle => "idle",
+        Inactive => "inactive",
+        Updating => "updating",
+        Deleting => "deleting",
+        Deleted => "deleted",
+        Failed => "failed",
+        PendingSetup => "pending_setup",
+        PendingDelete => "pending_delete",
+        Unknown => "unknown",
+    }
+}
+
+label_enum! {
+    /// Bounded embedded schema-compatibility outcomes.
+    pub enum SchemaOutcomeLabel {
+        NotApplicable => "not_applicable",
+        Compatible => "compatible",
+        Initialized => "initialized",
+        Migrated => "migrated",
+        MetadataBackfilled => "metadata_backfilled",
+        MigrationRequired => "migration_required",
+        Incompatible => "incompatible",
+        Failed => "failed",
+    }
+}
+
+label_enum! {
+    /// Bounded embedded-owner lifecycle outcomes.
+    pub enum OwnershipOutcomeLabel {
+        NotApplicable => "not_applicable",
+        AcquiredClean => "acquired_clean",
+        AcquiredExpired => "acquired_expired",
+        Released => "released",
+        Lost => "lost",
+        Rejected => "rejected",
+    }
+}
+
+label_enum! {
+    /// Bounded embedded lifecycle operation kinds.
+    pub enum EmbeddedOperationLabel {
+        Startup => "startup",
+        ClusterRecovery => "cluster_recovery",
+        Schema => "schema",
+        Ownership => "ownership",
+        Shutdown => "shutdown",
+        DestroyPlan => "destroy_plan",
+        DestroyApply => "destroy_apply",
+    }
+}
+
+label_enum! {
+    /// Redacted error classes for lifecycle metrics.
+    pub enum ErrorClassLabel {
+        None => "none",
+        Configuration => "configuration",
+        Descriptor => "descriptor",
+        AccessDenied => "access_denied",
+        Quota => "quota",
+        Retryable => "retryable",
+        Identity => "identity",
+        Status => "status",
+        Storage => "storage",
+        Schema => "schema",
+        Ownership => "ownership",
+        Deadline => "deadline",
+        Internal => "internal",
+    }
+}
+
+label_enum! {
     /// Autoscaler control-loop labels.
     pub enum AutoscalerLoopLabel {
         Replica => "replica",

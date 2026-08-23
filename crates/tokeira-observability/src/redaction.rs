@@ -15,6 +15,11 @@ const SENSITIVE_KEYS: &[&str] = &[
     "authorization",
     "connection_string",
     "private_key",
+    "prompt",
+    "tool_input",
+    "tool_output",
+    "payload",
+    "error_chain",
 ];
 
 /// Redact sensitive fields in-place.
@@ -63,6 +68,7 @@ fn looks_like_credentialed_connection_string(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use serde_json::json;
 
     use super::*;
@@ -97,5 +103,59 @@ mod tests {
 
         assert_eq!(value["endpoint"], "[redacted]");
         assert_eq!(value["public_endpoint"], "https://example.com/path");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Feature: managed-embedded-dsql, Property 18: sensitive content is absent by default
+        #[test]
+        fn sensitive_content_is_absent_by_default(
+            prompt in "prompt-canary-[a-zA-Z0-9]{8,32}",
+            tool_input in "tool-input-canary-[a-zA-Z0-9]{8,32}",
+            tool_output in "tool-output-canary-[a-zA-Z0-9]{8,32}",
+            payload in "payload-canary-[a-zA-Z0-9]{8,32}",
+            credential in "credential-canary-[a-zA-Z0-9]{8,32}",
+            auth_token in "auth-token-canary-[a-zA-Z0-9]{8,32}",
+            creation_token in "creation-token-canary-[a-zA-Z0-9]{8,32}",
+            password in "password-canary-[a-zA-Z0-9]{8,32}",
+            error_chain in "error-canary-[a-zA-Z0-9]{8,32}",
+            host_limit in 0usize..128,
+        ) {
+            let canaries = [
+                prompt.clone(),
+                tool_input.clone(),
+                tool_output.clone(),
+                payload.clone(),
+                credential.clone(),
+                auth_token.clone(),
+                creation_token.clone(),
+                password.clone(),
+                error_chain.clone(),
+            ];
+            let mut value = json!({
+                "prompt": prompt,
+                "tool_input": tool_input,
+                "tool_output": tool_output,
+                "workflow_payload": payload,
+                "aws_credentials": credential,
+                "dsql_auth_token": auth_token,
+                "creation_client_token": creation_token,
+                "connection_password": password,
+                "nested": { "error_chain": error_chain },
+                "public": "bounded-operational-value",
+            });
+            redact_value(&mut value);
+            let rendered = serde_json::to_string(&value).expect("redacted JSON");
+            for canary in &canaries {
+                prop_assert!(!rendered.contains(canary));
+            }
+
+            // Deliberate content capture belongs to the host. This fixture
+            // models a host redactor and only asserts its own explicit bound;
+            // Tokeira defines no switch or provider API for it.
+            let host_output = canaries[0].chars().take(host_limit).collect::<String>();
+            prop_assert!(host_output.chars().count() <= host_limit);
+        }
     }
 }

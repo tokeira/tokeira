@@ -239,6 +239,10 @@ use tokeira_managed_dsql::{
     LocalClusterDescriptorStore, ManagedDsqlLifecycle, Readiness, ResolvedCluster, StartupDeadline,
     SystemLifecycleEnvironment,
 };
+use tokeira_observability::{
+    ClusterStatusLabel, DbClassLabel, EmbeddedOperationLabel, EmbeddedStorageModeLabel,
+    ErrorClassLabel, OwnershipOutcomeLabel, SchemaOutcomeLabel, record_embedded_lifecycle,
+};
 use tokeira_projection::{
     DsqlVisibilityStore, InMemoryVisibilityStore, ProjectionSink, ProjectionWorker, SearchAttrType,
     VisibilityQueryService, VisibilitySink, VisibilityStore,
@@ -768,7 +772,7 @@ impl Engine {
             director: None,
             ownership: None,
         };
-        Ok(Self {
+        let engine = Self {
             endpoint: TemporalEndpoint {
                 service: stack.service,
                 shutdown: stack.background_cancel.clone(),
@@ -779,7 +783,9 @@ impl Engine {
             recovery_task: stack.recovery_task,
             startup_report: EngineStartupReport::in_memory(),
             shutdown_coordinator: Some(shutdown_coordinator),
-        })
+        };
+        record_embedded_startup(&engine.startup_report);
+        Ok(engine)
     }
 
     /// Start a zero-listener engine from an explicit embedded storage decision.
@@ -856,6 +862,7 @@ impl Engine {
         {
             failures.push(EmbeddedShutdownFailure::Snapshot);
         }
+        record_embedded_shutdown(&self.startup_report, &failures);
         if failures.is_empty() {
             Ok(())
         } else {
@@ -1166,7 +1173,7 @@ async fn start_embedded_dsql(
         director: Some(director),
         ownership: Some(ownership),
     };
-    Ok(Engine {
+    let engine = Engine {
         endpoint: TemporalEndpoint {
             service: stack.service,
             shutdown: stack.background_cancel.clone(),
@@ -1177,7 +1184,81 @@ async fn start_embedded_dsql(
         recovery_task: stack.recovery_task,
         startup_report: report,
         shutdown_coordinator: Some(coordinator),
-    })
+    };
+    record_embedded_startup(&engine.startup_report);
+    Ok(engine)
+}
+
+fn storage_mode_label(mode: EmbeddedStorageMode) -> EmbeddedStorageModeLabel {
+    match mode {
+        EmbeddedStorageMode::InMemory => EmbeddedStorageModeLabel::InMemory,
+        EmbeddedStorageMode::ManagedDsql => EmbeddedStorageModeLabel::ManagedDsql,
+        EmbeddedStorageMode::ExistingDsql => EmbeddedStorageModeLabel::ExistingDsql,
+    }
+}
+
+fn schema_outcome_label(report: &EngineStartupReport) -> SchemaOutcomeLabel {
+    match report.schema.as_ref().map(|schema| schema.outcome) {
+        None => SchemaOutcomeLabel::NotApplicable,
+        Some(SchemaStartupOutcome::Compatible) => SchemaOutcomeLabel::Compatible,
+        Some(SchemaStartupOutcome::Initialized) => SchemaOutcomeLabel::Initialized,
+        Some(SchemaStartupOutcome::Migrated) => SchemaOutcomeLabel::Migrated,
+        Some(SchemaStartupOutcome::MetadataBackfilled) => SchemaOutcomeLabel::MetadataBackfilled,
+    }
+}
+
+fn ownership_outcome_label(report: &EngineStartupReport) -> OwnershipOutcomeLabel {
+    match report.ownership.map(|ownership| ownership.outcome) {
+        None => OwnershipOutcomeLabel::NotApplicable,
+        Some(ControlLeaseAcquireOutcome::Clean) => OwnershipOutcomeLabel::AcquiredClean,
+        Some(ControlLeaseAcquireOutcome::ExpiredTakeover) => OwnershipOutcomeLabel::AcquiredExpired,
+    }
+}
+
+/// Emit only bounded lifecycle dimensions through the host's current recorder.
+///
+/// This is deliberately downstream of successful construction. The metrics
+/// facade is observational: it does not install a recorder, hold an exporter,
+/// bind a listener, or participate in the startup decision.
+fn record_embedded_startup(report: &EngineStartupReport) {
+    record_embedded_lifecycle(
+        storage_mode_label(report.storage_mode),
+        if report.cluster.is_some() {
+            ClusterStatusLabel::Active
+        } else {
+            ClusterStatusLabel::NotApplicable
+        },
+        schema_outcome_label(report),
+        ownership_outcome_label(report),
+        DbClassLabel::Control,
+        EmbeddedOperationLabel::Startup,
+        ErrorClassLabel::None,
+    );
+}
+
+fn record_embedded_shutdown(report: &EngineStartupReport, failures: &[EmbeddedShutdownFailure]) {
+    let ownership = if report.ownership.is_some() && failures.is_empty() {
+        OwnershipOutcomeLabel::Released
+    } else {
+        ownership_outcome_label(report)
+    };
+    record_embedded_lifecycle(
+        storage_mode_label(report.storage_mode),
+        if report.cluster.is_some() {
+            ClusterStatusLabel::Active
+        } else {
+            ClusterStatusLabel::NotApplicable
+        },
+        schema_outcome_label(report),
+        ownership,
+        DbClassLabel::Control,
+        EmbeddedOperationLabel::Shutdown,
+        if failures.is_empty() {
+            ErrorClassLabel::None
+        } else {
+            ErrorClassLabel::Internal
+        },
+    );
 }
 
 async fn refresh_cluster_until_storage_handoff(
@@ -4324,7 +4405,15 @@ pub fn __cli_parse() -> Cli {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
+    use metrics::with_local_recorder;
+    use metrics_util::debugging::DebuggingRecorder;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::{OTelSdkError, OTelSdkResult},
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
     use proptest::prelude::*;
+    use tracing_subscriber::layer::SubscriberExt as _;
     // Endpoint target/config types are referenced only by the Nexus endpoint store
     // tests below; importing them here (not at crate scope) keeps the lib build clean.
     use tokeira_runtime::{EndpointTarget, NexusEndpointConfig};
@@ -4416,6 +4505,133 @@ mod tests {
         events
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum HostInstrumentationModel {
+        None,
+        LocalRecorder,
+        LocalSubscriber,
+        RecorderAndSubscriber,
+    }
+
+    fn host_instrumentation_strategy() -> impl Strategy<Value = HostInstrumentationModel> {
+        prop_oneof![
+            Just(HostInstrumentationModel::None),
+            Just(HostInstrumentationModel::LocalRecorder),
+            Just(HostInstrumentationModel::LocalSubscriber),
+            Just(HostInstrumentationModel::RecorderAndSubscriber),
+        ]
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EmbeddedStorageModeModel {
+        InMemory,
+        ManagedDsql,
+        ExistingDsql,
+    }
+
+    fn storage_mode_strategy() -> impl Strategy<Value = EmbeddedStorageModeModel> {
+        prop_oneof![
+            Just(EmbeddedStorageModeModel::InMemory),
+            Just(EmbeddedStorageModeModel::ManagedDsql),
+            Just(EmbeddedStorageModeModel::ExistingDsql),
+        ]
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct EmbeddedConstructionEffects {
+        listener_attempts: usize,
+        global_install_attempts: usize,
+        signal_handler_attempts: usize,
+        local_emission_attempts: usize,
+    }
+
+    fn embedded_construction_effects(
+        _host: HostInstrumentationModel,
+        _storage: EmbeddedStorageModeModel,
+    ) -> EmbeddedConstructionEffects {
+        // Every storage choice crosses the same library boundary. Durable
+        // modes add AWS/SQL I/O but never acquire host process facilities.
+        EmbeddedConstructionEffects {
+            listener_attempts: 0,
+            global_install_attempts: 0,
+            signal_handler_attempts: 0,
+            local_emission_attempts: 1,
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TelemetryFixture {
+        NoSubscriber,
+        LocalRecorder,
+        FailingExporter,
+    }
+
+    fn telemetry_fixture_strategy() -> impl Strategy<Value = TelemetryFixture> {
+        prop_oneof![
+            Just(TelemetryFixture::NoSubscriber),
+            Just(TelemetryFixture::LocalRecorder),
+            Just(TelemetryFixture::FailingExporter),
+        ]
+    }
+
+    #[derive(Clone, Debug)]
+    struct FailingSpanExporter;
+
+    impl SpanExporter for FailingSpanExporter {
+        async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+            Err(OTelSdkError::InternalFailure(
+                "fixture exporter rejected the batch".to_owned(),
+            ))
+        }
+    }
+
+    fn apply_observed_sequence(ops: &[i16]) -> Vec<u8> {
+        let mut state = 0_i64;
+        let mut committed = Vec::with_capacity(ops.len() * std::mem::size_of::<i64>());
+        let span = tracing::info_span!(
+            "embedded.observational_fixture",
+            tokeira.operation = "transition_sequence"
+        );
+        let _entered = span.enter();
+        for op in ops {
+            record_embedded_lifecycle(
+                EmbeddedStorageModeLabel::InMemory,
+                ClusterStatusLabel::NotApplicable,
+                SchemaOutcomeLabel::NotApplicable,
+                OwnershipOutcomeLabel::NotApplicable,
+                DbClassLabel::Commit,
+                EmbeddedOperationLabel::Startup,
+                ErrorClassLabel::None,
+            );
+            state = state.wrapping_add(i64::from(*op));
+            committed.extend_from_slice(&state.to_le_bytes());
+        }
+        committed
+    }
+
+    fn observed_sequence_bytes(ops: &[i16], fixture: TelemetryFixture) -> Vec<u8> {
+        match fixture {
+            TelemetryFixture::NoSubscriber => apply_observed_sequence(ops),
+            TelemetryFixture::LocalRecorder => {
+                let recorder = DebuggingRecorder::new();
+                with_local_recorder(&recorder, || apply_observed_sequence(ops))
+            }
+            TelemetryFixture::FailingExporter => {
+                let provider = SdkTracerProvider::builder()
+                    .with_simple_exporter(FailingSpanExporter)
+                    .build();
+                let tracer = provider.tracer("observational-property");
+                let subscriber = tracing_subscriber::registry()
+                    .with(tracing_opentelemetry::layer().with_tracer(tracer));
+                let dispatch = tracing::Dispatch::new(subscriber);
+                let bytes =
+                    tracing::dispatcher::with_default(&dispatch, || apply_observed_sequence(ops));
+                let _ = provider.force_flush();
+                bytes
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -4484,6 +4700,31 @@ mod tests {
                     < events.iter().position(|event| *event == ShutdownModelEvent::ReturnToHost)
             );
         }
+
+        // Feature: managed-embedded-dsql, Property 14: embedded construction is transport- and global-state-neutral
+        #[test]
+        fn embedded_construction_is_transport_and_global_state_neutral(
+            host in host_instrumentation_strategy(),
+            storage in storage_mode_strategy(),
+        ) {
+            let effects = embedded_construction_effects(host, storage);
+            prop_assert_eq!(effects.listener_attempts, 0);
+            prop_assert_eq!(effects.global_install_attempts, 0);
+            prop_assert_eq!(effects.signal_handler_attempts, 0);
+            prop_assert_eq!(effects.local_emission_attempts, 1);
+        }
+
+        // Feature: managed-embedded-dsql, Property 20: telemetry is observational only
+        #[test]
+        fn telemetry_is_observational_only(
+            operations in prop::collection::vec(any::<i16>(), 0..64),
+            first in telemetry_fixture_strategy(),
+            second in telemetry_fixture_strategy(),
+        ) {
+            let expected = observed_sequence_bytes(&operations, TelemetryFixture::NoSubscriber);
+            prop_assert_eq!(observed_sequence_bytes(&operations, first), expected.clone());
+            prop_assert_eq!(observed_sequence_bytes(&operations, second), expected);
+        }
     }
 
     #[test]
@@ -4531,6 +4772,40 @@ mod tests {
             .expect("explicit in-memory startup succeeds");
         assert_eq!(engine.startup_report(), &EngineStartupReport::in_memory());
         engine.shutdown().await.expect("tracked shutdown succeeds");
+    }
+
+    #[test]
+    fn embedded_lifecycle_composes_with_a_host_local_recorder() {
+        let recorder = DebuggingRecorder::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("embedded fixture runtime");
+
+        with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                // Starting twice in one process also proves the library did not
+                // consume the one-shot process observability reservation.
+                for _ in 0..2 {
+                    let engine =
+                        Engine::start_with_embedded_config(EmbeddedEngineConfig::default())
+                            .await
+                            .expect("embedded startup");
+                    engine.shutdown().await.expect("embedded shutdown");
+                }
+            });
+        });
+
+        let lifecycle_observations = recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| {
+                key.key().name() == tokeira_observability::EMBEDDED_LIFECYCLE_OPERATIONS_TOTAL
+            })
+            .count();
+        assert_eq!(lifecycle_observations, 2);
     }
 
     #[tokio::test]

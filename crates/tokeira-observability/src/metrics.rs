@@ -4,18 +4,22 @@
 //! global Prometheus recorder and emits only process metadata that is common to
 //! every Tokeira binary.
 
-use metrics::gauge;
+use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use crate::{
-    LabelCardinality, LabelDescriptor, MetricDescriptor, MetricManifest, MetricType, MetricUnit,
-    ObservabilityError, ProcessObservabilityConfig,
+    ClusterStatusLabel, DbClassLabel, EmbeddedOperationLabel, EmbeddedStorageModeLabel,
+    ErrorClassLabel, LabelCardinality, LabelDescriptor, MetricDescriptor, MetricManifest,
+    MetricType, MetricUnit, ObservabilityError, OwnershipOutcomeLabel, ProcessObservabilityConfig,
+    SchemaOutcomeLabel,
 };
 
 /// Build metadata gauge; value is always `1`.
 pub const BUILD_INFO: &str = "tokeira_build_info";
 /// Process start timestamp as Unix seconds.
 pub const PROCESS_START_TIME_SECONDS: &str = "tokeira_process_metadata_start_time_seconds";
+/// Embedded lifecycle attempts, classified only by bounded operational dimensions.
+pub const EMBEDDED_LIFECYCLE_OPERATIONS_TOTAL: &str = "tokeira_embedded_lifecycle_operations_total";
 
 const SERVICE_LABEL: LabelDescriptor = LabelDescriptor {
     name: "service",
@@ -73,6 +77,113 @@ const RUSTC_VERSION_LABEL: LabelDescriptor = LabelDescriptor {
     description: "compiler version for the running build",
 };
 
+const STORAGE_MODE_LABEL: LabelDescriptor = LabelDescriptor {
+    name: "storage_mode",
+    cardinality: LabelCardinality::BoundedEnum,
+    allowed_values: &["in_memory", "managed_dsql", "existing_dsql"],
+    max_cardinality_hint: Some(3),
+    description: "explicit embedded storage mode",
+};
+
+const CLUSTER_STATUS_LABEL: LabelDescriptor = LabelDescriptor {
+    name: "cluster_status",
+    cardinality: LabelCardinality::BoundedEnum,
+    allowed_values: &[
+        "not_applicable",
+        "creating",
+        "active",
+        "idle",
+        "inactive",
+        "updating",
+        "deleting",
+        "deleted",
+        "failed",
+        "pending_setup",
+        "pending_delete",
+        "unknown",
+    ],
+    max_cardinality_hint: Some(12),
+    description: "bounded Aurora DSQL control-plane status",
+};
+
+const SCHEMA_OUTCOME_LABEL: LabelDescriptor = LabelDescriptor {
+    name: "schema_outcome",
+    cardinality: LabelCardinality::BoundedEnum,
+    allowed_values: &[
+        "not_applicable",
+        "compatible",
+        "initialized",
+        "migrated",
+        "metadata_backfilled",
+        "migration_required",
+        "incompatible",
+        "failed",
+    ],
+    max_cardinality_hint: Some(8),
+    description: "bounded release/schema compatibility outcome",
+};
+
+const OWNERSHIP_OUTCOME_LABEL: LabelDescriptor = LabelDescriptor {
+    name: "ownership_outcome",
+    cardinality: LabelCardinality::BoundedEnum,
+    allowed_values: &[
+        "not_applicable",
+        "acquired_clean",
+        "acquired_expired",
+        "released",
+        "lost",
+        "rejected",
+    ],
+    max_cardinality_hint: Some(6),
+    description: "bounded exclusive embedded-owner outcome",
+};
+
+const DATABASE_CLASS_LABEL: LabelDescriptor = LabelDescriptor {
+    name: "database_class",
+    cardinality: LabelCardinality::BoundedEnum,
+    allowed_values: &["control", "commit", "read", "projection", "maintenance"],
+    max_cardinality_hint: Some(5),
+    description: "bounded DSQL connection budget class",
+};
+
+const OPERATION_KIND_LABEL: LabelDescriptor = LabelDescriptor {
+    name: "operation_kind",
+    cardinality: LabelCardinality::BoundedEnum,
+    allowed_values: &[
+        "startup",
+        "cluster_recovery",
+        "schema",
+        "ownership",
+        "shutdown",
+        "destroy_plan",
+        "destroy_apply",
+    ],
+    max_cardinality_hint: Some(7),
+    description: "bounded embedded lifecycle operation",
+};
+
+const ERROR_CLASS_LABEL: LabelDescriptor = LabelDescriptor {
+    name: "error_class",
+    cardinality: LabelCardinality::BoundedEnum,
+    allowed_values: &[
+        "none",
+        "configuration",
+        "descriptor",
+        "access_denied",
+        "quota",
+        "retryable",
+        "identity",
+        "status",
+        "storage",
+        "schema",
+        "ownership",
+        "deadline",
+        "internal",
+    ],
+    max_cardinality_hint: Some(13),
+    description: "redacted bounded failure class",
+};
+
 pub static PROCESS_METRIC_MANIFEST: MetricManifest = MetricManifest {
     crate_name: "tokeira-observability",
     metrics: &[
@@ -99,6 +210,53 @@ pub static PROCESS_METRIC_MANIFEST: MetricManifest = MetricManifest {
         },
     ],
 };
+
+/// Metrics emitted by the embeddable library without installing a recorder.
+pub static EMBEDDED_METRIC_MANIFEST: MetricManifest = MetricManifest {
+    crate_name: "tokeira-observability-embedded",
+    metrics: &[MetricDescriptor {
+        name: EMBEDDED_LIFECYCLE_OPERATIONS_TOTAL,
+        metric_type: MetricType::Counter,
+        unit: MetricUnit::Count,
+        description: "Embedded lifecycle attempts by bounded operational outcome.",
+        labels: &[
+            STORAGE_MODE_LABEL,
+            CLUSTER_STATUS_LABEL,
+            SCHEMA_OUTCOME_LABEL,
+            OWNERSHIP_OUTCOME_LABEL,
+            DATABASE_CLASS_LABEL,
+            OPERATION_KIND_LABEL,
+            ERROR_CLASS_LABEL,
+        ],
+    }],
+};
+
+/// Emit one embedded lifecycle observation through the host's current recorder.
+///
+/// This function performs no recorder installation and accepts only enums, so
+/// execution identifiers, content, and credentials cannot become metric labels.
+#[allow(clippy::too_many_arguments)]
+pub fn record_embedded_lifecycle(
+    storage_mode: EmbeddedStorageModeLabel,
+    cluster_status: ClusterStatusLabel,
+    schema_outcome: SchemaOutcomeLabel,
+    ownership_outcome: OwnershipOutcomeLabel,
+    database_class: DbClassLabel,
+    operation_kind: EmbeddedOperationLabel,
+    error_class: ErrorClassLabel,
+) {
+    counter!(
+        EMBEDDED_LIFECYCLE_OPERATIONS_TOTAL,
+        "storage_mode" => storage_mode.as_str(),
+        "cluster_status" => cluster_status.as_str(),
+        "schema_outcome" => schema_outcome.as_str(),
+        "ownership_outcome" => ownership_outcome.as_str(),
+        "database_class" => database_class.as_str(),
+        "operation_kind" => operation_kind.as_str(),
+        "error_class" => error_class.as_str(),
+    )
+    .increment(1);
+}
 
 /// Install the global Prometheus recorder when enabled.
 ///
@@ -154,6 +312,7 @@ pub fn record_process_metadata(config: &ProcessObservabilityConfig) {
 mod tests {
     use metrics::with_local_recorder;
     use metrics_util::debugging::DebuggingRecorder;
+    use proptest::prelude::*;
 
     use crate::{LogFormat, OtlpMetricsConfig, ServiceName, TraceExportConfig, validate_manifest};
 
@@ -180,6 +339,69 @@ mod tests {
     #[test]
     fn process_metric_manifest_is_valid() {
         validate_manifest(&PROCESS_METRIC_MANIFEST).unwrap();
+    }
+
+    #[test]
+    fn embedded_metric_manifest_is_valid() {
+        validate_manifest(&EMBEDDED_METRIC_MANIFEST).unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Feature: managed-embedded-dsql, Property 17: metric dimensions stay bounded
+        #[test]
+        fn embedded_metric_dimensions_stay_bounded(
+            workflow_ids in prop::collection::vec("workflow-[a-zA-Z0-9]{1,32}", 0..24),
+            run_ids in prop::collection::vec("run-[a-zA-Z0-9]{1,32}", 0..24),
+            activity_ids in prop::collection::vec("activity-[a-zA-Z0-9]{1,32}", 0..24),
+            prompts in prop::collection::vec("prompt-[a-zA-Z0-9]{1,32}", 0..24),
+            tool_inputs in prop::collection::vec("tool-[a-zA-Z0-9]{1,32}", 0..24),
+        ) {
+            let recorder = DebuggingRecorder::new();
+            let repetitions = workflow_ids.len()
+                .max(run_ids.len())
+                .max(activity_ids.len())
+                .max(prompts.len())
+                .max(tool_inputs.len())
+                .max(1);
+            with_local_recorder(&recorder, || {
+                for _ in 0..repetitions {
+                    record_embedded_lifecycle(
+                        EmbeddedStorageModeLabel::ManagedDsql,
+                        ClusterStatusLabel::Active,
+                        SchemaOutcomeLabel::Compatible,
+                        OwnershipOutcomeLabel::AcquiredClean,
+                        DbClassLabel::Control,
+                        EmbeddedOperationLabel::Startup,
+                        ErrorClassLabel::None,
+                    );
+                }
+            });
+
+            let snapshot = recorder.snapshotter().snapshot().into_vec();
+            let metric = snapshot.iter()
+                .find(|(key, _, _, _)| key.key().name() == EMBEDDED_LIFECYCLE_OPERATIONS_TOTAL)
+                .expect("embedded metric recorded");
+            let labels = metric.0.key().labels()
+                .map(|label| (label.key(), label.value()))
+                .collect::<std::collections::HashMap<_, _>>();
+            let descriptor = &EMBEDDED_METRIC_MANIFEST.metrics[0];
+            prop_assert_eq!(labels.len(), descriptor.labels.len());
+            for label in descriptor.labels {
+                let value = labels.get(label.name).expect("manifest label emitted");
+                prop_assert!(label.allowed_values.contains(value));
+            }
+            let rendered = format!("{labels:?}");
+            for canary in workflow_ids.iter()
+                .chain(run_ids.iter())
+                .chain(activity_ids.iter())
+                .chain(prompts.iter())
+                .chain(tool_inputs.iter())
+            {
+                prop_assert!(!rendered.contains(canary));
+            }
+        }
     }
 
     #[test]

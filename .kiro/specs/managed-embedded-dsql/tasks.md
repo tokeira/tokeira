@@ -343,17 +343,17 @@
     engine lifecycle tests make zero destructive AWS calls.
   - _Requirements: 1.1–10.10, 13.10–13.14, 13.21, 14.1–14.8_
 
-- [ ] 15. Implement composable trace-context propagation and durable correlation
-  - [ ] 15.1 Extend `ChannelTraceContext` to complete serializable W3C span context
+- [x] 15. Implement composable trace-context propagation and durable correlation
+  - [x] 15.1 Extend `ChannelTraceContext` to complete serializable W3C span context
     - Capture trace ID, span ID, flags, and tracestate from the current context and rebuild
       an OpenTelemetry remote parent; carry data rather than span handles and keep it out
       of authoritative history.
     - _Requirements: 11.2, 11.5, 11.10–11.11_
-  - [ ] 15.2 Extract W3C parentage at the in-process `service_override` boundary
+  - [x] 15.2 Extract W3C parentage at the in-process `service_override` boundary
     - Parse copied gRPC `traceparent`/`tracestate`, set a valid remote parent on the server
       span, and start a root for absent/invalid input without changing Temporal results.
     - _Requirements: 1.8, 11.1, 11.14, 13.16_
-  - [ ] 15.3 Thread context through runtime channels and task processing
+  - [x] 15.3 Thread context through runtime channels and task processing
     - Propagate parent or link relationships through direct dispatch, fanout/handoff,
       workflow-task and activity-task processing, and Tokeira-owned outbound calls while
       preserving opaque Temporal headers.
@@ -361,94 +361,94 @@
       spans/events so a restarted process may start a new trace without losing durable
       correlation.
     - _Requirements: 11.2–11.11, 13.17–13.19_
-  - [ ] 15.4 Add host-carrier integration fixtures without defining host APIs
+  - [x] 15.4 Add host-carrier integration fixtures without defining host APIs
     - Exercise provider, MCP-tool, and handoff context carriers through a host-owned test
       fixture; Tokeira supplies only stable identifiers and context at boundaries it
       actually mediates.
     - _Requirements: 11.6–11.9, 13.18–13.19_
-  - [ ] 15.5 Property test: Property 15 — `service_override` preserves W3C parentage
+  - [x] 15.5 Property test: Property 15 — `service_override` preserves W3C parentage
     - Generate valid, absent, and malformed W3C contexts for at least 100 cases and
       compare recorded span relationships and unchanged service results.
     - Tag: `// Feature: managed-embedded-dsql, Property 15: service_override preserves W3C parentage`
     - _Requirements: 11.1, 11.14, 13.16_
-  - [ ] 15.6 Property test: Property 16 — transient context and durable identifiers compose
+  - [x] 15.6 Property test: Property 16 — transient context and durable identifiers compose
     - Generate boundary chains, relationship kinds, execution identifiers, and restart
       points for at least 100 cases against a parent/link/correlation reference model.
     - Tag: `// Feature: managed-embedded-dsql, Property 16: transient context and durable identifiers compose`
     - _Requirements: 11.2–11.11, 13.17–13.19_
 
-- [ ] 16. Make embedded telemetry host-owned, bounded, redacted, and observational
-  - [ ] 16.1 Separate library instrumentation from process-level installation
+- [x] 16. Make embedded telemetry host-owned, bounded, redacted, and observational
+  - [x] 16.1 Separate library instrumentation from process-level installation
     - Ensure no embedded construction path calls the process installer, mutates a global
       dispatcher/recorder/propagator/provider, starts a metrics listener, owns an
       exporter, or globally flushes/shuts down host telemetry.
     - Keep existing composable `tracing` and `metrics` emission and use pinned stable
       semantic conventions plus documented `tokeira.*` attributes where needed.
     - _Requirements: 10.1–10.13, 13.15_
-  - [ ] 16.2 Extend the metric manifest with bounded lifecycle dimensions
+  - [x] 16.2 Extend the metric manifest with bounded lifecycle dimensions
     - Add storage mode, cluster status, schema/ownership outcome, database class,
       operation kind, and error class as bounded dimensions; reject workflow/run/trace/
       request/activity identifiers and prompt/tool/credential/token fields as labels.
     - _Requirements: 10.6–10.7, 10.12–10.13, 11.12–11.13, 13.20_
-  - [ ] 16.3 Apply default sensitive-data exclusion and redacted formatting
+  - [x] 16.3 Apply default sensitive-data exclusion and redacted formatting
     - Keep prompts, tool inputs/outputs, workflow/activity payloads, AWS credentials,
       DSQL auth tokens, creation tokens, connection passwords, and secret-bearing errors
       out of spans, events, metrics, reports, and `Debug`/`Display` output.
     - Leave deliberate host content capture and redaction entirely host-owned; add no
       Tokeira content-capture switch.
     - _Requirements: 2.12, 8.13, 12.1–12.10, 13.22_
-  - [ ] 16.4 Property test: Property 14 — embedded construction is transport- and global-state-neutral
+  - [x] 16.4 Property test: Property 14 — embedded construction is transport- and global-state-neutral
     - Generate host instrumentation setups and embedded storage modes for at least 100
       cases, recording listener attempts, globals, and locally emitted instrumentation.
     - Tag: `// Feature: managed-embedded-dsql, Property 14: embedded construction is transport- and global-state-neutral`
     - _Requirements: 1.7–1.10, 10.1–10.7, 10.11, 13.15_
-  - [ ] 16.5 Property test: Property 17 — metric dimensions stay bounded
+  - [x] 16.5 Property test: Property 17 — metric dimensions stay bounded
     - Generate arbitrary counts and contents of high-cardinality identifiers and content
       for at least 100 cases; assert emitted labels remain in the bounded manifest.
     - Tag: `// Feature: managed-embedded-dsql, Property 17: metric dimensions stay bounded`
     - _Requirements: 10.6–10.7, 10.12–10.13, 11.12–11.13, 13.20_
-  - [ ] 16.6 Property test: Property 18 — sensitive content is absent by default
+  - [x] 16.6 Property test: Property 18 — sensitive content is absent by default
     - Generate unique canaries for every sensitive source, nested error chain, report,
       formatting path, and host-redactor result for at least 100 cases.
     - Tag: `// Feature: managed-embedded-dsql, Property 18: sensitive content is absent by default`
     - _Requirements: 2.12, 8.13, 12.1–12.10, 13.22_
-  - [ ] 16.7 Property test: Property 20 — telemetry is observational only
+  - [x] 16.7 Property test: Property 20 — telemetry is observational only
     - Replay generated request sequences with no subscriber, a recorder, and a dropping/
       failing exporter for at least 100 cases; compare decisions and committed transition
       bytes exactly.
     - Tag: `// Feature: managed-embedded-dsql, Property 20: telemetry is observational only`
     - _Requirements: 11.10–11.11, 14.4–14.6_
-  - [ ] 16.8 Add fixed observability and security tests
+  - [x] 16.8 Add fixed observability and security tests
     - Cover every forbidden metric label, semantic-attribute names, process-global state
       preservation, no-subscriber behavior, failed exporter behavior, and canary absence
       from each fixed output surface.
     - _Requirements: 10.1–12.10, 13.15, 13.20, 13.22, 14.4–14.6_
 
-- [ ] 17. Checkpoint: context and observability are green
+- [x] 17. Checkpoint: context and observability are green
   - Run formatting plus focused check, clippy, nextest, and doctests for observability,
     edge, runtime, and engine; confirm Properties 14–18 and 20 pass under isolated test
     processes and no test installs shared process-global state across cases.
   - _Requirements: 10.1–12.10, 13.15–13.22, 14.4–14.6_
 
-- [ ] 18. Add end-to-end embedded DSQL verification
-  - [ ] 18.1 Add the full embedded storage integration test
+- [x] 18. Add end-to-end embedded DSQL verification
+  - [x] 18.1 Add the full embedded storage integration test
     - Build `StackTransport::Embedded` over the DSQL repository path, invoke Temporal SDK
       calls through `service_override`, and assert no listener and no DynamoDB
       client/table/config access.
     - _Requirements: 1.5, 1.7–1.10, 6.1–6.18, 8.5, 13.10–13.11, 14.7_
-  - [ ] 18.2 Add restart and ownership integration tests
+  - [x] 18.2 Add restart and ownership integration tests
     - Recreate the engine from the same descriptor/database state; verify canonical
       cluster identity, stable workflow/run correlation with a permitted new trace, one
       admitted owner, immediate clean takeover, quiesced expired takeover, and old
       endpoint fencing.
     - _Requirements: 2.3–2.9, 3.1–3.13, 7.1–7.9, 11.9, 13.12–13.13, 13.19_
-  - [ ] 18.3 Add telemetry, host-carrier, shutdown-flush, and canary integrations
+  - [x] 18.3 Add telemetry, host-carrier, shutdown-flush, and canary integrations
     - Install local host-owned test instrumentation before startup; exercise RPC,
       workflow, activity, outbound, provider, MCP-tool, handoff, restart, and shutdown
       paths; flush only after engine shutdown; assert stable correlation, bounded metrics,
       and complete canary exclusion.
     - _Requirements: 10.1–12.10, 13.15–13.22_
-  - [ ] 18.4 Add the non-default live AWS lifecycle test and runbook
+  - [x] 18.4 Add the non-default live AWS lifecycle test and runbook
     - Behind the existing DSQL integration mechanism and an explicit credentialed
       invocation, create one disposable single-Region cluster, inject post-create crash,
       recover with the durable token, exercise wake/schema/ownership, obtain and confirm
@@ -456,13 +456,13 @@
     - Document permissions, Region, cost, timeout, descriptor path, cleanup/recovery, and
       why default CI skips it; do not add a `tkr` or `tkp` adapter.
     - _Requirements: 2.1–3.16, 5.5–5.12, 7.1–7.9, 9.5–9.11, 13.23–13.24_
-  - [ ] 18.5 Add cross-crate architecture and default-suite assertions
+  - [x] 18.5 Add cross-crate architecture and default-suite assertions
     - Prove the default workspace tests need neither AWS credentials nor Docker, DSQL SQL
       tests stay feature-gated, all async tests synchronize without sleeps, and kernel
       dependencies/features/source remain unchanged.
     - _Requirements: 13.23–13.24, 14.1–14.8_
 
-- [ ] 19. Final checkpoint: workspace quality bar is green
+- [x] 19. Final checkpoint: workspace quality bar is green
   - Run `cargo +nightly fmt --all`, `cargo lint --locked`,
     `cargo check --workspace --locked`, `cargo nextest run --workspace --locked`,
     `cargo test --workspace --doc --locked`, and

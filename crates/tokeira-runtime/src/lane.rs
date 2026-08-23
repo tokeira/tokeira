@@ -33,6 +33,7 @@ use tokeira_storage::{CommitResult, RunRepository, metrics as storage_metrics};
 use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch, execution_home_bundle};
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
     UpdateRegistry, UpdateResolution, metrics as runtime_metrics,
@@ -424,7 +425,7 @@ where
             config.max_occ_retries,
             cache,
         )
-        .instrument(processing_span)
+        .instrument(processing_span.clone())
         .await;
 
         let stop_draining = result.is_err();
@@ -865,7 +866,10 @@ where
                     dispatch_ops.retain(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. }));
                 }
                 if !dispatch_ops.is_empty()
-                    && let Err(error) = publisher.publish(message.run_key, &dispatch_ops).await
+                    && let Err(error) = publisher
+                        .publish(message.run_key, &dispatch_ops)
+                        .instrument(processing_span.clone())
+                        .await
                 {
                     // Dispatch is a derived effect, not authority: a failed
                     // publish is logged but not fatal because the sweeper
@@ -1387,21 +1391,31 @@ fn lane_processing_span(
 ) -> tracing::Span {
     let origin_trace_id = message
         .trace_context
-        .map(ChannelTraceContext::origin_trace_id_hex)
+        .as_ref()
+        .map(ChannelTraceContext::trace_id_hex)
         .unwrap_or_default();
     let origin_span_id = message
         .trace_context
-        .map(ChannelTraceContext::origin_span_id_hex)
+        .as_ref()
+        .map(ChannelTraceContext::span_id_hex)
         .unwrap_or_default();
-    tracing::info_span!(
+    let span = tracing::info_span!(
         "lane.process",
         tokeira.lane_id = message.lane_id,
         tokeira.shard_id = shard_id.0,
         tokeira.bundle_id = shard_id.0,
+        tokeira.run_key = %message.run_key.0,
         tokeira.command_type = command_type,
-        origin_trace_id = origin_trace_id.as_str(),
-        origin_span_id = origin_span_id.as_str(),
-    )
+        tokeira.origin_trace_id = origin_trace_id.as_str(),
+        tokeira.origin_span_id = origin_span_id.as_str(),
+    );
+    if let Some(context) = &message.trace_context {
+        // The lane message is a direct causal hop. Rebuilding a remote parent
+        // preserves W3C flags/tracestate without carrying subscriber-owned span
+        // state through the bounded channel.
+        let _ = span.set_parent(context.as_remote_parent());
+    }
+    span
 }
 
 #[cfg(test)]
@@ -3120,9 +3134,10 @@ mod tests {
                     LaneMessage::new(7, RunKey::new(), sample_command("traced"), reply_tx);
                 let context = message
                     .trace_context
+                    .as_ref()
                     .expect("message should capture active OTel span context");
-                let expected_trace_id = context.origin_trace_id_hex();
-                let expected_span_id = context.origin_span_id_hex();
+                let expected_trace_id = context.trace_id_hex();
+                let expected_span_id = context.span_id_hex();
                 let _processing_span =
                     lane_processing_span(&message, command_type_name(&message.command), ShardId(3));
                 (message, expected_trace_id, expected_span_id)
@@ -3134,8 +3149,14 @@ mod tests {
             .iter()
             .find(|(name, _)| name == "lane.process")
             .expect("lane processing span should be created");
-        assert_eq!(fields.get("origin_trace_id"), Some(&expected_trace_id));
-        assert_eq!(fields.get("origin_span_id"), Some(&expected_span_id));
+        assert_eq!(
+            fields.get("tokeira.origin_trace_id"),
+            Some(&expected_trace_id)
+        );
+        assert_eq!(
+            fields.get("tokeira.origin_span_id"),
+            Some(&expected_span_id)
+        );
         assert_eq!(fields.get("tokeira.lane_id"), Some(&"7".to_string()));
         assert_eq!(fields.get("tokeira.shard_id"), Some(&"3".to_string()));
         assert_eq!(

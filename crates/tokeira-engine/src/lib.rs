@@ -441,7 +441,7 @@ impl EngineSnapshotPolicy {
                             error!(
                                 snapshot_path = %periodic_location.display(),
                                 error = %error,
-                                "failed to persist periodic embedded-engine snapshot"
+                                "failed to persist periodic engine snapshot"
                             );
                         }
                     }
@@ -487,7 +487,7 @@ impl Engine {
     pub async fn start_with_config(config: TokeiraConfig) -> Result<Self> {
         let config = embedded_config(config)?;
         let snapshot_config = config.policy.snapshot.clone();
-        let (store, restored) = restore_embedded_store(&config).await?;
+        let (store, restored) = restore_snapshot_store(&config).await?;
         let stack = build_embedded(Arc::new(config), store.clone(), restored).await?;
         let snapshot_policy = snapshot_config.map(|config| {
             EngineSnapshotPolicy::start(store, config, stack.background_cancel.clone())
@@ -530,44 +530,48 @@ impl Engine {
     /// graceful shutdown must not silently claim durability it did not achieve.
     pub async fn shutdown(mut self) -> Result<()> {
         self.background_cancel.cancel();
-        let periodic_result = match self
-            .snapshot_policy
-            .as_mut()
-            .and_then(|policy| policy.periodic_task.take())
-        {
-            Some(task) => task
-                .await
-                .context("embedded snapshot task panicked during shutdown"),
-            None => Ok(()),
-        };
         let recovery_result = match self.recovery_task.take() {
             Some(task) => task
                 .await
                 .context("embedded snapshot recovery task panicked during shutdown")?,
             None => Ok(()),
         };
-        // The endpoint observes the same token. Yield once so cancellation-aware
-        // workers that are already runnable can leave their select loops before the
-        // final consistent cut and before the caller tears down its Tokio runtime.
-        tokio::task::yield_now().await;
-        let snapshot_result = match self.snapshot_policy.as_ref() {
-            Some(policy) => persist_snapshot(&policy.store, &policy.location)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to persist final embedded-engine snapshot to {}",
-                        policy.location.display()
-                    )
-                }),
+        let snapshot_result = match self.snapshot_policy.take() {
+            Some(policy) => finish_snapshot_policy(policy).await,
             None => Ok(()),
         };
-        periodic_result?;
         recovery_result?;
         snapshot_result
     }
 }
 
-async fn restore_embedded_store(config: &TokeiraConfig) -> Result<(InMemoryStore, bool)> {
+/// Drain a cancelled snapshot policy: await its periodic task, then persist
+/// the final consistent cut.
+///
+/// Shared by the embedded facade and the listener-backed daemon so both
+/// serving modes end with the identical durability sequence. The caller must
+/// already have cancelled the policy's cancellation token.
+async fn finish_snapshot_policy(mut policy: EngineSnapshotPolicy) -> Result<()> {
+    if let Some(task) = policy.periodic_task.take() {
+        task.await
+            .context("engine snapshot task panicked during shutdown")?;
+    }
+    // Background workers observe the same token. Yield once so
+    // cancellation-aware workers that are already runnable can leave their
+    // select loops before the final consistent cut and before the caller
+    // tears down its Tokio runtime.
+    tokio::task::yield_now().await;
+    persist_snapshot(&policy.store, &policy.location)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to persist final engine snapshot to {}",
+                policy.location.display()
+            )
+        })
+}
+
+async fn restore_snapshot_store(config: &TokeiraConfig) -> Result<(InMemoryStore, bool)> {
     let Some(snapshot) = config.policy.snapshot.as_ref() else {
         return Ok((InMemoryStore::default(), false));
     };
@@ -575,7 +579,7 @@ async fn restore_embedded_store(config: &TokeiraConfig) -> Result<(InMemoryStore
         Ok(bytes) => {
             let store = InMemoryStore::from_snapshot(&bytes).with_context(|| {
                 format!(
-                    "failed to restore embedded-engine snapshot from {}",
+                    "failed to restore engine snapshot from {}",
                     snapshot.location.display()
                 )
             })?;
@@ -587,7 +591,7 @@ async fn restore_embedded_store(config: &TokeiraConfig) -> Result<(InMemoryStore
             })?;
             info!(
                 snapshot_path = %snapshot.location.display(),
-                "restored embedded-engine snapshot"
+                "restored engine snapshot"
             );
             Ok((store, true))
         }
@@ -596,7 +600,7 @@ async fn restore_embedded_store(config: &TokeiraConfig) -> Result<(InMemoryStore
         }
         Err(error) => Err(error).with_context(|| {
             format!(
-                "failed to read embedded-engine snapshot from {}",
+                "failed to read engine snapshot from {}",
                 snapshot.location.display()
             )
         }),
@@ -607,7 +611,7 @@ async fn retire_snapshot_leases(store: &InMemoryStore) -> Result<()> {
     for lease in store
         .list_bundle_leases()
         .await
-        .context("failed to list embedded snapshot leases")?
+        .context("failed to list engine snapshot leases")?
     {
         let Some(owner) = lease.owner_node_id else {
             continue;
@@ -615,7 +619,7 @@ async fn retire_snapshot_leases(store: &InMemoryStore) -> Result<()> {
         match store
             .relinquish_bundle(lease.bundle_id, owner, lease.epoch)
             .await
-            .context("failed to relinquish an embedded snapshot lease")?
+            .context("failed to relinquish an engine snapshot lease")?
         {
             LeaseOutcome::Acquired { .. } => {}
             LeaseOutcome::Rejected {
@@ -623,13 +627,13 @@ async fn retire_snapshot_leases(store: &InMemoryStore) -> Result<()> {
                 current_epoch,
             } => {
                 return Err(anyhow!(
-                    "embedded snapshot lease retirement was fenced by owner {current_owner} at epoch {}",
+                    "engine snapshot lease retirement was fenced by owner {current_owner} at epoch {}",
                     current_epoch.0
                 ));
             }
             LeaseOutcome::Renewed { epoch } => {
                 return Err(anyhow!(
-                    "embedded snapshot lease retirement unexpectedly renewed epoch {}",
+                    "engine snapshot lease retirement unexpectedly renewed epoch {}",
                     epoch.0
                 ));
             }
@@ -642,7 +646,7 @@ async fn persist_snapshot(store: &InMemoryStore, location: &Path) -> Result<()> 
     let bytes = store
         .snapshot()
         .await
-        .context("failed to capture embedded-engine snapshot")?;
+        .context("failed to capture engine snapshot")?;
     write_snapshot_atomically(location, &bytes).await
 }
 
@@ -653,7 +657,7 @@ async fn write_snapshot_atomically(location: &Path, bytes: &[u8]) -> Result<()> 
     {
         fs::create_dir_all(parent).await.with_context(|| {
             format!(
-                "failed to create embedded snapshot directory {}",
+                "failed to create engine snapshot directory {}",
                 parent.display()
             )
         })?;
@@ -676,26 +680,26 @@ async fn write_snapshot_atomically(location: &Path, bytes: &[u8]) -> Result<()> 
             .await
             .with_context(|| {
                 format!(
-                    "failed to create temporary embedded snapshot {}",
+                    "failed to create temporary engine snapshot {}",
                     temporary.display()
                 )
             })?;
         file.write_all(bytes).await.with_context(|| {
             format!(
-                "failed to write temporary embedded snapshot {}",
+                "failed to write temporary engine snapshot {}",
                 temporary.display()
             )
         })?;
         file.sync_all().await.with_context(|| {
             format!(
-                "failed to sync temporary embedded snapshot {}",
+                "failed to sync temporary engine snapshot {}",
                 temporary.display()
             )
         })?;
         drop(file);
-        fs::rename(&temporary, location).await.with_context(|| {
-            format!("failed to replace embedded snapshot {}", location.display())
-        })?;
+        fs::rename(&temporary, location)
+            .await
+            .with_context(|| format!("failed to replace engine snapshot {}", location.display()))?;
         Ok(())
     }
     .await;
@@ -929,6 +933,10 @@ pub struct TokeiradHandle {
     /// schedule engine in lockstep with the gRPC server shutdown.
     background_cancel: CancellationToken,
     log_broadcast: broadcast::Sender<LogEvent>,
+    /// In-memory snapshot policy, when configured. The final consistent cut
+    /// runs in [`Self::shutdown`]; a plain drop cancels only (an async write
+    /// cannot run in `Drop`), so callers needing durability call `shutdown`.
+    snapshot_policy: Option<EngineSnapshotPolicy>,
 }
 
 /// One observable RPC event streamed through [`TokeiradHandle::log_sink`].
@@ -975,14 +983,17 @@ impl TokeiradHandle {
             .validate()
             .context("invalid in-memory server config")?;
         let effective_config = Arc::new(config);
-        let (server_task, bound_addr, shutdown_tx, background_cancel, log_broadcast, _recorder) =
-            build_and_serve(addr, effective_config).await?;
+        let (
+            (server_task, bound_addr, shutdown_tx, background_cancel, log_broadcast, _recorder),
+            snapshot_policy,
+        ) = build_and_serve(addr, effective_config).await?;
         Ok(Self {
             bound_addr,
             shutdown_tx: Some(shutdown_tx),
             server_task: Some(server_task),
             background_cancel,
             log_broadcast,
+            snapshot_policy,
         })
     }
 
@@ -1007,7 +1018,8 @@ impl TokeiradHandle {
         self.log_broadcast.subscribe()
     }
 
-    /// Signal the server to shut down and wait for the task to exit.
+    /// Signal the server to shut down, wait for the task to exit, and persist
+    /// the final snapshot when a snapshot policy is configured.
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -1018,7 +1030,10 @@ impl TokeiradHandle {
                 .context("tokeirad server task panicked")?
                 .context("tokeirad server task returned an error")?;
         }
-        Ok(())
+        match self.snapshot_policy.take() {
+            Some(policy) => finish_snapshot_policy(policy).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -1101,8 +1116,10 @@ fn dsql_coordination_table_names(config: &TokeiraConfig) -> (String, String) {
 /// Entrypoint the CLI delegates to.
 ///
 /// Parses `TokeiraConfig` from the CLI arguments, handles `--dump-config`, and
-/// serves the gRPC stack on `infrastructure.network.grpc_addr` until
-/// Ctrl-C.
+/// serves the gRPC stack on `infrastructure.network.grpc_addr` until ctrl-C
+/// or SIGTERM, then drains gracefully: in-flight requests finish, background
+/// work is cancelled, and (for in-memory storage with a snapshot policy) the
+/// final consistent cut is persisted before exit.
 // `--version` / `--dump-config` are CLI outputs to stdout by contract; daemon
 // logging elsewhere speaks `tracing` only.
 #[allow(clippy::print_stdout)]
@@ -1146,14 +1163,79 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
         })?;
     info!(config_source = %config_source, "loaded tokeirad configuration");
 
-    let (server_task, bound_addr, _shutdown_tx, _background_cancel, _log_broadcast, wire_recorder) =
-        build_and_serve(addr, effective_config).await?;
+    let (
+        (
+            mut server_task,
+            bound_addr,
+            shutdown_tx,
+            background_cancel,
+            _log_broadcast,
+            wire_recorder,
+        ),
+        snapshot_policy,
+    ) = build_and_serve(addr, effective_config).await?;
     readiness.mark_started();
     info!("tokeirad gRPC server listening on {bound_addr}");
-    let serve_result = server_task
-        .await
-        .context("tokeirad server task panicked")?
-        .context("tokeirad server task returned an error");
+
+    // Daemon-only signal handling. The embedded facade (`Engine`) deliberately
+    // installs no handlers and no process observability: an embedded host owns
+    // its process lifecycle, and a library that grabs SIGTERM would race the
+    // host's own shutdown sequence. Only this served entrypoint reacts to
+    // ctrl-C/SIGTERM, and the reaction is the graceful drain: stop accepting
+    // connections via the listener's shutdown oneshot, await in-flight
+    // requests, cancel background work, then take the final snapshot below.
+    let serve_result = {
+        let drain_signal = async {
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .context("failed to install the SIGTERM handler")?;
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => result
+                        .context("failed to listen for ctrl-c")
+                        .map(|()| "SIGINT"),
+                    _ = sigterm.recv() => Ok("SIGTERM"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c()
+                    .await
+                    .context("failed to listen for ctrl-c")
+                    .map(|()| "ctrl-c")
+            }
+        };
+        tokio::select! {
+            result = &mut server_task => result
+                .context("tokeirad server task panicked")?
+                .context("tokeirad server task returned an error"),
+            signal = drain_signal => {
+                match signal {
+                    Ok(signal) => info!(signal, "shutdown signal received; draining tokeirad"),
+                    Err(error) => {
+                        // Signal delivery is broken; a blunt stop is the only
+                        // honest option left, but say why.
+                        tracing::warn!(?error, "signal handling failed; shutting down");
+                    }
+                }
+                let _ = shutdown_tx.send(());
+                (&mut server_task)
+                    .await
+                    .context("tokeirad server task panicked")?
+                    .context("tokeirad server task returned an error")
+            }
+        }
+    };
+    background_cancel.cancel();
+    // The final consistent cut runs after the drain regardless of how the
+    // server exited, so an error exit still leaves the freshest snapshot. A
+    // snapshot failure must not mask the server's own exit status; it is
+    // surfaced only after that status is known good.
+    let snapshot_result = match snapshot_policy {
+        Some(policy) => finish_snapshot_policy(policy).await,
+        None => Ok(()),
+    };
 
     // Tier-2 conformance evidence export. When the wire-coverage recorder is present (the
     // conformance flag was set), snapshot the observed `(wire_method, status_code)` set
@@ -1175,6 +1257,7 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
     }
 
     serve_result?;
+    snapshot_result?;
     Ok(())
 }
 
@@ -1317,18 +1400,37 @@ const DEFAULT_MAX_ID_LENGTH: usize = 1000;
 async fn build_and_serve(
     addr: SocketAddr,
     effective_config: Arc<TokeiraConfig>,
-) -> Result<ServerStack> {
+) -> Result<(ServerStack, Option<EngineSnapshotPolicy>)> {
+    let mut snapshot_inputs = None;
     let stack = match effective_config.infrastructure.storage {
         ConfigStorageKind::InMemory => {
+            // The listener-backed in-memory server shares the embedded
+            // facade's snapshot mechanism exactly: restore at boot, periodic
+            // persistence, and a final cut at shutdown all operate on the one
+            // in-memory store.
+            let (store, restored) = restore_snapshot_store(&effective_config).await?;
+            snapshot_inputs = effective_config
+                .policy
+                .snapshot
+                .clone()
+                .map(|config| (store.clone(), config));
             build_in_memory_stack(
                 StackTransport::Network(addr),
                 effective_config,
-                InMemoryStore::default(),
-                false,
+                store,
+                restored,
             )
             .await
         }
         ConfigStorageKind::Dsql => {
+            if effective_config.policy.snapshot.is_some() {
+                return Err(anyhow!(
+                    "policy.snapshot is configured but infrastructure.storage is \"dsql\": \
+                     snapshots are the in-memory store's persistence mechanism, and DSQL \
+                     storage is already durable — remove policy.snapshot or switch \
+                     infrastructure.storage to \"memory\""
+                ));
+            }
             let auth = dsql_auth_config(&effective_config)?;
             let endpoint = auth.endpoint.clone();
             let (pool_config, ddb_client) = dsql_pool_config(&effective_config, &auth).await?;
@@ -1385,7 +1487,14 @@ async fn build_and_serve(
         }
     }?;
     match stack {
-        ConstructedStack::Network(stack) => Ok(stack),
+        ConstructedStack::Network(stack) => {
+            // The policy shares the stack's cancellation token so the periodic
+            // task dies with the server's other background work; the final
+            // consistent cut stays with the caller's shutdown sequence.
+            let snapshot_policy = snapshot_inputs
+                .map(|(store, config)| EngineSnapshotPolicy::start(store, config, stack.3.clone()));
+            Ok((stack, snapshot_policy))
+        }
         ConstructedStack::Embedded(_) => Err(anyhow!(
             "network service construction returned an embedded stack"
         )),
@@ -3041,6 +3150,170 @@ mod tests {
     // Endpoint target/config types are referenced only by the Nexus endpoint store
     // tests below; importing them here (not at crate scope) keeps the lib build clean.
     use tokeira_runtime::{EndpointTarget, NexusEndpointConfig};
+
+    #[tokio::test]
+    async fn snapshot_policy_over_dsql_storage_is_rejected() {
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.storage = ConfigStorageKind::Dsql;
+        config.policy.snapshot = Some(SnapshotPolicyConfig {
+            location: std::path::PathBuf::from("unused.snapshot"),
+            interval_ms: 60_000,
+        });
+        let error = build_and_serve(
+            "127.0.0.1:0".parse().expect("loopback addr"),
+            Arc::new(config),
+        )
+        .await
+        .expect_err("snapshot policy over DSQL must be rejected before any I/O");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("in-memory store's persistence mechanism"),
+            "the rejection must name the mechanism: {message}"
+        );
+    }
+
+    /// The daemon drain regression: a real SIGTERM to the serving process
+    /// finishes in-flight work, persists the final snapshot, and the next
+    /// boot restores from it. Runs in-process (nextest isolates one process
+    /// per test, so signalling ourselves is safe); the restart half uses the
+    /// listener facade, which shares the same build path minus the
+    /// signal/observability install that must stay daemon-only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sigterm_drains_persists_final_snapshot_and_next_boot_restores() {
+        use tokeira_proto::workflowservice::{
+            DescribeWorkflowExecutionRequest, StartWorkflowExecutionRequest,
+            workflow_service_client::WorkflowServiceClient,
+        };
+
+        let scratch =
+            std::env::temp_dir().join(format!("tokeira-engine-sigterm-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let snapshot_location = scratch.join("tokeirad.snapshot");
+
+        // Reserve a loopback port for the daemon config. The tiny window
+        // between drop and rebind is acceptable in a single-purpose test
+        // process.
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let addr = reserved.local_addr().expect("reserved addr");
+        drop(reserved);
+
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.network.grpc_addr = addr.to_string();
+        // Loopback-ephemeral Nexus completion listener, exactly as the
+        // in-memory facade configures it, so parallel tests never collide.
+        config.policy.nexus_completion.http_addr = "127.0.0.1:0".to_string();
+        config.policy.nexus_completion.system_callback_url = "http://127.0.0.1:0".to_string();
+        config.policy.snapshot = Some(SnapshotPolicyConfig {
+            location: snapshot_location.clone(),
+            // Effectively periodic-off: this regression is about the FINAL
+            // cut on the signal path.
+            interval_ms: 3_600_000,
+        });
+        let config_path = scratch.join("tokeirad.toml");
+        std::fs::write(&config_path, config.to_toml().expect("render config"))
+            .expect("write config");
+
+        let mut daemon = tokio::spawn(run_from_cli(Cli {
+            config: Some(config_path.display().to_string()),
+            dump_config: false,
+            version: false,
+            verbose: false,
+            json: false,
+        }));
+
+        // Connect-poll until the daemon serves. The retry interval is a
+        // polling cadence against an external TCP bind (the one boundary a
+        // channel cannot observe), bounded by the deadline; a daemon that
+        // exits early fails the wait immediately with its own error.
+        let target = format!("http://{addr}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut client = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "daemon must start serving"
+            );
+            tokio::select! {
+                result = &mut daemon => {
+                    panic!("daemon exited before serving: {result:?}");
+                }
+                connected = WorkflowServiceClient::connect(target.clone()) => {
+                    match connected {
+                        Ok(client) => break client,
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }
+        };
+        client
+            .start_workflow_execution(StartWorkflowExecutionRequest {
+                namespace: "default".to_owned(),
+                workflow_id: "sigterm-canary".to_owned(),
+                workflow_type: Some(tokeira_proto::common::WorkflowType {
+                    name: "sigterm-workflow".to_owned(),
+                }),
+                task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                    name: "sigterm-queue".to_owned(),
+                    ..Default::default()
+                }),
+                request_id: "sigterm-start".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("start canary workflow");
+
+        // The real signal, sent to this very process; the drain must treat it
+        // exactly as an operator's `kill`.
+        let delivered = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("send SIGTERM");
+        assert!(delivered.success(), "kill -TERM must be deliverable");
+
+        daemon
+            .await
+            .expect("daemon task must not panic")
+            .expect("SIGTERM drain must exit cleanly");
+        assert!(
+            snapshot_location.is_file(),
+            "the drain must persist the final snapshot"
+        );
+
+        // Next boot restores the canary from the snapshot.
+        let restored =
+            TokeiradHandle::start_in_memory_with_config("127.0.0.1:0".parse().expect("addr"), {
+                let mut config = TokeiraConfig::default();
+                config.policy.snapshot = Some(SnapshotPolicyConfig {
+                    location: snapshot_location.clone(),
+                    interval_ms: 3_600_000,
+                });
+                config
+            })
+            .await
+            .expect("restart over the final snapshot");
+        let mut client =
+            WorkflowServiceClient::connect(format!("http://{}", restored.bound_addr()))
+                .await
+                .expect("connect to restarted server");
+        let described = client
+            .describe_workflow_execution(DescribeWorkflowExecutionRequest {
+                namespace: "default".to_owned(),
+                execution: Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id: "sigterm-canary".to_owned(),
+                    run_id: String::new(),
+                }),
+            })
+            .await
+            .expect("restored workflow must be describable")
+            .into_inner();
+        assert!(
+            described.workflow_execution_info.is_some(),
+            "state must survive the SIGTERM drain via snapshot restore"
+        );
+        restored.shutdown().await.expect("clean restart shutdown");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 
     #[cfg(feature = "temporalio-client")]
     #[test]

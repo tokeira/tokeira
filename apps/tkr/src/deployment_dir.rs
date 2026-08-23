@@ -48,6 +48,39 @@ use crate::metadata::{self, DeploymentMetadata, DeploymentStatus};
 
 pub(crate) const DEPLOYMENT_TOML: &str = "deployment.toml";
 pub(crate) const TOKEIRAD_TOML: &str = "tokeirad.toml";
+
+/// Snapshot file the local platform's generated server config points at,
+/// relative to the deployment directory (inside its existing `state/` dir).
+pub(crate) const LOCAL_SNAPSHOT_FILE: &str = "state/tokeirad.snapshot";
+
+/// Periodic snapshot cadence synthesized for local deployments: frequent
+/// enough that an abrupt developer-machine stop loses little, rare enough to
+/// stay invisible next to real work.
+pub(crate) const LOCAL_SNAPSHOT_INTERVAL_MS: u64 = 30_000;
+
+/// Synthesize the local platform's snapshot-policy default into a generated
+/// `tokeirad.toml`.
+///
+/// tkr owns this default at deployment creation — it is deliberately NOT a
+/// `tokeira-config` default or part of the platform's prototypical server
+/// config, because the location is deployment-relative and only tkr knows the
+/// deployment directory. Applied only for the local platform with in-memory
+/// storage: the snapshot mechanism is the in-memory store's, and the engine
+/// rejects a snapshot policy over DSQL storage at boot.
+pub(crate) fn apply_local_snapshot_default(
+    platform: &PlatformId,
+    storage: StorageKind,
+    deployment_path: &Path,
+    config: &mut tokeira_config::TokeiraConfig,
+) {
+    if platform.as_str() != "local" || storage != StorageKind::InMemory {
+        return;
+    }
+    config.policy.snapshot = Some(tokeira_config::SnapshotPolicyConfig {
+        location: deployment_path.join(LOCAL_SNAPSHOT_FILE),
+        interval_ms: LOCAL_SNAPSHOT_INTERVAL_MS,
+    });
+}
 pub(crate) const METADATA_JSON: &str = "metadata.json";
 pub(crate) const LATEST_FILE: &str = ".latest";
 /// The deployment-local provisioner binary — the `tkp` married to this
@@ -376,10 +409,14 @@ impl DeploymentResolver {
             for (name, bytes) in &seed.parts {
                 fs::write(definition_parent.join(name), bytes)?;
             }
-            fs::write(
-                path.join(TOKEIRAD_TOML),
-                tokeira_config::TokeiraConfig::default().to_toml()?,
-            )?;
+            let mut server_config = tokeira_config::TokeiraConfig::default();
+            apply_local_snapshot_default(
+                &platform,
+                storage,
+                &pending.final_path,
+                &mut server_config,
+            );
+            fs::write(path.join(TOKEIRAD_TOML), server_config.to_toml()?)?;
         } else {
             let legacy = crate::legacy::LegacyPlatform::from_id(&platform).ok_or_else(|| {
                 anyhow!("platform `{platform}` has neither a discovered definition seed nor a legacy adapter")
@@ -388,10 +425,23 @@ impl DeploymentResolver {
                 path.join(DEPLOYMENT_TOML),
                 legacy.deployment_config(storage),
             )?;
-            fs::write(
-                path.join(TOKEIRAD_TOML),
-                legacy.server_config(storage, region.as_deref())?,
-            )?;
+            let server_toml = legacy.server_config(storage, region.as_deref())?;
+            // Only the local platform's generation changes; other platforms'
+            // templates pass through byte-for-byte (comments included).
+            let server_toml = if platform.as_str() == "local" {
+                let mut server_config: tokeira_config::TokeiraConfig = toml::from_str(&server_toml)
+                    .context("generated local server config must parse as TokeiraConfig")?;
+                apply_local_snapshot_default(
+                    &platform,
+                    storage,
+                    &pending.final_path,
+                    &mut server_config,
+                );
+                server_config.to_toml()?
+            } else {
+                server_toml
+            };
+            fs::write(path.join(TOKEIRAD_TOML), server_toml)?;
         }
         let now = timestamp();
         let metadata = DeploymentMetadata {
@@ -621,4 +671,63 @@ pub(crate) fn normalize_name(name: &str) -> String {
 
 fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod local_snapshot_tests {
+    use super::*;
+
+    fn platform(id: &str) -> PlatformId {
+        PlatformId::new(id).expect("test platform id")
+    }
+
+    #[test]
+    fn local_in_memory_deployments_get_the_snapshot_default() {
+        let mut config = tokeira_config::TokeiraConfig::default();
+        apply_local_snapshot_default(
+            &platform("local"),
+            StorageKind::InMemory,
+            Path::new("/deployments/dev"),
+            &mut config,
+        );
+        let snapshot = config
+            .policy
+            .snapshot
+            .clone()
+            .expect("local default synthesized");
+        assert_eq!(
+            snapshot.location,
+            Path::new("/deployments/dev").join(LOCAL_SNAPSHOT_FILE)
+        );
+        assert_eq!(snapshot.interval_ms, LOCAL_SNAPSHOT_INTERVAL_MS);
+        // The synthesized config must round-trip through the same TOML the
+        // deployment writes.
+        let rendered = config.to_toml().expect("render");
+        let parsed: tokeira_config::TokeiraConfig =
+            toml::from_str(&rendered).expect("reparse generated tokeirad.toml");
+        assert_eq!(parsed.policy.snapshot, config.policy.snapshot);
+    }
+
+    #[test]
+    fn non_local_or_dsql_deployments_are_untouched() {
+        // DSQL local: the engine rejects snapshot-over-DSQL, so tkr must not
+        // synthesize one.
+        let mut dsql = tokeira_config::TokeiraConfig::default();
+        apply_local_snapshot_default(
+            &platform("local"),
+            StorageKind::Dsql,
+            Path::new("/deployments/dev"),
+            &mut dsql,
+        );
+        assert!(dsql.policy.snapshot.is_none());
+
+        let mut ecs = tokeira_config::TokeiraConfig::default();
+        apply_local_snapshot_default(
+            &platform("ecs"),
+            StorageKind::InMemory,
+            Path::new("/deployments/dev"),
+            &mut ecs,
+        );
+        assert!(ecs.policy.snapshot.is_none());
+    }
 }

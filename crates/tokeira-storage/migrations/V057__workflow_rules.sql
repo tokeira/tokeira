@@ -1,4 +1,4 @@
-CREATE TABLE workflow_rules (
+CREATE TABLE IF NOT EXISTS workflow_rules (
     namespace_id UUID NOT NULL,
     rule_id TEXT NOT NULL,
     expiration_time TIMESTAMPTZ,

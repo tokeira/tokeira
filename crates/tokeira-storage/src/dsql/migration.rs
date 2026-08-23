@@ -8,13 +8,44 @@
 use std::{fs, path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, PgPool};
 use time::OffsetDateTime;
 use tokeira_observability::{ErrorBiasedSamplingReason, OutcomeLabel, mark_error_biased_sample};
 
-use super::{MigrationConfig, validation::DdlValidator};
-use crate::metrics as storage_metrics;
+use super::{
+    ControlLeaseGuard, MigrationConfig,
+    schema_compatibility::{
+        AppliedMigration, SchemaCompatibilityContract, SchemaCompatibilityRecord, SchemaDecision,
+        SchemaIncompatibility, SchemaMigrationPolicy, SchemaObservation,
+        assess_schema_compatibility,
+    },
+    validation::DdlValidator,
+};
+use crate::{
+    metrics as storage_metrics,
+    schema_contract::{MigrationIdentity, SchemaContract, migration_set_digest, sha256_hex},
+};
+
+const SCHEMA_VERSION_BOOTSTRAP_SQL: &str =
+    include_str!("../../migrations/V001__schema_version.sql");
+const SCHEMA_COMPATIBILITY_BOOTSTRAP_SQL: &str =
+    include_str!("../../migrations/V066__schema_compatibility.sql");
+const CONTROL_LEASE_BOOTSTRAP_SQL: &str =
+    include_str!("../../migrations/V067__tokeira_control_lease.sql");
+
+/// Return the baseline-locked control-lease bootstrap statement.
+///
+/// First-run migration coordination needs this table before the migration that
+/// records it can run. Reusing the migration bytes prevents the bootstrap path
+/// from silently defining a different schema.
+pub const fn control_lease_bootstrap_sql() -> &'static str {
+    CONTROL_LEASE_BOOTSTRAP_SQL
+}
+
+/// Return the baseline-locked schema-compatibility bootstrap statement.
+pub const fn schema_compatibility_bootstrap_sql() -> &'static str {
+    SCHEMA_COMPATIBILITY_BOOTSTRAP_SQL
+}
 
 /// Forward-only schema migration runner for DSQL.
 #[derive(Clone, Debug)]
@@ -29,6 +60,53 @@ pub struct MigrationRunner {
 pub struct MigrationReport {
     /// Number of migration files applied during this invocation.
     pub applied: usize,
+}
+
+/// Failures while observing or changing the versioned DSQL schema.
+#[derive(Debug, thiserror::Error)]
+pub enum SchemaCompatibilityError {
+    /// A database query failed.
+    #[error("schema compatibility database operation failed")]
+    Database(#[from] sqlx::Error),
+    /// Local migration discovery or contract data is invalid.
+    #[error("schema compatibility metadata is invalid: {0}")]
+    InvalidMetadata(String),
+    /// Validate-only policy requires an explicit migration.
+    #[error("schema migration required: current V{current}, target V{target}")]
+    MigrationRequired {
+        /// Current version, with zero representing an uninitialized schema.
+        current: u32,
+        /// Required target version.
+        target: u32,
+    },
+    /// The schema failed checksum, digest, or readable-version validation.
+    #[error("schema is incompatible: {0:?}")]
+    Incompatible(SchemaIncompatibility),
+    /// The supplied guard is not the active schema-migration owner.
+    #[error("schema migration ownership fence was lost")]
+    Fenced,
+    /// An asynchronous index job failed.
+    #[error("asynchronous index {index_name} failed: {details}")]
+    IndexFailed {
+        /// Named index from the migration statement.
+        index_name: String,
+        /// Redacted DSQL job detail.
+        details: String,
+    },
+    /// The named asynchronous index is absent, invalid, or structurally unexpected.
+    #[error("asynchronous index {index_name} is not valid: {reason}")]
+    IndexInvalid {
+        /// Named index from the migration statement.
+        index_name: String,
+        /// Catalog validation reason.
+        reason: String,
+    },
+    /// Automatic replay encountered a statement not proven idempotent.
+    #[error("migration V{version} is not proven idempotent")]
+    NonIdempotentMigration {
+        /// Unsafe migration version.
+        version: u32,
+    },
 }
 
 /// One migration statement that would be applied.
@@ -69,14 +147,72 @@ enum MigrationSource {
     Embedded(&'static [EmbeddedMigration]),
 }
 
+impl MigrationFile {
+    fn identity(&self) -> MigrationIdentity {
+        MigrationIdentity {
+            version: self.version,
+            name: self.name.clone(),
+            checksum: self.checksum.clone(),
+        }
+    }
+}
+
 /// Compile-time embedded migration statement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddedMigration {
+    /// Numeric migration version.
     pub version: u32,
+    /// Filename-derived migration name.
     pub name: &'static str,
+    /// Workspace-relative source path used in diagnostics.
     pub path: &'static str,
+    /// Lowercase SHA-256 checksum of the SQL bytes.
     pub checksum: &'static str,
+    /// One DSQL-safe statement.
     pub sql: &'static str,
+}
+
+/// Compile-time schema compatibility contract validated by the storage build script.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmbeddedSchemaContract {
+    /// Checked-in contract format version.
+    pub format_version: u32,
+    /// Tokeira release owning the contract.
+    pub tokeira_release: &'static str,
+    /// Oldest readable schema version.
+    pub minimum_supported_version: u32,
+    /// Migration target for this release.
+    pub target_version: u32,
+    /// Newest readable schema version.
+    pub maximum_readable_version: u32,
+    /// Canonical digest through the maximum readable version.
+    pub migration_set_digest: &'static str,
+    /// Highest migration locked against modification.
+    pub immutable_through_version: u32,
+}
+
+impl EmbeddedSchemaContract {
+    /// Convert the zero-allocation embedded view into the storage-owned contract type.
+    pub fn to_owned(self) -> SchemaContract {
+        SchemaContract {
+            format_version: self.format_version,
+            tokeira_release: self.tokeira_release.to_owned(),
+            minimum_supported_version: self.minimum_supported_version,
+            target_version: self.target_version,
+            maximum_readable_version: self.maximum_readable_version,
+            migration_set_digest: self.migration_set_digest.to_owned(),
+            immutable_through_version: self.immutable_through_version,
+        }
+    }
+}
+
+/// Compile-time canonical digest for one recognized migration prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmbeddedMigrationPrefixDigest {
+    /// Highest migration version included in this prefix.
+    pub version: u32,
+    /// Canonical SHA-256 digest for the prefix.
+    pub digest: &'static str,
 }
 
 include!(concat!(env!("OUT_DIR"), "/migrations_embedded.rs"));
@@ -96,6 +232,64 @@ impl MigrationRunner {
         Self {
             source: MigrationSource::Embedded(EMBEDDED_MIGRATIONS),
         }
+    }
+
+    /// Return the release-pinned schema compatibility contract.
+    pub fn embedded_schema_contract() -> SchemaContract {
+        EMBEDDED_SCHEMA_CONTRACT.to_owned()
+    }
+
+    /// Return the compatibility view of the release-pinned embedded contract.
+    pub fn compatibility_contract() -> SchemaCompatibilityContract {
+        let contract = Self::embedded_schema_contract();
+        SchemaCompatibilityContract {
+            tokeira_release: contract.tokeira_release,
+            minimum_supported_version: contract.minimum_supported_version,
+            target_version: contract.target_version,
+            maximum_readable_version: contract.maximum_readable_version,
+            migration_set_digest: contract.migration_set_digest,
+        }
+    }
+
+    /// Return canonical digests for every recognized migration prefix.
+    pub const fn embedded_prefix_digests() -> &'static [EmbeddedMigrationPrefixDigest] {
+        EMBEDDED_MIGRATION_PREFIX_DIGESTS
+    }
+
+    /// Assess catalog and ledger state without issuing DDL or DML.
+    pub async fn assess_connection(
+        &self,
+        connection: &mut PgConnection,
+        contract: &SchemaCompatibilityContract,
+        policy: SchemaMigrationPolicy,
+    ) -> Result<SchemaDecision, SchemaCompatibilityError> {
+        let observation = read_schema_observation(connection).await?;
+        let recognized = self
+            .recognized_identities()
+            .map_err(|error| SchemaCompatibilityError::InvalidMetadata(error.to_string()))?;
+        Ok(assess_schema_compatibility(
+            contract,
+            &recognized,
+            &observation,
+            policy,
+        ))
+    }
+
+    /// Install only the metadata needed to acquire the schema-migration claim.
+    ///
+    /// A new database cannot acquire a claim from a table that does not yet
+    /// exist. The engine calls this after an automatic initialize/migrate
+    /// decision and before claim acquisition. Validate-only and already
+    /// compatible decisions issue no writes.
+    pub async fn bootstrap_migration_coordination(
+        &self,
+        connection: &mut PgConnection,
+        decision: &SchemaDecision,
+    ) -> Result<(), SchemaCompatibilityError> {
+        for statement in bootstrap_statements_for_decision(decision)? {
+            sqlx::query(statement).execute(&mut *connection).await?;
+        }
+        Ok(())
     }
 
     /// Apply every unapplied migration in strict version order.
@@ -207,6 +401,164 @@ impl MigrationRunner {
         Ok(MigrationReport { applied })
     }
 
+    /// Apply an approved automatic decision under the schema-migration fence.
+    ///
+    /// Every migration statement, ledger record, and compatibility record uses
+    /// a separate transaction. The fence and complete applied ledger are
+    /// revalidated before each new migration statement, so a crash or takeover
+    /// can replay only idempotent work and never advance metadata speculatively.
+    pub async fn apply_decision(
+        &self,
+        connection: &mut PgConnection,
+        decision: &SchemaDecision,
+        migration_lease: &ControlLeaseGuard,
+    ) -> Result<MigrationReport, SchemaCompatibilityError> {
+        if migration_lease.claim_name() != "schema-migration" {
+            return Err(SchemaCompatibilityError::Fenced);
+        }
+        let target = match decision {
+            SchemaDecision::Initialize { target } | SchemaDecision::Migrate { to: target, .. } => {
+                *target
+            }
+            SchemaDecision::Compatible {
+                current,
+                legacy_backfill: true,
+            } => {
+                ensure_migration_fence(connection, migration_lease).await?;
+                let recognized = self.recognized_identities().map_err(|error| {
+                    SchemaCompatibilityError::InvalidMetadata(error.to_string())
+                })?;
+                let observed = read_applied_migrations(connection).await?;
+                validate_applied_prefix(&recognized, &observed)?;
+                sqlx::query(schema_compatibility_bootstrap_sql())
+                    .execute(&mut *connection)
+                    .await?;
+                ensure_migration_fence(connection, migration_lease).await?;
+                self.persist_compatibility(connection, *current, migration_lease)
+                    .await?;
+                return Ok(MigrationReport { applied: 0 });
+            }
+            SchemaDecision::Compatible { .. } => return Ok(MigrationReport { applied: 0 }),
+            SchemaDecision::MigrationRequired { current, target } => {
+                return Err(SchemaCompatibilityError::MigrationRequired {
+                    current: *current,
+                    target: *target,
+                });
+            }
+            SchemaDecision::Reject(incompatibility) => {
+                return Err(SchemaCompatibilityError::Incompatible(
+                    incompatibility.clone(),
+                ));
+            }
+        };
+
+        let contract = Self::compatibility_contract();
+        if target != contract.target_version {
+            return Err(SchemaCompatibilityError::InvalidMetadata(format!(
+                "decision target V{target} differs from embedded target V{}",
+                contract.target_version
+            )));
+        }
+        // These two tables are the only bootstrap exception. Both statements
+        // are the exact baseline-locked migration bytes and each runs alone.
+        ensure_migration_fence(connection, migration_lease).await?;
+        sqlx::query(SCHEMA_VERSION_BOOTSTRAP_SQL)
+            .execute(&mut *connection)
+            .await?;
+        ensure_migration_fence(connection, migration_lease).await?;
+        sqlx::query(control_lease_bootstrap_sql())
+            .execute(&mut *connection)
+            .await?;
+
+        let migrations = self
+            .discover()
+            .map_err(|error| SchemaCompatibilityError::InvalidMetadata(error.to_string()))?;
+        let recognized = migrations
+            .iter()
+            .map(MigrationFile::identity)
+            .collect::<Vec<_>>();
+        let mut applied = 0;
+        for migration in migrations
+            .iter()
+            .filter(|migration| migration.version <= target)
+        {
+            ensure_migration_fence(connection, migration_lease).await?;
+            let observed = read_applied_migrations(connection).await?;
+            validate_applied_prefix(&recognized, &observed)?;
+            if observed
+                .iter()
+                .any(|applied| applied.version == migration.version)
+            {
+                continue;
+            }
+            execute_migration_step(connection, migration).await?;
+
+            ensure_migration_fence(connection, migration_lease).await?;
+            record_applied_migration(connection, migration).await?;
+            ensure_migration_fence(connection, migration_lease).await?;
+            self.persist_compatibility(connection, migration.version, migration_lease)
+                .await?;
+            record_migration_success(migration, std::time::Duration::ZERO);
+            applied += 1;
+        }
+        Ok(MigrationReport { applied })
+    }
+
+    async fn persist_compatibility(
+        &self,
+        connection: &mut PgConnection,
+        version: u32,
+        migration_lease: &ControlLeaseGuard,
+    ) -> Result<(), SchemaCompatibilityError> {
+        ensure_migration_fence(connection, migration_lease).await?;
+        let recognized = self
+            .recognized_identities()
+            .map_err(|error| SchemaCompatibilityError::InvalidMetadata(error.to_string()))?;
+        let digest = migration_set_digest(&recognized, version)
+            .map_err(SchemaCompatibilityError::InvalidMetadata)?;
+        let contract = Self::compatibility_contract();
+        sqlx::query(
+            "INSERT INTO schema_compatibility \
+             (schema_version, tokeira_release, migration_set_digest, recorded_at) \
+             VALUES ($1, $2, $3, now()) ON CONFLICT (schema_version) DO NOTHING",
+        )
+        .bind(i32::try_from(version).map_err(|error| {
+            SchemaCompatibilityError::InvalidMetadata(format!(
+                "schema version does not fit DSQL integer: {error}"
+            ))
+        })?)
+        .bind(&contract.tokeira_release)
+        .bind(&digest)
+        .execute(&mut *connection)
+        .await?;
+        let stored = sqlx::query_as::<_, (String,)>(
+            "SELECT migration_set_digest FROM schema_compatibility WHERE schema_version = $1",
+        )
+        .bind(i32::try_from(version).map_err(|error| {
+            SchemaCompatibilityError::InvalidMetadata(format!(
+                "schema version does not fit DSQL integer: {error}"
+            ))
+        })?)
+        .fetch_one(&mut *connection)
+        .await?;
+        if stored.0 != digest {
+            return Err(SchemaCompatibilityError::Incompatible(
+                SchemaIncompatibility {
+                    observed_version: Some(version),
+                    minimum_supported_version: contract.minimum_supported_version,
+                    target_version: contract.target_version,
+                    maximum_readable_version: contract.maximum_readable_version,
+                    category: super::SchemaIncompatibilityCategory::DigestMismatch {
+                        version,
+                        expected: digest,
+                        observed: stored.0,
+                    },
+                },
+            ));
+        }
+        Ok(())
+    }
+
     /// Return the ordered migration plan without touching the database.
     pub fn dry_run(&self) -> Result<Vec<MigrationPlan>> {
         self.discover()?
@@ -297,39 +649,29 @@ impl MigrationRunner {
         }
     }
 
+    fn recognized_identities(&self) -> Result<Vec<MigrationIdentity>> {
+        Ok(self
+            .discover()?
+            .iter()
+            .map(MigrationFile::identity)
+            .collect())
+    }
+
     /// Bootstrap the migration metadata table.
     ///
     /// This statement is intentionally embedded instead of represented as a
     /// normal migration so a brand-new database can record V001 immediately.
     async fn ensure_schema_version(&self, pool: &PgPool) -> Result<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS schema_version (
-                version INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                checksum TEXT NOT NULL,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (version)
-            )",
-        )
-        .execute(pool)
-        .await?;
+        sqlx::query(SCHEMA_VERSION_BOOTSTRAP_SQL)
+            .execute(pool)
+            .await?;
         Ok(())
     }
 
     async fn ensure_schema_version_connection(&self, connection: &mut PgConnection) -> Result<()> {
-        // Keep this SQL byte-for-byte aligned with the pool variant. The two
-        // entry points differ only by executor shape.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS schema_version (
-                version INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                checksum TEXT NOT NULL,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (version)
-            )",
-        )
-        .execute(connection)
-        .await?;
+        sqlx::query(SCHEMA_VERSION_BOOTSTRAP_SQL)
+            .execute(connection)
+            .await?;
         Ok(())
     }
 
@@ -364,6 +706,474 @@ impl MigrationRunner {
             None => Ok(false),
         }
     }
+}
+
+fn bootstrap_statements_for_decision(
+    decision: &SchemaDecision,
+) -> Result<&'static [&'static str], SchemaCompatibilityError> {
+    const COORDINATION_BOOTSTRAP: &[&str] =
+        &[SCHEMA_VERSION_BOOTSTRAP_SQL, CONTROL_LEASE_BOOTSTRAP_SQL];
+    match decision {
+        SchemaDecision::Initialize { .. } | SchemaDecision::Migrate { .. } => {
+            Ok(COORDINATION_BOOTSTRAP)
+        }
+        SchemaDecision::Compatible { .. } => Ok(&[]),
+        SchemaDecision::MigrationRequired { current, target } => {
+            Err(SchemaCompatibilityError::MigrationRequired {
+                current: *current,
+                target: *target,
+            })
+        }
+        SchemaDecision::Reject(incompatibility) => Err(SchemaCompatibilityError::Incompatible(
+            incompatibility.clone(),
+        )),
+    }
+}
+
+async fn read_schema_observation(
+    connection: &mut PgConnection,
+) -> Result<SchemaObservation, SchemaCompatibilityError> {
+    let applied_migrations = read_applied_migrations(connection).await?;
+    let compatibility = match sqlx::query_as::<_, (i32, String, String)>(
+        "SELECT schema_version, tokeira_release, migration_set_digest \
+         FROM schema_compatibility ORDER BY schema_version DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *connection)
+    .await
+    {
+        Ok(row) => row
+            .map(
+                |(version, release, digest)| -> Result<_, SchemaCompatibilityError> {
+                    Ok(SchemaCompatibilityRecord {
+                        schema_version: u32::try_from(version).map_err(|error| {
+                            SchemaCompatibilityError::InvalidMetadata(format!(
+                                "negative compatibility version: {error}"
+                            ))
+                        })?,
+                        tokeira_release: release,
+                        migration_set_digest: digest,
+                    })
+                },
+            )
+            .transpose()?,
+        Err(error) if is_missing_schema_version(&error) => None,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(SchemaObservation {
+        applied_migrations,
+        compatibility,
+    })
+}
+
+async fn read_applied_migrations(
+    connection: &mut PgConnection,
+) -> Result<Vec<AppliedMigration>, SchemaCompatibilityError> {
+    let rows = match sqlx::query_as::<_, (i32, String, String)>(
+        "SELECT version, name, checksum FROM schema_version ORDER BY version",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) if is_missing_schema_version(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    rows.into_iter()
+        .map(|(version, name, checksum)| {
+            Ok(AppliedMigration {
+                version: u32::try_from(version).map_err(|error| {
+                    SchemaCompatibilityError::InvalidMetadata(format!(
+                        "negative applied migration version: {error}"
+                    ))
+                })?,
+                name,
+                checksum,
+            })
+        })
+        .collect()
+}
+
+fn validate_applied_prefix(
+    recognized: &[MigrationIdentity],
+    applied: &[AppliedMigration],
+) -> Result<(), SchemaCompatibilityError> {
+    let contract = MigrationRunner::compatibility_contract();
+    let observed_version = applied.last().map(|migration| migration.version);
+    for (index, observed) in applied.iter().enumerate() {
+        let expected_version = u32::try_from(index + 1).map_err(|error| {
+            SchemaCompatibilityError::InvalidMetadata(format!(
+                "migration ledger length exceeds u32: {error}"
+            ))
+        })?;
+        if observed.version != expected_version {
+            return Err(incompatible(
+                &contract,
+                observed_version,
+                super::SchemaIncompatibilityCategory::LedgerOrdering {
+                    expected: expected_version,
+                    observed: observed.version,
+                },
+            ));
+        }
+        let Some(expected) = recognized.get(index) else {
+            return Err(incompatible(
+                &contract,
+                observed_version,
+                super::SchemaIncompatibilityCategory::UnknownMigration {
+                    version: observed.version,
+                },
+            ));
+        };
+        if observed.name != expected.name {
+            return Err(incompatible(
+                &contract,
+                observed_version,
+                super::SchemaIncompatibilityCategory::MigrationNameMismatch {
+                    version: observed.version,
+                    expected: expected.name.clone(),
+                    observed: observed.name.clone(),
+                },
+            ));
+        }
+        if observed.checksum != expected.checksum {
+            return Err(incompatible(
+                &contract,
+                observed_version,
+                super::SchemaIncompatibilityCategory::ChecksumMismatch {
+                    version: observed.version,
+                    expected: expected.checksum.clone(),
+                    observed: observed.checksum.clone(),
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn incompatible(
+    contract: &SchemaCompatibilityContract,
+    observed_version: Option<u32>,
+    category: super::SchemaIncompatibilityCategory,
+) -> SchemaCompatibilityError {
+    SchemaCompatibilityError::Incompatible(SchemaIncompatibility {
+        observed_version,
+        minimum_supported_version: contract.minimum_supported_version,
+        target_version: contract.target_version,
+        maximum_readable_version: contract.maximum_readable_version,
+        category,
+    })
+}
+
+async fn ensure_migration_fence(
+    connection: &mut PgConnection,
+    guard: &ControlLeaseGuard,
+) -> Result<(), SchemaCompatibilityError> {
+    let owned = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM tokeira_control_lease WHERE claim_name = $1 \
+         AND cluster_id = $2 AND cluster_arn = $3 AND owner_id = $4 \
+         AND fence_token = $5 AND expires_at > now())",
+    )
+    .bind(guard.claim_name())
+    .bind(&guard.cluster().cluster_id)
+    .bind(&guard.cluster().cluster_arn)
+    .bind(guard.owner_id())
+    .bind(guard.fence_token())
+    .fetch_one(&mut *connection)
+    .await?;
+    if !owned {
+        return Err(SchemaCompatibilityError::Fenced);
+    }
+    Ok(())
+}
+
+async fn record_applied_migration(
+    connection: &mut PgConnection,
+    migration: &MigrationFile,
+) -> Result<(), SchemaCompatibilityError> {
+    let version = i32::try_from(migration.version).map_err(|error| {
+        SchemaCompatibilityError::InvalidMetadata(format!(
+            "migration version does not fit DSQL integer: {error}"
+        ))
+    })?;
+    sqlx::query(
+        "INSERT INTO schema_version (version, name, checksum, applied_at) \
+         VALUES ($1, $2, $3, now()) ON CONFLICT (version) DO NOTHING",
+    )
+    .bind(version)
+    .bind(&migration.name)
+    .bind(&migration.checksum)
+    .execute(&mut *connection)
+    .await?;
+    let stored = sqlx::query_as::<_, (String, String)>(
+        "SELECT name, checksum FROM schema_version WHERE version = $1",
+    )
+    .bind(version)
+    .fetch_one(&mut *connection)
+    .await?;
+    let contract = MigrationRunner::compatibility_contract();
+    if stored.0 != migration.name {
+        return Err(incompatible(
+            &contract,
+            Some(migration.version),
+            super::SchemaIncompatibilityCategory::MigrationNameMismatch {
+                version: migration.version,
+                expected: migration.name.clone(),
+                observed: stored.0,
+            },
+        ));
+    }
+    if stored.1 != migration.checksum {
+        return Err(incompatible(
+            &contract,
+            Some(migration.version),
+            super::SchemaIncompatibilityCategory::ChecksumMismatch {
+                version: migration.version,
+                expected: migration.checksum.clone(),
+                observed: stored.1,
+            },
+        ));
+    }
+    Ok(())
+}
+
+async fn execute_migration_step(
+    connection: &mut PgConnection,
+    migration: &MigrationFile,
+) -> Result<(), SchemaCompatibilityError> {
+    if !migration_is_idempotent(&migration.sql) {
+        return Err(SchemaCompatibilityError::NonIdempotentMigration {
+            version: migration.version,
+        });
+    }
+    let index_spec = parse_async_index_spec(&migration.sql);
+    let mut conflicts = 0_u32;
+    let job_id = loop {
+        let mut transaction = connection.begin().await?;
+        let result = match &index_spec {
+            Some(_) => {
+                sqlx::query_scalar::<_, String>(&migration.sql)
+                    .fetch_optional(&mut *transaction)
+                    .await
+            }
+            None => sqlx::query(&migration.sql)
+                .execute(&mut *transaction)
+                .await
+                .map(|_| None),
+        };
+        let job_id = match result {
+            Ok(job_id) => job_id,
+            Err(error) if is_occ_error(&error) && conflicts < DEFAULT_MIGRATION_OCC_RETRIES => {
+                conflicts += 1;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match transaction.commit().await {
+            Ok(()) => break job_id,
+            Err(error) if is_occ_error(&error) && conflicts < DEFAULT_MIGRATION_OCC_RETRIES => {
+                conflicts += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if let Some(spec) = index_spec {
+        wait_for_async_index(connection, &spec, job_id.as_deref()).await?;
+    }
+    Ok(())
+}
+
+const DEFAULT_MIGRATION_OCC_RETRIES: u32 = 5;
+
+fn migration_is_idempotent(sql: &str) -> bool {
+    let normalized = sql.to_ascii_uppercase();
+    (normalized.contains("CREATE TABLE IF NOT EXISTS"))
+        || (normalized.contains("CREATE INDEX ASYNC IF NOT EXISTS"))
+        || (normalized.contains("CREATE UNIQUE INDEX ASYNC IF NOT EXISTS"))
+        || (normalized.contains("INSERT INTO")
+            && normalized.contains("ON CONFLICT")
+            && normalized.contains("DO NOTHING"))
+}
+
+fn is_occ_error(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database) if is_occ_sqlstate(database.code().as_deref())
+    )
+}
+
+fn is_occ_sqlstate(code: Option<&str>) -> bool {
+    code == Some("40001")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AsyncIndexSpec {
+    name: String,
+    table: String,
+    columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AsyncIndexRecoveryAction {
+    WaitForJob(String),
+    ValidateCatalog,
+}
+
+fn parse_async_index_spec(sql: &str) -> Option<AsyncIndexSpec> {
+    let flattened = sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+    let tokens = flattened.split_ascii_whitespace().collect::<Vec<_>>();
+    let async_position = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("ASYNC"))?;
+    let mut name_position = async_position + 1;
+    if tokens
+        .get(name_position)
+        .is_some_and(|token| token.eq_ignore_ascii_case("IF"))
+    {
+        name_position += 3;
+    }
+    let name = tokens.get(name_position)?.trim_matches('"').to_owned();
+    let on_position = tokens
+        .iter()
+        .skip(name_position + 1)
+        .position(|token| token.eq_ignore_ascii_case("ON"))?
+        + name_position
+        + 1;
+    let table = tokens.get(on_position + 1)?.trim_matches('"').to_owned();
+    let columns_start = flattened.find('(')? + 1;
+    let columns_end = flattened[columns_start..].find(')')? + columns_start;
+    let columns = flattened[columns_start..columns_end]
+        .split(',')
+        .filter_map(|column| column.split_ascii_whitespace().next())
+        .map(|column| column.trim_matches('"').to_owned())
+        .collect::<Vec<_>>();
+    (!columns.is_empty()).then_some(AsyncIndexSpec {
+        name,
+        table,
+        columns,
+    })
+}
+
+async fn wait_for_async_index(
+    connection: &mut PgConnection,
+    spec: &AsyncIndexSpec,
+    submitted_job_id: Option<&str>,
+) -> Result<(), SchemaCompatibilityError> {
+    if let Some(job_id) = submitted_job_id {
+        wait_for_job(connection, spec, job_id).await?;
+    }
+    if index_is_valid(connection, spec).await? {
+        return Ok(());
+    }
+
+    // `IF NOT EXISTS` returns no new job after a crash. Recover the recent
+    // named build from `sys.jobs`; completed/failed jobs are retained only
+    // briefly, so the catalog remains the final authority.
+    let qualified = format!("public.{}", spec.name);
+    let job = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT job_id, status, details FROM sys.jobs WHERE job_type = 'INDEX_BUILD' \
+         AND (object_name = $1 OR object_name = $2) ORDER BY update_time DESC LIMIT 1",
+    )
+    .bind(&spec.name)
+    .bind(&qualified)
+    .fetch_optional(&mut *connection)
+    .await?;
+    if let AsyncIndexRecoveryAction::WaitForJob(job_id) = classify_async_index_job(spec, job)? {
+        wait_for_job(connection, spec, &job_id).await?;
+    }
+    if index_is_valid(connection, spec).await? {
+        Ok(())
+    } else {
+        Err(SchemaCompatibilityError::IndexInvalid {
+            index_name: spec.name.clone(),
+            reason: "catalog reports the named index absent, invalid, or structurally different"
+                .to_owned(),
+        })
+    }
+}
+
+fn classify_async_index_job(
+    spec: &AsyncIndexSpec,
+    job: Option<(String, String, Option<String>)>,
+) -> Result<AsyncIndexRecoveryAction, SchemaCompatibilityError> {
+    match job {
+        Some((job_id, status, _)) if status == "submitted" || status == "processing" => {
+            Ok(AsyncIndexRecoveryAction::WaitForJob(job_id))
+        }
+        Some((_, status, details)) if status == "failed" => {
+            Err(SchemaCompatibilityError::IndexFailed {
+                index_name: spec.name.clone(),
+                details: details.unwrap_or_else(|| "DSQL reported a failed index job".to_owned()),
+            })
+        }
+        Some((_, status, _)) if status != "completed" => {
+            Err(SchemaCompatibilityError::IndexInvalid {
+                index_name: spec.name.clone(),
+                reason: format!("unexpected DSQL job status {status}"),
+            })
+        }
+        _ => Ok(AsyncIndexRecoveryAction::ValidateCatalog),
+    }
+}
+
+async fn wait_for_job(
+    connection: &mut PgConnection,
+    spec: &AsyncIndexSpec,
+    job_id: &str,
+) -> Result<(), SchemaCompatibilityError> {
+    let completed = sqlx::query_scalar::<_, bool>("SELECT sys.wait_for_job($1)")
+        .bind(job_id)
+        .fetch_one(&mut *connection)
+        .await?;
+    if completed {
+        return Ok(());
+    }
+    let details = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT status, details FROM sys.jobs WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .map(|(status, details)| {
+        details.unwrap_or_else(|| format!("DSQL job ended with status {status}"))
+    })
+    .unwrap_or_else(|| "DSQL job disappeared before catalog validation".to_owned());
+    Err(SchemaCompatibilityError::IndexFailed {
+        index_name: spec.name.clone(),
+        details,
+    })
+}
+
+async fn index_is_valid(
+    connection: &mut PgConnection,
+    spec: &AsyncIndexSpec,
+) -> Result<bool, SchemaCompatibilityError> {
+    let catalog = sqlx::query_as::<_, (bool, String)>(
+        "SELECT i.indisvalid, pg_get_indexdef(i.indexrelid) FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indexrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname = $1 AND n.nspname = current_schema()",
+    )
+    .bind(&spec.name)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some((valid, definition)) = catalog else {
+        return Ok(false);
+    };
+    if !valid {
+        return Ok(false);
+    }
+    Ok(index_definition_matches(spec, valid, &definition))
+}
+
+fn index_definition_matches(spec: &AsyncIndexSpec, valid: bool, definition: &str) -> bool {
+    let definition = definition.to_ascii_lowercase();
+    let expected_table = spec.table.to_ascii_lowercase();
+    valid
+        && definition.contains(&expected_table)
+        && spec
+            .columns
+            .iter()
+            .all(|column| definition.contains(&column.to_ascii_lowercase()))
 }
 
 fn discover_directory_migrations(config: &MigrationConfig) -> Result<Vec<MigrationFile>> {
@@ -507,9 +1317,7 @@ pub fn parse_migration_filename(filename: &str) -> Result<(u32, String)> {
 }
 
 fn checksum(sql: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(sql.as_bytes());
-    format!("{:x}", hasher.finalize())
+    sha256_hex(sql.as_bytes())
 }
 
 /// Approximate statement count for the one-DDL-per-file safety check.
@@ -536,9 +1344,13 @@ mod tests {
     use metrics_util::debugging::DebuggingRecorder;
     use proptest::prelude::*;
 
-    use super::{MigrationFile, MigrationRunner, checksum, parse_migration_filename};
+    use super::{
+        AsyncIndexRecoveryAction, MigrationFile, MigrationRunner, SchemaCompatibilityError,
+        checksum, classify_async_index_job, index_definition_matches, migration_is_idempotent,
+        parse_async_index_spec, parse_migration_filename,
+    };
     use crate::{
-        dsql::MigrationConfig,
+        dsql::{MigrationConfig, SchemaDecision},
         metrics::{MIGRATION_APPLIED_TOTAL, MIGRATION_DURATION_SECONDS},
     };
 
@@ -661,6 +1473,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
         #[test]
         fn filename_parser_accepts_expected_pattern(version in 1u32..999, name in "[a-z][a-z0-9_]{0,20}") {
             let filename = format!("V{version:03}__{name}.sql");
@@ -682,6 +1496,213 @@ mod tests {
             let sql = String::from_utf8_lossy(&bytes);
             prop_assert_eq!(checksum(&sql), checksum(&sql));
         }
+
+        // Feature: managed-embedded-dsql, Property 8: migration replay is serialized, fenced, and idempotent
+        #[test]
+        fn migration_replay_model_is_serialized_fenced_and_idempotent(
+            target in 1_usize..40,
+            events in proptest::collection::vec(
+                (any::<bool>(), any::<bool>(), 0_u8..8, any::<bool>(), any::<bool>()),
+                1..200,
+            ),
+        ) {
+            let mut physical = vec![false; target];
+            let mut ledger = vec![false; target];
+            let mut fenced = false;
+            let mut explicit_failure = false;
+            for (crash_after_operation, competing_owner, occ_conflicts, async_index_failed, checksum_drift) in events {
+                if fenced || explicit_failure {
+                    break;
+                }
+                if competing_owner {
+                    fenced = true;
+                    continue;
+                }
+                let Some(version) = ledger.iter().position(|recorded| !recorded) else {
+                    break;
+                };
+                if checksum_drift && version > 0 {
+                    explicit_failure = true;
+                    continue;
+                }
+                if occ_conflicts > super::DEFAULT_MIGRATION_OCC_RETRIES as u8 {
+                    explicit_failure = true;
+                    continue;
+                }
+                // Re-execution after a crash is a logical no-op because every
+                // migration admitted to this path is proven idempotent.
+                physical[version] = true;
+                if async_index_failed {
+                    explicit_failure = true;
+                    continue;
+                }
+                if !crash_after_operation {
+                    ledger[version] = true;
+                }
+                prop_assert!(ledger
+                    .iter()
+                    .zip(&physical)
+                    .all(|(recorded, completed)| !recorded || *completed));
+                let prefix = ledger.iter().take_while(|recorded| **recorded).count();
+                prop_assert!(ledger[prefix..].iter().all(|recorded| !recorded));
+            }
+
+            let before_recovery = physical.clone();
+            if !fenced && !explicit_failure {
+                for version in 0..target {
+                    physical[version] = true;
+                    ledger[version] = true;
+                }
+                prop_assert!(ledger.iter().all(|recorded| *recorded));
+                prop_assert!(physical.iter().all(|completed| *completed));
+                prop_assert!(before_recovery
+                    .iter()
+                    .enumerate()
+                    .all(|(version, completed)| !completed || physical[version]));
+            }
+        }
+    }
+
+    #[test]
+    fn every_embedded_migration_is_proven_idempotent() {
+        let plans = MigrationRunner::embedded()
+            .dry_run()
+            .expect("embedded migrations are valid");
+        assert_eq!(plans.len(), 67);
+        assert!(plans.iter().all(|plan| migration_is_idempotent(&plan.sql)));
+    }
+
+    #[test]
+    fn async_index_parser_extracts_named_catalog_identity() {
+        let spec = parse_async_index_spec(
+            "CREATE UNIQUE INDEX ASYNC IF NOT EXISTS idx_example ON records (namespace_id, run_id);",
+        )
+        .expect("valid async index is recognized");
+        assert_eq!(spec.name, "idx_example");
+        assert_eq!(spec.table, "records");
+        assert_eq!(spec.columns, ["namespace_id", "run_id"]);
+    }
+
+    #[test]
+    fn bootstrap_statements_are_exact_migration_bytes() {
+        assert_eq!(
+            super::SCHEMA_VERSION_BOOTSTRAP_SQL,
+            include_str!("../../migrations/V001__schema_version.sql")
+        );
+        assert_eq!(
+            super::schema_compatibility_bootstrap_sql(),
+            include_str!("../../migrations/V066__schema_compatibility.sql")
+        );
+        assert_eq!(
+            super::control_lease_bootstrap_sql(),
+            include_str!("../../migrations/V067__tokeira_control_lease.sql")
+        );
+    }
+
+    #[test]
+    fn bootstrap_writes_only_for_automatic_schema_changes() {
+        assert_eq!(
+            super::bootstrap_statements_for_decision(&SchemaDecision::Initialize { target: 67 })
+                .expect("initialize bootstrap")
+                .len(),
+            2
+        );
+        assert_eq!(
+            super::bootstrap_statements_for_decision(&SchemaDecision::Migrate { from: 66, to: 67 })
+                .expect("migration bootstrap")
+                .len(),
+            2
+        );
+        assert!(
+            super::bootstrap_statements_for_decision(&SchemaDecision::Compatible {
+                current: 67,
+                legacy_backfill: false,
+            })
+            .expect("compatible schema")
+            .is_empty()
+        );
+        assert!(matches!(
+            super::bootstrap_statements_for_decision(&SchemaDecision::MigrationRequired {
+                current: 0,
+                target: 67,
+            }),
+            Err(SchemaCompatibilityError::MigrationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn migration_required_error_is_actionable() {
+        let error = SchemaCompatibilityError::MigrationRequired {
+            current: 12,
+            target: 67,
+        };
+        assert_eq!(
+            error.to_string(),
+            "schema migration required: current V12, target V67"
+        );
+    }
+
+    #[test]
+    fn only_serialization_failure_sqlstate_is_retryable() {
+        assert!(super::is_occ_sqlstate(Some("40001")));
+        assert!(!super::is_occ_sqlstate(Some("40P01")));
+        assert!(!super::is_occ_sqlstate(Some("23505")));
+        assert!(!super::is_occ_sqlstate(None));
+    }
+
+    #[test]
+    fn lost_async_index_jobs_fall_back_to_catalog_validation() {
+        let spec = parse_async_index_spec(
+            "CREATE INDEX ASYNC IF NOT EXISTS idx_example ON records (namespace_id, run_id);",
+        )
+        .expect("valid index fixture");
+        assert_eq!(
+            classify_async_index_job(&spec, None).expect("lost job is recoverable"),
+            AsyncIndexRecoveryAction::ValidateCatalog
+        );
+        assert_eq!(
+            classify_async_index_job(
+                &spec,
+                Some(("job-1".to_owned(), "processing".to_owned(), None)),
+            )
+            .expect("active job is recoverable"),
+            AsyncIndexRecoveryAction::WaitForJob("job-1".to_owned())
+        );
+        assert!(matches!(
+            classify_async_index_job(
+                &spec,
+                Some((
+                    "job-2".to_owned(),
+                    "failed".to_owned(),
+                    Some("build failed".to_owned()),
+                )),
+            ),
+            Err(SchemaCompatibilityError::IndexFailed { .. })
+        ));
+        assert!(matches!(
+            classify_async_index_job(
+                &spec,
+                Some(("job-3".to_owned(), "unknown".to_owned(), None)),
+            ),
+            Err(SchemaCompatibilityError::IndexInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_or_structurally_different_indexes_are_rejected() {
+        let spec = parse_async_index_spec(
+            "CREATE INDEX ASYNC IF NOT EXISTS idx_example ON records (namespace_id, run_id);",
+        )
+        .expect("valid index fixture");
+        let matching =
+            "CREATE INDEX idx_example ON public.records USING btree (namespace_id, run_id)";
+        assert!(index_definition_matches(&spec, true, matching));
+        assert!(!index_definition_matches(&spec, false, matching));
+        assert!(!index_definition_matches(
+            &spec,
+            true,
+            "CREATE INDEX idx_example ON public.other USING btree (namespace_id)"
+        ));
     }
 
     fn temp_migration_dir(name: &str) -> PathBuf {

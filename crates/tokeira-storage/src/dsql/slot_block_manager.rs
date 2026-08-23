@@ -178,6 +178,11 @@ impl SlotBlockManager {
         self.used_slots.load(Ordering::Acquire)
     }
 
+    /// Number of physical connection slots currently charged to this process.
+    pub fn used_slots(&self) -> usize {
+        self.used_slots.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn total_slots_for_tests(&self) -> usize {
         self.total_slots.load(Ordering::Acquire)

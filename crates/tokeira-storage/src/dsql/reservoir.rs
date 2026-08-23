@@ -9,7 +9,7 @@ use std::{
     error::Error as StdError,
     fmt,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration as StdDuration, Instant},
@@ -20,13 +20,13 @@ use rand::Rng;
 use sqlx::PgConnection;
 use tokeira_observability::OutcomeLabel;
 use tokio::{
-    sync::{Semaphore, mpsc},
+    sync::{Notify, Semaphore, mpsc},
     task::JoinHandle,
 };
 
 use crate::metrics;
 
-use super::{DistributedTokenBucket, PhysicalConnectionFactory, ReservoirConfig, SlotBlockManager};
+use super::{ConnectionCoordinator, PhysicalConnectionFactory, ReservoirConfig};
 
 /// Default warm connection target for one node.
 // Pinned here for reservoir startup wiring and tested as part of the DSQL token-safety contract.
@@ -54,6 +54,24 @@ pub(crate) const WARMUP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 pub(crate) const REFILLER_IDLE_INTERVAL: StdDuration = StdDuration::from_millis(100);
 pub(crate) const REFILLER_ERROR_BACKOFF: StdDuration = StdDuration::from_millis(250);
 
+/// Caller-owned monotonic deadline for embedded reservoir warmup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WarmupDeadline {
+    at: Instant,
+}
+
+impl WarmupDeadline {
+    /// Wrap an absolute process-monotonic startup deadline.
+    pub const fn new(at: Instant) -> Self {
+        Self { at }
+    }
+
+    /// Absolute process-monotonic instant at which warmup must stop.
+    pub const fn instant(self) -> Instant {
+        self.at
+    }
+}
+
 #[derive(Debug)]
 pub struct ReservoirEntry {
     /// The physical connection whose DSQL slot is currently reserved.
@@ -80,6 +98,31 @@ pub struct ReturnedConnection {
 }
 
 #[derive(Debug)]
+struct PendingSlotCharge {
+    coordinator: Option<Arc<dyn ConnectionCoordinator>>,
+}
+
+impl PendingSlotCharge {
+    fn new(coordinator: Arc<dyn ConnectionCoordinator>) -> Self {
+        Self {
+            coordinator: Some(coordinator),
+        }
+    }
+
+    fn transfer_to_connection(mut self) {
+        self.coordinator.take();
+    }
+}
+
+impl Drop for PendingSlotCharge {
+    fn drop(&mut self) {
+        if let Some(coordinator) = self.coordinator.take() {
+            coordinator.release_slot();
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum ReservoirError {
     Empty,
     Closed,
@@ -99,12 +142,13 @@ impl StdError for ReservoirError {}
 #[derive(Debug)]
 pub struct Reservoir {
     ready: async_channel::Receiver<ReservoirEntry>,
-    return_tx: mpsc::UnboundedSender<ReturnedConnection>,
+    return_tx: Mutex<Option<mpsc::UnboundedSender<ReturnedConnection>>>,
     target_ready: Arc<AtomicUsize>,
-    slot_manager: Arc<SlotBlockManager>,
-    refiller_handle: JoinHandle<()>,
-    scanner_handle: JoinHandle<()>,
-    return_processor_handle: JoinHandle<()>,
+    coordinator: Arc<dyn ConnectionCoordinator>,
+    ready_changed: Arc<Notify>,
+    refiller_handles: Mutex<Vec<JoinHandle<()>>>,
+    scanner_handle: Mutex<Option<JoinHandle<()>>>,
+    return_processor_handle: Mutex<Option<JoinHandle<()>>>,
     config: ReservoirConfig,
 }
 
@@ -118,59 +162,98 @@ impl Reservoir {
     pub async fn start(
         config: ReservoirConfig,
         factory: Arc<dyn PhysicalConnectionFactory>,
-        distributed_bucket: Arc<DistributedTokenBucket>,
-        slot_manager: Arc<SlotBlockManager>,
+        coordinator: Arc<dyn ConnectionCoordinator>,
+    ) -> Result<Self> {
+        Self::start_with_deadline(
+            config,
+            factory,
+            coordinator,
+            Instant::now() + WARMUP_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Start the reservoir without exceeding a caller-owned startup deadline.
+    pub async fn start_with_deadline(
+        config: ReservoirConfig,
+        factory: Arc<dyn PhysicalConnectionFactory>,
+        coordinator: Arc<dyn ConnectionCoordinator>,
+        deadline: Instant,
     ) -> Result<Self> {
         config.validate()?;
+        coordinator.validate().await?;
         let (ready_tx, ready) = async_channel::bounded(config.target_ready);
         let (return_tx, return_rx) = mpsc::unbounded_channel();
         let inflight = Arc::new(Semaphore::new(config.inflight_limit));
         let target_ready = Arc::new(AtomicUsize::new(config.target_ready));
+        let ready_changed = Arc::new(Notify::new());
         metrics::set_dsql_reservoir_target_connections(config.target_ready);
         metrics::set_dsql_reservoir_ready_connections(0);
-        let refiller_handle = spawn_refiller(
+        let refiller_handles = spawn_refillers(
             config.clone(),
             Arc::clone(&factory),
             ready_tx.clone(),
-            Arc::clone(&distributed_bucket),
-            Arc::clone(&slot_manager),
+            Arc::clone(&coordinator),
             Arc::clone(&inflight),
             Arc::clone(&target_ready),
+            Arc::clone(&ready_changed),
         );
         let scanner_handle = spawn_scanner(
             config.clone(),
             ready_tx.clone(),
             ready.clone(),
-            Arc::clone(&slot_manager),
+            Arc::clone(&coordinator),
             Arc::clone(&target_ready),
         );
         let return_processor_handle = spawn_return_processor(
             config.clone(),
             ready_tx,
             return_rx,
-            Arc::clone(&slot_manager),
+            Arc::clone(&coordinator),
         );
         let reservoir = Self {
             ready,
-            return_tx,
+            return_tx: Mutex::new(Some(return_tx)),
             target_ready,
-            slot_manager,
-            refiller_handle,
-            scanner_handle,
-            return_processor_handle,
+            coordinator,
+            ready_changed,
+            refiller_handles: Mutex::new(refiller_handles),
+            scanner_handle: Mutex::new(Some(scanner_handle)),
+            return_processor_handle: Mutex::new(Some(return_processor_handle)),
             config,
         };
-        reservoir.warmup().await?;
+        if let Err(error) = reservoir.warmup_until(deadline).await {
+            reservoir.begin_shutdown();
+            let _ = reservoir.finish_shutdown().await;
+            return Err(error);
+        }
         Ok(reservoir)
     }
 
     pub async fn warmup(&self) -> Result<()> {
-        let started = Instant::now();
+        self.warmup_until(Instant::now() + WARMUP_TIMEOUT).await
+    }
+
+    /// Wait for the configured idle capacity within the remaining startup budget.
+    pub async fn warmup_until(&self, deadline: Instant) -> Result<()> {
         while self.ready.len() < self.config.target_ready {
-            if started.elapsed() > WARMUP_TIMEOUT {
+            let notified = self.ready_changed.notified();
+            if self.ready.len() >= self.config.target_ready {
+                break;
+            }
+            if self.ready.is_closed() {
+                anyhow::bail!("DSQL connection reservoir closed during warmup");
+            }
+            let now = Instant::now();
+            if now >= deadline {
                 anyhow::bail!("timed out warming DSQL connection reservoir");
             }
-            tokio::task::yield_now().await;
+            if tokio::time::timeout(deadline.saturating_duration_since(now), notified)
+                .await
+                .is_err()
+            {
+                anyhow::bail!("timed out warming DSQL connection reservoir");
+            }
         }
         metrics::record_dsql_pool_connections_total(self.ready.len());
         metrics::set_dsql_reservoir_ready_connections(self.ready.len());
@@ -195,12 +278,28 @@ impl Reservoir {
         }
     }
 
-    pub fn return_sender(&self) -> mpsc::UnboundedSender<ReturnedConnection> {
-        self.return_tx.clone()
+    /// Wait for a warm connection, returning promptly when shutdown closes admission.
+    pub async fn checkout_wait(&self) -> Result<ReservoirEntry, ReservoirError> {
+        match self.ready.recv().await {
+            Ok(entry) => {
+                metrics::record_dsql_pool_connections_total(self.ready.len());
+                metrics::set_dsql_reservoir_ready_connections(self.ready.len());
+                Ok(entry)
+            }
+            Err(_) => Err(ReservoirError::Closed),
+        }
     }
 
-    pub fn slot_manager(&self) -> Arc<SlotBlockManager> {
-        Arc::clone(&self.slot_manager)
+    pub fn return_sender(&self) -> Option<mpsc::UnboundedSender<ReturnedConnection>> {
+        self.return_tx
+            .lock()
+            .expect("DSQL reservoir return sender poisoned")
+            .as_ref()
+            .cloned()
+    }
+
+    pub fn coordinator(&self) -> Arc<dyn ConnectionCoordinator> {
+        Arc::clone(&self.coordinator)
     }
 
     pub fn ready_count(&self) -> usize {
@@ -220,7 +319,11 @@ impl Reservoir {
             match self.ready.try_recv() {
                 Ok(entry) => {
                     retired += 1;
-                    record_retirement(&self.slot_manager, "budget_cap", entry.created_at.elapsed());
+                    record_retirement(
+                        self.coordinator.as_ref(),
+                        "budget_cap",
+                        entry.created_at.elapsed(),
+                    );
                 }
                 Err(_) => break,
             }
@@ -235,34 +338,121 @@ impl Reservoir {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        // Abort background producers before releasing slot blocks. Otherwise a
-        // refiller could acquire a fresh slot while shutdown is trying to
-        // relinquish capacity.
-        self.refiller_handle.abort();
-        self.scanner_handle.abort();
-        self.return_processor_handle.abort();
-        self.slot_manager.release_all().await
+        self.begin_shutdown();
+        self.finish_shutdown().await
+    }
+
+    /// Close ready admission and retire every idle physical connection.
+    pub fn begin_shutdown(&self) {
+        self.ready.close();
+        if let Ok(handles) = self.refiller_handles.lock() {
+            for handle in handles.iter() {
+                handle.abort();
+            }
+        }
+        if let Ok(handle) = self.scanner_handle.lock()
+            && let Some(handle) = handle.as_ref()
+        {
+            handle.abort();
+        }
+        if let Ok(mut sender) = self.return_tx.lock() {
+            sender.take();
+        }
+        while let Ok(entry) = self.ready.try_recv() {
+            record_retirement(
+                self.coordinator.as_ref(),
+                "shutdown",
+                entry.created_at.elapsed(),
+            );
+        }
+        self.ready_changed.notify_waiters();
+        metrics::record_dsql_pool_connections_total(0);
+        metrics::set_dsql_reservoir_ready_connections(0);
+    }
+
+    /// Abort return processing after a caller-owned shutdown deadline expires.
+    pub fn abort_return_processing(&self) {
+        if let Ok(handle) = self.return_processor_handle.lock()
+            && let Some(handle) = handle.as_ref()
+        {
+            handle.abort();
+        }
+    }
+
+    /// Join closed return processing and relinquish coordinator resources.
+    pub async fn finish_shutdown(&self) -> Result<()> {
+        let refiller_handles = self
+            .refiller_handles
+            .lock()
+            .map(|mut handles| std::mem::take(&mut *handles))
+            .unwrap_or_default();
+        for handle in refiller_handles {
+            let _ = handle.await;
+        }
+        let scanner_handle = self
+            .scanner_handle
+            .lock()
+            .ok()
+            .and_then(|mut handle| handle.take());
+        if let Some(handle) = scanner_handle {
+            let _ = handle.await;
+        }
+        let return_processor_handle = self
+            .return_processor_handle
+            .lock()
+            .ok()
+            .and_then(|mut handle| handle.take());
+        if let Some(handle) = return_processor_handle {
+            let _ = handle.await;
+        }
+        self.coordinator.shutdown().await
     }
 }
 
 impl Drop for Reservoir {
     fn drop(&mut self) {
-        self.refiller_handle.abort();
-        self.scanner_handle.abort();
-        self.return_processor_handle.abort();
+        self.ready.close();
+        if let Ok(handles) = self.refiller_handles.get_mut() {
+            for handle in handles.iter() {
+                handle.abort();
+            }
+        }
+        if let Ok(handle) = self.scanner_handle.get_mut()
+            && let Some(handle) = handle.as_ref()
+        {
+            handle.abort();
+        }
+        if let Ok(handle) = self.return_processor_handle.get_mut()
+            && let Some(handle) = handle.as_ref()
+        {
+            handle.abort();
+        }
+        while let Ok(entry) = self.ready.try_recv() {
+            self.coordinator.release_slot();
+            drop(entry);
+        }
     }
 }
 
-fn spawn_refiller(
+fn spawn_refillers(
     config: ReservoirConfig,
     factory: Arc<dyn PhysicalConnectionFactory>,
     ready_tx: async_channel::Sender<ReservoirEntry>,
-    distributed_bucket: Arc<DistributedTokenBucket>,
-    slot_manager: Arc<SlotBlockManager>,
+    coordinator: Arc<dyn ConnectionCoordinator>,
     inflight: Arc<Semaphore>,
     target_ready: Arc<AtomicUsize>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    ready_changed: Arc<Notify>,
+) -> Vec<JoinHandle<()>> {
+    (0..config.inflight_limit)
+        .map(|_| {
+            let config = config.clone();
+            let factory = Arc::clone(&factory);
+            let ready_tx = ready_tx.clone();
+            let coordinator = Arc::clone(&coordinator);
+            let inflight = Arc::clone(&inflight);
+            let target_ready = Arc::clone(&target_ready);
+            let ready_changed = Arc::clone(&ready_changed);
+            tokio::spawn(async move {
         loop {
             while ready_tx.len() >= target_ready.load(Ordering::Acquire) {
                 tokio::time::sleep(REFILLER_IDLE_INTERVAL).await;
@@ -270,17 +460,21 @@ fn spawn_refiller(
             let Ok(_inflight_guard) = inflight.clone().acquire_owned().await else {
                 return;
             };
-            let Ok(_slot) = slot_manager.acquire_slot().await else {
+            let Ok(()) = coordinator.acquire_slot().await else {
                 metrics::record_dsql_reservoir_refill_error("slot_unavailable");
                 tokio::time::sleep(StdDuration::from_secs(1)).await;
                 continue;
             };
+            // Cancellation can land while waiting for a token, IAM, TCP, or
+            // the ready channel. The pending RAII charge makes every such path
+            // release exactly once; success explicitly transfers the charge
+            // to the physical connection's reservoir entry.
+            let slot_charge = PendingSlotCharge::new(Arc::clone(&coordinator));
             let refill_started = Instant::now();
-            if let Err(error) = distributed_bucket.wait().await {
+            if let Err(error) = coordinator.acquire_creation_token().await {
                 // A slot is reserved before the global rate token so local
                 // refillers cannot collectively overshoot capacity while
                 // waiting for token-bucket admission.
-                slot_manager.release_slot();
                 metrics::record_dsql_reservoir_refill_error("rate_limiter");
                 metrics::record_dsql_reservoir_refill_duration(
                     OutcomeLabel::Failure,
@@ -306,7 +500,6 @@ fn spawn_refiller(
                         // Channel closure means shutdown won the race after the
                         // physical connection was created. Dropping the
                         // connection must also release its reserved slot.
-                        slot_manager.release_slot();
                         metrics::record_dsql_reservoir_refill_error("ready_channel_closed");
                         metrics::record_dsql_reservoir_refill_duration(
                             OutcomeLabel::Failure,
@@ -314,15 +507,16 @@ fn spawn_refiller(
                         );
                         return;
                     }
+                    slot_charge.transfer_to_connection();
                     metrics::record_dsql_pool_connections_total(ready_tx.len());
                     metrics::set_dsql_reservoir_ready_connections(ready_tx.len());
                     metrics::record_dsql_reservoir_refill_duration(
                         OutcomeLabel::Success,
                         refill_started.elapsed(),
                     );
+                    ready_changed.notify_waiters();
                 }
                 Err(error) => {
-                    slot_manager.release_slot();
                     metrics::record_dsql_reservoir_connection_create_duration(
                         create_started.elapsed(),
                     );
@@ -337,14 +531,16 @@ fn spawn_refiller(
                 }
             }
         }
-    })
+            })
+        })
+        .collect()
 }
 
 fn spawn_scanner(
     config: ReservoirConfig,
     ready_tx: async_channel::Sender<ReservoirEntry>,
     ready_rx: async_channel::Receiver<ReservoirEntry>,
-    slot_manager: Arc<SlotBlockManager>,
+    coordinator: Arc<dyn ConnectionCoordinator>,
     target_ready: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -361,7 +557,7 @@ fn spawn_scanner(
                         scanned += 1;
                         if entry.should_retire(guard_window) {
                             record_retirement(
-                                &slot_manager,
+                                coordinator.as_ref(),
                                 "guard_window",
                                 entry.created_at.elapsed(),
                             );
@@ -369,7 +565,7 @@ fn spawn_scanner(
                             // The scanner took a healthy connection out of the
                             // ready queue. If it cannot put it back, it becomes
                             // the owner of the discard and must release the slot.
-                            slot_manager.release_slot();
+                            coordinator.release_slot();
                             metrics::record_dsql_pool_connection_retired("ready_channel_full");
                             metrics::set_dsql_reservoir_ready_connections(ready_tx.len());
                             break;
@@ -388,25 +584,20 @@ fn spawn_return_processor(
     config: ReservoirConfig,
     ready_tx: async_channel::Sender<ReservoirEntry>,
     mut return_rx: mpsc::UnboundedReceiver<ReturnedConnection>,
-    slot_manager: Arc<SlotBlockManager>,
+    coordinator: Arc<dyn ConnectionCoordinator>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let guard_window = duration_or_default(config.guard_window, GUARD_WINDOW);
         while let Some(returned) = return_rx.recv().await {
             let validate_started = Instant::now();
             let entry = returned.entry;
-            if returned.marked_bad {
+            if let Some(reason) =
+                return_retirement_reason(returned.marked_bad, entry.should_retire(guard_window))
+            {
                 metrics::record_dsql_reservoir_connection_validate_duration(
                     validate_started.elapsed(),
                 );
-                record_retirement(&slot_manager, "bad_flag", entry.created_at.elapsed());
-                continue;
-            }
-            if entry.should_retire(guard_window) {
-                metrics::record_dsql_reservoir_connection_validate_duration(
-                    validate_started.elapsed(),
-                );
-                record_retirement(&slot_manager, "guard_window", entry.created_at.elapsed());
+                record_retirement(coordinator.as_ref(), reason, entry.created_at.elapsed());
                 continue;
             }
             metrics::record_dsql_reservoir_connection_validate_duration(validate_started.elapsed());
@@ -414,9 +605,9 @@ fn spawn_return_processor(
             if ready_tx.send(entry).await.is_err() {
                 // The return processor is the last owner when the ready channel
                 // is closed. Retire the connection instead of leaking capacity.
-                slot_manager.release_slot();
+                coordinator.release_slot();
                 metrics::record_dsql_pool_connection_retired("return_channel_closed");
-                return;
+                continue;
             }
             metrics::record_dsql_pool_connections_total(ready_tx.len());
             metrics::set_dsql_reservoir_ready_connections(ready_tx.len());
@@ -424,10 +615,24 @@ fn spawn_return_processor(
     })
 }
 
-fn record_retirement(slot_manager: &SlotBlockManager, reason: &'static str, age: StdDuration) {
+fn return_retirement_reason(marked_bad: bool, inside_guard_window: bool) -> Option<&'static str> {
+    if marked_bad {
+        Some("bad_flag")
+    } else if inside_guard_window {
+        Some("guard_window")
+    } else {
+        None
+    }
+}
+
+fn record_retirement(
+    coordinator: &dyn ConnectionCoordinator,
+    reason: &'static str,
+    age: StdDuration,
+) {
     metrics::record_dsql_reservoir_connection_age(reason, age);
     metrics::record_dsql_pool_connection_retired(reason);
-    slot_manager.release_slot();
+    coordinator.release_slot();
 }
 
 pub(crate) fn assign_lifetime(config: &ReservoirConfig) -> StdDuration {
@@ -460,10 +665,91 @@ fn duration_or_default(value: time::Duration, fallback: StdDuration) -> StdDurat
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use anyhow::Result;
     use proptest::prelude::*;
     use time::Duration;
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct FailingFactory {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PhysicalConnectionFactory for FailingFactory {
+        async fn create_connection(
+            &self,
+        ) -> Result<PgConnection, crate::dsql::ConnectionFactoryError> {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            Err(crate::dsql::ConnectionFactoryError::Connection(
+                "injected connection failure".to_owned(),
+            ))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingCoordinator {
+        events: Mutex<Vec<&'static str>>,
+        used: AtomicUsize,
+    }
+
+    impl RecordingCoordinator {
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().expect("recording coordinator").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConnectionCoordinator for RecordingCoordinator {
+        async fn validate(&self) -> Result<()> {
+            self.events
+                .lock()
+                .expect("recording coordinator")
+                .push("validate");
+            Ok(())
+        }
+
+        async fn acquire_slot(&self) -> Result<()> {
+            self.events
+                .lock()
+                .expect("recording coordinator")
+                .push("slot");
+            self.used.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        async fn acquire_creation_token(&self) -> Result<()> {
+            self.events
+                .lock()
+                .expect("recording coordinator")
+                .push("token");
+            Ok(())
+        }
+
+        fn release_slot(&self) {
+            self.events
+                .lock()
+                .expect("recording coordinator")
+                .push("release");
+            self.used.fetch_sub(1, Ordering::AcqRel);
+        }
+
+        fn used_slots(&self) -> usize {
+            self.used.load(Ordering::Acquire)
+        }
+
+        async fn shutdown(&self) -> Result<()> {
+            self.events
+                .lock()
+                .expect("recording coordinator")
+                .push("shutdown");
+            anyhow::ensure!(self.used_slots() == 0, "slot leak");
+            Ok(())
+        }
+    }
 
     proptest! {
         #[test]
@@ -536,5 +822,60 @@ mod tests {
             StdDuration::from_secs(140),
             StdDuration::from_secs(25)
         ));
+    }
+
+    #[test]
+    fn bad_returns_are_unconditionally_retired() {
+        assert_eq!(return_retirement_reason(true, false), Some("bad_flag"));
+        assert_eq!(return_retirement_reason(true, true), Some("bad_flag"));
+        assert_eq!(return_retirement_reason(false, true), Some("guard_window"));
+        assert_eq!(return_retirement_reason(false, false), None);
+    }
+
+    #[tokio::test]
+    async fn warmup_obeys_expired_caller_deadline_without_retry_sleep() {
+        let factory = Arc::new(FailingFactory::default());
+        let coordinator = Arc::new(RecordingCoordinator::default());
+        let coordinator_trait: Arc<dyn ConnectionCoordinator> = coordinator.clone();
+        let result = Reservoir::start_with_deadline(
+            ReservoirConfig {
+                target_ready: 1,
+                inflight_limit: 1,
+                ..ReservoirConfig::default()
+            },
+            factory.clone(),
+            coordinator_trait,
+            Instant::now(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(factory.attempts.load(Ordering::Acquire), 0);
+        assert_eq!(coordinator.used_slots(), 0);
+        assert_eq!(coordinator.events(), vec!["validate", "shutdown"]);
+    }
+
+    #[tokio::test]
+    async fn failed_creation_releases_one_slot_after_rate_admission() {
+        let factory = Arc::new(FailingFactory::default());
+        let coordinator = Arc::new(RecordingCoordinator::default());
+        let coordinator_trait: Arc<dyn ConnectionCoordinator> = coordinator.clone();
+        let result = Reservoir::start_with_deadline(
+            ReservoirConfig {
+                target_ready: 1,
+                inflight_limit: 1,
+                ..ReservoirConfig::default()
+            },
+            factory,
+            coordinator_trait,
+            Instant::now() + StdDuration::from_millis(20),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(coordinator.used_slots(), 0);
+        let events = coordinator.events();
+        assert!(events.starts_with(&["validate", "slot", "token", "release"]));
+        assert_eq!(events.last(), Some(&"shutdown"));
     }
 }

@@ -3,7 +3,8 @@
 //! The closure is the union of workspace crates reachable from one or more
 //! provisioner roots, resolved from `cargo metadata` so it cannot rot as
 //! crates move — plus the workspace files that shape every build
-//! (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`).
+//! (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`,
+//! and the storage-owned schema contract consumed by `tokeira-build-info`).
 //! Legacy callers still resolve one platform seed; statically assembled
 //! provisioners resolve exactly the shell, selected platform, and selected
 //! frontend roots.
@@ -33,6 +34,7 @@ const WORKSPACE_BUILD_FILES: &[&str] = &[
     "Cargo.lock",
     "rust-toolchain.toml",
     ".cargo/config.toml",
+    "crates/tokeira-storage/schema-contract.toml",
 ];
 
 /// The resolved provisioner closure.

@@ -52,6 +52,15 @@ fn default_burst_capacity() -> u64 {
     1_000
 }
 
+const EMBEDDED_DEFAULT_MAX_CONNECTIONS: usize = 8;
+const EMBEDDED_DEFAULT_CONCURRENT_CREATIONS: usize = 2;
+const EMBEDDED_DEFAULT_RATE_PER_SECOND: f64 = 8.0;
+const EMBEDDED_DEFAULT_BURST: u64 = 2;
+const EMBEDDED_MAX_CONNECTIONS: usize = 16;
+const EMBEDDED_MAX_CONCURRENT_CREATIONS: usize = 4;
+const EMBEDDED_MAX_RATE_PER_SECOND: f64 = 16.0;
+const EMBEDDED_MAX_BURST: u64 = 4;
+
 fn default_shard_count() -> u32 {
     64
 }
@@ -372,6 +381,109 @@ impl DsqlPoolConfig {
     }
 }
 
+/// DynamoDB-free pool settings for one exclusive embedded engine process.
+///
+/// `max_connections` is both the physical connection cap and the reservoir's
+/// idle capacity, so the resulting pool always preserves
+/// `max_idle_conns == max_conns`. The type deliberately has no distributed
+/// coordination field and cannot name a DynamoDB resource.
+#[derive(Clone, Debug)]
+pub struct EmbeddedDsqlPoolConfig {
+    /// Maximum physical and idle DSQL connections.
+    pub max_connections: usize,
+    /// Maximum concurrent physical connection creation attempts.
+    pub concurrent_connection_creations: usize,
+    /// Sustained process-local connection creation rate.
+    pub connection_rate_per_second: f64,
+    /// Initial and maximum process-local creation burst.
+    pub connection_burst: u64,
+    /// Migration discovery settings.
+    pub migration: MigrationConfig,
+    /// Runtime shard count used for deterministic run-key ownership.
+    pub shard_count: u32,
+    /// Projection partition count used by writers and projection workers.
+    pub projection_partition_count: u32,
+    /// Workflow-id conflict behavior used by repository start commits.
+    pub conflict_policy: CurrentExecutionConflictPolicy,
+    /// Duration added to the repository application clock for shard leases.
+    pub lease_duration: Duration,
+}
+
+impl Default for EmbeddedDsqlPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: EMBEDDED_DEFAULT_MAX_CONNECTIONS,
+            concurrent_connection_creations: EMBEDDED_DEFAULT_CONCURRENT_CREATIONS,
+            connection_rate_per_second: EMBEDDED_DEFAULT_RATE_PER_SECOND,
+            connection_burst: EMBEDDED_DEFAULT_BURST,
+            migration: MigrationConfig::default(),
+            shard_count: default_shard_count(),
+            projection_partition_count: default_projection_partition_count(),
+            conflict_policy: CurrentExecutionConflictPolicy::default(),
+            lease_duration: default_lease_duration(),
+        }
+    }
+}
+
+impl EmbeddedDsqlPoolConfig {
+    /// Construct the storage envelope from validated embedded limit values.
+    pub fn with_limits(
+        max_connections: usize,
+        concurrent_connection_creations: usize,
+        connection_rate_per_second: f64,
+        connection_burst: u64,
+    ) -> Self {
+        Self {
+            max_connections,
+            concurrent_connection_creations,
+            connection_rate_per_second,
+            connection_burst,
+            ..Self::default()
+        }
+    }
+
+    /// Validate the deliberately small embedded connection envelope.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=EMBEDDED_MAX_CONNECTIONS).contains(&self.max_connections) {
+            bail!("embedded DSQL max_connections must be between 1 and 16");
+        }
+        if !(1..=EMBEDDED_MAX_CONCURRENT_CREATIONS).contains(&self.concurrent_connection_creations)
+        {
+            bail!("embedded DSQL concurrent connection creations must be between 1 and 4");
+        }
+        if self.concurrent_connection_creations > self.max_connections {
+            bail!("embedded DSQL concurrent connection creations exceed max_connections");
+        }
+        if !self.connection_rate_per_second.is_finite()
+            || self.connection_rate_per_second <= 0.0
+            || self.connection_rate_per_second > EMBEDDED_MAX_RATE_PER_SECOND
+        {
+            bail!("embedded DSQL connection rate must be finite and between 0 and 16");
+        }
+        if !(1..=EMBEDDED_MAX_BURST).contains(&self.connection_burst) {
+            bail!("embedded DSQL connection burst must be between 1 and 4");
+        }
+        if self.shard_count == 0 {
+            bail!("shard_count must be greater than zero");
+        }
+        if self.projection_partition_count == 0 {
+            bail!("projection_partition_count must be greater than zero");
+        }
+        if self.lease_duration <= Duration::ZERO {
+            bail!("lease_duration must be positive");
+        }
+        self.reservoir_config().validate()
+    }
+
+    pub(crate) fn reservoir_config(&self) -> ReservoirConfig {
+        ReservoirConfig {
+            target_ready: self.max_connections,
+            inflight_limit: self.concurrent_connection_creations,
+            ..ReservoirConfig::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use time::Duration;
@@ -381,6 +493,19 @@ mod tests {
     #[test]
     fn defaults_validate() {
         DsqlPoolConfig::default().validate().unwrap();
+        EmbeddedDsqlPoolConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn embedded_pool_has_no_coordination_and_keeps_all_connections_idle() {
+        let config = EmbeddedDsqlPoolConfig::default();
+        let reservoir = config.reservoir_config();
+
+        assert_eq!(reservoir.target_ready, config.max_connections);
+        assert_eq!(reservoir.inflight_limit, 2);
+        assert_eq!(config.connection_rate_per_second, 8.0);
+        assert_eq!(config.connection_burst, 2);
+        assert!(!std::any::type_name::<EmbeddedDsqlPoolConfig>().contains("Coordination"));
     }
 
     #[test]

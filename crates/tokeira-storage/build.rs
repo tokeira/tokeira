@@ -3,7 +3,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use sha2::{Digest, Sha256};
+use schema_contract::{
+    LockedMigration, MigrationIdentity, SchemaBaseline, SchemaContract, cumulative_prefix_digests,
+    sha256_hex, validate_schema_contract,
+};
+use toml::Value;
+
+// The shared module's public API is externally reachable from the library;
+// build-script inclusion necessarily makes those same items locally private.
+#[allow(unreachable_pub)]
+#[path = "src/schema_contract.rs"]
+mod schema_contract;
 
 #[derive(Debug)]
 struct Migration {
@@ -17,11 +27,36 @@ struct Migration {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let migrations_dir = manifest_dir.join("migrations");
+    let contract_path = manifest_dir.join("schema-contract.toml");
+    let baseline_path = manifest_dir.join("schema-baseline.lock");
     println!("cargo:rerun-if-changed={}", migrations_dir.display());
+    println!("cargo:rerun-if-changed={}", contract_path.display());
+    println!("cargo:rerun-if-changed={}", baseline_path.display());
 
     let migrations = discover_migrations(&migrations_dir)?;
+    let identities = migrations
+        .iter()
+        .map(|migration| MigrationIdentity {
+            version: migration.version,
+            name: migration.name.clone(),
+            checksum: migration.checksum.clone(),
+        })
+        .collect::<Vec<_>>();
+    let contract = parse_contract(&contract_path)?;
+    let baseline = parse_baseline(&baseline_path)?;
+    validate_schema_contract(
+        &contract,
+        &baseline,
+        &identities,
+        &env::var("CARGO_PKG_VERSION")?,
+    )
+    .map_err(invalid_data)?;
+    let prefix_digests = cumulative_prefix_digests(&identities).map_err(invalid_data)?;
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-    fs::write(out_dir.join("migrations_embedded.rs"), render(&migrations))?;
+    fs::write(
+        out_dir.join("migrations_embedded.rs"),
+        render(&migrations, &contract, &prefix_digests),
+    )?;
     Ok(())
 }
 
@@ -88,12 +123,103 @@ fn invalid_data(message: impl Into<String>) -> std::io::Error {
 }
 
 fn checksum(sql: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(sql.as_bytes());
-    format!("{:x}", hasher.finalize())
+    sha256_hex(sql.as_bytes())
 }
 
-fn render(migrations: &[Migration]) -> String {
+fn parse_contract(path: &Path) -> Result<SchemaContract, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)?;
+    let value = content.parse::<Value>()?;
+    Ok(SchemaContract {
+        format_version: contract_u32(&value, "format_version")?,
+        tokeira_release: contract_string(&value, "tokeira_release")?,
+        minimum_supported_version: contract_u32(&value, "minimum_supported_version")?,
+        target_version: contract_u32(&value, "target_version")?,
+        maximum_readable_version: contract_u32(&value, "maximum_readable_version")?,
+        migration_set_digest: contract_string(&value, "migration_set_digest")?,
+        immutable_through_version: contract_u32(&value, "immutable_through_version")?,
+    })
+}
+
+fn contract_u32(value: &Value, key: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let integer = value
+        .get(key)
+        .and_then(Value::as_integer)
+        .ok_or_else(|| invalid_data(format!("schema contract missing integer {key}")))?;
+    u32::try_from(integer)
+        .map_err(|_| invalid_data(format!("schema contract {key} is out of range")).into())
+}
+
+fn contract_string(value: &Value, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_data(format!("schema contract missing string {key}")).into())
+}
+
+fn parse_baseline(path: &Path) -> Result<SchemaBaseline, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)?;
+    let mut lines = content.lines();
+    if lines.next() != Some("# tokeira-dsql-schema-baseline-v1") {
+        return Err(invalid_data("schema baseline has an unsupported header").into());
+    }
+    let ceiling_line = lines
+        .next()
+        .ok_or_else(|| invalid_data("schema baseline is missing its immutable ceiling"))?;
+    let (ceiling_key, ceiling_value) = ceiling_line
+        .split_once(' ')
+        .ok_or_else(|| invalid_data("schema baseline ceiling is malformed"))?;
+    if ceiling_key != "immutable_through_version" {
+        return Err(invalid_data("schema baseline ceiling key is malformed").into());
+    }
+
+    let migrations = lines
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| parse_locked_migration(index + 3, line))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SchemaBaseline {
+        format_version: 1,
+        immutable_through_version: ceiling_value.parse()?,
+        migrations,
+    })
+}
+
+fn parse_locked_migration(
+    line_number: usize,
+    line: &str,
+) -> Result<LockedMigration, Box<dyn std::error::Error>> {
+    let mut fields = line.split_ascii_whitespace();
+    let version = fields
+        .next()
+        .ok_or_else(|| invalid_data(format!("baseline line {line_number} is missing version")))?
+        .parse()?;
+    let name = fields
+        .next()
+        .ok_or_else(|| invalid_data(format!("baseline line {line_number} is missing name")))?
+        .to_owned();
+    let checksum = fields
+        .next()
+        .ok_or_else(|| invalid_data(format!("baseline line {line_number} is missing checksum")))?
+        .to_owned();
+    if fields.next().is_some() {
+        return Err(invalid_data(format!(
+            "baseline line {line_number} has unexpected trailing fields"
+        ))
+        .into());
+    }
+    Ok(LockedMigration {
+        version,
+        name,
+        checksum,
+    })
+}
+
+fn render(
+    migrations: &[Migration],
+    contract: &SchemaContract,
+    prefix_digests: &[(u32, String)],
+) -> String {
     let mut output = String::from("static EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[\n");
     for migration in migrations {
         output.push_str("    EmbeddedMigration {\n");
@@ -105,6 +231,48 @@ fn render(migrations: &[Migration]) -> String {
         ));
         output.push_str(&format!("        checksum: {:?},\n", migration.checksum));
         output.push_str(&format!("        sql: {:?},\n", migration.sql));
+        output.push_str("    },\n");
+    }
+    output.push_str("];\n\n");
+    output.push_str(
+        "static EMBEDDED_SCHEMA_CONTRACT: EmbeddedSchemaContract = EmbeddedSchemaContract {\n",
+    );
+    output.push_str(&format!(
+        "    format_version: {},\n",
+        contract.format_version
+    ));
+    output.push_str(&format!(
+        "    tokeira_release: {:?},\n",
+        contract.tokeira_release
+    ));
+    output.push_str(&format!(
+        "    minimum_supported_version: {},\n",
+        contract.minimum_supported_version
+    ));
+    output.push_str(&format!(
+        "    target_version: {},\n",
+        contract.target_version
+    ));
+    output.push_str(&format!(
+        "    maximum_readable_version: {},\n",
+        contract.maximum_readable_version
+    ));
+    output.push_str(&format!(
+        "    migration_set_digest: {:?},\n",
+        contract.migration_set_digest
+    ));
+    output.push_str(&format!(
+        "    immutable_through_version: {},\n",
+        contract.immutable_through_version
+    ));
+    output.push_str("};\n\n");
+    output.push_str(
+        "static EMBEDDED_MIGRATION_PREFIX_DIGESTS: &[EmbeddedMigrationPrefixDigest] = &[\n",
+    );
+    for (version, digest) in prefix_digests {
+        output.push_str("    EmbeddedMigrationPrefixDigest {\n");
+        output.push_str(&format!("        version: {version},\n"));
+        output.push_str(&format!("        digest: {digest:?},\n"));
         output.push_str("    },\n");
     }
     output.push_str("];\n");

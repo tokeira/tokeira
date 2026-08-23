@@ -1,37 +1,37 @@
 # Implementation Plan
 
-- [ ] 1. Add explicit embedded-storage configuration
-  - [ ] 1.1 Add the embedded configuration model in `tokeira-config`
+- [x] 1. Add explicit embedded-storage configuration
+  - [x] 1.1 Add the embedded configuration model in `tokeira-config`
     - Implement `EmbeddedEngineConfig`, the closed `EmbeddedStorageConfig` enum,
       managed create-or-recover intent, existing-cluster identity, migration policy,
       startup deadline, and embedded DSQL resource limits with unknown-field rejection.
     - Preserve the existing `Engine::start*` configuration path by defaulting only that
       compatibility path to in-memory storage.
     - _Requirements: 1.1–1.6, 5.1–5.3, 6.5–6.12, 7.10–7.11, 8.14_
-  - [ ] 1.2 Extend listener-backed DSQL configuration with an explicit migration policy
+  - [x] 1.2 Extend listener-backed DSQL configuration with an explicit migration policy
     - Add the optional serialized field to `DsqlInfraConfig`; defer its required-value
       validation to DSQL startup so non-DSQL configurations remain unaffected.
     - Keep the configuration types independent of storage implementation types and map
       them exhaustively at the engine boundary.
     - _Requirements: 5.2–5.3, 5.12–5.13_
-  - [ ] 1.3 Add fixed configuration and serialization tests
+  - [x] 1.3 Add fixed configuration and serialization tests
     - Cover exact defaults and maxima, positive-value and cross-field validation,
       unknown fields, missing identity/intent/policy, lossless TOML round trips, and
       error messages that identify the invalid field without exposing secrets.
     - _Requirements: 1.1–1.6, 5.1–5.3, 6.5–6.12, 7.10–7.11_
-  - [ ] 1.4 Property test: Property 1 — embedded configuration is explicit and closed
+  - [x] 1.4 Property test: Property 1 — embedded configuration is explicit and closed
     - Add a `proptest` model with at least 100 cases covering decoding, defaulting,
       validation, and rejection without storage-mode fallback.
     - Tag: `// Feature: managed-embedded-dsql, Property 1: embedded configuration is explicit and closed`
     - _Requirements: 1.1–1.6, 5.1–5.3, 6.5–6.12, 7.10–7.11_
 
-- [ ] 2. Checkpoint: embedded configuration is green
+- [x] 2. Checkpoint: embedded configuration is green
   - Run formatting plus focused `tokeira-config` check, clippy, and nextest commands
     with `--locked`; confirm serialization tests and Property 1 pass with no warnings.
   - _Requirements: 1.1–1.6, 5.1–5.3, 6.5–6.12, 7.10–7.11_
 
-- [ ] 3. Create the managed DSQL lifecycle crate and durable descriptor store
-  - [ ] 3.1 Add `tokeira-managed-dsql` as a documented workspace crate
+- [x] 3. Create the managed DSQL lifecycle crate and durable descriptor store
+  - [x] 3.1 Add `tokeira-managed-dsql` as a documented workspace crate
     - Register the crate and workspace path dependency, inherit workspace lints, and add
       only the already-locked AWS DSQL and common workspace dependencies required by
       the approved design.
@@ -40,26 +40,26 @@
       wrapper; do not depend on engine, storage, runtime, edge, observability, kernel,
       `tkr`, or `tkp`.
     - _Requirements: 2.1–2.12, 3.1–3.16, 9.4–9.11, 14.1–14.3_
-  - [ ] 3.2 Implement the local crash-safe `ClusterDescriptorStore`
+  - [x] 3.2 Implement the local crash-safe `ClusterDescriptorStore`
     - Use a sidecar exclusive lock, monotonically increasing CAS revision, an owner-only
       same-directory temporary file, file `sync_all`, atomic rename, and parent-directory
       sync before releasing the lock.
     - Persist `PendingCreate`, `Ready`, and `Destroyed` states; reject corrupt or future
       formats and treat `Destroyed` as a tombstone rather than implicit create intent.
     - _Requirements: 2.1–2.4, 2.8–2.11, 3.8, 3.10, 9.10_
-  - [ ] 3.3 Add descriptor and identity example tests
+  - [x] 3.3 Add descriptor and identity example tests
     - Cover owner-only permissions where supported, fsync/rename failure injection,
       redacted `Debug`/errors, descriptor format rejection, ID/ARN/Region parsing, and
       every partial-identity rejection.
     - _Requirements: 2.2, 2.8–2.12, 3.1–3.2, 3.6, 3.8, 8.13, 12.7–12.8_
-  - [ ] 3.4 Property test: Property 2 — descriptor CAS admits one canonical history
+  - [x] 3.4 Property test: Property 2 — descriptor CAS admits one canonical history
     - Use generated descriptor histories and two same-revision writers against the
       descriptor-store model for at least 100 cases.
     - Tag: `// Feature: managed-embedded-dsql, Property 2: descriptor CAS admits one canonical history`
     - _Requirements: 2.2, 2.8–2.11, 3.8, 13.1, 13.6_
 
-- [ ] 4. Implement create, recovery, identity validation, and AWS adaptation
-  - [ ] 4.1 Implement the production `aws_sdk_dsql` control-plane adapter
+- [x] 4. Implement create, recovery, identity validation, and AWS adaptation
+  - [x] 4.1 Implement the production `aws_sdk_dsql` control-plane adapter
     - Build create requests with the explicit persisted token, deletion protection, and
       configured tags; omit multi-Region, KMS, policy, and bypass fields exactly as the
       approved request-policy table specifies.
@@ -67,7 +67,7 @@
       access, validation, quota, conflict, and terminal errors without leaking SDK
       request debug output.
     - _Requirements: 2.5–2.7, 2.11–2.12, 3.1–3.5, 3.15–3.16, 9.11_
-  - [ ] 4.2 Implement the create-or-recover state machine
+  - [x] 4.2 Implement the create-or-recover state machine
     - Persist the client token before the first create call; on CAS loss reload and use
       the winning token; on replay reuse the durable token; and persist returned Region,
       ID, ARN, and endpoint as one canonical ready identity.
@@ -75,45 +75,45 @@
       reject lost descriptors and canonical-identity disagreement, and never use tags or
       endpoint for discovery.
     - _Requirements: 2.1–2.10, 3.1–3.10, 13.1–13.4, 13.6_
-  - [ ] 4.3 Implement bounded status recovery and scale-to-zero wake handling
+  - [x] 4.3 Implement bounded status recovery and scale-to-zero wake handling
     - Follow the approved status table, use one injected startup deadline, honor
       `retryAfterSeconds` as a lower bound, and use deterministic fake time in tests.
     - Allow `IDLE`/`INACTIVE` to enter bounded pool warmup, proceed to schema only after
       `ACTIVE`, and reject failed, deleting, deleted, and multi-Region-only statuses.
     - _Requirements: 3.11–3.16, 8.14, 13.4–13.6_
-  - [ ] 4.4 Implement existing-cluster resolution without managed mutations
+  - [x] 4.4 Implement existing-cluster resolution without managed mutations
     - Validate configured Region, cluster ID, and ARN with `GetCluster` by ID; refresh
       only the endpoint; expose no create, protection-update, delete, or descriptor path.
     - _Requirements: 3.1–3.9, 5.2, 9.11_
-  - [ ] 4.5 Property test: Property 3 — creation is idempotent across every crash point
+  - [x] 4.5 Property test: Property 3 — creation is idempotent across every crash point
     - Drive the lifecycle with fake AWS, fake descriptor persistence, injected crashes,
       and deterministic replay for at least 100 cases.
     - Tag: `// Feature: managed-embedded-dsql, Property 3: creation is idempotent across every crash point`
     - _Requirements: 2.1–2.9, 2.12, 13.1–13.2_
-  - [ ] 4.6 Property test: Property 4 — AWS request construction is complete and identity-neutral
+  - [x] 4.6 Property test: Property 4 — AWS request construction is complete and identity-neutral
     - Generate valid managed configurations and all control-plane operation kinds for at
       least 100 cases, asserting field closure and canonical-ID targeting.
     - Tag: `// Feature: managed-embedded-dsql, Property 4: AWS request construction is complete and identity-neutral`
     - _Requirements: 2.5–2.7, 3.1–3.5, 3.9–3.10, 9.11, 13.3_
-  - [ ] 4.7 Property test: Property 5 — recovery follows the cluster-status reference model
+  - [x] 4.7 Property test: Property 5 — recovery follows the cluster-status reference model
     - Compare generated AWS observation/error sequences with a pure status/retry model
       using injected time for at least 100 cases and no sleeps.
     - Tag: `// Feature: managed-embedded-dsql, Property 5: recovery follows the cluster-status reference model`
     - _Requirements: 3.5–3.16, 8.14, 13.4–13.6_
 
-- [ ] 5. Checkpoint: managed lifecycle is green
+- [x] 5. Checkpoint: managed lifecycle is green
   - Run formatting plus focused check, clippy, nextest, and doctests for
     `tokeira-managed-dsql`; confirm its fake-AWS suite and Properties 2–5 pass without
     credentials or network access.
   - _Requirements: 2.1–2.12, 3.1–3.16, 9.11, 13.1–13.6_
 
-- [ ] 6. Establish the release-bound schema contract and immutable baseline
-  - [ ] 6.1 Add storage-owned schema contract parsing and canonical digest generation
+- [x] 6. Establish the release-bound schema contract and immutable baseline
+  - [x] 6.1 Add storage-owned schema contract parsing and canonical digest generation
     - Implement the platform-independent ordered digest format, cumulative prefix
       digests, contiguous-version checks, and contract ordering validation in a helper
       shared by `build.rs` and storage tests.
     - _Requirements: 4.1–4.7, 4.10, 13.8_
-  - [ ] 6.2 Normalize and extend the DSQL migration set before cutting the baseline
+  - [x] 6.2 Normalize and extend the DSQL migration set before cutting the baseline
     - Inventory the current migration head at implementation time; normalize existing
       table/index/seed migrations to the supported idempotent DSQL forms while the
       build-phase rule still permits it.
@@ -121,7 +121,7 @@
       `tokeira_control_lease`, including the equivalent idempotent bootstrap DDL used by
       first-run automatic migration.
     - _Requirements: 4.8–4.10, 5.6–5.11, 7.1–7.9_
-  - [ ] 6.3 Check in and enforce `schema-contract.toml` and `schema-baseline.lock`
+  - [x] 6.3 Check in and enforce `schema-contract.toml` and `schema-baseline.lock`
     - Select nonzero `MIN`, `TARGET`, `MAX`, digest, and immutable ceiling from the final
       contiguous migration set; record every immutable `(version, name, checksum)`.
     - Make the storage build fail on gaps, duplicates, ordering/release/digest mismatch,
@@ -129,121 +129,121 @@
       the crate-local migration rule in the same baseline-cut change so future edits are
       forward-only.
     - _Requirements: 4.1–4.10, 13.8_
-  - [ ] 6.4 Expose the validated contract through `tokeira-build-info`
+  - [x] 6.4 Expose the validated contract through `tokeira-build-info`
     - Add minimum, target, maximum readable, and migration-set digest fields without
       moving validation authority out of `tokeira-storage`.
     - _Requirements: 4.1–4.7_
-  - [ ] 6.5 Property test: Property 6 — the release schema contract is deterministic and immutable
+  - [x] 6.5 Property test: Property 6 — the release schema contract is deterministic and immutable
     - Generate ordered and malformed migration sets, mutations, and contracts for at
       least 100 cases against a pure reference digest/baseline model.
     - Tag: `// Feature: managed-embedded-dsql, Property 6: the release schema contract is deterministic and immutable`
     - _Requirements: 4.1–4.10, 13.8_
-  - [ ] 6.6 Add schema-contract build-helper unit tests
+  - [x] 6.6 Add schema-contract build-helper unit tests
     - Cover exact canonical bytes, fixed known digests, missing/duplicate versions,
       invalid version inequalities, release mismatch, and mutation at every baseline
       position.
     - _Requirements: 4.1–4.10, 13.8_
 
-- [ ] 7. Add fenced DSQL control leases and the shared admission gate
-  - [ ] 7.1 Implement `ControlLeaseRepository` and `ControlLeaseGuard`
+- [x] 7. Add fenced DSQL control leases and the shared admission gate
+  - [x] 7.1 Implement `ControlLeaseRepository` and `ControlLeaseGuard`
     - Acquire with insert-on-conflict plus a fresh repeatable-read lock transaction,
       database-time expiry checks, exact cluster identity, monotonic fence increments,
       and bounded OCC retry.
     - Condition renew and release on claim name, owner incarnation, and fence token;
       treat zero affected rows as fencing.
     - _Requirements: 5.7–5.8, 7.1–7.9, 13.9, 13.12–13.13_
-  - [ ] 7.2 Implement owner renewal, quiescence, and `OwnershipAdmissionGate`
+  - [x] 7.2 Implement owner renewal, quiescence, and `OwnershipAdmissionGate`
     - Share `Open`/`Closing`/`Fenced` state with edge and storage, close local admission
       before an unconfirmed renewal can pass database expiry, and distinguish clean from
       expired takeover using the approved quiescence rule.
     - Keep owner/fence data out of kernel commands and workflow history.
     - _Requirements: 7.1–7.9, 11.10, 14.2–14.5_
-  - [ ] 7.3 Add fixed lease/OCC/fencing tests
+  - [x] 7.3 Add fixed lease/OCC/fencing tests
     - Cover busy claims, renewal and release fencing, database versus monotonic time,
       owner crash expiry, clean takeover, expired takeover, and redacted diagnostics with
       injected clocks and no sleeps.
     - _Requirements: 5.7–5.9, 7.1–7.9, 13.9, 13.12–13.13_
-  - [ ] 7.4 Property test: Property 11 — embedded ownership has at most one admitted owner
+  - [x] 7.4 Property test: Property 11 — embedded ownership has at most one admitted owner
     - Compare generated multi-owner operation/time sequences against a lease reference
       model for at least 100 cases.
     - Tag: `// Feature: managed-embedded-dsql, Property 11: embedded ownership has at most one admitted owner`
     - _Requirements: 7.1–7.9, 13.12–13.13_
 
-- [ ] 8. Implement schema compatibility assessment and automatic migration
-  - [ ] 8.1 Add the compatibility record, contract, decisions, and pure assessment logic
+- [x] 8. Implement schema compatibility assessment and automatic migration
+  - [x] 8.1 Add the compatibility record, contract, decisions, and pure assessment logic
     - Read catalog, migration ledger, and cumulative digest without DDL; tolerate absent
       metadata; validate known checksums/digests before version-policy decisions; and
       return typed incompatibility details.
     - Permit legacy compatibility backfill only after complete checksum validation and
       only under automatic policy.
     - _Requirements: 4.10–4.17, 5.1–5.6, 5.13_
-  - [ ] 8.2 Refactor `MigrationRunner` into assess/apply phases
+  - [x] 8.2 Refactor `MigrationRunner` into assess/apply phases
     - Map configuration policy exhaustively at the engine boundary; initialize a new
       managed cluster automatically, but leave an uninitialized validate-only existing
       cluster unchanged with `MigrationRequired`.
     - Serialize apply with the schema-migration claim and revalidate the fence and all
       applied checksums before every migration step.
     - _Requirements: 5.1–5.9, 5.11–5.13_
-  - [ ] 8.3 Implement DSQL-safe, crash-recoverable migration steps
+  - [x] 8.3 Implement DSQL-safe, crash-recoverable migration steps
     - Execute one DDL or DML statement per transaction, wait for and validate asynchronous
       indexes, write the ledger only after the operation completes, then persist the
       cumulative digest in a separate compatible transaction.
     - Retry `40001` only for proven-idempotent steps; on lost job IDs inspect named index
       and job state; stop immediately on fencing, invalid index, or checksum drift.
     - _Requirements: 4.10–4.12, 5.5–5.12, 13.8–13.9_
-  - [ ] 8.4 Property test: Property 7 — schema compatibility matches the decision table
+  - [x] 8.4 Property test: Property 7 — schema compatibility matches the decision table
     - Generate valid contracts, ledgers, digests, versions, and policies and compare the
       pure function with the approved decision table for at least 100 cases, including
       no modeled mutation on rejection.
     - Tag: `// Feature: managed-embedded-dsql, Property 7: schema compatibility matches the decision table`
     - _Requirements: 4.11–4.17, 5.4–5.6, 13.7_
-  - [ ] 8.5 Property test: Property 8 — migration replay is serialized, fenced, and idempotent
+  - [x] 8.5 Property test: Property 8 — migration replay is serialized, fenced, and idempotent
     - Generate migration sequences, crash points, async-index states, OCC schedules, and
       competing owners against fake SQL and lease boundaries for at least 100 cases.
     - Tag: `// Feature: managed-embedded-dsql, Property 8: migration replay is serialized, fenced, and idempotent`
     - _Requirements: 5.5–5.12, 13.8–13.9_
-  - [ ] 8.6 Add fixed compatibility and migration tests
+  - [x] 8.6 Add fixed compatibility and migration tests
     - Cover every decision-table row, modified released migrations, bootstrap behavior,
       validate-only no-write behavior, exact `40001` classification, lost async-index
       jobs, invalid indexes, and actionable migration-required errors.
     - _Requirements: 4.11–4.17, 5.4–5.13, 13.7–13.9_
 
-- [ ] 9. Add DynamoDB-free process-local connection coordination
-  - [ ] 9.1 Introduce the storage-local `ConnectionCoordinator` interface
+- [x] 9. Add DynamoDB-free process-local connection coordination
+  - [x] 9.1 Introduce the storage-local `ConnectionCoordinator` interface
     - Adapt the current distributed token bucket and slot-block manager behind it without
       changing their DynamoDB validation, ordering, rate, or slot behavior.
     - Preserve the director invariant: class/in-flight permit, then physical slot, then
       creation-rate token, then physical connection.
     - _Requirements: 6.1–6.4, 6.13–6.16, 14.2, 14.7_
-  - [ ] 9.2 Implement the process-local token bucket and atomic slot budget
+  - [x] 9.2 Implement the process-local token bucket and atomic slot budget
     - Use an injected monotonic clock and `Notify`, initialize to the configured burst,
       cap replenishment and slots, and release exactly one slot on every failure,
       retirement, and bad-return path.
     - _Requirements: 6.1–6.2, 6.5–6.14, 13.10–13.11_
-  - [ ] 9.3 Add `DsqlStore::connect_embedded` and bounded shutdown
+  - [x] 9.3 Add `DsqlStore::connect_embedded` and bounded shutdown
     - Construct no DynamoDB configuration/client/table names; use the shared reservoir,
       director, five `DbClass` budgets, leak diagnostics, authentication, and repository
       path with `max_idle_conns == max_conns`.
     - Make warmup and ready-channel waiting deadline/cancellation aware; close admission,
       refillers, checked-out permits, coordinator, and physical pool during shutdown.
     - _Requirements: 1.5, 1.9, 6.1–6.18, 8.2, 13.10–13.11_
-  - [ ] 9.4 Property test: Property 9 — process-local creation limiting obeys rate and burst
+  - [x] 9.4 Property test: Property 9 — process-local creation limiting obeys rate and burst
     - Compare generated monotonic arrival/time sequences with a token-bucket reference
       model for at least 100 cases.
     - Tag: `// Feature: managed-embedded-dsql, Property 9: process-local creation limiting obeys rate and burst`
     - _Requirements: 6.1, 6.7–6.12, 13.10–13.11_
-  - [ ] 9.5 Property test: Property 10 — connection slot and class accounting is conserved
+  - [x] 9.5 Property test: Property 10 — connection slot and class accounting is conserved
     - Generate creation/check-out/return/expiry/leak/shutdown sequences for at least 100
       cases, checking the physical-slot and class-budget conservation model.
     - Tag: `// Feature: managed-embedded-dsql, Property 10: connection slot and class accounting is conserved`
     - _Requirements: 6.2–6.6, 6.13–6.18, 13.10–13.11_
-  - [ ] 9.6 Add focused embedded-reservoir tests
+  - [x] 9.6 Add focused embedded-reservoir tests
     - Prove no DynamoDB object is constructed, all connection classes remain bounded,
       warmup uses the remaining startup deadline, bad connections release slots, leak
       diagnostics fire, and shutdown reaches zero resources without sleeps.
     - _Requirements: 6.1–6.18, 13.10–13.11_
 
-- [ ] 10. Checkpoint: storage foundations are green
+- [x] 10. Checkpoint: storage foundations are green
   - Run formatting plus focused check, clippy, nextest, doctests, and build-script tests
     for storage and build-info with `--locked`; confirm Properties 6–11 pass and the
     build rejects an intentionally altered baseline fixture.

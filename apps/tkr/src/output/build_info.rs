@@ -61,6 +61,10 @@ mod tests {
         feature_matrix_digest: "feature",
         sdk_matrix_digest: "sdk",
         build_mode: "dev",
+        schema_min_supported_version: 1,
+        schema_target_version: 67,
+        schema_max_readable_version: 67,
+        schema_migration_set_digest: "sha256:fixture",
     };
 
     #[test]

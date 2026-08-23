@@ -30,6 +30,7 @@ pub mod memory;
 pub mod metrics;
 #[cfg(test)]
 mod preservation_property_tests;
+pub mod schema_contract;
 pub mod worker_compute;
 
 pub use api::*;

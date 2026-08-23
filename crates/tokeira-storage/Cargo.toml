@@ -45,6 +45,7 @@ dsql-integration = ["dsql"]
 
 [build-dependencies]
 sha2.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 metrics-util.workspace = true

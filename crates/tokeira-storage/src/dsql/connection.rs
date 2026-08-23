@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
@@ -20,18 +20,29 @@ use async_trait::async_trait;
 use sqlx::PgConnection;
 use tokeira_observability::DbClassLabel;
 use tokio::{
-    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinHandle,
 };
 
 use crate::{ConnectionDirector, DbClass, metrics};
 
 use super::{
-    DsqlPoolConfig, Reservoir, ReservoirEntry, ReturnedConnection, config::ReservoirConfig,
+    ConnectionCoordinator, DsqlPoolConfig, Reservoir, ReservoirEntry, ReturnedConnection,
+    config::ReservoirConfig,
 };
 
 const LEAK_SUSPECT_AFTER: StdDuration = StdDuration::from_secs(30);
 const LEAK_SCAN_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+/// Behavior when a class-admitted operation finds no idle physical connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckoutPolicy {
+    /// Preserve distributed-mode load shedding by returning immediately.
+    Immediate,
+    /// Bound embedded concurrency at the class permit while waiting for a return.
+    Wait,
+}
 
 #[derive(Debug)]
 pub struct ClassBudgets {
@@ -97,6 +108,13 @@ impl ClassBudgets {
         Ok(())
     }
 
+    async fn close(&self) {
+        let budgets = self.budgets.read().await;
+        for semaphore in budgets.values() {
+            semaphore.close();
+        }
+    }
+
     pub fn total_budget(&self) -> usize {
         self.total_budget.load(Ordering::Acquire)
     }
@@ -139,6 +157,10 @@ pub struct DsqlConnectionDirector {
     class_budgets: Arc<ClassBudgets>,
     /// Number of permits currently holding a physical connection.
     in_flight: Arc<AtomicUsize>,
+    in_flight_changed: Arc<Notify>,
+    accepting: AtomicBool,
+    admission_lock: AsyncMutex<()>,
+    checkout_policy: CheckoutPolicy,
     /// Tracks long-lived checkouts without using stack traces or raw call-site
     /// strings as labels. The call-site dimension is derived from `DbClass`.
     leak_tracker: Arc<CheckoutLeakTracker>,
@@ -150,9 +172,19 @@ pub struct DsqlConnectionDirector {
 impl DsqlConnectionDirector {
     /// Start the background connection reservoir and class-budget controller.
     pub fn start(config: DsqlPoolConfig, reservoir: Reservoir) -> Result<Self> {
+        Self::start_with_policy(&config.reservoir, reservoir, CheckoutPolicy::Immediate)
+    }
+
+    /// Start a director with an explicit empty-reservoir policy.
+    pub fn start_with_policy(
+        config: &ReservoirConfig,
+        reservoir: Reservoir,
+        checkout_policy: CheckoutPolicy,
+    ) -> Result<Self> {
         let reservoir = Arc::new(reservoir);
-        let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(&config.reservoir))?);
+        let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(config))?);
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let in_flight_changed = Arc::new(Notify::new());
         let leak_tracker = Arc::new(CheckoutLeakTracker::default());
         let reporter_handle = spawn_periodic_reporter(
             Arc::clone(&class_budgets),
@@ -164,6 +196,10 @@ impl DsqlConnectionDirector {
             reservoir,
             class_budgets,
             in_flight,
+            in_flight_changed,
+            accepting: AtomicBool::new(true),
+            admission_lock: AsyncMutex::new(()),
+            checkout_policy,
             leak_tracker,
             reporter_handle,
             leak_detector_handle,
@@ -178,9 +214,51 @@ impl DsqlConnectionDirector {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.shutdown_with_deadline(Instant::now() + SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    /// Close admission and drain all physical resources within a monotonic deadline.
+    pub async fn shutdown_with_deadline(&self, deadline: Instant) -> Result<()> {
+        {
+            let _guard = self.admission_lock.lock().await;
+            self.accepting.store(false, Ordering::Release);
+        }
+        self.class_budgets.close().await;
         self.reporter_handle.abort();
         self.leak_detector_handle.abort();
-        self.reservoir.shutdown().await
+        self.reservoir.begin_shutdown();
+
+        while self.in_flight.load(Ordering::Acquire) != 0 {
+            let notified = self.in_flight_changed.notified();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline
+                || tokio::time::timeout(deadline.saturating_duration_since(now), notified)
+                    .await
+                    .is_err()
+            {
+                self.reservoir.abort_return_processing();
+                bail!(
+                    "timed out draining {} checked-out DSQL connections",
+                    self.in_flight.load(Ordering::Acquire)
+                );
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            self.reservoir.abort_return_processing();
+            bail!("timed out shutting down DSQL connection resources");
+        }
+        tokio::time::timeout(
+            deadline.saturating_duration_since(now),
+            self.reservoir.finish_shutdown(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out shutting down DSQL connection resources"))?
     }
 }
 
@@ -189,12 +267,30 @@ impl ConnectionDirector for DsqlConnectionDirector {
     type Permit = DsqlPermit;
 
     async fn acquire(&self, class: DbClass) -> Result<DsqlPermit> {
+        if !self.accepting.load(Ordering::Acquire) {
+            bail!("DSQL connection director is closed");
+        }
         let started = Instant::now();
         let class_guard = self.class_budgets.acquire(class).await?;
-        let entry = self.reservoir.checkout()?;
+        let entry = match self.checkout_policy {
+            CheckoutPolicy::Immediate => self.reservoir.checkout()?,
+            CheckoutPolicy::Wait => self.reservoir.checkout_wait().await?,
+        };
+        let admission_guard = self.admission_lock.lock().await;
+        if !self.accepting.load(Ordering::Acquire) {
+            self.reservoir.coordinator().release_slot();
+            drop(entry);
+            bail!("DSQL connection director is closed");
+        }
+        let Some(return_sender) = self.reservoir.return_sender() else {
+            self.reservoir.coordinator().release_slot();
+            drop(entry);
+            bail!("DSQL connection director is closed");
+        };
         // From this point until `DsqlPermit::drop`, the connection is out of
         // the ready reservoir but still owns exactly one slot reservation.
         let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+        drop(admission_guard);
         metrics::record_dsql_pool_checkout_duration(db_class_label(class), started.elapsed());
         metrics::set_dsql_reservoir_in_flight(in_flight);
         metrics::set_dsql_reservoir_utilization_ratio(in_flight, self.reservoir.ready_count());
@@ -203,9 +299,10 @@ impl ConnectionDirector for DsqlConnectionDirector {
             class,
             entry,
             class_guard,
-            self.reservoir.return_sender(),
-            self.reservoir.slot_manager(),
+            return_sender,
+            self.reservoir.coordinator(),
             Arc::clone(&self.in_flight),
+            Arc::clone(&self.in_flight_changed),
             Arc::clone(&self.leak_tracker),
             leak_checkout,
         ))
@@ -327,9 +424,10 @@ pub struct DsqlPermit {
     /// Synchronous return path into the reservoir return processor.
     reservoir_return: tokio::sync::mpsc::UnboundedSender<ReturnedConnection>,
     /// Slot accounting owner for discard paths that bypass the return processor.
-    slot_manager: Arc<super::SlotBlockManager>,
+    coordinator: Arc<dyn ConnectionCoordinator>,
     /// Shared in-flight counter owned by the director.
     director_in_flight: Arc<AtomicUsize>,
+    director_in_flight_changed: Arc<Notify>,
     leak_tracker: Arc<CheckoutLeakTracker>,
     leak_checkout: CheckoutLeak,
     /// Caller-set flag that causes return processing to discard the connection.
@@ -342,8 +440,9 @@ impl DsqlPermit {
         entry: ReservoirEntry,
         class_guard: OwnedSemaphorePermit,
         reservoir_return: tokio::sync::mpsc::UnboundedSender<ReturnedConnection>,
-        slot_manager: Arc<super::SlotBlockManager>,
+        coordinator: Arc<dyn ConnectionCoordinator>,
         director_in_flight: Arc<AtomicUsize>,
+        director_in_flight_changed: Arc<Notify>,
         leak_tracker: Arc<CheckoutLeakTracker>,
         leak_checkout: CheckoutLeak,
     ) -> Self {
@@ -354,8 +453,9 @@ impl DsqlPermit {
             max_lifetime: entry.max_lifetime,
             _class_guard: class_guard,
             reservoir_return,
-            slot_manager,
+            coordinator,
             director_in_flight,
+            director_in_flight_changed,
             leak_tracker,
             leak_checkout,
             marked_bad: false,
@@ -381,6 +481,7 @@ impl Drop for DsqlPermit {
     fn drop(&mut self) {
         let previous = self.director_in_flight.fetch_sub(1, Ordering::AcqRel);
         metrics::set_dsql_reservoir_in_flight(previous.saturating_sub(1));
+        self.director_in_flight_changed.notify_waiters();
         self.leak_tracker.complete(self.leak_checkout);
         // Dropping the permit is the storage-layer "return connection" API.
         // Expired connections are intentionally discarded here because handing
@@ -400,13 +501,13 @@ impl Drop for DsqlPermit {
                     })
                     .is_err()
                 {
-                    self.slot_manager.release_slot();
+                    self.coordinator.release_slot();
                     metrics::record_dsql_pool_connection_retired("return_channel_closed");
                 }
             } else {
                 metrics::record_dsql_reservoir_connection_age("expired", self.created_at.elapsed());
                 metrics::record_dsql_pool_connection_retired("expired");
-                self.slot_manager.release_slot();
+                self.coordinator.release_slot();
             }
         }
     }
@@ -589,6 +690,9 @@ mod tests {
         let class_guard = budgets.acquire(DbClass::Commit).await.unwrap();
         let (return_tx, _return_rx) = tokio::sync::mpsc::unbounded_channel();
         let in_flight = Arc::new(AtomicUsize::new(1));
+        let coordinator: Arc<dyn ConnectionCoordinator> =
+            Arc::new(crate::dsql::ProcessLocalConnectionCoordinator::new(1, 1.0, 1).unwrap());
+        coordinator.acquire_slot().await.unwrap();
         let leak_tracker = Arc::new(CheckoutLeakTracker::default());
         let leak_checkout = leak_tracker.track(DbClass::Commit, Instant::now());
         let mut permit = DsqlPermit {
@@ -598,8 +702,9 @@ mod tests {
             max_lifetime: std::time::Duration::from_secs(60),
             _class_guard: class_guard,
             reservoir_return: return_tx,
-            slot_manager: crate::dsql::SlotBlockManager::local_for_tests(1),
+            coordinator: Arc::clone(&coordinator),
             director_in_flight: Arc::clone(&in_flight),
+            director_in_flight_changed: Arc::new(Notify::new()),
             leak_tracker: Arc::clone(&leak_tracker),
             leak_checkout,
             marked_bad: false,
@@ -610,6 +715,8 @@ mod tests {
         assert!(permit.marked_bad);
         drop(permit);
         assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(coordinator.used_slots(), 1);
+        coordinator.release_slot();
         assert_eq!(leak_tracker.active_count(), 0);
     }
 

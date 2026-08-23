@@ -19,15 +19,15 @@ use crate::identity::{CanonicalClusterIdentity, IdentityError};
 
 const FORMAT_VERSION: u32 = 1;
 
-/// The explicit AWS `CreateCluster` idempotency token.
+/// An explicit AWS DSQL control-plane idempotency token.
 ///
-/// Its value is serialized only into the durable descriptor. Formatting always
-/// redacts it so diagnostics cannot leak the token.
+/// The managed lifecycle serializes the creation token into the durable descriptor.
+/// Formatting always redacts token values so diagnostics cannot leak them.
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(transparent)]
-pub struct CreationClientToken(String);
+pub struct DsqlClientToken(String);
 
-impl CreationClientToken {
+impl DsqlClientToken {
     /// Constructs a token satisfying the AWS 1–128 printable-ASCII contract.
     pub fn new(value: impl Into<String>) -> Result<Self, DescriptorError> {
         let value = value.into();
@@ -46,13 +46,13 @@ impl CreationClientToken {
     }
 }
 
-impl fmt::Debug for CreationClientToken {
+impl fmt::Debug for DsqlClientToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("CreationClientToken([REDACTED])")
+        formatter.write_str("DsqlClientToken([REDACTED])")
     }
 }
 
-impl fmt::Display for CreationClientToken {
+impl fmt::Display for DsqlClientToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("[REDACTED]")
     }
@@ -69,14 +69,14 @@ pub struct ClusterDescriptorV1 {
     /// Region in which the dedicated cluster is managed.
     pub region: String,
     /// Explicit token persisted before the first create request.
-    pub creation_client_token: CreationClientToken,
+    pub creation_client_token: DsqlClientToken,
     /// Durable lifecycle phase.
     pub state: ClusterDescriptorState,
 }
 
 impl ClusterDescriptorV1 {
     /// Constructs an uncommitted pending descriptor.
-    pub fn pending(region: impl Into<String>, token: CreationClientToken) -> Self {
+    pub fn pending(region: impl Into<String>, token: DsqlClientToken) -> Self {
         Self {
             format_version: FORMAT_VERSION,
             revision: 0,
@@ -91,7 +91,7 @@ impl ClusterDescriptorV1 {
         if self.format_version != FORMAT_VERSION {
             return Err(DescriptorError::UnsupportedFormat(self.format_version));
         }
-        CreationClientToken::new(self.creation_client_token.0.clone())?;
+        DsqlClientToken::new(self.creation_client_token.0.clone())?;
         if self.region.is_empty() {
             return Err(DescriptorError::InvalidIdentity(
                 IdentityError::InvalidRegion,
@@ -404,14 +404,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ClusterDescriptorState, ClusterDescriptorStore, ClusterDescriptorV1, CreationClientToken,
-        DescriptorError, LocalClusterDescriptorStore, persist_atomically_with,
+        ClusterDescriptorState, ClusterDescriptorStore, ClusterDescriptorV1, DescriptorError,
+        DsqlClientToken, LocalClusterDescriptorStore, persist_atomically_with,
     };
 
     fn pending(region: &str, token: &str) -> ClusterDescriptorV1 {
         ClusterDescriptorV1::pending(
             region,
-            CreationClientToken::new(token).expect("fixture token is valid"),
+            DsqlClientToken::new(token).expect("fixture token is valid"),
         )
     }
 

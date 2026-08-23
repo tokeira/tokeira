@@ -15,8 +15,8 @@ use crate::{
         ClusterObservation, ClusterStatus, CreateClusterRequest, DsqlControlError, DsqlControlPlane,
     },
     descriptor::{
-        ClusterDescriptorState, ClusterDescriptorStore, ClusterDescriptorV1, CreationClientToken,
-        DescriptorError,
+        ClusterDescriptorState, ClusterDescriptorStore, ClusterDescriptorV1, DescriptorError,
+        DsqlClientToken,
     },
     identity::{CanonicalClusterIdentity, IdentityError},
 };
@@ -49,7 +49,7 @@ pub trait LifecycleEnvironment: Send + Sync + fmt::Debug {
     fn now(&self) -> Instant;
 
     /// Generates one valid candidate client token.
-    fn new_client_token(&self) -> Result<CreationClientToken, DescriptorError>;
+    fn new_client_token(&self) -> Result<DsqlClientToken, DescriptorError>;
 
     /// Waits or deterministically advances fake time by `duration`.
     async fn sleep(&self, duration: Duration);
@@ -65,8 +65,8 @@ impl LifecycleEnvironment for SystemLifecycleEnvironment {
         Instant::now()
     }
 
-    fn new_client_token(&self) -> Result<CreationClientToken, DescriptorError> {
-        CreationClientToken::new(uuid::Uuid::new_v4().to_string())
+    fn new_client_token(&self) -> Result<DsqlClientToken, DescriptorError> {
+        DsqlClientToken::new(uuid::Uuid::new_v4().to_string())
     }
 
     async fn sleep(&self, duration: Duration) {
@@ -593,8 +593,8 @@ mod tests {
             DsqlControlError, DsqlControlPlane, SetDeletionProtectionRequest,
         },
         descriptor::{
-            ClusterDescriptorState, ClusterDescriptorStore, ClusterDescriptorV1,
-            CreationClientToken, DescriptorError, VersionedClusterDescriptor,
+            ClusterDescriptorState, ClusterDescriptorStore, ClusterDescriptorV1, DescriptorError,
+            DsqlClientToken, VersionedClusterDescriptor,
         },
         identity::CanonicalClusterIdentity,
     };
@@ -641,8 +641,8 @@ mod tests {
                     .expect("fake clock lock is not poisoned")
         }
 
-        fn new_client_token(&self) -> Result<CreationClientToken, DescriptorError> {
-            CreationClientToken::new("durable-test-token")
+        fn new_client_token(&self) -> Result<DsqlClientToken, DescriptorError> {
+            DsqlClientToken::new("durable-test-token")
         }
 
         async fn sleep(&self, duration: Duration) {
@@ -765,7 +765,7 @@ mod tests {
             format_version: 1,
             revision: 1,
             region: "eu-west-2".to_owned(),
-            creation_client_token: CreationClientToken::new(token).expect("fixture token is valid"),
+            creation_client_token: DsqlClientToken::new(token).expect("fixture token is valid"),
             state: ClusterDescriptorState::Ready {
                 cluster_id: ID.to_owned(),
                 cluster_arn: ARN.to_owned(),
@@ -921,7 +921,8 @@ mod tests {
                 if crash_point == 1 || crash_point == 2 {
                     let pending = ClusterDescriptorV1::pending(
                         "eu-west-2",
-                        CreationClientToken::new("durable-test-token").expect("fixture token is valid"),
+                        DsqlClientToken::new("durable-test-token")
+                            .expect("fixture token is valid"),
                     );
                     store.compare_and_swap(None, &pending).await.expect("pending descriptor persists");
                 }

@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, fmt, time::Duration};
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::descriptor::CreationClientToken;
+use crate::descriptor::DsqlClientToken;
 
 /// Closed create request for single-Region managed embedded clusters.
 ///
@@ -16,7 +16,7 @@ pub struct CreateClusterRequest {
     /// Region in which the adapter must issue the request.
     pub region: String,
     /// Explicit descriptor-backed idempotency token.
-    pub client_token: CreationClientToken,
+    pub client_token: DsqlClientToken,
     /// Deletion protection; managed startup requires this to be true.
     pub deletion_protection_enabled: bool,
     /// Optional metadata. Tags are never used for identity or recovery.
@@ -85,7 +85,7 @@ pub struct SetDeletionProtectionRequest {
     /// Desired protection state.
     pub enabled: bool,
     /// Operation-specific idempotency token.
-    pub client_token: CreationClientToken,
+    pub client_token: DsqlClientToken,
 }
 
 /// Administrative request to delete one canonical cluster.
@@ -96,7 +96,7 @@ pub struct DeleteClusterRequest {
     /// Canonical cluster ID; never an endpoint or tag selector.
     pub cluster_id: String,
     /// Operation-specific idempotency token.
-    pub client_token: CreationClientToken,
+    pub client_token: DsqlClientToken,
 }
 
 /// Contract-shaped result of an AWS create/get/update operation.

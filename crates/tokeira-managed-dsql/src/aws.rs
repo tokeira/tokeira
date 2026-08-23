@@ -366,7 +366,7 @@ mod tests {
     use super::{build_create_input, build_delete_input, build_get_input, build_update_input};
     use crate::{
         control::{CreateClusterRequest, DeleteClusterRequest, SetDeletionProtectionRequest},
-        descriptor::CreationClientToken,
+        descriptor::DsqlClientToken,
     };
 
     proptest! {
@@ -383,7 +383,7 @@ mod tests {
             tags.insert("purpose".to_owned(), tag_value.clone());
             let request = CreateClusterRequest {
                 region: "eu-west-2".to_owned(),
-                client_token: CreationClientToken::new(token.clone()).expect("generated token is valid"),
+                client_token: DsqlClientToken::new(token.clone()).expect("generated token is valid"),
                 deletion_protection_enabled: true,
                 tags,
             };

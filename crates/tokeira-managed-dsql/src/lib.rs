@@ -16,8 +16,8 @@ pub use control::{
     DsqlControlError, DsqlControlPlane, RetryableErrorKind, SetDeletionProtectionRequest,
 };
 pub use descriptor::{
-    ClusterDescriptorState, ClusterDescriptorStore, ClusterDescriptorV1, CreationClientToken,
-    DescriptorError, LocalClusterDescriptorStore, VersionedClusterDescriptor,
+    ClusterDescriptorState, ClusterDescriptorStore, ClusterDescriptorV1, DescriptorError,
+    DsqlClientToken, LocalClusterDescriptorStore, VersionedClusterDescriptor,
 };
 pub use identity::{CanonicalClusterIdentity, IdentityError};
 pub use lifecycle::{

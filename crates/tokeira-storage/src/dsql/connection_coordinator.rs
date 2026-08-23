@@ -1,10 +1,9 @@
-//! Physical DSQL connection-creation admission.
+//! Process-local DSQL connection-creation admission for embedded engines.
 //!
-//! The reservoir uses one interface for both distributed deployments and a
-//! single embedded engine process. Distributed mode delegates to the existing
-//! DynamoDB token bucket and slot-block manager unchanged. Embedded mode keeps
-//! the same acquisition order with a process-local token bucket and atomic slot
-//! budget, without constructing any DynamoDB client or table configuration.
+//! This module is deliberately absent from the distributed `tokeirad` path.
+//! Embedded mode uses a monotonic token bucket and atomic slot budget without
+//! constructing DynamoDB resources or changing the established distributed
+//! reservoir, rate limiter, or slot-block manager.
 
 use std::{
     fmt,
@@ -19,7 +18,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use tokio::sync::Notify;
 
-use super::{DistributedTokenBucket, MonotonicClock, SlotBlockManager, SystemMonotonicClock};
+use super::{MonotonicClock, SystemMonotonicClock};
 
 /// Admission boundary used immediately before opening a physical connection.
 ///
@@ -27,8 +26,8 @@ use super::{DistributedTokenBucket, MonotonicClock, SlotBlockManager, SystemMono
 /// release exactly one slot on every path that discards or fails to create the
 /// corresponding connection.
 #[async_trait]
-pub trait ConnectionCoordinator: fmt::Debug + Send + Sync {
-    /// Validate external coordination resources before reservoir warmup.
+pub(crate) trait EmbeddedConnectionCoordinator: fmt::Debug + Send + Sync {
+    /// Validate process-local admission state before reservoir warmup.
     async fn validate(&self) -> Result<()>;
 
     /// Reserve capacity for one physical connection.
@@ -43,51 +42,8 @@ pub trait ConnectionCoordinator: fmt::Debug + Send + Sync {
     /// Number of physical slots currently charged to this coordinator.
     fn used_slots(&self) -> usize;
 
-    /// Stop new admissions and relinquish external coordination resources.
+    /// Stop new admissions and verify that every local slot was released.
     async fn shutdown(&self) -> Result<()>;
-}
-
-/// Adapter preserving the existing DynamoDB coordination behavior.
-#[derive(Debug)]
-pub struct DistributedConnectionCoordinator {
-    bucket: Arc<DistributedTokenBucket>,
-    slots: Arc<SlotBlockManager>,
-}
-
-impl DistributedConnectionCoordinator {
-    /// Wrap the existing distributed rate and slot primitives.
-    pub fn new(bucket: Arc<DistributedTokenBucket>, slots: Arc<SlotBlockManager>) -> Self {
-        Self { bucket, slots }
-    }
-}
-
-#[async_trait]
-impl ConnectionCoordinator for DistributedConnectionCoordinator {
-    async fn validate(&self) -> Result<()> {
-        // Production construction validates the bucket before starting the
-        // slot manager, preserving the established DynamoDB failure order.
-        Ok(())
-    }
-
-    async fn acquire_slot(&self) -> Result<()> {
-        self.slots.acquire_slot().await.map(|_| ())
-    }
-
-    async fn acquire_creation_token(&self) -> Result<()> {
-        self.bucket.wait().await
-    }
-
-    fn release_slot(&self) {
-        self.slots.release_slot();
-    }
-
-    fn used_slots(&self) -> usize {
-        self.slots.used_slots()
-    }
-
-    async fn shutdown(&self) -> Result<()> {
-        self.slots.release_all().await
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,7 +73,7 @@ impl TokenBucketState {
 }
 
 /// DynamoDB-free coordinator for one exclusive embedded engine process.
-pub struct ProcessLocalConnectionCoordinator {
+pub(crate) struct ProcessLocalConnectionCoordinator {
     max_slots: usize,
     used_slots: AtomicUsize,
     rate_per_second: f64,
@@ -144,7 +100,7 @@ impl fmt::Debug for ProcessLocalConnectionCoordinator {
 
 impl ProcessLocalConnectionCoordinator {
     /// Construct production process-local admission using the system monotonic clock.
-    pub fn new(max_slots: usize, rate_per_second: f64, burst_capacity: u64) -> Result<Self> {
+    pub(crate) fn new(max_slots: usize, rate_per_second: f64, burst_capacity: u64) -> Result<Self> {
         Self::with_clock(
             max_slots,
             rate_per_second,
@@ -154,7 +110,7 @@ impl ProcessLocalConnectionCoordinator {
     }
 
     /// Construct process-local admission with an injected monotonic clock.
-    pub fn with_clock(
+    pub(crate) fn with_clock(
         max_slots: usize,
         rate_per_second: f64,
         burst_capacity: u64,
@@ -219,7 +175,7 @@ impl ProcessLocalConnectionCoordinator {
 }
 
 #[async_trait]
-impl ConnectionCoordinator for ProcessLocalConnectionCoordinator {
+impl EmbeddedConnectionCoordinator for ProcessLocalConnectionCoordinator {
     async fn validate(&self) -> Result<()> {
         Ok(())
     }

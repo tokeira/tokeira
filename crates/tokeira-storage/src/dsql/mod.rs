@@ -3,12 +3,12 @@
 //! This module contains the schema/migration and connection-management
 //! primitives used by the production DSQL backend. The public entry point is
 //! [`DsqlStore`], which wires a connection director, migration runner, and
-//! DSQL `RunRepository` over the same raw-connection reservoir foundation.
+//! DSQL `RunRepository` over mode-specific connection foundations.
 //!
-//! Distributed startup validates DynamoDB rate and slot coordination before
-//! warming connections. Exclusive embedded startup instead injects a bounded
-//! process-local coordinator and never constructs DynamoDB resources; both
-//! modes then share the same reservoir, director, and repositories.
+//! Distributed startup retains its established DynamoDB-backed reservoir,
+//! token bucket, and slot-block manager. Exclusive embedded startup uses a
+//! separate bounded process-local reservoir and never constructs DynamoDB
+//! resources; the repository implementations remain shared.
 
 use std::{sync::Arc, time::Instant};
 
@@ -17,11 +17,12 @@ pub mod chasm_node;
 pub mod codec;
 pub mod config;
 pub mod connection;
-pub mod connection_coordinator;
+pub(crate) mod connection_coordinator;
 pub mod connection_factory;
 pub mod control_lease;
 pub(crate) mod convert;
 pub mod distributed_bucket;
+pub(crate) mod embedded_reservoir;
 pub mod migration;
 pub mod projection_log;
 pub mod reservoir;
@@ -38,10 +39,10 @@ pub use aws_http::offline_ddb_client;
 pub use chasm_node::*;
 pub use config::*;
 pub use connection::*;
-pub use connection_coordinator::*;
 pub use connection_factory::*;
 pub use control_lease::*;
 pub use distributed_bucket::*;
+pub use embedded_reservoir::WarmupDeadline;
 pub use migration::*;
 pub use projection_log::*;
 pub use reservoir::*;
@@ -155,28 +156,25 @@ impl DsqlStore {
             auth.endpoint.clone(),
         )
         .await?;
-        let coordinator: Arc<dyn connection_coordinator::ConnectionCoordinator> = Arc::new(
-            connection_coordinator::DistributedConnectionCoordinator::new(bucket, slot_manager),
-        );
-        let reservoir =
-            reservoir::Reservoir::start(config.reservoir.clone(), factory, coordinator).await?;
-        Self::from_reservoir(
-            reservoir,
-            StoreFoundationConfig::from(config),
-            connection::CheckoutPolicy::Immediate,
+        let reservoir = reservoir::Reservoir::start(
+            config.reservoir.clone(),
+            factory,
+            bucket,
+            Arc::clone(&slot_manager),
         )
-        .await
+        .await?;
+        Self::from_reservoir(reservoir, config).await
     }
 
     /// Construct a DynamoDB-free DSQL foundation for one embedded engine process.
     ///
     /// The caller owns the end-to-end startup deadline. This path constructs
-    /// only IAM authentication, the shared raw-connection reservoir, five
+    /// only IAM authentication, the embedded raw-connection reservoir, five
     /// operation-class budgets, and process-local connection admission.
     pub async fn connect_embedded(
         auth: config::DsqlAuthConfig,
         config: config::EmbeddedDsqlPoolConfig,
-        warmup_deadline: reservoir::WarmupDeadline,
+        warmup_deadline: embedded_reservoir::WarmupDeadline,
     ) -> anyhow::Result<Self> {
         config.validate()?;
         auth.validate()?;
@@ -188,26 +186,21 @@ impl DsqlStore {
             &region,
         )?);
         let reservoir_config = config.reservoir_config();
-        let coordinator: Arc<dyn connection_coordinator::ConnectionCoordinator> = Arc::new(
+        let coordinator: Arc<dyn connection_coordinator::EmbeddedConnectionCoordinator> = Arc::new(
             connection_coordinator::ProcessLocalConnectionCoordinator::new(
                 config.max_connections,
                 config.connection_rate_per_second,
                 config.connection_burst,
             )?,
         );
-        let reservoir = reservoir::Reservoir::start_with_deadline(
+        let reservoir = embedded_reservoir::EmbeddedReservoir::start_with_deadline(
             reservoir_config,
             factory,
             coordinator,
             warmup_deadline.instant(),
         )
         .await?;
-        Self::from_reservoir(
-            reservoir,
-            StoreFoundationConfig::from(config),
-            connection::CheckoutPolicy::Wait,
-        )
-        .await
+        Self::from_embedded_reservoir(reservoir, StoreFoundationConfig::from(config)).await
     }
 
     /// Construct the foundational DSQL components from a database URL for tests.
@@ -222,35 +215,45 @@ impl DsqlStore {
     ) -> anyhow::Result<Self> {
         config.validate()?;
         let factory = Arc::new(connection_factory::DatabaseUrlConnectionFactory::new(url));
-        let coordinator: Arc<dyn connection_coordinator::ConnectionCoordinator> = Arc::new(
-            connection_coordinator::ProcessLocalConnectionCoordinator::new(
-                config.reservoir.target_ready,
-                config.connection_rate_per_second,
-                config.burst_capacity,
-            )?,
-        );
-        let reservoir =
-            reservoir::Reservoir::start(config.reservoir.clone(), factory, coordinator).await?;
-        Self::from_reservoir(
-            reservoir,
-            StoreFoundationConfig::from(config),
-            connection::CheckoutPolicy::Immediate,
+        let bucket = Arc::new(distributed_bucket::DistributedTokenBucket::local_for_tests(
+            config.connection_rate_per_second,
+            config.burst_capacity,
+        ));
+        let slot_manager =
+            slot_block_manager::SlotBlockManager::local_for_tests(config.reservoir.target_ready);
+        let reservoir = reservoir::Reservoir::start(
+            config.reservoir.clone(),
+            factory,
+            bucket,
+            Arc::clone(&slot_manager),
         )
-        .await
+        .await?;
+        Self::from_reservoir(reservoir, config).await
     }
 
     async fn from_reservoir(
         reservoir: reservoir::Reservoir,
-        config: StoreFoundationConfig,
-        checkout_policy: connection::CheckoutPolicy,
+        config: config::DsqlPoolConfig,
     ) -> anyhow::Result<Self> {
         // One `Arc<DsqlConnectionDirector>` is shared by all DSQL surfaces so
         // class budgets and reservoir state remain globally coordinated.
-        let director = connection::DsqlConnectionDirector::start_with_policy(
-            &config.reservoir,
-            reservoir,
-            checkout_policy,
-        )?;
+        let director = connection::DsqlConnectionDirector::start(config.clone(), reservoir)?;
+        Self::from_director(director, StoreFoundationConfig::from(config)).await
+    }
+
+    async fn from_embedded_reservoir(
+        reservoir: embedded_reservoir::EmbeddedReservoir,
+        config: StoreFoundationConfig,
+    ) -> anyhow::Result<Self> {
+        let director =
+            connection::DsqlConnectionDirector::start_embedded(&config.reservoir, reservoir)?;
+        Self::from_director(director, config).await
+    }
+
+    async fn from_director(
+        director: connection::DsqlConnectionDirector,
+        config: StoreFoundationConfig,
+    ) -> anyhow::Result<Self> {
         let director = Arc::new(director);
         let migration_runner = migration::MigrationRunner::new(config.migration);
         let run_repository = run_repository::DsqlRunRepository::new(

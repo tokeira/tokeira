@@ -208,11 +208,13 @@
       jobs, invalid indexes, and actionable migration-required errors.
     - _Requirements: 4.11–4.17, 5.4–5.13, 13.7–13.9_
 
-- [x] 9. Add DynamoDB-free process-local connection coordination
-  - [x] 9.1 Introduce the storage-local `ConnectionCoordinator` interface
-    - Adapt the current distributed token bucket and slot-block manager behind it without
-      changing their DynamoDB validation, ordering, rate, or slot behavior.
-    - Preserve the director invariant: class/in-flight permit, then physical slot, then
+- [x] 9. Add an isolated DynamoDB-free embedded connection foundation
+  - [x] 9.1 Preserve the distributed foundation and add embedded-only coordination
+    - Keep `Reservoir`, `DistributedTokenBucket`, and `SlotBlockManager` on their
+      pre-feature direct construction path without changing DynamoDB validation,
+      ordering, rate, slot, refill, scheduling, or cancellation behavior.
+    - Add a private embedded-only coordinator and preserve its director invariant:
+      class/in-flight permit, then process-local physical slot, then process-local
       creation-rate token, then physical connection.
     - _Requirements: 6.1–6.4, 6.13–6.16, 14.2, 14.7_
   - [x] 9.2 Implement the process-local token bucket and atomic slot budget
@@ -221,11 +223,12 @@
       retirement, and bad-return path.
     - _Requirements: 6.1–6.2, 6.5–6.14, 13.10–13.11_
   - [x] 9.3 Add `DsqlStore::connect_embedded` and bounded shutdown
-    - Construct no DynamoDB configuration/client/table names; use the shared reservoir,
-      director, five `DbClass` budgets, leak diagnostics, authentication, and repository
-      path with `max_idle_conns == max_conns`.
-    - Make warmup and ready-channel waiting deadline/cancellation aware; close admission,
-      refillers, checked-out permits, coordinator, and physical pool during shutdown.
+    - Construct no DynamoDB configuration/client/table names; use a separate embedded
+      reservoir with the existing director, five `DbClass` budgets, leak diagnostics,
+      authentication, and repository path with `max_idle_conns == max_conns`.
+    - Make only the embedded reservoir's warmup and ready-channel waiting deadline/
+      cancellation aware; close its admission, refillers, checked-out permits,
+      coordinator, and physical pool during shutdown.
     - _Requirements: 1.5, 1.9, 6.1–6.18, 8.2, 13.10–13.11_
   - [x] 9.4 Property test: Property 9 — process-local creation limiting obeys rate and burst
     - Compare generated monotonic arrival/time sequences with a token-bucket reference
@@ -233,14 +236,15 @@
     - Tag: `// Feature: managed-embedded-dsql, Property 9: process-local creation limiting obeys rate and burst`
     - _Requirements: 6.1, 6.7–6.12, 13.10–13.11_
   - [x] 9.5 Property test: Property 10 — connection slot and class accounting is conserved
-    - Generate creation/check-out/return/expiry/leak/shutdown sequences for at least 100
-      cases, checking the physical-slot and class-budget conservation model.
+    - Generate embedded creation/check-out/return/expiry/leak/shutdown sequences for at
+      least 100 cases, checking the physical-slot and class-budget conservation model.
     - Tag: `// Feature: managed-embedded-dsql, Property 10: connection slot and class accounting is conserved`
     - _Requirements: 6.2–6.6, 6.13–6.18, 13.10–13.11_
   - [x] 9.6 Add focused embedded-reservoir tests
     - Prove no DynamoDB object is constructed, all connection classes remain bounded,
       warmup uses the remaining startup deadline, bad connections release slots, leak
-      diagnostics fire, and shutdown reaches zero resources without sleeps.
+      diagnostics fire, and shutdown reaches zero resources without sleeps; retain the
+      distributed reservoir, bucket, and slot-manager tests on their existing path.
     - _Requirements: 6.1–6.18, 13.10–13.11_
 
 - [x] 10. Checkpoint: storage foundations are green
@@ -256,8 +260,9 @@
       bounded deadline across lifecycle, warmup, schema, ownership, and stack phases.
     - _Requirements: 1.1–1.6, 5.1–5.3, 8.1–8.14_
   - [ ] 11.2 Factor the current DSQL path into reusable transport-neutral construction
-    - Make distributed mode pass the existing distributed coordinator and embedded mode
-      pass the process-local coordinator into the same repositories/runtime stack.
+    - Preserve distributed mode's concrete token-bucket, slot-manager, and reservoir
+      construction; make embedded mode pass its isolated process-local pool into the
+      same repositories/runtime stack.
     - Ensure embedded DSQL returns `ConstructedStack::Embedded` and binds no gRPC, Nexus,
       callback, metrics, control, or other Tokeira listener.
     - _Requirements: 1.5, 1.7–1.10, 6.3–6.4, 10.5, 14.7_
@@ -507,6 +512,10 @@ join before engine wiring.
 - The new `tokeira-managed-dsql` crate is the approved architectural addition. Reuse the
   already-locked AWS DSQL dependencies; any further new third-party dependency requires
   separate architectural approval.
+- A shared-reservoir refactor or hardening campaign is deferred until after the initial
+  public launch and is not part of this spec. It requires a separate consent-gated spec
+  covering DSQL service-quota behavior, DynamoDB conditional-write and hot-key capacity,
+  concurrency accounting, cold starts, cancellation, throttling, and scale-to-zero.
 - Select schema contract versions and cut the immutable baseline against the current
   contiguous migration head at implementation time so concurrent migration work is not
   overwritten. The baseline cut and the crate-local forward-only instruction change are

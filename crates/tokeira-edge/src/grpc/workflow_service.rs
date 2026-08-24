@@ -3907,6 +3907,14 @@ mod tests {
             unreachable!()
         }
 
+        async fn start_workflow_with_policy_and_callback_limit(
+            &self,
+            _req: tokeira_kernel::StartRequest,
+            _completion_callback_limit: usize,
+        ) -> Result<tokeira_runtime::StartWorkflowResult> {
+            unreachable!()
+        }
+
         async fn signal_with_start_workflow(
             &self,
             _req: tokeira_kernel::SignalWithStartRequest,
@@ -4083,6 +4091,14 @@ mod tests {
         async fn start_workflow_with_policy(
             &self,
             _req: tokeira_kernel::StartRequest,
+        ) -> Result<tokeira_runtime::StartWorkflowResult> {
+            unreachable!()
+        }
+
+        async fn start_workflow_with_policy_and_callback_limit(
+            &self,
+            _req: tokeira_kernel::StartRequest,
+            _completion_callback_limit: usize,
         ) -> Result<tokeira_runtime::StartWorkflowResult> {
             unreachable!()
         }
@@ -4265,6 +4281,14 @@ mod tests {
         async fn start_workflow_with_policy(
             &self,
             _req: tokeira_kernel::StartRequest,
+        ) -> Result<tokeira_runtime::StartWorkflowResult> {
+            unreachable!()
+        }
+
+        async fn start_workflow_with_policy_and_callback_limit(
+            &self,
+            _req: tokeira_kernel::StartRequest,
+            _completion_callback_limit: usize,
         ) -> Result<tokeira_runtime::StartWorkflowResult> {
             unreachable!()
         }

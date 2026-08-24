@@ -341,7 +341,7 @@ fn callback_to_edge(
 
 fn validate_completion_callbacks(
     callbacks: &[proto_common::Callback],
-) -> Result<(), ProtoConversionError> {
+) -> Result<usize, ProtoConversionError> {
     // Temporal performs callback admission at the frontend before history is
     // written (`service/frontend/workflow_handler.go:6299 @ v1.31.0`). Keeping
     // this in the edge preserves that validation order without making callback
@@ -370,7 +370,7 @@ fn validate_completion_callbacks(
             }
         }
     }
-    Ok(())
+    Ok(max_callbacks)
 }
 
 /// Builds the link set v1.31.0 validates on admission: the request's own links
@@ -1217,7 +1217,7 @@ pub fn start_request_to_edge(
 
     let cron_schedule = non_empty(req.cron_schedule);
     validate_client_cron_schedule(cron_schedule.as_deref())?;
-    validate_completion_callbacks(&req.completion_callbacks)?;
+    let completion_callback_limit = validate_completion_callbacks(&req.completion_callbacks)?;
     validate_links(&collect_admission_links(
         &req.links,
         &req.completion_callbacks,
@@ -1248,6 +1248,7 @@ pub fn start_request_to_edge(
             "StartWorkflowExecutionRequest.workflow_start_delay",
         )?,
         completion_callbacks: callbacks_to_edge(&req.completion_callbacks)?,
+        completion_callback_limit,
         user_metadata: user_metadata_to_edge(req.user_metadata.as_ref()),
         links: links_to_edge(&req.links)?,
         eager_worker_deployment_options: worker_deployment_version_from_options(

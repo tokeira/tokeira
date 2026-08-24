@@ -832,6 +832,7 @@ fn arb_update_execution_options_request(
                     request: request_context(&request_id, now),
                     now,
                     priority: FieldChange::Unchanged,
+                    completion_callback_limit: None,
                 }
             },
         )
@@ -4386,6 +4387,7 @@ fn workflow_priority_update(priority: Priority, now: OffsetDateTime) -> Command 
         request: request_context("priority-update", now),
         now,
         priority: FieldChange::Set(priority),
+        completion_callback_limit: None,
     })
 }
 
@@ -5905,6 +5907,46 @@ proptest! {
         prop_assert_eq!(transition.next_state.status, ExecutionStatus::Running);
     }
 
+    // Feature: on-conflict-callback-limit, Property 1: append-only callback
+    // attachments succeed exactly when the authoritative post-append total is
+    // within the runtime-resolved limit.
+    #[test]
+    fn property_on_conflict_callback_limit_is_atomic(
+        existing in 0usize..8,
+        attached in 1usize..8,
+        limit in 0usize..12,
+    ) {
+        let now = fixed_now();
+        let state = with_execution_options(make_open_state(now), existing);
+        let command = Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+            versioning_override: VersioningOverrideChange::Unchanged,
+            completion_callbacks: FieldChange::Unchanged,
+            attached_completion_callbacks: vec![completion_callback(); attached],
+            attached_links: Vec::new(),
+            attached_request_id: None,
+            request: request_context("callback-limit", now),
+            now,
+            priority: FieldChange::Unchanged,
+            completion_callback_limit: Some(limit),
+        });
+
+        let result = kernel().apply(LoadedRun::Existing(state), command);
+        if existing + attached > limit {
+            let reject = result.unwrap_err();
+            prop_assert_eq!(
+                reject,
+                Reject::CompletionCallbackLimitExceeded { limit, existing }
+            );
+        } else {
+            let transition = result.unwrap();
+            prop_assert_eq!(
+                transition.next_state.completion_callbacks.len(),
+                existing + attached
+            );
+            prop_assert_eq!(transition.history_events.len(), 1);
+        }
+    }
+
     // Feature: api-conformance-workflow-options, Property 4
     #[test]
     fn property_63_implied_pin_resolves_from_the_serialized_state(
@@ -5933,6 +5975,7 @@ proptest! {
             request: request_context("implied", now),
             now,
             priority: FieldChange::Unchanged,
+            completion_callback_limit: None,
         });
 
         if pinned_before_update {
@@ -5989,6 +6032,7 @@ proptest! {
                     request: request_context("noop", now),
                     now,
                     priority: FieldChange::Unchanged,
+                    completion_callback_limit: None,
                 }),
             )
             .unwrap();

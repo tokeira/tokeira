@@ -1122,6 +1122,13 @@ pub struct UpdateExecutionOptionsRequest {
     /// Workflow Priority patch selected by the request field mask.
     #[serde(default)]
     pub priority: FieldChange<Priority>,
+    /// Maximum total callback registrations after append-only attachments.
+    ///
+    /// The caller resolves this configuration before entering the pure kernel.
+    /// `None` preserves the generic execution-options update contract, which
+    /// does not attach callbacks through conflict resolution.
+    #[serde(default)]
+    pub completion_callback_limit: Option<usize>,
 }
 
 /// Request from the runtime indicating a worker has picked

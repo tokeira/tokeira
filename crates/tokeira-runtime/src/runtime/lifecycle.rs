@@ -196,7 +196,26 @@ where
     /// so a dedupe hit indicates an unexpected racing start for the same run key.
     pub async fn start_workflow_with_policy(
         &self,
+        request: StartRequest,
+    ) -> Result<StartWorkflowResult> {
+        self.start_workflow_with_policy_at_callback_limit(request, None)
+            .await
+    }
+
+    /// Start with an edge-resolved limit for callbacks attached to an existing run.
+    pub async fn start_workflow_with_policy_and_callback_limit(
+        &self,
+        request: StartRequest,
+        completion_callback_limit: usize,
+    ) -> Result<StartWorkflowResult> {
+        self.start_workflow_with_policy_at_callback_limit(request, Some(completion_callback_limit))
+            .await
+    }
+
+    async fn start_workflow_with_policy_at_callback_limit(
+        &self,
         mut request: StartRequest,
+        completion_callback_limit: Option<usize>,
     ) -> Result<StartWorkflowResult> {
         // v1.31.0 applies the effective first-WFT backoff before eager gating
         // and conflict handling, including the request-id retry path
@@ -252,8 +271,12 @@ where
                     }
                 }
                 ConflictResolution::UseExisting { run_key, run_id } => {
-                    self.apply_start_on_conflict_options(run_key, &request)
-                        .await?;
+                    self.apply_start_on_conflict_options(
+                        run_key,
+                        &request,
+                        completion_callback_limit,
+                    )
+                    .await?;
                     return Ok(StartWorkflowResult::UsedExisting { run_key, run_id });
                 }
                 ConflictResolution::TerminateAndStart { run_key } => {
@@ -377,6 +400,7 @@ where
         &self,
         run_key: RunKey,
         request: &StartRequest,
+        completion_callback_limit: Option<usize>,
     ) -> Result<()> {
         let Some(options) = &request.on_conflict_options else {
             return Ok(());
@@ -413,6 +437,7 @@ where
             attached_request_id,
             request: request.request.clone(),
             now: request.now,
+            completion_callback_limit,
         };
         match self
             .submit(run_key, Command::UpdateExecutionOptions(update))
@@ -1038,6 +1063,7 @@ where
             attached_request_id: None,
             request,
             now: OffsetDateTime::now_utc(),
+            completion_callback_limit: None,
         };
         self.submit(run_key, Command::UpdateExecutionOptions(update))
             .await

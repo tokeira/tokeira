@@ -56,9 +56,12 @@ use uuid::Uuid;
 
 proptest! {
     #[test]
-    fn property_start_request_roundtrip(edge in arb_start_request()) {
+    fn property_start_request_roundtrip_except_derived_callback_limit(
+        mut edge in arb_start_request()
+    ) {
         let proto = start_request_to_proto(&edge);
         let roundtrip = start_request_to_edge(proto).unwrap();
+        edge.completion_callback_limit = roundtrip.completion_callback_limit;
         prop_assert_eq!(roundtrip, edge);
     }
 
@@ -713,6 +716,7 @@ fn arb_start_request() -> impl Strategy<Value = StartWorkflowExecutionRequest> {
                 request_eager_execution,
                 workflow_start_delay: None,
                 completion_callbacks: Vec::new(),
+                completion_callback_limit: usize::MAX,
                 user_metadata: None,
                 links: Vec::new(),
                 eager_worker_deployment_options: None,

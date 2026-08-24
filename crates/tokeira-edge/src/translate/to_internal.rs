@@ -629,6 +629,7 @@ mod tests {
             request_eager_execution: false,
             workflow_start_delay: None,
             completion_callbacks: Vec::new(),
+            completion_callback_limit: usize::MAX,
             user_metadata: None,
             links: Vec::new(),
             eager_worker_deployment_options: None,

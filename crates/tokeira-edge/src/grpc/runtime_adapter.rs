@@ -114,6 +114,16 @@ where
         self.runtime.start_workflow_with_policy(req).await
     }
 
+    async fn start_workflow_with_policy_and_callback_limit(
+        &self,
+        req: StartRequest,
+        completion_callback_limit: usize,
+    ) -> Result<StartWorkflowResult> {
+        self.runtime
+            .start_workflow_with_policy_and_callback_limit(req, completion_callback_limit)
+            .await
+    }
+
     async fn signal_with_start_workflow(
         &self,
         req: tokeira_kernel::SignalWithStartRequest,

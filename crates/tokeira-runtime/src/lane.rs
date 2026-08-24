@@ -831,6 +831,7 @@ where
                                                     attached_request_id: None,
                                                     request,
                                                     now: time::OffsetDateTime::now_utc(),
+                                                    completion_callback_limit: None,
                                                 },
                                             );
                                         if let Err(error) = publisher

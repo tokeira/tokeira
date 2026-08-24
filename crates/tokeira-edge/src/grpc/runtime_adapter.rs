@@ -214,11 +214,12 @@ where
     async fn try_claim_workflow_task(
         &self,
         queue: tokeira_types::QueueKey,
+        normal_queue: Option<tokeira_types::QueueKey>,
         run_key: tokeira_types::RunKey,
         worker_identity: tokeira_types::WorkerIdentity,
     ) -> Result<Option<tokeira_runtime::StartedWorkflowTask>> {
         self.runtime
-            .try_claim_workflow_task(queue, run_key, worker_identity)
+            .try_claim_workflow_task(queue, normal_queue, run_key, worker_identity)
             .await
     }
 

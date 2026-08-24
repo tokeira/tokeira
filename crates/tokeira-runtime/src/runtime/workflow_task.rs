@@ -781,12 +781,18 @@ where
     pub async fn try_claim_workflow_task(
         &self,
         queue: QueueKey,
+        normal_queue: Option<QueueKey>,
         run_key: RunKey,
         worker_identity: WorkerIdentity,
     ) -> Result<Option<StartedWorkflowTask>> {
         let Some(offered) = self
             .broker
-            .try_claim_workflow_task_for_worker(&queue, run_key, Some(&worker_identity))
+            .try_claim_workflow_task_for_worker_with_normal(
+                &queue,
+                normal_queue.as_ref(),
+                run_key,
+                Some(&worker_identity),
+            )
             .await
         else {
             return Ok(None);

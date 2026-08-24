@@ -300,7 +300,7 @@ async fn build_grpc_with_namespaces(
 }
 
 #[tokio::test]
-async fn respond_workflow_task_completed_returns_new_started_wft_after_durable_schedule() {
+async fn respond_workflow_task_completed_returns_inline_sticky_wft_without_sticky_poller() {
     let store = Arc::new(InMemoryStore::default());
     let grpc = build_grpc(store).await;
 
@@ -339,7 +339,16 @@ async fn respond_workflow_task_completed_returns_new_started_wft_after_durable_s
     let completed = grpc
         .respond_workflow_task_completed(Request::new(RespondWorkflowTaskCompletedRequest {
             task_token: poll.task_token,
-            identity: "worker-a".to_string(),
+            sticky_attributes: Some(tokeira_proto::taskqueue::StickyExecutionAttributes {
+                worker_task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                    name: "sticky-return-new".to_owned(),
+                    ..Default::default()
+                }),
+                schedule_to_start_timeout: Some(prost_types::Duration {
+                    seconds: 5,
+                    nanos: 0,
+                }),
+            }),
             force_create_new_workflow_task: true,
             return_new_workflow_task: true,
             ..Default::default()

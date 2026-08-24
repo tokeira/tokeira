@@ -776,6 +776,23 @@ impl InMemoryBroker {
         run_key: RunKey,
         worker: Option<&WorkerIdentity>,
     ) -> Option<(DispatchableWorkflowTask, Instant)> {
+        self.try_claim_workflow_task_for_worker_with_normal(queue, None, run_key, worker)
+            .await
+    }
+
+    /// Take a specific run's task from its sticky queue or normal fallback.
+    ///
+    /// The publisher may move a sticky offer to `normal_queue` when no sticky
+    /// long poll is present. Inline WFT return still belongs to the completing
+    /// worker, so its direct claimant must see the same alias pair as an
+    /// ordinary sticky poll.
+    pub async fn try_claim_workflow_task_for_worker_with_normal(
+        &self,
+        queue: &QueueKey,
+        normal_queue: Option<&QueueKey>,
+        run_key: RunKey,
+        worker: Option<&WorkerIdentity>,
+    ) -> Option<(DispatchableWorkflowTask, Instant)> {
         let mut inner = self.inner.lock().await;
         if let Some(worker) = worker
             && inner.denied_workers.contains(&(
@@ -796,7 +813,7 @@ impl InMemoryBroker {
         });
 
         let matched = matched.or_else(|| {
-            let ready = inner.general_ready.get_mut(queue)?;
+            let ready = inner.general_ready.get_mut(normal_queue.unwrap_or(queue))?;
             ready.remove_where(|task| task.task.run_key == run_key)
         });
 
@@ -813,7 +830,7 @@ impl InMemoryBroker {
             inner
                 .enqueued
                 .remove(&(removed.task.run_key, removed.task.logical_seq));
-            Self::emit_queue_depths(&inner, queue);
+            Self::emit_queue_depths(&inner, &removed.task.queue);
             drop(inner);
             if let Some(metric_key) = metric_key {
                 self.policy.queue_metrics().record_dispatch(metric_key);

@@ -659,10 +659,11 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     async fn try_claim_workflow_task(
         &self,
         queue: tokeira_types::QueueKey,
+        normal_queue: Option<tokeira_types::QueueKey>,
         run_key: RunKey,
         worker_identity: tokeira_types::WorkerIdentity,
     ) -> Result<Option<StartedWorkflowTask>> {
-        let _ = (queue, run_key, worker_identity);
+        let _ = (queue, normal_queue, run_key, worker_identity);
         Ok(None)
     }
 
@@ -1440,6 +1441,17 @@ struct TaskQueueRateLimiter {
         Arc<tokio::sync::Mutex<HashMap<(tokeira_types::NamespaceId, TaskQueueName), Instant>>>,
 }
 
+fn worker_rate_limit_when_api_unset(
+    worker_rate_limit: Option<f64>,
+    config: Option<&TaskQueueConfigEntry>,
+) -> Option<f64> {
+    if config.is_some_and(|config| config.queue_rate_limit.is_some()) {
+        None
+    } else {
+        worker_rate_limit
+    }
+}
+
 impl TaskQueueRateLimiter {
     async fn acquire(
         &self,
@@ -1471,6 +1483,13 @@ impl TaskQueueRateLimiter {
             tokio::time::sleep(wait).await;
         }
         true
+    }
+
+    async fn clear(&self, namespace_id: tokeira_types::NamespaceId, task_queue: &TaskQueueName) {
+        self.next_dispatch
+            .lock()
+            .await
+            .remove(&(namespace_id, task_queue.clone()));
     }
 }
 
@@ -5205,10 +5224,13 @@ impl WorkflowService {
                         .map_err(EdgeError::from)?;
                     if let tokeira_kernel::LoadedRun::Existing(state) = loaded {
                         if wants_eager_return && state.pending_workflow_task.is_some() {
-                            // The pending WFT was dispatched onto the STICKY
-                            // queue when this completion set a sticky affinity
-                            // (sticky raise S2) — claim it from where the
-                            // kernel actually enqueued it.
+                            // The kernel authors the sticky destination, but
+                            // the disposable publisher may immediately fall
+                            // back to normal when no sticky long poll exists.
+                            // Eager return itself is the eligible worker path,
+                            // so claim through both aliases just as a sticky
+                            // poll does (`service/history/api/
+                            // respondworkflowtaskcompleted/api.go:745-766 @ v1.31.0`).
                             let sticky_dispatched =
                                 state.pending_workflow_task.as_ref().is_some_and(|pending| {
                                     pending.schedule_to_start_deadline.is_some()
@@ -5228,6 +5250,12 @@ impl WorkflowService {
                                 deployment: state.deployment.clone(),
                                 build_id: state.build_id.clone(),
                             };
+                            let normal_queue = (queue.task_queue != state.task_queue).then(|| {
+                                tokeira_types::QueueKey {
+                                    task_queue: state.task_queue.clone(),
+                                    ..queue.clone()
+                                }
+                            });
                             let prospective_origin =
                                 tokeira_types::WorkerTaskOrigin::from_queue_key(
                                     &queue,
@@ -5245,6 +5273,7 @@ impl WorkflowService {
                                 .runtime
                                 .try_claim_workflow_task(
                                     queue,
+                                    normal_queue,
                                     run_key,
                                     WorkerIdentity(completion_identity.clone()),
                                 )
@@ -6797,23 +6826,45 @@ impl WorkflowService {
                         .absorb_unversioned_backlog(&internal.queue)
                         .await;
                 }
-                // Worker-advertised capacity is a poller-side ceiling. The
-                // UpdateTaskQueueConfig queue/per-key limits are enforced by
-                // the broker at candidate handout so they can observe the
-                // candidate fairness key and react live to config changes.
-                if let Some(rate) = internal.worker_rate_limit
-                    && !self
-                        .task_queue_rate_limiter
-                        .acquire(
-                            internal.queue.namespace_id,
-                            internal.queue.task_queue.clone(),
-                            rate,
-                            internal.timeout,
-                        )
+                if let Some(rate) = internal.worker_rate_limit {
+                    let config_key = TaskQueueConfigKey {
+                        namespace_id: internal.queue.namespace_id,
+                        task_queue: internal.queue.task_queue.clone(),
+                        kind: TaskQueueConfigKind::Activity,
+                    };
+                    let config = self
+                        .task_queue_config_store
+                        .get(&config_key)
                         .await
-                {
-                    poller.completed();
-                    return Ok(None);
+                        .map_err(task_queue_config_store_error_to_edge)?;
+                    let worker_rate = worker_rate_limit_when_api_unset(Some(rate), config.as_ref());
+
+                    // Matching selects exactly one rate source: API config has
+                    // highest priority, then the poller's worker rate, then the
+                    // system default. Applying the first two independently
+                    // would incorrectly take their minimum and keep a stale
+                    // worker schedule after API unset
+                    // (`service/matching/task_queue_partition_manager.go:605-614`
+                    // and `service/matching/ratelimit_manager.go:130-161 @ v1.31.0`).
+                    if let Some(worker_rate) = worker_rate {
+                        if !self
+                            .task_queue_rate_limiter
+                            .acquire(
+                                internal.queue.namespace_id,
+                                internal.queue.task_queue.clone(),
+                                worker_rate,
+                                internal.timeout,
+                            )
+                            .await
+                        {
+                            poller.completed();
+                            return Ok(None);
+                        }
+                    } else {
+                        self.task_queue_rate_limiter
+                            .clear(internal.queue.namespace_id, &internal.queue.task_queue)
+                            .await;
+                    }
                 }
                 // The runtime evaluates durable rules when the broker offer is about to become a
                 // Started transition. Poll admission deliberately carries no CRUD-gate decision.
@@ -9640,7 +9691,7 @@ pub fn not_wired_runtime() -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use super::{
         EmptyVisibilityApi, ExecutionResolver, WorkflowService,
@@ -9649,7 +9700,7 @@ mod tests {
         cross_namespace_authorization_targets, resolve_build_id_reset_point,
         scoped_worker_allows_completion_targets, scoped_worker_allows_task_origin,
         system_capabilities_with_matrix_overlay, worker_identity_from_request,
-        workflow_rule_crud_admitted,
+        worker_rate_limit_when_api_unset, workflow_rule_crud_admitted,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -9661,9 +9712,9 @@ mod tests {
         ActivityPriorityPatch, FieldChange, ParentClosePolicy, StartRequest, WorkflowCommand,
     };
     use tokeira_runtime::{
-        BacklogConfig, InMemoryBroker, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-        UpdateLifecycleStage, UpdateWaitPolicy, WorkerRegistrationKey,
-        WorkflowTimeoutScannerConfig,
+        BacklogConfig, InMemoryBroker, LaneConfig, TaskQueueConfigEntry, TaskQueueConfigKind,
+        TimerScannerConfig, TokeiraRuntime, UpdateLifecycleStage, UpdateWaitPolicy,
+        WorkerRegistrationKey, WorkflowTimeoutScannerConfig,
     };
     use tokeira_storage::{
         CommitResult, InMemoryStore, ProvenancePut, RunRepository, WorkerTaskProvenance,
@@ -9693,6 +9744,31 @@ mod tests {
         },
     };
     use tokeira_auth::{AuthError, ClaimMapper, Claims, DefaultAuthorizer, WorkerScope};
+
+    #[test]
+    fn api_queue_rate_limit_suppresses_worker_rate_source() {
+        let mut config = TaskQueueConfigEntry {
+            namespace_id: NamespaceId::new(),
+            task_queue: TaskQueueName("activity-queue".to_owned()),
+            kind: TaskQueueConfigKind::Activity,
+            queue_rate_limit: Some(4.0),
+            queue_rate_limit_metadata: None,
+            fairness_key_rate_limit_default: None,
+            fairness_key_rate_limit_metadata: None,
+            fairness_weight_overrides: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            worker_rate_limit_when_api_unset(Some(2.0), Some(&config)),
+            None
+        );
+        config.queue_rate_limit = None;
+        assert_eq!(
+            worker_rate_limit_when_api_unset(Some(2.0), Some(&config)),
+            Some(2.0)
+        );
+        assert_eq!(worker_rate_limit_when_api_unset(Some(2.0), None), Some(2.0));
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]

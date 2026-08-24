@@ -170,9 +170,7 @@ impl WorkflowServiceGrpc {
         // (`common/namespace/nsregistry/registry.go:313 @ v1.31.0`;
         // `standalone_activity_test.go:3964`). Without this the empty name falls
         // through to a NotFound, the wrong status class.
-        if namespace.is_empty() {
-            return Err(Status::invalid_argument("Namespace is empty."));
-        }
+        validate_namespace_present(namespace)?;
         self.inner
             .resolve_namespace_id(namespace)
             .await
@@ -243,6 +241,13 @@ fn batch_translate_error_status(error: batch::BatchTranslateError) -> Status {
 
 fn nexus_translate_error_status(error: nexus::NexusTranslateError) -> Status {
     Status::invalid_argument(error.to_string())
+}
+
+fn validate_namespace_present(namespace: &str) -> Result<(), Status> {
+    if namespace.is_empty() {
+        return Err(Status::invalid_argument("Namespace is empty."));
+    }
+    Ok(())
 }
 
 fn namespace_resolution_status(error: crate::errors::EdgeError) -> Status {
@@ -669,6 +674,36 @@ fn validate_sa_ids(
         validate_sa_run_id(run_id)?;
     }
     Ok(())
+}
+
+/// Validate DescribeActivityExecution after the standalone-activity enable gate and
+/// before namespace admission. Temporal validates activity/run fields first, then
+/// resolves the namespace (`chasm/lib/activity/frontend.go:107-128` and
+/// `chasm/lib/activity/validator.go:273-297 @ v1.31.0`).
+fn validate_describe_activity_execution_admission(
+    request: &workflowservice::DescribeActivityExecutionRequest,
+    max_id_length: usize,
+) -> Result<(), Status> {
+    validate_sa_activity_id(&request.activity_id, max_id_length)?;
+    validate_sa_run_id(&request.run_id)?;
+    if !request.long_poll_token.is_empty() && request.run_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "run id is required when long poll token is provided",
+        ));
+    }
+    validate_namespace_present(&request.namespace)
+}
+
+/// Validate PollActivityExecution in the v1.31.0 frontend order: request identifiers
+/// before namespace resolution (`chasm/lib/activity/frontend.go:137-156` and
+/// `chasm/lib/activity/validator.go:299-317 @ v1.31.0`).
+fn validate_poll_activity_execution_admission(
+    request: &workflowservice::PollActivityExecutionRequest,
+    max_id_length: usize,
+) -> Result<(), Status> {
+    validate_sa_activity_id(&request.activity_id, max_id_length)?;
+    validate_sa_run_id(&request.run_id)?;
+    validate_namespace_present(&request.namespace)
 }
 
 /// Parse the caller's `grpc-timeout` header into a wait budget, if present. gRPC wire
@@ -3189,6 +3224,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::DescribeActivityExecutionRequest>,
     ) -> Result<Response<workflowservice::DescribeActivityExecutionResponse>, Status> {
+        if let Some(bridge) = &self.chasm_activity
+            && bridge.is_enabled()
+        {
+            validate_describe_activity_execution_admission(
+                request.get_ref(),
+                bridge.max_id_length(),
+            )?;
+        }
         let headers = metadata_to_header_map(request.metadata());
         self.inner
             .admit_request(
@@ -3205,17 +3248,6 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         };
         let caller_timeout = parse_grpc_timeout(request.metadata());
         let req = request.into_inner();
-        if bridge.is_enabled() {
-            validate_sa_activity_id(&req.activity_id, bridge.max_id_length())?;
-            validate_sa_run_id(&req.run_id)?;
-            // A long-poll token needs a concrete run id to anchor the wait
-            // (`chasm/lib/activity/validator.go @ v1.31.0`).
-            if !req.long_poll_token.is_empty() && req.run_id.is_empty() {
-                return Err(Status::invalid_argument(
-                    "run id is required when long poll token is provided",
-                ));
-            }
-        }
         let key = self
             .activity_execution_key(
                 bridge,
@@ -3291,6 +3323,11 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::PollActivityExecutionRequest>,
     ) -> Result<Response<workflowservice::PollActivityExecutionResponse>, Status> {
+        if let Some(bridge) = &self.chasm_activity
+            && bridge.is_enabled()
+        {
+            validate_poll_activity_execution_admission(request.get_ref(), bridge.max_id_length())?;
+        }
         let headers = metadata_to_header_map(request.metadata());
         self.inner
             .admit_request(
@@ -3306,12 +3343,6 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         };
         let req = request.into_inner();
-        validate_sa_ids(
-            bridge.is_enabled(),
-            bridge.max_id_length(),
-            &req.activity_id,
-            &req.run_id,
-        )?;
         let key = self
             .activity_execution_key(
                 bridge,
@@ -4707,6 +4738,46 @@ mod tests {
                 Arc::new(tokeira_runtime::BatchOperationStore::default()),
             );
         WorkflowServiceGrpc::new(service)
+    }
+
+    #[test]
+    fn describe_activity_execution_rejects_empty_namespace_before_lookup() {
+        let request = workflowservice::DescribeActivityExecutionRequest {
+            activity_id: "activity-a".to_owned(),
+            ..Default::default()
+        };
+        let error = validate_describe_activity_execution_admission(&request, 1_000)
+            .expect_err("empty namespace must be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), "Namespace is empty.");
+
+        let error = validate_describe_activity_execution_admission(
+            &workflowservice::DescribeActivityExecutionRequest::default(),
+            1_000,
+        )
+        .expect_err("request validation must precede namespace lookup");
+        assert_eq!(error.message(), "activity ID is required");
+    }
+
+    #[test]
+    fn poll_activity_execution_rejects_empty_namespace_before_lookup() {
+        let request = workflowservice::PollActivityExecutionRequest {
+            activity_id: "activity-a".to_owned(),
+            ..Default::default()
+        };
+        let error = validate_poll_activity_execution_admission(&request, 1_000)
+            .expect_err("empty namespace must be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), "Namespace is empty.");
+
+        let error = validate_poll_activity_execution_admission(
+            &workflowservice::PollActivityExecutionRequest::default(),
+            1_000,
+        )
+        .expect_err("request validation must precede namespace lookup");
+        assert_eq!(error.message(), "activity ID is required");
     }
 
     fn task_queue_config_test_service(

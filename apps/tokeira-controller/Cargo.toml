@@ -10,6 +10,7 @@ authors.workspace = true
 [[bin]]
 name = "tokeira-controller"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 anyhow.workspace = true

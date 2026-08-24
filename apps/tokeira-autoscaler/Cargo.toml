@@ -10,6 +10,7 @@ authors.workspace = true
 [[bin]]
 name = "tokeira-autoscaler"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 anyhow.workspace = true

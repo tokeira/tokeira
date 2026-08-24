@@ -45,7 +45,7 @@
 //!    waiters, so the `enable()` is what makes the race-close sound.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, RwLock as StdRwLock},
 };
 
@@ -375,6 +375,7 @@ impl Default for InMemoryActivityBroker {
 #[derive(Debug)]
 struct OrderedReady<T> {
     entries: BTreeMap<DeliveryOrder, VecDeque<T>>,
+    seen_priority_keys: BTreeSet<i32>,
     len: usize,
 }
 
@@ -386,6 +387,7 @@ impl<T> Default for OrderedReady<T> {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
+            seen_priority_keys: BTreeSet::new(),
             len: 0,
         }
     }
@@ -401,8 +403,18 @@ impl<T> OrderedReady<T> {
     }
 
     fn insert(&mut self, order: DeliveryOrder, value: T) {
+        self.seen_priority_keys
+            .insert(i32::from(order.priority_key));
         self.entries.entry(order).or_default().push_back(value);
         self.len += 1;
+    }
+
+    fn seen_priority_keys(&self) -> impl Iterator<Item = i32> + '_ {
+        self.seen_priority_keys.iter().copied()
+    }
+
+    fn has_seen_priority_keys(&self) -> bool {
+        !self.seen_priority_keys.is_empty()
     }
 
     fn front(&self) -> Option<&T> {
@@ -472,6 +484,8 @@ impl<T> OrderedReady<T> {
     }
 
     fn append(&mut self, other: &mut Self) {
+        self.seen_priority_keys
+            .extend(other.seen_priority_keys.iter().copied());
         for (order, mut bucket) in std::mem::take(&mut other.entries) {
             self.len += bucket.len();
             self.entries.entry(order).or_default().append(&mut bucket);
@@ -663,7 +677,16 @@ impl InMemoryBroker {
         let Some(ready) = inner.general_ready.get(queue) else {
             return PriorityBacklogStats::new();
         };
-        let mut stats = PriorityBacklogStats::new();
+        // v1.31.0 retains add/dispatch rate trackers for every priority key a
+        // physical queue has used, so DescribeTaskQueue keeps the zero-count
+        // band after its final task drains
+        // (`physical_task_queue_manager.go:646-664 @ v1.31.0`). The broker's
+        // seen-key set is the equivalent disposable observation; it does not
+        // carry workflow correctness.
+        let mut stats = ready
+            .seen_priority_keys()
+            .map(|priority_key| (priority_key, BrokerBacklogStats::default()))
+            .collect();
         for task in ready.iter() {
             add_priority_stat(
                 &mut stats,
@@ -700,7 +723,10 @@ impl InMemoryBroker {
         let Some(ready) = inner.sticky_ready.get(queue) else {
             return PriorityBacklogStats::new();
         };
-        let mut stats = PriorityBacklogStats::new();
+        let mut stats = ready
+            .seen_priority_keys()
+            .map(|priority_key| (priority_key, BrokerBacklogStats::default()))
+            .collect();
         for task in ready.iter() {
             add_priority_stat(
                 &mut stats,
@@ -731,6 +757,9 @@ impl InMemoryBroker {
         let mut inner = self.inner.lock().await;
         let mut moved = inner.general_ready.remove(&source).unwrap_or_default();
         if moved.is_empty() {
+            if moved.has_seen_priority_keys() {
+                inner.general_ready.insert(source, moved);
+            }
             return;
         }
         for entry in moved.iter_mut() {
@@ -741,6 +770,10 @@ impl InMemoryBroker {
             .entry(target.clone())
             .or_default()
             .append(&mut moved);
+        // Re-keying work does not erase the source physical queue's observed
+        // add-rate priority bands in v1.31.0. Keep the empty observation while
+        // copying the bands to the destination that will dispatch the tasks.
+        inner.general_ready.insert(source.clone(), moved);
         Self::emit_queue_depths(&inner, &source);
         Self::emit_queue_depths(&inner, target);
         let wake = inner.wakes.entry(target.clone()).or_default().clone();
@@ -1155,18 +1188,31 @@ impl InMemoryBroker {
         )) {
             return false;
         }
-        let active = inner.workflow_waiters.get(queue).is_some_and(|waiters| {
-            waiters
-                .iter()
-                .any(|waiter| waiter.worker == *worker && !waiter.response_tx.is_closed())
+        // v1.31.0 leaves modern deployment polls on the unversioned physical
+        // queue when the partition is sticky; only normal queues select a
+        // deployment-version physical queue
+        // (`task_queue_partition_manager.go:519-531 @ v1.31.0`). Sticky
+        // availability must therefore compare the physical sticky queue and
+        // worker while ignoring deployment/build coordinates.
+        let same_physical_queue = |candidate: &QueueKey| {
+            candidate.namespace_id == queue.namespace_id
+                && candidate.task_queue == queue.task_queue
+                && candidate.task_kind == queue.task_kind
+        };
+        let active = inner.workflow_waiters.iter().any(|(candidate, waiters)| {
+            same_physical_queue(candidate)
+                && waiters
+                    .iter()
+                    .any(|waiter| waiter.worker == *worker && !waiter.response_tx.is_closed())
         });
         active
-            || inner
-                .poller_observations
-                .get(&(queue.clone(), worker.clone()))
-                .is_some_and(|observed_at| {
-                    observed_at.elapsed() <= STICKY_POLLER_AVAILABILITY_WINDOW
-                })
+            || inner.poller_observations.iter().any(
+                |((candidate, candidate_worker), observed_at)| {
+                    same_physical_queue(candidate)
+                        && candidate_worker == worker
+                        && observed_at.elapsed() <= STICKY_POLLER_AVAILABILITY_WINDOW
+                },
+            )
     }
 
     async fn record_workflow_poller(&self, queue: &QueueKey, worker: &WorkerIdentity) -> bool {
@@ -1757,7 +1803,10 @@ impl InMemoryActivityBroker {
         let Some(ready) = inner.ready.get(queue) else {
             return PriorityBacklogStats::new();
         };
-        let mut stats = PriorityBacklogStats::new();
+        let mut stats = ready
+            .seen_priority_keys()
+            .map(|priority_key| (priority_key, BrokerBacklogStats::default()))
+            .collect();
         for task in ready.iter() {
             add_priority_stat(
                 &mut stats,
@@ -1796,6 +1845,9 @@ impl InMemoryActivityBroker {
         let mut inner = self.inner.lock().await;
         let mut moved = inner.ready.remove(&source).unwrap_or_default();
         if moved.is_empty() {
+            if moved.has_seen_priority_keys() {
+                inner.ready.insert(source, moved);
+            }
             return;
         }
         for entry in moved.iter_mut() {
@@ -1806,6 +1858,7 @@ impl InMemoryActivityBroker {
             .entry(target.clone())
             .or_default()
             .append(&mut moved);
+        inner.ready.insert(source.clone(), moved);
         Self::emit_queue_depth(&inner, &source);
         Self::emit_queue_depth(&inner, target);
         let wake = inner.wakes.entry(target.clone()).or_default().clone();
@@ -1887,7 +1940,8 @@ impl InMemoryActivityBroker {
                 kept.insert(order, entry);
             }
         }
-        if !kept.is_empty() {
+        kept.seen_priority_keys.extend(ready.seen_priority_keys);
+        if !kept.is_empty() || kept.has_seen_priority_keys() {
             inner.ready.insert(source.clone(), kept);
         }
         Self::emit_queue_depth(&inner, &source);
@@ -2356,6 +2410,100 @@ mod tests {
             priority: Some(priority),
             ..activity_task(queue.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn drained_activity_queue_retains_its_zero_count_priority_band() {
+        let broker = InMemoryActivityBroker::default();
+        let queue = activity_queue("drained-priority");
+        broker
+            .publish_activity_task(
+                named_activity_task(&queue, "activity", priority(3, "", 0.0)),
+                None,
+            )
+            .await
+            .expect("publish activity");
+
+        let stats = broker.backlog_stats_by_priority(&queue).await;
+        assert_eq!(stats.get(&3).map(|band| band.count), Some(1));
+        assert!(
+            broker
+                .poll_activity_task(&queue, Duration::ZERO)
+                .await
+                .expect("poll activity")
+                .is_some()
+        );
+
+        let drained = broker.backlog_stats_by_priority(&queue).await;
+        assert_eq!(drained.get(&3), Some(&BrokerBacklogStats::default()));
+    }
+
+    #[tokio::test]
+    async fn activity_migration_retains_the_source_queue_priority_band() {
+        let broker = InMemoryActivityBroker::default();
+        let source = activity_queue("migrated-priority");
+        let target = QueueKey {
+            deployment: Some(DeploymentId("payments".into())),
+            build_id: Some(BuildId("build-a".into())),
+            ..source.clone()
+        };
+        let task = named_activity_task(&source, "activity", priority(3, "", 0.0));
+        let identity = (task.run_key, task.activity_id.clone(), task.attempt);
+        broker
+            .publish_activity_task(task, None)
+            .await
+            .expect("publish activity");
+        broker
+            .reroute_unversioned_ready_tasks(&target, &HashMap::from([(identity, target.clone())]))
+            .await;
+        assert!(
+            broker
+                .poll_activity_task(&target, Duration::ZERO)
+                .await
+                .expect("poll migrated activity")
+                .is_some()
+        );
+
+        let source_stats = broker.backlog_stats_by_priority(&source).await;
+        assert_eq!(source_stats.get(&3), Some(&BrokerBacklogStats::default()));
+    }
+
+    #[tokio::test]
+    async fn drained_workflow_queue_retains_its_zero_count_priority_band() {
+        let broker = InMemoryBroker::default();
+        let queue = workflow_queue("drained-priority", None, None);
+        broker
+            .publish_workflow_task(
+                DispatchableWorkflowTask {
+                    priority: Some(priority(2, "", 0.0)),
+                    ..workflow_task(queue.clone())
+                },
+                None,
+            )
+            .await;
+        assert_eq!(
+            broker
+                .backlog_stats_by_priority(&queue)
+                .await
+                .get(&2)
+                .map(|band| band.count),
+            Some(1)
+        );
+        assert!(
+            broker
+                .poll_workflow_activation(
+                    &queue,
+                    None,
+                    &WorkerIdentity("worker".into()),
+                    Duration::ZERO,
+                )
+                .await
+                .expect("poll workflow")
+                .is_some()
+        );
+
+        let drained = broker.backlog_stats_by_priority(&queue).await;
+        assert_eq!(drained.get(&2), Some(&BrokerBacklogStats::default()));
     }
 
     #[tokio::test]
@@ -3819,6 +3967,59 @@ mod tests {
             .await
             .expect("the named sticky queue and owning worker must claim the query");
         assert_eq!(task.query_type, "sticky");
+    }
+
+    #[tokio::test]
+    async fn unversioned_sticky_observation_keeps_a_versioned_query_sticky() {
+        let broker = InMemoryBroker::default();
+        let normal_queue = workflow_queue("normal", Some("payments"), Some("build-a"));
+        let sticky_name = TaskQueueName("sticky".into());
+        let unversioned_sticky = QueueKey {
+            task_queue: sticky_name.clone(),
+            deployment: None,
+            build_id: None,
+            ..normal_queue.clone()
+        };
+        let versioned_sticky = QueueKey {
+            task_queue: sticky_name.clone(),
+            ..normal_queue.clone()
+        };
+        let worker = WorkerIdentity("worker-a".into());
+        assert!(
+            broker
+                .record_workflow_poller(&unversioned_sticky, &worker)
+                .await
+        );
+        let (tx, _rx) = oneshot::channel();
+        broker
+            .publish_query_task(QueryTask {
+                run_key: RunKey::new(),
+                query_type: "cross-version-sticky".into(),
+                query_args: Payloads::default(),
+                queue: normal_queue.clone(),
+                origin: query_origin(&normal_queue),
+                sticky_preferred: Some(worker.clone()),
+                sticky_queue: Some(sticky_name),
+                sticky_deadline: Some(OffsetDateTime::now_utc() + TimeDuration::seconds(5)),
+                deadline: OffsetDateTime::now_utc() + TimeDuration::minutes(1),
+                response_tx: tx,
+            })
+            .await;
+
+        assert!(
+            broker
+                .try_take_query(&normal_queue, &WorkerIdentity("worker-b".into()))
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            broker
+                .try_take_query(&versioned_sticky, &worker)
+                .await
+                .expect("modern sticky poll claims query from unversioned physical queue")
+                .query_type,
+            "cross-version-sticky"
+        );
     }
 
     #[tokio::test]

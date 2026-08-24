@@ -581,6 +581,13 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     /// by edge APIs such as `SignalWithStartWorkflowExecution`.
     async fn start_workflow_with_policy(&self, req: StartRequest) -> Result<StartWorkflowResult>;
 
+    /// Start with the callback limit resolved at transport admission time.
+    async fn start_workflow_with_policy_and_callback_limit(
+        &self,
+        req: StartRequest,
+        completion_callback_limit: usize,
+    ) -> Result<StartWorkflowResult>;
+
     /// Start a new execution or signal an existing one according to the
     /// workflow-id conflict policy carried in the request.
     async fn signal_with_start_workflow(
@@ -4348,6 +4355,7 @@ impl WorkflowService {
             async move {
                 let namespace = req.namespace.clone();
                 let workflow_id = req.workflow_id.clone();
+                let completion_callback_limit = req.completion_callback_limit;
                 let ctx = self
                     .interceptors
                     .begin(
@@ -4370,7 +4378,10 @@ impl WorkflowService {
                     .await?;
                 let outcome = self
                     .runtime
-                    .start_workflow_with_policy(internal.clone())
+                    .start_workflow_with_policy_and_callback_limit(
+                        internal.clone(),
+                        completion_callback_limit,
+                    )
                     .await
                     .map_err(EdgeError::from)?;
                 if !matches!(&outcome, StartWorkflowResult::Rejected { .. }) {
@@ -10857,6 +10868,7 @@ mod tests {
             request_eager_execution: false,
             workflow_start_delay: None,
             completion_callbacks: Vec::new(),
+            completion_callback_limit: usize::MAX,
             user_metadata: None,
             links: Vec::new(),
             eager_worker_deployment_options: None,
@@ -10966,6 +10978,55 @@ mod tests {
         assert_eq!(
             resp.run_id, existing_run_id,
             "attach must return the running incumbent's run id"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_use_existing_callback_total_exceeding_limit_is_failed_precondition() -> Result<()>
+    {
+        let (service, _runtime, _namespace_id, _workflow_id, _existing_run_id) =
+            update_test_service().await?;
+        let workflow_id = WorkflowId("callback-limit-workflow".to_string());
+        let callback = crate::translate::CompletionCallback {
+            url: "https://callback.example/run".to_string(),
+            header: Default::default(),
+            links: Vec::new(),
+        };
+        let mut first = start_request_for(
+            &workflow_id,
+            tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+            "callback-limit-first",
+        );
+        first.completion_callbacks = vec![callback.clone()];
+        first.completion_callback_limit = 1;
+        service
+            .start_workflow_execution(&HeaderMap::new(), first)
+            .await?;
+
+        let mut second = start_request_for(
+            &workflow_id,
+            tokeira_kernel::WorkflowIdConflictPolicy::UseExisting,
+            "callback-limit-second",
+        );
+        second.completion_callbacks = vec![callback];
+        second.completion_callback_limit = 1;
+        second.on_conflict_options = Some(crate::translate::OnConflictOptions {
+            attach_request_id: true,
+            attach_completion_callbacks: true,
+            attach_links: false,
+        });
+
+        let error = service
+            .start_workflow_execution(&HeaderMap::new(), second)
+            .await
+            .expect_err("authoritative callback total exceeds the cap");
+        let EdgeError::FailedPrecondition(message) = error else {
+            panic!("callback limit must surface as failed precondition");
+        };
+        assert_eq!(
+            message,
+            "cannot attach more than 1 callbacks to a workflow (1 callbacks already attached)"
         );
         Ok(())
     }

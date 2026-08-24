@@ -193,6 +193,9 @@ pub struct StartWorkflowExecutionRequest {
     pub request_eager_execution: bool,
     pub workflow_start_delay: Option<time::Duration>,
     pub completion_callbacks: Vec<CompletionCallback>,
+    /// Edge-resolved maximum used if these callbacks are attached to an
+    /// existing execution by `OnConflictOptions`.
+    pub completion_callback_limit: usize,
     pub user_metadata: Option<UserMetadata>,
     pub links: Vec<Link>,
     /// Worker deployment requested for the eagerly returned first WFT.

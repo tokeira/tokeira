@@ -1545,6 +1545,19 @@ impl BasicKernel {
         req: UpdateExecutionOptionsRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
+        if let Some(limit) = req.completion_callback_limit {
+            let existing = state.completion_callbacks.len();
+            // The total must be checked against the state loaded inside the
+            // lane's OCC loop. A preflight count would race another attachment
+            // and could admit more callbacks than the configured maximum
+            // (`addCompletionCallbacksHsm`, mutable_state_impl.go:3154-3161
+            // @ v1.31.0).
+            if !req.attached_completion_callbacks.is_empty()
+                && req.attached_completion_callbacks.len() > limit.saturating_sub(existing)
+            {
+                return Err(Reject::CompletionCallbackLimitExceeded { limit, existing });
+            }
+        }
         let versioning_override =
             resolve_versioning_override_change(&state, req.versioning_override)?;
         let priority = resolve_priority_change(&state, req.priority);
@@ -7245,6 +7258,14 @@ pub enum Reject {
     /// to `FAILED_PRECONDITION`, matching updateworkflowoptions at v1.31.0.
     #[error("{0}")]
     InvalidVersioningOverride(String),
+    /// Append-only callback attachment would exceed the configured per-run
+    /// limit. Temporal evaluates the total against mutable state and returns
+    /// `FAILED_PRECONDITION` (`addCompletionCallbacksHsm`,
+    /// `service/history/workflow/mutable_state_impl.go:3154-3161 @ v1.31.0`).
+    #[error(
+        "cannot attach more than {limit} callbacks to a workflow ({existing} callbacks already attached)"
+    )]
+    CompletionCallbackLimitExceeded { limit: usize, existing: usize },
     /// A `WorkflowTaskStarted` was issued but the pending WFT
     /// has already been started.
     #[error("workflow task already started: logical_seq={logical_seq}")]

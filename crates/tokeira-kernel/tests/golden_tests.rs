@@ -6969,6 +6969,7 @@ fn update_execution_options_happy_path() {
         request: request_context("options-req"),
         now: now(),
         priority: FieldChange::Unchanged,
+        completion_callback_limit: None,
     };
     let transition = kernel()
         .apply(
@@ -7039,6 +7040,7 @@ fn update_execution_options_clear_versioning() {
                 request: request_context("options-clear"),
                 now: now(),
                 priority: FieldChange::Unchanged,
+                completion_callback_limit: None,
             }),
         )
         .unwrap();
@@ -7076,6 +7078,7 @@ fn update_execution_options_resolves_implied_pin_in_authoritative_state() {
                 request: request_context("options-implied"),
                 now: now(),
                 priority: FieldChange::Unchanged,
+                completion_callback_limit: None,
             }),
         )
         .unwrap();
@@ -7114,6 +7117,7 @@ fn update_execution_options_rejects_implied_pin_before_run_is_pinned() {
                 request: request_context("options-implied-error"),
                 now: now(),
                 priority: FieldChange::Unchanged,
+                completion_callback_limit: None,
             }),
         )
         .unwrap_err();
@@ -7143,6 +7147,7 @@ fn update_execution_options_equal_value_is_an_explicit_noop() {
                 request: request_context("options-same"),
                 now: now(),
                 priority: FieldChange::Unchanged,
+                completion_callback_limit: None,
             }),
         )
         .unwrap();
@@ -7165,6 +7170,7 @@ fn update_execution_options_missing_run() {
                 request: request_context("options-missing"),
                 now: now(),
                 priority: FieldChange::Unchanged,
+                completion_callback_limit: None,
             }),
         )
         .unwrap_err();
@@ -7186,6 +7192,7 @@ fn update_execution_options_closed_run() {
                 request: request_context("options-closed"),
                 now: now(),
                 priority: FieldChange::Unchanged,
+                completion_callback_limit: None,
             }),
         )
         .unwrap_err();

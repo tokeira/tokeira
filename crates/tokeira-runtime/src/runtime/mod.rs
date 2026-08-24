@@ -1770,7 +1770,7 @@ mod tests {
         broker::InMemoryBroker,
         deployment_registry::{RegisterPolledDeployment, SetCurrent},
         drain::RuntimeDrainState,
-        lane::DispatchPublisher,
+        lane::{DispatchPublisher, KernelRejected},
         nexus::{
             EndpointTarget, NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusTaskBroker,
             NexusTimeoutScannerConfig, NexusTimeoutTrackingState, NoopNexusCompletionClient,
@@ -1787,8 +1787,8 @@ mod tests {
     };
     use tokeira_kernel::{
         CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback, Link, OnConflictOptions,
-        RetryState, VersioningBehavior, WorkerDeploymentVersionRef, WorkflowTaskFailedCause,
-        WorkflowVersioningInfo,
+        Reject, RetryState, VersioningBehavior, WorkerDeploymentVersionRef,
+        WorkflowTaskFailedCause, WorkflowVersioningInfo,
     };
     use tokeira_storage::{
         BacklogEntry, BuildId as StoredBuildId, CommitResult, DeploymentName,
@@ -2235,6 +2235,87 @@ mod tests {
                 ..
             } if id == "attach-req"
         )));
+    }
+
+    #[tokio::test]
+    async fn start_use_existing_callback_limit_rejects_without_mutation() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let callback = CompletionCallback {
+            spec: CallbackSpec::Nexus {
+                url: "https://callback.example/run".to_string(),
+                header: Default::default(),
+            },
+            links: Vec::new(),
+            trigger: CallbackTrigger::WorkflowClosed,
+            registration_time: None,
+            state: CallbackState::Standby,
+            attempt: 0,
+            last_attempt_failure: None,
+            last_attempt_complete_time: None,
+            next_attempt_at: None,
+        };
+        let mut first = sample_start_request(None, None);
+        first.completion_callbacks = vec![callback.clone()];
+        runtime
+            .start_workflow_with_policy(first.clone())
+            .await
+            .unwrap();
+
+        let LoadedRun::Existing(before_state) = repo.load_run(first.run_key).await.unwrap() else {
+            panic!("started run should still exist");
+        };
+        let before_history = repo
+            .read_history(first.run_key, 0, usize::MAX)
+            .await
+            .unwrap();
+
+        let mut second = sample_start_request(None, None);
+        second.namespace_id = first.namespace_id;
+        second.workflow_id = first.workflow_id.clone();
+        second.conflict_policy = WorkflowIdConflictPolicy::UseExisting;
+        second.completion_callbacks = vec![callback];
+        second.links = vec![Link::BatchJob {
+            job_id: "must-not-attach".to_string(),
+        }];
+        second.on_conflict_options = Some(OnConflictOptions {
+            attach_request_id: true,
+            attach_completion_callbacks: true,
+            attach_links: true,
+        });
+        second.request.request_id = RequestId("must-not-attach".to_string());
+
+        let error = runtime
+            .start_workflow_with_policy_and_callback_limit(second, 1)
+            .await
+            .unwrap_err();
+        let rejected = error
+            .downcast_ref::<KernelRejected>()
+            .expect("callback cap remains a typed kernel rejection");
+        assert_eq!(
+            &rejected.0,
+            &Reject::CompletionCallbackLimitExceeded {
+                limit: 1,
+                existing: 1,
+            }
+        );
+
+        let LoadedRun::Existing(after_state) = repo.load_run(first.run_key).await.unwrap() else {
+            panic!("rejected attachment must preserve the run");
+        };
+        let after_history = repo
+            .read_history(first.run_key, 0, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(after_state, before_state);
+        assert_eq!(after_history, before_history);
     }
 
     #[tokio::test]

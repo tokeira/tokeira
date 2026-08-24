@@ -316,6 +316,19 @@ impl From<anyhow::Error> for EdgeError {
         {
             return Self::FailedPrecondition(reason.clone());
         }
+        // UseExisting callback attachment is structurally valid at admission;
+        // it fails only when the serialized total exceeds the configured cap.
+        // Temporal returns FAILED_PRECONDITION from mutable state for this case
+        // (`addCompletionCallbacksHsm`, mutable_state_impl.go:3154-3161
+        // @ v1.31.0).
+        if let Some(tokeira_runtime::KernelRejected(
+            tokeira_kernel::Reject::CompletionCallbackLimitExceeded { limit, existing },
+        )) = value.downcast_ref::<tokeira_runtime::KernelRejected>()
+        {
+            return Self::FailedPrecondition(format!(
+                "cannot attach more than {limit} callbacks to a workflow ({existing} callbacks already attached)"
+            ));
+        }
         // An invalid workflow command fails the WFT server-side and errors the
         // completion with INVALID_ARGUMENT carrying the cause message — the
         // corpus asserts err.Error() == "UnhandledCommand" exactly
@@ -434,5 +447,28 @@ impl From<anyhow::Error> for EdgeError {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_limit_rejection_is_a_failed_precondition() {
+        let error = anyhow::Error::new(tokeira_runtime::KernelRejected(
+            tokeira_kernel::Reject::CompletionCallbackLimitExceeded {
+                limit: 1,
+                existing: 1,
+            },
+        ));
+
+        let EdgeError::FailedPrecondition(message) = EdgeError::from(error) else {
+            panic!("callback limit must map to failed precondition");
+        };
+        assert_eq!(
+            message,
+            "cannot attach more than 1 callbacks to a workflow (1 callbacks already attached)"
+        );
     }
 }

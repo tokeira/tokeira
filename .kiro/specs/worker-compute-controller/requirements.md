@@ -34,7 +34,7 @@ Tokeira deliberately uses its own architecture:
 The first implementation supports remote Nexus compute providers using the pinned
 `no-sync` scaler and its `invoke-worker` action. Direct AWS/GCP/Kubernetes/subprocess
 providers, `rate-based`, worker-set sizing, scale-down policy, and provider-specific
-placement are separate features. Yadori is the first intended remote provider, but
+placement are separate features. A sibling worker-compute provider is the first intended remote provider, but
 the contract in this spec is provider-neutral. Queue-scoped credentials for the
 untrusted workers that a provider starts are owned by the sibling
 `scoped-worker-authorization` spec and tracked by `tokeira/tokeira#29`; this spec
@@ -161,8 +161,8 @@ contract.
   startup-static policy and `crates/tokeira-compatibility/src/matrix.rs` owns the
   generated Feature Catalog rendered into
   `docs/conformance/v1.31.0/tokeira-configuration.md`.
-- **Downstream consumer:** the sibling `tokeira-yadori` repository's
-  `docs/architecture/000-overview.md` and `docs/tokeirad-contract.md` require an
+- **Downstream consumer:** the sibling worker-compute provider's architecture and
+  engine-contract documents require an
   engine-pushed, exact-version, idempotent scaling request while task delivery remains
   ordinary Temporal polling.
 - **Authorization dependency:** `tokeira/tokeira#29` records the need for
@@ -289,7 +289,7 @@ control-plane feature, so that empty configuration never starts external capacit
 
 **User Story:** As a platform integrator, I want implementation-specific remote
 providers to compose with existing scaling groups, so that Tokeira does not hard-code a
-Yadori or cloud-provider type.
+specific remote-provider or cloud-provider type.
 
 #### Acceptance Criteria
 
@@ -634,7 +634,7 @@ administration surface.
    Worker_Compute_Controller SHALL use the existing Nexus task broker.
 3. THE Worker_Compute_Controller SHALL NOT add a provider-specific HTTP route.
 4. THE Worker_Compute_Controller SHALL NOT add AWS, GCP, Kubernetes, Firecracker, or
-   Yadori client logic.
+   remote-provider client logic.
 5. WHEN endpoint metadata changes before an undelivered retry, THE
    Worker_Compute_Controller SHALL resolve the endpoint's current target.
 6. WHEN an endpoint is deleted before an undelivered retry, THE
@@ -675,7 +675,7 @@ provider failures.
 ### Requirement 15: Cross-Repository and Regression Boundaries
 
 **User Story:** As a maintainer, I want the controller contract independently testable
-from Yadori and authorization, so that either repository can evolve without hidden
+from the sibling worker-compute provider and authorization, so that either repository can evolve without hidden
 engine coupling.
 
 #### Acceptance Criteria
@@ -697,9 +697,9 @@ engine coupling.
    token correlation or response completion.
 8. THE Worker Deployment regression tests SHALL retain existing ComputeConfig
    update-mask and round-trip behavior.
-9. THE default workspace test suite SHALL require no live Nexus provider, Yadori
+9. THE default workspace test suite SHALL require no live Nexus provider, sibling-provider
    process, cloud credentials, or Docker.
-10. THE Yadori integration test SHALL remain outside Tokeira's default workspace bar.
+10. THE sibling-provider integration test SHALL remain outside Tokeira's default workspace bar.
 11. THE `scoped-worker-authorization` spec SHALL own all guest-worker JWT/STS claim and
     RPC authorization changes.
 12. THE Worker_Compute_Controller SHALL NOT grant a provider or launched worker access
@@ -731,9 +731,9 @@ engine coupling.
   the WCI_Pin nor the current upstream module defines a canonical Nexus operation
   schema. `tokeira.compute.v1.InvokeWorkerRequest` is therefore a Tokeira-owned public
   extension, not a claimed Temporal wire contract.
-- **Yadori boundary:** Yadori may map every `invoke-worker` request to placement of one
+- **Provider boundary:** the sibling worker-compute provider may map every `invoke-worker` request to placement of one
   fleet-version worker. Slot lifetime, scale-down, Firecracker placement, and
-  poll-ready reporting remain Yadori concerns.
+  poll-ready reporting remain provider concerns.
 - **Security boundary:** issue `tokeira/tokeira#29` blocks safe untrusted guest polling,
   not provider invocation. The separate `scoped-worker-authorization` spec will make
   that dependency explicit and fail closed.

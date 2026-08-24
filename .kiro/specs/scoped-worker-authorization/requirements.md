@@ -11,7 +11,7 @@ describe those queues. It does not grant general namespace read or write access.
 The feature closes the security dependency tracked by
 [`tokeira/tokeira#29`](https://github.com/tokeira/tokeira/issues/29) and by the
 [`worker-compute-controller`](../worker-compute-controller/requirements.md) spec. It allows a
-compute provider such as Yadori to launch an untrusted worker that uses an ordinary Temporal SDK
+compute provider such as the sibling worker-compute provider to launch an untrusted worker that uses an ordinary Temporal SDK
 and bearer metadata without giving the guest a namespace-wide Writer role.
 
 This is an extension of, not a replacement for, the
@@ -143,7 +143,7 @@ when the same token also contains ordinary namespace roles.
 - Activity By-ID response RPCs are implemented and share namespace-Write classifications with
   token response RPCs. A namespace-only decision therefore grants more authority than Issue #29
   permits.
-- The sibling `tokeira-yadori` contract requires exact namespace, fleet-version, task-queue, and
+- The sibling worker-compute provider's contract requires exact namespace, fleet-version, task-queue, and
   operation grants for an untrusted Firecracker guest. Its readiness check uses
   `DescribeTaskQueue` and matches an exact `(deployment_name, build_id)` PollerInfo.
 
@@ -542,7 +542,7 @@ without exposing tenant or credential data.
 ### Requirement 12: Verification and downstream readiness
 
 **User Story:** As the owner, I want executable evidence at each security boundary, so that
-Yadori readiness rests on fail-closed behavior rather than a happy-path demonstration.
+provider readiness rests on fail-closed behavior rather than a happy-path demonstration.
 
 #### Acceptance Criteria
 
@@ -575,7 +575,7 @@ Yadori readiness rests on fail-closed behavior rather than a happy-path demonstr
     or version.
 15. THE integration tests SHALL demonstrate that the same credential can call
     `DescribeTaskQueue` for readiness and cannot call namespace-wide read or write APIs.
-16. THE cross-repository contract evidence SHALL record the exact tokeira commit and Yadori
+16. THE cross-repository contract evidence SHALL record the exact tokeira commit and sibling-provider
     contract revision used for the end-to-end readiness proof.
 
 ## Out of Scope

@@ -410,8 +410,8 @@ commands, transitions, history, lane routing, projection semantics, or delivery 
     - Prove same-namespace commands retain ordinary semantics, cross-namespace commands reject
       atomically, and out-of-scope eager/inline tasks are withheld without durable work loss.
     - _Requirements: 7.1-7.8, 12.8-12.9_
-  - [ ] 15.6 Record and verify the downstream Yadori contract evidence
-    - Add versioned evidence that names the exact Tokeira commit and sibling Yadori contract
+  - [ ] 15.6 Record and verify the downstream sibling-provider contract evidence
+    - Add versioned evidence that names the exact Tokeira commit and sibling worker-compute-provider contract
       revision used to launch a Firecracker guest and satisfy exact-version
       `DescribeTaskQueue` readiness.
     - Make the readiness test validate the evidence shape and reject stale/missing revision
@@ -470,5 +470,5 @@ commands, transitions, history, lane routing, projection semantics, or delivery 
   carries the exact `// Feature: scoped-worker-authorization, Property N: ...` tag.
 - The Feature Catalog entry is default-inert and presence-activated. Tokeira does not issue or
   distribute the guest credential.
-- The final Yadori evidence depends on an exact sibling contract revision and must never embed
+- The final sibling-provider evidence depends on an exact sibling contract revision and must never embed
   a bearer, presigned STS URL, private key, task token, payload, or tenant secret.

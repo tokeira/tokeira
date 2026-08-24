@@ -102,7 +102,7 @@ a deprecated method against a rejecting server gets a clean, synchronous typed e
 
 - **tokeira-odori** uses no versioning surface; its Rust SDK workers send GA
   `deployment_options` on every poll (a GA-side field obligation, unaffected by this decision).
-- **tokeira-yadori**'s worker-fleet specs are built entirely on the GA deployment surface
+- The sibling worker-compute provider's worker-fleet specs are built entirely on the GA deployment surface
   (`WorkerDeploymentVersionInfo.compute_config`, `WorkerDeploymentInfo.manager_identity`,
   `DescribeWorkerDeployment(Version)`), with zero references to version sets, rules, or
   reachability.

@@ -497,12 +497,16 @@ pub(crate) async fn validate_staged_definition(deployment_dir: &Path) -> Result<
         print!("{}", String::from_utf8_lossy(&output.stdout));
         bail!("staged provisioner refused the deployment definition");
     }
-    serde_json::from_slice(&output.stdout).with_context(|| {
+    let facts: StagedCheckFacts = serde_json::from_slice(&output.stdout).with_context(|| {
         format!(
             "staged provisioner check succeeded but its report does not decode: {}",
             String::from_utf8_lossy(&output.stdout)
         )
-    })
+    })?;
+    if !facts.verifies {
+        bail!("staged provisioner check exited successfully but reported `verifies: false`");
+    }
+    Ok(facts)
 }
 
 /// Seed the staged deployment's server configuration through the exact

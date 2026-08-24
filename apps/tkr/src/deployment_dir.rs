@@ -279,6 +279,7 @@ impl DeploymentResolver {
 
     /// Build the discovery-selected composition root and marry its exact `tkp`
     /// bytes to the staged deployment.
+    #[cfg(test)]
     pub(crate) fn place_provisioner_at(
         &self,
         deployment_dir: &Path,

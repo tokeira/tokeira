@@ -2382,7 +2382,7 @@ proptest! {
         let transition = result.unwrap();
         let run_timeout = 60;
         let expected_s2c_secs = schedule_to_close_secs
-            .or(Some(run_timeout).filter(|_| start_to_close_secs.is_some()))
+            .or(start_to_close_secs.is_some().then_some(run_timeout))
             .map(|seconds| seconds.min(run_timeout));
         let expected_s2s_secs = match schedule_to_close_secs {
             Some(schedule_to_close) => Some(

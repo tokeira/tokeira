@@ -167,11 +167,7 @@ fn selection_path(query: &str) -> Vec<String> {
                     path.push(std::mem::take(&mut identifier));
                 }
             }
-            _ if paren_depth == 0 => {
-                if ch.is_alphanumeric() || ch == '_' {
-                    identifier.push(ch);
-                }
-            }
+            _ if paren_depth == 0 && (ch.is_alphanumeric() || ch == '_') => identifier.push(ch),
             _ => {}
         }
     }

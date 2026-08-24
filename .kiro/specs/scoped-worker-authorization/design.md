@@ -23,7 +23,7 @@ The design is derived from:
   `crates/tokeira-edge/src/grpc/workflow_service.rs` for the current authorization chokepoint;
 - committed run state and started-task DTOs for Workflow and Activity task origin;
 - the existing query and Nexus correlation stores; and
-- [`tokeira/tokeira#29`](https://github.com/tokeira/tokeira/issues/29) plus the sibling Yadori
+- [`tokeira/tokeira#29`](https://github.com/tokeira/tokeira/issues/29) plus the sibling worker-compute provider's
   contract for the downstream untrusted-Worker boundary.
 
 The design preserves Tokeira's architecture:
@@ -728,7 +728,7 @@ enters the kernel.
 select response shape only; they never widen the queue target.
 
 The existing response is not filtered by credential version. It describes the authorized queue
-family and preserves all PollerInfo rows, including exact Deployment name and Build ID. Yadori
+family and preserves all PollerInfo rows, including exact Deployment name and Build ID. The sibling provider
 selects its exact pair from that result. This matches the approved requirement and avoids
 inventing a filtered DQT behavior that v1.31.0 does not promise.
 
@@ -1056,7 +1056,7 @@ Use workspace `proptest`, at least 100 cases, with
   eager/inline returns withheld without durable work loss.
 - **Path closure:** direct gRPC, HTTP/gRPC gateway, legacy token, query, Nexus piggyback heartbeat,
   and CHASM fast path.
-- **Yadori contract:** record the exact tokeira commit and sibling contract revision used to
+- **Sibling-provider contract:** record the exact tokeira commit and sibling contract revision used to
   launch a Firecracker guest and satisfy exact-version `DescribeTaskQueue` readiness.
 
 ### Structural checks

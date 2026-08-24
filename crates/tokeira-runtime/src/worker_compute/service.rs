@@ -732,7 +732,7 @@ mod tests {
             })?;
         }
 
-        // Feature: worker-compute-controller, Property 17: provider-neutral tests do not require Yadori or cloud state
+        // Feature: worker-compute-controller, Property 17: provider-neutral tests do not require a remote provider or cloud state
         #[test]
         fn property_provider_neutral_harness_has_no_external_state(
             outcomes in proptest::collection::vec(0u8..3, 1..30),

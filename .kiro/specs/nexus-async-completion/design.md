@@ -7,7 +7,7 @@ workflow. When a tokeira workflow schedules a Nexus operation whose handler is a
 `WorkflowRunOperation` (the Python guest's `@workflow_run_operation`, or any handler that returns an
 operation token), the handler's `StartOperation` returns `AsyncSuccess` — tokeira records
 `NexusOperationStarted` and the operation stays pending. The real result arrives only when the
-handler-side backing workflow (e.g. Odori's `AgentWorkflow`) reaches a terminal state and a
+handler-side backing workflow (e.g. a downstream agent framework's run workflow) reaches a terminal state and a
 **completion callback** registered on that workflow fires. tokeira does not implement this: the
 runtime's `DispatchOp::DispatchCompletionCallback` is a no-op stub, so a started async operation
 never resolves and the caller blocks until schedule-to-close timeout.
@@ -91,7 +91,7 @@ inbound completion handler in `components/nexusoperations/frontend/handler.go`
 
 ```mermaid
 flowchart TD
-    subgraph caller["originator (e.g. odori-control)"]
+    subgraph caller["originator (an agent control plane)"]
       Sched["ScheduleNexusOperation cmd"] --> SchedEv["NexusOperationScheduled"]
       Resolve["Command::NexusOperationResolved\n(Completed/Failed/Canceled)"] --> Term["NexusOperation{Completed,Failed,Canceled}\n+ schedule WFT"]
     end
@@ -99,7 +99,7 @@ flowchart TD
       SchedEv --> Disp["handle_schedule_nexus_operation\n(Worker target)"]
       Disp -->|"task + callback URL + Temporal-Callback-Token"| Broker["NexusTaskBroker"]
     end
-    subgraph handler["handler side (e.g. odori-agents)"]
+    subgraph handler["handler side (an agent worker service)"]
       Broker -->|PollNexusTaskQueue| Worker["external worker\n(Python WorkflowRunOperation)"]
       Worker -->|"StartWorkflow(AgentWorkflow,\n callbacks=[{url, token}])"| Agent["AgentWorkflow run\n(completion_callbacks stored)"]
       Worker -->|"RespondNexusTaskCompleted(AsyncSuccess)"| StartedRes["NexusResolution::Started\n→ NexusOperationStarted"]
@@ -231,7 +231,7 @@ round-trip (the *poll/respond* token) is unchanged.
   `NexusOperationCompletion` proto token wire format and the per-run state-machine staleness model that
   tokeira **deliberately does not adopt** (opaque versioned token + op-fencing as the staleness analogue,
   `tokeira-runtime/src/nexus.rs:523`). The callback token is opaque to real workers (minted by tokeira,
-  echoed back, decoded by tokeira — proven by Odori's round-trip), so it is **not a client-observable
+  echoed back, decoded by tokeira — proven by a downstream consumer's round-trip), so it is **not a client-observable
   contract**; only the corpus test constructs/decodes it. These tests are therefore **out of public
   scope** and stay skipped, reclassified as deliberate-deviation. The observable contract (stale/invalid
   completion → not-found; async completion/failure delivery; pre-process errors) is upheld by op-fencing

@@ -86,7 +86,7 @@ on that sibling feature.
 
 ### Non-goals
 
-- Direct AWS Lambda, ECS, GCP, Kubernetes, subprocess, Firecracker, or Yadori clients.
+- Direct AWS Lambda, ECS, GCP, Kubernetes, subprocess, Firecracker, or remote-provider clients.
 - `rate-based` scaling, desired worker-set sizing, scale-down, or provider placement.
 - A Temporal system Workflow or a port of the WCI module.
 - Proving that a requested worker reached poll-ready state. Provider success only
@@ -138,7 +138,7 @@ flowchart LR
     subgraph ProviderSide["Configured provider"]
         External["External Nexus endpoint"]
         Worker["Worker Nexus endpoint"]
-        Capacity["Provider placement<br/>(for example Yadori)"]
+        Capacity["Provider placement<br/>(a remote provider)"]
     end
 
     WD --> WDEdge --> Registry --> Deployments
@@ -1296,7 +1296,7 @@ diagnostics contain neither provider details nor credentials.
 
 **Validates: Requirements 14.1–14.6**
 
-### Property 17: Provider-neutral tests do not require Yadori or cloud state
+### Property 17: Provider-neutral tests do not require a remote provider or cloud state
 
 For every generated controller scenario, replacing the provider with the in-process
 Nexus test double preserves decision and retry semantics, and the default workspace
@@ -1424,7 +1424,7 @@ Integration scenarios cover:
 11. blocked provider with unaffected task publication; and
 12. clean cancellation with claim recovery.
 
-The sibling Yadori integration remains an opt-in cross-repository test and is not part
+The sibling worker-compute-provider integration remains an opt-in cross-repository test and is not part
 of `cargo test --workspace`.
 
 ### Regression gates
@@ -1437,7 +1437,7 @@ of `cargo test --workspace`.
 - Existing Nexus HTTP, task transport, async completion, token, and workflow
   resolution suites remain green.
 - Kernel tests and serialized state goldens have no worker-compute delta.
-- The default workspace bar needs no live Nexus provider, Yadori, cloud credential,
+- The default workspace bar needs no live Nexus provider, sibling provider, cloud credential,
   Docker, or DSQL.
 
 ## Requirement Traceability

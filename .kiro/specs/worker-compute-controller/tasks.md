@@ -402,7 +402,7 @@
   - [x] 18.3 Add a deny-by-construction provider-neutral integration harness
     - Provide an in-process Nexus provider that records/deduplicates requests and can
       return all approved outcomes, with ports that cannot open cloud credentials,
-      Docker, Yadori, or sibling-repository processes.
+      Docker, remote-provider, or sibling-repository processes.
     - _Requirements: 15.1, 15.2, 15.5, 15.9, 15.10_
   - [x] 18.4 Property test: Property 1 — disabled configuration is inert
     - Generate stored registries, publications, polls, mutations, and time advances;
@@ -410,11 +410,11 @@
       disabled, for at least 100 cases.
     - Tag: `// Feature: worker-compute-controller, Property 1: disabled configuration is inert`
     - _Requirements: 1.1, 1.2, 1.3, 1.5, 1.6_
-  - [x] 18.5 Property test: Property 17 — provider-neutral tests require no Yadori or cloud state
+  - [x] 18.5 Property test: Property 17 — provider-neutral tests require no remote provider or cloud state
     - Generate controller scenarios against the in-process provider and prove decision/
       retry equivalence while the default harness cannot access live provider, cloud
       credential, Docker, or sibling-process ports, for at least 100 cases.
-    - Tag: `// Feature: worker-compute-controller, Property 17: provider-neutral tests do not require Yadori or cloud state`
+    - Tag: `// Feature: worker-compute-controller, Property 17: provider-neutral tests do not require a remote provider or cloud state`
     - _Requirements: 15.1, 15.2, 15.5, 15.8, 15.9, 15.10, 15.11_
 
 - [x] 19. Add bounded observability, diagnostics, and operator truth
@@ -465,7 +465,7 @@
     - _Requirements: 1.5; 15.11, 15.12_
   - [x] 20.4 Keep cross-repository validation opt-in
     - Add only the Tokeira-side contract fixture or ignored test entry needed for a
-      separately invoked Yadori integration; ensure the default workspace bar neither
+      separately invoked sibling-provider integration; ensure the default workspace bar neither
       starts nor requires the sibling repository.
     - _Requirements: 15.9, 15.10_
 
@@ -478,7 +478,7 @@
     - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`
   - Confirm every Property 1–17 PBT runs at least 100 cases, all affected Worker
     Deployment/broker/Nexus regressions are green, migration/link checks pass, the tree
-    remains clean after validation, and no live Yadori/cloud/Docker dependency enters
+    remains clean after validation, and no live provider/cloud/Docker dependency enters
     the default bar.
 
 ## Task Dependency Graph
@@ -523,7 +523,7 @@
 - DSQL migrations use the next contiguous versions at implementation time. They remain
   forward-only, one statement per migration, and use a separate asynchronous index
   migration.
-- The sibling Yadori repository is a provider implementation and optional integration
+- The sibling worker-compute provider repository is a provider implementation and optional integration
   target, not a build or test dependency. Guest-worker JWT/STS authorization remains
   owned by the separate `scoped-worker-authorization` specification and Issue #29.
 - A checkpoint is a stop-and-fix gate: do not advance while its focused compilation,

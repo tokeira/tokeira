@@ -27,8 +27,7 @@ not require the `devbox` CLI.
 
 The sync excludes are hardcoded and not configurable:
 
-- `.env*` — `.worktreeinclude` deliberately copies gitignored secrets into every
-  worktree, and secrets never leave the machine (§10.3).
+- `.env*` — local environment files are machine-local and never leave it (§10.3).
 - `.git` — a linked worktree's `.git` is a pointer file into the machine-local
   common dir; meaningless remotely. `tokeira-build-info` degrades to an `unknown`
   git SHA without it.
@@ -46,15 +45,15 @@ binary (`curl -fsSL get.namespace.so/devbox/install.sh | bash`; installs to
 trust `--help` over any doc, including this one.
 
 ```bash
-devbox site-latency          # pick the site; zrh measured 26 ms p50 from here
+devbox site-latency          # pick the nearest site
 devbox create --name <box> --size xl --volume_size_gb 100 \
-    --no_checkout --site zrh --image builtin:base --purpose "<why>"
+    --no_checkout --site <site> --image builtin:base --purpose "<why>"
 ```
 
 - `create` auto-runs the SSH-config step; `devbox configure-ssh <name>` is only for
   boxes created elsewhere.
-- `--no_checkout` skips the default repo clone: rsync carries the worktree, so no
-  GitHub credentials land on the box.
+- `--no_checkout` skips the default repo clone: rsync carries the worktree, so the
+  box needs no repository credentials.
 - A `create` that fails (e.g. against a workspace quota) still registers the name,
   leaving a record to remove with `devbox expire <name> --force` before the name can
   be reused. Fleet-wide vCPU concurrency is a separate per-plan limit from instance
@@ -136,7 +135,7 @@ EOF
 
 ## Measured reference timings
 
-Size `m` (8 vCPU / 16 GiB) box at zrh, 2026-08-12, against this workspace
+Size `m` (8 vCPU / 16 GiB) box at a nearby site, 2026-08-12, against this workspace
 (52 crates, ~346k lines, 895 locked packages):
 
 | Measurement | Result |

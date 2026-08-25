@@ -459,16 +459,16 @@ impl MigrationRunner {
                 contract.target_version
             )));
         }
-        // These two tables are the only bootstrap exception. Both statements
-        // are the exact baseline-locked migration bytes and each runs alone.
+        // Claim-protected recovery metadata must exist before the first
+        // per-version compatibility write. The ordinary migration loop still
+        // records all three exact migration identities in version order.
+        for statement in post_claim_bootstrap_statements() {
+            ensure_migration_fence(connection, migration_lease).await?;
+            sqlx::query(statement).execute(&mut *connection).await?;
+        }
+        // Fence the interval after the final bootstrap; otherwise takeover
+        // could occur after V066 and before the migration loop's first read.
         ensure_migration_fence(connection, migration_lease).await?;
-        sqlx::query(SCHEMA_VERSION_BOOTSTRAP_SQL)
-            .execute(&mut *connection)
-            .await?;
-        ensure_migration_fence(connection, migration_lease).await?;
-        sqlx::query(control_lease_bootstrap_sql())
-            .execute(&mut *connection)
-            .await?;
 
         let migrations = self
             .discover()
@@ -728,6 +728,15 @@ fn bootstrap_statements_for_decision(
             incompatibility.clone(),
         )),
     }
+}
+
+fn post_claim_bootstrap_statements() -> &'static [&'static str] {
+    const APPLICATION_BOOTSTRAP: &[&str] = &[
+        SCHEMA_VERSION_BOOTSTRAP_SQL,
+        CONTROL_LEASE_BOOTSTRAP_SQL,
+        SCHEMA_COMPATIBILITY_BOOTSTRAP_SQL,
+    ];
+    APPLICATION_BOOTSTRAP
 }
 
 async fn read_schema_observation(
@@ -1333,6 +1342,10 @@ fn count_statements(sql: &str) -> usize {
 }
 
 #[cfg(test)]
+#[path = "migration/schema_bootstrap_property_tests.rs"]
+mod schema_bootstrap_property_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         collections::HashMap,
@@ -1597,6 +1610,23 @@ mod tests {
             super::control_lease_bootstrap_sql(),
             include_str!("../../migrations/V067__tokeira_control_lease.sql")
         );
+        assert_eq!(
+            super::post_claim_bootstrap_statements(),
+            &[
+                include_str!("../../migrations/V001__schema_version.sql"),
+                include_str!("../../migrations/V067__tokeira_control_lease.sql"),
+                include_str!("../../migrations/V066__schema_compatibility.sql"),
+            ]
+        );
+
+        let migration = MigrationRunner::embedded()
+            .dry_run()
+            .expect("embedded migrations are valid")
+            .into_iter()
+            .find(|migration| migration.version == 66)
+            .expect("V066 remains an ordinary migration");
+        assert_eq!(migration.name, "schema_compatibility");
+        assert_eq!(migration.sql, super::schema_compatibility_bootstrap_sql());
     }
 
     #[test]

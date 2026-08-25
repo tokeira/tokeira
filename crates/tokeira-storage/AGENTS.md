@@ -14,10 +14,15 @@ the schema.
 This file is the **canonical** home of the root heading *Adding or Changing a DSQL
 Migration* (the root keeps the name and points here). The rules:
 
-- **Strictly forward-only.** The baseline is cut through V067. Never edit, rename,
-  reorder, or delete a baseline-locked migration; `schema-baseline.lock` makes such a
-  change a build failure. Every schema change is a new migration above the current
-  head, including any supported, idempotent `ALTER TABLE` operation.
+- **Baseline lock discipline.** The tracked baseline through V067 prevents
+  uncoordinated edits and makes any migration/lock mismatch a build failure. Before
+  Tokeira declares its first durable release baseline, an explicitly approved schema
+  re-cut may replace a locked migration only when migration bytes, baseline metadata,
+  schema contract and digests, build information, tests, and this policy are updated as
+  one reviewed unit. After that first durable release, migrations are strictly
+  forward-only: never edit, rename, reorder, or delete a baseline-locked migration;
+  every schema change is a new migration above the current head, including any
+  supported, idempotent `ALTER TABLE` operation.
 - **Contiguous versions.** No gaps or duplicate `VNNN`; the next schema change after
   the baseline starts at V068.
 - **DSQL DDL subset always.** One statement per file; secondary indexes created `ASYNC`;

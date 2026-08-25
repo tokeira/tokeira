@@ -152,7 +152,7 @@ pub enum SchemaIncompatibilityCategory {
         /// Observed persisted digest.
         observed: String,
     },
-    /// Compatibility metadata describes a different version from the ledger head.
+    /// Compatibility metadata does not name a possible non-empty ledger prefix.
     MetadataVersionMismatch {
         /// Ledger head.
         current: u32,
@@ -258,23 +258,27 @@ pub fn assess_schema_compatibility(
     };
 
     if let Some(metadata) = &observation.compatibility {
-        if metadata.schema_version != current {
+        if metadata.schema_version == 0 || metadata.schema_version > current {
             return reject(SchemaIncompatibilityCategory::MetadataVersionMismatch {
                 current,
                 metadata: metadata.schema_version,
             });
         }
-        let expected = match migration_set_digest(recognized, current) {
+        // Ledger recording precedes compatibility persistence so a crash may
+        // leave valid metadata one or more versions behind. Only metadata
+        // zero or a version ahead of the authoritative ledger is impossible
+        // under this protocol.
+        let expected = match migration_set_digest(recognized, metadata.schema_version) {
             Ok(digest) => digest,
             Err(_) => {
                 return reject(SchemaIncompatibilityCategory::UnknownMigration {
-                    version: current,
+                    version: metadata.schema_version,
                 });
             }
         };
         if metadata.migration_set_digest != expected {
             return reject(SchemaIncompatibilityCategory::DigestMismatch {
-                version: current,
+                version: metadata.schema_version,
                 expected,
                 observed: metadata.migration_set_digest.clone(),
             });
@@ -301,8 +305,11 @@ pub fn assess_schema_compatibility(
     }
     SchemaDecision::Compatible {
         current,
-        legacy_backfill: observation.compatibility.is_none()
-            && policy == SchemaMigrationPolicy::Automatic,
+        legacy_backfill: policy == SchemaMigrationPolicy::Automatic
+            && observation
+                .compatibility
+                .as_ref()
+                .is_none_or(|metadata| metadata.schema_version < current),
     }
 }
 
@@ -587,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn released_name_and_metadata_version_changes_are_rejected() {
+    fn released_name_and_metadata_ahead_of_the_ledger_are_rejected() {
         let migrations = recognized(3);
         let contract = SchemaCompatibilityContract {
             tokeira_release: "test".to_owned(),
@@ -616,7 +623,7 @@ mod tests {
             .compatibility
             .as_mut()
             .expect("metadata fixture")
-            .schema_version = 2;
+            .schema_version = 4;
         assert!(matches!(
             assess_schema_compatibility(
                 &contract,
@@ -629,5 +636,66 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn validated_metadata_lag_is_recoverable() {
+        let migrations = recognized(3);
+        let contract = SchemaCompatibilityContract {
+            tokeira_release: "test".to_owned(),
+            minimum_supported_version: 1,
+            target_version: 3,
+            maximum_readable_version: 3,
+            migration_set_digest: migration_set_digest(&migrations, 3).expect("fixture digest"),
+        };
+        let mut observed = observation(&migrations, 3, true);
+        observed
+            .compatibility
+            .as_mut()
+            .expect("metadata fixture")
+            .schema_version = 0;
+        assert!(matches!(
+            assess_schema_compatibility(
+                &contract,
+                &migrations,
+                &observed,
+                SchemaMigrationPolicy::Automatic,
+            ),
+            SchemaDecision::Reject(SchemaIncompatibility {
+                category: SchemaIncompatibilityCategory::MetadataVersionMismatch { .. },
+                ..
+            })
+        ));
+
+        let mut observed = observation(&migrations, 3, true);
+        let metadata = observed.compatibility.as_mut().expect("metadata fixture");
+        metadata.schema_version = 2;
+        metadata.migration_set_digest =
+            migration_set_digest(&migrations, 2).expect("prefix digest");
+
+        assert_eq!(
+            assess_schema_compatibility(
+                &contract,
+                &migrations,
+                &observed,
+                SchemaMigrationPolicy::Automatic,
+            ),
+            SchemaDecision::Compatible {
+                current: 3,
+                legacy_backfill: true,
+            }
+        );
+        assert_eq!(
+            assess_schema_compatibility(
+                &contract,
+                &migrations,
+                &observed,
+                SchemaMigrationPolicy::ValidateOnly,
+            ),
+            SchemaDecision::Compatible {
+                current: 3,
+                legacy_backfill: false,
+            }
+        );
     }
 }

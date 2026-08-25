@@ -541,7 +541,7 @@ pub struct SchemaCompatibilityContract {
 pub enum SchemaDecision {
     Initialize { target: u32 },
     Migrate { from: u32, to: u32 },
-    Compatible { current: u32 },
+    Compatible { current: u32, legacy_backfill: bool },
     MigrationRequired { current: u32, target: u32 },
     Reject(SchemaIncompatibility),
 }
@@ -568,12 +568,24 @@ configuration crate's `DsqlMigrationPolicy` into it with an exhaustive match, av
 new `tokeira-storage` → `tokeira-config` dependency.
 
 Assessment begins with catalog/ledger reads that tolerate missing metadata tables and
-performs no DDL. Only an `Initialize` or `Migrate` decision creates `schema_version` and
-`tokeira_control_lease` with idempotent bootstrap DDL before acquiring the migration
-claim. Their canonical DDL is also represented by the corresponding numbered migrations,
-so the ledger and digest still account for them. This small bootstrap exception is
-necessary because the lease table cannot protect its own first creation. Validate-only
-assessment never bootstraps either table.
+performs no DDL. Only an automatic `Initialize` or `Migrate` decision creates the exact
+V001 `schema_version` and V067 `tokeira_control_lease` tables with idempotent bootstrap
+DDL before acquiring the migration claim. This pre-claim exception is necessary because
+the lease table cannot protect its own first creation. Validate-only assessment never
+bootstraps either table.
+
+After the claim is acquired, automatic application revalidates the fence before each
+exact V001, V067, and V066 bootstrap statement and once more after V066. V066 makes
+`schema_compatibility` available before the first per-version compatibility write. All
+three canonical statements remain ordinary numbered migrations: the ordered loop still
+executes or recognizes them and records their exact identities in the ledger, so the
+ledger and digest account for every bootstrap table.
+
+The migration ledger is authoritative for the applied prefix. Because ledger recording
+precedes compatibility persistence, a crash may leave checksum-valid compatibility
+metadata behind the ledger head. Assessment validates that metadata against its own
+prefix digest, rejects metadata ahead of the ledger, and lets automatic policy backfill
+a validated lag; validate-only policy remains read-only.
 
 An uninitialized cluster carrying a managed descriptor is always `Initialize`, including
 recovery after a crash between cluster creation and schema installation. This is the one

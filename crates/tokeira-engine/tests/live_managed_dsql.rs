@@ -8,6 +8,7 @@
 
 use std::{
     collections::BTreeMap,
+    future::Future,
     net::TcpListener,
     path::PathBuf,
     sync::{
@@ -159,6 +160,268 @@ fn trace_headers(trace_id: &str, span_id: &str) -> Result<HeaderMap> {
     Ok(headers)
 }
 
+fn combine_generation_result<T, E>(
+    exercise: Result<T>,
+    shutdown: std::result::Result<(), E>,
+    generation: &str,
+) -> Result<T> {
+    match (exercise, shutdown) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => {
+            Err(error).with_context(|| format!("{generation} engine exercise failed"))
+        }
+        (Ok(_), Err(_)) => bail!("{generation} engine shutdown failed"),
+        (Err(_), Err(_)) => bail!("{generation} engine exercise and shutdown failed"),
+    }
+}
+
+async fn exercise_first_generation(
+    engine: &Engine,
+    config: &EmbeddedEngineConfig,
+    cluster_id: &str,
+    cluster_arn: &str,
+) -> Result<(String, String, i64)> {
+    let report = engine.startup_report();
+    let cluster = report
+        .cluster
+        .as_ref()
+        .context("managed startup report must contain canonical cluster identity")?;
+    ensure!(cluster.cluster_id == cluster_id);
+    ensure!(cluster.cluster_arn == cluster_arn);
+    ensure!(
+        report.schema.is_some(),
+        "managed startup must apply the schema contract"
+    );
+    ensure!(
+        report.ownership.is_some(),
+        "managed startup must acquire exclusive embedded ownership"
+    );
+    let first_fence = report
+        .ownership
+        .context("managed startup must report the owner fence")?
+        .fence_token;
+
+    let options = ConnectionOptions::new(url::Url::parse(
+        "http://managed-embedded-dsql.invalid:7233",
+    )?)
+    .service_override(engine.service_override())
+    .dns_load_balancing(None)
+    .build();
+    let connection = Connection::connect(options).await?;
+    ensure!(
+        connection.capabilities().is_some(),
+        "the DSQL-backed embedded edge must serve Temporal SDK calls through service_override"
+    );
+    drop(connection);
+
+    let cluster_prefix = cluster_id.chars().take(8).collect::<String>();
+    let workflow_id = format!("managed-live-{cluster_prefix}");
+    let started: StartWorkflowExecutionResponse = call(
+        &engine.endpoint(),
+        "StartWorkflowExecution",
+        trace_headers("11111111111111111111111111111111", "1111111111111111")?,
+        StartWorkflowExecutionRequest {
+            namespace: "default".to_owned(),
+            workflow_id: workflow_id.clone(),
+            workflow_type: Some(WorkflowType {
+                name: "managed-live-workflow".to_owned(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: "managed-live-queue".to_owned(),
+                ..Default::default()
+            }),
+            request_id: format!("start-{workflow_id}"),
+            ..Default::default()
+        },
+    )
+    .await?;
+    ensure!(!started.run_id.is_empty());
+
+    let mut competing_config = config.clone();
+    competing_config.startup_timeout_ms = Duration::from_secs(120).as_millis() as u64;
+    match Engine::start_with_embedded_config(competing_config).await {
+        Ok(competing) => {
+            let shutdown = competing.shutdown().await;
+            ensure!(
+                shutdown.is_ok(),
+                "an unexpectedly admitted competing engine also failed explicit shutdown"
+            );
+            bail!("a live embedded owner unexpectedly admitted a second engine");
+        }
+        Err(error) => ensure!(
+            matches!(
+                error,
+                EmbeddedEngineStartError::Phase {
+                    phase: EmbeddedStartupPhase::Ownership
+                }
+            ),
+            "the competing engine must fail at ownership without mutating shared state"
+        ),
+    }
+
+    Ok((workflow_id, started.run_id, first_fence))
+}
+
+async fn exercise_restart_generation(
+    engine: &Engine,
+    cluster_id: &str,
+    cluster_arn: &str,
+    workflow_id: &str,
+    run_id: &str,
+    first_fence: i64,
+) -> Result<()> {
+    let restart_report = engine.startup_report();
+    let restart_cluster = restart_report
+        .cluster
+        .as_ref()
+        .context("restart must report its recovered cluster")?;
+    ensure!(restart_cluster.cluster_id == cluster_id);
+    ensure!(restart_cluster.cluster_arn == cluster_arn);
+    let restart_ownership = restart_report
+        .ownership
+        .context("restart must report clean ownership")?;
+    ensure!(restart_ownership.outcome == ControlLeaseAcquireOutcome::Clean);
+    ensure!(restart_ownership.fence_token > first_fence);
+
+    let described: DescribeWorkflowExecutionResponse = call(
+        &engine.endpoint(),
+        "DescribeWorkflowExecution",
+        trace_headers("22222222222222222222222222222222", "2222222222222222")?,
+        DescribeWorkflowExecutionRequest {
+            namespace: "default".to_owned(),
+            execution: Some(WorkflowExecution {
+                workflow_id: workflow_id.to_owned(),
+                run_id: String::new(),
+            }),
+        },
+    )
+    .await?;
+    let execution = described
+        .workflow_execution_info
+        .and_then(|info| info.execution)
+        .context("restarted engine must preserve the workflow execution")?;
+    ensure!(execution.workflow_id == workflow_id);
+    ensure!(execution.run_id == run_id);
+    Ok(())
+}
+
+async fn exercise_ready_cluster(
+    region: &str,
+    descriptor_path: PathBuf,
+    tags: BTreeMap<String, String>,
+    cluster_id: &str,
+    cluster_arn: &str,
+) -> Result<()> {
+    // Occupied configured listeners prove embedded transport remains callback-only.
+    let occupied_grpc = TcpListener::bind("127.0.0.1:0")?;
+    let occupied_metrics = TcpListener::bind("127.0.0.1:0")?;
+    let occupied_nexus = TcpListener::bind("127.0.0.1:0")?;
+    let config = live_configuration(
+        region,
+        descriptor_path,
+        tags,
+        &occupied_grpc,
+        &occupied_metrics,
+        &occupied_nexus,
+    );
+
+    let engine = Engine::start_with_embedded_config(config.clone()).await?;
+    let old_endpoint = engine.endpoint();
+    let first_result = exercise_first_generation(&engine, &config, cluster_id, cluster_arn).await;
+    let first_shutdown = engine.shutdown().await;
+    let (workflow_id, run_id, first_fence) =
+        combine_generation_result(first_result, first_shutdown, "first")?;
+
+    let old_status = old_endpoint
+        .call(InProcessGrpcRequest {
+            service: WORKFLOW_SERVICE.to_owned(),
+            rpc: "GetSystemInfo".to_owned(),
+            headers: HeaderMap::new(),
+            proto: GetSystemInfoRequest::default().encode_to_vec().into(),
+        })
+        .await
+        .expect_err("the old embedded endpoint must remain closed after ownership release");
+    ensure!(old_status.code() == tonic::Code::Unavailable);
+
+    let restarted = Engine::start_with_embedded_config(config).await?;
+    let restart_result = exercise_restart_generation(
+        &restarted,
+        cluster_id,
+        cluster_arn,
+        &workflow_id,
+        &run_id,
+        first_fence,
+    )
+    .await;
+    let restart_shutdown = restarted.shutdown().await;
+    combine_generation_result(restart_result, restart_shutdown, "restarted")
+}
+
+async fn destroy_ready_cluster(
+    control: AwsDsqlControlPlane,
+    store: LocalClusterDescriptorStore,
+    expected_cluster_id: String,
+    expected_cluster_arn: String,
+) -> Result<()> {
+    let admin = ManagedDsqlAdmin::new(control, store.clone());
+    let plan = admin
+        .plan_destroy(AdminDeadline::after(LIFECYCLE_TIMEOUT))
+        .await?;
+    ensure!(plan.cluster_id == expected_cluster_id);
+    ensure!(plan.cluster_arn == expected_cluster_arn);
+    ensure!(
+        plan.deletion_protection_enabled,
+        "the explicit destroy plan must observe deletion protection before disabling it"
+    );
+    let confirmation = plan.confirm();
+    let destroyed = admin
+        .apply_destroy(&plan, confirmation, AdminDeadline::after(LIFECYCLE_TIMEOUT))
+        .await?;
+    ensure!(destroyed.outcome == DestroyOutcome::Destroyed);
+    ensure!(
+        matches!(
+            store
+                .load()
+                .await?
+                .context("destruction must leave a durable tombstone")?
+                .into_v1()
+                .state,
+            ClusterDescriptorState::Destroyed { .. }
+        ),
+        "explicit destruction must persist a destroyed tombstone"
+    );
+    Ok(())
+}
+
+fn combine_ready_cluster_results(exercise: Result<()>, teardown: Result<()>) -> Result<()> {
+    match (exercise, teardown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(_), Ok(())) => {
+            bail!("managed embedded DSQL exercise failed; administrative teardown completed")
+        }
+        (Ok(()), Err(_)) => bail!(
+            "managed embedded DSQL administrative teardown failed; the cluster may remain live; use descriptor-bound recovery"
+        ),
+        (Err(_), Err(_)) => bail!(
+            "managed embedded DSQL exercise and administrative teardown failed; the cluster may remain live; use descriptor-bound recovery"
+        ),
+    }
+}
+
+async fn complete_ready_cluster<Exercise, Teardown, TeardownFuture>(
+    exercise: Exercise,
+    teardown: Teardown,
+) -> Result<()>
+where
+    Exercise: Future<Output = Result<()>>,
+    Teardown: FnOnce() -> TeardownFuture,
+    TeardownFuture: Future<Output = Result<()>>,
+{
+    let exercise_result = exercise.await;
+    let teardown_result = teardown().await;
+    combine_ready_cluster_results(exercise_result, teardown_result)
+}
+
 #[tokio::test]
 #[ignore = "creates and destroys a billable Aurora DSQL cluster; follow docs/testing/managed-embedded-dsql-live-aws.md"]
 async fn managed_embedded_dsql_live_lifecycle() -> Result<()> {
@@ -247,10 +510,6 @@ async fn managed_embedded_dsql_live_lifecycle() -> Result<()> {
         .await?
         .context("recovery must commit the canonical identity")?
         .into_v1();
-    ensure!(
-        ready.creation_client_token.expose() == creation_token,
-        "recovery must reuse the creation token persisted before CreateCluster"
-    );
     let (cluster_id, cluster_arn, endpoint) = match &ready.state {
         ClusterDescriptorState::Ready {
             cluster_id,
@@ -264,172 +523,117 @@ async fn managed_embedded_dsql_live_lifecycle() -> Result<()> {
             bail!("recovery unexpectedly observed a destroyed tombstone")
         }
     };
-    ensure!(recovered.identity.cluster_id == *cluster_id);
-    ensure!(recovered.identity.cluster_arn == *cluster_arn);
-    ensure!(recovered.endpoint == *endpoint);
-    ensure!(
-        recovered.deletion_protection_enabled,
-        "managed creation must enable deletion protection"
-    );
+    // Once the descriptor is Ready, assertion failures belong to the captured
+    // exercise result so none can bypass descriptor-bound teardown.
+    let ready_validation = (|| -> Result<()> {
+        ensure!(
+            ready.creation_client_token.expose() == creation_token,
+            "recovery must reuse the creation token persisted before CreateCluster"
+        );
+        ensure!(recovered.identity.cluster_id == *cluster_id);
+        ensure!(recovered.identity.cluster_arn == *cluster_arn);
+        ensure!(recovered.endpoint == *endpoint);
+        ensure!(
+            recovered.deletion_protection_enabled,
+            "managed creation must enable deletion protection"
+        );
+        Ok(())
+    })();
 
-    // Keeping all configured process listener addresses occupied proves that
-    // `StackTransport::Embedded` stays entirely on the callback transport.
-    let occupied_grpc = TcpListener::bind("127.0.0.1:0")?;
-    let occupied_metrics = TcpListener::bind("127.0.0.1:0")?;
-    let occupied_nexus = TcpListener::bind("127.0.0.1:0")?;
-    let config = live_configuration(
-        &region,
-        descriptor_path,
-        tags,
-        &occupied_grpc,
-        &occupied_metrics,
-        &occupied_nexus,
-    );
-    let engine = Engine::start_with_embedded_config(config.clone()).await?;
-    let report = engine.startup_report();
-    let cluster = report
-        .cluster
-        .as_ref()
-        .context("managed startup report must contain canonical cluster identity")?;
-    ensure!(cluster.cluster_id == *cluster_id);
-    ensure!(cluster.cluster_arn == *cluster_arn);
-    ensure!(
-        report.schema.is_some(),
-        "managed startup must apply the schema contract"
-    );
-    ensure!(
-        report.ownership.is_some(),
-        "managed startup must acquire exclusive embedded ownership"
-    );
-    let first_fence = report
-        .ownership
-        .context("managed startup must report the owner fence")?
-        .fence_token;
-
-    let options = ConnectionOptions::new(url::Url::parse(
-        "http://managed-embedded-dsql.invalid:7233",
-    )?)
-    .service_override(engine.service_override())
-    .dns_load_balancing(None)
-    .build();
-    let connection = Connection::connect(options).await?;
-    ensure!(
-        connection.capabilities().is_some(),
-        "the DSQL-backed embedded edge must serve Temporal SDK calls through service_override"
-    );
-    drop(connection);
-
-    let workflow_id = format!("managed-live-{}", &cluster_id[..8]);
-    let started: StartWorkflowExecutionResponse = call(
-        &engine.endpoint(),
-        "StartWorkflowExecution",
-        trace_headers("11111111111111111111111111111111", "1111111111111111")?,
-        StartWorkflowExecutionRequest {
-            namespace: "default".to_owned(),
-            workflow_id: workflow_id.clone(),
-            workflow_type: Some(WorkflowType {
-                name: "managed-live-workflow".to_owned(),
-            }),
-            task_queue: Some(TaskQueue {
-                name: "managed-live-queue".to_owned(),
-                ..Default::default()
-            }),
-            request_id: format!("start-{workflow_id}"),
-            ..Default::default()
+    let teardown_cluster_id = cluster_id.to_owned();
+    let teardown_cluster_arn = cluster_arn.to_owned();
+    complete_ready_cluster(
+        async {
+            ready_validation?;
+            exercise_ready_cluster(&region, descriptor_path, tags, cluster_id, cluster_arn).await
         },
+        move || destroy_ready_cluster(control, store, teardown_cluster_id, teardown_cluster_arn),
     )
-    .await?;
-    ensure!(!started.run_id.is_empty());
+    .await
+}
 
-    let mut competing_config = config.clone();
-    competing_config.startup_timeout_ms = Duration::from_secs(120).as_millis() as u64;
-    let competing_error = Engine::start_with_embedded_config(competing_config)
-        .await
-        .expect_err("a live embedded owner must exclude a second engine");
-    ensure!(
-        matches!(
-            competing_error,
-            EmbeddedEngineStartError::Phase {
-                phase: EmbeddedStartupPhase::Ownership
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use anyhow::anyhow;
+
+    use super::*;
+
+    const SECRET_CANARIES: [&str; 6] = [
+        "credential-canary=AKIA0000000000000000",
+        "database-token-canary=db-token-secret",
+        "creation-token-canary=create-token-secret",
+        "postgresql://secret@cluster.example.invalid/tokeira",
+        "endpoint-canary=cluster.dsql.example.invalid",
+        "/private/descriptor-canary.json",
+    ];
+
+    #[tokio::test]
+    async fn ready_cluster_teardown_runs_once_and_results_are_secret_safe() {
+        for (exercise_fails, teardown_fails, expected_message) in [
+            (false, false, None),
+            (
+                true,
+                false,
+                Some("managed embedded DSQL exercise failed; administrative teardown completed"),
+            ),
+            (
+                false,
+                true,
+                Some(
+                    "managed embedded DSQL administrative teardown failed; the cluster may remain live; use descriptor-bound recovery",
+                ),
+            ),
+            (
+                true,
+                true,
+                Some(
+                    "managed embedded DSQL exercise and administrative teardown failed; the cluster may remain live; use descriptor-bound recovery",
+                ),
+            ),
+        ] {
+            let teardown_calls = Arc::new(AtomicUsize::new(0));
+            let canary_error = SECRET_CANARIES.join("|");
+            let exercise_error = canary_error.clone();
+            let teardown_error = canary_error.clone();
+            let calls = Arc::clone(&teardown_calls);
+
+            let result = complete_ready_cluster(
+                async move {
+                    if exercise_fails {
+                        Err(anyhow!(exercise_error))
+                    } else {
+                        Ok(())
+                    }
+                },
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if teardown_fails {
+                        Err(anyhow!(teardown_error))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+
+            assert_eq!(teardown_calls.load(Ordering::SeqCst), 1);
+            match expected_message {
+                Some(expected) => {
+                    let message = result
+                        .expect_err("selected failure must be classified")
+                        .to_string();
+                    assert_eq!(message, expected);
+                    for canary in SECRET_CANARIES {
+                        assert!(!message.contains(canary));
+                    }
+                }
+                None => result.expect("successful exercise and teardown must succeed"),
             }
-        ),
-        "the competing engine must fail at ownership, not mutate shared state: {competing_error}"
-    );
-
-    let old_endpoint = engine.endpoint();
-    engine.shutdown().await?;
-    let old_status = old_endpoint
-        .call(InProcessGrpcRequest {
-            service: WORKFLOW_SERVICE.to_owned(),
-            rpc: "GetSystemInfo".to_owned(),
-            headers: HeaderMap::new(),
-            proto: GetSystemInfoRequest::default().encode_to_vec().into(),
-        })
-        .await
-        .expect_err("the old embedded endpoint must remain closed after ownership release");
-    ensure!(old_status.code() == tonic::Code::Unavailable);
-
-    let restarted = Engine::start_with_embedded_config(config).await?;
-    let restart_report = restarted.startup_report();
-    let restart_cluster = restart_report
-        .cluster
-        .as_ref()
-        .context("restart must report its recovered cluster")?;
-    ensure!(restart_cluster.cluster_id == *cluster_id);
-    ensure!(restart_cluster.cluster_arn == *cluster_arn);
-    let restart_ownership = restart_report
-        .ownership
-        .context("restart must report clean ownership")?;
-    ensure!(restart_ownership.outcome == ControlLeaseAcquireOutcome::Clean);
-    ensure!(restart_ownership.fence_token > first_fence);
-
-    let described: DescribeWorkflowExecutionResponse = call(
-        &restarted.endpoint(),
-        "DescribeWorkflowExecution",
-        trace_headers("22222222222222222222222222222222", "2222222222222222")?,
-        DescribeWorkflowExecutionRequest {
-            namespace: "default".to_owned(),
-            execution: Some(WorkflowExecution {
-                workflow_id: workflow_id.clone(),
-                run_id: String::new(),
-            }),
-        },
-    )
-    .await?;
-    let execution = described
-        .workflow_execution_info
-        .and_then(|info| info.execution)
-        .context("restarted engine must preserve the workflow execution")?;
-    ensure!(execution.workflow_id == workflow_id);
-    ensure!(execution.run_id == started.run_id);
-    restarted.shutdown().await?;
-
-    let admin = ManagedDsqlAdmin::new(control, store.clone());
-    let plan = admin
-        .plan_destroy(AdminDeadline::after(LIFECYCLE_TIMEOUT))
-        .await?;
-    ensure!(plan.cluster_id == *cluster_id);
-    ensure!(plan.cluster_arn == *cluster_arn);
-    ensure!(
-        plan.deletion_protection_enabled,
-        "the explicit destroy plan must observe deletion protection before disabling it"
-    );
-    let confirmation = plan.confirm();
-    let destroyed = admin
-        .apply_destroy(&plan, confirmation, AdminDeadline::after(LIFECYCLE_TIMEOUT))
-        .await?;
-    ensure!(destroyed.outcome == DestroyOutcome::Destroyed);
-    ensure!(
-        matches!(
-            store
-                .load()
-                .await?
-                .context("destruction must leave a durable tombstone")?
-                .into_v1()
-                .state,
-            ClusterDescriptorState::Destroyed { .. }
-        ),
-        "explicit destruction must persist a destroyed tombstone"
-    );
-    Ok(())
+        }
+    }
 }

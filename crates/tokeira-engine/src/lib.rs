@@ -550,7 +550,7 @@ impl std::fmt::Display for EmbeddedStartupPhase {
 pub enum EmbeddedEngineStartError {
     /// Configuration failed before any external resource was touched.
     InvalidConfiguration(tokeira_config::EmbeddedConfigError),
-    /// One startup phase failed; details remain in host-controlled telemetry.
+    /// One startup phase failed; the nested cause is deliberately discarded.
     Phase {
         /// Phase that did not complete.
         phase: EmbeddedStartupPhase,

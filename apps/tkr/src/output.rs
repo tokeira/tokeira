@@ -11,6 +11,40 @@ use std::fmt::Display;
 
 pub(crate) mod build_info;
 
+/// Render a refusal through the operator Markdown convention — skinned via
+/// termimad on a terminal, raw deterministic Markdown to a pipe — mirroring
+/// `tkp`'s report emission. Refusals are authored in Markdown from here on;
+/// existing plain-text messages render unchanged. Always stderr: stdout
+/// stays parseable for `--json` consumers.
+pub(crate) fn render_refusal(error: &anyhow::Error) {
+    use std::io::IsTerminal;
+    let mut text = format!("**refused:** {error}\n");
+    let mut causes = error.chain().skip(1).peekable();
+    if causes.peek().is_some() {
+        text.push_str("\nbecause:\n");
+        for cause in causes {
+            text.push_str(&format!("- {cause}\n"));
+        }
+    }
+    if std::io::stderr().is_terminal() {
+        eprintln!("{}", termimad::term_text(&text));
+    } else {
+        eprint!("{text}");
+    }
+}
+
+/// Render a report through the same operator Markdown convention as
+/// [`render_refusal`], on stdout: reports are the verb's answer, not a
+/// complaint about the request.
+pub(crate) fn render_markdown(text: &str) {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        println!("{}", termimad::term_text(text));
+    } else {
+        print!("{text}");
+    }
+}
+
 pub(crate) struct OutputFormatter {
     json: bool,
 }

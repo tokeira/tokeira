@@ -246,10 +246,21 @@ pub fn resolve_source_closure_for_packages(
         }
     }
     // `[patch.*]` targets resolve eagerly — a dangling patch path fails the
-    // scoped workspace outright, reachable or not — so every patch path
-    // stages unconditionally.
-    for patch_dir in manifest_patch_paths(workspace_root)? {
-        path_dependency_dirs.insert(patch_dir);
+    // scoped workspace outright — so a patch whose package the closure
+    // reaches must stage. An UNREACHABLE patch is instead dropped from the
+    // scoped manifest entirely (`scoped_workspace_manifest`): keeping it
+    // would draw an unrelated vendored tree into every frozen source (and
+    // re-key every engine identity when that vendor advances), and cargo
+    // warns "patch was not used" on every resolution besides.
+    let reachable_names: BTreeSet<&str> = crate_names
+        .iter()
+        .map(String::as_str)
+        .chain(locked.iter().map(|dep| dep.name.as_str()))
+        .collect();
+    for (name, patch_dir) in manifest_patch_paths(workspace_root)? {
+        if reachable_names.contains(name.as_str()) {
+            path_dependency_dirs.insert(patch_dir);
+        }
     }
     crate_dirs.sort();
     crate_names.sort();
@@ -270,10 +281,13 @@ pub fn resolve_source_closure_for_packages(
     })
 }
 
-/// Workspace-relative `path` targets of every `[patch.*]` entry in the root
-/// manifest. Patch paths are authored workspace-relative; an absolute or
-/// escaping path is refused — it could not be frozen with the source.
-fn manifest_patch_paths(workspace_root: &Path) -> Result<Vec<PathBuf>, ClosureError> {
+/// `(package, workspace-relative path)` of every `[patch.*]` path entry in
+/// the root manifest. Patch paths are authored workspace-relative; an
+/// absolute or escaping path is refused — it could not be frozen with the
+/// source.
+pub(crate) fn manifest_patch_paths(
+    workspace_root: &Path,
+) -> Result<Vec<(String, PathBuf)>, ClosureError> {
     let path = workspace_root.join("Cargo.toml");
     let content = std::fs::read_to_string(&path).map_err(|source| ClosureError::ReadFile {
         path: path.display().to_string(),
@@ -299,7 +313,7 @@ fn manifest_patch_paths(workspace_root: &Path) -> Result<Vec<PathBuf>, ClosureEr
                     path: patch_path.to_owned(),
                 });
             }
-            paths.push(relative.to_path_buf());
+            paths.push((name.clone(), relative.to_path_buf()));
         }
     }
     Ok(paths)

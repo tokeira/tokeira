@@ -160,21 +160,20 @@ pub(crate) enum DevAction {
 
 #[derive(Subcommand)]
 pub(crate) enum DefinitionAction {
-    /// Check a definition: parse + interpret it in memory — no providers
-    /// touched, nothing changes. Checks the selected deployment's
-    /// recorded definition (or `--deployment <name>`'s); `--definition`
-    /// checks a source anywhere on disk through an explicit frontend format.
+    /// Check a definition. `--definition <path>` is the frontend syntax
+    /// tier: parse + admitted-subset + companion parts, in process,
+    /// instantly. The selected deployment's definition (or
+    /// `--deployment <name>`'s) is the full check: interpreted through the
+    /// deployment's platform — vocabulary, typed config, context.
     Check {
-        /// Check the definition at this path instead of a deployment's:
-        /// authoring mode — the definition needs no deployment to exist yet.
+        /// Check the source at this path through its frontend's syntax
+        /// tier: authoring mode — no deployment, no platform.
         #[arg(long, alias = "path")]
         definition: Option<std::path::PathBuf>,
-        /// Definition format resolved through trusted frontend discovery.
+        /// Frontend override when the file extension is misleading;
+        /// normally the extension (`.tkd`, `.tkdp`) names the frontend.
         #[arg(long, requires = "definition")]
         format: Option<tokeira_orchestrator::DefinitionFormatId>,
-        /// Platform whose typed config, context, and kinds admit the source.
-        #[arg(long, requires = "definition")]
-        platform: Option<tokeira_orchestrator::PlatformId>,
     },
 }
 

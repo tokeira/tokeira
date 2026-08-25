@@ -359,6 +359,18 @@ fn scoped_workspace_manifest(
     }
 
     let scoped = format!("{}{}{}", &full[..open], rendered, &full[close..]);
+    // Patches resolve eagerly: an entry whose package the closure never
+    // reaches would drag an unrelated vendored tree into every frozen
+    // source (re-keying identities when that vendor advances) and draw a
+    // "patch was not used" warning from every resolution — drop it.
+    let reachable: BTreeSet<&str> = closure
+        .crate_names
+        .iter()
+        .map(String::as_str)
+        .chain(closure.locked.iter().map(|dep| dep.name.as_str()))
+        .collect();
+    let scoped = drop_unreachable_patches(&scoped, &reachable)?;
+
     let parsed: toml::Value = toml::from_str(&scoped).map_err(|error| {
         CompositionError::InvalidSelection(format!(
             "scoped workspace manifest does not parse: {error}"
@@ -379,7 +391,85 @@ fn scoped_workspace_manifest(
             "scoping the workspace members array altered the wrong region".to_string(),
         ));
     }
+    if let Some(patches) = parsed.get("patch").and_then(toml::Value::as_table) {
+        for registry in patches.values() {
+            if let Some(entries) = registry.as_table() {
+                if let Some(stray) = entries
+                    .keys()
+                    .find(|name| !reachable.contains(name.as_str()))
+                {
+                    return Err(CompositionError::InvalidSelection(format!(
+                        "scoped manifest still patches unreachable package `{stray}`"
+                    )));
+                }
+            }
+        }
+    }
     Ok(scoped)
+}
+
+/// Remove `[patch.<registry>]` entry lines (and emptied table headers) for
+/// packages outside `reachable`, line-based so every kept line survives
+/// byte-identically. Tables and entries are recognized structurally
+/// (`[patch.` headers, `name = value` lines within), and the result is
+/// re-parsed by the caller, so a miss fails loudly rather than silently.
+fn drop_unreachable_patches(
+    manifest: &str,
+    reachable: &BTreeSet<&str>,
+) -> Result<String, CompositionError> {
+    let mut kept = String::with_capacity(manifest.len());
+    let mut in_patch_table = false;
+    let mut table_buffer: Vec<&str> = Vec::new();
+    let mut table_has_entries = false;
+
+    let flush = |buffer: &mut Vec<&str>, has_entries: bool, kept: &mut String| {
+        if has_entries {
+            for line in buffer.iter() {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        buffer.clear();
+    };
+
+    for line in manifest.lines() {
+        let trimmed = line.trim_start();
+        let is_header = trimmed.starts_with('[');
+        if is_header {
+            if in_patch_table {
+                flush(&mut table_buffer, table_has_entries, &mut kept);
+            }
+            in_patch_table = trimmed.starts_with("[patch.");
+            if in_patch_table {
+                table_buffer.push(line);
+                table_has_entries = false;
+                continue;
+            }
+        }
+        if in_patch_table {
+            let entry_name = trimmed
+                .split_once('=')
+                .map(|(name, _)| name.trim().trim_matches('"'));
+            match entry_name {
+                Some(name) if !name.is_empty() && !trimmed.starts_with('#') => {
+                    if reachable.contains(name) {
+                        table_buffer.push(line);
+                        table_has_entries = true;
+                    }
+                    // Unreachable entry lines are dropped.
+                }
+                // Comments and blank lines ride with the table.
+                _ => table_buffer.push(line),
+            }
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    if in_patch_table {
+        flush(&mut table_buffer, table_has_entries, &mut kept);
+    }
+    Ok(kept)
 }
 
 /// Refuse a staged scoped lock that strays outside the admitted closure:
@@ -1168,6 +1258,44 @@ macro_rules! bound_provisioner_main {
         assert_eq!(
             parsed["workspace"]["resolver"],
             toml::Value::String("3".to_string())
+        );
+    }
+
+    #[test]
+    fn scoped_manifest_drops_patches_the_closure_never_reaches() {
+        let fixture = Fixture::new();
+        let source = fixture.assemble("tkd");
+        let full =
+            std::fs::read_to_string(fixture.root.join("Cargo.toml")).expect("fixture manifest");
+        // One patch the closure reaches (a member's name) and one it never
+        // does — only the reachable entry may survive the scoping.
+        let with_patches = format!(
+            "{full}\n[patch.crates-io]\nalpha-platform = {{ path = \"platforms/alpha\" }}\nunrelated-vendored = {{ path = \"vendor/unrelated\" }}\n"
+        );
+
+        let scoped =
+            scoped_workspace_manifest(&with_patches, source.closure()).expect("scoped manifest");
+        let parsed: toml::Value = toml::from_str(&scoped).expect("scoped manifest parses");
+        let patches = parsed["patch"]["crates-io"]
+            .as_table()
+            .expect("patch table survives");
+        assert!(patches.contains_key("alpha-platform"));
+        assert!(!patches.contains_key("unrelated-vendored"));
+
+        // A closure reaching NO patched package drops the table whole.
+        let mut none_reachable = source.clone();
+        let scoped = {
+            let closure = none_reachable.closure().clone();
+            let _ = &mut none_reachable;
+            let mut trimmed = closure;
+            trimmed.crate_names.retain(|name| name != "alpha-platform");
+            trimmed.locked.clear();
+            scoped_workspace_manifest(&with_patches, &trimmed).expect("scoped manifest")
+        };
+        let parsed: toml::Value = toml::from_str(&scoped).expect("scoped manifest parses");
+        assert!(
+            parsed.get("patch").is_none(),
+            "an all-unreachable patch table is dropped whole:\n{scoped}"
         );
     }
 

@@ -27,6 +27,7 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+termimad.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
@@ -41,6 +42,9 @@ tokeira-local-deployment = { path = "../../platforms/local" }
 tokeira-ecs-deployment = { path = "../../platforms/ecs" }
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
 tokeira-platform.workspace = true
+# The linked frontends for the standalone `definition check` syntax tier: the
+# check runs in-process against the frontend libraries — no provisioner build.
+tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
 tokeira-deployment = { workspace = true }
 tokeira-state = { workspace = true }
 tokeira-storage = { path = "../../crates/tokeira-storage", features = ["dsql"] }

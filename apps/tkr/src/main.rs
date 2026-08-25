@@ -46,6 +46,7 @@ use clap::Parser;
 mod bundle_create;
 mod cli;
 mod commands;
+mod definition_check;
 mod deployment_dir;
 mod deployment_lock;
 mod launcher;
@@ -64,7 +65,17 @@ use cli::{
 use deployment_dir::{DeploymentResolver, load_context};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            output::render_refusal(&error);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     let deployments = DeploymentResolver::default()?;
 
@@ -107,11 +118,7 @@ async fn main() -> Result<()> {
             commands::image::run(args.command, deployment, format).await
         }
         Command::Definition { action } => {
-            let cli::DefinitionAction::Check {
-                definition,
-                format,
-                platform,
-            } = action;
+            let cli::DefinitionAction::Check { definition, format } = action;
             if let Some(path) = definition {
                 // Authoring mode: the definition needs no deployment. One
                 // subject per check — a named path and a named deployment
@@ -119,16 +126,10 @@ async fn main() -> Result<()> {
                 if selected.is_some() {
                     anyhow::bail!("pass either `--definition` or `--deployment`, not both");
                 }
-                let format = format.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("standalone definition checking requires `--format <id>`")
-                })?;
-                let platform = platform.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("standalone definition checking requires `--platform <id>`")
-                })?;
-                launcher::launch_definition_check_at_path(
-                    &path, platform, format, cli.json, cli.detail,
-                )
-                .await
+                // The syntax tier: in-process, against the frontends linked
+                // into `tkr`. Engine interpretation belongs to the
+                // deployment-bound arm below.
+                definition_check::check_at_path(&path, format.as_ref(), cli.json)
             } else if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
                 launcher::launch(
@@ -858,17 +859,14 @@ mod tests {
                 "--definition",
                 "defs/staging.tkd",
                 "--format",
-                "tkd",
-                "--platform",
-                "compose"
+                "tkd"
             ])
             .unwrap()
             .command,
             Command::Definition {
                 action: cli::DefinitionAction::Check {
                     definition: Some(_),
-                    format: Some(_),
-                    platform: Some(_)
+                    format: Some(_)
                 }
             }
         ));

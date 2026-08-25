@@ -153,10 +153,9 @@ async fn run() -> Result<()> {
             // in-process platforms run through `commands::infra`.
             if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
-                // `infra apply` is the same coherent one-command flow as
-                // `deployment apply` (Req 6.5): a never-stamped deployment is
-                // initialized first, then applied — the operator's first
-                // apply works whichever spelling they reach for.
+                // `infra apply` is the same forwarded operation as
+                // `deployment apply` (Req 6.5); creation has already committed
+                // the binding and initial revision.
                 if let InfraAction::Apply {
                     yes,
                     explanation,
@@ -190,9 +189,9 @@ async fn run() -> Result<()> {
             if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
                 let (verb, mut extra) = forwarded_deploy_verb(&action);
-                if matches!(action, DeployAction::Plan { .. } | DeployAction::Status) {
-                    extra.extend(output_flags(cli.json, cli.detail));
-                }
+                // Both workload verbs now produce reports, so their global
+                // output mode crosses the provisioner boundary unchanged.
+                extra.extend(output_flags(cli.json, cli.detail));
                 launcher::launch(&dir, verb, &extra).await
             } else {
                 let ctx = load_context(&deployments, selected)?;
@@ -1287,6 +1286,11 @@ mod tests {
             "stages the observability part"
         );
         assert!(
+            dir.join("observability/dashboards/broker-runtime-health.json")
+                .is_file(),
+            "stages platform-owned companion content"
+        );
+        assert!(
             tkd.contains("Storage::InMemory"),
             "in-memory keeps the shipped config()"
         );
@@ -1318,6 +1322,14 @@ mod tests {
             .expect("Compose seed frontend");
         let platform_package = &descriptor.package;
         let frontend_package = &frontend.package;
+        let sources = tokeira_platform_definition::read_source_set(&seed, Some(&frontend.format))
+            .expect("frontend-owned sources");
+        let content = discovery
+            .workspace_content(descriptor)
+            .expect("platform-owned content")
+            .into_iter()
+            .map(|file| (file.relative_path, file.bytes))
+            .collect();
         let temp = tempfile::tempdir().expect("deployment root");
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         let pending = deployments
@@ -1331,8 +1343,9 @@ mod tests {
                         format: frontend.format.clone(),
                         path: definition_path,
                     },
-                    parts: deployment_dir::sibling_parts(&seed).expect("platform-owned parts"),
-                    bytes: fs::read(seed).expect("platform-owned seed"),
+                    parts: sources.parts,
+                    bytes: sources.root,
+                    content,
                 }),
             )
             .expect("stage deployment");
@@ -1404,6 +1417,9 @@ mod tests {
         let facts = launcher::validate_staged_definition(pending.path())
             .await
             .expect("generated provisioner validates its seed");
+        launcher::realize_staged_deployment(pending.path(), &facts, 0)
+            .await
+            .expect("creation realizes the Day-0 binding");
         let identity = facts.identity.expect("the check reports the identity");
         let companions = facts.companions.unwrap_or_default();
         let staged_repository = repository_setup::provision_staged(
@@ -1417,6 +1433,35 @@ mod tests {
         assert_eq!(metadata.platform.as_str(), "compose");
         let dir = deployments.path("generated-compose");
         assert!(dir.join("tkp").is_file());
+        let envelope_store: Box<
+            dyn tokeira_state::DeploymentStore<tokeira_deployment::DeploymentStateEnvelope>,
+        > = Box::new(tokeira_state::CasStore::new(
+            Box::new(tokeira_state::LocalBackend::new(dir.join("state/envelope"))),
+            "envelope".to_string(),
+        ));
+        let (envelope, _) = envelope_store
+            .load()
+            .await
+            .expect("created deployment envelope loads");
+        assert!(
+            envelope.binding.is_some(),
+            "creation records the Day-0 provisioner binding"
+        );
+        assert!(
+            envelope.integrity.is_some(),
+            "creation records the placed provisioner's integrity manifest"
+        );
+        let retained_zero = dir.join("state/config-revisions/0");
+        assert!(
+            retained_zero
+                .join("observability/templates/alloy.alloy")
+                .is_file(),
+            "revision zero retains the platform-declared authored content tree"
+        );
+        assert!(
+            !retained_zero.join("config").exists(),
+            "revision zero does not invent rendered apply output"
+        );
         repository_setup::publish_birth(&dir, &staged_repository, identity, companions)
             .await
             .expect("the birth publication uploads");
@@ -1436,13 +1481,41 @@ mod tests {
         )
         .await
         .expect("fetch materializes the publication");
-        launcher::launch(
-            &fetched_resolver.path("generated-compose"),
-            &["describe"],
-            &[],
-        )
-        .await
-        .expect("post-fetch describe admission is green");
+        let fetched_dir = fetched_resolver.path("generated-compose");
+        let fetched_envelope_store: Box<
+            dyn tokeira_state::DeploymentStore<tokeira_deployment::DeploymentStateEnvelope>,
+        > = Box::new(tokeira_state::CasStore::new(
+            Box::new(tokeira_state::LocalBackend::new(
+                fetched_dir.join("state/envelope"),
+            )),
+            "envelope".to_string(),
+        ));
+        let (fetched_envelope, _) = fetched_envelope_store
+            .load()
+            .await
+            .expect("fetched creation envelope loads");
+        assert!(
+            fetched_envelope.binding.is_some(),
+            "fetch realizes the verified creation binding before publication"
+        );
+        assert!(
+            fetched_dir
+                .join("state/config-revisions/0/observability/templates/alloy.alloy")
+                .is_file(),
+            "fetch retains the materialized authored source at the claim's revision"
+        );
+        let fetched_metadata = metadata::read(&fetched_dir).expect("fetched metadata");
+        let fetched_binding = fetched_metadata
+            .deployment_repository
+            .expect("fetched metadata carries the repository binding");
+        assert_eq!(
+            fetched_binding.trusted_root_digest,
+            tokeira_deployment::sha256_hex(&staged_repository.trusted_root),
+            "fetch re-pins the accepted trust anchor"
+        );
+        launcher::launch(&fetched_dir, &["describe"], &[])
+            .await
+            .expect("post-fetch describe admission is green");
     }
 
     /// Task 15.3: local create → local repository, no Dagger. The engine is
@@ -1475,6 +1548,13 @@ mod tests {
                     },
                     bytes: b"root-definition".to_vec(),
                     parts: vec![("platform.tkd".to_string(), b"companion-part".to_vec())],
+                    content: vec![(
+                        tokeira_orchestrator::RelativeDefinitionPath::new(
+                            "observability/templates/alloy.alloy",
+                        )
+                        .expect("content path"),
+                        b"template-content".to_vec(),
+                    )],
                 }),
             )
             .expect("stage deployment");
@@ -1585,6 +1665,13 @@ mod tests {
                 .any(|target| target == TOKEIRAD_TOML),
             "the templated config tree is published"
         );
+        assert!(
+            publication
+                .config_targets()
+                .iter()
+                .any(|target| target == "observability/templates/alloy.alloy"),
+            "platform-owned content is published"
+        );
         for target in publication.config_targets() {
             assert_eq!(
                 publication.read(target).await.expect("published config"),
@@ -1601,21 +1688,21 @@ mod tests {
             "the engine binary is the placed tkp"
         );
 
-        // Fetch onto a second deployments root (task 17.3): every
-        // materialized file is byte-identical to the created dir — the
-        // manifest sidecar included, since publish carries it verbatim.
+        // Exercise the verified materialization plan directly: the public
+        // fetch path additionally executes the staged provisioner, which the
+        // real generated-provisioner test above covers. These deterministic
+        // mock artifact bytes deliberately are not an executable.
         let second = tempfile::tempdir().expect("second root");
         let fetched_resolver = DeploymentResolver::with_root(second.path().to_path_buf());
-        let repo_home = repository_setup::local_repository_home(deployments.root(), "dev");
-        repository_setup::fetch(
-            &fetched_resolver,
-            "dev",
-            &repo_home.display().to_string(),
-            &dir.join("state/repository/root.json"),
-        )
-        .await
-        .expect("fetch materializes the publication");
         let fetched_dir = fetched_resolver.path("dev");
+        let plan = tokeira_deployment::repository::fetch::MaterializePlan::new(
+            &publication,
+            env!("TKR_TARGET"),
+        )
+        .expect("verified publication has a host materialization plan");
+        plan.materialize_into(&publication, &fetched_dir)
+            .await
+            .expect("verified bytes materialize");
         for file in [
             "definition.tkd",
             "platform.tkd",
@@ -1629,15 +1716,6 @@ mod tests {
                 "{file} byte-identical across create and fetch"
             );
         }
-        let fetched_metadata = metadata::read(&fetched_dir).expect("fetched metadata");
-        let fetched_binding = fetched_metadata
-            .deployment_repository
-            .expect("fetched metadata carries the repository binding");
-        assert_eq!(
-            fetched_binding.trusted_root_digest,
-            tokeira_deployment::sha256_hex(&anchor),
-            "fetch re-pins the accepted trust anchor"
-        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

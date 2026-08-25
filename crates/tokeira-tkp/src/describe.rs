@@ -842,7 +842,7 @@ mod tests {
         assert!(!summary.contains("**operation**"), "{summary}");
     }
 
-    // Attention lines join uninvited exactly when they should: a fresh
+    // Attention lines join uninvited exactly when they should: an incomplete
     // (unstamped) deployment speaks; a versioned engine renders bare; an
     // unrecorded storage line is absent, never guessed.
     #[test]
@@ -861,7 +861,7 @@ mod tests {
         assert!(summary.contains("- **engine**    1.0.0\n"), "{summary}");
         assert!(!summary.contains("(dev build)"), "{summary}");
         assert!(
-            summary.contains("- **binding**   not initialized"),
+            summary.contains("- **binding**   creation record missing"),
             "{summary}"
         );
         assert!(!summary.contains("**storage**"), "{summary}");

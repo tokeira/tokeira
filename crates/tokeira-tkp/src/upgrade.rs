@@ -21,7 +21,7 @@ use tokeira_state::DeploymentStore;
 
 use tokeira_platform::definition::DefinitionFrontend;
 
-use crate::{engine::Engine, envelope_store, init::running_integrity_manifest, platform::Admitted};
+use crate::{engine::Engine, envelope_store, platform::Admitted, running_integrity_manifest};
 
 pub(crate) async fn upgrade<F: DefinitionFrontend>(
     engine: &Engine<F>,

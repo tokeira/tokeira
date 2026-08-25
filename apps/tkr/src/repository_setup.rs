@@ -215,16 +215,24 @@ pub(crate) async fn fetch(
         .root()
         .join(format!(".{name}.fetch-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(staging.join("state"))?;
-    let result = fetch_into(&staging, &locator, &anchor, s3, &name).await;
+    let result = async {
+        let fetched = fetch_into(&staging, &locator, &anchor, s3, &name).await?;
+        let facts = crate::launcher::validate_staged_definition(&staging).await?;
+        crate::launcher::realize_staged_deployment(&staging, &facts, fetched.config_revision)
+            .await?;
+        Ok::<_, anyhow::Error>(fetched)
+    }
+    .await;
     match result {
-        Ok(version) => {
+        Ok(fetched) => {
             std::fs::rename(&staging, &final_path).with_context(|| {
                 format!("failed to commit the fetch to {}", final_path.display())
             })?;
             println!(
                 "fetched publication {version} of deployment '{name}' from {} into {}",
                 locator.display(),
-                final_path.display()
+                final_path.display(),
+                version = fetched.publication_version,
             );
             Ok(())
         }
@@ -235,13 +243,18 @@ pub(crate) async fn fetch(
     }
 }
 
+struct FetchedPublication {
+    publication_version: u64,
+    config_revision: u64,
+}
+
 async fn fetch_into(
     staging: &Path,
     locator: &RepositoryLocator,
     anchor: &[u8],
     s3: Option<aws_sdk_s3::Client>,
     name: &str,
-) -> Result<u64> {
+) -> Result<FetchedPublication> {
     // The TUF client's datastore must exist before the load that fills it.
     std::fs::create_dir_all(staging.join(DATASTORE_DIR))?;
     let opened = open(
@@ -302,7 +315,10 @@ async fn fetch_into(
         updated_at: now,
     };
     crate::metadata::write(staging, &metadata)?;
-    Ok(publication.version())
+    Ok(FetchedPublication {
+        publication_version: publication.version(),
+        config_revision: claim.config_revision,
+    })
 }
 
 /// The storage kind recorded in the fetched `tokeirad.toml` (the CLI-side

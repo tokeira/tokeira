@@ -68,6 +68,23 @@ impl Fixture {
         }
     }
 
+    fn local_with_space() -> Self {
+        let keys_dir = tempfile::tempdir().expect("keys dir");
+        let repo_parent = tempfile::tempdir().expect("repo parent");
+        let repo_path = repo_parent.path().join("Application Support/repository");
+        let config = RepositoryConfig {
+            locator: RepositoryLocator::Local { path: repo_path },
+            keys: RoleKeyConfig::generate_local(keys_dir.path()).expect("keygen"),
+            lifetimes: RoleLifetimes::default(),
+        };
+        Self {
+            config,
+            input_dir: tempfile::tempdir().expect("input dir"),
+            _keys_dir: keys_dir,
+            repo_dir: Some(repo_parent),
+        }
+    }
+
     fn s3(bucket_name: &str) -> (Self, testkit::Bucket) {
         let keys_dir = tempfile::tempdir().expect("keys dir");
         let bucket: testkit::Bucket = Default::default();
@@ -186,6 +203,33 @@ impl Fixture {
             bundle_artifacts: artifact_paths,
         }
     }
+}
+
+#[test]
+fn local_repository_loads_from_a_path_with_spaces() {
+    runtime().block_on(async {
+        let fixture = Fixture::local_with_space();
+        let input = fixture.input(b"root", &[], &[], Transition::Create, 0);
+        let receipt = publish_local(&fixture, input, 0, None)
+            .await
+            .expect("publish under spaced path");
+
+        let opened = open(
+            &fixture.config.locator,
+            &receipt.trusted_root,
+            None,
+            Freshness::Enforced,
+            None,
+        )
+        .await
+        .expect("open under spaced path");
+        let publication = opened
+            .verified_publication()
+            .await
+            .expect("verify publication");
+
+        assert_eq!(publication.version(), 1);
+    });
 }
 
 fn engine_identity() -> EngineIdentity {

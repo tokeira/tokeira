@@ -94,6 +94,7 @@ pub fn platform() -> PlatformDeclaration {
 //         expected_platform: "compose",
 //         platform: tokeira_compose_deployment::platform,
 //         expected_format: "tkd",
+//         content_roots: ["observability"],
 //         frontend: tokeira_platform_definition::tkd::frontend,
 //     }
 //

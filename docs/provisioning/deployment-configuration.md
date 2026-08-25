@@ -218,8 +218,9 @@ tkr infra apply
 tkr deployment describe
 ```
 
-The first apply initializes the provisioner envelope, then converges the interpreted
-definition. Compose workloads are infrastructure resources, so deploy plan/apply are an
+Creation has already realized the provisioner envelope and retained revision `0`; the
+first apply only converges the interpreted definition. Compose workloads are
+infrastructure resources, so deploy plan/apply are an
 alternate namespace over the same realized universe rather than a separate runtime
 store transition.
 

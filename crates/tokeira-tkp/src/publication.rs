@@ -230,10 +230,10 @@ mod tests {
     async fn apply_and_revert_publish_their_committed_transitions() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (engine, admitted) = crate::testkit::engine(tmp.path());
-        // Init before the fake sidecar lands: admission self-verifies the
-        // running binary against a placed manifest, and the fake engine is
-        // not the test process.
-        crate::init::init(&admitted).await.expect("init");
+        // Realize creation before the fake sidecar lands: admission
+        // self-verifies a placed manifest, and the fake engine is not the test
+        // process.
+        crate::testkit::realize_creation(&admitted).await;
         stage_fake_engine(tmp.path());
         let (config, anchor) = provision_and_birth(tmp.path(), &engine, &admitted).await;
 

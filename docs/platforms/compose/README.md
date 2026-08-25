@@ -42,9 +42,10 @@ tkr infra destroy --yes
 tkr deployment destroy --name dev-compose --yes
 ```
 
-The first apply runs the hidden Day-0 initialization before provider mutation. It stamps
-the envelope and retains `definition.tkd` as revision 0, then performs `tkp infra apply`.
-A non-destructive plan does not require `--yes`; deletes and replacements do.
+Creation stamps the envelope and retains the complete authored source set as revision 0
+before the deployment directory becomes visible. The first apply therefore performs only
+`tkp infra apply`. A non-destructive plan does not require `--yes`; deletes and
+replacements do.
 
 `tkr deploy plan/apply` is also forwarded, but Compose models containers as
 infrastructure resources, so those verbs realize the same desired universe as the infra

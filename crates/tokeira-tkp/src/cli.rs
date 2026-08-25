@@ -17,8 +17,8 @@ use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_platform::definition::DefinitionFrontend;
 
 use crate::{
-    apply, definition, deploy, describe, destroy, engine::Engine, init, lock, plan,
-    platform::Admitted, revert, rollback, scale, upgrade,
+    apply, definition, deploy, describe, destroy, engine::Engine, lock, plan, platform::Admitted,
+    revert, rollback, scale, upgrade,
 };
 
 #[derive(Parser)]
@@ -42,12 +42,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Day-0 mandatory versioning: write the first provenance stamp + integrity
-    /// manifest before any resource create. Internal — an inception step of
-    /// `tkr deployment create`, not an operator verb, so it is hidden
-    /// from help.
-    #[command(hide = true)]
-    Init(LifecycleArgs),
     /// Read-only report of identity, recorded provenance, binding verdict, and
     /// state facts. Never gates.
     Describe(DescribeArgs),
@@ -87,7 +81,7 @@ impl Command {
     /// standalone authored source has no deployment metadata to admit.
     fn admission_dir(&self) -> Option<&std::path::Path> {
         match self {
-            Self::Init(args) | Self::Upgrade(args) => Some(&args.deployment_dir),
+            Self::Upgrade(args) => Some(&args.deployment_dir),
             Self::Config(ConfigCommand::Seed(args)) => Some(&args.deployment_dir),
             Self::Describe(args) => Some(&args.deployment_dir),
             Self::Definition(DefinitionCommand::Check(args)) => args
@@ -385,13 +379,6 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
         }
         // Mutating verbs run under the deployment's operation lock.
         // `rollback` holds one continuous lock across its whole sequence.
-        Command::Init(_) => {
-            let admitted = require(admitted);
-            lock::with_operation_lock(&admitted.deployment_ref.dir, "init", || {
-                init::init(admitted)
-            })
-            .await
-        }
         Command::Infra(InfraCommand::Apply(args)) => {
             let admitted = require(admitted);
             let yes = args.yes;
@@ -482,5 +469,18 @@ pub(crate) fn exit_status(outcome: Result<()>) -> Result<std::process::ExitCode>
             Ok(_) => Ok(std::process::ExitCode::FAILURE),
             Err(err) => Err(err),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_is_not_a_provisioner_command() {
+        let Err(error) = Cli::try_parse_from(["tkp", "init", "--deployment-dir", "/tmp/d"]) else {
+            panic!("creation has no provisioner inception verb");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 }

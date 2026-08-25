@@ -17,7 +17,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tokeira_deployment::DeploymentBindingMetadata;
-use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
+use tokeira_orchestrator::{DefinitionFormatId, PlatformId, RelativeDefinitionPath};
 use tokeira_platform::{
     declaration::{
         DeploymentRef, Ops, PlatformDeclaration, PlatformExecution, PlatformIntegration,
@@ -39,6 +39,7 @@ pub struct Admitted {
     pub metadata: DeploymentBindingMetadata,
     /// The deployment's coordinates: identity, never state.
     pub deployment_ref: DeploymentRef,
+    content_roots: Vec<RelativeDefinitionPath>,
 }
 
 impl Admitted {
@@ -50,7 +51,11 @@ impl Admitted {
             .definition
             .as_ref()
             .expect("admission verified the definition record");
-        crate::ConfigSource::recorded(definition.format.clone(), definition.path.clone())
+        crate::ConfigSource::recorded_with_content(
+            definition.format.clone(),
+            definition.path.clone(),
+            self.content_roots.clone(),
+        )
     }
 }
 
@@ -62,6 +67,7 @@ impl Admitted {
 pub struct BoundPlatform {
     id: PlatformId,
     format: DefinitionFormatId,
+    content_roots: Vec<RelativeDefinitionPath>,
     declaration: PlatformDeclaration,
 }
 
@@ -81,10 +87,26 @@ impl BoundPlatform {
         format: &'static str,
         declaration: PlatformDeclaration,
     ) -> Result<Self> {
+        Self::bind_with_content(id, format, &[], declaration)
+    }
+
+    /// Bind the declaration and its generated, descriptor-owned authored
+    /// content roots to the built-as identity pair.
+    pub fn bind_with_content(
+        id: &'static str,
+        format: &'static str,
+        content_roots: &[&str],
+        declaration: PlatformDeclaration,
+    ) -> Result<Self> {
         validate_namespace_kinds(&declaration.namespaces)?;
+        let content_roots = content_roots
+            .iter()
+            .map(RelativeDefinitionPath::new)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             id: PlatformId::new(id)?,
             format: DefinitionFormatId::new(format)?,
+            content_roots,
             declaration,
         })
     }
@@ -114,6 +136,7 @@ impl BoundPlatform {
         Ok(Admitted {
             metadata,
             deployment_ref,
+            content_roots: self.content_roots.clone(),
         })
     }
 
@@ -448,11 +471,22 @@ mod tests {
     fn admission_yields_the_value_every_verb_threads() {
         let dir = tempfile::tempdir().unwrap();
         write_metadata(dir.path(), "test");
-        let platform = BoundPlatform::bind("test", "tkd", declaration()).unwrap();
+        let platform =
+            BoundPlatform::bind_with_content("test", "tkd", &["observability"], declaration())
+                .unwrap();
         let admitted = platform.admit_deployment(dir.path()).unwrap();
         assert_eq!(admitted.metadata.name, "demo");
         assert_eq!(admitted.deployment_ref.name, "demo");
         assert_eq!(admitted.deployment_ref.dir, dir.path());
+        assert_eq!(
+            admitted
+                .config_source()
+                .content_roots
+                .iter()
+                .map(RelativeDefinitionPath::as_str)
+                .collect::<Vec<_>>(),
+            ["observability"]
+        );
     }
 
     #[test]

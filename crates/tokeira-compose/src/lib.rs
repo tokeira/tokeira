@@ -25,6 +25,7 @@
 //! A deployment that uses this crate passes a [`ComposePlatform`] to the deploy
 //! facade for runtime service apply.
 
+mod docker_endpoint;
 pub mod execution;
 pub mod kinds;
 pub mod ops;
@@ -62,6 +63,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac as iac;
+
+use crate::docker_endpoint::DockerEndpoint;
 
 /// The Compose resource namespace exposed to definition frontends.
 ///
@@ -398,18 +401,23 @@ impl ComposePlatform {
         deployment_dir: impl Into<PathBuf>,
         project_name: impl Into<String>,
     ) -> Result<Self, ComposeError> {
-        let docker = Docker::connect_with_local_defaults().map_err(|error| {
-            ComposeError::DockerNotAvailable {
-                socket_path: "local-default".into(),
+        let endpoint =
+            DockerEndpoint::resolve().map_err(|evidence| ComposeError::DockerNotAvailable {
+                socket_path: "Docker context".into(),
+                evidence,
+            })?;
+        let docker = endpoint
+            .connect()
+            .map_err(|error| ComposeError::DockerNotAvailable {
+                socket_path: endpoint.label().to_string(),
                 evidence: error.to_string(),
-            }
-        })?;
+            })?;
         Ok(Self {
             docker,
             compose_file: compose_file.into(),
             deployment_dir: deployment_dir.into(),
             project_name: project_name.into(),
-            socket_path: "local-default".into(),
+            socket_path: endpoint.label().to_string(),
         })
     }
 

@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use chrono::Utc;
 use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_report::{Depth, Mode, Report};
 
@@ -39,6 +40,14 @@ struct CheckReport {
     /// single-document definition, absent when the check failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     companions: Option<Vec<String>>,
+    /// The exact running-engine stamp creation records after this read-only
+    /// admission succeeds. Absent in standalone authoring mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<tokeira_deployment::ProvenanceStamp>,
+    /// The admitted source set creation retains as its initial revision.
+    /// Absent in standalone authoring mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<tokeira_deployment::ConfigSource>,
     /// The interpreter's located verdict ("parse error at line 112, …").
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -154,17 +163,22 @@ pub(crate) async fn check<F: DefinitionFrontend>(
     // mode names the deployment, its definition basename, and the revision
     // anchor (read tolerantly — the check's subject is the definition, so an
     // unreadable envelope drops the fact rather than failing the verb).
-    let (deployment, definition, revision) = match (source, admitted) {
-        (Some(path), _) => (None, path.display().to_string(), None),
-        (None, Some(admitted)) => (
-            Some(admitted.deployment_ref.name.clone()),
-            admitted.config_source().path.as_str().to_string(),
-            crate::envelope_store(&admitted.deployment_ref.dir)
-                .load()
-                .await
-                .ok()
-                .map(|(envelope, _)| envelope.config_revision),
-        ),
+    let (deployment, definition, revision, provenance, config_source) = match (source, admitted) {
+        (Some(path), _) => (None, path.display().to_string(), None, None, None),
+        (None, Some(admitted)) => {
+            let config_source = admitted.config_source();
+            (
+                Some(admitted.deployment_ref.name.clone()),
+                config_source.path.as_str().to_string(),
+                crate::envelope_store(&admitted.deployment_ref.dir)
+                    .load()
+                    .await
+                    .ok()
+                    .map(|(envelope, _)| envelope.config_revision),
+                Some(tokeira_deployment::ProvenanceStamp::current(Utc::now())),
+                Some(config_source),
+            )
+        }
         (None, None) => unreachable!("deployment-mode check admits its deployment"),
     };
     let report = CheckReport {
@@ -174,6 +188,8 @@ pub(crate) async fn check<F: DefinitionFrontend>(
         verifies: error.is_none(),
         identity,
         companions,
+        provenance,
+        source: config_source,
         error,
     };
     crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
@@ -208,6 +224,8 @@ mod tests {
             verifies: true,
             identity: Some(identity.clone()),
             companions: Some(vec!["platform".to_string()]),
+            provenance: None,
+            source: None,
             error: None,
         };
         let value = serde_json::to_value(&report).unwrap();
@@ -222,6 +240,8 @@ mod tests {
             verifies: false,
             identity: None,
             companions: None,
+            provenance: None,
+            source: None,
             error: Some("parse error".to_string()),
         };
         let value = serde_json::to_value(&failed).unwrap();
@@ -244,6 +264,8 @@ mod tests {
             verifies: true,
             identity: Some(identity),
             companions: Some(Vec::new()),
+            provenance: None,
+            source: None,
             error: None,
         };
         let value = serde_json::to_value(&report).unwrap();
@@ -272,6 +294,8 @@ mod tests {
             verifies: true,
             identity: None,
             companions: None,
+            provenance: None,
+            source: None,
             error: None,
         };
         let narrative = tokeira_report::render(&report, Mode::resolve(false, false)).unwrap();
@@ -301,6 +325,8 @@ mod tests {
             verifies: false,
             identity: None,
             companions: None,
+            provenance: None,
+            source: None,
             error: Some(
                 "the definition does not verify: parse error at line 112, column 18: expected `,`"
                     .to_string(),

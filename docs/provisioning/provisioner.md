@@ -67,8 +67,9 @@ Every command targets exactly one directory using `--deployment-dir`.
 | `tkp upgrade --deployment-dir DIR` | Mutating | Transfers ownership to the running engine, applies it, and retains rollback evidence. |
 | `tkp rollback --deployment-dir DIR` | Mutating | Uses the prior checkpoint to remove new-engine creations, re-pin, and reconcile with the prior engine. |
 
-`init` is a hidden Day-0 command. `tkr` invokes it before the first forwarded apply when
-the deployment has no recorded binding.
+Day 0 is deliberately not a TKP command. `tkr deployment create` records the binding,
+integrity manifest, and initial source revision while the deployment is still staged;
+mutating TKP verbs therefore always begin from a complete creation record.
 
 Global `--json` and `--detail` select structured output and evidence depth. Plan and
 apply commands can additionally write a complete explanation model with
@@ -176,10 +177,10 @@ provider object exists.
 
 ## Day 0 and configuration revisions
 
-Initialization runs before the first provider create. It records the current provenance
-and an integrity manifest, sets revision `0`, and retains the platform's config source. A
-bundle sidecar is accepted only when it parses, validates, and describes the running
-binary; otherwise initialization refuses rather than silently self-stamping.
+Deployment creation records the provisioner's reported provenance and independently
+verified integrity manifest, sets revision `0`, and retains the platform's complete
+authored source set before publishing the deployment directory. No provider operation
+runs during this creation transition.
 
 Every successful config-applying operation advances the revision and snapshots the exact
 source beneath `state/config-revisions/`. The effective config reference is a SHA-256
@@ -203,7 +204,7 @@ equality.
 | `Mismatch` | Versioned hashes differ, or a versioned binary meets a dev deployment. | Refuse ordinary mutation; use the matching engine or upgrade. |
 | `Downgrade` | Running version is older than the recorded version. | Refuse. |
 | `ModeRegression` | A dev binary meets a versioned deployment. | Refuse. |
-| `Unknown` | No binding is recorded. | Refuse direct mutation; initialize through `tkr` first. |
+| `Unknown` | No binding is recorded. | Refuse mutation; recreate or re-fetch the incomplete deployment. |
 
 Read-only commands report rather than enforce this verdict. This is intentional: an
 operator must be able to inspect and plan a deployment precisely when mutation is

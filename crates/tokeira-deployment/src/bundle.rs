@@ -21,9 +21,9 @@ use crate::{
 };
 
 /// Basename of the bundle-manifest sidecar `tkr deployment create` places
-/// next to the deployment's `tkp` (task 18.3). `tkp init` records it as the
-/// Day-0 integrity manifest — after verifying its own bytes are one of the
-/// manifest's artifacts — instead of the pre-identity self-stamp.
+/// next to the deployment's `tkp` (task 18.3). Staged creation records it as
+/// the Day-0 integrity manifest after independently verifying that the placed
+/// bytes are one of the manifest's artifacts.
 pub const BUNDLE_MANIFEST_BASENAME: &str = "tkp.manifest.json";
 
 /// Evidence that the bundle's bytes passed their tests. Bound to the bundle —

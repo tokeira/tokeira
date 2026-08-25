@@ -34,6 +34,10 @@ struct RetainedSourceIdentity {
     /// shape the platform-source-set work will formalize.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parts: Vec<String>,
+    /// Platform-declared authored content roots retained recursively beside
+    /// the definition. Rendered output roots are absent by construction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    content_roots: Vec<RelativeDefinitionPath>,
 }
 
 impl RetainedSourceIdentity {
@@ -42,6 +46,7 @@ impl RetainedSourceIdentity {
             format: source.format.clone(),
             path: source.path.clone(),
             parts,
+            content_roots: source.content_roots.clone(),
         }
     }
 }
@@ -69,7 +74,8 @@ fn identity_path(deployment_dir: &Path, revision: u64) -> PathBuf {
 }
 
 /// Retain exact live bytes and their independently admitted format/path,
-/// plus every sibling definition part (`*.{format}` beside the root).
+/// plus every sibling definition part (`*.{format}` beside the root) and
+/// every platform-declared authored content root.
 pub fn snapshot(deployment_dir: &Path, source: &ConfigSource, revision: u64) -> Result<()> {
     let live = config_file(deployment_dir, source);
     let bytes = match std::fs::read(&live) {
@@ -101,6 +107,13 @@ pub fn snapshot(deployment_dir: &Path, source: &ConfigSource, revision: u64) -> 
             .with_context(|| format!("failed to read part {}", live_part.display()))?;
         std::fs::write(&retained_part, bytes)
             .with_context(|| format!("failed to write {}", retained_part.display()))?;
+    }
+    let retained_root = revision_root(deployment_dir, revision);
+    for content_root in &source.content_roots {
+        let live_content = deployment_dir.join(content_root.as_path());
+        let retained_content = retained_root.join(content_root.as_path());
+        remove_path_if_present(&retained_content)?;
+        copy_authored_path(&live_content, &retained_content)?;
     }
     let identity = serde_json::to_vec_pretty(&RetainedSourceIdentity::new(source, parts))?;
     let identity_path = identity_path(deployment_dir, revision);
@@ -199,7 +212,9 @@ fn retained_identity(
 }
 
 fn identity_matches(retained: &RetainedSourceIdentity, source: &ConfigSource) -> bool {
-    retained.format == source.format && retained.path == source.path
+    retained.format == source.format
+        && retained.path == source.path
+        && retained.content_roots == source.content_roots
 }
 
 /// Whether a revision carries bytes under the exact current format/path.
@@ -252,23 +267,27 @@ pub fn retained_revisions(deployment_dir: &Path, source: &ConfigSource) -> Vec<u
     revisions
 }
 
-/// Restore one same-format, same-path revision into the recorded live
-/// source, definition parts included. Parts the revision retained are
-/// written back over their live counterparts; a live part file the revision
-/// never knew is left in place — the restored root decides what it imports,
-/// and an unimported file is inert.
+/// Restore one revision with the exact current source identity into the live
+/// source. Definition parts retained by the revision are written back; an
+/// unknown live definition part remains inert unless the root imports it.
+/// Declared content roots are replaced whole because their loaders discover
+/// files recursively, making an extra live content file semantically active.
 pub fn restore(deployment_dir: &Path, source: &ConfigSource, revision: u64) -> Result<()> {
     let retained = retained_identity(deployment_dir, revision)?;
-    let parts = match retained {
-        Some(retained) if identity_matches(&retained, source) => retained.parts,
+    let (parts, content_roots) = match retained {
+        Some(retained) if identity_matches(&retained, source) => {
+            (retained.parts, retained.content_roots)
+        }
         Some(retained) => bail!(
-            "config revision {revision} records format/path {:?}/{}; current source is {:?}/{}",
+            "config revision {revision} records source {:?}/{} with content roots {:?}; current source is {:?}/{} with content roots {:?}",
             retained.format,
             retained.path.as_str(),
+            retained.content_roots,
             source.format,
-            source.path.as_str()
+            source.path.as_str(),
+            source.content_roots,
         ),
-        None if source.format.is_none() => Vec::new(),
+        None if source.format.is_none() => (Vec::new(), Vec::new()),
         None => bail!(
             "config revision {revision} has no format-bearing source identity; refusing restore"
         ),
@@ -291,7 +310,114 @@ pub fn restore(deployment_dir: &Path, source: &ConfigSource, revision: u64) -> R
             .with_context(|| format!("config revision {revision} has no retained part {part}"))?;
         replace_file(&live_dir.join(part), bytes)?;
     }
+    let retained_root = revision_root(deployment_dir, revision);
+    for content_root in &content_roots {
+        replace_authored_path(
+            &deployment_dir.join(content_root.as_path()),
+            &retained_root.join(content_root.as_path()),
+        )?;
+    }
     Ok(())
+}
+
+/// Copy one admitted authored file or directory without following symlinks.
+/// Content began as regular staged bytes; a symlink introduced during a dev
+/// loop must not expand a revision beyond its declared deployment root.
+fn copy_authored_path(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(source)
+        .with_context(|| format!("failed to inspect authored content {}", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "authored content {} is a symlink; retained revisions do not follow symlinks",
+            source.display()
+        );
+    }
+    if metadata.is_file() {
+        let parent = destination
+            .parent()
+            .expect("a deployment-relative content path has a parent");
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        let bytes = std::fs::read(source)
+            .with_context(|| format!("failed to read authored content {}", source.display()))?;
+        std::fs::write(destination, bytes).with_context(|| {
+            format!(
+                "failed to retain authored content as {}",
+                destination.display()
+            )
+        })?;
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        bail!(
+            "authored content {} is neither a regular file nor directory",
+            source.display()
+        );
+    }
+    std::fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    let entries = std::fs::read_dir(source)
+        .with_context(|| format!("failed to list authored content {}", source.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("failed to list {}", source.display()))?;
+        copy_authored_path(&entry.path(), &destination.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+/// Replace a declared live content root as one path-level unit. The old root
+/// is first renamed aside so a failed final rename can put it back.
+fn replace_authored_path(live: &Path, retained: &Path) -> Result<()> {
+    let parent = live
+        .parent()
+        .expect("a deployment-relative content root has a parent");
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let name = live
+        .file_name()
+        .expect("an authored content root has a file name")
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{name}.restore-{}", std::process::id()));
+    let backup = parent.join(format!(".{name}.restore-backup-{}", std::process::id()));
+    remove_path_if_present(&temporary)?;
+    remove_path_if_present(&backup)?;
+    copy_authored_path(retained, &temporary)?;
+
+    let had_live = match std::fs::rename(live, &backup) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            remove_path_if_present(&temporary)?;
+            return Err(error).with_context(|| format!("failed to stage aside {}", live.display()));
+        }
+    };
+    if let Err(error) = std::fs::rename(&temporary, live) {
+        if had_live {
+            let _ = std::fs::rename(&backup, live);
+        }
+        let _ = remove_path_if_present(&temporary);
+        return Err(error).with_context(|| format!("failed to restore {}", live.display()));
+    }
+    if had_live {
+        remove_path_if_present(&backup)?;
+    }
+    Ok(())
+}
+
+fn remove_path_if_present(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove {}", path.display()))
+    } else {
+        std::fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+    }
 }
 
 /// Writes bytes next to the target and renames into place, so a torn write
@@ -363,6 +489,71 @@ mod tests {
         assert_eq!(
             std::fs::read(temp.path().join("networking.tkd")).expect("live part"),
             b"part-one"
+        );
+    }
+
+    #[test]
+    fn snapshot_and_restore_carry_only_declared_authored_content() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = ConfigSource::recorded_with_content(
+            tokeira_orchestrator::DefinitionFormatId::new("tkd").expect("format"),
+            tokeira_orchestrator::RelativeDefinitionPath::new("definition.tkd").expect("path"),
+            vec![
+                tokeira_orchestrator::RelativeDefinitionPath::new("observability")
+                    .expect("content root"),
+            ],
+        );
+        std::fs::write(config_file(temp.path(), &source), b"root").expect("write root");
+        std::fs::create_dir_all(temp.path().join("observability/dashboards"))
+            .expect("create authored tree");
+        std::fs::write(
+            temp.path().join("observability/dashboards/original.json"),
+            b"one",
+        )
+        .expect("write authored content");
+        std::fs::create_dir_all(temp.path().join("config")).expect("create rendered output");
+        std::fs::write(temp.path().join("config/rendered.yaml"), b"generated")
+            .expect("write rendered output");
+
+        snapshot(temp.path(), &source, 0).expect("snapshot");
+        let retained = revision_root(temp.path(), 0);
+        assert_eq!(
+            std::fs::read(retained.join("observability/dashboards/original.json"))
+                .expect("retained authored content"),
+            b"one"
+        );
+        assert!(
+            !retained.join("config").exists(),
+            "rendered output is not authored source"
+        );
+
+        std::fs::write(
+            temp.path().join("observability/dashboards/original.json"),
+            b"two",
+        )
+        .expect("edit authored content");
+        std::fs::write(
+            temp.path().join("observability/dashboards/added.json"),
+            b"added",
+        )
+        .expect("add authored content");
+        restore(temp.path(), &source, 0).expect("restore");
+        assert_eq!(
+            std::fs::read(temp.path().join("observability/dashboards/original.json"))
+                .expect("restored authored content"),
+            b"one"
+        );
+        assert!(
+            !temp
+                .path()
+                .join("observability/dashboards/added.json")
+                .exists(),
+            "restoring a recursive content root removes later files"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("config/rendered.yaml"))
+                .expect("rendered output remains live"),
+            b"generated"
         );
     }
 

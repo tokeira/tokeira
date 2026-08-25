@@ -185,13 +185,6 @@ pub(crate) fn write_deployment(dir: &Path) {
     std::fs::write(dir.join("definition.tkd"), "").expect("test definition writes");
 }
 
-/// The bound platform alone, for tests asserting admission outcomes
-/// directly (a refused admission never yields an engine pair).
-pub(crate) fn bound_platform() -> BoundPlatform {
-    BoundPlatform::bind("test", "tkd", declaration(FixedProbe(None)))
-        .expect("test declaration binds")
-}
-
 /// A bound engine over the stub world, with `dir` admitted: the triple every
 /// verb test starts from.
 pub(crate) fn engine_over(
@@ -212,4 +205,29 @@ pub(crate) fn engine_over(
 /// The reachable-world engine most tests want.
 pub(crate) fn engine(dir: &Path) -> (Engine<StubFrontend>, Admitted) {
     engine_over(dir, FixedProbe(None), StubFrontend::new())
+}
+
+/// Realize the creation record test verbs require without routing through a
+/// CLI lifecycle command. Production creation is owned by `tkr`; this helper
+/// supplies the same envelope/source precondition to shell unit tests.
+pub(crate) async fn realize_creation(admitted: &Admitted) {
+    let deployment_dir = &admitted.deployment_ref.dir;
+    let store = crate::envelope_store(deployment_dir);
+    let (existing, version) = store.load().await.expect("load test envelope");
+    assert!(existing.binding.is_none(), "test deployment starts unbound");
+    crate::config_history::snapshot(deployment_dir, &admitted.config_source(), 0)
+        .expect("retain test revision zero");
+    let envelope = tokeira_deployment::DeploymentStateEnvelope {
+        deployment_id: admitted.deployment_ref.name.clone(),
+        binding: Some(tokeira_deployment::ProvenanceStamp::current(
+            chrono::Utc::now(),
+        )),
+        integrity: Some(crate::running_integrity_manifest().expect("running test manifest")),
+        config_revision: 0,
+        ..Default::default()
+    };
+    store
+        .save(&envelope, &version)
+        .await
+        .expect("save test creation record");
 }

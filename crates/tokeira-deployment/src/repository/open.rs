@@ -20,7 +20,7 @@ use super::{
     error::{OpenError, Refusal},
     locator::RepositoryLocator,
     publish::engine_target_name,
-    transport::S3Transport,
+    transport::{LocalTransport, S3Transport},
 };
 use crate::ProvisionerBundle;
 
@@ -69,7 +69,7 @@ pub async fn open(
     let targets = locator.targets_url()?;
     let mut loader = RepositoryLoader::new(&trusted_root, metadata, targets);
     loader = match locator {
-        RepositoryLocator::Local { .. } => loader.transport(tough::FilesystemTransport),
+        RepositoryLocator::Local { path } => loader.transport(LocalTransport::new(path)),
         RepositoryLocator::S3 { .. } => {
             let client = s3.ok_or_else(|| OpenError::Verification {
                 error: "an S3 locator needs a configured S3 client".to_string(),

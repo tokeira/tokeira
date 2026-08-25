@@ -276,8 +276,7 @@ pub(crate) enum DeploymentAction {
     /// Report the deployment's provisioner identity + binding (forwards to `tkp
     /// describe`; read-only, never gates).
     Describe,
-    /// Apply the deployment via its bound provisioner (forwards to `tkp apply`,
-    /// initializing it first if needed).
+    /// Apply the deployment via its creation-bound provisioner.
     Apply {
         /// Confirm a destructive plan (deletes or replacements).
         #[arg(long)]

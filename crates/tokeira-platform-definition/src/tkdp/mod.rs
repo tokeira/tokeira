@@ -27,5 +27,8 @@ pub mod preflight;
 pub mod program;
 pub mod runner;
 pub mod source_map;
+mod syntax;
 
 pub use frontend::{TkdpFrontend, frontend};
+pub use preflight::{preflight_part_syntax, preflight_syntax};
+pub use syntax::{SyntaxFinding, SyntaxValidation, validate_syntax};

@@ -22,6 +22,9 @@ default-format = "tkd"
 # found through the extension. Convention is the operator's; no engine-side
 # name exists.
 definitions = ["deployment.tkd", "definition.tkdp"]
+# Authored inputs interpreted beside either definition projection. Discovery
+# materializes this tree generically; tkr carries no Compose-specific paths.
+content = ["observability"]
 
 # The platform is description plus its own kinds: the definitions, their
 # companion content (observability/), the descriptor above, one exported

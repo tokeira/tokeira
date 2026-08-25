@@ -5,8 +5,9 @@
 //! built-as identity pair ([`BoundPlatform`]) and married to a definition
 //! frontend ([`Engine`]). The shell owns the lifecycle verbs, the
 //! binding-gate orchestration, the operation-lock wrapper, the deployment
-//! state envelope, `describe`, the Day-0 stamp, and the config-revision
-//! history; the declaration supplies what varies — the kinds, the ops
+//! state envelope after creation, `describe`, and the config-revision
+//! history; `tkr deployment create` owns the initial binding and revision.
+//! The declaration supplies what varies — the kinds, the ops
 //! surface, the reachability probe, and the registration constructors. The
 //! shell is a distinct layer over `tokeira-deployment` (the domain
 //! library — stamps, binding, integrity), never folded into it.
@@ -34,7 +35,6 @@ mod described;
 mod destroy;
 pub mod engine;
 mod gate;
-mod init;
 
 mod plan;
 pub mod platform;
@@ -53,6 +53,29 @@ pub use platform::{Admitted, BoundPlatform};
 // The seam's audit vocabulary travels with the seam: platform realizations
 // return these from their applying verbs.
 pub use tokeira_deployment::{ChangeLogEntry, ChangeOp, ConfigSource};
+
+/// Describe the running binary when no placed bundle is available, notably a
+/// native candidate performing an upgrade. Ordinary creation records the
+/// independently verified bundle manifest and never needs a provisioner
+/// inception command.
+pub(crate) fn running_integrity_manifest() -> anyhow::Result<tokeira_deployment::IntegrityManifest>
+{
+    let executable =
+        std::env::current_exe().context("failed to locate the running provisioner binary")?;
+    let bytes = std::fs::read(&executable)
+        .with_context(|| format!("failed to read {}", executable.display()))?;
+    Ok(tokeira_deployment::IntegrityManifest {
+        engine_identity: None,
+        authority: tokeira_deployment::BuildAuthority::LocalDeveloper,
+        provisioner_version: tokeira_build_info::TOKEIRA_VERSION.to_string(),
+        artifacts: vec![tokeira_deployment::BinaryArtifactDescriptor {
+            target: tokeira_deployment::Target(env!("TKP_TARGET").to_string()),
+            sha256: tokeira_deployment::sha256_hex(&bytes),
+            retrieval_ref: None,
+            size_bytes: bytes.len() as u64,
+        }],
+    })
+}
 pub(crate) use tokeira_deployment::{config_history, lock, marker};
 
 /// Generate the disposable `tkp` entrypoint for one statically selected
@@ -63,10 +86,17 @@ macro_rules! bound_provisioner_main {
         expected_platform: $platform:literal,
         platform: $platform_factory:path,
         expected_format: $format:literal,
+        content_roots: [$($content_root:literal),* $(,)?],
         frontend: $frontend:path $(,)?
     ) => {
         fn main() -> std::process::ExitCode {
-            $crate::run_bound_provisioner($platform, $format, $platform_factory(), $frontend())
+            $crate::run_bound_provisioner(
+                $platform,
+                $format,
+                &[$($content_root),*],
+                $platform_factory(),
+                $frontend(),
+            )
         }
     };
 }
@@ -78,15 +108,20 @@ macro_rules! bound_provisioner_main {
 pub fn run_bound_provisioner<F>(
     expected_platform: &'static str,
     expected_format: &'static str,
+    content_roots: &'static [&'static str],
     declaration: PlatformDeclaration,
     frontend: F,
 ) -> std::process::ExitCode
 where
     F: tokeira_platform::definition::DefinitionFrontend,
 {
-    let engine =
-        crate::platform::BoundPlatform::bind(expected_platform, expected_format, declaration)
-            .and_then(|platform| crate::engine::Engine::new(platform, frontend));
+    let engine = crate::platform::BoundPlatform::bind_with_content(
+        expected_platform,
+        expected_format,
+        content_roots,
+        declaration,
+    )
+    .and_then(|platform| crate::engine::Engine::new(platform, frontend));
     let engine = match engine {
         Ok(engine) => engine,
         Err(error) => {
@@ -260,8 +295,8 @@ pub(crate) fn committed_changes(applied: &AppliedOutcome) -> Vec<tokeira_explain
 /// The retarget gate, run by every config-applying verb after the binding
 /// gate and before any mutation: a `#[create]` change is a new deployment,
 /// not an apply. No retained prior revision means nothing has ever applied,
-/// so there is nothing to gate — Day-0 `init` retains revision 0 from the
-/// operator's already-edited definition, which is exactly why choosing a
+/// so there is nothing to gate — deployment creation retains revision 0 from
+/// the operator's already-edited definition, which is exactly why choosing a
 /// `#[create]` value *before* the first apply is legitimate and changing it
 /// *after* is refused.
 pub(crate) async fn retarget_gate<F: tokeira_platform::definition::DefinitionFrontend>(

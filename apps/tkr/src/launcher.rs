@@ -390,69 +390,6 @@ pub(crate) async fn launch_upgrade(deployment_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check a named platform/format definition anywhere on disk without deployment
-/// state. Catalog selection generates the same static composition root used at
-/// deployment creation; a directory uses the format's conventional basename.
-pub(crate) async fn launch_definition_check_at_path(
-    path: &Path,
-    platform: &tokeira_orchestrator::PlatformId,
-    format: &tokeira_orchestrator::DefinitionFormatId,
-    json: bool,
-    detail: bool,
-) -> Result<()> {
-    let (definition, dir) = if path.is_dir() {
-        (
-            path.join(format!("definition.{format}")),
-            path.to_path_buf(),
-        )
-    } else {
-        let dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        (path.to_path_buf(), dir)
-    };
-    if !definition.exists() {
-        bail!("no definition found at {}", definition.display());
-    }
-    let cwd = std::env::current_dir().context("cannot determine current directory")?;
-    let workspace = crate::bundle_create::workspace_root_from(&cwd)?;
-    let discovery = crate::platform_discovery::PlatformDiscovery::from_workspace(&workspace)?;
-    let platform = &discovery.platform(platform)?.package;
-    let frontend = &discovery.frontend(format)?.package;
-    let candidate = crate::deployment_dir::DeploymentResolver::build_provisioner_from_workspace(
-        &workspace, platform, frontend,
-    )?;
-    let mut args = vec![
-        "definition".to_string(),
-        "check".to_string(),
-        "--deployment-dir".to_string(),
-        dir.display().to_string(),
-        "--definition".to_string(),
-        definition.display().to_string(),
-        "--format".to_string(),
-        format.to_string(),
-    ];
-    if json {
-        args.push("--json".to_string());
-    }
-    if detail {
-        args.push("--detail".to_string());
-    }
-    let status = tokio::process::Command::new(&candidate)
-        .args(&args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .with_context(|| format!("failed to launch `{}`", candidate.display()))?;
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
-}
 
 /// Validate a staged deployment through the exact provisioner bytes that will
 /// be published with it. Staging remains invisible if the check fails.

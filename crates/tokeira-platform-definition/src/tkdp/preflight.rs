@@ -115,6 +115,25 @@ pub struct PartImport {
 /// Parses and validates a definition against the facade surface
 /// (importable names: builders plus the engine kind inventory).
 pub fn preflight(source: &str, facade_names: &[&str]) -> Result<Preflight, Vec<Finding>> {
+    preflight_with_facade(source, Some(facade_names))
+}
+
+/// Parses and validates a definition through the platform-free frontend
+/// syntax tier.
+///
+/// This keeps the full import contract except facade membership: explicit
+/// names imported from `tokeira` remain unresolved until engine
+/// interpretation supplies a deployment platform's published vocabulary.
+/// Star imports, relative imports, subset violations, hygiene, shadowing, and
+/// entrypoint rules retain their normal findings.
+pub fn preflight_syntax(source: &str) -> Result<Preflight, Vec<Finding>> {
+    preflight_with_facade(source, None)
+}
+
+fn preflight_with_facade(
+    source: &str,
+    facade_names: Option<&[&str]>,
+) -> Result<Preflight, Vec<Finding>> {
     let parsed = match ruff_python_parser::parse_module(source) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -154,6 +173,23 @@ pub fn preflight(source: &str, facade_names: &[&str]) -> Result<Preflight, Vec<F
 /// Parses and validates a definition part: the root's admission surface
 /// without the entrypoint requirement.
 pub fn preflight_part(source: &str, facade_names: &[&str]) -> Result<PartPreflight, Vec<Finding>> {
+    preflight_part_with_facade(source, Some(facade_names))
+}
+
+/// Parses and validates one companion part through the platform-free
+/// frontend syntax tier.
+///
+/// A part has the root's admitted surface without entrypoint requirements.
+/// As with [`preflight_syntax`], only explicit facade-name membership is
+/// deferred to engine interpretation.
+pub fn preflight_part_syntax(source: &str) -> Result<PartPreflight, Vec<Finding>> {
+    preflight_part_with_facade(source, None)
+}
+
+fn preflight_part_with_facade(
+    source: &str,
+    facade_names: Option<&[&str]>,
+) -> Result<PartPreflight, Vec<Finding>> {
     let parsed = match ruff_python_parser::parse_module(source) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -315,7 +351,10 @@ fn check_entrypoints(
 /// contract, and call-site collection.
 #[derive(Default)]
 struct Checker<'a> {
-    facade_names: &'a [&'a str],
+    /// `None` is the frontend syntax tier: only a concrete platform can say
+    /// which explicit names its `tokeira` facade publishes. Every structural
+    /// import rule remains enforced in that mode.
+    facade_names: Option<&'a [&'a str]>,
     findings: Vec<Finding>,
     imports: Vec<FacadeImport>,
     part_imports: Vec<PartImport>,
@@ -386,7 +425,10 @@ impl Checker<'_> {
                 ));
                 continue;
             }
-            if !self.facade_names.contains(&alias.name.as_str()) {
+            if self
+                .facade_names
+                .is_some_and(|names| !names.contains(&alias.name.as_str()))
+            {
                 self.findings.push(Finding::new(
                     "TKDP012",
                     format!(

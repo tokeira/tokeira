@@ -390,7 +390,6 @@ pub(crate) async fn launch_upgrade(deployment_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-
 /// Validate a staged deployment through the exact provisioner bytes that will
 /// be published with it. Staging remains invisible if the check fails.
 /// The staged check's identity facts (the extended check report,

@@ -16,6 +16,7 @@ mod framework;
 pub mod parts;
 pub mod schema;
 pub mod subset;
+mod syntax;
 pub mod value;
 
 pub use bridge::HostBridge;
@@ -71,6 +72,19 @@ pub fn validate<B: HostBridge>(
     parts::load(&file, types, fns, bridge, part_sources)
         .map(|_| ())
         .map_err(|e| vec![e.msg])
+}
+
+/// Validate a `.tkd` through the platform-free frontend syntax tier.
+///
+/// This parses the complete definition set and enforces the interpreted
+/// subset without evaluating it. Platform vocabulary is deliberately not
+/// checked here; kind, method, and associated-function membership is settled
+/// when the engine interprets the definition for a deployment's platform.
+pub fn validate_syntax(
+    src: &str,
+    part_sources: &dyn tokeira_platform::definition::SourceResolver,
+) -> Result<(), Vec<String>> {
+    validate(src, &syntax::SyntaxBridge, part_sources)
 }
 
 /// Locate a parse failure for the operator: syn's message alone ("expected

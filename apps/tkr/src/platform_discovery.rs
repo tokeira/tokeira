@@ -12,7 +12,7 @@ use tokeira_build::{
     DefinitionFrontendPackageDescriptor, DiscoveryError, PlatformPackageDescriptor,
     discover_workspace_descriptors,
 };
-use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
+use tokeira_orchestrator::{DefinitionFormatId, PlatformId, RelativeDefinitionPath};
 
 /// Provider-neutral platform descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,15 @@ pub struct FrontendDescriptor {
     pub source_extension: tokeira_orchestrator::DefinitionSourceExtension,
     /// Workspace package coordinates retained after admission.
     pub package: DefinitionFrontendPackageDescriptor,
+}
+
+/// One platform-authored non-definition file ready for deployment staging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformContentFile {
+    /// Portable destination beneath the deployment root.
+    pub relative_path: RelativeDefinitionPath,
+    /// Exact workspace bytes published with the definition package.
+    pub bytes: Vec<u8>,
 }
 
 /// One normalized, deterministic platform/frontend inventory.
@@ -304,6 +313,111 @@ impl PlatformDiscovery {
         }
         Ok((frontend, entry.clone(), seed))
     }
+
+    /// Materialize every platform-declared non-definition content root.
+    ///
+    /// The descriptor owns membership; this generic traversal retains the
+    /// declared relative layout and refuses symlinks so a trusted package
+    /// cannot accidentally stage bytes from outside itself.
+    pub fn workspace_content(
+        &self,
+        platform: &PlatformDescriptor,
+    ) -> Result<Vec<PlatformContentFile>, PlatformDiscoveryError> {
+        let package_dir = platform
+            .package
+            .package
+            .manifest_path
+            .parent()
+            .ok_or_else(|| {
+                PlatformDiscoveryError::Invalid(format!(
+                    "platform `{}` manifest has no parent",
+                    platform.id
+                ))
+            })?;
+        let mut files = Vec::new();
+        for root in &platform.package.content {
+            collect_content_files(package_dir, &package_dir.join(root.as_path()), &mut files)?;
+        }
+        files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        for pair in files.windows(2) {
+            if pair[0].relative_path == pair[1].relative_path {
+                return Err(PlatformDiscoveryError::Invalid(format!(
+                    "platform `{}` content resolves `{}` more than once",
+                    platform.id, pair[0].relative_path
+                )));
+            }
+        }
+        Ok(files)
+    }
+}
+
+fn collect_content_files(
+    package_dir: &Path,
+    path: &Path,
+    files: &mut Vec<PlatformContentFile>,
+) -> Result<(), PlatformDiscoveryError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        PlatformDiscoveryError::Invalid(format!(
+            "declared platform content `{}` is unavailable: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(PlatformDiscoveryError::Invalid(format!(
+            "declared platform content `{}` is a symlink; content must remain inside its package",
+            path.display()
+        )));
+    }
+    if metadata.is_dir() {
+        let mut entries = std::fs::read_dir(path)
+            .map_err(|error| {
+                PlatformDiscoveryError::Invalid(format!(
+                    "cannot enumerate platform content `{}`: {error}",
+                    path.display()
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                PlatformDiscoveryError::Invalid(format!(
+                    "cannot enumerate platform content `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            collect_content_files(package_dir, &entry.path(), files)?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err(PlatformDiscoveryError::Invalid(format!(
+            "declared platform content `{}` is not a regular file or directory",
+            path.display()
+        )));
+    }
+    let relative = path.strip_prefix(package_dir).map_err(|error| {
+        PlatformDiscoveryError::Invalid(format!(
+            "platform content `{}` escapes its package: {error}",
+            path.display()
+        ))
+    })?;
+    let relative_path = RelativeDefinitionPath::new(relative).map_err(|error| {
+        PlatformDiscoveryError::Invalid(format!(
+            "platform content `{}` is not portable: {error}",
+            path.display()
+        ))
+    })?;
+    let bytes = std::fs::read(path).map_err(|error| {
+        PlatformDiscoveryError::Invalid(format!(
+            "cannot read platform content `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    files.push(PlatformContentFile {
+        relative_path,
+        bytes,
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -338,6 +452,17 @@ mod tests {
             .expect("requested tkdp seed");
         assert_eq!(frontend.format, format("tkdp"));
         assert!(seed.ends_with("platforms/compose/definition.tkdp"));
+
+        let content = discovery
+            .workspace_content(platform)
+            .expect("platform-owned content");
+        let paths = content
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"observability/templates/alloy.alloy"));
+        assert!(paths.contains(&"observability/dashboards/broker-runtime-health.json"));
+        assert!(paths.contains(&"observability/alerts/observability-alerts.yaml"));
     }
 
     #[test]

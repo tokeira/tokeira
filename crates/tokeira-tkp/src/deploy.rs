@@ -8,9 +8,10 @@
 //! contract as `infra apply` — gate before any mutation, then a
 //! config-revision advance on success.
 //!
-//! The service plane has no explanation model yet (that machinery is the
-//! infra plane's); the verbs render the typed service changes directly and
-//! refuse an `--explanation` request rather than mislabel an infra model.
+//! The service plane has no field-level explanation model yet (that machinery
+//! is the infra plane's), but its typed Delta still renders through the shared
+//! operator report contract. An `--explanation` artifact request is refused
+//! rather than populated with a mislabeled infra model.
 
 use std::path::Path;
 
@@ -26,6 +27,7 @@ use crate::{
     envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform::Admitted,
+    render::ServiceReport,
 };
 
 /// Read-only workload plan: the per-service Delta, by manifest hash against
@@ -33,12 +35,21 @@ use crate::{
 pub(crate) async fn deploy_plan<F: DefinitionFrontend>(
     engine: &Engine<F>,
     admitted: &Admitted,
-    _mode: tokeira_report::Mode,
+    mode: tokeira_report::Mode,
     explanation_path: Option<&Path>,
 ) -> Result<()> {
     refuse_explanation(explanation_path)?;
+    let (envelope, _) = envelope_store(&admitted.deployment_ref.dir)
+        .load()
+        .await
+        .context("failed to load the deployment envelope")?;
     let changes = engine.deploy_plan(admitted).await?;
-    render_service_changes("deploy plan", &changes);
+    let report = ServiceReport::plan(
+        &admitted.deployment_ref.name,
+        envelope.config_revision,
+        &changes,
+    );
+    crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
     Ok(())
 }
 
@@ -47,7 +58,7 @@ pub(crate) async fn deploy_apply<F: DefinitionFrontend>(
     engine: &Engine<F>,
     admitted: &Admitted,
     yes: bool,
-    _mode: tokeira_report::Mode,
+    mode: tokeira_report::Mode,
     explanation_path: Option<&Path>,
 ) -> Result<()> {
     refuse_explanation(explanation_path)?;
@@ -99,7 +110,6 @@ pub(crate) async fn deploy_apply<F: DefinitionFrontend>(
 
     // ── Service apply, through the deploy engine ──
     let changes = engine.deploy_apply(admitted).await?;
-    render_service_changes("deploy apply", &changes);
 
     // ── Re-stamp: a workload apply advances the config revision like any apply ──
     let from_revision = envelope.config_revision;
@@ -110,7 +120,13 @@ pub(crate) async fn deploy_apply<F: DefinitionFrontend>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after deploy apply")?;
-    println!("revision {} → {}", from_revision, envelope.config_revision);
+    let report = ServiceReport::applied(
+        &admitted.deployment_ref.name,
+        from_revision,
+        envelope.config_revision,
+        &changes,
+    );
+    crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
     Ok(())
 }
 
@@ -124,32 +140,6 @@ fn refuse_explanation(explanation_path: Option<&Path>) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// The typed service Delta, rendered directly: one line per changed
-/// service, and an honest "nothing" when the plane is empty or steady.
-fn render_service_changes(verb: &str, changes: &[ServiceChange]) {
-    let changed: Vec<&ServiceChange> = changes
-        .iter()
-        .filter(|change| !matches!(change.kind, ServiceChangeKind::NoChange))
-        .collect();
-    if changed.is_empty() {
-        println!("{verb}: no service changes (the declared service set is steady)");
-        return;
-    }
-    for change in &changed {
-        let glyph = match change.kind {
-            ServiceChangeKind::Create => "+",
-            ServiceChangeKind::Update => "~",
-            ServiceChangeKind::Delete => "-",
-            ServiceChangeKind::NoChange => unreachable!("filtered above"),
-        };
-        println!("  {glyph} {}", change.service);
-    }
-    println!(
-        "{verb}: {}",
-        tokeira_report::counted(changed.len(), "service change")
-    );
 }
 
 #[cfg(test)]

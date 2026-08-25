@@ -141,12 +141,12 @@ engine source used by verified two-binary rollback.
     └── binaries/
 ```
 
-Creating Compose without `--bundle` follows the native development path. `tkr` uses the
+Creating Compose with `--dev-engine` follows the native development path. `tkr` uses the
 same catalog selection and composition-root generation, builds that generated root with
-the workspace toolchain and lockfile, and places its `tkp` bytes in the deployment. There
-is no bundle sidecar, so first initialization records a development self-stamp rather
-than versioned bundle evidence. This path is useful for native iteration; it is not
-interchangeable with the versioned bundle guarantee.
+the workspace toolchain and lockfile, and places its `tkp` bytes plus a development-tier
+bundle sidecar in the deployment. The sidecar honestly records a native, non-hermetic
+build and local-developer authority. This path is useful for native iteration; it is not
+interchangeable with the hermetic bundle guarantee.
 
 Local and ECS currently use the in-process deployment shape, receive `deployment.toml`,
 and have no deployment-local provisioner. See
@@ -154,23 +154,22 @@ and have no deployment-local provisioner. See
 
 ## Day-0 marriage
 
-Creation places files but does not create provider resources or stamp the envelope. The
-first forwarded apply runs hidden `tkp init` before mutation.
+Creation realizes the complete local deployment before its staged directory becomes
+visible. It does not create provider resources.
 
-For a bundled engine, initialization:
+For every discovered engine, creation:
 
-1. parses and validates `tkp.manifest.json` as a bundle;
-2. reads the bytes of the currently running executable;
-3. selects the descriptor for `TKP_TARGET`;
-4. verifies descriptor uniqueness, canonical SHA-256, size, and digest;
-5. records the bundle's integrity manifest and engine provenance in the deployment
-   envelope; and
-6. retains the definition recorded in `metadata.json` as configuration revision `0`.
+1. runs the placed provisioner's read-only admission and definition check;
+2. receives that exact binary's embedded provenance and admitted source set;
+3. parses and validates `tkp.manifest.json` as a bundle;
+4. independently verifies the placed artifact's target, canonical SHA-256, size, and
+   digest;
+5. records the bundle's integrity manifest and reported engine provenance in the
+   deployment envelope; and
+6. retains the complete authored source set as configuration revision `0`.
 
-A missing target, malformed sidecar, or byte mismatch aborts initialization. The sidecar
-is not permission to trust arbitrary bytes; it supplies the bundle material from which
-the running artifact must be verified. Without a sidecar, only the native development
-self-stamp is available.
+A missing target, malformed sidecar, absent creation fact, or byte mismatch aborts
+creation. Apply never repairs or initializes an incomplete deployment.
 
 ```mermaid
 sequenceDiagram
@@ -180,13 +179,14 @@ sequenceDiagram
     participant Envelope as deployment envelope
     participant History as config revisions
 
-    TKR->>TKP: init --deployment-dir DIR
-    TKP->>Sidecar: parse and validate bundle
-    TKP->>TKP: read its running executable
-    TKP->>TKP: verify target size and SHA-256
-    TKP->>Envelope: record identity, authority, provenance, integrity
-    TKP->>History: retain recorded definition as revision 0
-    TKP-->>TKR: binding established
+    TKR->>TKP: definition check --json --deployment-dir DIR
+    TKP->>Sidecar: admit bundle and verify its running executable
+    TKP-->>TKR: definition identity, provenance, admitted source set
+    TKR->>Sidecar: parse and validate bundle
+    TKR->>TKR: verify placed target size and SHA-256
+    TKR->>History: retain admitted source set as revision 0
+    TKR->>Envelope: record identity, authority, provenance, integrity
+    TKR-->>TKR: atomically publish complete deployment
 ```
 
 The envelope is now the durable marriage. Retained definition revisions have meaning
@@ -201,7 +201,7 @@ Before spawning, `tkr` loads the envelope and classifies the request:
 |---|---|---|---|
 | `ReadOnly` | `describe`, `definition check`, and namespaced plans | Resolve an available provisioner so blocked deployments remain diagnosable. | Not required. |
 | `Bound` | Normal mutation of a versioned deployment | Prefer `<deployment>/tkp`; refuse a development fallback. | Verify target-specific size and SHA-256 against the envelope integrity manifest. |
-| `DevCandidate` | Mutation of a development or unstamped deployment | Use the deployment copy or native source fallback. | No versioned manifest requirement; development binding remains advisory. |
+| `DevCandidate` | Mutation of a development deployment | Use the deployment copy or native source fallback. | No versioned manifest requirement; development binding remains advisory. An unstamped directory is incomplete and the TKP gate refuses it. |
 | `CandidateUpgrade` | Upgrade | Resolve a candidate outside the old deployment-local married copy. | The old manifest describes engine A and cannot attest candidate B; the launcher does not perform replacement prelaunch manifest verification. |
 | `Rollback` | Engine handback | Start with bound B, then restore retained A. | Verify B against the current envelope and A against A's checkpoint manifest. |
 
@@ -238,7 +238,7 @@ without a TKP implementation is refused rather than sent to a legacy in-process 
 |---|---|
 | `tkr definition check` | `tkp definition check --deployment-dir DIR` |
 | `tkr infra plan` | `tkp infra plan --deployment-dir DIR` |
-| `tkr infra apply` | hidden `tkp init` when needed, then `tkp infra apply --deployment-dir DIR` |
+| `tkr infra apply` | `tkp infra apply --deployment-dir DIR` |
 | `tkr infra destroy` | `tkp infra destroy --deployment-dir DIR` |
 | `tkr infra status` | `tkp describe --deployment-dir DIR` |
 | `tkr deploy plan` | `tkp deploy plan --deployment-dir DIR` |
@@ -247,7 +247,7 @@ without a TKP implementation is refused rather than sent to a legacy in-process 
 | `tkr scale up/down` | `tkp scale --deployment-dir DIR ...` |
 | `tkr scale status` | `tkp describe --deployment-dir DIR` |
 | `tkr deployment describe` | `tkp describe --deployment-dir DIR` |
-| `tkr deployment apply` | hidden `tkp init` when needed, then `tkp infra apply --deployment-dir DIR` |
+| `tkr deployment apply` | `tkp infra apply --deployment-dir DIR` |
 | `tkr deployment upgrade` | candidate-driven `tkp upgrade`, then provisioner replacement |
 | `tkr deployment rollback` | rollback orchestration across the bound and retained provisioners |
 
@@ -270,11 +270,6 @@ sequenceDiagram
 
     Operator->>TKR: tkr infra apply
     TKR->>Envelope: load binding and integrity manifest
-    alt No binding
-        TKR->>Binary: init --deployment-dir DIR
-        Binary->>Binary: verify bundle sidecar when present
-        Binary->>Envelope: stamp Day 0 and retain revision 0
-    end
     TKR->>TKR: classify launch
     opt Versioned Bound launch
         TKR->>TKR: verify host-target size and SHA-256
@@ -390,7 +385,7 @@ the single-process fallback and cannot claim the verified two-binary handoff.
 A platform `tkp` can be invoked directly for a known deployment directory, but doing so
 does not reproduce TKR's full role. `tkr` adds registry selection, platform-engine obtain
 and placement, authority policy, identity-keyed retention, launch-class byte verification,
-first-apply initialization, candidate selection, deployment-level lock enforcement, and
+staged Day-0 realization, candidate selection, deployment-level lock enforcement, and
 multi-binary rollback. It is therefore the recommended operator surface; direct TKP
 commands are primarily useful for implementation tests and precise lifecycle diagnosis.
 

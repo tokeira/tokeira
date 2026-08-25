@@ -18,13 +18,17 @@ pub struct RecordedDefinition {
 }
 
 /// Recorded desired-source identity used by shell history and evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigSource {
     /// Definition format for interpreted sources; absent only for retained
     /// legacy configuration files outside the bound-provisioner path.
     pub format: Option<DefinitionFormatId>,
     /// Canonical path relative to the deployment root.
     pub path: RelativeDefinitionPath,
+    /// Platform-declared authored content roots that travel with the
+    /// definition. These are source inputs, never rendered apply outputs.
+    pub content_roots: Vec<RelativeDefinitionPath>,
 }
 
 impl ConfigSource {
@@ -33,6 +37,21 @@ impl ConfigSource {
         Self {
             format: Some(format),
             path,
+            content_roots: Vec::new(),
+        }
+    }
+
+    /// Construct an interpreted definition source with its platform-declared
+    /// authored content roots.
+    pub fn recorded_with_content(
+        format: DefinitionFormatId,
+        path: RelativeDefinitionPath,
+        content_roots: Vec<RelativeDefinitionPath>,
+    ) -> Self {
+        Self {
+            format: Some(format),
+            path,
+            content_roots,
         }
     }
 }

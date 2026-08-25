@@ -19,7 +19,10 @@
 //! one format-neutral report. Callers therefore do not duplicate the set of
 //! shipped formats or learn how an individual frontend composes source files.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use thiserror::Error;
 use tokeira_orchestrator::{DefinitionFormatId, DefinitionSourceExtension};
@@ -51,6 +54,60 @@ pub struct SyntaxCheckFinding {
     pub file: String,
     /// Stable frontend diagnostic code, when available, and actionable text.
     pub message: String,
+}
+
+/// Exact source bytes staged for one definition root and its frontend-owned
+/// companion candidates.
+///
+/// The root dispatcher owns the canonical extension and sibling convention;
+/// deployment clients consume this result without learning either detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionSourceSet {
+    /// Bytes of the selected root document.
+    pub root: Vec<u8>,
+    /// Companion filenames and bytes, ordered lexically by filename.
+    pub parts: Vec<(String, Vec<u8>)>,
+}
+
+/// Failure to select or read a complete definition source set.
+#[derive(Debug, Error)]
+pub enum DefinitionSourceSetError {
+    /// No linked frontend owns the requested format or root extension.
+    #[error(transparent)]
+    Frontend(#[from] SyntaxCheckError),
+    /// The root document could not be read.
+    #[error("failed to read definition root {path}: {source}")]
+    Root {
+        /// Root path supplied by the caller.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The root's containing directory could not be enumerated.
+    #[error("failed to read definition directory {path}: {source}")]
+    Directory {
+        /// Directory containing the selected root.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A companion filename was not portable UTF-8.
+    #[error("definition companion {path} has a non-UTF-8 filename")]
+    NonUtf8Part {
+        /// Companion path that could not be represented.
+        path: PathBuf,
+    },
+    /// A companion document could not be read.
+    #[error("failed to read definition companion {path}: {source}")]
+    Part {
+        /// Companion path selected by the frontend.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Failure to select a syntax frontend linked into the current binary.
@@ -106,22 +163,7 @@ pub fn check_syntax(
     source: &str,
     format: Option<&DefinitionFormatId>,
 ) -> Result<SyntaxCheck, SyntaxCheckError> {
-    let frontend = match format {
-        Some(format) => LINKED_SYNTAX_FRONTENDS
-            .iter()
-            .find(|frontend| frontend.format == format.as_str())
-            .ok_or_else(|| unknown_format(format))?,
-        None => {
-            let extension = root
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default();
-            LINKED_SYNTAX_FRONTENDS
-                .iter()
-                .find(|frontend| frontend.source_extension == extension)
-                .ok_or_else(|| unknown_extension(extension))?
-        }
-    };
+    let frontend = select_frontend(root, format)?;
 
     let dir = root
         .parent()
@@ -160,6 +202,81 @@ pub fn check_syntax(
         parts: validation.parts,
         findings,
     })
+}
+
+/// Read a root and the complete sibling candidate set selected by its linked
+/// frontend.
+///
+/// Evaluation decides which candidates are actually served. Staging retains
+/// all same-format siblings so later operator edits cannot introduce a part
+/// that creation silently discarded.
+pub fn read_source_set(
+    root: &Path,
+    format: Option<&DefinitionFormatId>,
+) -> Result<DefinitionSourceSet, DefinitionSourceSetError> {
+    let frontend = select_frontend(root, format)?;
+    let root_bytes = fs::read(root).map_err(|source| DefinitionSourceSetError::Root {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let dir = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let root_name = root.file_name();
+    let entries = fs::read_dir(dir).map_err(|source| DefinitionSourceSetError::Directory {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    let mut parts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| DefinitionSourceSetError::Directory {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some(frontend.source_extension)
+            || path.file_name() == root_name
+            || !path.is_file()
+        {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| DefinitionSourceSetError::NonUtf8Part { path: path.clone() })?
+            .to_string();
+        let bytes =
+            fs::read(&path).map_err(|source| DefinitionSourceSetError::Part { path, source })?;
+        parts.push((name, bytes));
+    }
+    parts.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(DefinitionSourceSet {
+        root: root_bytes,
+        parts,
+    })
+}
+
+fn select_frontend(
+    root: &Path,
+    format: Option<&DefinitionFormatId>,
+) -> Result<&'static SyntaxFrontend, SyntaxCheckError> {
+    match format {
+        Some(format) => LINKED_SYNTAX_FRONTENDS
+            .iter()
+            .find(|frontend| frontend.format == format.as_str())
+            .ok_or_else(|| unknown_format(format)),
+        None => {
+            let extension = root
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            LINKED_SYNTAX_FRONTENDS
+                .iter()
+                .find(|frontend| frontend.source_extension == extension)
+                .ok_or_else(|| unknown_extension(extension))
+        }
+    }
 }
 
 fn unknown_format(format: &DefinitionFormatId) -> SyntaxCheckError {
@@ -289,6 +406,28 @@ fn deployment(cfg: Config, cx: Context) -> Deployment {
             format!("{}:1:21", temp.path().join("second.tkdp").display())
         );
         assert!(check.findings[0].message.contains("TKDP012"));
+    }
+
+    #[cfg(feature = "tkd")]
+    #[test]
+    fn source_set_collection_uses_the_selected_frontends_extension() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("deployment.tkd");
+        std::fs::write(&root, b"root").expect("root");
+        std::fs::write(temp.path().join("zeta.tkd"), b"zeta").expect("zeta");
+        std::fs::write(temp.path().join("alpha.tkd"), b"alpha").expect("alpha");
+        std::fs::write(temp.path().join("peer.tkdp"), b"peer").expect("peer format");
+
+        let sources = read_source_set(&root, None).expect("source set");
+
+        assert_eq!(sources.root, b"root");
+        assert_eq!(
+            sources.parts,
+            [
+                ("alpha.tkd".to_string(), b"alpha".to_vec()),
+                ("zeta.tkd".to_string(), b"zeta".to_vec()),
+            ]
+        );
     }
 
     #[test]

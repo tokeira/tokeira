@@ -41,7 +41,7 @@ use directories::ProjectDirs;
 use tokeira_deployment::RecordedDefinition;
 use tokeira_ecs_deployment::EcsConfig;
 use tokeira_local_deployment::LocalConfig;
-use tokeira_orchestrator::{PlatformId, StorageKind};
+use tokeira_orchestrator::{PlatformId, RelativeDefinitionPath, StorageKind};
 use uuid::Uuid;
 
 use crate::metadata::{self, DeploymentMetadata, DeploymentStatus};
@@ -94,40 +94,10 @@ pub(crate) const PROVISIONER_BIN: &str = "tkp";
 pub(crate) struct DefinitionSeed {
     pub(crate) definition: RecordedDefinition,
     pub(crate) bytes: Vec<u8>,
-    /// The definition's part files, staged beside the root: every sibling
-    /// carrying the root's extension in the platform package. A part is a
-    /// document of the definition set — without them a split root cannot
-    /// resolve at check or evaluation. Mirrors the retention rule in
-    /// `tokeira-tkp::config_history`.
+    /// Frontend-selected companion candidates, staged beside the root.
     pub(crate) parts: Vec<(String, Vec<u8>)>,
-}
-
-/// Collect the definition's part files beside the seed: every sibling file
-/// with the root's extension, excluding the root itself, ascending by name.
-pub(crate) fn sibling_parts(seed_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
-    let Some(dir) = seed_path.parent() else {
-        return Ok(Vec::new());
-    };
-    let Some(extension) = seed_path.extension() else {
-        return Ok(Vec::new());
-    };
-    let root_name = seed_path.file_name();
-    let mut parts = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension() == Some(extension) && path.file_name() != root_name && path.is_file() {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| anyhow!("part file {} has a non-UTF-8 name", path.display()))?
-                .to_string();
-            let bytes = fs::read(&path)
-                .with_context(|| format!("failed to read definition part {}", path.display()))?;
-            parts.push((name, bytes));
-        }
-    }
-    parts.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(parts)
+    /// Platform-declared non-definition files at deployment-relative paths.
+    pub(crate) content: Vec<(RelativeDefinitionPath, Vec<u8>)>,
 }
 
 /// Incomplete deployment held away from its final name until every staged
@@ -404,11 +374,16 @@ impl DeploymentResolver {
                 .expect("a deployment-relative definition has a parent")
                 .to_path_buf();
             fs::create_dir_all(&definition_parent)?;
-            fs::write(definition_path, seed.bytes)?;
+            write_staged_source(&definition_path, &seed.bytes)?;
             // The definition set stages whole: parts land beside the root,
             // where check, evaluation, retention, and retarget resolve them.
             for (name, bytes) in &seed.parts {
-                fs::write(definition_parent.join(name), bytes)?;
+                write_staged_source(&definition_parent.join(name), bytes)?;
+            }
+            // Platform-authored content retains its descriptor-owned layout;
+            // tkr does not name a platform's dashboards, alerts, or templates.
+            for (relative, bytes) in &seed.content {
+                write_staged_source(&path.join(relative.as_path()), bytes)?;
             }
             let mut server_config = tokeira_config::TokeiraConfig::default();
             apply_local_snapshot_default(
@@ -481,13 +456,21 @@ impl DeploymentResolver {
             let platform_descriptor = discovery.platform(&platform)?;
             let (frontend, definition_path, path) =
                 discovery.workspace_frontend(platform_descriptor, None)?;
+            let sources =
+                tokeira_platform_definition::read_source_set(&path, Some(&frontend.format))?;
+            let content = discovery
+                .workspace_content(platform_descriptor)?
+                .into_iter()
+                .map(|file| (file.relative_path, file.bytes))
+                .collect();
             Some(DefinitionSeed {
                 definition: RecordedDefinition {
                     format: frontend.format.clone(),
                     path: definition_path,
                 },
-                parts: sibling_parts(&path)?,
-                bytes: fs::read(path)?,
+                parts: sources.parts,
+                bytes: sources.root,
+                content,
             })
         };
         self.begin_create(name, platform, storage, region, seed)?
@@ -572,6 +555,20 @@ impl DeploymentResolver {
             ))
         }
     }
+}
+
+fn write_staged_source(path: &Path, bytes: &[u8]) -> Result<()> {
+    if path.exists() {
+        bail!(
+            "platform package stages more than one source at {}",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create source directory {}", parent.display()))?;
+    }
+    fs::write(path, bytes).with_context(|| format!("failed to stage source {}", path.display()))
 }
 
 /// Platform-specific config loaded from deployment.toml.

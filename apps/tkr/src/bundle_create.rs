@@ -98,9 +98,9 @@ pub(crate) async fn place_bundle_provisioner_at(
 /// under the deployment's own state (self-contained rollback, Proposal
 /// 002/005), record the retention ref inside the bundle — the sidecar
 /// carries the FULL bundle (describe surfaces identity fields, build
-/// provenance, and test evidence from it; init extracts the integrity
-/// manifest after self-verifying) — then place `tkp` and the sidecar
-/// `tkp init` records.
+/// provenance, and test evidence from it; staged creation records its
+/// integrity manifest after independently verifying the placed artifact) —
+/// then place `tkp` and its sidecar.
 pub(crate) async fn marry_bundle_at(
     deployment_dir: &std::path::Path,
     mut bundle: tokeira_deployment::ProvisionerBundle,

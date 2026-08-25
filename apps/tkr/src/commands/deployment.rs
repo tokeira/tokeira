@@ -70,15 +70,23 @@ pub(crate) async fn run(
                 discovery.workspace_frontend(platform_descriptor, format.as_ref())?;
             let platform_package = &platform_descriptor.package;
             let frontend_package = &frontend_descriptor.package;
+            let sources = tokeira_platform_definition::read_source_set(
+                &seed_path,
+                Some(&frontend_descriptor.format),
+            )?;
+            let content = discovery
+                .workspace_content(platform_descriptor)?
+                .into_iter()
+                .map(|file| (file.relative_path, file.bytes))
+                .collect();
             let seed = DefinitionSeed {
                 definition: RecordedDefinition {
                     format: frontend_descriptor.format.clone(),
                     path: definition_path,
                 },
-                bytes: std::fs::read(&seed_path).with_context(|| {
-                    format!("failed to read definition seed {}", seed_path.display())
-                })?,
-                parts: crate::deployment_dir::sibling_parts(&seed_path)?,
+                bytes: sources.root,
+                parts: sources.parts,
+                content,
             };
             let pending =
                 deployments.begin_create(&resolved_name, platform, storage, region, Some(seed))?;
@@ -110,6 +118,8 @@ pub(crate) async fn run(
                 .await?;
             }
             let facts = launcher::validate_staged_definition(pending.path()).await?;
+            launcher::seed_staged_config(pending.path()).await?;
+            launcher::realize_staged_deployment(pending.path(), &facts, 0).await?;
             let identity = facts.identity.ok_or_else(|| {
                 anyhow::anyhow!(
                     "the staged check verified but reported no configuration identity; \
@@ -117,7 +127,6 @@ pub(crate) async fn run(
                 )
             })?;
             let companions = facts.companions.unwrap_or_default();
-            launcher::seed_staged_config(pending.path()).await?;
 
             // Repository state lands in the staged dir (Requirement 2.3);
             // only the upload itself waits for the local commit.

@@ -393,15 +393,14 @@ fn scoped_workspace_manifest(
     }
     if let Some(patches) = parsed.get("patch").and_then(toml::Value::as_table) {
         for registry in patches.values() {
-            if let Some(entries) = registry.as_table() {
-                if let Some(stray) = entries
+            if let Some(entries) = registry.as_table()
+                && let Some(stray) = entries
                     .keys()
                     .find(|name| !reachable.contains(name.as_str()))
-                {
-                    return Err(CompositionError::InvalidSelection(format!(
-                        "scoped manifest still patches unreachable package `{stray}`"
-                    )));
-                }
+            {
+                return Err(CompositionError::InvalidSelection(format!(
+                    "scoped manifest still patches unreachable package `{stray}`"
+                )));
             }
         }
     }
@@ -738,7 +737,12 @@ pub fn assemble_bound_provisioner(
         &frontend_path,
         &frontend.feature,
     );
-    let main_rs = render_main(&platform.id, &frontend.format, &frontend.feature);
+    let main_rs = render_main(
+        &platform.id,
+        &frontend.format,
+        &platform.content,
+        &frontend.feature,
+    );
     let closure = resolve_source_closure_for_packages(
         &workspace_root,
         &[
@@ -837,12 +841,18 @@ fn render_manifest(
 fn render_main(
     platform: &PlatformId,
     format: &DefinitionFormatId,
+    content_roots: &[tokeira_orchestrator::RelativeDefinitionPath],
     frontend_module: &str,
 ) -> String {
     let platform = serde_json::to_string(platform.as_str()).expect("platform ids serialize");
     let format = serde_json::to_string(format.as_str()).expect("format ids serialize");
+    let content_roots = content_roots
+        .iter()
+        .map(|root| serde_json::to_string(root.as_str()).expect("content roots serialize"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "tokeira_tkp::bound_provisioner_main!(\n    expected_platform: {platform},\n    platform: selected_platform::platform,\n    expected_format: {format},\n    frontend: selected_frontend::{frontend_module}::frontend,\n);\n"
+        "tokeira_tkp::bound_provisioner_main!(\n    expected_platform: {platform},\n    platform: selected_platform::platform,\n    expected_format: {format},\n    content_roots: [{content_roots}],\n    frontend: selected_frontend::{frontend_module}::frontend,\n);\n"
     )
 }
 
@@ -897,10 +907,17 @@ macro_rules! bound_provisioner_main {
         expected_platform: $platform:literal,
         platform: $platform_factory:path,
         expected_format: $format:literal,
+        content_roots: [$($content_root:literal),* $(,)?],
         frontend: $frontend:path $(,)?
     ) => {
         fn main() {
-            let _ = ($platform, $format, $platform_factory(), $frontend());
+            let _ = (
+                $platform,
+                $format,
+                &[$($content_root),*],
+                $platform_factory(),
+                $frontend(),
+            );
         }
     };
 }
@@ -910,8 +927,14 @@ macro_rules! bound_provisioner_main {
                 &root,
                 "platforms/alpha",
                 "alpha-platform",
-                "[package.metadata.tokeira.platform]\nid = \"alpha\"\nengine = \"0.1.0\"\ndefault = false\n",
+                "[package.metadata.tokeira.platform]\nid = \"alpha\"\nengine = \"0.1.0\"\ndefault = false\ncontent = [\"observability\"]\n",
                 "pub fn platform() {}\n",
+            );
+            std::fs::create_dir_all(root.join("platforms/alpha/observability"))
+                .expect("create platform content root");
+            write(
+                &root.join("platforms/alpha/observability/template.txt"),
+                "authored content\n",
             );
             package(
                 &root,
@@ -963,7 +986,7 @@ macro_rules! bound_provisioner_main {
         assert_eq!(first, second);
         assert_eq!(
             first.main_rs,
-            "tokeira_tkp::bound_provisioner_main!(\n    expected_platform: \"alpha\",\n    platform: selected_platform::platform,\n    expected_format: \"tkd\",\n    frontend: selected_frontend::tkd::frontend,\n);\n"
+            "tokeira_tkp::bound_provisioner_main!(\n    expected_platform: \"alpha\",\n    platform: selected_platform::platform,\n    expected_format: \"tkd\",\n    content_roots: [\"observability\"],\n    frontend: selected_frontend::tkd::frontend,\n);\n"
         );
         let manifest: toml::Value = toml::from_str(&first.cargo_toml).expect("generated manifest");
         let dependencies = manifest
@@ -1090,7 +1113,7 @@ macro_rules! bound_provisioner_main {
                 &format!("../../frontends/{format_segment}"),
                 &format_segment,
             );
-            let main_rs = render_main(&platform_id, &format_id, &format_segment);
+            let main_rs = render_main(&platform_id, &format_id, &[], &format_segment);
             let source = BoundProvisionerSource {
                 platform: platform_id,
                 format: format_id,
@@ -1143,6 +1166,7 @@ macro_rules! bound_provisioner_main {
             changed_format.main_rs = render_main(
                 &changed_format.platform,
                 &changed_format.format,
+                &[],
                 changed_format.format.as_str(),
             );
             prop_assert_ne!(

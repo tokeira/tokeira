@@ -1,8 +1,9 @@
 //! The launch seam (Requirement 7, task 9.1).
 //!
-//! `tkr` never mutates a definition-bound deployment itself. It executes the
-//! `tkp` married to that deployment, applying the appropriate binding and
-//! integrity gate before a lifecycle mutation.
+//! `tkr` owns the staged Day-0 creation record, then never performs a
+//! definition-bound lifecycle mutation itself. It executes the `tkp` married
+//! to that deployment, applying the appropriate binding and integrity gate
+//! before each post-creation mutation.
 //!
 //! | Class | When | Binary | Verified against |
 //! |-------|------|--------|------------------|
@@ -25,8 +26,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tokeira_deployment::{
-    BinaryStore, BuildMode, DeploymentStateEnvelope, ORCHESTRATED_LOCK_HOLDER_ENV,
-    ORCHESTRATED_LOCK_TOKEN_ENV, Target,
+    BUNDLE_MANIFEST_BASENAME, BinaryStore, BuildMode, ConfigSource, DeploymentStateEnvelope,
+    ORCHESTRATED_LOCK_HOLDER_ENV, ORCHESTRATED_LOCK_TOKEN_ENV, ProvenanceStamp, ProvisionerBundle,
+    Target, config_history,
 };
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend, OperationLock};
 
@@ -53,8 +55,8 @@ pub(crate) enum LaunchClass {
 /// `upgrade` cannot run the recorded binary (A cannot know how to advance to B)
 /// → candidate-upgrade; `rollback` runs B-then-A. Otherwise a versioned binding
 /// is **bound** (run exactly the recorded binary) and a dev/unstamped binding is
-/// a **dev-candidate** (the current local build; a fresh deployment we are about
-/// to `init` is treated the same).
+/// a **dev-candidate**. An unstamped directory is incomplete and the
+/// provisioner's mutation gate will refuse it.
 pub(crate) fn resolve_class(verb: &[&str], envelope: &DeploymentStateEnvelope) -> LaunchClass {
     match verb {
         ["describe"] | ["definition", "check"] | ["logs"] | ["port-mappings"] | [_, "plan"] => {
@@ -90,8 +92,9 @@ impl TkpBinary {
     }
 }
 
-/// Load the deployment's provisioner envelope (a `Default` envelope when the
-/// deployment has never been `tkp init`-stamped). Mirrors `tkp`'s own store seam.
+/// Load the deployment's provisioner envelope. A definition-bound deployment
+/// without a binding is incomplete: creation and fetch both realize Day 0
+/// before publishing their staging directory.
 async fn load_envelope(deployment_dir: &Path) -> Result<DeploymentStateEnvelope> {
     let store: Box<dyn DeploymentStore<DeploymentStateEnvelope>> = Box::new(CasStore::new(
         Box::new(LocalBackend::new(deployment_dir.join("state/envelope"))),
@@ -134,8 +137,8 @@ fn requires_manifest_verification(class: LaunchClass, envelope: &DeploymentState
 fn verify_against_manifest(path: &Path, envelope: &DeploymentStateEnvelope) -> Result<()> {
     let manifest = envelope.integrity.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
-            "deployment is bound but records no integrity manifest; cannot verify the bound `tkp` \
-             (was it initialized by `tkp init`?)"
+            "deployment is bound but records no integrity manifest; the deployment creation \
+             record is incomplete"
         )
     })?;
     let bytes =
@@ -403,6 +406,10 @@ pub(crate) struct StagedCheckFacts {
     pub(crate) identity: Option<tokeira_platform::definition::ConfigurationIdentity>,
     #[serde(default)]
     pub(crate) companions: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) provenance: Option<ProvenanceStamp>,
+    #[serde(default)]
+    pub(crate) source: Option<ConfigSource>,
 }
 
 pub(crate) async fn validate_staged_definition(deployment_dir: &Path) -> Result<StagedCheckFacts> {
@@ -471,18 +478,81 @@ pub(crate) async fn seed_staged_config(deployment_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Forward `infra apply`, first forwarding the internal `init` when the
-/// deployment has never been stamped — so `tkr deployment apply` is a coherent
-/// one-command flow.
+/// Commit the complete Day-0 creation record while the deployment is still
+/// staged and invisible.
+///
+/// The bound provisioner's read-only definition check supplied `provenance`
+/// and the exact admitted `source`; `tkr` independently verifies the placed
+/// bytes against the bundle before recording either claim. No platform or
+/// provider method runs here: creation owns the initial envelope and source
+/// retention, while subsequent lifecycle mutation remains wholly in `tkp`.
+pub(crate) async fn realize_staged_deployment(
+    deployment_dir: &Path,
+    facts: &StagedCheckFacts,
+    revision: u64,
+) -> Result<()> {
+    let provenance = facts.provenance.clone().ok_or_else(|| {
+        anyhow::anyhow!("staged provisioner check reported no running-engine provenance")
+    })?;
+    let source = facts.source.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("staged provisioner check reported no admitted configuration source")
+    })?;
+    let bundle_path = deployment_dir.join(BUNDLE_MANIFEST_BASENAME);
+    let bundle: ProvisionerBundle = serde_json::from_slice(
+        &std::fs::read(&bundle_path)
+            .with_context(|| format!("failed to read {}", bundle_path.display()))?,
+    )
+    .with_context(|| format!("failed to decode {}", bundle_path.display()))?;
+    bundle
+        .validate_bound_evidence()
+        .context("placed provisioner bundle has invalid bound evidence")?;
+    let manifest = bundle.integrity_manifest();
+    manifest
+        .validate()
+        .context("placed provisioner bundle has an invalid integrity manifest")?;
+    let provisioner = deployment_dir.join(crate::deployment_dir::PROVISIONER_BIN);
+    let bytes = std::fs::read(&provisioner)
+        .with_context(|| format!("failed to read {}", provisioner.display()))?;
+    manifest
+        .verify_artifact(&bytes, &Target(env!("TKR_TARGET").to_string()))
+        .context("the staged provisioner disagrees with its placed bundle")?;
+
+    let store: Box<dyn DeploymentStore<DeploymentStateEnvelope>> = Box::new(CasStore::new(
+        Box::new(LocalBackend::new(deployment_dir.join("state/envelope"))),
+        "envelope".to_string(),
+    ));
+    let (existing, version) = store
+        .load()
+        .await
+        .context("failed to load the staged deployment envelope")?;
+    if existing.binding.is_some() {
+        bail!("staged deployment already carries a Day-0 binding");
+    }
+    let metadata = crate::metadata::read(deployment_dir)?;
+    config_history::snapshot(deployment_dir, source, revision)
+        .context("failed to retain the staged deployment's initial source")?;
+    let envelope = DeploymentStateEnvelope {
+        deployment_id: metadata.name,
+        binding: Some(provenance),
+        integrity: Some(manifest),
+        config_revision: revision,
+        ..Default::default()
+    };
+    store
+        .save(&envelope, &version)
+        .await
+        .context("failed to commit the staged deployment's Day-0 envelope")?;
+    Ok(())
+}
+
+/// Forward `infra apply`. Creation has already committed the deployment's
+/// binding and initial source revision; apply never doubles as inception.
 pub(crate) async fn launch_apply(
     deployment_dir: &Path,
     yes: bool,
     module: Option<&str>,
     explanation: Option<&Path>,
 ) -> Result<()> {
-    if load_envelope(deployment_dir).await?.binding.is_none() {
-        launch(deployment_dir, &["init"], &[]).await?;
-    }
     let mut extra = Vec::new();
     if yes {
         extra.push("--yes".to_string());
@@ -659,6 +729,108 @@ mod tests {
         assert!(
             err.to_string().contains("no integrity manifest"),
             "unexpected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_realization_commits_binding_integrity_and_initial_source() {
+        use std::collections::BTreeSet;
+
+        use tokeira_deployment::{
+            BoundProvisionerEvidence, BuildAuthority, BuildManifest, BuildProfile, EngineIdentity,
+            ProvisionerBundle, Sha256Digest, TestEvidence,
+        };
+
+        let tmp = tempfile::tempdir().expect("deployment");
+        std::fs::create_dir_all(tmp.path().join("state")).expect("state");
+        std::fs::write(
+            tmp.path().join("metadata.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "created",
+                "id": "00000000-0000-0000-0000-000000000000",
+                "platform": "compose",
+                "definition": {"format": "tkd", "path": "deployment.tkd"},
+                "storage": "in-memory",
+                "status": "created",
+                "created_at": "2026-08-25T00:00:00Z",
+                "updated_at": "2026-08-25T00:00:00Z"
+            }))
+            .expect("metadata json"),
+        )
+        .expect("metadata");
+        std::fs::write(tmp.path().join("deployment.tkd"), b"definition").expect("definition");
+        std::fs::write(tmp.path().join("tokeirad.toml"), b"").expect("server config");
+        let provisioner_bytes = b"bound provisioner";
+        std::fs::write(tmp.path().join(PROVISIONER_BIN), provisioner_bytes).expect("provisioner");
+        let identity = EngineIdentity {
+            source_closure: Sha256Digest::from_bytes(b"source"),
+            lock_closure: Sha256Digest::from_bytes(b"lock"),
+            toolchain: "rustc test".to_string(),
+            build_container: None,
+            features: BTreeSet::new(),
+            profile: BuildProfile::Dev,
+        };
+        let bundle = ProvisionerBundle {
+            bound: Some(BoundProvisionerEvidence {
+                platform: tokeira_orchestrator::PlatformId::new("compose").expect("platform"),
+                format: tokeira_orchestrator::DefinitionFormatId::new("tkd").expect("format"),
+                engine: "0.1.0".to_string(),
+                generated_root: Sha256Digest::from_bytes(b"root"),
+                source_closure: identity.source_closure,
+                lock_closure: identity.lock_closure,
+            }),
+            identity,
+            authority: BuildAuthority::LocalDeveloper,
+            provisioner_version: "0.1.0".to_string(),
+            artifacts: vec![BinaryArtifactDescriptor {
+                target: Target(env!("TKR_TARGET").to_string()),
+                sha256: tokeira_deployment::sha256_hex(provisioner_bytes),
+                retrieval_ref: None,
+                size_bytes: provisioner_bytes.len() as u64,
+            }],
+            tests: TestEvidence {
+                command: "test".to_string(),
+                passed: true,
+            },
+            build: BuildManifest {
+                request_id: "request".to_string(),
+                source_tree_oid: "tree".to_string(),
+                snapshot_commit_oid: "commit".to_string(),
+                toolchain: "rustc test".to_string(),
+                builder: "test".to_string(),
+            },
+        };
+        std::fs::write(
+            tmp.path().join(BUNDLE_MANIFEST_BASENAME),
+            serde_json::to_vec(&bundle).expect("bundle json"),
+        )
+        .expect("bundle");
+        let provenance = ProvenanceStamp::current(Utc::now());
+        let source = ConfigSource::recorded(
+            tokeira_orchestrator::DefinitionFormatId::new("tkd").expect("format"),
+            tokeira_orchestrator::RelativeDefinitionPath::new("deployment.tkd").expect("path"),
+        );
+        let facts = StagedCheckFacts {
+            verifies: true,
+            identity: None,
+            companions: Some(Vec::new()),
+            provenance: Some(provenance.clone()),
+            source: Some(source),
+        };
+
+        realize_staged_deployment(tmp.path(), &facts, 0)
+            .await
+            .expect("realize creation");
+
+        let envelope = load_envelope(tmp.path()).await.expect("load envelope");
+        assert_eq!(envelope.deployment_id, "created");
+        assert_eq!(envelope.binding, Some(provenance));
+        assert_eq!(envelope.integrity, Some(bundle.integrity_manifest()));
+        assert_eq!(envelope.config_revision, 0);
+        assert_eq!(
+            std::fs::read(tmp.path().join("state/config-revisions/0/deployment.tkd"))
+                .expect("revision zero"),
+            b"definition"
         );
     }
 }

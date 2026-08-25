@@ -74,7 +74,8 @@ pub(crate) async fn apply<F: DefinitionFrontend>(
     };
 
     // ── Engine apply ──
-    // The deployment identity seeds the context; it was set at `init`.
+    // The deployment identity seeds the context; creation recorded it before
+    // the deployment directory became visible.
     let project_name = deployment_identity(&envelope.deployment_id);
     let applied = engine.apply(admitted, module).await?;
     // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)

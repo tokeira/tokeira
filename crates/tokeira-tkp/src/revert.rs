@@ -67,7 +67,7 @@ pub(crate) async fn revert<F: DefinitionFrontend>(
     if !config_history::is_retained(deployment_dir, &config_source, to_revision) {
         anyhow::bail!(
             "config revision {to_revision} was not retained; only revisions produced by a prior \
-             `init`/`apply` can be reverted to"
+             creation/apply can be reverted to"
         );
     }
 
@@ -168,12 +168,12 @@ mod tests {
 
     #[tokio::test]
     async fn revert_restores_a_prior_local_revision_and_advances_forward() {
-        // Full flow through the shell (empty test-platform apply): init → apply →
+        // Full flow through the shell (empty test-platform apply): creation → apply →
         // apply builds two retained revisions with distinct config, then revert to
         // the first restores its config and advances the counter forward.
         let tmp = tempfile::tempdir().unwrap();
         let (engine, admitted) = crate::testkit::engine(tmp.path());
-        crate::init::init(&admitted).await.expect("init");
+        crate::testkit::realize_creation(&admitted).await;
 
         // Revision 1: a definition with marker content "one" (the stub
         // frontend ignores the bytes; retention copies them).

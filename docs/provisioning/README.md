@@ -127,14 +127,16 @@ flowchart LR
 
 ## Binding the definition to the engine
 
-Bundled creation places both `<deployment>/tkp` and `tkp.manifest.json`. Before the first
-provider mutation, hidden `tkp init` parses and validates that sidecar, reads the running
-executable, and verifies its target-specific size and SHA-256. Only then does it record
-the bundle integrity manifest and retain `definition.tkd` as configuration revision `0`.
-A sidecar that does not describe the running bytes is a refusal, not a warning.
+Creation places both `<deployment>/tkp` and `tkp.manifest.json` while the deployment is
+still staged. The placed provisioner admits and checks the definition read-only, reporting
+its embedded provenance and exact source set. `tkr` then independently verifies the
+target-specific provisioner bytes against the bundle, records the initial envelope, and
+retains the complete authored source set as configuration revision `0` before atomically
+publishing the deployment directory. A sidecar that does not describe the placed bytes is
+a creation refusal, not a warning.
 
-After initialization, the envelope is the durable marriage between engine provenance and
-the effective definition revision. For an ordinary versioned mutation, `tkr` verifies the
+The created envelope is the durable marriage between engine provenance and the effective
+definition revision. For an ordinary versioned mutation, `tkr` verifies the
 deployment-local executable against the target descriptor recorded in that envelope
 before spawning it. TKP then enforces the running-versus-recorded binding at the lifecycle
 gate. Retained prior artifacts are keyed by `EngineIdentity × target` so rollback can
@@ -190,8 +192,8 @@ flowchart TD
 ## A forwarded apply
 
 For a Compose deployment, `tkr infra apply` and `tkr deployment apply` converge through
-the same provisioner apply path. If the envelope is unstamped, the launcher first runs
-the hidden initialization step.
+the same provisioner apply path. Apply never initializes a deployment: a missing creation
+binding is an incomplete deployment and is refused.
 
 ```mermaid
 sequenceDiagram
@@ -206,11 +208,6 @@ sequenceDiagram
 
     Operator->>TKR: tkr infra apply
     TKR->>TKR: resolve deployment and definition-backed route
-    opt No binding is recorded
-        TKR->>TKP: init --deployment-dir DIR
-        TKP->>Shell: verify sidecar when present and stamp binding
-        Shell->>Shell: retain definition as revision 0
-    end
     TKR->>TKR: verify bound versioned tkp bytes when required
     TKR->>TKP: infra apply --deployment-dir DIR
     TKP->>Shell: acquire lease and evaluate binding gate

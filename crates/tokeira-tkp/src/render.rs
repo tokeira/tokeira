@@ -7,12 +7,13 @@
 //! value behind the copy (§Values 3, operator empathy): every report says
 //! what happened, why, and what to do next — in operator language, not ours.
 //! "Unknown — apply would REFUSE" is a true statement about internals and a
-//! useless one to a person staring at a fresh deployment; "not initialized —
-//! `apply` stamps it on first run" is the same fact, usable.
+//! useless one to a person staring at an incomplete deployment; "creation
+//! record missing — recreate or re-fetch" is the same fact, usable.
 
 use tokeira_deployment::BindingVerdict;
 use tokeira_explain::{DeploymentExplanation, ExplainedChange};
 use tokeira_iac::{ChangeKind, RefreshStatus};
+use tokeira_orchestrator::{ServiceChange, ServiceChangeKind};
 use tokeira_report::{Depth, Report};
 
 /// The read-only plan report: the deployment explanation, framed by the
@@ -80,6 +81,189 @@ impl Report for ExplanationReport {
         drift_section(explanation, depth, out);
         unchanged_section(explanation, depth, out);
         impacts_section(explanation, out);
+    }
+}
+
+/// A workload plan or committed apply, expressed independently from the
+/// infrastructure explanation model.
+///
+/// Service reconciliation does not yet carry field-level evidence, but it
+/// still follows the same data-first output contract: JSON receives the
+/// complete Delta, summary names every action, and detail adds the unchanged
+/// service census for a plan.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ServiceReport {
+    operation: &'static str,
+    deployment: String,
+    current_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposed_revision: Option<u64>,
+    changes: Vec<ReportedServiceChange>,
+}
+
+impl ServiceReport {
+    /// Build the read-only workload plan anchored to the recorded revision.
+    pub(crate) fn plan(deployment: &str, current_revision: u64, changes: &[ServiceChange]) -> Self {
+        Self::new("deploy plan", deployment, current_revision, None, changes)
+    }
+
+    /// Build the workload apply record with the revision it committed.
+    pub(crate) fn applied(
+        deployment: &str,
+        current_revision: u64,
+        proposed_revision: u64,
+        changes: &[ServiceChange],
+    ) -> Self {
+        Self::new(
+            "deploy apply",
+            deployment,
+            current_revision,
+            Some(proposed_revision),
+            changes,
+        )
+    }
+
+    fn new(
+        operation: &'static str,
+        deployment: &str,
+        current_revision: u64,
+        proposed_revision: Option<u64>,
+        changes: &[ServiceChange],
+    ) -> Self {
+        Self {
+            operation,
+            deployment: deployment.to_string(),
+            current_revision,
+            proposed_revision,
+            changes: changes.iter().map(ReportedServiceChange::from).collect(),
+        }
+    }
+}
+
+impl Report for ServiceReport {
+    fn narrative(&self, depth: Depth, out: &mut String) {
+        out.push_str(&format!("# {}\n", title_case(self.operation)));
+        let applied = self.operation.ends_with("apply");
+        if applied {
+            let revision = match self.proposed_revision {
+                Some(to) => format!("revision {} → {to}", self.current_revision),
+                None => format!("revision {}", self.current_revision),
+            };
+            out.push_str(&format!(
+                "**Applied to {}** — {revision}\n",
+                self.deployment
+            ));
+        } else {
+            let revision = match self.current_revision {
+                0 => "before its first apply".to_string(),
+                revision => format!("at revision {revision}"),
+            };
+            out.push_str(&format!("**Plan for {}** {revision}\n", self.deployment));
+        }
+        service_action_sections(self, applied, depth, out);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ServiceAction {
+    Create,
+    Update,
+    Delete,
+    Unchanged,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReportedServiceChange {
+    action: ServiceAction,
+    service: String,
+    module: String,
+}
+
+impl From<&ServiceChange> for ReportedServiceChange {
+    fn from(change: &ServiceChange) -> Self {
+        let action = match change.kind {
+            ServiceChangeKind::Create => ServiceAction::Create,
+            ServiceChangeKind::Update => ServiceAction::Update,
+            ServiceChangeKind::Delete => ServiceAction::Delete,
+            ServiceChangeKind::NoChange => ServiceAction::Unchanged,
+        };
+        Self {
+            action,
+            service: change.service.clone(),
+            module: change.module.clone(),
+        }
+    }
+}
+
+fn service_action_sections(report: &ServiceReport, applied: bool, depth: Depth, out: &mut String) {
+    let acting_exists = report
+        .changes
+        .iter()
+        .any(|change| change.action != ServiceAction::Unchanged);
+    if !acting_exists {
+        out.push_str("\nNo service changes - everything matches the definition.\n");
+    }
+
+    for (action, plan_heading, applied_heading, verb) in [
+        (ServiceAction::Create, "## Create", "## Created", "created"),
+        (ServiceAction::Update, "## Update", "## Updated", "updated"),
+        (ServiceAction::Delete, "## Delete", "## Deleted", "deleted"),
+    ] {
+        let members: Vec<&ReportedServiceChange> = report
+            .changes
+            .iter()
+            .filter(|change| change.action == action)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let heading = if applied {
+            applied_heading
+        } else {
+            plan_heading
+        };
+        out.push_str(&format!("\n{heading}\n"));
+        for change in members {
+            let identity = service_identity(change);
+            if applied {
+                out.push_str(&format!(
+                    "- the *{}* service - {identity}\n",
+                    change.service
+                ));
+            } else {
+                out.push_str(&format!(
+                    "- the *{}* service would be {verb} - {identity}\n",
+                    change.service
+                ));
+            }
+        }
+    }
+
+    if !applied && depth == Depth::Detail {
+        let unchanged: Vec<&ReportedServiceChange> = report
+            .changes
+            .iter()
+            .filter(|change| change.action == ServiceAction::Unchanged)
+            .collect();
+        if !unchanged.is_empty() {
+            out.push_str("\n## Unchanged\n");
+            for change in unchanged {
+                out.push_str(&format!(
+                    "- the *{}* service - {}\n",
+                    change.service,
+                    service_identity(change)
+                ));
+            }
+        }
+    }
+}
+
+fn service_identity(change: &ReportedServiceChange) -> String {
+    if change.module.is_empty() {
+        code_span(&change.service)
+    } else {
+        code_span(&format!("{}::{}", change.module, change.service))
     }
 }
 
@@ -862,15 +1046,14 @@ fn join_would_phrases(phrases: &[(bool, String)]) -> String {
 }
 
 /// The attention-worthy binding line for a **read-only** report: `Some` only
-/// when the verdict would block the apply, or the deployment is fresh (the
-/// first apply does more than the plan shows — the Day-0 stamp). Proceeding
-/// verdicts return `None`.
+/// when the verdict would block the apply, including an incomplete deployment
+/// that lacks creation's Day-0 record. Proceeding verdicts return `None`.
 pub(crate) fn binding_attention(
     initialized: bool,
     verdict: BindingVerdict,
 ) -> Option<&'static str> {
     if !initialized {
-        return Some("not initialized — `apply` stamps this deployment on first run");
+        return Some("creation record missing — recreate or re-fetch this deployment");
     }
     match verdict {
         BindingVerdict::Match | BindingVerdict::DevIterate => None,
@@ -947,6 +1130,63 @@ mod tests {
             binding,
             explanation: explain_plan(context(), outcome),
         }
+    }
+
+    fn service_change(kind: ServiceChangeKind, service: &str) -> ServiceChange {
+        ServiceChange {
+            kind,
+            service: service.to_string(),
+            module: "observability".to_string(),
+        }
+    }
+
+    #[test]
+    fn deploy_plan_uses_the_shared_markdown_and_depth_contract() {
+        let report = ServiceReport::plan(
+            "de-4",
+            2,
+            &[
+                service_change(ServiceChangeKind::Update, "mimir"),
+                service_change(ServiceChangeKind::NoChange, "tokeirad"),
+            ],
+        );
+
+        let summary = render(&report, Mode::resolve(false, false)).unwrap();
+        assert!(summary.starts_with("# Deploy Plan\n**Plan for de-4** at revision 2\n"));
+        assert!(summary.contains(
+            "## Update\n- the *mimir* service would be updated - `observability::mimir`\n"
+        ));
+        assert!(!summary.contains("## Unchanged"), "summary: {summary}");
+
+        let detail = render(&report, Mode::resolve(false, true)).unwrap();
+        assert!(
+            detail.contains("## Unchanged\n- the *tokeirad* service - `observability::tokeirad`\n")
+        );
+
+        let json = render(&report, Mode::resolve(true, true)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["operation"], "deploy plan");
+        assert_eq!(value["current_revision"], 2);
+        assert_eq!(value["changes"][0]["action"], "update");
+        assert_eq!(value["changes"][1]["action"], "unchanged");
+    }
+
+    #[test]
+    fn deploy_apply_is_a_past_tense_revision_record() {
+        let report = ServiceReport::applied(
+            "de-4",
+            2,
+            3,
+            &[
+                service_change(ServiceChangeKind::Update, "mimir"),
+                service_change(ServiceChangeKind::NoChange, "tokeirad"),
+            ],
+        );
+
+        let text = render(&report, Mode::resolve(false, true)).unwrap();
+        assert!(text.starts_with("# Deploy Apply\n**Applied to de-4** — revision 2 → 3\n"));
+        assert!(text.contains("## Updated\n- the *mimir* service - `observability::mimir`\n"));
+        assert!(!text.contains("## Unchanged"), "apply record: {text}");
     }
 
     /// A fully-declared semantics value: these tests exercise refresh and
@@ -1061,7 +1301,7 @@ mod tests {
         let fresh = report_for(&outcome, BindingVerdict::DevIterate, false);
         let text = render(&fresh, Mode::resolve(false, false)).unwrap();
         assert!(
-            text.contains("not initialized"),
+            text.contains("creation record missing"),
             "fresh case speaks: {text}"
         );
     }

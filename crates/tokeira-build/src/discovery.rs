@@ -46,6 +46,12 @@ pub struct PlatformPackageDescriptor {
     /// through each entry's extension. The platform names its own files;
     /// no engine-side name exists.
     pub definitions: Vec<RelativeDefinitionPath>,
+    /// Platform-authored non-definition content roots materialized recursively
+    /// beside the selected definition.
+    ///
+    /// Paths use the same portable deployment-relative admission as definition
+    /// roots; each entry may name one regular file or directory tree.
+    pub content: Vec<RelativeDefinitionPath>,
     /// Conventional source-library coordinates.
     pub package: PackageCoordinates,
 }
@@ -110,6 +116,8 @@ struct RawPlatformDescriptor {
     default_format: Option<String>,
     #[serde(default)]
     definitions: Vec<String>,
+    #[serde(default)]
+    content: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,6 +278,36 @@ fn decode_platform(
         }
         definitions.push(path);
     }
+    let mut content = Vec::new();
+    for entry in raw.content {
+        let path = RelativeDefinitionPath::new(entry)
+            .map_err(|error| invalid(package, "platform", error.to_string()))?;
+        if definitions.iter().any(|definition| {
+            definition.as_path() == path.as_path()
+                || definition.as_path().starts_with(path.as_path())
+                || path.as_path().starts_with(definition.as_path())
+        }) {
+            return Err(invalid(
+                package,
+                "platform",
+                format!(
+                    "content root `{path}` overlaps a declared definition; definitions and \
+                     non-definition content must be disjoint"
+                ),
+            ));
+        }
+        if let Some(existing) = content.iter().find(|existing: &&RelativeDefinitionPath| {
+            existing.as_path().starts_with(path.as_path())
+                || path.as_path().starts_with(existing.as_path())
+        }) {
+            return Err(invalid(
+                package,
+                "platform",
+                format!("content roots `{existing}` and `{path}` overlap"),
+            ));
+        }
+        content.push(path);
+    }
     let coordinates = package_coordinates(package, "platform")?;
     Ok(PlatformPackageDescriptor {
         id,
@@ -277,6 +315,7 @@ fn decode_platform(
         engine: raw.engine,
         default_format,
         definitions,
+        content,
         package: coordinates,
     })
 }
@@ -459,6 +498,7 @@ engine = "0.1.0"
 default = false
 default-format = "tkd"
 definitions = ["deployment.tkd"]
+content = ["observability"]
 "#,
             false,
         );
@@ -501,6 +541,7 @@ feature = "tkd"
             discovered.platforms[1].definitions[0].as_str(),
             "deployment.tkd"
         );
+        assert_eq!(discovered.platforms[1].content[0].as_str(), "observability");
     }
 
     #[test]
@@ -586,6 +627,23 @@ definitions = ["a.tkd", "b.tkd"]
         );
         let error = discover_workspace_descriptors(root.path()).expect_err("one root per format");
         assert!(error.to_string().contains("one root per format"));
+
+        let root = workspace(&["overlap"]);
+        write_package(
+            root.path(),
+            "overlap",
+            r#"
+[package.metadata.tokeira.platform]
+id = "overlap"
+engine = "0.1.0"
+default = false
+definitions = ["deployment.tkd"]
+content = ["observability", "observability/dashboards"]
+"#,
+            false,
+        );
+        let error = discover_workspace_descriptors(root.path()).expect_err("overlapping content");
+        assert!(error.to_string().contains("content roots"));
     }
 
     #[test]

@@ -58,8 +58,8 @@ pub(crate) fn evaluate_gate(
         },
         BindingVerdict::Unknown => GateOutcome::Refuse {
             verdict,
-            reason: "the deployment was never initialized (no Day-0 stamp) — `tkr deployment \
-                     apply` initializes it on first run"
+            reason: "the deployment has no creation binding — recreate or re-fetch it; apply \
+                     never initializes a deployment"
                 .to_string(),
         },
     }

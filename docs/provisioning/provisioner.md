@@ -62,6 +62,8 @@ Every command targets exactly one directory using `--deployment-dir`.
 | `tkp infra destroy --deployment-dir DIR --yes` | Mutating | Gates and irreversibly tears down platform infrastructure. |
 | `tkp deploy plan --deployment-dir DIR` | Read-only | Plans the platform's workload realization, or reports `NotApplicable`. |
 | `tkp deploy apply --deployment-dir DIR [--yes]` | Mutating | Gates, confirms, applies workloads, and advances the config revision. |
+| `tkp deploy destroy --deployment-dir DIR --yes` | Mutating | Removes workloads in reverse dependency order while retaining infrastructure and deployment records. |
+| `tkp destroy --deployment-dir DIR --yes` | Mutating | Removes workloads and then infrastructure; the owning `tkr` removes local records after success. |
 | `tkp scale --deployment-dir DIR SPEC...` | Mutating | Passes platform-interpreted capacity specs and advances the config revision when realized. |
 | `tkp revert --deployment-dir DIR --to N` | Mutating | Restores retained config revision `N`, reconciles with the same engine, and records a new forward revision. |
 | `tkp upgrade --deployment-dir DIR` | Mutating | Transfers ownership to the running engine, applies it, and retains rollback evidence. |

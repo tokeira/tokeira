@@ -788,3 +788,49 @@ fn session_control_and_process_input_debug_never_render_credentials() {
         vec![(DiagnosticStream::Stdout, b"safe progress".to_vec())]
     );
 }
+
+#[test]
+fn isolated_cli_session_ignores_ambient_source_selection() {
+    let counts = Arc::new(BoundaryCounts::default());
+    let inputs = ProcessInputs::for_test(
+        Some(OsString::from("1234")),
+        Some(OsString::from("ambient-session-token")),
+        Some(OsString::from("/ambient/dagger")),
+    )
+    .with_ambient_for_test(
+        Some(OsString::from("docker-container://ambient-runner")),
+        Some(OsString::from("ambient-runner-token")),
+        Some(OsString::from("00-ambient-trace")),
+        None,
+        None,
+    );
+    let context = RecordingContext {
+        directory: true,
+        inputs,
+        counts,
+    };
+    let config = ClientConfig::builder()
+        .isolated_cli_session()
+        .runner_host("docker-container://managed-runner")
+        .build()
+        .expect("the isolated CLI configuration is valid");
+
+    let plan = preflight_with(config, &context).expect("isolated source planning succeeds");
+    let ConnectionPlan::NewCli { source, request } = plan else {
+        panic!("an isolated session must select a new CLI");
+    };
+
+    assert!(matches!(*source, crate::preflight::CliSourcePlan::CompiledRelease { .. }));
+    assert_eq!(
+        request.environment(),
+        &[
+            (
+                OsString::from("_EXPERIMENTAL_DAGGER_RUNNER_HOST"),
+                OsString::from("docker-container://managed-runner"),
+            ),
+        ]
+    );
+    assert!(request.ambient().runner().host().is_none());
+    assert!(request.ambient().runner().token().is_none());
+    assert!(request.ambient().propagation().values()[0].1.is_some());
+}

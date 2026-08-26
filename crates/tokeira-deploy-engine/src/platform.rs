@@ -16,6 +16,22 @@ use crate::RuntimeError;
 /// service updates, and any provider-specific validation.
 #[async_trait::async_trait]
 pub trait Platform: Send + Sync {
+    /// Resolve any platform-owned prerequisites for one service manifest.
+    ///
+    /// The engine invokes this immediately before classifying the service in
+    /// a platform-aware plan and immediately before applying that same
+    /// service. Implementations may populate a local image cache according to
+    /// manifest policy, but must not mutate the running workload. Returning an
+    /// error aborts at this service, so earlier services may already have been
+    /// applied and persisted while later services remain untouched.
+    async fn prepare_service(
+        &self,
+        _service_name: &str,
+        _manifests: &[serde_json::Value],
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     /// Apply a set of manifests and return the number applied.
     async fn apply_manifests(&self, manifests: &[serde_json::Value])
     -> Result<usize, RuntimeError>;

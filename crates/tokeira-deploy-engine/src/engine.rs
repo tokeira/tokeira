@@ -8,7 +8,11 @@
 //! their prerequisites. Cycle detection and missing-dependency errors use
 //! the same resolution algorithm as the deploy-eks `RuntimeEngine`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::{
+    collections::{BTreeSet, HashSet},
+    future::Future,
+    pin::Pin,
+};
 
 use tracing::info;
 
@@ -46,6 +50,17 @@ pub struct PlannedServiceManifest {
     /// SHA-256 hex digest of the serialized manifests.
     pub desired_hash: String,
 }
+
+/// Callback invoked after one service mutation has been reflected in runtime
+/// state, allowing the caller to persist partial progress before the next
+/// service begins.
+pub type ServiceStateSaver = Box<
+    dyn Fn(
+            &tokeira_iac::RuntimeState,
+        ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + '_>>
+        + Send
+        + Sync,
+>;
 
 /// Stateless service engine.
 ///
@@ -94,6 +109,46 @@ impl ServiceEngine {
         Ok(changes)
     }
 
+    /// Plan services against both recorded state and the selected platform.
+    ///
+    /// Services are prepared and classified one at a time in dependency
+    /// order. Platform preparation may resolve an image into a local cache so
+    /// registry failures are reported by plan, while workload resources remain
+    /// untouched.
+    pub async fn plan_services_with_platform(
+        &self,
+        services: &[Box<dyn Service>],
+        platform: &dyn Platform,
+        ctx: &mut ServiceContext,
+        state: &tokeira_iac::RuntimeState,
+    ) -> Result<Vec<ServiceChange>, RuntimeError> {
+        let ordered = ordered_services(services)?;
+        let mut changes = Vec::new();
+        for service in ordered {
+            let manifests = service.manifests(ctx)?;
+            platform.prepare_service(service.name(), &manifests).await?;
+            let hash = hash_manifests(&manifests);
+            let mut kind = match state.services.get(service.name()) {
+                Some(existing) if existing.desired_hash == hash => ServiceChangeKind::NoChange,
+                Some(_) => ServiceChangeKind::Update,
+                None => ServiceChangeKind::Create,
+            };
+            if kind == ServiceChangeKind::NoChange
+                && !platform
+                    .is_service_current(service.name(), &manifests)
+                    .await
+            {
+                kind = ServiceChangeKind::Update;
+            }
+            changes.push(ServiceChange {
+                kind,
+                service: service.name().to_string(),
+                module: service.module().to_string(),
+            });
+        }
+        Ok(changes)
+    }
+
     /// Apply service manifests via the platform and update state.
     ///
     /// Services are topologically sorted by `Service::dependencies()`.
@@ -104,10 +159,29 @@ impl ServiceEngine {
         ctx: &mut ServiceContext,
         state: &mut tokeira_iac::RuntimeState,
     ) -> Result<Vec<ServiceChange>, RuntimeError> {
+        self.apply_services_with_saver(services, platform, ctx, state, None)
+            .await
+    }
+
+    /// Apply services one at a time and optionally persist after each
+    /// successful service mutation.
+    ///
+    /// Preparation, apply, state update, and persistence complete for service
+    /// N before service N+1 begins. A failure therefore preserves the durable
+    /// progress of earlier services without recording the failed service.
+    pub async fn apply_services_with_saver(
+        &self,
+        services: &[Box<dyn Service>],
+        platform: &dyn Platform,
+        ctx: &mut ServiceContext,
+        state: &mut tokeira_iac::RuntimeState,
+        saver: Option<&ServiceStateSaver>,
+    ) -> Result<Vec<ServiceChange>, RuntimeError> {
         let ordered = ordered_services(services)?;
         let mut changes = Vec::new();
         for service in ordered {
             let manifests = service.manifests(ctx)?;
+            platform.prepare_service(service.name(), &manifests).await?;
             let hash = hash_manifests(&manifests);
             let mut kind = match state.services.get(service.name()) {
                 Some(existing) if existing.desired_hash == hash => ServiceChangeKind::NoChange,
@@ -137,6 +211,9 @@ impl ServiceEngine {
                         last_applied: chrono::Utc::now().to_rfc3339(),
                     },
                 );
+                if let Some(save) = saver {
+                    save(state).await?;
+                }
                 info!(
                     service = service.name(),
                     module = service.module(),
@@ -173,6 +250,41 @@ impl ServiceEngine {
         ctx: &mut ServiceContext,
         state: &mut tokeira_iac::RuntimeState,
     ) -> Result<Vec<ServiceChange>, RuntimeError> {
+        self.destroy_services_with_saver(services, platform, ctx, state, None)
+            .await
+    }
+
+    /// Destroy services one at a time and optionally persist after each
+    /// successful workload removal.
+    ///
+    /// The reverse dependency order is also the commit order. If service N
+    /// fails, every dependent removed before it is durably absent while N and
+    /// its remaining prerequisites stay recorded for a retry.
+    pub async fn destroy_services_with_saver(
+        &self,
+        services: &[Box<dyn Service>],
+        platform: &dyn Platform,
+        ctx: &mut ServiceContext,
+        state: &mut tokeira_iac::RuntimeState,
+        saver: Option<&ServiceStateSaver>,
+    ) -> Result<Vec<ServiceChange>, RuntimeError> {
+        let desired_names = services
+            .iter()
+            .map(|service| service.name())
+            .collect::<HashSet<_>>();
+        let mut undescribed = state
+            .services
+            .keys()
+            .filter(|name| !desired_names.contains(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        undescribed.sort();
+        if !undescribed.is_empty() {
+            return Err(RuntimeError::Service(format!(
+                "cannot destroy recorded services absent from the current definition: {}; restore the service definitions so their provider manifests can be deleted",
+                undescribed.join(", ")
+            )));
+        }
         if !services.is_empty() && !platform.supports_delete() {
             return Err(RuntimeError::Platform(
                 "platform does not support service deletion; refusing delete-only pass".to_string(),
@@ -184,6 +296,9 @@ impl ServiceEngine {
             let manifests = service.manifests(ctx)?;
             platform.delete_service(service.name(), &manifests).await?;
             state.services.remove(service.name());
+            if let Some(save) = saver {
+                save(state).await?;
+            }
             info!(
                 service = service.name(),
                 module = service.module(),
@@ -331,6 +446,7 @@ mod tests {
     };
     use std::{
         future::Future,
+        sync::Arc,
         task::{Context, Poll, Waker},
     };
 
@@ -364,22 +480,45 @@ mod tests {
             self.deps.to_vec()
         }
         fn manifests(&self, _ctx: &ServiceContext) -> Result<Vec<serde_json::Value>, RuntimeError> {
-            Ok(vec![])
+            Ok(vec![serde_json::json!({ "name": self.name })])
         }
     }
 
     #[derive(Default)]
     struct MockPlatform {
+        prepared: std::sync::Mutex<Vec<String>>,
+        applied: std::sync::Mutex<Vec<String>>,
+        fail_prepare_on: std::sync::Mutex<Option<String>>,
+        fail_delete_on: std::sync::Mutex<Option<String>>,
         deleted: std::sync::Mutex<Vec<String>>,
         supports_delete: bool,
     }
 
     #[async_trait::async_trait]
     impl crate::Platform for MockPlatform {
+        async fn prepare_service(
+            &self,
+            service_name: &str,
+            _manifests: &[serde_json::Value],
+        ) -> Result<(), RuntimeError> {
+            self.prepared.lock().unwrap().push(service_name.to_string());
+            if self.fail_prepare_on.lock().unwrap().as_deref() == Some(service_name) {
+                return Err(RuntimeError::Platform(format!(
+                    "image pull failed for service '{service_name}': manifest unknown"
+                )));
+            }
+            Ok(())
+        }
+
         async fn apply_manifests(
             &self,
             manifests: &[serde_json::Value],
         ) -> Result<usize, RuntimeError> {
+            for manifest in manifests {
+                if let Some(name) = manifest.get("name").and_then(serde_json::Value::as_str) {
+                    self.applied.lock().unwrap().push(name.to_string());
+                }
+            }
             Ok(manifests.len())
         }
         fn supports_delete(&self) -> bool {
@@ -390,6 +529,11 @@ mod tests {
             service_name: &str,
             _manifests: &[serde_json::Value],
         ) -> Result<(), RuntimeError> {
+            if self.fail_delete_on.lock().unwrap().as_deref() == Some(service_name) {
+                return Err(RuntimeError::Platform(format!(
+                    "delete failed for service '{service_name}'"
+                )));
+            }
             self.deleted.lock().unwrap().push(service_name.to_string());
             Ok(())
         }
@@ -405,6 +549,99 @@ mod tests {
                 desired_hash: String::new(),
                 last_applied: String::new(),
             },
+        );
+    }
+
+    fn dependent_services() -> Vec<Box<dyn Service>> {
+        vec![
+            Box::new(MockService {
+                name: "a",
+                deps: &[],
+            }),
+            Box::new(MockService {
+                name: "b",
+                deps: &["a"],
+            }),
+            Box::new(MockService {
+                name: "c",
+                deps: &["b"],
+            }),
+        ]
+    }
+
+    #[test]
+    fn platform_aware_plan_surfaces_the_failing_service_preparation() {
+        let platform = MockPlatform::default();
+        *platform.fail_prepare_on.lock().unwrap() = Some("b".to_string());
+        let services = dependent_services();
+        let engine = ServiceEngine::new();
+        let mut ctx = ServiceContext::default();
+        let state = tokeira_iac::RuntimeState::default();
+
+        let error = block_on_ready(
+            engine.plan_services_with_platform(&services, &platform, &mut ctx, &state),
+        )
+        .expect_err("the platform's image error must fail plan");
+
+        assert!(error.to_string().contains("manifest unknown"));
+        assert_eq!(platform.prepared.lock().unwrap().as_slice(), ["a", "b"]);
+        assert!(platform.applied.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_persists_each_service_and_retry_resumes_after_pull_failure() {
+        let platform = MockPlatform::default();
+        *platform.fail_prepare_on.lock().unwrap() = Some("b".to_string());
+        let services = dependent_services();
+        let engine = ServiceEngine::new();
+        let mut ctx = ServiceContext::default();
+        let mut state = tokeira_iac::RuntimeState::default();
+        let snapshots = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let saved = Arc::clone(&snapshots);
+        let saver: ServiceStateSaver = Box::new(move |state| {
+            let mut names: Vec<String> = state.services.keys().cloned().collect();
+            names.sort();
+            saved.lock().unwrap().push(names);
+            Box::pin(async { Ok(()) })
+        });
+
+        let error = block_on_ready(engine.apply_services_with_saver(
+            &services,
+            &platform,
+            &mut ctx,
+            &mut state,
+            Some(&saver),
+        ))
+        .expect_err("the second service's pull fails");
+        assert!(error.to_string().contains("service 'b'"));
+        assert_eq!(state.services.keys().cloned().collect::<Vec<_>>(), ["a"]);
+        assert_eq!(
+            snapshots.lock().unwrap().as_slice(),
+            [vec!["a".to_string()]]
+        );
+        assert_eq!(platform.applied.lock().unwrap().as_slice(), ["a"]);
+
+        *platform.fail_prepare_on.lock().unwrap() = None;
+        let changes = block_on_ready(engine.apply_services_with_saver(
+            &services,
+            &platform,
+            &mut ctx,
+            &mut state,
+            Some(&saver),
+        ))
+        .expect("retry resumes after the persisted service");
+
+        assert_eq!(changes[0].kind, ServiceChangeKind::NoChange);
+        assert_eq!(changes[1].kind, ServiceChangeKind::Create);
+        assert_eq!(changes[2].kind, ServiceChangeKind::Create);
+        assert_eq!(platform.applied.lock().unwrap().as_slice(), ["a", "b", "c"]);
+        assert_eq!(
+            snapshots.lock().unwrap().as_slice(),
+            [
+                vec!["a".to_string()],
+                vec!["a".to_string(), "b".to_string()],
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            ]
         );
     }
 
@@ -427,11 +664,41 @@ mod tests {
     }
 
     #[test]
+    fn destroy_refuses_before_mutation_when_recorded_service_has_no_manifest() {
+        let platform = MockPlatform {
+            supports_delete: true,
+            ..Default::default()
+        };
+        let services: Vec<Box<dyn Service>> = vec![Box::new(MockService {
+            name: "current",
+            deps: &[],
+        })];
+        let engine = ServiceEngine::new();
+        let mut ctx = ServiceContext::default();
+        let mut state = tokeira_iac::RuntimeState::default();
+        seed_service_state(&mut state, "removed-from-definition");
+
+        let error =
+            block_on_ready(engine.destroy_services(&services, &platform, &mut ctx, &mut state))
+                .expect_err("a recorded service without manifests must fail closed");
+
+        assert!(error.to_string().contains("removed-from-definition"));
+        assert!(
+            error
+                .to_string()
+                .contains("restore the service definitions")
+        );
+        assert!(platform.deleted.lock().unwrap().is_empty());
+        assert!(state.services.contains_key("removed-from-definition"));
+    }
+
+    #[test]
     fn destroy_services_deletes_in_reverse_dependency_order() {
         // 11.3d: delete dependents before dependencies, removing each from state.
         let platform = MockPlatform {
             deleted: std::sync::Mutex::new(Vec::new()),
             supports_delete: true,
+            ..Default::default()
         };
         let services: Vec<Box<dyn Service>> = vec![
             Box::new(MockService {
@@ -462,6 +729,63 @@ mod tests {
         assert!(state.services.is_empty(), "all services removed from state");
         let deleted = platform.deleted.lock().unwrap().clone();
         assert_eq!(deleted, vec!["frontend", "matching", "history"]);
+    }
+
+    #[test]
+    fn destroy_persists_each_service_and_stops_before_its_failed_prerequisite() {
+        let platform = MockPlatform {
+            supports_delete: true,
+            ..Default::default()
+        };
+        *platform.fail_delete_on.lock().unwrap() = Some("matching".to_string());
+        let services: Vec<Box<dyn Service>> = vec![
+            Box::new(MockService {
+                name: "history",
+                deps: &[],
+            }),
+            Box::new(MockService {
+                name: "matching",
+                deps: &["history"],
+            }),
+            Box::new(MockService {
+                name: "frontend",
+                deps: &["matching"],
+            }),
+        ];
+        let engine = ServiceEngine::new();
+        let mut ctx = ServiceContext::default();
+        let mut state = tokeira_iac::RuntimeState::default();
+        for name in ["history", "matching", "frontend"] {
+            seed_service_state(&mut state, name);
+        }
+        let snapshots = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let saved = Arc::clone(&snapshots);
+        let saver: ServiceStateSaver = Box::new(move |state| {
+            let mut names: Vec<String> = state.services.keys().cloned().collect();
+            names.sort();
+            saved.lock().unwrap().push(names);
+            Box::pin(async { Ok(()) })
+        });
+
+        let error = block_on_ready(engine.destroy_services_with_saver(
+            &services,
+            &platform,
+            &mut ctx,
+            &mut state,
+            Some(&saver),
+        ))
+        .expect_err("the prerequisite deletion fails after its dependent is gone");
+
+        assert!(error.to_string().contains("matching"));
+        assert_eq!(platform.deleted.lock().unwrap().as_slice(), ["frontend"]);
+        assert_eq!(
+            snapshots.lock().unwrap().as_slice(),
+            [vec!["history".to_string(), "matching".to_string()]]
+        );
+        assert_eq!(
+            state.services.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["history".to_string(), "matching".to_string()])
+        );
     }
 
     #[test]

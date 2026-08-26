@@ -23,8 +23,10 @@ mod image;
 mod platform;
 mod service;
 
-pub use engine::{PlannedServiceManifest, ServiceChange, ServiceChangeKind, ServiceEngine};
-pub use error::RuntimeError;
+pub use engine::{
+    PlannedServiceManifest, ServiceChange, ServiceChangeKind, ServiceEngine, ServiceStateSaver,
+};
+pub use error::{RuntimeError, ServiceImageIssue, ServiceImageIssueKind};
 pub use image::{
     DesiredImageRef, Image, ImageContext, ImageSourceType, WritebackTarget, validate_registry,
 };

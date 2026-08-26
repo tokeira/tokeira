@@ -1,10 +1,15 @@
-//! `tkp destroy` — gated teardown of the deployment's infrastructure.
+//! Gated teardown of infrastructure and the complete live deployment.
 //!
-//! `destroy` is a mutating verb, so the binding gate runs **before any provider
+//! Every destroy is a mutating verb, so the binding gate runs **before any provider
 //! mutation** (versioned deployments refuse on a non-`Match` verdict; dev
 //! deployments take the permissive `DevIterate` warn-and-proceed path — the same
 //! policy as `apply`). Because a teardown is irreversible, it additionally
 //! requires an explicit `--yes` confirmation.
+//!
+//! `infra destroy` removes only the substrate. The aggregate `tkp destroy`,
+//! invoked by `tkr deployment destroy`, removes services first and then the
+//! substrate. It deliberately leaves local records to `tkr`, which removes
+//! them only after the provisioner exits successfully.
 //!
 //! The engine identity binding is retained (the running binary is still the
 //! authority over the now-empty state) and `effective_config_ref` is cleared to
@@ -18,11 +23,49 @@ use tokeira_deployment::ProvenanceStamp;
 use tokeira_platform::definition::DefinitionFrontend;
 
 use crate::{
+    deploy,
     engine::Engine,
     envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform::Admitted,
 };
+
+/// Tear down the complete live footprint while retaining the deployment
+/// records needed to resume a partial failure.
+///
+/// Workloads stand on infrastructure, so teardown reverses the creation
+/// sequence. The owning `tkr` process removes the directory only after this
+/// function returns success; `tkp` cannot delete the binary and definition it
+/// is actively using.
+pub(crate) async fn destroy_deployment<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
+    yes: bool,
+    mode: tokeira_report::Mode,
+) -> Result<()> {
+    if !yes {
+        anyhow::bail!(
+            "`deployment destroy` tears down services and infrastructure and is irreversible; \
+             re-run with `--yes` to confirm"
+        );
+    }
+    ordered_teardown(
+        || deploy::deploy_destroy(engine, admitted, true, mode),
+        || destroy(engine, admitted, None, true),
+    )
+    .await
+}
+
+async fn ordered_teardown<D, DFut, I, IFut>(deploy: D, infra: I) -> Result<()>
+where
+    D: FnOnce() -> DFut,
+    DFut: std::future::Future<Output = Result<()>>,
+    I: FnOnce() -> IFut,
+    IFut: std::future::Future<Output = Result<()>>,
+{
+    deploy().await?;
+    infra().await
+}
 
 pub(crate) async fn destroy<F: DefinitionFrontend>(
     engine: &Engine<F>,
@@ -89,6 +132,7 @@ pub(crate) async fn destroy<F: DefinitionFrontend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use tokeira_deployment::DeploymentStateEnvelope;
 
     #[tokio::test]
@@ -153,5 +197,44 @@ mod tests {
             "effective config ref cleared"
         );
         assert!(after.binding.is_some(), "engine identity retained");
+    }
+
+    #[tokio::test]
+    async fn complete_teardown_runs_workloads_before_infrastructure() {
+        let calls = RefCell::new(Vec::new());
+        ordered_teardown(
+            || async {
+                calls.borrow_mut().push("deploy");
+                Ok(())
+            },
+            || async {
+                calls.borrow_mut().push("infra");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.into_inner(), ["deploy", "infra"]);
+    }
+
+    #[tokio::test]
+    async fn complete_teardown_never_enters_infrastructure_after_workload_failure() {
+        let calls = RefCell::new(Vec::new());
+        let error = ordered_teardown(
+            || async {
+                calls.borrow_mut().push("deploy");
+                anyhow::bail!("workload deletion failed")
+            },
+            || async {
+                calls.borrow_mut().push("infra");
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("the workload failure stops the aggregate teardown");
+
+        assert!(error.to_string().contains("workload deletion failed"));
+        assert_eq!(calls.into_inner(), ["deploy"]);
     }
 }

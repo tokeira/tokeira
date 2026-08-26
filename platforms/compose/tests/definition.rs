@@ -6,14 +6,38 @@
 
 use std::path::Path;
 
-use serde::Serialize;
-use tokeira_platform::definition::{
-    DefinitionFrontend, DefinitionSourceName, DirectoryPartSources, FrontendOutput, FrontendSource,
+use serde::{Deserialize, Serialize};
+use tokeira_platform::{
+    author::from_located_value,
+    definition::{
+        DefinitionFrontend, DefinitionSourceName, DirectoryPartSources, FrontendOutput,
+        FrontendSource,
+    },
 };
 
 #[derive(Serialize)]
 struct Ctx {
     project_name: String,
+}
+
+#[derive(Deserialize)]
+struct ShippedConfig {
+    tokeirad: ShippedImage,
+    observability: ShippedObservability,
+}
+
+#[derive(Deserialize)]
+struct ShippedObservability {
+    mimir: ShippedImage,
+    loki: ShippedImage,
+    grafana: ShippedImage,
+    alloy: ShippedImage,
+}
+
+#[derive(Deserialize)]
+struct ShippedImage {
+    image: String,
+    pull_policy: String,
 }
 
 fn evaluate(root_text: &str) -> Result<FrontendOutput, String> {
@@ -75,6 +99,23 @@ fn the_shipped_set_evaluates_with_in_memory_defaults() {
         );
     }
     assert!(output.graph.writeback().is_empty());
+}
+
+#[test]
+fn the_shipped_set_pins_current_observability_images() {
+    let output = evaluate(&shipped_root()).expect("the shipped definition set evaluates");
+    let config: ShippedConfig =
+        from_located_value(output.config).expect("the shipped config admits");
+    assert_eq!(config.tokeirad.image, "tokeirad:latest");
+    assert_eq!(config.tokeirad.pull_policy, "never");
+    assert_eq!(config.observability.mimir.image, "grafana/mimir:3.2.0");
+    assert_eq!(config.observability.mimir.pull_policy, "missing");
+    assert_eq!(config.observability.loki.image, "grafana/loki:3.7.6");
+    assert_eq!(config.observability.loki.pull_policy, "missing");
+    assert_eq!(config.observability.grafana.image, "grafana/grafana:12.4.9");
+    assert_eq!(config.observability.grafana.pull_policy, "missing");
+    assert_eq!(config.observability.alloy.image, "grafana/alloy:v1.19.0");
+    assert_eq!(config.observability.alloy.pull_policy, "missing");
 }
 
 // Selecting DSQL storage in the root's config adds the dsql module and the

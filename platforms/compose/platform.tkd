@@ -35,6 +35,7 @@ pub enum Storage {
 // ports (Temporal-compatible gRPC, Prometheus metrics).
 pub struct Tokeirad {
     pub image: String,
+    pub pull_policy: String,
     pub replicas: u32,
     pub grpc_port: u16,
     pub metrics_port: u16,
@@ -43,6 +44,7 @@ pub struct Tokeirad {
 // One observability backend container: image and capacity.
 pub struct Backend {
     pub image: String,
+    pub pull_policy: String,
     pub replicas: u32,
 }
 
@@ -50,6 +52,7 @@ pub struct Backend {
 // administrator password seeded at first start.
 pub struct Grafana {
     pub image: String,
+    pub pull_policy: String,
     pub replicas: u32,
     pub port: u16,
     pub admin_password: String,

@@ -243,11 +243,13 @@ without a TKP implementation is refused rather than sent to a legacy in-process 
 | `tkr infra status` | `tkp describe --deployment-dir DIR` |
 | `tkr deploy plan` | `tkp deploy plan --deployment-dir DIR` |
 | `tkr deploy apply` | `tkp deploy apply --deployment-dir DIR` |
+| `tkr deploy destroy` | `tkp deploy destroy --deployment-dir DIR` |
 | `tkr deploy status` | `tkp describe --deployment-dir DIR` |
 | `tkr scale up/down` | `tkp scale --deployment-dir DIR ...` |
 | `tkr scale status` | `tkp describe --deployment-dir DIR` |
 | `tkr deployment describe` | `tkp describe --deployment-dir DIR` |
 | `tkr deployment apply` | `tkp infra apply --deployment-dir DIR` |
+| `tkr deployment destroy --name NAME` | `tkp destroy --deployment-dir DIR`, followed by local record removal |
 | `tkr deployment upgrade` | candidate-driven `tkp upgrade`, then provisioner replacement |
 | `tkr deployment rollback` | rollback orchestration across the bound and retained provisioners |
 

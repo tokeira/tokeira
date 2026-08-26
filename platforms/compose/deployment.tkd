@@ -19,20 +19,22 @@ fn config() -> Compose {
         aws: Aws { region: "eu-west-2".into() },
         tokeirad: Tokeirad {
             image: "tokeirad:latest".into(),
+            pull_policy: "never".into(),
             replicas: 1,
             grpc_port: 7233,
             metrics_port: 9090,
         },
         observability: Observability {
-            mimir: Backend { image: "grafana/mimir:3.0.6".into(), replicas: 1 },
-            loki: Backend { image: "grafana/loki:3.7.1".into(), replicas: 1 },
+            mimir: Backend { image: "grafana/mimir:3.2.0".into(), pull_policy: "missing".into(), replicas: 1 },
+            loki: Backend { image: "grafana/loki:3.7.6".into(), pull_policy: "missing".into(), replicas: 1 },
             grafana: Grafana {
-                image: "grafana/grafana-oss:12.4.3".into(),
+                image: "grafana/grafana:12.4.9".into(),
+                pull_policy: "missing".into(),
                 replicas: 1,
                 port: 3000,
                 admin_password: "admin".into(),
             },
-            alloy: Backend { image: "grafana/alloy:v1.16.0".into(), replicas: 1 },
+            alloy: Backend { image: "grafana/alloy:v1.19.0".into(), pull_policy: "missing".into(), replicas: 1 },
         },
     }
 }
@@ -97,6 +99,7 @@ fn deployment(cfg: Compose, cx: Context) -> Deployment {
         "tokeirad",
         Service {
             image: cfg.tokeirad.image.clone(),
+            pull_policy: cfg.tokeirad.pull_policy.clone(),
             replicas: cfg.tokeirad.replicas,
             publish: vec![cfg.tokeirad.grpc_port, cfg.tokeirad.metrics_port],
             aws_region: match &cfg.storage {

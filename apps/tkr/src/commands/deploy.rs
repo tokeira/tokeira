@@ -1,4 +1,4 @@
-//! `tkr deploy` — service lifecycle: plan, apply, report status.
+//! `tkr deploy` — service lifecycle: plan, apply, destroy, report status.
 //!
 //! `deploy apply` behaves differently per platform because the underlying
 //! runtime engine does:
@@ -18,7 +18,7 @@
 //! surfaced as `Stopped` even if the metadata still says `Running`.
 
 use anyhow::Result;
-use tokeira_ecs_deployment::EcsDeployment;
+use tokeira_ecs_deployment::{EcsDeployment, EcsPlatform};
 use tokeira_local_deployment::LocalDeployment;
 use tokeira_orchestrator::DeployEngine;
 
@@ -68,6 +68,23 @@ pub(crate) async fn run(
                 }
                 PlatformDeploymentConfig::Ecs(_) => {
                     anyhow::bail!("ECS deploy apply is not implemented yet");
+                }
+            }
+        }
+        DeployAction::Destroy { yes } => {
+            super::require_confirmation(yes, "deploy destroy")?;
+            match &ctx.platform_config {
+                PlatformDeploymentConfig::Local(_) => {
+                    process::stop_tokeirad(&ctx.path).await?;
+                    deployments.update_status(&ctx.name, DeploymentStatus::Stopped)?;
+                    println!("destroyed local services for {}", ctx.name);
+                }
+                PlatformDeploymentConfig::Ecs(config) => {
+                    let mut engine =
+                        DeployEngine::new(EcsDeployment::new(&ctx.path), config, &ctx.path).await?;
+                    let changes = engine.destroy(&EcsPlatform::new()).await?;
+                    print_plan(&changes);
+                    deployments.update_status(&ctx.name, DeploymentStatus::Stopped)?;
                 }
             }
         }

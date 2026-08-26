@@ -119,10 +119,15 @@ impl BoundPlatform {
 
     /// Admit one deployment directory.
     ///
-    /// Three agreements, all or nothing: the deployment metadata names this
-    /// platform and this definition format; the placed provisioner bundle,
-    /// when present, carries bound evidence for the same pair; and the
-    /// bundle's integrity manifest verifies the running executable.
+    /// Two agreements, all or nothing: the deployment metadata names this
+    /// platform and this definition format, and the placed provisioner
+    /// bundle, when present, carries bound evidence for the same pair.
+    ///
+    /// Executable-byte admission belongs to `tkr`'s launch class. In
+    /// particular, an upgrade candidate B cannot match the placed sidecar for
+    /// A; bound and rollback launches are instead verified against the
+    /// authoritative envelope manifest before `tkr` starts them. Creation
+    /// independently verifies the placed bytes before committing Day 0.
     ///
     /// Called once per command; the returned [`Admitted`] value threads
     /// through every engine verb the command drives.
@@ -193,24 +198,9 @@ impl BoundPlatform {
                 self.format
             );
         }
-        let manifest = bundle.integrity_manifest();
-        manifest.validate().map_err(|error| {
+        bundle.integrity_manifest().validate().map_err(|error| {
             anyhow::anyhow!("placed provisioner bundle has an invalid integrity manifest: {error}")
-        })?;
-        let executable =
-            std::env::current_exe().context("failed to locate the running bound provisioner")?;
-        let executable_bytes = std::fs::read(&executable)
-            .with_context(|| format!("failed to read {}", executable.display()))?;
-        manifest
-            .verify_artifact(
-                &executable_bytes,
-                &tokeira_deployment::Target(env!("TKP_TARGET").to_string()),
-            )
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "the running bound provisioner disagrees with its placed bundle: {error}"
-                )
-            })
+        })
     }
 
     // ------------------------------------------------------------------
@@ -467,6 +457,59 @@ mod tests {
         .unwrap();
     }
 
+    fn write_bundle_for_other_executable(dir: &Path) {
+        use std::collections::BTreeSet;
+
+        use tokeira_deployment::{
+            BinaryArtifactDescriptor, BoundProvisionerEvidence, BuildAuthority, BuildManifest,
+            BuildProfile, EngineIdentity, ProvisionerBundle, Sha256Digest, Target, TestEvidence,
+        };
+
+        let identity = EngineIdentity {
+            source_closure: Sha256Digest::from_bytes(b"source"),
+            lock_closure: Sha256Digest::from_bytes(b"lock"),
+            toolchain: "rustc test".to_string(),
+            build_container: None,
+            features: BTreeSet::new(),
+            profile: BuildProfile::Dev,
+        };
+        let bundle = ProvisionerBundle {
+            bound: Some(BoundProvisionerEvidence {
+                platform: PlatformId::new("test").unwrap(),
+                format: DefinitionFormatId::new("tkd").unwrap(),
+                engine: "0.1.0".to_string(),
+                generated_root: Sha256Digest::from_bytes(b"root"),
+                source_closure: identity.source_closure,
+                lock_closure: identity.lock_closure,
+            }),
+            identity,
+            authority: BuildAuthority::LocalDeveloper,
+            provisioner_version: "0.1.0".to_string(),
+            artifacts: vec![BinaryArtifactDescriptor {
+                target: Target(env!("TKP_TARGET").to_string()),
+                sha256: tokeira_deployment::sha256_hex(b"candidate-a"),
+                retrieval_ref: None,
+                size_bytes: b"candidate-a".len() as u64,
+            }],
+            tests: TestEvidence {
+                command: "test".to_string(),
+                passed: true,
+            },
+            build: BuildManifest {
+                request_id: "request".to_string(),
+                source_tree_oid: "tree".to_string(),
+                snapshot_commit_oid: "commit".to_string(),
+                toolchain: "rustc test".to_string(),
+                builder: "test".to_string(),
+            },
+        };
+        std::fs::write(
+            dir.join(tokeira_deployment::BUNDLE_MANIFEST_BASENAME),
+            serde_json::to_vec(&bundle).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn admission_yields_the_value_every_verb_threads() {
         let dir = tempfile::tempdir().unwrap();
@@ -487,6 +530,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["observability"]
         );
+    }
+
+    #[test]
+    fn admission_leaves_executable_verification_to_the_launch_class() {
+        let dir = tempfile::tempdir().unwrap();
+        write_metadata(dir.path(), "test");
+        write_bundle_for_other_executable(dir.path());
+        let platform = BoundPlatform::bind("test", "tkd", declaration()).unwrap();
+
+        platform
+            .admit_deployment(dir.path())
+            .expect("candidate admission checks provenance, not A's artifact bytes");
     }
 
     #[test]

@@ -1,23 +1,20 @@
 //! `tkr deployment` — CRUD and selection for named deployments.
 //!
 //! This module owns the operator-facing lifecycle (create / list / use /
-//! destroy). It deliberately does NOT touch infrastructure or services:
-//! `deployment create` writes template configs and records metadata, but
-//! nothing tangible exists in AWS / Compose until `tkr infra apply` and
-//! `tkr deploy apply` run against that deployment.
-//!
-//! The `Destroy` action removes the deployment directory from disk but
-//! does NOT destroy cloud resources. Operators must run `tkr infra
-//! destroy` first; this ordering is deliberate so a misplaced
-//! `deployment destroy` never orphans AWS resources.
+//! destroy). Creation realizes a durable Day-0 deployment. Destruction is its
+//! reverse: services first, infrastructure second, and records last. The
+//! directory remains authoritative recovery material until both live planes
+//! report success.
+
+use std::future::Future;
 
 use anyhow::{Context, Result, bail};
 use tokeira_deployment::RecordedDefinition;
 use tokeira_orchestrator::StorageKind;
 
 use crate::{
-    cli::DeploymentAction,
-    deployment_dir::{DefinitionSeed, DeploymentResolver, normalize_name},
+    cli::{DeployAction, DeploymentAction, InfraAction},
+    deployment_dir::{DefinitionSeed, DeploymentResolver, load_context, normalize_name},
     deployment_lock, launcher,
     metadata::DeploymentMetadata,
     output::OutputFormatter,
@@ -233,7 +230,43 @@ pub(crate) async fn run(
         DeploymentAction::Destroy { name, yes } => {
             super::require_confirmation(yes, "deployment destroy")?;
             let name = normalize_name(&name);
-            deployments.remove(&name)?;
+            let dir = deployments.resolve_dir(Some(&name))?;
+            remove_after_teardown(deployments, &name, async {
+                if deployments.uses_bound_provisioner(Some(&name))? {
+                    let mut extra = vec!["--yes".to_string()];
+                    if json {
+                        extra.push("--json".to_string());
+                    }
+                    if detail {
+                        extra.push("--detail".to_string());
+                    }
+                    launcher::launch(&dir, &["destroy"], &extra).await?;
+                } else {
+                    crate::commands::deploy::run(
+                        DeployAction::Destroy { yes: true },
+                        deployments,
+                        load_context(deployments, Some(&name))?,
+                    )
+                    .await?;
+                    let format = if json {
+                        crate::tui::OutputFormat::Json
+                    } else {
+                        crate::tui::OutputFormat::Human
+                    };
+                    crate::commands::infra::run(
+                        InfraAction::Destroy {
+                            yes: true,
+                            module: None,
+                        },
+                        deployments,
+                        load_context(deployments, Some(&name))?,
+                        format,
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+            .await?;
             println!("destroyed deployment {name}");
         }
         DeploymentAction::Lock { name } => {
@@ -282,6 +315,18 @@ pub(crate) async fn run(
     Ok(())
 }
 
+async fn remove_after_teardown<F>(
+    deployments: &DeploymentResolver,
+    name: &str,
+    teardown: F,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    teardown.await?;
+    deployments.remove(name)
+}
+
 fn print_metadata(metadata: &DeploymentMetadata, as_json: bool) -> Result<()> {
     if as_json {
         println!("{}", serde_json::to_string_pretty(metadata)?);
@@ -292,4 +337,40 @@ fn print_metadata(metadata: &DeploymentMetadata, as_json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn teardown_failure_retains_the_deployment_records() {
+        let root = tempfile::tempdir().unwrap();
+        let deployments = DeploymentResolver::with_root(root.path().to_path_buf());
+        let deployment = deployments.path("dev");
+        std::fs::create_dir_all(&deployment).unwrap();
+
+        let error = remove_after_teardown(&deployments, "dev", async {
+            Err(anyhow::anyhow!("provider deletion failed"))
+        })
+        .await
+        .expect_err("teardown failure must retain recovery records");
+
+        assert!(error.to_string().contains("provider deletion failed"));
+        assert!(deployment.exists());
+    }
+
+    #[tokio::test]
+    async fn successful_teardown_removes_the_deployment_records() {
+        let root = tempfile::tempdir().unwrap();
+        let deployments = DeploymentResolver::with_root(root.path().to_path_buf());
+        let deployment = deployments.path("dev");
+        std::fs::create_dir_all(&deployment).unwrap();
+
+        remove_after_teardown(&deployments, "dev", async { Ok(()) })
+            .await
+            .unwrap();
+
+        assert!(!deployment.exists());
+    }
 }

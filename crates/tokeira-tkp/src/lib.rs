@@ -163,21 +163,21 @@ pub use tokeira_platform::declaration::{
 };
 pub use tokeira_platform::{definition::Namespace, kind};
 
-/// The typed refusal a verb returns after emitting a platform-issue
-/// document: the document already said everything (output-templates §The
-/// platform cannot be reached — "The verb exits non-zero"), so [`cli::run`]
-/// turns this into a bare non-zero exit instead of an error line that would
-/// restate the report. The message exists for any other caller.
+/// The typed failure a verb returns after emitting its complete report.
+///
+/// [`cli::run`] turns this into a bare non-zero exit so the process boundary
+/// cannot restate a platform issue or service failure that Markdown or JSON
+/// already carried. The message exists for any other caller.
 #[derive(Debug)]
-pub(crate) struct PlatformBlocked;
+pub(crate) struct ReportEmitted;
 
-impl std::fmt::Display for PlatformBlocked {
+impl std::fmt::Display for ReportEmitted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the platform reported an issue; the report carries it")
+        f.write_str("the operation failed; the emitted report carries the failure")
     }
 }
 
-impl std::error::Error for PlatformBlocked {}
+impl std::error::Error for ReportEmitted {}
 
 /// What an apply committed, under the identity the engine executed it with.
 ///

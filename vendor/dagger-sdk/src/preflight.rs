@@ -264,6 +264,7 @@ struct ValidatedConfig {
     http_connect_timeout: Duration,
     graphql_execution_timeout: Option<Duration>,
     allow_unverified_compatibility: bool,
+    isolated_cli_session: bool,
     explicit: ConfigExplicitness,
 }
 
@@ -282,6 +283,7 @@ impl ValidatedConfig {
             http_connect_timeout: parts.http_connect_timeout,
             graphql_execution_timeout: parts.graphql_execution_timeout,
             allow_unverified_compatibility: parts.allow_unverified_compatibility,
+            isolated_cli_session: parts.isolated_cli_session,
             explicit: parts.explicit,
         }
     }
@@ -295,7 +297,9 @@ impl ValidatedConfig {
             discovery,
             propagation,
         } = inputs;
-        if let Some(port) = session_port {
+        if !self.isolated_cli_session
+            && let Some(port) = session_port
+        {
             self.validate_existing_compatibility()?;
             return Ok(ConnectionPlan::Existing {
                 input: ExistingSessionInput {
@@ -306,15 +310,27 @@ impl ValidatedConfig {
             });
         }
 
-        let source = match explicit_cli {
-            Some(configured) => CliSourcePlan::ExplicitLocal {
-                configured,
-                discovery,
-            },
-            None => CliSourcePlan::CompiledRelease {
+        let source = if self.isolated_cli_session {
+            CliSourcePlan::CompiledRelease {
                 descriptor: ArchiveDescriptor::for_native_target(exact_target()?)?,
                 discovery,
-            },
+            }
+        } else {
+            match explicit_cli {
+                Some(configured) => CliSourcePlan::ExplicitLocal {
+                    configured,
+                    discovery,
+                },
+                None => CliSourcePlan::CompiledRelease {
+                    descriptor: ArchiveDescriptor::for_native_target(exact_target()?)?,
+                    discovery,
+                },
+            }
+        };
+        let runner = if self.isolated_cli_session {
+            RunnerInputs::default()
+        } else {
+            runner
         };
         Ok(ConnectionPlan::NewCli {
             source: Box::new(source),

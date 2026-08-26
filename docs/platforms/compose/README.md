@@ -1,72 +1,153 @@
 # Compose platform
 
-Compose is the current complete custom-TKD platform chain. Its `definition.tkd`
-vocabulary, bridge, adapter, lifecycle implementation, Docker realization, and shared
-interpreter and transition machinery are compiled into the platform-owned Compose `tkp`.
-That deployment-local engine gives the definition its meaning; `tkr` owns its
-construction or discovery, placement, binding initialization, and launch verification.
+Compose is the current complete definition-backed platform chain. At creation, `tkr`
+compiles the selected definition frontend, Compose lifecycle implementation, Docker
+realization, and shared interpreter and transition machinery into a deployment-local
+`tkp`. This `tkp` is the deployment's bound provisioner: the exact engine assembled for
+the selected platform and definition format. It gives the configuration its meaning and
+realizes its lifecycle. `tkr` owns the provisioner's construction or discovery,
+placement, launch verification, and repository publication.
 
-The default create path copies a native development binary and records a pre-identity
-stamp. Add `--bundle --build-image IMAGE@sha256:DIGEST` to request the current versioned
-path: `tkr` freezes the Compose seed package's reachable closure, derives
-`EngineIdentity`, obtains a tested and attested target artifact, and places both `tkp` and
-`tkp.manifest.json`. The [provisioning guide](../../provisioning/README.md) distinguishes
-these guarantees in detail.
+The canonical TKD (`rust-syn` syntax) source set is:
 
-Compose runs `tokeirad` and the observability stack as Docker containers. A reachable
-Docker daemon is required for apply and destroy. Plan can still report desired changes
-when live Docker description is unavailable.
+- `deployment.tkd` — the root, configuration values, and module wiring;
+- `platform.tkd` — the Compose configuration and shared authoring types; and
+- `observability.tkd` — the observability module and service declarations.
 
-## Lifecycle
+The package also provides `definition.tkdp`, the same Compose configuration and
+deployment graph expressed through the TKDP (`python` syntax) frontend. The selected
+frontend and platform are bound into the placed provisioner; neither `tkr` nor the
+retained definition performs runtime platform dispatch.
+
+## Choosing the definition format
+
+Compose declares TKD (`rust-syn` syntax) as its default. When `deployment create` is run
+without `--format`, `tkr` selects `deployment.tkd` and builds the placed provisioner with
+the TKD frontend:
 
 ```bash
-# Create definition.tkd, tokeirad.toml, metadata, state/, and a local tkp
 tkr deployment create \
   --name dev-compose \
   --platform compose \
-  --storage in-memory
+  --dev-engine
+```
 
-# Build the runtime image referenced by the seeded definition
+Select TKDP (`python` syntax) explicitly with `--format tkdp`; `tkr` then selects
+`definition.tkdp` and builds the provisioner with the TKDP frontend:
+
+```bash
+tkr deployment create \
+  --name dev-compose-python \
+  --platform compose \
+  --format tkdp \
+  --dev-engine
+```
+
+The chosen format and configuration path are recorded with the deployment. Later
+definition checks and lifecycle commands use that recorded frontend rather than selecting
+again. The format cannot be changed after creation; moving between TKD and TKDP requires
+a new deployment. `--format tkd` is accepted when an explicit statement of the default
+is useful.
+
+## Creating a deployment
+
+The default engine path is a verified hermetic bundle. It requires a digest-pinned build
+container because that container is part of the engine identity:
+
+```bash
+tkr deployment create \
+  --name dev-compose \
+  --platform compose \
+  --build-image IMAGE@sha256:DIGEST
+```
+
+For local platform development, `--dev-engine` builds the generated bound provisioner
+with the workspace toolchain instead. It still places both `tkp` and
+`tkp.manifest.json`, but the manifest records native, non-hermetic, local-developer
+provenance:
+
+```bash
+tkr deployment create \
+  --name dev-compose \
+  --platform compose \
+  --dev-engine
+```
+
+Definition-backed platform creation requires either `--dev-engine` or `--build-image`.
+
+Creation fully materializes the deployment before making its directory visible. It
+places and verifies the engine, admits the complete source set, writes the initial
+`tokeirad.toml`, records the binding and integrity evidence, retains configuration
+revision `0`, and creates the deployment's initial repository publication. It does not
+create provider resources, start services, or produce apply-time rendered outputs.
+
+## Lifecycle
+
+Compose has separate infrastructure and workload planes. The normal development path is:
+
+```bash
+# Create and select the deployment
+tkr deployment create \
+  --name dev-compose \
+  --platform compose \
+  --dev-engine
+
+# Build the local image referenced by the shipped definition
 tkr image build
 
-# Check, review, and apply through the bound provisioner
+# Check the complete deployment-bound definition
 tkr definition check
+
+# Review and realize infrastructure and rendered configuration
 tkr infra plan
 tkr infra apply
+
+# Review and realize Docker services
+tkr deploy plan
+tkr deploy apply
 
 # Inspect provisioner identity, binding, revision, and state facts
 tkr deployment describe --detail
 
-# Tear down provider resources before deleting the registry directory
-tkr infra destroy --yes
+# Remove services, infrastructure, and then local deployment records
 tkr deployment destroy --name dev-compose --yes
 ```
 
-Creation stamps the envelope and retains the complete authored source set as revision 0
-before the deployment directory becomes visible. The first apply therefore performs only
-`tkp infra apply`. A non-destructive plan does not require `--yes`; deletes and
-replacements do.
+Apply without `--yes` performs the plan needed to enforce the destructive-change gate.
+Deletes and replacements require `--yes`.
 
-`tkr deploy plan/apply` is also forwarded, but Compose models containers as
-infrastructure resources, so those verbs realize the same desired universe as the infra
-verbs. Prefer the infra spelling when reasoning about the complete Compose stack.
+The two live planes can be torn down independently while retaining the deployment:
+
+```bash
+tkr --deployment dev-compose deploy destroy --yes
+tkr --deployment dev-compose infra destroy --yes
+```
+
+`deployment destroy` is the aggregate operation. It removes services first,
+infrastructure second, and local records only after both live-plane operations succeed.
+A failure retains the deployment directory and state so teardown can be retried.
 
 ## Definition and modules
 
-The seeded `definition.tkd` contains both operator config and deployment structure. The
-canonical definition organizes the desired model into:
+The `config()` function in `deployment.tkd` is the operator-visible desired
+configuration. The root wires that value into four modules:
 
-- **`local_state`** — deployment-local state and rendered configuration roots;
+- **`local_state`** — deployment-local state roots;
 - **`dsql`** — conditional Aurora DSQL and coordination resources;
-- **`observability`** — Mimir, Loki, Grafana, Alloy, and their rendered config; and
-- **`runtime`** — `tokeirad` containers and their dependencies.
+- **`runtime`** — the rendered server configuration and `tokeirad` service; and
+- **`observability`** — Mimir, Loki, Grafana, Alloy, and their rendered configuration.
 
-The `dsql` module exists only when the definition's `Storage` config selects DSQL. Module
-and resource ordering is evaluated by the convergence engine after interpretation.
+The `dsql` module exists only when `Storage::Dsql` is selected. Module and resource
+ordering is evaluated after interpretation. Infrastructure commands accept `--module`
+and forward it to TKP; workload commands deliberately do not expose module filtering.
 
-Forwarded Compose operations currently apply `ModuleSelection::All`. Although the shared
-`tkr infra` parser exposes `--module`, that option has no TKP counterpart and is not a
-Compose scoping mechanism.
+Fields marked `#[create]` in `platform.tkd`, including storage and AWS region, are
+deployment identity. Their values must be present in the configuration admitted at
+creation and cannot be changed by a later apply. The current discovered-platform CLI
+does not map `--storage dsql` or `--region` into the Compose configuration; it rejects
+those flags. For a source-workspace development deployment that needs DSQL today, author
+the DSQL values in `platforms/compose/deployment.tkd` before running `deployment create`.
+Do not treat a post-creation storage edit as an ordinary reconciliation.
 
 Read the
 [deployment definition programming guide](../../provisioning/deployment-definitions.md)
@@ -74,61 +155,76 @@ for the admitted language and interpreter model. See
 [definition patterns and current practice](../../provisioning/deployment-definition-patterns.md)
 for the source-backed Compose builder and module idioms.
 
-## Image changes
+## Docker and image behavior
+
+Compose runs `tokeirad` and the observability stack as Docker containers. Docker must be
+reachable for workload planning and mutation, logs, and port mapping inspection.
+`deploy plan` reads live containers and resolves each desired image before reporting a
+change; according to the manifest's policy, that read-only workload operation may
+populate Docker's image cache. A connection failure or image-pull stream failure is
+rendered as a typed operator report and stops at the first failed service.
+
+Every service declares a Compose-compatible `pull_policy` in the definition. Supported
+values are `always`, `never`, `missing`, `daily`, `weekly`, and
+`every_<duration>`; `if_not_present` is accepted as an alias for `missing`. The `build`
+policy is refused because Tokeira's service manifest does not carry a Compose build
+configuration. The shipped definition uses `never` for the locally built `tokeirad`
+image and `missing` for registry-hosted observability images.
 
 Image building is separate from convergence. `tkr image build` does not require an
-active deployment and does not edit `definition.tkd`.
-
-A definition identifies the desired image by tag. Rebuilding different bytes behind the
-same tag does not change that desired value, and the forwarded TKP surface has no
-`--force` flag. To make an image change explicit, build a new tag and update the image
-field in `definition.tkd`, then plan and apply.
+active deployment and does not edit `deployment.tkd`. A definition identifies its
+desired image by tag, so rebuilding different bytes behind the same tag does not change
+the desired manifest. The forwarded Compose path has no `--force` apply contract; prefer
+a new tag and an explicit definition edit:
 
 ```bash
 tkr image build --tag dev-2
-# Edit definition.tkd: image: "tokeirad:dev-2".into()
+# Edit deployment.tkd: image: "tokeirad:dev-2".into()
 tkr definition check
-tkr infra plan
-tkr infra apply
+tkr deploy plan
+tkr deploy apply
 ```
 
-## DSQL configuration
+## DSQL configuration and writeback
 
-Select DSQL through the `Storage::Dsql` value in `definition.tkd`; a Compose deployment
-created with `--storage dsql --region REGION` receives that shape in its seeded
-`config()` literal. The definition can request a managed cluster or describe a
-preexisting cluster using its endpoint and ARN fields.
+The definition models managed and preexisting Aurora DSQL through
+`Storage::Dsql(DsqlStorage { ... })`. A DSQL deployment realizes the cluster and its two
+coordination tables in the infrastructure plane. As described above, those create-time
+values must be part of the configuration admitted at deployment creation; the current
+Compose create route does not accept them through `--storage` and `--region`.
 
-A DSQL definition declares deferred writeback from resource outputs to server config,
-and the Compose adapter can calculate those values from applied infrastructure state.
-The TKP platform seam returns committed change identities rather than a writeback payload,
-so the forwarded apply does not persist calculated updates into `tokeirad.toml`. Verify
-and complete the server runtime config before starting a DSQL-backed server.
+After a successful infrastructure apply, TKP resolves the definition's declared
+writebacks and persists them into `tokeirad.toml` before advancing the retained
+configuration revision. These include the storage mode, DSQL endpoint and region, and
+the rate-limiter and connection-lease table names.
 
-The `tkr schema` commands are in-process handlers and are not forwarded for a
-`definition.tkd` deployment. Do not use the in-process Compose/DSQL sequence from an
-older `deployment.toml` deployment as an operator recipe for this path.
+The `tkr schema` commands remain in-process handlers and have no forwarded Compose path.
+Do not use the legacy `deployment.toml` Compose/DSQL sequence as the recipe for a
+definition-backed deployment.
 
 ## Operations available through `tkr`
 
 | Command | Compose behavior |
 |---|---|
-| `tkr definition check` | Fully parses and interprets the definition in memory. |
-| `tkr infra plan/apply/destroy` | Forwards to the deployment-local TKP and its Compose `ProvisionerPlatform`. |
-| `tkr deploy plan/apply` | Forwards to TKP; delegates to the same infrastructure universe. |
-| `tkr deployment describe/apply/upgrade/rollback` | Uses the trust-aware provisioner launcher. |
-| `tkr scale up/down` | Forwards to TKP, which returns `NotApplicable` because Compose exposes no scale dimension. |
+| `tkr definition check` | Launches the bound TKP and fully interprets the deployment source set. `--definition PATH` is the separate deployment-free syntax check. |
+| `tkr infra plan/apply/destroy` | Forwards to TKP's infrastructure lifecycle; `--module` is supported. |
+| `tkr deploy plan/apply/destroy` | Forwards to TKP's workload lifecycle. |
+| `tkr deployment describe/apply/upgrade/rollback` | Uses the trust-aware provisioner launcher. `deployment apply` is the infrastructure apply spelling. |
+| `tkr deployment destroy --name NAME` | Runs ordered workload and infrastructure teardown, then removes local records. |
+| `tkr scale up/down` | Forwards to TKP; Compose reports that it exposes no scale dimension. |
 | `tkr infra status`, `deploy status`, `scale status` | Render TKP `describe`. |
-| `tkr logs`, `port-forward`, `exec`, `schema` | In-process-only; no forwarded Compose path. |
+| `tkr logs` | Forwards to TKP's Docker log stream. |
+| `tkr port-forward` | Reports provider-published port mappings; `--local-port` is not available on the bound path. |
+| `tkr exec`, `schema` | In-process-only; there is no forwarded Compose path. |
 
 ## See also
 
 - [Platform support matrix](../README.md)
 - [Provisioning](../../provisioning/README.md) — the `tkr`/`tkp`/`tkd` triad
 - [Deployment definition programming guide](../../provisioning/deployment-definitions.md) —
-  abstract language and authoring rules.
+  abstract language and authoring rules
 - [Definition patterns and current practice](../../provisioning/deployment-definition-patterns.md) —
-  Compose source, bridge, and adapter idioms.
+  Compose source, bridge, and adapter idioms
 - [`tkr` and `tkp`](../../provisioning/tkr-and-tkp.md) — forwarding, launch trust,
   upgrade, and rollback
 - [Production observability](../observability.md) — what the stack collects and alerts on

@@ -61,6 +61,9 @@ enum Command {
     /// these as the infra verbs.
     #[command(subcommand)]
     Deploy(DeployCommand),
+    /// Tear down workloads and then infrastructure. The owning `tkr`
+    /// removes deployment records only after this command succeeds.
+    Destroy(DeploymentDestroyArgs),
     /// Change workload capacity (`<dim>=<n>` specs); a config revision + a
     /// workload apply. `NotApplicable` where the platform has no scale dimension.
     Scale(ScaleArgs),
@@ -95,6 +98,8 @@ impl Command {
                 Some(&args.deployment_dir)
             }
             Self::Infra(InfraCommand::Destroy(args)) => Some(&args.deployment_dir),
+            Self::Deploy(DeployCommand::Destroy(args)) => Some(&args.deployment_dir),
+            Self::Destroy(args) => Some(&args.deployment_dir),
             Self::Scale(args) => Some(&args.deployment_dir),
             Self::Logs(args) => Some(&args.deployment_dir),
             Self::PortMappings(args) => Some(&args.deployment_dir),
@@ -190,6 +195,8 @@ enum DeployCommand {
     Plan(PlanArgs),
     /// Reconcile the workload to desired, gated on the binding.
     Apply(ApplyArgs),
+    /// Tear down every workload in reverse dependency order. Irreversible.
+    Destroy(DeployDestroyArgs),
 }
 
 #[derive(Args)]
@@ -261,6 +268,26 @@ struct DestroyArgs {
     #[arg(long)]
     module: Option<String>,
     /// Confirm the irreversible teardown (required).
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct DeployDestroyArgs {
+    /// Deployment directory holding the state envelope.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Confirm the irreversible workload teardown (required).
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct DeploymentDestroyArgs {
+    /// Deployment directory retained until both live planes are empty.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Confirm the complete workload and infrastructure teardown (required).
     #[arg(long)]
     yes: bool,
 }
@@ -405,6 +432,22 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             })
             .await
         }
+        Command::Deploy(DeployCommand::Destroy(args)) => {
+            let admitted = require(admitted);
+            let yes = args.yes;
+            lock::with_operation_lock(&admitted.deployment_ref.dir, "deploy-destroy", || {
+                deploy::deploy_destroy(&engine, admitted, yes, mode)
+            })
+            .await
+        }
+        Command::Destroy(args) => {
+            let admitted = require(admitted);
+            let yes = args.yes;
+            lock::with_operation_lock(&admitted.deployment_ref.dir, "deployment-destroy", || {
+                destroy::destroy_deployment(&engine, admitted, yes, mode)
+            })
+            .await
+        }
         Command::Deploy(DeployCommand::Apply(args)) => {
             // Refused, never silently dropped — as with `deploy plan`.
             if args.module.is_some() {
@@ -460,12 +503,12 @@ fn require(admitted: Option<&Admitted>) -> &Admitted {
     admitted.expect("admission precedes every deployment verb")
 }
 
-/// Collapse the typed post-report platform refusal to a bare process status.
-/// Every other failure remains an error so the entrypoint can render it once.
+/// Collapse a typed post-report failure to a bare process status. Every other
+/// failure remains an error so the entrypoint can render it once.
 pub(crate) fn exit_status(outcome: Result<()>) -> Result<std::process::ExitCode> {
     match outcome {
         Ok(()) => Ok(std::process::ExitCode::SUCCESS),
-        Err(err) => match err.downcast::<crate::PlatformBlocked>() {
+        Err(err) => match err.downcast::<crate::ReportEmitted>() {
             Ok(_) => Ok(std::process::ExitCode::FAILURE),
             Err(err) => Err(err),
         },
@@ -482,5 +525,29 @@ mod tests {
             panic!("creation has no provisioner inception verb");
         };
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn parses_granular_and_complete_destroy_commands() {
+        let deploy = Cli::try_parse_from([
+            "tkp",
+            "deploy",
+            "destroy",
+            "--deployment-dir",
+            "/tmp/d",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            deploy.command,
+            Command::Deploy(DeployCommand::Destroy(DeployDestroyArgs { yes: true, .. }))
+        ));
+
+        let complete =
+            Cli::try_parse_from(["tkp", "destroy", "--deployment-dir", "/tmp/d", "--yes"]).unwrap();
+        assert!(matches!(
+            complete.command,
+            Command::Destroy(DeploymentDestroyArgs { yes: true, .. })
+        ));
     }
 }

@@ -67,6 +67,8 @@ pub enum ConfigOption {
     HttpConnectTimeout,
     /// Acceptance of an implicit engine whose provenance cannot be proved.
     AllowUnverifiedCompatibility,
+    /// Selection of a newly owned exact-release CLI session.
+    IsolatedCliSession,
 }
 
 impl fmt::Display for ConfigOption {
@@ -83,6 +85,7 @@ impl fmt::Display for ConfigOption {
             Self::SessionStartupTimeout => "session startup timeout",
             Self::HttpConnectTimeout => "HTTP connect timeout",
             Self::AllowUnverifiedCompatibility => "unverified compatibility bypass",
+            Self::IsolatedCliSession => "isolated CLI session selection",
         })
     }
 }

@@ -18,7 +18,9 @@ use tokeira_platform::{
     kind::{self, DecodedKind, Kind, PlacementContext},
 };
 
-use crate::{ComposeService, Environment, Healthcheck, Volume, config_content_resource_id};
+use crate::{
+    ComposeService, Environment, Healthcheck, PullPolicy, Volume, config_content_resource_id,
+};
 
 /// The authored face of a compose service. Realizes the [`ComposeService`]
 /// model directly: the service name comes from the graph's logical id, and
@@ -28,6 +30,9 @@ use crate::{ComposeService, Environment, Healthcheck, Volume, config_content_res
 pub struct Service {
     /// Image reference.
     pub image: String,
+    /// Registry resolution policy carried into the service manifest.
+    #[serde(default)]
+    pub pull_policy: PullPolicy,
     /// Desired replicas.
     #[serde(default = "crate::kinds::default_replicas")]
     pub replicas: u32,
@@ -69,6 +74,7 @@ impl Service {
         let mut service = ComposeService {
             name: placement.logical_id.clone(),
             image: self.image.clone(),
+            pull_policy: self.pull_policy.clone(),
             replicas: self.replicas,
             publish: self.publish.clone(),
             volumes: self.volumes.clone(),
@@ -496,6 +502,7 @@ pub fn defaults(name: &str) -> Option<LocatedValue> {
             name: ComposeService::TYPE.to_string(),
             fields: vec![
                 ("image".to_string(), LocatedValue::string("")),
+                ("pull_policy".to_string(), LocatedValue::string("missing")),
                 (
                     "replicas".to_string(),
                     LocatedValue::new(tokeira_platform::author::ValueShape::Integer(1)),
@@ -607,6 +614,7 @@ mod kind_inventory_tests {
     fn kinds_realize_their_concrete_resources() {
         let service = Service {
             image: "tokeirad:latest".to_string(),
+            pull_policy: PullPolicy::Never,
             replicas: 1,
             publish: Vec::new(),
             volumes: Vec::new(),
@@ -618,6 +626,7 @@ mod kind_inventory_tests {
         };
         let realized: ComposeService = service.realize(&placement()).expect("service realizes");
         assert_eq!(realized.name, "tokeirad");
+        assert_eq!(realized.pull_policy, PullPolicy::Never);
 
         let realized: LocalStateResource = LocalStateDir {}
             .realize(&placement())

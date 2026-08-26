@@ -13,6 +13,9 @@ use crate::errors::{PlatformError, PlatformErrorKind, TargetError, TargetErrorKi
 use crate::target_generated::{TARGET_CLI_VERSION, TARGET_ENGINE_VERSION, TARGET_REVISION};
 
 const RELEASE_ORIGIN: &str = "https://dl.dagger.io/dagger/releases/";
+const APPLE_SILICON_RELEASE_ORIGIN: &str =
+    "https://github.com/iw/dagger/releases/download/sdk/rust/";
+const APPLE_SILICON_MANIFEST: &str = "SHA256SUMS.arm64";
 
 /// One validated, immutable repository target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -166,7 +169,7 @@ pub(crate) enum ArchiveFormat {
     Zip,
 }
 
-/// Complete fixed-origin release description used by provisioning.
+/// Complete trusted-origin release description used by provisioning.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArchiveDescriptor {
     archive_name: String,
@@ -201,8 +204,26 @@ impl ArchiveDescriptor {
             architecture.release_name(),
             extension
         );
-        let base = format!("{RELEASE_ORIGIN}{}/", target.cli_version());
-        let manifest_url = Url::parse(&format!("{base}checksums.txt"))
+        // The immutable companion release fills the one upstream publishing gap for
+        // this exact SDK line: a native Apple Silicon CLI. All other coordinates keep
+        // using Dagger's ordinary release origin.
+        let (base, manifest_name) = if operating_system == OperatingSystem::Darwin
+            && architecture == Architecture::Arm64
+        {
+            (
+                format!(
+                    "{APPLE_SILICON_RELEASE_ORIGIN}v{}-apple-silicon/",
+                    target.cli_version()
+                ),
+                APPLE_SILICON_MANIFEST,
+            )
+        } else {
+            (
+                format!("{RELEASE_ORIGIN}{}/", target.cli_version()),
+                "checksums.txt",
+            )
+        };
+        let manifest_url = Url::parse(&format!("{base}{manifest_name}"))
             .map_err(|_| PlatformError::new(PlatformErrorKind::InvalidDescriptor))?;
         let archive_url = Url::parse(&format!("{base}{archive_name}"))
             .map_err(|_| PlatformError::new(PlatformErrorKind::InvalidDescriptor))?;

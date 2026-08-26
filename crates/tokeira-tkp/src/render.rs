@@ -123,6 +123,22 @@ impl ServiceReport {
         )
     }
 
+    /// Build the committed workload teardown record. Destroy changes runtime
+    /// state but does not author a new configuration revision.
+    pub(crate) fn destroyed(
+        deployment: &str,
+        current_revision: u64,
+        changes: &[ServiceChange],
+    ) -> Self {
+        Self::new(
+            "deploy destroy",
+            deployment,
+            current_revision,
+            None,
+            changes,
+        )
+    }
+
     fn new(
         operation: &'static str,
         deployment: &str,
@@ -143,15 +159,76 @@ impl ServiceReport {
 impl Report for ServiceReport {
     fn narrative(&self, depth: Depth, out: &mut String) {
         out.push_str(&format!("# {}\n", title_case(self.operation)));
+        let committed = match self.operation {
+            "deploy apply" => {
+                let revision = match self.proposed_revision {
+                    Some(to) => format!("revision {} → {to}", self.current_revision),
+                    None => format!("revision {}", self.current_revision),
+                };
+                out.push_str(&format!(
+                    "**Applied to {}** — {revision}\n",
+                    self.deployment
+                ));
+                true
+            }
+            "deploy destroy" => {
+                out.push_str(&format!(
+                    "**Destroyed services from {}** — revision {} retained\n",
+                    self.deployment, self.current_revision
+                ));
+                true
+            }
+            _ => {
+                let revision = match self.current_revision {
+                    0 => "before its first apply".to_string(),
+                    revision => format!("at revision {revision}"),
+                };
+                out.push_str(&format!("**Plan for {}** {revision}\n", self.deployment));
+                false
+            }
+        };
+        service_action_sections(self, committed, depth, out);
+    }
+}
+
+/// A deploy plan or apply that stopped while resolving one service image.
+///
+/// This is a report, rather than process-boundary prose, so narrative and
+/// structured output carry the same single copy of the platform evidence.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ServiceFailureReport {
+    operation: &'static str,
+    deployment: String,
+    current_revision: u64,
+    status: &'static str,
+    failure: tokeira_deploy_engine::ServiceImageIssue,
+}
+
+impl ServiceFailureReport {
+    pub(crate) fn new(
+        operation: &'static str,
+        deployment: &str,
+        current_revision: u64,
+        failure: tokeira_deploy_engine::ServiceImageIssue,
+    ) -> Self {
+        Self {
+            operation,
+            deployment: deployment.to_string(),
+            current_revision,
+            status: "failed",
+            failure,
+        }
+    }
+}
+
+impl Report for ServiceFailureReport {
+    fn narrative(&self, _depth: Depth, out: &mut String) {
+        out.push_str(&format!("# {}\n", title_case(self.operation)));
         let applied = self.operation.ends_with("apply");
         if applied {
-            let revision = match self.proposed_revision {
-                Some(to) => format!("revision {} → {to}", self.current_revision),
-                None => format!("revision {}", self.current_revision),
-            };
             out.push_str(&format!(
-                "**Applied to {}** — {revision}\n",
-                self.deployment
+                "**Apply to {} stopped** — revision {} did not advance\n",
+                self.deployment, self.current_revision
             ));
         } else {
             let revision = match self.current_revision {
@@ -160,7 +237,32 @@ impl Report for ServiceReport {
             };
             out.push_str(&format!("**Plan for {}** {revision}\n", self.deployment));
         }
-        service_action_sections(self, applied, depth, out);
+
+        let (heading, outcome) = match self.failure.kind {
+            tokeira_deploy_engine::ServiceImageIssueKind::Pull => {
+                ("Image Pull Failure", "could not be pulled")
+            }
+            tokeira_deploy_engine::ServiceImageIssueKind::Inspect => {
+                ("Image Inspection Failure", "could not be inspected")
+            }
+            tokeira_deploy_engine::ServiceImageIssueKind::Unavailable => {
+                ("Image Unavailable", "is not available locally")
+            }
+        };
+        out.push_str(&format!(
+            "\n## {heading}\n- the image for the *{}* service {outcome}:\n",
+            self.failure.service
+        ));
+        out.push_str(&format!("  - image: {}\n", code_span(&self.failure.image)));
+        out.push_str(&format!("  - {}\n", code_span(&self.failure.evidence)));
+        if applied {
+            out.push_str("  - **services completed before this failure remain applied**\n");
+        }
+        if let Some(direction) = &self.failure.direction {
+            out.push_str(&format!("  - **{direction}**\n"));
+        }
+        let command = format!("tkr --deployment {} {}", self.deployment, self.operation);
+        out.push_str(&format!("  - **Run {} again**\n", code_span(&command)));
     }
 }
 
@@ -202,7 +304,11 @@ fn service_action_sections(report: &ServiceReport, applied: bool, depth: Depth, 
         .iter()
         .any(|change| change.action != ServiceAction::Unchanged);
     if !acting_exists {
-        out.push_str("\nNo service changes - everything matches the definition.\n");
+        if report.operation == "deploy destroy" {
+            out.push_str("\nNo deployed services remain.\n");
+        } else {
+            out.push_str("\nNo service changes - everything matches the definition.\n");
+        }
     }
 
     for (action, plan_heading, applied_heading, verb) in [
@@ -1172,6 +1278,58 @@ mod tests {
     }
 
     #[test]
+    fn deploy_image_failure_is_one_markdown_and_json_report() {
+        let failure = tokeira_deploy_engine::ServiceImageIssue {
+            service: "grafana".to_string(),
+            image: "grafana/grafana-missing:12.4.9".to_string(),
+            kind: tokeira_deploy_engine::ServiceImageIssueKind::Pull,
+            evidence: "denied: requested access to the resource is denied".to_string(),
+            direction: Some("Verify the image reference and Docker's registry access".to_string()),
+        };
+        let report = ServiceFailureReport::new("deploy plan", "de-5", 2, failure);
+
+        let text = render(&report, Mode::resolve(false, false)).unwrap();
+        assert!(text.starts_with("# Deploy Plan\n**Plan for de-5** at revision 2\n"));
+        assert!(text.contains("## Image Pull Failure"));
+        assert_eq!(text.matches("requested access").count(), 1, "{text}");
+        assert!(
+            text.contains("`tkr --deployment de-5 deploy plan`"),
+            "{text}"
+        );
+
+        let json = render(&report, Mode::resolve(true, true)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["failure"]["kind"], "pull");
+        assert_eq!(value["failure"]["service"], "grafana");
+        assert_eq!(value["failure"]["image"], "grafana/grafana-missing:12.4.9");
+    }
+
+    #[test]
+    fn deploy_apply_failure_states_partial_progress_and_unchanged_revision() {
+        let report = ServiceFailureReport::new(
+            "deploy apply",
+            "de-5",
+            2,
+            tokeira_deploy_engine::ServiceImageIssue {
+                service: "grafana".to_string(),
+                image: "missing:1".to_string(),
+                kind: tokeira_deploy_engine::ServiceImageIssueKind::Pull,
+                evidence: "manifest unknown".to_string(),
+                direction: None,
+            },
+        );
+
+        let text = render(&report, Mode::resolve(false, false)).unwrap();
+        assert!(text.contains("revision 2 did not advance"), "{text}");
+        assert!(
+            text.contains("services completed before this failure remain applied"),
+            "{text}"
+        );
+        assert_eq!(text.matches("manifest unknown").count(), 1, "{text}");
+    }
+
+    #[test]
     fn deploy_apply_is_a_past_tense_revision_record() {
         let report = ServiceReport::applied(
             "de-4",
@@ -1187,6 +1345,38 @@ mod tests {
         assert!(text.starts_with("# Deploy Apply\n**Applied to de-4** — revision 2 → 3\n"));
         assert!(text.contains("## Updated\n- the *mimir* service - `observability::mimir`\n"));
         assert!(!text.contains("## Unchanged"), "apply record: {text}");
+    }
+
+    #[test]
+    fn deploy_destroy_is_a_past_tense_record_without_a_revision_advance() {
+        let report = ServiceReport::destroyed(
+            "de-5",
+            3,
+            &[
+                service_change(ServiceChangeKind::Delete, "grafana"),
+                service_change(ServiceChangeKind::Delete, "loki"),
+            ],
+        );
+
+        let text = render(&report, Mode::resolve(false, false)).unwrap();
+        assert!(text.starts_with(
+            "# Deploy Destroy\n**Destroyed services from de-5** — revision 3 retained\n"
+        ));
+        assert!(text.contains("## Deleted\n"), "{text}");
+        assert!(!text.contains("would be deleted"), "{text}");
+
+        let json = render(&report, Mode::resolve(true, true)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["operation"], "deploy destroy");
+        assert_eq!(value["current_revision"], 3);
+        assert!(value.get("proposed_revision").is_none());
+    }
+
+    #[test]
+    fn deploy_destroy_reports_an_already_empty_service_plane() {
+        let report = ServiceReport::destroyed("de-5", 3, &[]);
+        let text = render(&report, Mode::resolve(false, false)).unwrap();
+        assert!(text.contains("No deployed services remain."), "{text}");
     }
 
     /// A fully-declared semantics value: these tests exercise refresh and
@@ -2197,7 +2387,7 @@ mod tests {
             prop_assert_eq!(decoded.platform_issues, report.explanation.platform_issues);
             prop_assert!(decoded.changes.is_empty());
 
-            let status = crate::cli::exit_status(Err(crate::PlatformBlocked.into()))
+            let status = crate::cli::exit_status(Err(crate::ReportEmitted.into()))
                 .expect("the already-rendered issue becomes a process status");
             prop_assert_eq!(status, std::process::ExitCode::FAILURE);
         }

@@ -22,6 +22,7 @@ use tokio::sync::Notify;
 use super::migration::control_lease_bootstrap_sql;
 
 const DEFAULT_MAX_OCC_RETRIES: u32 = 5;
+const CONTROL_LEASE_ISOLATION_SQL: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ";
 /// Default lifetime for the managed embedded owner claim.
 pub const OWNER_LEASE_DURATION: Duration = Duration::seconds(60);
 /// Normal interval between managed embedded owner renewals.
@@ -340,12 +341,9 @@ async fn acquire_once_connection(
     request: &ControlLeaseAcquireRequest,
     timing: ValidatedLeaseTiming,
 ) -> Result<ControlLeaseGuard, ControlLeaseError> {
-    // Every 40001 retry re-enters here with a fresh transaction and therefore
-    // a fresh DSQL repeatable-read snapshot.
-    let mut transaction = connection.begin().await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        .execute(&mut *transaction)
-        .await?;
+    // DSQL fixes isolation at repeatable read and accepts the explicit level on
+    // BEGIN. A separate SET TRANSACTION is rejected before the fence can advance.
+    let mut transaction = connection.begin_with(CONTROL_LEASE_ISOLATION_SQL).await?;
     let row = sqlx::query_as::<
         _,
         (
@@ -460,12 +458,10 @@ impl ControlLeaseRepository {
         request: &ControlLeaseAcquireRequest,
         timing: ValidatedLeaseTiming,
     ) -> Result<ControlLeaseGuard, ControlLeaseError> {
-        // A fresh transaction is mandatory after every 40001: DSQL's
-        // repeatable-read snapshot cannot be reused after a concurrent winner.
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            .execute(&mut *transaction)
-            .await?;
+        // DSQL fixes isolation at repeatable read and accepts the explicit level on
+        // BEGIN. A fresh BEGIN is mandatory after every 40001 because its snapshot
+        // cannot be reused after a concurrent winner.
+        let mut transaction = self.pool.begin_with(CONTROL_LEASE_ISOLATION_SQL).await?;
         let row = sqlx::query_as::<
             _,
             (
@@ -1089,5 +1085,13 @@ mod tests {
         assert!(RENEW_CLAIM_SQL.contains("expires_at > now()"));
         assert!(RELEASE_CLAIM_SQL.contains("owner_id = $2"));
         assert!(RELEASE_CLAIM_SQL.contains("fence_token = $3"));
+    }
+
+    #[test]
+    fn lease_transaction_uses_the_dsql_supported_isolation_form() {
+        assert_eq!(
+            CONTROL_LEASE_ISOLATION_SQL,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ"
+        );
     }
 }

@@ -1543,7 +1543,7 @@ mod tests {
     fn serializes_compose_yaml_with_all_fields() {
         let service = ComposeService {
             name: "grafana".into(),
-            image: "grafana/grafana-oss:12.4.3".into(),
+            image: "grafana/grafana:12.4.9".into(),
             replicas: 1,
             publish: vec![3000],
             volumes: vec![Volume::State(StateVolume {
@@ -1565,7 +1565,7 @@ mod tests {
             ..Default::default()
         };
         let yaml = compose_yaml_fragment(&service).unwrap();
-        assert!(yaml.contains("grafana/grafana-oss:12.4.3"));
+        assert!(yaml.contains("grafana/grafana:12.4.9"));
         assert!(yaml.contains("3000"));
         assert!(yaml.contains("GF_SECURITY_ADMIN_PASSWORD"));
         assert!(yaml.contains("/var/lib/grafana"));

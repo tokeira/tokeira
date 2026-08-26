@@ -24,15 +24,15 @@ fn config() -> Compose {
             metrics_port: 9090,
         },
         observability: Observability {
-            mimir: Backend { image: "grafana/mimir:3.0.6".into(), replicas: 1 },
-            loki: Backend { image: "grafana/loki:3.7.1".into(), replicas: 1 },
+            mimir: Backend { image: "grafana/mimir:3.2.0".into(), replicas: 1 },
+            loki: Backend { image: "grafana/loki:3.7.6".into(), replicas: 1 },
             grafana: Grafana {
-                image: "grafana/grafana-oss:12.4.3".into(),
+                image: "grafana/grafana:12.4.9".into(),
                 replicas: 1,
                 port: 3000,
                 admin_password: "admin".into(),
             },
-            alloy: Backend { image: "grafana/alloy:v1.16.0".into(), replicas: 1 },
+            alloy: Backend { image: "grafana/alloy:v1.19.0".into(), replicas: 1 },
         },
     }
 }

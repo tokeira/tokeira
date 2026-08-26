@@ -1,10 +1,11 @@
 #![cfg(feature = "dsql-integration")]
 
-//! Opt-in real-DSQL recovery from the minimal V001 migration prefix.
+//! Opt-in real-DSQL recovery from the observed token-zero bootstrap state.
 //!
 //! The test never resets a database. It mutates only an explicitly acknowledged
-//! database whose current schema contains no relations, so an interrupted run requires
-//! a new disposable database rather than an automated destructive cleanup.
+//! database whose current schema contains no relations, seeds the exact metadata left
+//! by the failed startup, and requires a new disposable database after an interrupted
+//! run rather than performing automated destructive cleanup.
 
 use std::time::{Duration as StdDuration, Instant};
 
@@ -21,7 +22,7 @@ const DISPOSABLE_ACKNOWLEDGEMENT: &str = "MUTATE_DISPOSABLE_EMPTY_DATABASE";
 
 #[tokio::test]
 #[ignore = "mutates an explicitly acknowledged disposable DSQL database; set TOKEIRA_DSQL_SCHEMA_BOOTSTRAP_TEST_DATABASE_URL and TOKEIRA_DSQL_SCHEMA_BOOTSTRAP_TEST_ACK"]
-async fn partial_v001_prefix_converges_through_the_embedded_target() -> Result<()> {
+async fn token_zero_empty_ledger_state_converges_through_the_embedded_target() -> Result<()> {
     let database_url = std::env::var("TOKEIRA_DSQL_SCHEMA_BOOTSTRAP_TEST_DATABASE_URL").context(
         "TOKEIRA_DSQL_SCHEMA_BOOTSTRAP_TEST_DATABASE_URL must name a disposable database",
     )?;
@@ -37,49 +38,50 @@ async fn partial_v001_prefix_converges_through_the_embedded_target() -> Result<(
 
     let runner = MigrationRunner::embedded();
     let migration_plan = runner.dry_run()?;
-    let v1 = migration_plan
-        .iter()
-        .find(|migration| migration.version == 1)
-        .context("embedded migration plan must contain V001")?;
-    sqlx::query(&v1.sql).execute(&mut connection).await?;
-    sqlx::query(
-        "INSERT INTO schema_version (version, name, checksum, applied_at) \
-         VALUES ($1, $2, $3, now())",
-    )
-    .bind(i32::try_from(v1.version)?)
-    .bind(&v1.name)
-    .bind(&v1.checksum)
-    .execute(&mut connection)
-    .await?;
-
     let contract = MigrationRunner::compatibility_contract();
-    let decision = runner
+    let initial_decision = runner
         .assess_connection(&mut connection, &contract, SchemaMigrationPolicy::Automatic)
         .await?;
     assert_eq!(
-        decision,
-        SchemaDecision::Migrate {
-            from: 1,
-            to: contract.target_version,
+        initial_decision,
+        SchemaDecision::Initialize {
+            target: contract.target_version,
         }
     );
 
     runner
-        .bootstrap_migration_coordination(&mut connection, &decision)
+        .bootstrap_migration_coordination(&mut connection, &initial_decision)
         .await?;
     let leases = ConnectionControlLeaseRepository::new();
     leases.bootstrap(&mut connection).await?;
+    let cluster = ControlLeaseClusterIdentity {
+        cluster_id: "schema-bootstrap-integration".to_owned(),
+        cluster_arn: "arn:aws:dsql:eu-west-2:000000000000:cluster/schema-bootstrap-integration"
+            .to_owned(),
+    };
+    sqlx::query(
+        "INSERT INTO tokeira_control_lease \
+         (claim_name, cluster_id, cluster_arn, owner_id, fence_token, expires_at, updated_at) \
+         VALUES ('schema-migration', $1, $2, NULL, 0, now(), now())",
+    )
+    .bind(&cluster.cluster_id)
+    .bind(&cluster.cluster_arn)
+    .execute(&mut connection)
+    .await?;
+    verify_observed_partial_bootstrap_state(&mut connection).await?;
+
+    // A restart re-observes the empty authoritative ledger and must initialize
+    // through the pre-existing token-zero coordination row without manual repair.
+    let restart_decision = runner
+        .assess_connection(&mut connection, &contract, SchemaMigrationPolicy::Automatic)
+        .await?;
+    assert_eq!(restart_decision, initial_decision);
     let migration_guard = leases
         .acquire(
             &mut connection,
             &ControlLeaseAcquireRequest {
                 claim_name: "schema-migration".to_owned(),
-                cluster: ControlLeaseClusterIdentity {
-                    cluster_id: "schema-bootstrap-integration".to_owned(),
-                    cluster_arn:
-                        "arn:aws:dsql:eu-west-2:000000000000:cluster/schema-bootstrap-integration"
-                            .to_owned(),
-                },
+                cluster,
                 owner_id: format!("schema-bootstrap-{}", uuid::Uuid::new_v4()),
                 lease_duration: Duration::minutes(5),
                 admission_margin: Duration::seconds(20),
@@ -88,9 +90,10 @@ async fn partial_v001_prefix_converges_through_the_embedded_target() -> Result<(
         )
         .await?;
     assert_eq!(migration_guard.outcome(), ControlLeaseAcquireOutcome::Clean);
+    assert_eq!(migration_guard.fence_token(), 1);
     let migration_gate = OwnershipAdmissionGate::for_guard(&migration_guard);
     let application = runner
-        .apply_decision(&mut connection, &decision, &migration_guard)
+        .apply_decision(&mut connection, &restart_decision, &migration_guard)
         .await;
     let release = leases
         .release(&mut connection, &migration_guard, &migration_gate)
@@ -112,6 +115,32 @@ async fn partial_v001_prefix_converges_through_the_embedded_target() -> Result<(
             legacy_backfill: false,
         }
     );
+    Ok(())
+}
+
+async fn verify_observed_partial_bootstrap_state(connection: &mut PgConnection) -> Result<()> {
+    let ledger_rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM schema_version")
+        .fetch_one(&mut *connection)
+        .await?;
+    assert_eq!(ledger_rows, 0);
+
+    let compatibility_relations = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM information_schema.tables \
+         WHERE table_schema = current_schema() AND table_name = 'schema_compatibility'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    assert_eq!(compatibility_relations, 0);
+
+    let (owner_id, fence_token, expired) = sqlx::query_as::<_, (Option<String>, i64, bool)>(
+        "SELECT owner_id, fence_token, expires_at <= now() \
+             FROM tokeira_control_lease WHERE claim_name = 'schema-migration'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    assert_eq!(owner_id, None);
+    assert_eq!(fence_token, 0);
+    assert!(expired);
     Ok(())
 }
 

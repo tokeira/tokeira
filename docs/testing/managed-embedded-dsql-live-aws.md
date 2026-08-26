@@ -10,6 +10,53 @@ Do not run it against an account or Region where creating and deleting a cluster
 authorized. Aurora DSQL meters compute, reads, writes, and storage; see AWS's current
 [billing description](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/billing-metering.html).
 
+## Preserved upstream schema-bootstrap reproduction — 26 August 2026
+
+This is an upstream Tokeira recovery defect, not an Odori integration defect. The live
+cluster and its private managed descriptor are the reproduction fixture. Preserve both:
+do not run this document's destructive lifecycle test against that cluster, reset its
+schema, edit its control rows, replace its descriptor, or create a substitute cluster.
+
+The following behavior is verified against Tokeira merge revision
+`b9fc3f789a34f3c524b97223417044b1eecca71a`:
+
+- embedded startup still fails during the schema-compatibility phase;
+- AWS reports the cluster as `ACTIVE`, and the descriptor's canonical cluster ID and ARN
+  identify that same cluster;
+- `schema_version` exists and contains zero rows;
+- `schema_compatibility` does not exist;
+- `tokeira_control_lease` contains an expired `schema-migration` claim whose fence token
+  is `0`; and
+- repeated startup attempts do not advance that fence token.
+
+The source-level cause is now identified. Tokeira first commits the idempotent claim-row
+insert, which produces the observed ownerless, expired fence token `0`. It then opened a
+transaction and issued a separate `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`
+before locking or updating that row. Aurora DSQL fixes transactions at repeatable-read
+isolation and documents the explicit driver form as
+[`BEGIN ISOLATION LEVEL REPEATABLE READ`](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/accessing.html);
+its [supported transaction-control syntax](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-supported-sql-features.html)
+does not include the separate `SET TRANSACTION` statement. The rejected statement was
+therefore reached after the seed insert but before the row lock and fence update, exactly
+matching the persistent token-zero state. The embedded engine still reduces that inner
+database failure to its bounded schema-phase error, so the original process output alone
+does not reveal this cause.
+
+The correction opens both connection-scoped and pool-scoped lease transactions with the
+supported `BEGIN` form. The opt-in real-DSQL regression in
+`crates/tokeira-storage/tests/dsql_schema_bootstrap.rs` now seeds and verifies this exact
+empty-ledger, absent-compatibility, expired-token-zero state before exercising automatic
+recovery. It remains fail-closed, ignored by default, and has only been compile-verified;
+the preserved live fixture is the required end-to-end proof after the corrected revision
+is built and its execution is separately authorized.
+
+The required regression is automatic, non-destructive recovery from this exact partial
+bootstrap state. Using the same descriptor and cluster, managed embedded startup must
+acquire or recover the schema-migration claim, converge the migration ledger and
+compatibility metadata to the release target, and start the engine without manual table
+or row repair. Keep the fixture live until that regression has passed or the operator
+separately authorizes its explicit descriptor-bound destruction.
+
 ## Verified AWS contract
 
 The harness follows the current official Aurora DSQL APIs:
@@ -86,6 +133,10 @@ path; ordinary startup will not recreate from that tombstone. Choose a new descr
 for a subsequent new-cluster run.
 
 ## Recovery and cleanup
+
+The preserved reproduction fixture above is an explicit exception to the destructive
+cleanup procedure in this section. Do not disable its deletion protection or delete it
+unless the operator separately retires the fixture after the recovery regression.
 
 If the command stops before destruction completes, first rerun the exact same command with
 the same Region and descriptor path. Never substitute an endpoint or search by tag. A

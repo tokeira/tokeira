@@ -76,9 +76,7 @@ pub(crate) enum ServiceOperationError {
 }
 
 impl ServiceOperationError {
-    pub(crate) fn service_image_issue(
-        &self,
-    ) -> Option<&tokeira_deploy_engine::ServiceImageIssue> {
+    pub(crate) fn service_image_issue(&self) -> Option<&tokeira_deploy_engine::ServiceImageIssue> {
         match self {
             Self::Runtime(error) => error.service_image_issue(),
             Self::Other(_) => None,
@@ -516,6 +514,33 @@ impl<F: DefinitionFrontend> Engine<F> {
             .map_err(ServiceOperationError::Other)?;
         deploy
             .apply(platform.as_ref())
+            .await
+            .map_err(ServiceOperationError::from)
+    }
+
+    /// Tear down the service plane in reverse dependency order. Provider
+    /// mutations and deploy-state commits complete one service at a time.
+    pub(crate) async fn deploy_destroy(
+        &self,
+        admitted: &Admitted,
+    ) -> std::result::Result<Vec<tokeira_orchestrator::ServiceChange>, ServiceOperationError> {
+        let execution = self
+            .execution(admitted, None)
+            .map_err(ServiceOperationError::Other)?;
+        self.refuse_on_issue(admitted)
+            .await
+            .map_err(ServiceOperationError::Other)?;
+        let platform = self
+            .platform
+            .service_platform(&admitted.deployment_ref)
+            .context("failed to construct the service platform")
+            .map_err(ServiceOperationError::Other)?;
+        let mut deploy = self
+            .open_deploy(admitted, &execution)
+            .await
+            .map_err(ServiceOperationError::Other)?;
+        deploy
+            .destroy(platform.as_ref())
             .await
             .map_err(ServiceOperationError::from)
     }

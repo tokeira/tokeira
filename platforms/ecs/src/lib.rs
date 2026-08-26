@@ -13,7 +13,9 @@ use tokeira_platform::{declaration::PlatformDeclaration, definition::Namespace};
 
 pub mod observability;
 
-pub use tokeira_ecs::{EcsConfig, EcsDeployment, config, gates, images, modules, services};
+pub use tokeira_ecs::{
+    EcsConfig, EcsDeployment, config, execution::EcsPlatform, gates, images, modules, services,
+};
 
 /// The ECS platform declaration.
 ///

@@ -872,6 +872,34 @@ impl<D: Deployment> DeployEngine<D> {
         Ok(changes)
     }
 
+    /// Remove every desired service in reverse dependency order, persisting
+    /// the runtime state after each successful provider mutation.
+    ///
+    /// A failed destroy is therefore retryable from durable partial progress;
+    /// the caller must retain the deployment definition until this completes
+    /// because service manifests are recomputed for provider deletion.
+    pub async fn destroy(
+        &mut self,
+        platform: &dyn deploy_engine::Platform,
+    ) -> Result<Vec<deploy_engine::ServiceChange>> {
+        let (mut state, version) = self.state_store.load().await?;
+        self.service_ctx.state = state.clone();
+        let saver = self.make_saver(version);
+        let services = self.deployment.services(&self.config);
+        let changes = self
+            .engine
+            .destroy_services_with_saver(
+                &services,
+                platform,
+                &mut self.service_ctx,
+                &mut state,
+                Some(&saver),
+            )
+            .await?;
+        self.service_ctx.state = state;
+        Ok(changes)
+    }
+
     /// Clear persisted service state so the next apply treats all services as
     /// new. Use after rebuilding a local image behind the same tag.
     pub async fn clear_service_state(&mut self) -> Result<()> {

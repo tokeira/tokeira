@@ -106,16 +106,22 @@ against the same directory. Apply without `--yes` performs a plan pass and refus
 when it finds destructive changes. Pass `--yes` after review to authorize deletes or
 replacements and avoid the extra plan pass.
 
-Full infrastructure destroy and deployment-directory removal are separate operations:
+Full deployment teardown is one ordered operation:
 
 ```bash
-tkr infra destroy --yes
 tkr deployment destroy --name compose-dev --yes
 ```
 
-`deployment destroy` removes the registry directory; it does not destroy provider
-resources. Teardown infrastructure first so deleting local records does not orphan live
-resources.
+`deployment destroy` removes workloads first, infrastructure second, and the local
+deployment records last. A failure retains the directory and its state so the operation
+can be retried without orphaning whatever remains.
+
+The two live planes can also be removed independently while retaining the deployment:
+
+```bash
+tkr --deployment compose-dev deploy destroy --yes
+tkr --deployment compose-dev infra destroy --yes
+```
 
 ## Routing by platform
 
@@ -138,7 +144,7 @@ Some command names are deliberately shared while their executor differs:
 | `definition check` | Refuses because `deployment.toml` is configured, not interpreted. | Launches TKP definition check. `--path` can check a definition without a deployment. |
 | `infra plan/apply/destroy` | Runs platform infrastructure handlers. | Launches matching TKP infra verb. |
 | `infra status` | Runs in-process status. | Launches TKP describe. |
-| `deploy plan/apply` | Runs workload engine handlers. | Launches matching TKP deploy verb; Compose maps workloads into the infra universe. |
+| `deploy plan/apply/destroy` | Runs workload engine handlers. | Launches the matching TKP deploy verb. |
 | `deploy status` | Runs in-process status. | Launches TKP describe. |
 | `scale up/down` | Runs platform operations. | Launches TKP scale; Compose returns `NotApplicable`. |
 | `scale status` | Runs platform status. | Launches TKP describe. |

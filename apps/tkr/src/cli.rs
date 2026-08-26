@@ -437,6 +437,12 @@ pub(crate) enum DeployAction {
         #[arg(long, value_name = "PATH")]
         explanation: Option<PathBuf>,
     },
+    /// Tear down every deployed service while retaining infrastructure and
+    /// deployment records.
+    Destroy {
+        #[arg(long)]
+        yes: bool,
+    },
     Status,
 }
 

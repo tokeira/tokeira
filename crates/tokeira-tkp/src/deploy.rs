@@ -1,4 +1,4 @@
-//! `tkp deploy plan|apply` — the workload universe.
+//! `tkp deploy plan|apply|destroy` — the workload universe.
 //!
 //! The verbs drive the deploy engine over the definition's service plane:
 //! desired manifests hashed against recorded runtime state, reconciled per
@@ -164,6 +164,56 @@ pub(crate) async fn deploy_apply<F: DefinitionFrontend>(
     Ok(())
 }
 
+/// Remove the workload plane without touching its substrate or advancing the
+/// configuration revision.
+pub(crate) async fn deploy_destroy<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
+    yes: bool,
+    mode: tokeira_report::Mode,
+) -> Result<()> {
+    let deployment_dir = admitted.deployment_ref.dir.as_path();
+    let running = ProvenanceStamp::current(Utc::now());
+    let (envelope, _) = envelope_store(deployment_dir)
+        .load()
+        .await
+        .context("failed to load the deployment envelope")?;
+
+    crate::marker::refuse_if_marked(&envelope, "deploy destroy")?;
+    match evaluate_gate(envelope.binding.as_ref(), &running) {
+        GateOutcome::Refuse { verdict, reason } => {
+            anyhow::bail!("binding gate refuses `deploy destroy` ({verdict:?}): {reason}");
+        }
+        GateOutcome::Proceed { .. } => {}
+    }
+    if !yes {
+        anyhow::bail!(
+            "`deploy destroy` removes all of the deployment's services and is irreversible; \
+             re-run with `--yes` to confirm"
+        );
+    }
+
+    let changes = match engine.deploy_destroy(admitted).await {
+        Ok(changes) => changes,
+        Err(error) => {
+            return emit_service_failure(
+                "deploy destroy",
+                &admitted.deployment_ref.name,
+                envelope.config_revision,
+                mode,
+                error,
+            );
+        }
+    };
+    let report = ServiceReport::destroyed(
+        &admitted.deployment_ref.name,
+        envelope.config_revision,
+        &changes,
+    );
+    crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
+    Ok(())
+}
+
 /// The service plane's explanation model arrives with its realizers; until
 /// then the request is refused rather than answered with a mislabeled infra
 /// model.
@@ -190,6 +240,7 @@ fn emit_service_failure(
         let context = match operation {
             "deploy plan" => "service plan failed",
             "deploy apply" => "service apply failed",
+            "deploy destroy" => "service destroy failed",
             _ => "service operation failed",
         };
         return Err(error.into_anyhow(context));

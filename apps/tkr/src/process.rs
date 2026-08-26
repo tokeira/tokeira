@@ -145,6 +145,42 @@ pub(crate) async fn spawn_tokeirad(deployment_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Ask the supervised local server to drain and wait until its supervisor
+/// removes the PID sentinel.
+///
+/// A timeout refuses record deletion: the deployment directory contains the
+/// configuration and state the still-running process may need, so callers
+/// must never remove it merely because a stop signal was sent.
+pub(crate) async fn stop_tokeirad(deployment_path: &Path) -> Result<bool> {
+    let path = pid_file(deployment_path);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let pid = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("{} contains an invalid process id", path.display()))?;
+
+    #[cfg(unix)]
+    forward_signal(pid, StopSignal::Terminate);
+    #[cfg(not(unix))]
+    forward_signal(pid, StopSignal::Interrupt);
+
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if stopped.is_err() {
+        bail!(
+            "local tokeirad process {pid} did not stop within 5 seconds; deployment records were retained"
+        );
+    }
+    Ok(true)
+}
+
 /// Which stop signal the supervisor received, to forward in kind.
 #[derive(Clone, Copy, Debug)]
 enum StopSignal {
@@ -275,5 +311,11 @@ mod tests {
             }
             assert!(!launcher.describe().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn stopping_an_absent_local_process_is_idempotent() {
+        let deployment = tempfile::tempdir().unwrap();
+        assert!(!stop_tokeirad(deployment.path()).await.unwrap());
     }
 }

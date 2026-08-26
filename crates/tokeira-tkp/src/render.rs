@@ -123,6 +123,22 @@ impl ServiceReport {
         )
     }
 
+    /// Build the committed workload teardown record. Destroy changes runtime
+    /// state but does not author a new configuration revision.
+    pub(crate) fn destroyed(
+        deployment: &str,
+        current_revision: u64,
+        changes: &[ServiceChange],
+    ) -> Self {
+        Self::new(
+            "deploy destroy",
+            deployment,
+            current_revision,
+            None,
+            changes,
+        )
+    }
+
     fn new(
         operation: &'static str,
         deployment: &str,
@@ -143,24 +159,35 @@ impl ServiceReport {
 impl Report for ServiceReport {
     fn narrative(&self, depth: Depth, out: &mut String) {
         out.push_str(&format!("# {}\n", title_case(self.operation)));
-        let applied = self.operation.ends_with("apply");
-        if applied {
-            let revision = match self.proposed_revision {
-                Some(to) => format!("revision {} → {to}", self.current_revision),
-                None => format!("revision {}", self.current_revision),
-            };
-            out.push_str(&format!(
-                "**Applied to {}** — {revision}\n",
-                self.deployment
-            ));
-        } else {
-            let revision = match self.current_revision {
-                0 => "before its first apply".to_string(),
-                revision => format!("at revision {revision}"),
-            };
-            out.push_str(&format!("**Plan for {}** {revision}\n", self.deployment));
-        }
-        service_action_sections(self, applied, depth, out);
+        let committed = match self.operation {
+            "deploy apply" => {
+                let revision = match self.proposed_revision {
+                    Some(to) => format!("revision {} → {to}", self.current_revision),
+                    None => format!("revision {}", self.current_revision),
+                };
+                out.push_str(&format!(
+                    "**Applied to {}** — {revision}\n",
+                    self.deployment
+                ));
+                true
+            }
+            "deploy destroy" => {
+                out.push_str(&format!(
+                    "**Destroyed services from {}** — revision {} retained\n",
+                    self.deployment, self.current_revision
+                ));
+                true
+            }
+            _ => {
+                let revision = match self.current_revision {
+                    0 => "before its first apply".to_string(),
+                    revision => format!("at revision {revision}"),
+                };
+                out.push_str(&format!("**Plan for {}** {revision}\n", self.deployment));
+                false
+            }
+        };
+        service_action_sections(self, committed, depth, out);
     }
 }
 
@@ -277,7 +304,11 @@ fn service_action_sections(report: &ServiceReport, applied: bool, depth: Depth, 
         .iter()
         .any(|change| change.action != ServiceAction::Unchanged);
     if !acting_exists {
-        out.push_str("\nNo service changes - everything matches the definition.\n");
+        if report.operation == "deploy destroy" {
+            out.push_str("\nNo deployed services remain.\n");
+        } else {
+            out.push_str("\nNo service changes - everything matches the definition.\n");
+        }
     }
 
     for (action, plan_heading, applied_heading, verb) in [
@@ -1314,6 +1345,38 @@ mod tests {
         assert!(text.starts_with("# Deploy Apply\n**Applied to de-4** — revision 2 → 3\n"));
         assert!(text.contains("## Updated\n- the *mimir* service - `observability::mimir`\n"));
         assert!(!text.contains("## Unchanged"), "apply record: {text}");
+    }
+
+    #[test]
+    fn deploy_destroy_is_a_past_tense_record_without_a_revision_advance() {
+        let report = ServiceReport::destroyed(
+            "de-5",
+            3,
+            &[
+                service_change(ServiceChangeKind::Delete, "grafana"),
+                service_change(ServiceChangeKind::Delete, "loki"),
+            ],
+        );
+
+        let text = render(&report, Mode::resolve(false, false)).unwrap();
+        assert!(text.starts_with(
+            "# Deploy Destroy\n**Destroyed services from de-5** — revision 3 retained\n"
+        ));
+        assert!(text.contains("## Deleted\n"), "{text}");
+        assert!(!text.contains("would be deleted"), "{text}");
+
+        let json = render(&report, Mode::resolve(true, true)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["operation"], "deploy destroy");
+        assert_eq!(value["current_revision"], 3);
+        assert!(value.get("proposed_revision").is_none());
+    }
+
+    #[test]
+    fn deploy_destroy_reports_an_already_empty_service_plane() {
+        let report = ServiceReport::destroyed("de-5", 3, &[]);
+        let text = render(&report, Mode::resolve(false, false)).unwrap();
+        assert!(text.contains("No deployed services remain."), "{text}");
     }
 
     /// A fully-declared semantics value: these tests exercise refresh and

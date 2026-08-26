@@ -37,8 +37,7 @@ tkr infra apply
 # Inspect provisioner identity, binding, revision, and state facts
 tkr deployment describe --detail
 
-# Tear down provider resources before deleting the registry directory
-tkr infra destroy --yes
+# Tear down services, provider resources, then local records
 tkr deployment destroy --name dev-compose --yes
 ```
 
@@ -47,7 +46,7 @@ before the deployment directory becomes visible. The first apply therefore perfo
 `tkp infra apply`. A non-destructive plan does not require `--yes`; deletes and
 replacements do.
 
-`tkr deploy plan/apply` is also forwarded, but Compose models containers as
+`tkr deploy plan/apply/destroy` is also forwarded, and Compose models containers as
 infrastructure resources, so those verbs realize the same desired universe as the infra
 verbs. Prefer the infra spelling when reasoning about the complete Compose stack.
 
@@ -115,7 +114,7 @@ older `deployment.toml` deployment as an operator recipe for this path.
 |---|---|
 | `tkr definition check` | Fully parses and interprets the definition in memory. |
 | `tkr infra plan/apply/destroy` | Forwards to the deployment-local TKP and its Compose `ProvisionerPlatform`. |
-| `tkr deploy plan/apply` | Forwards to TKP; delegates to the same infrastructure universe. |
+| `tkr deploy plan/apply/destroy` | Forwards to TKP's workload lifecycle. |
 | `tkr deployment describe/apply/upgrade/rollback` | Uses the trust-aware provisioner launcher. |
 | `tkr scale up/down` | Forwards to TKP, which returns `NotApplicable` because Compose exposes no scale dimension. |
 | `tkr infra status`, `deploy status`, `scale status` | Render TKP `describe`. |

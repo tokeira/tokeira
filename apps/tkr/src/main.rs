@@ -13,7 +13,7 @@
 //! | Deployment CRUD   | `tkr deployment` | Create/list/use/destroy named deployments.     |
 //! | Container images  | `tkr image`      | Build, push, and mirror runtime images.        |
 //! | Cloud infra       | `tkr infra`      | Plan / apply / destroy declared resources.     |
-//! | Service deploy    | `tkr deploy`     | Plan / apply service manifests (0-replica).    |
+//! | Service deploy    | `tkr deploy`     | Plan / apply / destroy service manifests.      |
 //! | DSQL schema       | `tkr schema`     | Schema setup for DSQL-backed deployments.      |
 //! | Scaling + ops     | `tkr scale`, `tkr logs`, `tkr port-forward` | Day-2 operator loops. |
 //! | Inspection        | `tkr config show`, `tkr version`            | Debugging aids.       |
@@ -294,7 +294,7 @@ async fn run() -> Result<()> {
 ///
 /// The guarded set is the lifecycle mutations that change a deployment's
 /// infrastructure/services or its registry entry: `infra apply|destroy`,
-/// `deploy apply`, `schema setup`, `scale up|down`, `image push|mirror`,
+/// `deploy apply|destroy`, `schema setup`, `scale up|down`, `image push|mirror`,
 /// `admin`, `exec` (arbitrary in-container commands can mutate the deployment,
 /// exactly like `admin`), `deployment destroy`, and the forwarded `deployment
 /// apply|upgrade|rollback`. Plans, statuses, `describe`, `list`, `version`,
@@ -307,7 +307,7 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
             action: InfraAction::Apply { .. } | InfraAction::Destroy { .. },
         }
         | Command::Deploy {
-            action: DeployAction::Apply { .. },
+            action: DeployAction::Apply { .. } | DeployAction::Destroy { .. },
         }
         | Command::Schema {
             action: SchemaAction::Setup { .. },
@@ -392,6 +392,14 @@ fn forwarded_deploy_verb(action: &DeployAction) -> (&'static [&'static str], Vec
             }
             extra.extend(explanation_flag(explanation.as_deref()));
             (&["deploy", "apply"], extra)
+        }
+        DeployAction::Destroy { yes } => {
+            let extra = if *yes {
+                vec!["--yes".to_string()]
+            } else {
+                Vec::new()
+            };
+            (&["deploy", "destroy"], extra)
         }
         DeployAction::Status => (&["describe"], Vec::new()),
     }
@@ -654,6 +662,7 @@ mod tests {
             vec!["tkr", "infra", "apply", "--yes"],
             vec!["tkr", "infra", "destroy", "--yes"],
             vec!["tkr", "deploy", "apply", "--yes"],
+            vec!["tkr", "deploy", "destroy", "--yes"],
             vec!["tkr", "schema", "setup", "--yes"],
             vec!["tkr", "scale", "up"],
             vec!["tkr", "scale", "down"],
@@ -753,6 +762,11 @@ mod tests {
         };
         let (_, extra) = forwarded_deploy_verb(&unconfirmed);
         assert!(extra.is_empty(), "no confirmation is forwarded unasked");
+
+        let destroy = DeployAction::Destroy { yes: true };
+        let (verb, extra) = forwarded_deploy_verb(&destroy);
+        assert_eq!(verb, &["deploy", "destroy"]);
+        assert_eq!(extra, vec!["--yes"]);
     }
 
     #[test]
@@ -817,6 +831,14 @@ mod tests {
                 .command,
             Command::Deploy {
                 action: DeployAction::Apply { yes: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "deploy", "destroy", "--yes"])
+                .unwrap()
+                .command,
+            Command::Deploy {
+                action: DeployAction::Destroy { yes: true }
             }
         ));
         assert!(matches!(

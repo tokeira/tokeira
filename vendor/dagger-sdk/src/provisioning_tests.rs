@@ -23,7 +23,8 @@ use zip::write::SimpleFileOptions;
 use crate::archive::{MANIFEST_LIMIT, extract_expected, parse_manifest};
 use crate::provision::{
     DefaultCliProvisioner, DownloadResponse, ProvisioningHttp, ProvisioningRequestKind,
-    ReqwestProvisioningHttp, RetentionRemover, cache_for_test,
+    ReqwestProvisioningHttp, RetentionRemover, cache_for_test, validate_release_redirect,
+    validate_release_url,
 };
 use crate::provisioning_control::{
     NoopProvisioningObserver, ProvisionCheckpoint, ProvisioningCancellation, ProvisioningObserver,
@@ -715,6 +716,51 @@ fn production_http_rejects_non_release_authority_before_network_access() {
             Err(error) => error,
         };
         assert_eq!(error.kind(), ProvisionErrorKind::InvalidReleaseUrl);
+    }
+}
+
+#[test]
+fn apple_silicon_companion_origin_and_redirect_are_narrowly_trusted() {
+    let origin = url::Url::parse(
+        "https://github.com/iw/dagger/releases/download/sdk/rust/\
+         v1.0.0-beta.11.rust.3-apple-silicon/SHA256SUMS.arm64",
+    )
+    .expect("companion origin URL parses");
+    validate_release_url(&origin).expect("the fork release origin is trusted");
+
+    let redirected = url::Url::parse(
+        "https://release-assets.githubusercontent.com/github-production-release-asset/1/2",
+    )
+    .expect("release asset URL parses");
+    validate_release_redirect(&origin, &redirected)
+        .expect("one GitHub release-asset redirect is trusted");
+
+    for value in [
+        "https://github.com/other/dagger/releases/download/sdk/rust/v1/asset",
+        "https://github.com/iw/dagger/releases/latest/download/asset",
+        "https://user@github.com/iw/dagger/releases/download/sdk/rust/v1/asset",
+    ] {
+        let candidate = url::Url::parse(value).expect("rejected origin URL parses");
+        assert_eq!(
+            validate_release_url(&candidate)
+                .expect_err("non-companion origin rejects")
+                .kind(),
+            ProvisionErrorKind::InvalidReleaseUrl
+        );
+    }
+
+    for value in [
+        "http://release-assets.githubusercontent.com/asset",
+        "https://example.com/asset",
+        "https://user@release-assets.githubusercontent.com/asset",
+    ] {
+        let candidate = url::Url::parse(value).expect("rejected redirect URL parses");
+        assert_eq!(
+            validate_release_redirect(&origin, &candidate)
+                .expect_err("non-GitHub release redirect rejects")
+                .kind(),
+            ProvisionErrorKind::InvalidReleaseUrl
+        );
     }
 }
 

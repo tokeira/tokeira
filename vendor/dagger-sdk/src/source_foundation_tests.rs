@@ -356,8 +356,21 @@ proptest! {
                     descriptor.member_name(),
                     if os == OperatingSystem::Windows { "dagger.exe" } else { "dagger" }
                 );
-                prop_assert_eq!(descriptor.manifest_url().as_str(), "https://dl.dagger.io/dagger/releases/1.0.0-beta.11.rust.3/checksums.txt");
-                prop_assert_eq!(descriptor.archive_url().as_str(), format!("https://dl.dagger.io/dagger/releases/1.0.0-beta.11.rust.3/{expected_name}"));
+                let (base, manifest) = if os == OperatingSystem::Darwin
+                    && arch == Architecture::Arm64
+                {
+                    (
+                        "https://github.com/iw/dagger/releases/download/sdk/rust/v1.0.0-beta.11.rust.3-apple-silicon/",
+                        "SHA256SUMS.arm64",
+                    )
+                } else {
+                    (
+                        "https://dl.dagger.io/dagger/releases/1.0.0-beta.11.rust.3/",
+                        "checksums.txt",
+                    )
+                };
+                prop_assert_eq!(descriptor.manifest_url().as_str(), format!("{base}{manifest}"));
+                prop_assert_eq!(descriptor.archive_url().as_str(), format!("{base}{expected_name}"));
             }
             (Err(error), _) => prop_assert_eq!(error.kind(), PlatformErrorKind::UnsupportedOperatingSystem),
             (_, Err(error)) => prop_assert_eq!(error.kind(), PlatformErrorKind::UnsupportedArchitecture),
@@ -481,10 +494,21 @@ fn six_release_descriptors_match_the_published_naming_policy() {
         assert_eq!(descriptor.archive_name(), archive);
         assert_eq!(descriptor.member_name(), member);
         assert_eq!(descriptor.format(), format);
-        assert_eq!(
-            descriptor.archive_url().as_str(),
-            format!("https://dl.dagger.io/dagger/releases/1.0.0-beta.11.rust.3/{archive}")
-        );
+        let (base, manifest) = if os == OperatingSystem::Darwin
+            && arch == Architecture::Arm64
+        {
+            (
+                "https://github.com/iw/dagger/releases/download/sdk/rust/v1.0.0-beta.11.rust.3-apple-silicon/",
+                "SHA256SUMS.arm64",
+            )
+        } else {
+            (
+                "https://dl.dagger.io/dagger/releases/1.0.0-beta.11.rust.3/",
+                "checksums.txt",
+            )
+        };
+        assert_eq!(descriptor.manifest_url().as_str(), format!("{base}{manifest}"));
+        assert_eq!(descriptor.archive_url().as_str(), format!("{base}{archive}"));
     }
 }
 

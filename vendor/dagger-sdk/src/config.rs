@@ -43,6 +43,7 @@ pub(crate) struct ConfigExplicitness {
     pub(crate) http_connect_timeout: bool,
     pub(crate) graphql_execution_timeout: bool,
     pub(crate) allow_unverified_compatibility: bool,
+    pub(crate) isolated_cli_session: bool,
 }
 
 /// Immutable, validated inputs used to establish an owned Dagger client.
@@ -65,6 +66,7 @@ pub struct ClientConfig {
     http_connect_timeout: Duration,
     graphql_execution_timeout: Option<Duration>,
     allow_unverified_compatibility: bool,
+    isolated_cli_session: bool,
     explicit: ConfigExplicitness,
 }
 
@@ -87,6 +89,7 @@ pub(crate) struct ClientConfigParts {
     pub(crate) http_connect_timeout: Duration,
     pub(crate) graphql_execution_timeout: Option<Duration>,
     pub(crate) allow_unverified_compatibility: bool,
+    pub(crate) isolated_cli_session: bool,
     pub(crate) explicit: ConfigExplicitness,
 }
 
@@ -171,6 +174,14 @@ impl ClientConfig {
         self.allow_unverified_compatibility
     }
 
+    /// Returns whether this client requires a newly owned exact-release CLI session.
+    ///
+    /// Isolated sessions ignore ambient Dagger session, development CLI, and runner
+    /// selection. An explicitly configured [`Self::runner_host`] remains authoritative.
+    pub const fn uses_isolated_cli_session(&self) -> bool {
+        self.isolated_cli_session
+    }
+
     pub(crate) fn into_parts(self) -> ClientConfigParts {
         ClientConfigParts {
             workdir: self.workdir,
@@ -186,6 +197,7 @@ impl ClientConfig {
             http_connect_timeout: self.http_connect_timeout,
             graphql_execution_timeout: self.graphql_execution_timeout,
             allow_unverified_compatibility: self.allow_unverified_compatibility,
+            isolated_cli_session: self.isolated_cli_session,
             explicit: self.explicit,
         }
     }
@@ -207,6 +219,7 @@ impl Default for ClientConfig {
             http_connect_timeout: DEFAULT_HTTP_CONNECT_TIMEOUT,
             graphql_execution_timeout: None,
             allow_unverified_compatibility: false,
+            isolated_cli_session: false,
             explicit: ConfigExplicitness::default(),
         }
     }
@@ -249,6 +262,7 @@ impl fmt::Debug for ClientConfig {
                 "allow_unverified_compatibility",
                 &self.allow_unverified_compatibility,
             )
+            .field("isolated_cli_session", &self.isolated_cli_session)
             // Explicitness is lifecycle-planning state, not a second set of values;
             // rendering the bitset makes defaults reviewable without exposing inputs.
             .field("explicit_inputs", &self.explicit)
@@ -275,6 +289,7 @@ pub struct ClientConfigBuilder {
     http_connect_timeout: Option<Duration>,
     graphql_execution_timeout: Option<Duration>,
     allow_unverified_compatibility: Option<bool>,
+    isolated_cli_session: bool,
 }
 
 impl fmt::Debug for ClientConfigBuilder {
@@ -308,6 +323,7 @@ impl fmt::Debug for ClientConfigBuilder {
                 "allow_unverified_compatibility",
                 &self.allow_unverified_compatibility,
             )
+            .field("isolated_cli_session", &self.isolated_cli_session)
             .finish()
     }
 }
@@ -406,6 +422,17 @@ impl ClientConfigBuilder {
         self
     }
 
+    /// Requires a newly owned session using the SDK's exact compiled CLI release.
+    ///
+    /// This isolates applications from ambient Dagger source selection without
+    /// mutating process-global environment. A caller-supplied runner host still
+    /// applies to the newly started CLI.
+    #[must_use]
+    pub fn isolated_cli_session(mut self) -> Self {
+        self.isolated_cli_session = true;
+        self
+    }
+
     /// Validates and normalizes the candidate without performing external work.
     pub fn build(self) -> Result<ClientConfig, ConfigError> {
         validate_workdir(self.workdir.as_deref())?;
@@ -443,6 +470,7 @@ impl ClientConfigBuilder {
             http_connect_timeout: self.http_connect_timeout.is_some(),
             graphql_execution_timeout: self.graphql_execution_timeout.is_some(),
             allow_unverified_compatibility: self.allow_unverified_compatibility.is_some(),
+            isolated_cli_session: self.isolated_cli_session,
         };
 
         Ok(ClientConfig {
@@ -463,6 +491,7 @@ impl ClientConfigBuilder {
                 .unwrap_or(DEFAULT_HTTP_CONNECT_TIMEOUT),
             graphql_execution_timeout: self.graphql_execution_timeout,
             allow_unverified_compatibility: self.allow_unverified_compatibility.unwrap_or(false),
+            isolated_cli_session: self.isolated_cli_session,
             explicit,
         })
     }
@@ -564,6 +593,8 @@ fn validate_explicit_connection_conflicts(
         Some(ConfigOption::HttpConnectTimeout)
     } else if builder.allow_unverified_compatibility.is_some() {
         Some(ConfigOption::AllowUnverifiedCompatibility)
+    } else if builder.isolated_cli_session {
+        Some(ConfigOption::IsolatedCliSession)
     } else {
         None
     };

@@ -19,6 +19,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
+use reqwest::header::LOCATION;
 use semver::Version;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -38,6 +39,9 @@ use crate::provisioning_error::{ProvisionError, ProvisionErrorKind};
 use crate::target::{ArchiveDescriptor, ArchiveFormat};
 
 const RELEASE_HOST: &str = "dl.dagger.io";
+const FORK_RELEASE_HOST: &str = "github.com";
+const FORK_RELEASE_PATH: &str = "/iw/dagger/releases/download/sdk/rust/";
+const GITHUB_RELEASE_ASSET_HOST: &str = "release-assets.githubusercontent.com";
 const CACHE_DIRECTORY: &str = "dagger";
 const CACHE_LOCK_NAME: &str = ".rust-sdk-cli-cache.lock";
 const MANAGED_PREFIX: &str = "dagger-";
@@ -106,16 +110,22 @@ impl ProvisioningHttp for ReqwestProvisioningHttp {
         cancellation: &ProvisioningCancellation,
     ) -> Result<DownloadResponse, ProvisionError> {
         validate_release_url(url)?;
-        let send = self.client.get(url.clone()).send();
-        tokio::pin!(send);
-        let response = tokio::select! {
-            result = &mut send => result.map_err(|error| {
-                ProvisionError::with_source(transport_kind(kind), error)
-            })?,
-            () = cancellation.cancelled() => {
-                return Err(ProvisionError::new(ProvisionErrorKind::Cancelled));
+        let mut response = self.send(url, kind, cancellation).await?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| ProvisionError::new(ProvisionErrorKind::InvalidReleaseUrl))?;
+            let redirected = url
+                .join(location)
+                .map_err(|_| ProvisionError::new(ProvisionErrorKind::InvalidReleaseUrl))?;
+            validate_release_redirect(url, &redirected)?;
+            response = self.send(&redirected, kind, cancellation).await?;
+            if response.status().is_redirection() {
+                return Err(ProvisionError::new(ProvisionErrorKind::InvalidReleaseUrl));
             }
-        };
+        }
         let status = response.status().as_u16();
         let content_length = response.content_length();
         let body = response.bytes_stream().map(move |chunk| {
@@ -131,13 +141,54 @@ impl ProvisioningHttp for ReqwestProvisioningHttp {
     }
 }
 
-fn validate_release_url(url: &Url) -> Result<(), ProvisionError> {
+impl ReqwestProvisioningHttp {
+    async fn send(
+        &self,
+        url: &Url,
+        kind: ProvisioningRequestKind,
+        cancellation: &ProvisioningCancellation,
+    ) -> Result<reqwest::Response, ProvisionError> {
+        let send = self.client.get(url.clone()).send();
+        tokio::pin!(send);
+        tokio::select! {
+            result = &mut send => result.map_err(|error| {
+                ProvisionError::with_source(transport_kind(kind), error)
+            }),
+            () = cancellation.cancelled() => {
+                Err(ProvisionError::new(ProvisionErrorKind::Cancelled))
+            }
+        }
+    }
+}
+
+pub(crate) fn validate_release_url(url: &Url) -> Result<(), ProvisionError> {
+    let trusted_origin = (url.host_str() == Some(RELEASE_HOST)
+        && url.path().starts_with("/dagger/releases/"))
+        || (url.host_str() == Some(FORK_RELEASE_HOST)
+            && url.path().starts_with(FORK_RELEASE_PATH));
     if url.scheme() == "https"
-        && url.host_str() == Some(RELEASE_HOST)
+        && trusted_origin
         && url.port().is_none()
-        && url.path().starts_with("/dagger/releases/")
         && url.username().is_empty()
         && url.password().is_none()
+    {
+        Ok(())
+    } else {
+        Err(ProvisionError::new(ProvisionErrorKind::InvalidReleaseUrl))
+    }
+}
+
+pub(crate) fn validate_release_redirect(
+    origin: &Url,
+    redirected: &Url,
+) -> Result<(), ProvisionError> {
+    if origin.host_str() == Some(FORK_RELEASE_HOST)
+        && origin.path().starts_with(FORK_RELEASE_PATH)
+        && redirected.scheme() == "https"
+        && redirected.host_str() == Some(GITHUB_RELEASE_ASSET_HOST)
+        && redirected.port().is_none()
+        && redirected.username().is_empty()
+        && redirected.password().is_none()
     {
         Ok(())
     } else {

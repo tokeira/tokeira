@@ -13,6 +13,7 @@ fn timeout_defaults_and_every_public_config_error_coordinate_are_stable() {
     assert_eq!(defaults.session_startup_timeout(), Duration::from_secs(300));
     assert_eq!(defaults.http_connect_timeout(), Duration::from_secs(10));
     assert_eq!(defaults.graphql_execution_timeout(), None);
+    assert!(!defaults.uses_isolated_cli_session());
 
     let errors = [
         ConfigError::InvalidWorkdir,
@@ -45,11 +46,14 @@ fn timeout_defaults_and_every_public_config_error_coordinate_are_stable() {
         ConfigError::OptionConflict {
             option: ConfigOption::RunnerHost,
         },
+        ConfigError::ExplicitConnectionConflict {
+            option: ConfigOption::IsolatedCliSession,
+        },
         ConfigError::LegacyOptionRemoved,
     ];
     let rendered = errors.map(|error| error.to_string());
     assert!(rendered.iter().all(|message| !message.is_empty()));
-    assert_eq!(rendered.len(), 16);
+    assert_eq!(rendered.len(), 17);
 }
 
 #[test]

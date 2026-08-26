@@ -5165,6 +5165,7 @@ dependencies = [
  "tokeira-config",
  "tokeira-edge",
  "tokeira-kernel",
+ "tokeira-managed-dsql",
  "tokeira-observability",
  "tokeira-projection",
  "tokeira-proto",
@@ -5197,6 +5198,22 @@ dependencies = [
  "time",
  "tokeira-types",
  "tracing",
+]
+
+[[package]]
+name = "tokeira-managed-dsql"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-dsql",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -5337,6 +5354,7 @@ dependencies = [
  "tokeira-observability",
  "tokeira-types",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -5352,6 +5370,7 @@ dependencies = [
  "temporalio-macros",
  "temporalio-sdk",
  "temporalio-workflow",
+ "tokeira-config",
  "tokeira-engine",
  "tokio",
 ]

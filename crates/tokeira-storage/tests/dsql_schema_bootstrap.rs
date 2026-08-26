@@ -76,7 +76,7 @@ async fn token_zero_empty_ledger_state_converges_through_the_embedded_target() -
         .assess_connection(&mut connection, &contract, SchemaMigrationPolicy::Automatic)
         .await?;
     assert_eq!(restart_decision, initial_decision);
-    let migration_guard = leases
+    let mut migration_guard = leases
         .acquire(
             &mut connection,
             &ControlLeaseAcquireRequest {
@@ -93,7 +93,13 @@ async fn token_zero_empty_ledger_state_converges_through_the_embedded_target() -
     assert_eq!(migration_guard.fence_token(), 1);
     let migration_gate = OwnershipAdmissionGate::for_guard(&migration_guard);
     let application = runner
-        .apply_decision(&mut connection, &restart_decision, &migration_guard)
+        .apply_decision(
+            &mut connection,
+            &restart_decision,
+            &leases,
+            &mut migration_guard,
+            &migration_gate,
+        )
         .await;
     let release = leases
         .release(&mut connection, &migration_guard, &migration_gate)

@@ -485,7 +485,7 @@ proptest! {
         prop_assert_eq!(contract.immutable_through_version, 67);
         prop_assert_eq!(
             contract.migration_set_digest.as_str(),
-            "sha256:f9acbc0b4f472b90446109fa3553bde4ce71fa95b1f6dbd4efaa67a358783400"
+            "sha256:fb8d7c84c771a8cc9a9a8a53dca33a195d4ac7377e76df273171e7ee3d5e5892"
         );
         prop_assert_eq!(
             prefix_digest(contract.maximum_readable_version),

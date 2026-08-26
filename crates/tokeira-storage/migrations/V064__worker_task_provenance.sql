@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS worker_task_provenance (
-    token_digest BYTEA NOT NULL,
+    token_digest TEXT NOT NULL,
     namespace_id UUID NOT NULL,
     normal_task_queue TEXT NOT NULL,
     task_class SMALLINT NOT NULL,

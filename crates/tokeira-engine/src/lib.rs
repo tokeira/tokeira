@@ -270,7 +270,8 @@ use tokeira_storage::{
         ControlLeaseClusterIdentity, ControlLeaseError, ControlLeaseGuard, DsqlAuthConfig,
         DsqlConnectionDirector, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore,
         EmbeddedDsqlPoolConfig, MigrationRunner, OWNER_ADMISSION_MARGIN, OWNER_LEASE_DURATION,
-        OWNER_RENEW_INTERVAL, OwnershipAdmissionGate, OwnershipAdmissionState, SchemaDecision,
+        OWNER_RENEW_INTERVAL, OwnershipAdmissionGate, OwnershipAdmissionState,
+        SCHEMA_MIGRATION_ADMISSION_MARGIN, SCHEMA_MIGRATION_LEASE_DURATION, SchemaDecision,
         SchemaMigrationPolicy, WarmupDeadline,
     },
 };
@@ -874,9 +875,6 @@ impl Engine {
 impl EmbeddedShutdownCoordinator {
     fn begin_shutdown(&self) {
         self.service.begin_shutdown();
-        if let Some(ownership) = &self.ownership {
-            ownership.gate.begin_closing();
-        }
         self.engine_tasks.begin_shutdown();
         self.runtime_tasks.begin_shutdown();
     }
@@ -895,6 +893,14 @@ impl EmbeddedShutdownCoordinator {
             && cleanup(deadline).await.is_err()
         {
             failures.push(EmbeddedShutdownFailure::ShardRelease);
+        }
+        // RPC admission is already closed and both task groups have joined, so
+        // shard release is the last operation allowed through ordinary owner
+        // admission. Closing earlier makes that conditional DSQL release unable
+        // to acquire its bounded Control connection and also prevents already
+        // admitted RPCs from draining gracefully.
+        if let Some(ownership) = &self.ownership {
+            ownership.gate.begin_closing();
         }
         if let (Some(ownership), Some(director)) = (&self.ownership, &self.director) {
             let now = Instant::now();
@@ -1381,22 +1387,28 @@ async fn apply_embedded_schema(
             .bootstrap_migration_coordination(permit.connection()?, &decision)
             .await?;
         leases.bootstrap(permit.connection()?).await?;
-        let migration_guard = leases
+        let mut migration_guard = leases
             .acquire(
                 permit.connection()?,
                 &ControlLeaseAcquireRequest {
                     claim_name: "schema-migration".to_owned(),
                     cluster: control_lease_identity(cluster),
                     owner_id: format!("schema-{}", IncarnationId::new()),
-                    lease_duration: OWNER_LEASE_DURATION,
-                    admission_margin: OWNER_ADMISSION_MARGIN,
+                    lease_duration: SCHEMA_MIGRATION_LEASE_DURATION,
+                    admission_margin: SCHEMA_MIGRATION_ADMISSION_MARGIN,
                     acquire_deadline: deadline,
                 },
             )
             .await?;
         let migration_gate = OwnershipAdmissionGate::for_guard(&migration_guard);
         let apply_result = runner
-            .apply_decision(permit.connection()?, &decision, &migration_guard)
+            .apply_decision(
+                permit.connection()?,
+                &decision,
+                &leases,
+                &mut migration_guard,
+                &migration_gate,
+            )
             .await;
         let release_result = leases
             .release(permit.connection()?, &migration_guard, &migration_gate)
@@ -4477,6 +4489,7 @@ mod tests {
         JoinComplete,
         FinishTelemetry,
         AttemptShardRelease,
+        CloseOwnershipAdmission,
         AttemptOwnershipRelease,
         AttemptPoolClose,
         ReturnToHost,
@@ -4498,6 +4511,7 @@ mod tests {
             ShutdownModelEvent::JoinComplete,
             ShutdownModelEvent::FinishTelemetry,
             ShutdownModelEvent::AttemptShardRelease,
+            ShutdownModelEvent::CloseOwnershipAdmission,
             ShutdownModelEvent::AttemptOwnershipRelease,
             ShutdownModelEvent::AttemptPoolClose,
             ShutdownModelEvent::ReturnToHost,
@@ -4691,6 +4705,14 @@ mod tests {
             ] {
                 prop_assert!(events.contains(&cleanup));
             }
+            prop_assert!(
+                events.iter().position(|event| *event == ShutdownModelEvent::AttemptShardRelease)
+                    < events.iter().position(|event| *event == ShutdownModelEvent::CloseOwnershipAdmission)
+            );
+            prop_assert!(
+                events.iter().position(|event| *event == ShutdownModelEvent::CloseOwnershipAdmission)
+                    < events.iter().position(|event| *event == ShutdownModelEvent::AttemptOwnershipRelease)
+            );
             let failures = (0..3)
                 .filter(|bit| independent_failure_mask & (1 << bit) != 0)
                 .count();

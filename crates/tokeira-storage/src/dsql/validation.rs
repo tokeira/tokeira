@@ -41,6 +41,9 @@ pub enum ValidationKind {
     MissingAsyncKeyword,
     /// Primary keys must be spread keys, not plain monotonic identifiers.
     MonotonicPrimaryKey,
+    /// Aurora DSQL cannot index `BYTEA` columns, so they cannot participate in
+    /// primary, unique, or secondary keys.
+    UnindexableColumnType,
 }
 
 impl DdlValidator {
@@ -139,8 +142,69 @@ impl DdlValidator {
             ));
         }
 
+        let tokens = identifier_tokens(&lower);
+        let bytea_columns = tokens
+            .windows(2)
+            .filter(|window| window[1] == "bytea")
+            .map(|window| window[0])
+            .collect::<Vec<_>>();
+        let mut indexed_columns = parenthesized_columns(&lower, "primary key");
+        indexed_columns.extend(parenthesized_columns(&lower, "create index"));
+        indexed_columns.extend(parenthesized_columns(&lower, "create unique index"));
+        for column in bytea_columns {
+            let inline_key = lower
+                .split(|character| [',', '\n'].contains(&character))
+                .any(|column_definition| {
+                    let line_tokens = identifier_tokens(column_definition);
+                    let declares_column = line_tokens
+                        .windows(2)
+                        .any(|window| window[0] == column && window[1] == "bytea");
+                    let declares_key = line_tokens
+                        .windows(2)
+                        .any(|window| window[0] == "primary" && window[1] == "key")
+                        || line_tokens.contains(&"unique");
+                    declares_column && declares_key
+                });
+            if inline_key || indexed_columns.contains(&column) {
+                issues.push(issue(
+                    filename,
+                    1,
+                    ValidationKind::UnindexableColumnType,
+                    format!("Aurora DSQL does not support BYTEA column `{column}` in an index key"),
+                ));
+            }
+        }
+
         issues
     }
+}
+
+fn identifier_tokens(sql: &str) -> Vec<&str> {
+    sql.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn parenthesized_columns<'a>(sql: &'a str, marker: &str) -> Vec<&'a str> {
+    let mut columns = Vec::new();
+    let mut remaining = sql;
+    while let Some(marker_start) = remaining.find(marker) {
+        let after_marker = &remaining[marker_start + marker.len()..];
+        let Some(open) = after_marker.find('(') else {
+            break;
+        };
+        let after_open = &after_marker[open + 1..];
+        let Some(close) = after_open.find(')') else {
+            break;
+        };
+        columns.extend(
+            after_open[..close]
+                .split(',')
+                .filter_map(|entry| identifier_tokens(entry).first().copied()),
+        );
+        remaining = &after_open[close + 1..];
+    }
+    columns
 }
 
 fn issue(
@@ -230,6 +294,32 @@ mod tests {
     }
 
     #[test]
+    fn catches_binary_primary_and_secondary_keys() {
+        for sql in [
+            "CREATE TABLE t (digest BYTEA PRIMARY KEY);",
+            "CREATE TABLE t (digest BYTEA, PRIMARY KEY (digest));",
+            "CREATE TABLE t (digest BYTEA); CREATE INDEX ASYNC idx ON t (digest);",
+        ] {
+            let issues = DdlValidator::validate(sql, "binary-key.sql");
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.kind == ValidationKind::UnindexableColumnType),
+                "{sql}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_binary_payload_outside_keys() {
+        let issues = DdlValidator::validate(
+            "CREATE TABLE t (id UUID PRIMARY KEY, payload BYTEA);",
+            "binary-payload.sql",
+        );
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
     fn allows_singleton_control_table_primary_keys() {
         let routing = DdlValidator::validate(
             "CREATE TABLE IF NOT EXISTS routing_generation (id INTEGER PRIMARY KEY, generation BIGINT NOT NULL);",
@@ -268,6 +358,7 @@ mod tests {
             "REFERENCES other(id)",
             "CREATE INDEX idx",
             "plpgsql",
+            "digest BYTEA PRIMARY KEY",
         ])) {
             let sql = format!("CREATE TABLE t (a INT); {keyword}");
             let issues = DdlValidator::validate(&sql, "property.sql");

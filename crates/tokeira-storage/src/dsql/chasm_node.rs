@@ -71,14 +71,27 @@ impl DsqlChasmNodeRepository {
         ))
     }
 
+    /// Borrow the canonical path bytes as the DSQL `TEXT` key.
+    ///
+    /// Temporal's v1.31.0 path encoder emits a string
+    /// (`chasm/path_encoder.go:25-75 @ v1.31.0`), and Tokeira's equivalent
+    /// encoder appends only UTF-8 segment text plus ASCII separators and
+    /// escapes. Keeping that representation one-for-one avoids the key-size
+    /// expansion of a binary-to-text wrapper under DSQL's 1 KiB combined-key
+    /// limit.
+    fn path_key(encoded_path: &[u8]) -> Result<&str> {
+        std::str::from_utf8(encoded_path)
+            .map_err(|e| anyhow::anyhow!("CHASM encoded path is not valid UTF-8: {e}"))
+    }
+
     /// Reconstruct a [`ChasmNode`] from a result row (`metadata` blob is
     /// authoritative; `data` is the nullable column).
     fn node_from_row(row: &sqlx::postgres::PgRow) -> Result<(Vec<u8>, ChasmNode)> {
-        let encoded_path: Vec<u8> = row.try_get("encoded_path")?;
+        let encoded_path: String = row.try_get("encoded_path")?;
         let metadata_blob: Vec<u8> = row.try_get("metadata")?;
         let data: Option<Vec<u8>> = row.try_get("data")?;
         let metadata = codec::decode(&metadata_blob)?;
-        Ok((encoded_path, ChasmNode { metadata, data }))
+        Ok((encoded_path.into_bytes(), ChasmNode { metadata, data }))
     }
 
     /// Encode a [`LifecycleState`] as the `chasm_current_run.status` SMALLINT
@@ -118,6 +131,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
 
         // Phase 1 — check every fence before mutating anything (all-or-nothing).
         for write in &batch {
+            let encoded_path = Self::path_key(&write.encoded_path)?;
             let stored = sqlx::query(
                 "SELECT failover_version, transition_count
                  FROM chasm_node
@@ -127,7 +141,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
             .bind(namespace_id)
             .bind(business_id)
             .bind(run_id)
-            .bind(write.encoded_path.as_slice())
+            .bind(encoded_path)
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -163,6 +177,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
 
         // Phase 2 — every fence held; upsert the whole batch.
         for write in &batch {
+            let encoded_path = Self::path_key(&write.encoded_path)?;
             let metadata_blob = codec::encode(&write.node.metadata)?;
             let vt = write.node.metadata.versioned_transition;
             let initial_vt = write.node.metadata.initial_versioned_transition;
@@ -186,7 +201,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
             .bind(namespace_id)
             .bind(business_id)
             .bind(run_id)
-            .bind(write.encoded_path.as_slice())
+            .bind(encoded_path)
             .bind(i64::from(write.node.metadata.component_type_id))
             .bind(vt.namespace_failover_version)
             .bind(vt.transition_count)
@@ -230,6 +245,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
 
         // Phase 1 — node fences (all-or-nothing), identical to `persist_dirty`.
         for write in &batch {
+            let encoded_path = Self::path_key(&write.encoded_path)?;
             let stored = sqlx::query(
                 "SELECT failover_version, transition_count
                  FROM chasm_node
@@ -239,7 +255,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
             .bind(namespace_id)
             .bind(business_id)
             .bind(run_id)
-            .bind(write.encoded_path.as_slice())
+            .bind(encoded_path)
             .fetch_optional(&mut *tx)
             .await?;
             let conflict_reason = match (&write.expected, stored) {
@@ -274,6 +290,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
 
         // Phase 2 — upsert the node batch.
         for write in &batch {
+            let encoded_path = Self::path_key(&write.encoded_path)?;
             let metadata_blob = codec::encode(&write.node.metadata)?;
             let vt = write.node.metadata.versioned_transition;
             let initial_vt = write.node.metadata.initial_versioned_transition;
@@ -297,7 +314,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
             .bind(namespace_id)
             .bind(business_id)
             .bind(run_id)
-            .bind(write.encoded_path.as_slice())
+            .bind(encoded_path)
             .bind(i64::from(write.node.metadata.component_type_id))
             .bind(vt.namespace_failover_version)
             .bind(vt.transition_count)
@@ -419,6 +436,8 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
     ) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
         let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
         let end = tokeira_chasm::path::subtree_range_end(encoded_prefix);
+        let encoded_prefix = Self::path_key(encoded_prefix)?;
+        let encoded_end = Self::path_key(&end)?;
         let mut permit = self.director.acquire(DbClass::Read).await?;
         let rows = sqlx::query(
             "SELECT encoded_path, metadata, data
@@ -431,7 +450,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         .bind(business_id)
         .bind(run_id)
         .bind(encoded_prefix)
-        .bind(end.as_slice())
+        .bind(encoded_end)
         .fetch_all(permit.connection()?)
         .await?;
         rows.iter().map(Self::node_from_row).collect()
@@ -469,14 +488,14 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         let mut permit = self.director.acquire(DbClass::Read).await?;
         // Every execution's root component node (encoded_path = ROOT_PATH, b""),
         // ordered deterministically for the repair scanner (Req 10.11; AGENTS
-        // determinism). The empty-bytea predicate hits the PK prefix.
+        // determinism). The root is the empty text key.
         let rows = sqlx::query(
             "SELECT namespace_id, business_id, run_id, metadata, data
              FROM chasm_node
              WHERE encoded_path = $1
              ORDER BY namespace_id ASC, business_id ASC, run_id ASC",
         )
-        .bind(b"".as_slice())
+        .bind("")
         .fetch_all(permit.connection()?)
         .await?;
         rows.iter()
@@ -498,7 +517,10 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
 #[cfg(test)]
 mod tests {
     use time::Duration;
-    use tokeira_chasm::{LifecycleState, NodeMetadata, NodeTree, RetainAllValidator};
+    use tokeira_chasm::{
+        LifecycleState, NodeMetadata, NodeTree, RetainAllValidator,
+        path::{self, PathSegment},
+    };
 
     use crate::{
         ChasmNodeRepository, ExpectedVersion, NodePersistOutcome, NodeWrite,
@@ -527,7 +549,7 @@ mod tests {
                 namespace_id                UUID        NOT NULL,
                 business_id                 TEXT        NOT NULL,
                 run_id                      UUID        NOT NULL,
-                encoded_path                BYTEA       NOT NULL,
+                encoded_path                TEXT        NOT NULL,
                 archetype_id                BIGINT      NOT NULL,
                 failover_version            BIGINT      NOT NULL,
                 transition_count            BIGINT      NOT NULL,
@@ -565,6 +587,24 @@ mod tests {
 
     fn vt(failover: i64, count: i64) -> VersionedTransition {
         VersionedTransition::new(failover, count)
+    }
+
+    #[test]
+    fn dsql_path_key_preserves_canonical_utf8_bytes() {
+        let encoded = path::encode(&[
+            PathSegment::field("α"),
+            PathSegment::collection("escaped$#\\"),
+        ])
+        .expect("path encodes");
+        let key =
+            super::DsqlChasmNodeRepository::path_key(&encoded).expect("encoded path is UTF-8");
+
+        assert_eq!(key.as_bytes(), encoded);
+    }
+
+    #[test]
+    fn dsql_path_key_rejects_non_utf8_bytes() {
+        assert!(super::DsqlChasmNodeRepository::path_key(&[0xff]).is_err());
     }
 
     #[tokio::test]

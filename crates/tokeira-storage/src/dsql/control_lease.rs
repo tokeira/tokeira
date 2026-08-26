@@ -29,6 +29,10 @@ pub const OWNER_LEASE_DURATION: Duration = Duration::seconds(60);
 pub const OWNER_RENEW_INTERVAL: Duration = Duration::seconds(20);
 /// Safety margin between local admission closure and database expiry.
 pub const OWNER_ADMISSION_MARGIN: Duration = Duration::seconds(20);
+/// Schema claim lifetime, long enough to outlive one maximum-age DSQL transaction.
+pub const SCHEMA_MIGRATION_LEASE_DURATION: Duration = Duration::minutes(6);
+/// Safety interval retained after one maximum-age DSQL migration statement.
+pub const SCHEMA_MIGRATION_ADMISSION_MARGIN: Duration = Duration::minutes(1);
 /// Quiescence after an expired takeover, bounded by DSQL's transaction limit.
 pub const EXPIRED_TAKEOVER_QUIESCENCE: Duration = Duration::minutes(5);
 

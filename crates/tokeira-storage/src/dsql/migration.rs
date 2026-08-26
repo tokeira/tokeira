@@ -13,7 +13,8 @@ use time::OffsetDateTime;
 use tokeira_observability::{ErrorBiasedSamplingReason, OutcomeLabel, mark_error_biased_sample};
 
 use super::{
-    ControlLeaseGuard, MigrationConfig,
+    ConnectionControlLeaseRepository, ControlLeaseError, ControlLeaseGuard, MigrationConfig,
+    OwnershipAdmissionGate, SCHEMA_MIGRATION_ADMISSION_MARGIN, SCHEMA_MIGRATION_LEASE_DURATION,
     schema_compatibility::{
         AppliedMigration, SchemaCompatibilityContract, SchemaCompatibilityRecord, SchemaDecision,
         SchemaIncompatibility, SchemaMigrationPolicy, SchemaObservation,
@@ -85,6 +86,9 @@ pub enum SchemaCompatibilityError {
     /// The supplied guard is not the active schema-migration owner.
     #[error("schema migration ownership fence was lost")]
     Fenced,
+    /// The schema-migration claim could not be renewed safely.
+    #[error("schema migration control lease failed")]
+    ControlLease(#[source] ControlLeaseError),
     /// An asynchronous index job failed.
     #[error("asynchronous index {index_name} failed: {details}")]
     IndexFailed {
@@ -411,7 +415,9 @@ impl MigrationRunner {
         &self,
         connection: &mut PgConnection,
         decision: &SchemaDecision,
-        migration_lease: &ControlLeaseGuard,
+        leases: &ConnectionControlLeaseRepository,
+        migration_lease: &mut ControlLeaseGuard,
+        migration_gate: &OwnershipAdmissionGate,
     ) -> Result<MigrationReport, SchemaCompatibilityError> {
         if migration_lease.claim_name() != "schema-migration" {
             return Err(SchemaCompatibilityError::Fenced);
@@ -424,6 +430,7 @@ impl MigrationRunner {
                 current,
                 legacy_backfill: true,
             } => {
+                renew_migration_lease(connection, leases, migration_lease, migration_gate).await?;
                 ensure_migration_fence(connection, migration_lease).await?;
                 let recognized = self.recognized_identities().map_err(|error| {
                     SchemaCompatibilityError::InvalidMetadata(error.to_string())
@@ -463,7 +470,7 @@ impl MigrationRunner {
         // per-version compatibility write. The ordinary migration loop still
         // records all three exact migration identities in version order.
         for statement in post_claim_bootstrap_statements() {
-            ensure_migration_fence(connection, migration_lease).await?;
+            renew_migration_lease(connection, leases, migration_lease, migration_gate).await?;
             sqlx::query(statement).execute(&mut *connection).await?;
         }
         // Fence the interval after the final bootstrap; otherwise takeover
@@ -482,6 +489,11 @@ impl MigrationRunner {
             .iter()
             .filter(|migration| migration.version <= target)
         {
+            // The single admitted Control connection deliberately performs
+            // renewal and migration work sequentially. This preserves the
+            // embedded class budget while ensuring each potentially blocking
+            // DSQL async-index wait begins with a fresh schema lease.
+            renew_migration_lease(connection, leases, migration_lease, migration_gate).await?;
             ensure_migration_fence(connection, migration_lease).await?;
             let observed = read_applied_migrations(connection).await?;
             validate_applied_prefix(&recognized, &observed)?;
@@ -493,7 +505,7 @@ impl MigrationRunner {
             }
             execute_migration_step(connection, migration).await?;
 
-            ensure_migration_fence(connection, migration_lease).await?;
+            renew_migration_lease(connection, leases, migration_lease, migration_gate).await?;
             record_applied_migration(connection, migration).await?;
             ensure_migration_fence(connection, migration_lease).await?;
             self.persist_compatibility(connection, migration.version, migration_lease)
@@ -873,6 +885,28 @@ fn incompatible(
     })
 }
 
+async fn renew_migration_lease(
+    connection: &mut PgConnection,
+    leases: &ConnectionControlLeaseRepository,
+    guard: &mut ControlLeaseGuard,
+    gate: &OwnershipAdmissionGate,
+) -> Result<(), SchemaCompatibilityError> {
+    match leases
+        .renew(
+            connection,
+            guard,
+            SCHEMA_MIGRATION_LEASE_DURATION,
+            SCHEMA_MIGRATION_ADMISSION_MARGIN,
+            gate,
+        )
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(ControlLeaseError::Fenced) => Err(SchemaCompatibilityError::Fenced),
+        Err(error) => Err(SchemaCompatibilityError::ControlLease(error)),
+    }
+}
+
 async fn ensure_migration_fence(
     connection: &mut PgConnection,
     guard: &ControlLeaseGuard,
@@ -1129,7 +1163,10 @@ async fn wait_for_job(
     spec: &AsyncIndexSpec,
     job_id: &str,
 ) -> Result<(), SchemaCompatibilityError> {
-    let completed = sqlx::query_scalar::<_, bool>("SELECT sys.wait_for_job($1)")
+    // Aurora DSQL exposes `sys.wait_for_job` as a procedure whose Boolean
+    // output is returned as the `CALL` result row. Treating it as a PostgreSQL
+    // function fails with SQLSTATE 42809 before recovery can validate the index.
+    let completed = sqlx::query_scalar::<_, bool>("CALL sys.wait_for_job($1)")
         .bind(job_id)
         .fetch_one(&mut *connection)
         .await?;

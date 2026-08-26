@@ -23,6 +23,7 @@ pub mod control_lease;
 pub(crate) mod convert;
 pub mod distributed_bucket;
 pub(crate) mod embedded_reservoir;
+pub(crate) mod key_codec;
 pub mod migration;
 pub mod projection_log;
 pub mod reservoir;

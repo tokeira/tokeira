@@ -111,7 +111,7 @@ mod tests {
         assert_eq!(info.schema_max_readable_version, 67);
         assert_eq!(
             info.schema_migration_set_digest,
-            "sha256:f9acbc0b4f472b90446109fa3553bde4ce71fa95b1f6dbd4efaa67a358783400"
+            "sha256:fb8d7c84c771a8cc9a9a8a53dca33a195d4ac7377e76df273171e7ee3d5e5892"
         );
     }
 }

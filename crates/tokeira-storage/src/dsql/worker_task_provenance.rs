@@ -18,7 +18,7 @@ use crate::{
     WorkerTaskProvenanceStore,
 };
 
-use super::{DsqlConnectionAcquirer, DsqlConnectionDirector};
+use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, key_codec};
 
 /// DSQL-backed Worker task-provenance repository.
 #[derive(Debug)]
@@ -78,6 +78,7 @@ impl DsqlWorkerTaskProvenanceStore {
         &self,
         token_digest: [u8; 32],
     ) -> Result<Option<WorkerTaskProvenance>, WorkerTaskProvenanceError> {
+        let token_digest_key = key_codec::encode(&token_digest);
         let mut permit = self
             .director
             .acquire(DbClass::Read)
@@ -89,7 +90,7 @@ impl DsqlWorkerTaskProvenanceStore {
              FROM worker_task_provenance
              WHERE token_digest = $1",
         )
-        .bind(token_digest.as_slice())
+        .bind(token_digest_key)
         .fetch_optional(permit.connection().map_err(unavailable)?)
         .await
         .map_err(unavailable)?;
@@ -105,6 +106,7 @@ impl WorkerTaskProvenanceStore for DsqlWorkerTaskProvenanceStore {
         &self,
         record: WorkerTaskProvenance,
     ) -> Result<ProvenancePut, WorkerTaskProvenanceError> {
+        let token_digest_key = key_codec::encode(&record.token_digest);
         let mut permit = self
             .director
             .acquire(DbClass::Commit)
@@ -117,7 +119,7 @@ impl WorkerTaskProvenanceStore for DsqlWorkerTaskProvenanceStore {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (token_digest) DO NOTHING",
         )
-        .bind(record.token_digest.as_slice())
+        .bind(token_digest_key)
         .bind(record.origin.namespace_id.0)
         .bind(&record.origin.normal_task_queue.0)
         .bind(record.origin.task_class.to_db_smallint())
@@ -149,13 +151,14 @@ impl WorkerTaskProvenanceStore for DsqlWorkerTaskProvenanceStore {
     }
 
     async fn delete(&self, token_digest: [u8; 32]) -> Result<(), WorkerTaskProvenanceError> {
+        let token_digest_key = key_codec::encode(&token_digest);
         let mut permit = self
             .director
             .acquire(DbClass::Commit)
             .await
             .map_err(unavailable)?;
         sqlx::query("DELETE FROM worker_task_provenance WHERE token_digest = $1")
-            .bind(token_digest.as_slice())
+            .bind(token_digest_key)
             .execute(permit.connection().map_err(unavailable)?)
             .await
             .map_err(unavailable)?;
@@ -245,7 +248,7 @@ mod tests {
                 "provenance index must not persist {forbidden}"
             );
         }
-        assert!(table.contains("token_digest BYTEA NOT NULL"));
+        assert!(table.contains("token_digest TEXT NOT NULL"));
         assert!(index.contains("CREATE INDEX ASYNC"));
     }
 }

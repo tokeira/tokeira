@@ -87,10 +87,10 @@ functions in `tokeira-build`, each with its own hardcoded Dagger pipeline.
 
 ## Observability stack (compose platform)
 
-Pinned images: Mimir `3.0.6` · Loki `3.7.1` · Grafana OSS `12.4.3` · Alloy `v1.16.0` ·
-AWS CLI and BusyBox from public ECR. DSQL-mode module order: `local-state` → `dsql` →
-`observability` → `runtime` (in-memory omits `dsql`). Dashboards: broker-runtime-health,
-grpc-edge-health, storage-projection-health, log-exploration. The six mirror images are
-declared per-platform in `src/images/observability/mod.rs` via `mirror_image!`; version
-bumps are one-line changes in `ObservabilityConfig::default()` (or the
-`default_<field>_image()` helpers for AWS CLI and BusyBox).
+Pinned images: Mimir `3.2.0` · Loki `3.7.6` · Grafana `12.4.9` · Alloy `v1.19.0`.
+The operator-editable pins live in `platforms/compose/deployment.tkd`; the `.tkdp` peer
+must move with them, and `platforms/compose/tests/definition.rs` verifies the evaluated
+defaults. DSQL-mode module order: `local_state` → `dsql` → `runtime` → `observability`
+(in-memory omits `dsql`). Dashboards and backend configuration are companion content
+under `platforms/compose/observability/` and are rendered by the platform-owned
+`ObservabilityConfiguration` resource.

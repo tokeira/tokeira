@@ -164,6 +164,81 @@ impl Report for ServiceReport {
     }
 }
 
+/// A deploy plan or apply that stopped while resolving one service image.
+///
+/// This is a report, rather than process-boundary prose, so narrative and
+/// structured output carry the same single copy of the platform evidence.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ServiceFailureReport {
+    operation: &'static str,
+    deployment: String,
+    current_revision: u64,
+    status: &'static str,
+    failure: tokeira_deploy_engine::ServiceImageIssue,
+}
+
+impl ServiceFailureReport {
+    pub(crate) fn new(
+        operation: &'static str,
+        deployment: &str,
+        current_revision: u64,
+        failure: tokeira_deploy_engine::ServiceImageIssue,
+    ) -> Self {
+        Self {
+            operation,
+            deployment: deployment.to_string(),
+            current_revision,
+            status: "failed",
+            failure,
+        }
+    }
+}
+
+impl Report for ServiceFailureReport {
+    fn narrative(&self, _depth: Depth, out: &mut String) {
+        out.push_str(&format!("# {}\n", title_case(self.operation)));
+        let applied = self.operation.ends_with("apply");
+        if applied {
+            out.push_str(&format!(
+                "**Apply to {} stopped** — revision {} did not advance\n",
+                self.deployment, self.current_revision
+            ));
+        } else {
+            let revision = match self.current_revision {
+                0 => "before its first apply".to_string(),
+                revision => format!("at revision {revision}"),
+            };
+            out.push_str(&format!("**Plan for {}** {revision}\n", self.deployment));
+        }
+
+        let (heading, outcome) = match self.failure.kind {
+            tokeira_deploy_engine::ServiceImageIssueKind::Pull => {
+                ("Image Pull Failure", "could not be pulled")
+            }
+            tokeira_deploy_engine::ServiceImageIssueKind::Inspect => {
+                ("Image Inspection Failure", "could not be inspected")
+            }
+            tokeira_deploy_engine::ServiceImageIssueKind::Unavailable => {
+                ("Image Unavailable", "is not available locally")
+            }
+        };
+        out.push_str(&format!(
+            "\n## {heading}\n- the image for the *{}* service {outcome}:\n",
+            self.failure.service
+        ));
+        out.push_str(&format!("  - image: {}\n", code_span(&self.failure.image)));
+        out.push_str(&format!("  - {}\n", code_span(&self.failure.evidence)));
+        if applied {
+            out.push_str("  - **services completed before this failure remain applied**\n");
+        }
+        if let Some(direction) = &self.failure.direction {
+            out.push_str(&format!("  - **{direction}**\n"));
+        }
+        let command = format!("tkr --deployment {} {}", self.deployment, self.operation);
+        out.push_str(&format!("  - **Run {} again**\n", code_span(&command)));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ServiceAction {
@@ -1169,6 +1244,58 @@ mod tests {
         assert_eq!(value["current_revision"], 2);
         assert_eq!(value["changes"][0]["action"], "update");
         assert_eq!(value["changes"][1]["action"], "unchanged");
+    }
+
+    #[test]
+    fn deploy_image_failure_is_one_markdown_and_json_report() {
+        let failure = tokeira_deploy_engine::ServiceImageIssue {
+            service: "grafana".to_string(),
+            image: "grafana/grafana-missing:12.4.9".to_string(),
+            kind: tokeira_deploy_engine::ServiceImageIssueKind::Pull,
+            evidence: "denied: requested access to the resource is denied".to_string(),
+            direction: Some("Verify the image reference and Docker's registry access".to_string()),
+        };
+        let report = ServiceFailureReport::new("deploy plan", "de-5", 2, failure);
+
+        let text = render(&report, Mode::resolve(false, false)).unwrap();
+        assert!(text.starts_with("# Deploy Plan\n**Plan for de-5** at revision 2\n"));
+        assert!(text.contains("## Image Pull Failure"));
+        assert_eq!(text.matches("requested access").count(), 1, "{text}");
+        assert!(
+            text.contains("`tkr --deployment de-5 deploy plan`"),
+            "{text}"
+        );
+
+        let json = render(&report, Mode::resolve(true, true)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["failure"]["kind"], "pull");
+        assert_eq!(value["failure"]["service"], "grafana");
+        assert_eq!(value["failure"]["image"], "grafana/grafana-missing:12.4.9");
+    }
+
+    #[test]
+    fn deploy_apply_failure_states_partial_progress_and_unchanged_revision() {
+        let report = ServiceFailureReport::new(
+            "deploy apply",
+            "de-5",
+            2,
+            tokeira_deploy_engine::ServiceImageIssue {
+                service: "grafana".to_string(),
+                image: "missing:1".to_string(),
+                kind: tokeira_deploy_engine::ServiceImageIssueKind::Pull,
+                evidence: "manifest unknown".to_string(),
+                direction: None,
+            },
+        );
+
+        let text = render(&report, Mode::resolve(false, false)).unwrap();
+        assert!(text.contains("revision 2 did not advance"), "{text}");
+        assert!(
+            text.contains("services completed before this failure remain applied"),
+            "{text}"
+        );
+        assert_eq!(text.matches("manifest unknown").count(), 1, "{text}");
     }
 
     #[test]
@@ -2197,7 +2324,7 @@ mod tests {
             prop_assert_eq!(decoded.platform_issues, report.explanation.platform_issues);
             prop_assert!(decoded.changes.is_empty());
 
-            let status = crate::cli::exit_status(Err(crate::PlatformBlocked.into()))
+            let status = crate::cli::exit_status(Err(crate::ReportEmitted.into()))
                 .expect("the already-rendered issue becomes a process status");
             prop_assert_eq!(status, std::process::ExitCode::FAILURE);
         }

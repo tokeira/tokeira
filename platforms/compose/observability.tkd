@@ -36,6 +36,7 @@ pub fn define(d: Deployment, cfg: Compose, cx: Context, local_state: Module, run
         "mimir",
         Service {
             image: o.mimir.image.clone(),
+            pull_policy: o.mimir.pull_policy.clone(),
             replicas: o.mimir.replicas,
             publish: vec![9009],
             volumes: vec![
@@ -52,6 +53,7 @@ pub fn define(d: Deployment, cfg: Compose, cx: Context, local_state: Module, run
         "loki",
         Service {
             image: o.loki.image.clone(),
+            pull_policy: o.loki.pull_policy.clone(),
             replicas: o.loki.replicas,
             publish: vec![3100],
             volumes: vec![
@@ -67,6 +69,7 @@ pub fn define(d: Deployment, cfg: Compose, cx: Context, local_state: Module, run
         "grafana",
         Service {
             image: o.grafana.image.clone(),
+            pull_policy: o.grafana.pull_policy.clone(),
             replicas: o.grafana.replicas,
             publish: vec![o.grafana.port],
             volumes: vec![
@@ -88,6 +91,7 @@ pub fn define(d: Deployment, cfg: Compose, cx: Context, local_state: Module, run
         "alloy",
         Service {
             image: o.alloy.image.clone(),
+            pull_policy: o.alloy.pull_policy.clone(),
             replicas: o.alloy.replicas,
             publish: vec![4317, 4318],
             volumes: vec![

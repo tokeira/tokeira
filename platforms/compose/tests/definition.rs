@@ -22,6 +22,7 @@ struct Ctx {
 
 #[derive(Deserialize)]
 struct ShippedConfig {
+    tokeirad: ShippedImage,
     observability: ShippedObservability,
 }
 
@@ -36,6 +37,7 @@ struct ShippedObservability {
 #[derive(Deserialize)]
 struct ShippedImage {
     image: String,
+    pull_policy: String,
 }
 
 fn evaluate(root_text: &str) -> Result<FrontendOutput, String> {
@@ -104,10 +106,16 @@ fn the_shipped_set_pins_current_observability_images() {
     let output = evaluate(&shipped_root()).expect("the shipped definition set evaluates");
     let config: ShippedConfig =
         from_located_value(output.config).expect("the shipped config admits");
+    assert_eq!(config.tokeirad.image, "tokeirad:latest");
+    assert_eq!(config.tokeirad.pull_policy, "never");
     assert_eq!(config.observability.mimir.image, "grafana/mimir:3.2.0");
+    assert_eq!(config.observability.mimir.pull_policy, "missing");
     assert_eq!(config.observability.loki.image, "grafana/loki:3.7.6");
+    assert_eq!(config.observability.loki.pull_policy, "missing");
     assert_eq!(config.observability.grafana.image, "grafana/grafana:12.4.9");
+    assert_eq!(config.observability.grafana.pull_policy, "missing");
     assert_eq!(config.observability.alloy.image, "grafana/alloy:v1.19.0");
+    assert_eq!(config.observability.alloy.pull_policy, "missing");
 }
 
 // Selecting DSQL storage in the root's config adds the dsql module and the

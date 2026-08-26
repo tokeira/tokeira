@@ -63,6 +63,45 @@ pub struct Engine<F> {
     frontend: F,
 }
 
+/// Failure from the service-operation boundary before presentation erases
+/// the deploy engine's typed runtime evidence.
+///
+/// Setup failures retain their ordinary contextual chain. Runtime failures
+/// remain typed until `deploy.rs` either renders a specific report or elects
+/// to propagate them as ordinary process errors.
+#[derive(Debug)]
+pub(crate) enum ServiceOperationError {
+    Runtime(tokeira_deploy_engine::RuntimeError),
+    Other(anyhow::Error),
+}
+
+impl ServiceOperationError {
+    pub(crate) fn service_image_issue(
+        &self,
+    ) -> Option<&tokeira_deploy_engine::ServiceImageIssue> {
+        match self {
+            Self::Runtime(error) => error.service_image_issue(),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub(crate) fn into_anyhow(self, context: &'static str) -> anyhow::Error {
+        match self {
+            Self::Runtime(error) => anyhow::Error::new(error).context(context),
+            Self::Other(error) => error.context(context),
+        }
+    }
+}
+
+impl From<tokeira_orchestrator::OrchestratorError> for ServiceOperationError {
+    fn from(error: tokeira_orchestrator::OrchestratorError) -> Self {
+        match error {
+            tokeira_orchestrator::OrchestratorError::Deploy(error) => Self::Runtime(error),
+            error => Self::Other(anyhow::Error::new(error)),
+        }
+    }
+}
+
 impl<F> fmt::Debug for Engine<F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Engine")
@@ -428,36 +467,57 @@ impl<F: DefinitionFrontend> Engine<F> {
     // and become real the moment `services()` fills.
     // ------------------------------------------------------------------
 
-    /// Read-only service plan: which services would change, by desired
-    /// manifest hash against recorded runtime state. No substrate access —
-    /// the comparison is manifests against the recorded state — so no
-    /// probe gates it.
-    pub async fn deploy_plan(
+    /// Service plan: which services would change after each manifest's
+    /// platform-owned prerequisites have been resolved. Compose image policy
+    /// may populate Docker's image cache here so a registry failure is
+    /// reported before apply, but no running workload is mutated.
+    pub(crate) async fn deploy_plan(
         &self,
         admitted: &Admitted,
-    ) -> Result<Vec<tokeira_orchestrator::ServiceChange>> {
-        let execution = self.execution(admitted, None)?;
-        let mut deploy = self.open_deploy(admitted, &execution).await?;
-        deploy.plan().await.context("service plan failed")
+    ) -> std::result::Result<Vec<tokeira_orchestrator::ServiceChange>, ServiceOperationError> {
+        let execution = self
+            .execution(admitted, None)
+            .map_err(ServiceOperationError::Other)?;
+        let platform = self
+            .platform
+            .service_platform(&admitted.deployment_ref)
+            .context("failed to construct the service platform")
+            .map_err(ServiceOperationError::Other)?;
+        let mut deploy = self
+            .open_deploy(admitted, &execution)
+            .await
+            .map_err(ServiceOperationError::Other)?;
+        deploy
+            .plan_with_platform(platform.as_ref())
+            .await
+            .map_err(ServiceOperationError::from)
     }
 
     /// Reconcile the service set to desired. Refuses on a provider issue —
     /// applying manifests is substrate work.
-    pub async fn deploy_apply(
+    pub(crate) async fn deploy_apply(
         &self,
         admitted: &Admitted,
-    ) -> Result<Vec<tokeira_orchestrator::ServiceChange>> {
-        let execution = self.execution(admitted, None)?;
-        self.refuse_on_issue(admitted).await?;
+    ) -> std::result::Result<Vec<tokeira_orchestrator::ServiceChange>, ServiceOperationError> {
+        let execution = self
+            .execution(admitted, None)
+            .map_err(ServiceOperationError::Other)?;
+        self.refuse_on_issue(admitted)
+            .await
+            .map_err(ServiceOperationError::Other)?;
         let platform = self
             .platform
             .service_platform(&admitted.deployment_ref)
-            .context("failed to construct the service platform")?;
-        let mut deploy = self.open_deploy(admitted, &execution).await?;
+            .context("failed to construct the service platform")
+            .map_err(ServiceOperationError::Other)?;
+        let mut deploy = self
+            .open_deploy(admitted, &execution)
+            .await
+            .map_err(ServiceOperationError::Other)?;
         deploy
             .apply(platform.as_ref())
             .await
-            .context("service apply failed")
+            .map_err(ServiceOperationError::from)
     }
 
     async fn open_deploy(

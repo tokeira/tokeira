@@ -44,6 +44,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     pin::Pin,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::Stream;
@@ -56,7 +57,7 @@ use bollard::{
         RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
     },
     image::CreateImageOptions,
-    models::{ContainerInspectResponse, HostConfig, PortBinding},
+    models::{ContainerInspectResponse, HostConfig, ImageInspect, PortBinding},
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -105,8 +106,27 @@ pub enum ComposeError {
     },
     #[error("docker operation failed: {0}")]
     DockerIo(#[source] bollard::errors::Error),
-    #[error("local image '{image}' is missing; {remediation}")]
-    LocalBuildMissing { image: String, remediation: String },
+    #[error("image pull failed for service '{service}' using '{image}': {detail}")]
+    ImagePullFailed {
+        service: String,
+        image: String,
+        detail: String,
+        #[source]
+        source: Box<bollard::errors::Error>,
+    },
+    #[error("image inspection failed for service '{service}' using '{image}': {source}")]
+    ImageInspectFailed {
+        service: String,
+        image: String,
+        #[source]
+        source: Box<bollard::errors::Error>,
+    },
+    #[error(
+        "image '{image}' for service '{service}' is not present locally and pull_policy is 'never'"
+    )]
+    ImageUnavailable { service: String, image: String },
+    #[error("system clock is before the Unix epoch: {0}")]
+    Clock(#[source] std::time::SystemTimeError),
 }
 
 /// The compose platform's typed issue for an unreachable Docker daemon —
@@ -151,7 +171,48 @@ impl From<ComposeError> for iac::IacError {
 
 impl From<ComposeError> for deploy_engine::DeployError {
     fn from(value: ComposeError) -> Self {
-        deploy_engine::DeployError::Other(anyhow::anyhow!(value))
+        match value {
+            ComposeError::ImagePullFailed {
+                service,
+                image,
+                detail,
+                ..
+            } => deploy_engine::ServiceImageIssue {
+                service,
+                image,
+                kind: deploy_engine::ServiceImageIssueKind::Pull,
+                evidence: detail,
+                direction: Some(
+                    "Verify the image reference and Docker's registry access".to_string(),
+                ),
+            }
+            .into(),
+            ComposeError::ImageInspectFailed {
+                service,
+                image,
+                source,
+            } => deploy_engine::ServiceImageIssue {
+                service,
+                image,
+                kind: deploy_engine::ServiceImageIssueKind::Inspect,
+                evidence: source.to_string(),
+                direction: None,
+            }
+            .into(),
+            ComposeError::ImageUnavailable { service, image } => deploy_engine::ServiceImageIssue {
+                service,
+                image,
+                kind: deploy_engine::ServiceImageIssueKind::Unavailable,
+                evidence: "the image is not present in Docker and pull_policy is 'never'"
+                    .to_string(),
+                direction: Some(
+                    "Build or load the image locally, or change pull_policy in the definition"
+                        .to_string(),
+                ),
+            }
+            .into(),
+            error => deploy_engine::DeployError::Other(anyhow::anyhow!(error)),
+        }
     }
 }
 
@@ -171,6 +232,150 @@ pub struct Environment {
     pub name: String,
     /// Environment variable value.
     pub value: String,
+}
+
+/// [Docker Compose-compatible policy][compose-pull-policy] controlling when a
+/// service image is resolved from its registry.
+///
+/// Serialization uses the Compose scalar spellings. `if_not_present` is
+/// accepted while decoding and normalized to [`Missing`](Self::Missing).
+///
+/// [compose-pull-policy]: https://docs.docker.com/reference/compose-file/services/#pull_policy
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PullPolicy {
+    /// Always ask the registry to resolve the image.
+    Always,
+    /// Never contact a registry; the image must already exist locally.
+    Never,
+    /// Pull only when absent, except that a `latest` tag is always resolved.
+    #[default]
+    Missing,
+    /// Refresh when Tokeira's last successful pull is more than 24 hours old.
+    Daily,
+    /// Refresh when Tokeira's last successful pull is more than seven days old.
+    Weekly,
+    /// Refresh after a Compose duration such as `12h` or `1d6h`.
+    Every(String),
+}
+
+impl PullPolicy {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            "missing" | "if_not_present" => Ok(Self::Missing),
+            "daily" => Ok(Self::Daily),
+            "weekly" => Ok(Self::Weekly),
+            "build" => Err(
+                "pull_policy 'build' requires a Compose build configuration, which Tokeira Service does not support"
+                    .to_string(),
+            ),
+            value if value.starts_with("every_") => {
+                let duration = value
+                    .strip_prefix("every_")
+                    .expect("the match arm establishes the prefix");
+                parse_compose_duration(duration)?;
+                Ok(Self::Every(duration.to_string()))
+            }
+            value => Err(format!(
+                "unsupported pull_policy '{value}'; expected always, never, missing, if_not_present, daily, weekly, or every_<duration>"
+            )),
+        }
+    }
+
+    fn compose_value(&self) -> String {
+        match self {
+            Self::Always => "always".to_string(),
+            Self::Never => "never".to_string(),
+            Self::Missing => "missing".to_string(),
+            Self::Daily => "daily".to_string(),
+            Self::Weekly => "weekly".to_string(),
+            Self::Every(duration) => format!("every_{duration}"),
+        }
+    }
+
+    fn refresh_interval(&self) -> Result<Option<Duration>, String> {
+        match self {
+            Self::Daily => Ok(Some(Duration::from_secs(24 * 60 * 60))),
+            Self::Weekly => Ok(Some(Duration::from_secs(7 * 24 * 60 * 60))),
+            Self::Every(duration) => parse_compose_duration(duration).map(Some),
+            Self::Always | Self::Never | Self::Missing => Ok(None),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.refresh_interval().map(|_| ())
+    }
+}
+
+impl Serialize for PullPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.compose_value())
+    }
+}
+
+impl<'de> Deserialize<'de> for PullPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn parse_compose_duration(value: &str) -> Result<Duration, String> {
+    if value.is_empty() {
+        return Err("pull_policy every_<duration> requires a duration".to_string());
+    }
+    let mut total = 0u64;
+    let mut number = 0u64;
+    let mut has_digits = false;
+    for character in value.chars() {
+        if let Some(digit) = character.to_digit(10) {
+            number = number
+                .checked_mul(10)
+                .and_then(|number| number.checked_add(u64::from(digit)))
+                .ok_or_else(|| format!("pull_policy duration '{value}' is too large"))?;
+            has_digits = true;
+            continue;
+        }
+        if !has_digits {
+            return Err(format!(
+                "invalid pull_policy duration '{value}'; expected number-unit groups using w, d, h, m, or s"
+            ));
+        }
+        let unit = match character {
+            'w' => 7 * 24 * 60 * 60,
+            'd' => 24 * 60 * 60,
+            'h' => 60 * 60,
+            'm' => 60,
+            's' => 1,
+            _ => {
+                return Err(format!(
+                    "invalid pull_policy duration '{value}'; expected number-unit groups using w, d, h, m, or s"
+                ));
+            }
+        };
+        total = total
+            .checked_add(
+                number
+                    .checked_mul(unit)
+                    .ok_or_else(|| format!("pull_policy duration '{value}' is too large"))?,
+            )
+            .ok_or_else(|| format!("pull_policy duration '{value}' is too large"))?;
+        number = 0;
+        has_digits = false;
+    }
+    if has_digits {
+        return Err(format!(
+            "invalid pull_policy duration '{value}'; the final number has no unit"
+        ));
+    }
+    Ok(Duration::from_secs(total))
 }
 
 /// Platform-owned logical volume vocabulary. Host paths never appear here:
@@ -219,6 +424,9 @@ pub struct ComposeService {
     pub name: String,
     /// Container image reference to run.
     pub image: String,
+    /// Docker Compose-compatible registry resolution policy.
+    #[serde(default)]
+    pub pull_policy: PullPolicy,
     /// Desired container count. Applied by reconcile: replicas beyond the
     /// first run as `<name>-<index>` containers.
     #[serde(default = "default_replicas")]
@@ -295,6 +503,7 @@ impl deploy_engine::Service for ComposeService {
         if self.image.is_empty() {
             return Err("Compose service image cannot be empty".to_string());
         }
+        self.pull_policy.validate()?;
         if self.replicas == 0 {
             return Err("Compose service replicas must be greater than zero".to_string());
         }
@@ -467,6 +676,60 @@ impl ComposePlatform {
             })
     }
 
+    async fn prepare_service_image(&self, service: &ComposeService) -> Result<(), ComposeError> {
+        self.ensure_reachable().await?;
+        let inspect = match self.docker.inspect_image(&service.image).await {
+            Ok(inspect) => Some(inspect),
+            Err(error) if docker_not_found(&error) => None,
+            Err(source) => {
+                return Err(ComposeError::ImageInspectFailed {
+                    service: service.name.clone(),
+                    image: service.image.clone(),
+                    source: Box::new(source),
+                });
+            }
+        };
+
+        if matches!(service.pull_policy, PullPolicy::Never) && inspect.is_none() {
+            return Err(ComposeError::ImageUnavailable {
+                service: service.name.clone(),
+                image: service.image.clone(),
+            });
+        }
+
+        let now = current_unix_seconds()?;
+        let should_pull = should_pull_image(
+            &service.pull_policy,
+            inspect.is_some(),
+            is_latest_image(&service.image),
+            inspect.as_ref().and_then(image_last_tag_time),
+            now,
+        )
+        .map_err(|error| ComposeError::ContainerFailed {
+            container: service.name.clone(),
+            source: anyhow::anyhow!(error),
+        })?;
+
+        if should_pull {
+            self.pull_image(&service.name, &service.image).await?;
+        }
+        Ok(())
+    }
+
+    async fn pull_image(&self, service: &str, image: &str) -> Result<(), ComposeError> {
+        let (from_image, tag) = split_image_reference(image);
+        let stream = self.docker.create_image(
+            Some(CreateImageOptions {
+                from_image,
+                tag,
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        consume_pull_stream(stream, service, image).await
+    }
+
     pub fn docker_client(&self) -> Docker {
         self.docker.clone()
     }
@@ -549,11 +812,8 @@ impl ComposePlatform {
     /// replacing its local containers. The authored `replicas` count is
     /// honoured here: the first container runs as `{project}_{name}`,
     /// further replicas as `{project}_{name}-{index}`.
-    pub async fn reconcile_service(&self, service: &ComposeService) -> Result<(), ComposeError> {
+    async fn reconcile_service(&self, service: &ComposeService) -> Result<(), ComposeError> {
         self.ensure_reachable().await?;
-        let mut state = self.load_compose_state()?;
-        state.services.insert(service.name.clone(), service.clone());
-        self.save_compose_state(&state)?;
 
         // Ensure the project network exists so containers can resolve each other by name
         self.ensure_network().await?;
@@ -561,26 +821,6 @@ impl ComposePlatform {
         // Lowering happens here, at the Docker boundary: host paths and host
         // environment enter the container config and nothing else.
         let config = self.lower(service);
-
-        // Pull the image if not present locally
-        let image_ref = &service.image;
-        let (image_name, image_tag) = image_ref
-            .rsplit_once(':')
-            .unwrap_or((image_ref.as_str(), "latest"));
-        let mut pull_stream = self.docker.create_image(
-            Some(CreateImageOptions {
-                from_image: image_name.to_string(),
-                tag: image_tag.to_string(),
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-        while let Some(result) = pull_stream.next().await {
-            if result.is_err() {
-                break;
-            }
-        }
 
         for index in 0..service.replicas {
             let container_name = if index == 0 {
@@ -913,6 +1153,19 @@ impl ComposePlatform {
 
 #[async_trait]
 impl deploy_engine::Platform for ComposePlatform {
+    async fn prepare_service(
+        &self,
+        _service_name: &str,
+        manifests: &[serde_json::Value],
+    ) -> Result<(), deploy_engine::DeployError> {
+        for manifest in manifests {
+            let service: ComposeService = serde_json::from_value(manifest.clone())
+                .map_err(|error| deploy_engine::DeployError::Other(anyhow::anyhow!(error)))?;
+            self.prepare_service_image(&service).await?;
+        }
+        Ok(())
+    }
+
     async fn apply_manifests(
         &self,
         manifests: &[serde_json::Value],
@@ -923,11 +1176,14 @@ impl deploy_engine::Platform for ComposePlatform {
         for manifest in manifests {
             let service: ComposeService = serde_json::from_value(manifest.clone())
                 .map_err(|error| deploy_engine::DeployError::Other(anyhow::anyhow!(error)))?;
-            state.services.insert(service.name.clone(), service.clone());
             self.reconcile_service(&service).await?;
+            // Record the desired service only after every container mutation
+            // for it succeeds. A failed service therefore remains retryable
+            // and never masquerades as applied in the generated Compose file.
+            state.services.insert(service.name.clone(), service);
+            self.save_compose_state(&state)?;
             count += 1;
         }
-        self.save_compose_state(&state)?;
         Ok(count)
     }
 
@@ -993,6 +1249,103 @@ struct ComposeFile {
 
 fn compose_version() -> String {
     "3.9".into()
+}
+
+fn docker_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+fn current_unix_seconds() -> Result<u64, ComposeError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(ComposeError::Clock)
+}
+
+fn image_last_tag_time(inspect: &ImageInspect) -> Option<u64> {
+    inspect
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.last_tag_time.as_ref())
+        .and_then(|last_tag_time| u64::try_from(last_tag_time.unix_timestamp()).ok())
+}
+
+fn is_latest_image(reference: &str) -> bool {
+    if reference.contains('@') {
+        return false;
+    }
+    let final_component = reference.rsplit('/').next().unwrap_or(reference);
+    final_component
+        .rsplit_once(':')
+        .is_none_or(|(_, tag)| tag == "latest")
+}
+
+fn should_pull_image(
+    policy: &PullPolicy,
+    present: bool,
+    latest: bool,
+    last_pull: Option<u64>,
+    now: u64,
+) -> Result<bool, String> {
+    match policy {
+        PullPolicy::Always => Ok(true),
+        PullPolicy::Never => Ok(false),
+        PullPolicy::Missing => Ok(!present || latest),
+        policy @ (PullPolicy::Daily | PullPolicy::Weekly | PullPolicy::Every(_)) => {
+            let interval = policy
+                .refresh_interval()?
+                .expect("timed pull policies have a refresh interval");
+            Ok(!present
+                || last_pull
+                    .is_none_or(|last_pull| now.saturating_sub(last_pull) > interval.as_secs()))
+        }
+    }
+}
+
+fn split_image_reference(reference: &str) -> (String, String) {
+    if reference.contains('@') {
+        return (reference.to_string(), String::new());
+    }
+    let final_component = reference.rsplit('/').next().unwrap_or(reference);
+    match final_component.rsplit_once(':') {
+        Some((name, tag)) => {
+            let name_length = reference.len().saturating_sub(final_component.len()) + name.len();
+            (reference[..name_length].to_string(), tag.to_string())
+        }
+        None => (reference.to_string(), "latest".to_string()),
+    }
+}
+
+async fn consume_pull_stream<S, T>(
+    stream: S,
+    service: &str,
+    image: &str,
+) -> Result<(), ComposeError>
+where
+    S: Stream<Item = Result<T, bollard::errors::Error>>,
+{
+    futures_util::pin_mut!(stream);
+    while let Some(result) = stream.next().await {
+        if let Err(source) = result {
+            let detail = match &source {
+                bollard::errors::Error::DockerStreamError { error } => error.clone(),
+                error => error.to_string(),
+            };
+            return Err(ComposeError::ImagePullFailed {
+                service: service.to_string(),
+                image: image.to_string(),
+                detail,
+                source: Box::new(source),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The concrete Docker shapes for one logical service: bind strings, the
@@ -1250,6 +1603,10 @@ fn lift_from_inspect(
     ComposeService {
         name: name.to_string(),
         image,
+        // Pull policy is desired-state metadata and has no container inspect
+        // representation. Live reconstruction therefore uses its schema
+        // default; drift checks resolve image identity separately.
+        pull_policy: PullPolicy::default(),
         // The caller owns the live replica count; one container answers for
         // one replica here.
         replicas: 1,
@@ -1323,6 +1680,128 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn pull_policy_uses_compose_spellings_and_normalizes_the_legacy_alias() {
+        for (source, expected, canonical) in [
+            ("\"always\"", PullPolicy::Always, "\"always\""),
+            ("\"never\"", PullPolicy::Never, "\"never\""),
+            ("\"missing\"", PullPolicy::Missing, "\"missing\""),
+            ("\"if_not_present\"", PullPolicy::Missing, "\"missing\""),
+            ("\"daily\"", PullPolicy::Daily, "\"daily\""),
+            ("\"weekly\"", PullPolicy::Weekly, "\"weekly\""),
+        ] {
+            let policy: PullPolicy = serde_json::from_str(source).expect("policy decodes");
+            assert_eq!(policy, expected);
+            assert_eq!(serde_json::to_string(&policy).unwrap(), canonical);
+        }
+
+        let policy: PullPolicy =
+            serde_json::from_str("\"every_1d6h30m\"").expect("combined Compose duration decodes");
+        assert_eq!(policy, PullPolicy::Every("1d6h30m".to_string()));
+        assert_eq!(serde_json::to_string(&policy).unwrap(), "\"every_1d6h30m\"");
+    }
+
+    #[test]
+    fn pull_policy_rejects_build_and_invalid_refresh_durations_honestly() {
+        let build = serde_json::from_str::<PullPolicy>("\"build\"")
+            .expect_err("build has no Tokeira Service build configuration");
+        assert!(
+            build.to_string().contains("does not support"),
+            "unexpected: {build}"
+        );
+
+        for invalid in ["every_", "every_12", "every_h", "every_1x"] {
+            let error = serde_json::from_value::<PullPolicy>(serde_json::json!(invalid))
+                .expect_err("invalid duration refuses");
+            assert!(
+                error.to_string().contains("duration"),
+                "unexpected: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn pull_decision_follows_compose_cache_and_refresh_rules() {
+        assert!(should_pull_image(&PullPolicy::Always, true, false, None, 0).unwrap());
+        assert!(!should_pull_image(&PullPolicy::Never, false, false, None, 0).unwrap());
+        assert!(should_pull_image(&PullPolicy::Missing, false, false, None, 0).unwrap());
+        assert!(!should_pull_image(&PullPolicy::Missing, true, false, None, 0).unwrap());
+        assert!(should_pull_image(&PullPolicy::Missing, true, true, None, 0).unwrap());
+
+        let day = 24 * 60 * 60;
+        assert!(!should_pull_image(&PullPolicy::Daily, true, false, Some(10), 10 + day).unwrap());
+        assert!(should_pull_image(&PullPolicy::Daily, true, false, Some(10), 11 + day).unwrap());
+        assert!(should_pull_image(&PullPolicy::Weekly, true, false, None, 0).unwrap());
+        assert!(
+            should_pull_image(
+                &PullPolicy::Every("12h".to_string()),
+                false,
+                false,
+                Some(0),
+                1,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn image_reference_helpers_preserve_registry_ports_and_digests() {
+        assert!(is_latest_image("alpine"));
+        assert!(is_latest_image("registry.example:5000/team/app:latest"));
+        assert!(!is_latest_image("registry.example:5000/team/app:1.2"));
+        assert!(!is_latest_image("team/app@sha256:abc"));
+        assert_eq!(
+            split_image_reference("registry.example:5000/team/app:1.2"),
+            (
+                "registry.example:5000/team/app".to_string(),
+                "1.2".to_string()
+            )
+        );
+        assert_eq!(
+            split_image_reference("team/app@sha256:abc"),
+            ("team/app@sha256:abc".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn timed_pull_policies_use_the_daemons_last_tag_time() {
+        let inspect: ImageInspect = serde_json::from_value(serde_json::json!({
+            "Metadata": { "LastTagTime": "1970-01-02T00:00:00Z" }
+        }))
+        .expect("Docker's image metadata decodes");
+        assert_eq!(image_last_tag_time(&inspect), Some(24 * 60 * 60));
+    }
+
+    #[tokio::test]
+    async fn pull_stream_surfaces_the_original_registry_error() {
+        let stream = futures_util::stream::iter([
+            Ok::<(), bollard::errors::Error>(()),
+            Err(bollard::errors::Error::DockerStreamError {
+                error: "manifest for example/missing:9 not found".to_string(),
+            }),
+        ]);
+        let error = consume_pull_stream(stream, "grafana", "example/missing:9")
+            .await
+            .expect_err("the stream error must fail image resolution");
+        let rendered = error.to_string();
+        assert!(rendered.contains("grafana"), "unexpected: {rendered}");
+        assert!(
+            rendered.contains("example/missing:9"),
+            "unexpected: {rendered}"
+        );
+        assert!(rendered.contains("manifest for"), "unexpected: {rendered}");
+
+        let runtime: deploy_engine::RuntimeError = error.into();
+        let issue = runtime
+            .service_image_issue()
+            .expect("Compose transports image failure as reportable data");
+        assert_eq!(issue.service, "grafana");
+        assert_eq!(issue.image, "example/missing:9");
+        assert_eq!(issue.kind, deploy_engine::ServiceImageIssueKind::Pull);
+        assert_eq!(issue.evidence, "manifest for example/missing:9 not found");
+        assert_eq!(runtime.to_string().matches("manifest for").count(), 1);
+    }
 
     // The two compose phantom-drift classes, pinned:
     //
@@ -1544,6 +2023,7 @@ mod tests {
         let service = ComposeService {
             name: "grafana".into(),
             image: "grafana/grafana:12.4.9".into(),
+            pull_policy: PullPolicy::Always,
             replicas: 1,
             publish: vec![3000],
             volumes: vec![Volume::State(StateVolume {
@@ -1566,6 +2046,7 @@ mod tests {
         };
         let yaml = compose_yaml_fragment(&service).unwrap();
         assert!(yaml.contains("grafana/grafana:12.4.9"));
+        assert!(yaml.contains("pull_policy: always"));
         assert!(yaml.contains("3000"));
         assert!(yaml.contains("GF_SECURITY_ADMIN_PASSWORD"));
         assert!(yaml.contains("/var/lib/grafana"));

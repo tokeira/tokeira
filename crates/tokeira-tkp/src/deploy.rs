@@ -23,15 +23,16 @@ use tokeira_platform::definition::DefinitionFrontend;
 
 use crate::{
     apply::restamp_applied_revision,
-    engine::Engine,
+    engine::{Engine, ServiceOperationError},
     envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform::Admitted,
-    render::ServiceReport,
+    render::{ServiceFailureReport, ServiceReport},
 };
 
-/// Read-only workload plan: the per-service Delta, by manifest hash against
-/// recorded runtime state.
+/// Workload plan: the per-service Delta after resolving manifest-directed
+/// platform prerequisites. Image cache population may occur, but running
+/// workloads and deployment state remain untouched.
 pub(crate) async fn deploy_plan<F: DefinitionFrontend>(
     engine: &Engine<F>,
     admitted: &Admitted,
@@ -43,7 +44,18 @@ pub(crate) async fn deploy_plan<F: DefinitionFrontend>(
         .load()
         .await
         .context("failed to load the deployment envelope")?;
-    let changes = engine.deploy_plan(admitted).await?;
+    let changes = match engine.deploy_plan(admitted).await {
+        Ok(changes) => changes,
+        Err(error) => {
+            return emit_service_failure(
+                "deploy plan",
+                &admitted.deployment_ref.name,
+                envelope.config_revision,
+                mode,
+                error,
+            );
+        }
+    };
     let report = ServiceReport::plan(
         &admitted.deployment_ref.name,
         envelope.config_revision,
@@ -91,7 +103,18 @@ pub(crate) async fn deploy_apply<F: DefinitionFrontend>(
     // ── Destructive gate (§4), plane-correct: a torn-down service is the
     // destructive class here. ──
     if !yes {
-        let planned = engine.deploy_plan(admitted).await?;
+        let planned = match engine.deploy_plan(admitted).await {
+            Ok(changes) => changes,
+            Err(error) => {
+                return emit_service_failure(
+                    "deploy apply",
+                    &admitted.deployment_ref.name,
+                    envelope.config_revision,
+                    mode,
+                    error,
+                );
+            }
+        };
         let destructive: Vec<&ServiceChange> = planned
             .iter()
             .filter(|change| matches!(change.kind, ServiceChangeKind::Delete))
@@ -109,7 +132,18 @@ pub(crate) async fn deploy_apply<F: DefinitionFrontend>(
     }
 
     // ── Service apply, through the deploy engine ──
-    let changes = engine.deploy_apply(admitted).await?;
+    let changes = match engine.deploy_apply(admitted).await {
+        Ok(changes) => changes,
+        Err(error) => {
+            return emit_service_failure(
+                "deploy apply",
+                &admitted.deployment_ref.name,
+                envelope.config_revision,
+                mode,
+                error,
+            );
+        }
+    };
 
     // ── Re-stamp: a workload apply advances the config revision like any apply ──
     let from_revision = envelope.config_revision;
@@ -140,6 +174,29 @@ fn refuse_explanation(explanation_path: Option<&Path>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Render the typed platform evidence once and replace the ordinary error
+/// chain with the post-report marker. Non-image failures retain their
+/// existing propagation until their owning layers define equivalent models.
+fn emit_service_failure(
+    operation: &'static str,
+    deployment: &str,
+    current_revision: u64,
+    mode: tokeira_report::Mode,
+    error: ServiceOperationError,
+) -> Result<()> {
+    let Some(failure) = error.service_image_issue().cloned() else {
+        let context = match operation {
+            "deploy plan" => "service plan failed",
+            "deploy apply" => "service apply failed",
+            _ => "service operation failed",
+        };
+        return Err(error.into_anyhow(context));
+    };
+    let report = ServiceFailureReport::new(operation, deployment, current_revision, failure);
+    crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
+    Err(crate::ReportEmitted.into())
 }
 
 #[cfg(test)]
@@ -208,5 +265,25 @@ mod tests {
         .await
         .expect_err("no explanation model on the service plane yet");
         assert!(err.to_string().contains("no explanation model"), "{err}");
+    }
+
+    #[test]
+    fn image_failure_remains_typed_at_the_service_operation_boundary() {
+        let issue = tokeira_deploy_engine::ServiceImageIssue {
+            service: "grafana".to_string(),
+            image: "missing:1".to_string(),
+            kind: tokeira_deploy_engine::ServiceImageIssueKind::Pull,
+            evidence: "manifest unknown".to_string(),
+            direction: None,
+        };
+        let error = ServiceOperationError::from(tokeira_orchestrator::OrchestratorError::Deploy(
+            tokeira_deploy_engine::RuntimeError::from(issue),
+        ));
+
+        let failure = error
+            .service_image_issue()
+            .expect("typed evidence crosses the orchestrator unchanged");
+        assert_eq!(failure.service, "grafana");
+        assert_eq!(failure.evidence, "manifest unknown");
     }
 }

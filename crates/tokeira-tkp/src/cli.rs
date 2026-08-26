@@ -460,12 +460,12 @@ fn require(admitted: Option<&Admitted>) -> &Admitted {
     admitted.expect("admission precedes every deployment verb")
 }
 
-/// Collapse the typed post-report platform refusal to a bare process status.
-/// Every other failure remains an error so the entrypoint can render it once.
+/// Collapse a typed post-report failure to a bare process status. Every other
+/// failure remains an error so the entrypoint can render it once.
 pub(crate) fn exit_status(outcome: Result<()>) -> Result<std::process::ExitCode> {
     match outcome {
         Ok(()) => Ok(std::process::ExitCode::SUCCESS),
-        Err(err) => match err.downcast::<crate::PlatformBlocked>() {
+        Err(err) => match err.downcast::<crate::ReportEmitted>() {
             Ok(_) => Ok(std::process::ExitCode::FAILURE),
             Err(err) => Err(err),
         },

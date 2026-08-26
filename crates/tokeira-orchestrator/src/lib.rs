@@ -764,7 +764,7 @@ pub struct DeployEngine<D: Deployment> {
     service_ctx: deploy_engine::ServiceContext,
     image_ctx: deploy_engine::ImageContext,
     config: D::Config,
-    state_store: Box<dyn DeploymentStore<iac::RuntimeState>>,
+    state_store: Arc<dyn DeploymentStore<iac::RuntimeState>>,
 }
 
 // Manual impl: the store is a trait object and `D`/`D::Config` carry no
@@ -799,7 +799,7 @@ impl<D: Deployment> DeployEngine<D> {
             .load()
             .await?;
         service_ctx.infra_state = infra_state;
-        let state_store = deployment.create_deploy_store(config, deployment_dir);
+        let state_store = Arc::from(deployment.create_deploy_store(config, deployment_dir));
         Ok(Self {
             deployment,
             engine: deploy_engine::ServiceEngine::new(),
@@ -821,6 +821,21 @@ impl<D: Deployment> DeployEngine<D> {
             .await?)
     }
 
+    /// Plan service changes after resolving each service's platform-owned
+    /// prerequisites, such as a manifest-directed image pull.
+    pub async fn plan_with_platform(
+        &mut self,
+        platform: &dyn deploy_engine::Platform,
+    ) -> Result<Vec<deploy_engine::ServiceChange>> {
+        let (state, _) = self.state_store.load().await?;
+        self.service_ctx.state = state.clone();
+        let services = self.deployment.services(&self.config);
+        Ok(self
+            .engine
+            .plan_services_with_platform(&services, platform, &mut self.service_ctx, &state)
+            .await?)
+    }
+
     /// Resolve images, apply changed service manifests, and persist runtime state.
     pub async fn apply(
         &mut self,
@@ -832,13 +847,28 @@ impl<D: Deployment> DeployEngine<D> {
         self.engine
             .record_images(&images, &self.image_ctx, &mut state)
             .await?;
+        let saver = self.make_saver(version);
         let services = self.deployment.services(&self.config);
         let changes = self
             .engine
-            .apply_services(&services, platform, &mut self.service_ctx, &mut state)
+            .apply_services_with_saver(
+                &services,
+                platform,
+                &mut self.service_ctx,
+                &mut state,
+                Some(&saver),
+            )
             .await?;
+        // A changed service already saved the complete state after its own
+        // mutation. With no service changes, retain the prior behaviour of
+        // persisting newly resolved image records once at the end.
+        if changes
+            .iter()
+            .all(|change| change.kind == deploy_engine::ServiceChangeKind::NoChange)
+        {
+            saver(&state).await?;
+        }
         self.service_ctx.state = state.clone();
-        let _ = self.state_store.save(&state, &version).await?;
         Ok(changes)
     }
 
@@ -849,6 +879,33 @@ impl<D: Deployment> DeployEngine<D> {
         state.services.clear();
         let _ = self.state_store.save(&state, &version).await?;
         Ok(())
+    }
+
+    fn make_saver(&self, initial_version: String) -> deploy_engine::ServiceStateSaver {
+        let store = Arc::clone(&self.state_store);
+        let version = Arc::new(Mutex::new(initial_version));
+        Box::new(move |state: &iac::RuntimeState| {
+            let store = Arc::clone(&store);
+            let version = Arc::clone(&version);
+            let state = state.clone();
+            Box::pin(async move {
+                let current = version
+                    .lock()
+                    .map_err(|_| {
+                        deploy_engine::RuntimeError::Other(anyhow::anyhow!(
+                            "deploy state version mutex poisoned"
+                        ))
+                    })?
+                    .clone();
+                let next = store.save(&state, &current).await?;
+                *version.lock().map_err(|_| {
+                    deploy_engine::RuntimeError::Other(anyhow::anyhow!(
+                        "deploy state version mutex poisoned"
+                    ))
+                })? = next;
+                Ok(())
+            })
+        })
     }
 }
 

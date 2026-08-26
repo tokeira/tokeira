@@ -55,7 +55,7 @@ pub(crate) async fn plan<F: DefinitionFrontend>(
     if report.explanation.platform_issues.is_empty() {
         Ok(())
     } else {
-        Err(crate::PlatformBlocked.into())
+        Err(crate::ReportEmitted.into())
     }
 }
 
@@ -113,7 +113,7 @@ mod tests {
         .await
         .expect_err("a platform issue exits the verb non-zero");
         assert!(
-            err.downcast_ref::<crate::PlatformBlocked>().is_some(),
+            err.downcast_ref::<crate::ReportEmitted>().is_some(),
             "the typed refusal, not a prose error: {err:#}"
         );
 

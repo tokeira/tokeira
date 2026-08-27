@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{fs, path::PathBuf, process::Command};
 
 use dagger_sdk::{Client, HostDirectoryOpts};
 
@@ -41,8 +41,16 @@ const TOKEIRAD_WORKSPACE_EXCLUDES: &[&str] = &[
     "spikes",
     "tokeira.code-workspace",
     "tokeirad.log",
+    ".env*",
+    "**/.env*",
     "**/*.log",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageBuildProvenance {
+    git_sha: String,
+    source_tree_hash: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct TokeiradBuildRequest {
@@ -72,6 +80,7 @@ pub async fn build_tokeirad_image(
     client: &Client,
 ) -> Result<TokeiradBuildResult, BuildError> {
     let toolchain = rust_toolchain_version(&request.workspace_root)?;
+    let provenance = image_build_provenance(&request.workspace_root)?;
     let query = client.query();
 
     // Upload only the sources needed to build `tokeirad`.
@@ -97,6 +106,15 @@ pub async fn build_tokeirad_image(
         ])
         .with_env_variable("CARGO_TERM_COLOR", "never")
         .with_env_variable("RUSTUP_TOOLCHAIN", &toolchain)
+        // The build script treats release+CI as the fail-closed provenance path. Resolve
+        // these values before `.git` is excluded from the Dagger source upload so the
+        // shipped binary identifies the exact host worktree that supplied its bytes.
+        .with_env_variable("CI", "true")
+        .with_env_variable("TOKEIRA_GIT_SHA", &provenance.git_sha)
+        .with_env_variable(
+            "TOKEIRA_SOURCE_TREE_HASH",
+            &provenance.source_tree_hash,
+        )
         .with_exec(vec!["rustup", "target", "add", rust_target])
         .with_mounted_cache(registry_cache, "/usr/local/cargo/registry")
         .with_mounted_cache(target_cache, "/app/target")
@@ -105,6 +123,7 @@ pub async fn build_tokeirad_image(
         .with_exec(vec![
             "cargo",
             "build",
+            "--locked",
             "--release",
             "--target",
             rust_target,
@@ -144,6 +163,133 @@ pub async fn build_tokeirad_image(
     })
 }
 
+fn image_build_provenance(
+    workspace_root: &std::path::Path,
+) -> Result<ImageBuildProvenance, BuildError> {
+    let revision = git_text(workspace_root, &["rev-parse", "--short=8", "HEAD"])?;
+    if revision.len() != 8
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(BuildError::Validation {
+            reason: format!("git rev-parse returned non-canonical short revision `{revision}`"),
+        });
+    }
+    let dirty = !git_bytes(
+        workspace_root,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?
+    .is_empty();
+    let git_sha = if dirty {
+        format!("{revision}-dirty")
+    } else {
+        revision
+    };
+
+    Ok(ImageBuildProvenance {
+        git_sha,
+        source_tree_hash: image_source_tree_hash(workspace_root)?,
+    })
+}
+
+fn image_source_tree_hash(workspace_root: &std::path::Path) -> Result<String, BuildError> {
+    let head_tree = git_bytes(workspace_root, &["rev-parse", "HEAD^{tree}"])?;
+    let tracked_diff = git_bytes(
+        workspace_root,
+        &[
+            "diff",
+            "--binary",
+            "HEAD",
+            "--",
+            ".",
+            ":(exclude,glob).env*",
+            ":(exclude,glob)**/.env*",
+        ],
+    )?;
+    let untracked = git_bytes(
+        workspace_root,
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+        ],
+    )?;
+
+    let mut identity = b"tokeira-image-source/v1\n".to_vec();
+    frame_provenance_field(&mut identity, b"head-tree", &head_tree);
+    frame_provenance_field(&mut identity, b"tracked-diff", &tracked_diff);
+    for raw_path in untracked
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let relative = std::str::from_utf8(raw_path).map_err(|error| BuildError::Validation {
+            reason: format!("untracked source path is not UTF-8: {error}"),
+        })?;
+        if relative
+            .split('/')
+            .any(|component| component.starts_with(".env"))
+        {
+            continue;
+        }
+        let absolute = workspace_root.join(relative);
+        let bytes = if absolute.is_symlink() {
+            fs::read_link(&absolute).map(|target| target.as_os_str().as_encoded_bytes().to_vec())
+        } else {
+            fs::read(&absolute)
+        }
+        .map_err(|source| BuildError::Validation {
+            reason: format!(
+                "failed to read image source {}: {source}",
+                absolute.display()
+            ),
+        })?;
+        frame_provenance_field(&mut identity, raw_path, &bytes);
+    }
+
+    Ok(tokeira_deployment::sha256_hex(&identity))
+}
+
+fn frame_provenance_field(output: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    output.extend_from_slice(&(name.len() as u64).to_be_bytes());
+    output.extend_from_slice(name);
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+fn git_text(workspace_root: &std::path::Path, args: &[&str]) -> Result<String, BuildError> {
+    let output = git_bytes(workspace_root, args)?;
+    String::from_utf8(output)
+        .map(|value| value.trim().to_owned())
+        .map_err(|error| BuildError::Validation {
+            reason: format!("git output is not UTF-8: {error}"),
+        })
+}
+
+fn git_bytes(workspace_root: &std::path::Path, args: &[&str]) -> Result<Vec<u8>, BuildError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(args)
+        .output()
+        .map_err(|source| BuildError::Validation {
+            reason: format!("failed to run git {}: {source}", args.join(" ")),
+        })?;
+    if !output.status.success() {
+        return Err(BuildError::Validation {
+            reason: format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    Ok(output.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +324,9 @@ mod tests {
             "apt-get update",
             "tokeira-cargo-registry",
             "tokeira-build-target-aarch64-unknown-linux-gnu",
+            "TOKEIRA_GIT_SHA",
+            "TOKEIRA_SOURCE_TREE_HASH",
+            "--locked",
             "rustup",
             "aarch64-unknown-linux-gnu",
             "cgr.dev/chainguard/glibc-dynamic:latest",
@@ -281,6 +430,52 @@ mod tests {
             format!("[toolchain]\nchannel = \"{version}\"\n"),
         )
         .expect("write toolchain");
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        git(dir.path(), &["add", "rust-toolchain.toml"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Tokeira Test",
+                "-c",
+                "user.email=test@tokeira.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+        );
         dir
+    }
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn image_provenance_marks_dirty_worktrees_and_rekeys_the_source_hash() {
+        let workspace = workspace_with_toolchain("1.95");
+        let clean = image_build_provenance(workspace.path()).expect("clean provenance");
+        assert_eq!(clean.git_sha.len(), 8);
+        assert_eq!(clean.source_tree_hash.len(), 64);
+
+        std::fs::write(
+            workspace.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.96\"\n",
+        )
+        .expect("mutate source");
+        let dirty = image_build_provenance(workspace.path()).expect("dirty provenance");
+        assert!(dirty.git_sha.ends_with("-dirty"));
+        assert_ne!(dirty.source_tree_hash, clean.source_tree_hash);
     }
 }

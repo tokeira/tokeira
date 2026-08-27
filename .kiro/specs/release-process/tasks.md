@@ -11,10 +11,13 @@ out of scope (`pipeline-foundation`).
 
 ## Tasks
 
-- [ ] 1. Build-time provenance gate (`tokeira-build-info` `build.rs`)
-  - [ ] 1.1 Release+CI fails on empty `TOKEIRA_GIT_SHA`; release-non-CI warns + `dev`; debug resolves
+- [x] 1. Build-time provenance gate (`tokeira-build-info` `build.rs`)
+  - [x] 1.1 Release+CI fails on empty `TOKEIRA_GIT_SHA`; release-non-CI warns + `dev`; debug resolves
     `git rev-parse --short=8 HEAD` or `dev`. Confirm the image pipeline injects the env vars.
     - _Requirements: 1.1, 1.2, 1.3, 1.4_
+    - **DONE (2026-08-27, PR #130):** the build script enforces the profile/CI provenance gate,
+      and the image pipeline injects `CI`, `TOKEIRA_GIT_SHA`, and `TOKEIRA_SOURCE_TREE_HASH`
+      before its locked release build.
 
 - [ ] 2. CI checks in `crates/tokeira-build/src/pipelines/ci.rs`
   - [ ] 2.1 `run_ci_checks(request, dagger) -> CiCheckReport` + `CiCheck`/`CiCheckRequest`/`CiCheckResult`

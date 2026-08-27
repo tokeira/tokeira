@@ -8579,7 +8579,7 @@ mod tests {
     fn cluster_info_populated() {
         let proto = cluster_info_to_proto(ClusterInfo {
             cluster_name: "tokeira-local".to_string(),
-            version: "0.1.0-dev".to_string(),
+            version: "0.1.0+abcdef12".to_string(),
             notes: vec!["in-memory operator api".to_string()],
             shard_count: 1,
             supported_clients: std::collections::BTreeMap::from([(
@@ -8614,7 +8614,7 @@ mod tests {
         ];
 
         let proto = system_info_to_proto(SystemInfo {
-            server_version: "1.27.0".to_string(),
+            server_version: "0.1.0+abcdef12".to_string(),
             capabilities: crate::translate::SystemCapabilities {
                 signal_and_query_header: true,
                 internal_error_differentiation: true,
@@ -8632,7 +8632,7 @@ mod tests {
             },
         });
 
-        assert_eq!(proto.server_version, "1.27.0");
+        assert_eq!(proto.server_version, "0.1.0+abcdef12");
         assert!(proto.capabilities.is_some());
         assert_eq!(
             get_system_info_capability_fields(REQUEST_RESPONSE_PROTO),

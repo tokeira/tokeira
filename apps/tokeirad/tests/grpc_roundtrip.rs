@@ -844,7 +844,7 @@ async fn spawn_test_server() -> Result<(
         .await?;
 
     let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
-    let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+    let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
     let visibility_store = InMemoryVisibilityStore::default();
     for partition_id in 0..16 {
         let projection_worker = ProjectionWorker {

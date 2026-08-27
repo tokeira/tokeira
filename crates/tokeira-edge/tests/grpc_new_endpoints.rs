@@ -272,7 +272,7 @@ async fn build_grpc_with_namespaces(
     }
 
     let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
-    let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+    let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
     let router = Arc::new(LocalOnlyRouter);
     let workflow_broker = runtime.broker();
     let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime));
@@ -1250,7 +1250,7 @@ async fn discovery_and_namespace_reads_via_grpc() {
         .await
         .expect("get system info should succeed")
         .into_inner();
-    assert!(!system.server_version.is_empty());
+    assert_eq!(system.server_version, "0.1.0+test0001");
     let capabilities = system.capabilities.expect("system capabilities");
     assert!(capabilities.eager_workflow_start);
 
@@ -1260,7 +1260,16 @@ async fn discovery_and_namespace_reads_via_grpc() {
         .expect("get cluster info should succeed")
         .into_inner();
     assert_eq!(cluster.cluster_name, "tokeira-local");
-    assert!(!cluster.server_version.is_empty());
+    assert_eq!(cluster.server_version, "0.1.0+test0001");
+    assert_eq!(
+        cluster
+            .version_info
+            .expect("cluster version info")
+            .current
+            .expect("current cluster release")
+            .version,
+        "0.1.0+test0001"
+    );
 
     let namespaces = grpc
         .list_namespaces(Request::new(

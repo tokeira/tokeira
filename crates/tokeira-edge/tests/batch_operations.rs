@@ -468,7 +468,7 @@ async fn build_service(
         Arc::new(InMemoryExecutionResolver::new()),
         visibility,
         repo,
-        Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+        Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
         namespaces.clone(),
         Arc::new(EdgeInterceptors::permissive(namespaces)),
         PollerRegistry::default(),

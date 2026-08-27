@@ -7,8 +7,12 @@ use std::{
 use regex::Regex;
 use toml::Value;
 
+#[path = "src/provenance.rs"]
+mod provenance;
+
 const VERSION_KEY: &str = "TOKEIRA_BUILD_INFO_VERSION";
 const GIT_SHA_KEY: &str = "TOKEIRA_BUILD_INFO_GIT_SHA";
+const SERVER_VERSION_KEY: &str = "TOKEIRA_BUILD_INFO_SERVER_VERSION";
 const PROTO_VERSION_KEY: &str = "TOKEIRA_BUILD_INFO_PROTO_VERSION";
 const SERVER_COMPAT_KEY: &str = "TOKEIRA_BUILD_INFO_SERVER_COMPAT";
 const RUST_TOOLCHAIN_KEY: &str = "TOKEIRA_BUILD_INFO_RUST_TOOLCHAIN";
@@ -44,6 +48,11 @@ struct SchemaContractMetadata {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=TOKEIRA_BUILD_MANIFEST_PATH");
+    println!("cargo:rerun-if-env-changed=TOKEIRA_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=TOKEIRA_BUILD_INFO_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=TOKEIRA_SOURCE_TREE_HASH");
+    println!("cargo:rerun-if-env-changed=CI");
+    println!("cargo:rerun-if-env-changed=PROFILE");
 
     let root = workspace_root();
     println!(
@@ -55,27 +64,61 @@ fn main() {
         root.join("Cargo.toml").display()
     );
     println!("cargo:rerun-if-changed=src/pinned.rs");
+    println!("cargo:rerun-if-changed=src/provenance.rs");
     let schema_contract_path = root.join("crates/tokeira-storage/schema-contract.toml");
     println!("cargo:rerun-if-changed={}", schema_contract_path.display());
 
-    let manifest = match resolve_manifest_path() {
+    let manifest_path = resolve_manifest_path();
+    let parsed_manifest = match manifest_path.as_ref() {
         Some(path) => {
-            let content = fs::read_to_string(&path).unwrap_or_else(|error| {
+            let content = fs::read_to_string(path).unwrap_or_else(|error| {
                 panic!(
                     "failed to read build metadata manifest at {}: {error}",
                     path.display()
                 )
             });
-            parse_manifest(&content).unwrap_or_else(|error| {
+            Some(parse_manifest(&content).unwrap_or_else(|error| {
                 panic!(
                     "failed to parse build metadata manifest at {}: {error}",
                     path.display()
                 )
-            })
+            }))
         }
-        None => dev_fallback_manifest(&root)
-            .unwrap_or_else(|error| panic!("failed to derive development build metadata: {error}")),
+        None => None,
     };
+    let injected_git_sha = injected_git_sha();
+    let supplied_git_sha = parsed_manifest
+        .as_ref()
+        .map(|manifest| manifest.git_sha.as_str())
+        .or(injected_git_sha.as_deref());
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_owned());
+    let ci_is_set = env::var_os("CI").is_some();
+    let provenance =
+        provenance::resolve_git_sha(&profile, ci_is_set, supplied_git_sha, || git_sha(&root))
+            .unwrap_or_else(|error| panic!("build provenance gate failed: {error}"));
+    if provenance.warn_local_release {
+        println!(
+            "cargo::warning=release build outside CI carries degraded TOKEIRA_GIT_SHA=dev provenance"
+        );
+    }
+
+    let mut manifest = parsed_manifest.unwrap_or_else(|| {
+        dev_fallback_manifest(&root)
+            .unwrap_or_else(|error| panic!("failed to derive development build metadata: {error}"))
+    });
+    manifest.git_sha = provenance.value;
+    if manifest_path.is_none() {
+        if let Some(source_tree_hash) = non_empty_env("TOKEIRA_SOURCE_TREE_HASH") {
+            manifest.source_tree_hash = source_tree_hash;
+        }
+        if profile == "release" && ci_is_set {
+            manifest.build_mode = "versioned".to_owned();
+        }
+    }
+    if provenance.warn_local_release {
+        manifest.source_tree_hash = dev_source_tree_hash();
+        manifest.build_mode = "dev".to_owned();
+    }
 
     let schema_contract = read_schema_contract(&schema_contract_path).unwrap_or_else(|error| {
         panic!(
@@ -107,6 +150,17 @@ fn manifest_dir() -> PathBuf {
 
 fn resolve_manifest_path() -> Option<PathBuf> {
     env::var_os("TOKEIRA_BUILD_MANIFEST_PATH").map(PathBuf::from)
+}
+
+fn injected_git_sha() -> Option<String> {
+    non_empty_env("TOKEIRA_GIT_SHA").or_else(|| non_empty_env(GIT_SHA_KEY))
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn parse_manifest(content: &str) -> Result<Manifest, String> {
@@ -147,12 +201,12 @@ fn dev_fallback_manifest(root: &Path) -> Result<Manifest, String> {
 
     Ok(Manifest {
         version: env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0-dev".to_owned()),
-        git_sha: git_sha(root),
+        // The profile gate replaces this placeholder before emission.
+        git_sha: "dev".to_owned(),
         proto_version,
         server_compat,
         rust_toolchain: read_rust_toolchain(&root.join("rust-toolchain.toml"))?,
-        source_tree_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-            .to_owned(),
+        source_tree_hash: dev_source_tree_hash(),
         feature_matrix_digest: "dev".to_owned(),
         sdk_matrix_digest: "dev".to_owned(),
         build_mode: "dev".to_owned(),
@@ -253,7 +307,11 @@ fn read_schema_contract(path: &Path) -> Result<SchemaContractMetadata, String> {
     })
 }
 
-fn git_sha(root: &Path) -> String {
+fn dev_source_tree_hash() -> String {
+    "0000000000000000000000000000000000000000000000000000000000000000".to_owned()
+}
+
+fn git_sha(root: &Path) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -264,15 +322,21 @@ fn git_sha(root: &Path) -> String {
 
     match output {
         Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .filter(|value| !value.is_empty())
         }
-        _ => "unknown".to_owned(),
+        _ => None,
     }
 }
 
 fn emit_manifest(manifest: &Manifest) {
+    // Provenance belongs in SemVer build metadata so SDK release-version gates keep
+    // comparing only the package version. The resulting opaque identity is threaded
+    // into the edge constructor; the edge does not need to own build-provenance policy.
+    let server_version = format!("{}+{}", manifest.version, manifest.git_sha);
     emit(VERSION_KEY, &manifest.version);
     emit(GIT_SHA_KEY, &manifest.git_sha);
+    emit(SERVER_VERSION_KEY, &server_version);
     emit(PROTO_VERSION_KEY, &manifest.proto_version);
     emit(SERVER_COMPAT_KEY, &manifest.server_compat);
     emit(RUST_TOOLCHAIN_KEY, &manifest.rust_toolchain);

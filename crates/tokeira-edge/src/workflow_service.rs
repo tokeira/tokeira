@@ -10283,7 +10283,7 @@ mod tests {
             Arc::new(NoopResolver),
             Arc::new(EmptyVisibilityApi),
             store,
-            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
             cache.clone(),
             Arc::new(crate::interceptors::EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),

@@ -15,8 +15,8 @@ use tokeira_edge::{
     CallbackResponse, WorkflowMutationOutcome, WorkflowRuntimeApi, handle_nexus_callback,
 };
 use tokeira_kernel::{
-    CancelRequest, NexusResolution, ResetRequest, SignalRequest, StartRequest, TerminateRequest,
-    WorkflowTaskCompletedRequest,
+    CancelRequest, NexusCompletionOutcome, NexusResolution, ResetRequest, SignalRequest,
+    StartRequest, TerminateRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
     NexusCompletionFailureBody, NexusCompletionToken, PendingUpdateTransport, QueryResult,
@@ -289,8 +289,15 @@ async fn succeeded_completion_resolves_and_returns_200() {
     let run_key = RunKey::new();
     let token = encoded_token(run_key, "op-1", 7);
 
-    let response =
-        handle_nexus_callback(&runtime, Some(&token), Some("succeeded"), None, b"").await;
+    let response = handle_nexus_callback(
+        &runtime,
+        Some(&token),
+        Some("operation-token"),
+        Some("succeeded"),
+        None,
+        b"",
+    )
+    .await;
 
     assert_eq!(
         response,
@@ -306,8 +313,14 @@ async fn succeeded_completion_resolves_and_returns_200() {
     assert_eq!(forwarded_op, "op-1");
     assert_eq!(*forwarded_event, 7);
     assert!(
-        matches!(resolution, NexusResolution::Completed { .. }),
-        "succeeded → Completed, got {resolution:?}"
+        matches!(
+            resolution,
+            NexusResolution::CompletionReceived {
+                operation_token,
+                outcome: NexusCompletionOutcome::Succeeded { .. },
+            } if operation_token == "operation-token"
+        ),
+        "succeeded → completion callback with operation token, got {resolution:?}"
     );
 }
 
@@ -319,6 +332,7 @@ async fn failed_completion_wraps_failure_and_returns_200() {
     let response = handle_nexus_callback(
         &runtime,
         Some(&token),
+        Some("operation-token"),
         Some("failed"),
         Some("application/json"),
         &failure_body("boom"),
@@ -329,7 +343,11 @@ async fn failed_completion_wraps_failure_and_returns_200() {
     let calls = runtime.calls();
     assert_eq!(calls.len(), 1);
     match &calls[0].3 {
-        NexusResolution::Failed { failure } => {
+        NexusResolution::CompletionReceived {
+            operation_token,
+            outcome: NexusCompletionOutcome::Failed { failure },
+        } => {
+            assert_eq!(operation_token, "operation-token");
             // Gap A: the handler failure is wrapped in a NexusOperationFailureInfo (so the
             // caller decodes a NexusOperationError) and re-encoded as temporal/failure+proto
             // — NOT forwarded as the raw json/plain completion payload. The wrapper's
@@ -345,6 +363,19 @@ async fn failed_completion_wraps_failure_and_returns_200() {
                 failure.data, b"failure-detail",
                 "failure must be wrapped, not the raw forwarded payload"
             );
+            let decoded = tokeira_proto::conversions::common::payload_to_failure(failure);
+            let Some(
+                tokeira_proto::public::temporal::api::failure::v1::failure::FailureInfo::NexusOperationExecutionFailureInfo(
+                    info,
+                ),
+            ) = decoded.failure_info
+            else {
+                panic!("completion failure must carry NexusOperationFailureInfo");
+            };
+            assert_eq!(info.operation_token, "operation-token");
+            #[allow(deprecated)]
+            let legacy_operation_id = &info.operation_id;
+            assert_eq!(legacy_operation_id, "operation-token");
         }
         other => panic!("failed → Failed, got {other:?}"),
     }
@@ -358,6 +389,7 @@ async fn canceled_completion_resolves_to_canceled_and_returns_200() {
     let response = handle_nexus_callback(
         &runtime,
         Some(&token),
+        Some("operation-token"),
         Some("canceled"),
         // A charset parameter must not defeat the content-type check.
         Some("application/json; charset=utf-8"),
@@ -368,7 +400,13 @@ async fn canceled_completion_resolves_to_canceled_and_returns_200() {
     assert_eq!(response.status, 200);
     let calls = runtime.calls();
     assert_eq!(calls.len(), 1);
-    assert!(matches!(calls[0].3, NexusResolution::Canceled));
+    assert!(matches!(
+        calls[0].3,
+        NexusResolution::CompletionReceived {
+            ref operation_token,
+            outcome: NexusCompletionOutcome::Canceled,
+        } if operation_token == "operation-token"
+    ));
 }
 
 #[tokio::test]
@@ -377,7 +415,7 @@ async fn already_resolved_or_absent_operation_returns_404() {
     let token = encoded_token(RunKey::new(), "op-4", 17);
 
     let response =
-        handle_nexus_callback(&runtime, Some(&token), Some("succeeded"), None, b"").await;
+        handle_nexus_callback(&runtime, Some(&token), None, Some("succeeded"), None, b"").await;
 
     assert_eq!(
         response.status, 404,
@@ -392,7 +430,7 @@ async fn transient_runtime_error_returns_503() {
     let token = encoded_token(RunKey::new(), "op-5", 19);
 
     let response =
-        handle_nexus_callback(&runtime, Some(&token), Some("succeeded"), None, b"").await;
+        handle_nexus_callback(&runtime, Some(&token), None, Some("succeeded"), None, b"").await;
 
     assert_eq!(
         response.status, 503,
@@ -404,7 +442,7 @@ async fn transient_runtime_error_returns_503() {
 async fn missing_token_is_bad_request_and_does_not_resolve() {
     let runtime = FakeRuntime::new(Behavior::Accepted);
 
-    let response = handle_nexus_callback(&runtime, None, Some("succeeded"), None, b"").await;
+    let response = handle_nexus_callback(&runtime, None, None, Some("succeeded"), None, b"").await;
 
     assert_eq!(response.status, 400);
     assert!(
@@ -420,6 +458,7 @@ async fn undecodable_token_is_bad_request_and_does_not_resolve() {
     let response = handle_nexus_callback(
         &runtime,
         Some("not-a-valid-token"),
+        None,
         Some("succeeded"),
         None,
         b"",
@@ -439,8 +478,15 @@ async fn wrong_version_token_is_bad_request() {
     let wrong_version = valid.replace("\"v\":1", "\"v\":2");
     assert_ne!(valid, wrong_version, "the version substitution took effect");
 
-    let response =
-        handle_nexus_callback(&runtime, Some(&wrong_version), Some("succeeded"), None, b"").await;
+    let response = handle_nexus_callback(
+        &runtime,
+        Some(&wrong_version),
+        None,
+        Some("succeeded"),
+        None,
+        b"",
+    )
+    .await;
 
     assert_eq!(response.status, 400);
     assert!(runtime.calls().is_empty());
@@ -451,7 +497,7 @@ async fn missing_state_header_is_bad_request() {
     let runtime = FakeRuntime::new(Behavior::Accepted);
     let token = encoded_token(RunKey::new(), "op-7", 29);
 
-    let response = handle_nexus_callback(&runtime, Some(&token), None, None, b"").await;
+    let response = handle_nexus_callback(&runtime, Some(&token), None, None, None, b"").await;
 
     assert_eq!(response.status, 400);
     assert!(runtime.calls().is_empty());
@@ -462,7 +508,8 @@ async fn unknown_state_is_bad_request() {
     let runtime = FakeRuntime::new(Behavior::Accepted);
     let token = encoded_token(RunKey::new(), "op-8", 31);
 
-    let response = handle_nexus_callback(&runtime, Some(&token), Some("running"), None, b"").await;
+    let response =
+        handle_nexus_callback(&runtime, Some(&token), None, Some("running"), None, b"").await;
 
     assert_eq!(response.status, 400);
     assert!(runtime.calls().is_empty());
@@ -476,6 +523,7 @@ async fn failed_without_json_content_type_is_bad_request() {
     let response = handle_nexus_callback(
         &runtime,
         Some(&token),
+        None,
         Some("failed"),
         // Missing the required `application/json` content type.
         None,
@@ -495,6 +543,7 @@ async fn failed_with_malformed_body_is_bad_request() {
     let response = handle_nexus_callback(
         &runtime,
         Some(&token),
+        None,
         Some("failed"),
         Some("application/json"),
         b"{ this is not valid json",
@@ -514,7 +563,7 @@ async fn forwards_exact_run_key_from_token() {
     let token = encoded_token(run_key, "op-11", 43);
 
     let response =
-        handle_nexus_callback(&runtime, Some(&token), Some("succeeded"), None, b"").await;
+        handle_nexus_callback(&runtime, Some(&token), None, Some("succeeded"), None, b"").await;
 
     assert_eq!(response.status, 200);
     assert_eq!(runtime.calls()[0].0, run_key);

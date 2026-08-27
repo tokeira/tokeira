@@ -28,7 +28,8 @@ use tokeira_kernel::{
 };
 use tokeira_types::{
     ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor, QueueKey,
-    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId, WorkflowRuleRecord,
+    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TransitionSeq, WorkflowId,
+    WorkflowRuleRecord,
 };
 use tokio::sync::Mutex;
 
@@ -131,6 +132,14 @@ struct StoreState {
     transition_audit: HashMap<RunKey, Vec<TransitionAuditRecord>>,
     /// Projection records awaiting projection workers.
     projection_log: Vec<ProjectionRecord>,
+    /// Disposable cursor-to-log-position index for projection reads.
+    ///
+    /// Keeping this outside the snapshot document avoids duplicating durable
+    /// state. Restore reconstructs it from `projection_log` before the store is
+    /// exposed.
+    projection_cursor_offsets: HashMap<(u32, u16, RunKey, TransitionSeq), usize>,
+    /// Disposable pointer to the latest projection image for each run.
+    latest_projection_offsets: HashMap<RunKey, usize>,
     /// Shard lease state keyed by shard id.
     bundle_leases: HashMap<ShardId, BundleLeaseRow>,
     /// Controller routing generation singleton.
@@ -157,6 +166,60 @@ struct StoreState {
     run_shard_map: HashMap<RunKey, ShardId>,
     /// Total shard count for deterministic assignment.
     shard_count: u32,
+}
+
+impl StoreState {
+    fn append_projection_record(&mut self, record: ProjectionRecord) {
+        let offset = self.projection_log.len();
+        self.projection_cursor_offsets.insert(
+            (
+                record.partition_id,
+                record.fanout,
+                record.run_key,
+                record.transition_seq,
+            ),
+            offset,
+        );
+        self.latest_projection_offsets
+            .insert(record.run_key, offset);
+        self.projection_log.push(record);
+    }
+
+    fn rebuild_projection_indexes(&mut self) {
+        self.projection_cursor_offsets.clear();
+        self.latest_projection_offsets.clear();
+        for (offset, record) in self.projection_log.iter().enumerate() {
+            self.projection_cursor_offsets.insert(
+                (
+                    record.partition_id,
+                    record.fanout,
+                    record.run_key,
+                    record.transition_seq,
+                ),
+                offset,
+            );
+            self.latest_projection_offsets
+                .insert(record.run_key, offset);
+        }
+    }
+
+    fn projection_read_start(&self, cursor: &ProjectionCursor) -> usize {
+        let Some(transition_seq) = cursor.last_transition_seq else {
+            return 0;
+        };
+        let Some(run_key) = cursor.last_run_key else {
+            return self.projection_log.len();
+        };
+        self.projection_cursor_offsets
+            .get(&(cursor.partition_id, cursor.fanout, run_key, transition_seq))
+            .map_or(self.projection_log.len(), |offset| offset + 1)
+    }
+
+    fn latest_projection(&self, run_key: RunKey) -> Option<&ProjectionRecord> {
+        self.latest_projection_offsets
+            .get(&run_key)
+            .and_then(|offset| self.projection_log.get(*offset))
+    }
 }
 
 #[async_trait]
@@ -456,6 +519,8 @@ impl SnapshotDoc {
             request_dedupe,
             transition_audit,
             projection_log,
+            projection_cursor_offsets: _,
+            latest_projection_offsets: _,
             bundle_leases,
             routing_generation,
             budget_version,
@@ -510,7 +575,7 @@ impl SnapshotDoc {
     }
 
     fn into_state(self) -> StoreState {
-        StoreState {
+        let mut state = StoreState {
             current_open: self.current_open.into_iter().collect(),
             current_execution: self.current_execution.into_iter().collect(),
             execution_index: self.execution_index.into_iter().collect(),
@@ -529,6 +594,8 @@ impl SnapshotDoc {
             request_dedupe: self.request_dedupe.into_iter().collect(),
             transition_audit: self.transition_audit.into_iter().collect(),
             projection_log: self.projection_log,
+            projection_cursor_offsets: HashMap::new(),
+            latest_projection_offsets: HashMap::new(),
             bundle_leases: self.bundle_leases.into_iter().collect(),
             routing_generation: self.routing_generation,
             budget_version: self.budget_version,
@@ -542,7 +609,12 @@ impl SnapshotDoc {
             timer_bucket: self.timer_bucket.into_iter().collect(),
             run_shard_map: self.run_shard_map.into_iter().collect(),
             shard_count: self.shard_count,
-        }
+        };
+        // These maps only accelerate reads over the durable-equivalent log;
+        // rebuilding them at boot preserves snapshot bytes and makes them
+        // impossible to become a second source of truth.
+        state.rebuild_projection_indexes();
+        state
     }
 }
 
@@ -1139,12 +1211,9 @@ impl RunRepository for InMemoryStore {
         // in-memory reference store aligned with DSQL and prevents visibility
         // freshness from depending on whether the kernel emitted a legacy delta.
         let previous_projection = store
-            .projection_log
-            .iter()
-            .rev()
-            .find(|record| record.run_key == run_key)
+            .latest_projection(run_key)
             .map(|record| record.context.clone());
-        store.projection_log.push(ProjectionRecord {
+        store.append_projection_record(ProjectionRecord {
             partition_id: partition_for(run_key),
             fanout: 1,
             run_key,
@@ -1263,7 +1332,7 @@ impl RunRepository for InMemoryStore {
         };
         // The tombstone and purge share this lock acquisition. No reader can
         // observe the run removed without its anti-resurrection record present.
-        store.projection_log.push(tombstone.clone());
+        store.append_projection_record(tombstone.clone());
 
         let workflow_key = (state.namespace_id, state.workflow_id.0.clone());
         if store.current_open.get(&workflow_key) == Some(&run_key) {
@@ -2071,18 +2140,14 @@ impl TaskQueueConfigRepository for InMemoryStore {
 impl ProjectionLog for InMemoryStore {
     async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch> {
         let store = self.inner.lock().await;
-        let mut started = cursor.last_transition_seq.is_none();
         let mut out = Vec::new();
-        for record in store.projection_log.iter() {
+        // Empty polls dominate steady-state projection traffic. Resolving the
+        // cursor through the derived offset map starts at the unconsumed
+        // suffix instead of rescanning the whole log while holding the same
+        // lock used by authoritative commits.
+        let start = store.projection_read_start(cursor);
+        for record in &store.projection_log[start..] {
             if record.partition_id != cursor.partition_id || record.fanout != cursor.fanout {
-                continue;
-            }
-            if !started {
-                if Some(record.run_key) == cursor.last_run_key
-                    && Some(record.transition_seq) == cursor.last_transition_seq
-                {
-                    started = true;
-                }
                 continue;
             }
             out.push(record.clone());
@@ -2839,6 +2904,86 @@ mod tests {
             dispatch_ops: Default::default(),
             projection_ops: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn projection_cursor_indexes_preserve_pagination_after_snapshot_restore() {
+        let store = InMemoryStore::default();
+        let run_a = RunKey(uuid::Uuid::from_u128(1));
+        let other_partition = RunKey(uuid::Uuid::from_u128(2));
+        let run_b = RunKey(uuid::Uuid::from_u128(17));
+
+        let CommitResult::Applied {
+            new_state: mut run_a_state,
+        } = store
+            .commit_transition(run_a, start_transition(run_a), ShardEpoch::ZERO)
+            .await
+            .unwrap()
+        else {
+            panic!("first projection transition must apply");
+        };
+        store
+            .commit_transition(
+                other_partition,
+                start_transition(other_partition),
+                ShardEpoch::ZERO,
+            )
+            .await
+            .unwrap();
+        store
+            .commit_transition(run_b, start_transition(run_b), ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        run_a_state.transition_seq = run_a_state.transition_seq.next();
+        store
+            .commit_transition(
+                run_a,
+                Transition {
+                    expected_seq: TransitionSeq(1),
+                    next_state: run_a_state,
+                    history_events: Default::default(),
+                    event_principals: Default::default(),
+                    request_dedupe_ops: Default::default(),
+                    activity_ops: Default::default(),
+                    timer_ops: Default::default(),
+                    dispatch_ops: Default::default(),
+                    projection_ops: Default::default(),
+                },
+                ShardEpoch::ZERO,
+            )
+            .await
+            .unwrap();
+
+        let cursor = ProjectionCursor {
+            partition_id: 1,
+            fanout: 1,
+            last_run_key: Some(run_a),
+            last_transition_seq: Some(TransitionSeq(1)),
+        };
+        let batch = store.read_from(&cursor, 10).await.unwrap();
+        assert_eq!(
+            batch
+                .records
+                .iter()
+                .map(|record| (record.run_key, record.transition_seq))
+                .collect::<Vec<_>>(),
+            vec![(run_b, TransitionSeq(1)), (run_a, TransitionSeq(2))]
+        );
+
+        let restored = InMemoryStore::from_snapshot(&store.snapshot().await.unwrap()).unwrap();
+        assert_eq!(restored.read_from(&cursor, 10).await.unwrap(), batch);
+        let inner = restored.inner.lock().await;
+        assert_eq!(
+            inner.projection_cursor_offsets.len(),
+            inner.projection_log.len()
+        );
+        assert_eq!(
+            inner
+                .latest_projection(run_a)
+                .map(|record| record.transition_seq),
+            Some(TransitionSeq(2))
+        );
     }
 
     #[tokio::test]

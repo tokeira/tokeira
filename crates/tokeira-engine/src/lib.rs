@@ -251,15 +251,16 @@ use tokeira_runtime::{
     ChannelDemandObservationSink, ChannelWorkerComputeReconcileSink,
     CompletionCallbackScannerConfig, CompletionDeliveryOutcome, ConnectionBudgetApplier,
     HttpNexusClient, HttpNexusCompletionClient, InMemoryNexusEndpointStore, MembershipConfig,
-    NEXUS_CALLBACK_PATH, NEXUS_OPERATION_STATE_HEADER, NexusCompletion, NexusCompletionClient,
-    NexusCompletionDeps, NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusEndpointSpec,
-    NexusEndpointSpecTarget, NexusEndpointStore, NexusNamespaceResolver,
-    NexusWorkerComputeProvider, OBSERVATION_CHANNEL_CAPACITY, RECONCILE_CHANNEL_CAPACITY,
-    RepositoryBackedTaskQueueConfigStore, RuntimeConfig, RuntimeShutdownHandle,
-    ScheduleEngineConfig, ScheduleStore, SystemWorkerComputeClock, TEMPORAL_CALLBACK_TOKEN_HEADER,
-    TokeiraRuntime, WorkerComputeControllerService, WorkerComputeOutbox, WorkerComputeReconciler,
-    WorkflowTaskReportedProblem, nexus_payload_to_body, reported_problem_from_state,
-    run_schedule_engine, system_callback_post_url,
+    NEXUS_CALLBACK_PATH, NEXUS_OPERATION_STATE_HEADER, NEXUS_OPERATION_TOKEN_HEADER,
+    NexusCompletion, NexusCompletionClient, NexusCompletionDeps, NexusCompletionRuntimeConfig,
+    NexusEndpointRegistry, NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore,
+    NexusNamespaceResolver, NexusWorkerComputeProvider, OBSERVATION_CHANNEL_CAPACITY,
+    RECONCILE_CHANNEL_CAPACITY, RepositoryBackedTaskQueueConfigStore, RuntimeConfig,
+    RuntimeShutdownHandle, ScheduleEngineConfig, ScheduleStore, SystemWorkerComputeClock,
+    TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime, WorkerComputeControllerService,
+    WorkerComputeOutbox, WorkerComputeReconciler, WorkflowTaskReportedProblem,
+    nexus_payload_to_body, reported_problem_from_state, run_schedule_engine,
+    system_callback_post_url,
 };
 use tokeira_storage::{
     ConnectionDirector, DbClass, InMemoryStore, InMemoryWorkerComputeRepository, LeaseOutcome,
@@ -1931,13 +1932,14 @@ impl NexusCompletionClient for InProcessNexusCompletionClient {
         &self,
         url: &str,
         token: &str,
+        operation_token: &str,
         completion: NexusCompletion,
         links: &[Link],
     ) -> Result<CompletionDeliveryOutcome> {
         if url != system_callback_post_url(EMBEDDED_NEXUS_CALLBACK_BASE) {
             return self
                 .http
-                .complete_operation(url, token, completion, links)
+                .complete_operation(url, token, operation_token, completion, links)
                 .await;
         }
 
@@ -1962,6 +1964,7 @@ impl NexusCompletionClient for InProcessNexusCompletionClient {
         let response = handle_nexus_callback(
             runtime.as_ref(),
             Some(token),
+            Some(operation_token),
             Some(state),
             content_type.as_deref(),
             &body,
@@ -3728,6 +3731,7 @@ async fn nexus_callback_response(
             .map(str::to_owned)
     };
     let token = header(TEMPORAL_CALLBACK_TOKEN_HEADER);
+    let operation_token = header(NEXUS_OPERATION_TOKEN_HEADER);
     let state = header(NEXUS_OPERATION_STATE_HEADER);
     let content_type = header(hyper::header::CONTENT_TYPE.as_str());
 
@@ -3761,6 +3765,7 @@ async fn nexus_callback_response(
     let CallbackResponse { status, body } = handle_nexus_callback(
         runtime,
         token.as_deref(),
+        operation_token.as_deref(),
         state.as_deref(),
         content_type.as_deref(),
         &body_bytes,
@@ -5113,6 +5118,7 @@ mod tests {
             .complete_operation(
                 &target,
                 "not-yet-attached",
+                "operation-token",
                 NexusCompletion::Succeeded(tokeira_types::Payloads::default()),
                 &[],
             )

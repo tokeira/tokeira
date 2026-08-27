@@ -25,7 +25,7 @@ use crate::{
         Command, CompletionCallbackAttemptedRequest, ContinueAsNewInitiator, CronContinuation,
         ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
         ExternalSignalResult, FieldChange, MemoPatch, NexusCancellationAttemptOutcome,
-        NexusCancellationAttemptedRequest, NexusCancellationRetryRequest,
+        NexusCancellationAttemptedRequest, NexusCancellationRetryRequest, NexusCompletionOutcome,
         NexusOperationResolvedRequest, NexusOperationRetryRequest, NexusResolution,
         PauseActivityRequest, PauseWorkflowRequest, ResetActivityRequest, ResetRequest,
         ResetStickyRequest, RetryContinuation, RetryState, ScheduleQueryTaskRequest,
@@ -2778,6 +2778,65 @@ impl BasicKernel {
                     operation: pending.operation.clone(),
                     operation_token: pending.operation_token.clone(),
                 });
+                builder
+                    .state
+                    .pending_nexus_operations
+                    .remove(&pending.operation_id);
+                if builder.state.pending_workflow_task.is_none() {
+                    builder.schedule_workflow_task();
+                }
+            }
+            NexusResolution::CompletionReceived {
+                operation_token,
+                outcome,
+            } => {
+                // A backing workflow can close before its StartOperation response is
+                // committed. Temporal records the missing Started event and the terminal
+                // event under one write access so an SDK never observes a terminal Nexus
+                // operation without first learning its token
+                // (`fabricateStartedEventIfMissing` + `CompletionHandler`,
+                // components/nexusoperations/completion.go @ v1.31.0).
+                if !pending.started {
+                    builder.emit(HistoryEventKind::NexusOperationStarted {
+                        operation_id: pending.operation_id.clone(),
+                        scheduled_event_id: pending.scheduled_event_id,
+                        operation_token: operation_token.clone(),
+                        links: Vec::new(),
+                    });
+                }
+
+                match outcome {
+                    NexusCompletionOutcome::Succeeded { result, links } => {
+                        builder.emit(HistoryEventKind::NexusOperationCompleted {
+                            operation_id: pending.operation_id.clone(),
+                            scheduled_event_id: pending.scheduled_event_id,
+                            result,
+                            links,
+                        });
+                    }
+                    NexusCompletionOutcome::Failed { failure } => {
+                        builder.emit(HistoryEventKind::NexusOperationFailed {
+                            operation_id: pending.operation_id.clone(),
+                            scheduled_event_id: pending.scheduled_event_id,
+                            failure,
+                        });
+                    }
+                    NexusCompletionOutcome::Canceled => {
+                        builder.emit(HistoryEventKind::NexusOperationCanceled {
+                            operation_id: pending.operation_id.clone(),
+                            scheduled_event_id: pending.scheduled_event_id,
+                            endpoint: pending.endpoint.clone(),
+                            service: pending.service.clone(),
+                            operation: pending.operation.clone(),
+                            operation_token: if pending.started {
+                                pending.operation_token.clone()
+                            } else {
+                                operation_token
+                            },
+                        });
+                    }
+                }
+
                 builder
                     .state
                     .pending_nexus_operations

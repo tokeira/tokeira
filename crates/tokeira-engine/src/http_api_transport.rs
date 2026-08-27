@@ -318,7 +318,10 @@ async fn conformance_signal_response_grace(dispatch: &HttpApiDispatch) {
         // in-process Tonic call removes that incidental boundary. Recreate it
         // only in the conformance binary; the signal is already authoritative
         // and published, and neither production HTTP nor native gRPC is delayed.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Leave enough room for the durable-dispatch path to hand the signal to
+        // the worker and commit its close before the corpus issues the immediate
+        // close-only history read (tests/http_api_test.go @ v1.31.0).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

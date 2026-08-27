@@ -1624,11 +1624,42 @@ pub enum NexusResolution {
     },
     /// The operation was canceled.
     Canceled,
+    /// An asynchronous completion callback arrived. Unlike a terminal response to the
+    /// original start call, this may race ahead of the async-start response. The kernel
+    /// uses `operation_token` to record the missing started event before the terminal
+    /// event in the same transition (`fabricateStartedEventIfMissing`,
+    /// `components/nexusoperations/completion.go @ v1.31.0`).
+    CompletionReceived {
+        /// Handler-issued token forwarded by the completion protocol's
+        /// `Nexus-Operation-Token` header.
+        operation_token: String,
+        /// Terminal outcome carried by the callback.
+        outcome: NexusCompletionOutcome,
+    },
     /// The operation exceeded one of its timeouts.
     TimedOut {
         /// Which of the three Nexus timeouts fired.
         timeout_type: NexusTimeoutType,
     },
+}
+
+/// Terminal payload carried by an asynchronous Nexus completion callback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum NexusCompletionOutcome {
+    /// The operation completed successfully.
+    Succeeded {
+        /// Completion result payloads.
+        result: Payloads,
+        /// Links the handler returned on the completion response.
+        links: Vec<Link>,
+    },
+    /// The operation failed with a caller-facing, Nexus-operation-wrapped failure.
+    Failed {
+        /// Caller-facing, Nexus-operation-wrapped failure payload.
+        failure: Payload,
+    },
+    /// The operation was canceled.
+    Canceled,
 }
 
 /// Request from the runtime when a Nexus operation reaches a

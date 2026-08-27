@@ -750,6 +750,51 @@ pub fn wrap_handler_failure_as_resolution(
     operation: String,
     scheduled_event_id: i64,
 ) -> NexusResolution {
+    NexusResolution::Failed {
+        failure: wrap_handler_failure(
+            cause,
+            endpoint,
+            service,
+            operation,
+            scheduled_event_id,
+            String::new(),
+        ),
+    }
+}
+
+/// Wrap a handler failure for an asynchronous completion callback.
+///
+/// The completion's operation token is part of the outer
+/// `NexusOperationFailureInfo`, including when the completion arrives before the
+/// async-start response (`createNexusOperationFailure` after
+/// `fabricateStartedEventIfMissing`, `components/nexusoperations/completion.go @
+/// v1.31.0`).
+pub(crate) fn wrap_completion_failure(
+    cause: failure_proto::Failure,
+    endpoint: String,
+    service: String,
+    operation: String,
+    scheduled_event_id: i64,
+    operation_token: String,
+) -> Payload {
+    wrap_handler_failure(
+        cause,
+        endpoint,
+        service,
+        operation,
+        scheduled_event_id,
+        operation_token,
+    )
+}
+
+fn wrap_handler_failure(
+    cause: failure_proto::Failure,
+    endpoint: String,
+    service: String,
+    operation: String,
+    scheduled_event_id: i64,
+    operation_token: String,
+) -> Payload {
     let wrapped = failure_proto::Failure {
         message: "nexus operation completed unsuccessfully".to_string(),
         failure_info: Some(
@@ -759,17 +804,15 @@ pub fn wrap_handler_failure_as_resolution(
                     endpoint,
                     service,
                     operation,
-                    operation_id: String::new(),
-                    operation_token: String::new(),
+                    operation_id: operation_token.clone(),
+                    operation_token,
                 },
             ),
         ),
         cause: Some(Box::new(cause)),
         ..Default::default()
     };
-    NexusResolution::Failed {
-        failure: failure_to_payload(&wrapped),
-    }
+    failure_to_payload(&wrapped)
 }
 
 pub fn nexus_failure_to_kernel_payload(

@@ -43,9 +43,9 @@ use tokeira_types::{Payload, Payloads};
 use url::Url;
 
 use crate::nexus::{
-    CompletionDeliveryOutcome, NEXUS_OPERATION_STATE_HEADER, NexusCancelResult, NexusCompletion,
-    NexusCompletionClient, NexusHttpClient, NexusHttpFailureBody, NexusStartResult,
-    TEMPORAL_CALLBACK_TOKEN_HEADER,
+    CompletionDeliveryOutcome, NEXUS_OPERATION_STATE_HEADER, NEXUS_OPERATION_TOKEN_HEADER,
+    NexusCancelResult, NexusCompletion, NexusCompletionClient, NexusHttpClient,
+    NexusHttpFailureBody, NexusStartResult, TEMPORAL_CALLBACK_TOKEN_HEADER,
 };
 
 // Header names and the operation-unsuccessful status are lower-cased wire
@@ -53,7 +53,6 @@ use crate::nexus::{
 // case-insensitive; the SDK normalises to lower case).
 const HEADER_REQUEST_ID: &str = "nexus-request-id";
 const HEADER_LINK: &str = "nexus-link";
-const HEADER_OPERATION_TOKEN: &str = "nexus-operation-token";
 /// The Nexus per-request deadline header (`nexus.HeaderRequestTimeout`,
 /// `common/nexus/nexusrpc/api.go:134 @ v1.31.0`), carrying the timeout for THIS single
 /// start/cancel request (not the whole-operation schedule-to-close). Value is
@@ -308,7 +307,7 @@ impl NexusHttpClient for HttpNexusClient {
         let mut request = self
             .http
             .post(url)
-            .header(HEADER_OPERATION_TOKEN, operation_token);
+            .header(NEXUS_OPERATION_TOKEN_HEADER, operation_token);
         for kv in trace_headers {
             request = request.header(kv.key.as_str(), kv.value.as_str().as_ref());
         }
@@ -498,6 +497,7 @@ impl NexusCompletionClient for HttpNexusCompletionClient {
         &self,
         url: &str,
         token: &str,
+        operation_token: &str,
         completion: NexusCompletion,
         // Best-effort `Nexus-Link` headers are not essential to resolution (design.md
         // §5); their encoder lands with the link producer in Wave 4/5.
@@ -508,6 +508,7 @@ impl NexusCompletionClient for HttpNexusCompletionClient {
             .post(url)
             .header(HEADER_OPERATION_STATE, completion.operation_state())
             .header(TEMPORAL_CALLBACK_TOKEN_HEADER, token)
+            .header(NEXUS_OPERATION_TOKEN_HEADER, operation_token)
             .header(reqwest::header::USER_AGENT, NEXUS_USER_AGENT);
 
         let (bytes, content_type) = match completion {
@@ -1421,6 +1422,7 @@ mod tests {
             .complete_operation(
                 &base,
                 "tok-abc",
+                "operation-token",
                 NexusCompletion::Succeeded(Payloads(vec![Payload {
                     data: b"\"r\"".to_vec(),
                     metadata: BTreeMap::from([("encoding".to_owned(), "json/plain".to_owned())]),
@@ -1437,6 +1439,7 @@ mod tests {
         let lower = req.to_lowercase();
         assert!(lower.contains("nexus-operation-state: succeeded"));
         assert!(lower.contains("temporal-callback-token: tok-abc"));
+        assert!(lower.contains("nexus-operation-token: operation-token"));
         assert!(lower.contains("user-agent: temporalio/server"));
         assert!(lower.contains("content-type: application/json"));
         assert!(req.contains("\"r\""), "result payload is the body: {req}");
@@ -1449,6 +1452,7 @@ mod tests {
             .complete_operation(
                 &base,
                 "tok",
+                "operation-token",
                 NexusCompletion::Canceled(b"{\"message\":\"operation canceled\"}".to_vec()),
                 &[],
             )
@@ -1469,7 +1473,13 @@ mod tests {
     async fn deliver_against(response: &'static str) -> CompletionDeliveryOutcome {
         let (base, _rx) = serve_once_capture(response).await;
         HttpNexusCompletionClient::new()
-            .complete_operation(&base, "tok", NexusCompletion::Succeeded(empty_input()), &[])
+            .complete_operation(
+                &base,
+                "tok",
+                "operation-token",
+                NexusCompletion::Succeeded(empty_input()),
+                &[],
+            )
             .await
             .unwrap()
     }
@@ -1559,6 +1569,7 @@ mod tests {
             .complete_operation(
                 "http://127.0.0.1:1",
                 "tok",
+                "operation-token",
                 NexusCompletion::Succeeded(empty_input()),
                 &[],
             )

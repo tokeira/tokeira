@@ -4,10 +4,11 @@
 
 Build the release-governance layer over the existing `temporal-compatibility` substrate: build-time
 provenance enforcement, the Dagger-hosted version-pin monotonicity + bump-trailer CI checks, and the
-`tkr compat bump` engine. Order: provenance gate → CI checks (the gate that the bump engine relies on) →
-bump engine → CLI wiring → baseline record → docs. Consumes `temporal-compatibility` tasks 9–11 (the
-`tkr ci`/Dagger substrate); if those are not yet landed, they are a prerequisite. Remote triggers are
-out of scope (`pipeline-foundation`).
+`tkr compat bump` engine, plus the workspace bar as CI checks so `tkr ci check` is local CI whole.
+Order: provenance gate → CI checks + workspace bar (the gate the bump engine relies on) → bump engine →
+CLI wiring → baseline record → docs. The Dagger substrate this spec needs — the `dagger_reexec` helper
+and the pinned engine/SDK pair — is owned here (task 5.1) and by `tokeira-build`'s existing pin site;
+no unlanded external tasks are assumed. Remote triggers are out of scope (`pipeline-foundation`).
 
 ## Tasks
 
@@ -31,6 +32,12 @@ out of scope (`pipeline-foundation`).
     - _Requirements: 3.3_
   - [ ] 2.4 `trailer.rs`: `BumpTrailer` parse/render (Req 3.3 regex).
     - _Requirements: 3.3_
+  - [ ] 2.5 Workspace-bar checks: the eight bar `CiCheck` entries in the builder toolchain container,
+    named cache volumes (`tokeira-ci-registry` / `tokeira-ci-target`, keyed on the container
+    definition only), `CI=1` in every container, `--locked` throughout, nextest for tests.
+    - _Requirements: 1.5, 7.1, 7.3, 7.4, 7.5_
+  - [ ] 2.6 Monotonicity epoch handling: with no earlier tagged release, the checks pass and say so.
+    - _Requirements: 2.5_
 
 - [ ] 3. Property tests for checks + trailer
   - [ ] 3.1 P1 (pin regression detection + override), P2 (trailer/diff consistency), P6 (report
@@ -40,6 +47,10 @@ out of scope (`pipeline-foundation`).
   - [ ] 3.2 P3 trailer round-trip + regex.
     - _Feature: release-process, Property 3_
     - _Requirements: 3.3_
+  - [ ] 3.3 P7 bar parity: rendered bar command lines equal the finishing-bar table exactly; the
+    registry contains all eight bar checks.
+    - _Feature: release-process, Property 7_
+    - _Requirements: 7.1, 7.2_
 
 - [ ] 4. Bump engine `crates/tokeira-build/src/compat_bump/`
   - [ ] 4.1 `mod.rs` (`BumpRequest`/`BumpOutcome`/`run_bump`) + `BumpContext` + phase scaffolding.
@@ -58,8 +69,9 @@ out of scope (`pipeline-foundation`).
 
 - [ ] 5. CLI wiring (`apps/tkr`)
   - [ ] 5.1 Extract the shared `dagger_reexec` helper into `apps/tkr/src/dagger_reexec.rs`; wire
-    `tkr ci check [--check] [--json]`.
-    - _Requirements: 2.4, 6.2_
+    `tkr ci check [--check] [--json]`. Fail-closed on the pinned pair: refuse with the bootstrap
+    remediation when the pinned engine is absent; never provision an upstream CLI implicitly.
+    - _Requirements: 2.4, 6.2, 8.1, 8.2_
   - [ ] 5.2 Wire `tkr compat bump --to <version> [--dry-run] [--no-open] [--derive-surfaces] [--resume]`.
     - _Requirements: 4.1, 4.3_
 
@@ -79,8 +91,8 @@ out of scope (`pipeline-foundation`).
 {
   "waves": [
     { "wave": 0, "tasks": ["1.1"] },
-    { "wave": 1, "tasks": ["2.1", "2.2", "2.3", "2.4"] },
-    { "wave": 2, "tasks": ["3.1", "3.2"] },
+    { "wave": 1, "tasks": ["2.1", "2.2", "2.3", "2.4", "2.5", "2.6"] },
+    { "wave": 2, "tasks": ["3.1", "3.2", "3.3"] },
     { "wave": 3, "tasks": ["4.1", "4.2", "4.3", "4.4"] },
     { "wave": 4, "tasks": ["5.1", "5.2"] },
     { "wave": 5, "tasks": ["6.1", "6.2"] },

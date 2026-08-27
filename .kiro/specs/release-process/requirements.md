@@ -49,12 +49,22 @@ consumes.
   every bump commit.
 - **`run_ci_checks`** — the pure pipeline function (Dagger-backed) that runs the release-governance
   checks; reusable by `pipeline-foundation` for remote triggers.
+- **Bar checks** — the workspace quality gate (rustfmt, clippy, check, nextest, doctests, rustdoc,
+  cargo-deny, offline links) run as CI checks; one definition shared with the local finishing bar
+  (root `AGENTS.md` §10.4).
+- **Pinned Dagger pair** — the Dagger engine image + Rust SDK version that `tokeira-build` pins as a
+  strict pair; `run_ci_checks` runs only against it.
 
 ## Target State
 
 In scope (becomes `Implemented`):
 
 - Release builds fail (in CI) without valid provenance; the local debug loop is never blocked.
+- `tkr ci check` runs the full workspace bar as first-class checks — the local replacement for every
+  hosted-CI job, and the same bar the fleet contract requires before push. One bar, two runners,
+  verdicts never diverge.
+- The pipeline runs only against the pinned Dagger pair and never provisions an upstream CLI or engine
+  implicitly.
 - `tkr ci check` runs proto- and server-compat **monotonicity** checks and a **bump-trailer** check
   against the last tagged release, failing on a backward move or a missing/mismatched trailer unless an
   explicit override trailer is present.
@@ -102,6 +112,8 @@ provenance, so that `tokeirad --version` is always attributable to a specific so
 4. THE image build pipeline (`image-lifecycle`) SHALL set `TOKEIRA_GIT_SHA` (`git rev-parse --short=8
    HEAD`, `-dirty` suffix when the tree is dirty) and `TOKEIRA_SOURCE_TREE_HASH` on the build container
    before `cargo build`, and SHALL fail if `TOKEIRA_GIT_SHA` cannot be resolved.
+5. THE `run_ci_checks` containers and the image build pipeline SHALL set `CI=1`, so criterion 1.1 is
+   enforceable by the local pipeline: "in CI" means inside these containers, not a hosted runner.
 
 ### Requirement 2: Version pins move forward only
 
@@ -111,13 +123,15 @@ releases, so that a rollback can never silently reintroduce a protocol or behavi
 #### Acceptance Criteria
 
 1. WHEN `tkr ci check` runs, THE proto-monotonicity check SHALL compare `TEMPORAL_PROTO_VERSION` between
-   the tip commit and the last tagged tokeira release, and SHALL fail if the tip value is semver-less.
+   the tip commit and the last tagged tokeira release, and SHALL fail if the tip value is semver-lower than the last tagged release's value.
 2. WHEN `TEMPORAL_PROTO_VERSION` moves backward, THE check SHALL pass only if the commit message carries
    a `Proto-Downgrade: <reason>` trailer.
 3. WHEN `TEMPORAL_SERVER_COMPAT` moves backward, THE check SHALL pass only if the commit message carries
    a `Server-Compat-Downgrade: <reason>` trailer.
 4. THE checks SHALL run inside the Dagger-backed `run_ci_checks` pipeline (deterministic container), not
    as host shell scripts; remote-trigger wiring is out of scope (Requirement 6).
+5. THE first tagged tokeira release SHALL be the monotonicity epoch: WHEN no earlier tagged release
+   exists, the monotonicity checks SHALL pass and SHALL say so in their summaries.
 
 ### Requirement 3: The server-compat bump protocol
 
@@ -193,3 +207,42 @@ can reuse them, so that local and remote verdicts never diverge.
    re-serialising check logic; `tkr ci check --json` SHALL emit it unmodified.
 3. THIS spec SHALL NOT add any `.github/workflows/*.yml`, nightly cron, or scheduled runner; the local
    `tkr ci check` is the canonical pre-push gate until `pipeline-foundation` lands.
+
+### Requirement 7: The workspace bar runs as CI checks
+
+**User Story:** As a tokeira maintainer, I want `tkr ci check` to run the complete workspace quality
+bar locally, so that one command is CI, hosted runners stay unnecessary, and the pre-push verdict can
+never diverge from what a pipeline would say.
+
+#### Acceptance Criteria
+
+1. THE check registry SHALL include the workspace bar as independent checks, each with its own
+   `CiCheckResult`: rustfmt `--check` under the pinned nightly; `cargo lint --locked`;
+   `cargo check --workspace --locked`; `cargo nextest run --workspace --locked`;
+   `cargo test --workspace --doc --locked`; `RUSTDOCFLAGS="-D warnings" cargo doc --workspace
+   --no-deps --locked`; `cargo-deny` bans/licenses/sources; the offline link check.
+2. THE bar SHALL have exactly one definition: the commands the CI checks run and the commands the
+   fleet contract's finishing bar names (root `AGENTS.md` §10.4) are the same; a divergence between
+   them is a defect in this feature.
+3. Bar checks SHALL run in the builder toolchain container reused from `image-lifecycle` (pinned
+   stable toolchain + the pinned fmt nightly + protoc, cmake, clang); governance checks MAY keep the
+   slim container.
+4. THE pipeline SHALL mount the workspace with the `target/`-excluding filter and SHALL use named
+   Dagger cache volumes for the cargo registry and build artifacts, keyed so that changes outside the
+   toolchain container definition do not re-key them.
+5. ALL cargo invocations SHALL run `--locked`; tests SHALL run under nextest (one process per test,
+   per the fleet contract).
+
+### Requirement 8: The pinned Dagger pair, fail-closed
+
+**User Story:** As a tokeira maintainer, I want the CI pipeline to run only against the pinned
+forked-Dagger engine/SDK pair, so that a CI verdict is attributable to a known engine and an upstream
+CLI can never be pulled in silently.
+
+#### Acceptance Criteria
+
+1. `run_ci_checks` SHALL run against the pinned engine/SDK pair from `tokeira-build`'s single pin
+   site; no second pin location is introduced.
+2. WHEN the pinned engine is not running or not reachable, `tkr ci check` SHALL fail with a
+   remediation message naming the engine bootstrap, and SHALL NOT implicitly provision or download an
+   upstream Dagger CLI or engine.

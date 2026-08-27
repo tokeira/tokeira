@@ -48,7 +48,12 @@ A pure function over a `DaggerClient`, mounting the workspace with the same `tar
 the image build uses (cold invocations never upload the multi-GB target tree):
 
 ```rust
-pub enum CiCheck { ProtoMonotonicity, ServerCompatMonotonicity, BumpTrailer /* + workspace checks */ }
+pub enum CiCheck {
+    // governance
+    ProtoMonotonicity, ServerCompatMonotonicity, BumpTrailer,
+    // workspace bar (Req 7) — one definition with the fleet finishing bar
+    Fmt, Lint, Check, Nextest, Doctests, Rustdoc, Deny, Links,
+}
 
 pub struct CiCheckRequest { pub workspace_root: PathBuf, pub checks: Vec<CiCheck> } // empty = all
 
@@ -63,6 +68,20 @@ Each check runs `rg`/`git` inside a pinned `debian:bookworm-slim` container (det
 tagged tokeira release (`git` + `sort -V`); the bump-trailer check, for any commit whose diff touches
 `pinned.rs`, extracts the `Server-Compat-Bump:` trailer via `git interpret-trailers --parse` and
 validates it against the observed `pinned.rs` diff.
+
+**Bar checks (Req 7).** The eight workspace-bar checks run in the builder toolchain container reused
+from `image-lifecycle` (pinned stable + fmt nightly + protoc/cmake/clang) rather than the slim
+container. Named cache volumes — `tokeira-ci-registry` and `tokeira-ci-target` — carry the cargo
+registry and build artifacts between runs; their keys derive from the toolchain container definition
+only, so source edits reuse warm caches and an SDK or base-image advance re-keys deliberately (cache
+identity must never churn on unrelated change). Every container sets `CI=1` (Req 1.5), all cargo
+invocations are `--locked`, tests run under nextest. The command lines are rendered from one table
+shared with the finishing-bar documentation — the one-definition invariant is enforced by a test, not
+by prose.
+
+**Pinned pair, fail-closed (Req 8).** `dagger_reexec` resolves the engine from `tokeira-build`'s pin
+site and refuses to run when it is absent or unreachable, printing the bootstrap remediation; the
+upstream CLI's implicit-provisioning path is never taken by `tkr ci`.
 
 ### 2. CLI — `apps/tkr/src/commands/ci/` and `apps/tkr/src/commands/compat/bump.rs`
 
@@ -199,6 +218,8 @@ provenance env succeeds with `dev`.
 
 - **Pipeline checks:** unit tests over `run_ci_checks` with a fake `DaggerClient` — proto/server-compat
   regression detected; override trailers honoured; bump-trailer mismatch fails. (Property 1, 2, 6.)
+- **Bar parity:** a test renders every bar check's command line and asserts exact equality with the
+  finishing-bar command table; the registry contains all eight bar checks. (Property 7.)
 - **Trailer:** proptest round-trip + regex conformance (Property 3).
 - **Bump engine:** phase-ordering / fail-closed tests with stubbed git + GitHub (`run_bump` dry-run);
   equal/downgrade target rejected in preflight (Property 4). No live GitHub in the default suite.

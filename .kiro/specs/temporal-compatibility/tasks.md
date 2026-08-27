@@ -365,17 +365,22 @@ Correctness properties P1–P10 from the design are distributed across the tasks
     - Add `Ci(CiArgs)` variant to `apps/tkr/src/cli.rs::Command`
     - Wire dispatcher in `apps/tkr/src/main.rs`
     - _Requirements: 44.1–44.8, 46.1, 47.1_
+    - **DONE (2026-08-27, PR #133):** the scaffold now delegates every verb to the real
+      `tokeira-build` CI pipeline rather than the former honest stub.
 
   - [x] 9.2 Implement `tkr ci check`
     - Invoke the Dagger compatibility `check` function
     - Use frozen lock mode by default
-    - Re-exec under `dagger run` using the shared `dagger_reexec` helper
+    - Open an isolated in-process Dagger session against the pinned runner
     - When Dagger unavailable: fail with clear setup message
     - When checks fail: return non-zero exit code
     - When checks pass: print concise success summary
     - When the user supplies `--update-lock`, the command MAY delegate to `tkr ci lock-update`
     - Support JSON output
     - _Requirements: 46.1–46.9_
+    - **DONE (2026-08-27, PR #133):** check runs the reusable serde-report pipeline in-process,
+      supports exact JSON and selected checks, delegates `--update-lock`, and exits non-zero on a
+      failed result without implicitly provisioning an engine.
 
   - [x] 9.3 Implement `tkr ci build`
     - Without flags: invoke Dagger `dev` build function
@@ -384,12 +389,17 @@ Correctness properties P1–P10 from the design are distributed across the tasks
     - Do NOT use ambient environment variables as build metadata inputs
     - Support JSON output
     - _Requirements: 47.1–47.9_
+    - **DONE (2026-08-27, PR #133):** dev and versioned builds run inside Dagger; the versioned
+      path rejects dirt, derives its manifest twice inside the container, and validates every
+      embedded BuildInfo field before export.
 
   - [x]* 9.4 Write CLI parse tests for `tkr ci`
     - Parse `tkr ci check`, `tkr ci check --json`
     - Parse `tkr ci build`, `tkr ci build --versioned`
     - Parse `tkr ci lock-update`, `tkr ci lock-update --json`
     - Test location: `apps/tkr/src/commands/ci/mod.rs` `#[cfg(test)]` module
+    - **DONE (2026-08-27, PR #133):** parse coverage now includes all three verbs, JSON,
+      `--versioned`, and repeatable `--check` selection.
 
   - [ ]* 9.5 Write integration test for `tkr ci check`
     - Invoke `tkr ci check` against a clean working tree; assert exit 0
@@ -401,8 +411,11 @@ Correctness properties P1–P10 from the design are distributed across the tasks
     - Run compatibility checks after lockfile changes
     - Print changed container image references, Git references, and HTTP fetch references
     - Support JSON output
-    - Ensure normal `tkr ci check` and versioned build paths do not refresh `.dagger/lock`
+    - Ensure normal `tkr ci check` and versioned build paths do not refresh `dagger.lock`
     - _Requirements: 44.1–44.8, 46.4_
+    - **DONE (2026-08-27, PR #133):** live resolution writes the reviewed root `dagger.lock`,
+      classifies changed container/Git/HTTP inputs, runs the checks, and rejects every other host
+      working-tree mutation; normal check/build sessions remain frozen.
 
 - [ ] 10. Dagger CI pipeline — compatibility module
   - [ ] 10.1 Scaffold Dagger compatibility module

@@ -5,7 +5,9 @@
 
 mod arch;
 mod closure;
+pub mod compat_bump;
 mod composition;
+mod dagger_release;
 mod discovery;
 mod error;
 mod snapshot;
@@ -30,6 +32,9 @@ pub use composition::{
     GENERATED_ROOT_RELATIVE_PATH, SCOPED_WORKSPACE_RELATIVE_PATH, TKP_PACKAGE,
     assemble_bound_provisioner,
 };
+pub use dagger_release::{
+    CI_FMT_NIGHTLY, DAGGER_ENGINE_BOOTSTRAP_COMMAND, DAGGER_RELEASE, DaggerRelease,
+};
 pub use discovery::{
     DefinitionFrontendPackageDescriptor, DiscoveryError, PackageCoordinates,
     PlatformPackageDescriptor, WorkspaceDescriptors, discover_workspace_descriptors,
@@ -37,6 +42,10 @@ pub use discovery::{
 pub use error::BuildError;
 pub use pipelines::{
     build::{TokeiradBuildRequest, TokeiradBuildResult, build_tokeirad_image},
+    ci::{
+        CiBuildMode, CiBuildReport, CiBuildRequest, CiCheck, CiCheckReport, CiCheckRequest,
+        CiCheckResult, DaggerClient, run_ci_build, run_ci_checks, workspace_bar_commands,
+    },
     mirror::{MirrorRequest, MirroredReference, mirror_image},
     obtain::{ObtainedProvisioner, obtain_provisioner},
     provisioner::{ProvisionerBuildRequest, build_provisioner, engine_identity_for},

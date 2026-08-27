@@ -9,12 +9,13 @@
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 # The generated-provisioner test runs a full `cargo build` of the bound
-# provisioner inside the test: ~166s even warm, and any Cargo.lock movement
-# recompiles the changed dependency chain cold, pushing it past the default
-# 180s kill. The work is real, not a hang — give it its own ceiling.
+# provisioner inside the test. A cold container build is deliberately limited
+# to one Cargo job to stay within the CI runner's memory limit, so its final
+# link can take just over ten minutes. The work is real, not a hang — give only
+# this integration test a twenty-minute ceiling.
 [[profile.default.overrides]]
 filter = 'test(=tests::discovered_selection_creates_and_checks_with_the_generated_compose_provisioner)'
-slow-timeout = { period = "120s", terminate-after = 5 }
+slow-timeout = { period = "120s", terminate-after = 10 }
 
 [profile.ci]
 retries = 0        # a flaky test is a bug to fix, not to hide
@@ -23,7 +24,7 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
 filter = 'test(=tests::discovered_selection_creates_and_checks_with_the_generated_compose_provisioner)'
-slow-timeout = { period = "120s", terminate-after = 5 }
+slow-timeout = { period = "120s", terminate-after = 10 }
 
 [profile.ci.junit]
 path = "junit.xml"

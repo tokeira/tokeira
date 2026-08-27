@@ -334,6 +334,9 @@ pub(crate) enum CiCommand {
         json: bool,
         #[arg(long)]
         update_lock: bool,
+        /// Run only the named check; repeat to select more than one.
+        #[arg(long = "check", value_enum)]
+        checks: Vec<CliCiCheck>,
     },
     Build {
         #[arg(long)]
@@ -345,6 +348,21 @@ pub(crate) enum CiCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum CliCiCheck {
+    ProtoMonotonicity,
+    ServerCompatMonotonicity,
+    BumpTrailer,
+    Fmt,
+    Lint,
+    Check,
+    Nextest,
+    Doctests,
+    Rustdoc,
+    Deny,
+    Links,
 }
 
 #[derive(Subcommand)]

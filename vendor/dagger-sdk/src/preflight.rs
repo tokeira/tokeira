@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{ClientConfig, ClientConfigParts, ConfigExplicitness};
+use crate::config::{ClientConfig, ClientConfigParts, ConfigExplicitness, LockMode};
 use crate::connection::EngineConnection;
 use crate::diagnostic::{DiagnosticDispatcher, DiagnosticSink};
 use crate::discovery::NativeDiscoveryInputs;
@@ -265,6 +265,7 @@ struct ValidatedConfig {
     graphql_execution_timeout: Option<Duration>,
     allow_unverified_compatibility: bool,
     isolated_cli_session: bool,
+    lock_mode: Option<LockMode>,
     explicit: ConfigExplicitness,
 }
 
@@ -284,6 +285,7 @@ impl ValidatedConfig {
             graphql_execution_timeout: parts.graphql_execution_timeout,
             allow_unverified_compatibility: parts.allow_unverified_compatibility,
             isolated_cli_session: parts.isolated_cli_session,
+            lock_mode: parts.lock_mode,
             explicit: parts.explicit,
         }
     }
@@ -363,6 +365,8 @@ impl ValidatedConfig {
             Some(ConfigOption::RunnerHost)
         } else if !self.environment.is_empty() {
             Some(ConfigOption::Environment)
+        } else if self.lock_mode.is_some() {
+            Some(ConfigOption::LockMode)
         } else {
             None
         };
@@ -389,6 +393,10 @@ impl ValidatedConfig {
 
     fn into_cli_launch_request(self, ambient: CliAmbientInputs) -> CliLaunchRequest {
         let mut arguments = vec![OsString::from("session")];
+        if let Some(lock_mode) = self.lock_mode {
+            arguments.push(OsString::from("--lock"));
+            arguments.push(OsString::from(lock_mode.as_cli_value()));
+        }
         if let Some(workdir) = self.workdir {
             arguments.push(OsString::from("--workdir"));
             arguments.push(workdir.into_os_string());

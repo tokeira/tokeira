@@ -17,38 +17,13 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
+use tokeira_build::{DAGGER_ENGINE_BOOTSTRAP_COMMAND, DAGGER_RELEASE, DaggerRelease};
 use uuid::Uuid;
 
 use super::progress::ImageBuildProgress;
 
-const ENGINE_ASSET_NAME: &str = "dagger-engine-v1.0.0-beta.11.rust.3-linux-arm64.oci.tar";
-const ENGINE_ASSET_URL: &str = "https://github.com/iw/dagger/releases/download/sdk/rust/\
-v1.0.0-beta.11.rust.3-apple-silicon/dagger-engine-v1.0.0-beta.11.rust.3-linux-arm64.oci.tar";
-const ENGINE_ASSET_SIZE: u64 = 375_404_032;
-const ENGINE_ASSET_SHA256: &str =
-    "29077fa248530162d29cbb089b41435dcfb512741dc4b206df798ad886108254";
-const ENGINE_IMAGE: &str = "tokeira/dagger-engine:v1.0.0-beta.11.rust.3-linux-arm64";
-const ENGINE_CONTAINER: &str = "tokeira-dagger-engine-rust3-arm64";
 const CACHE_LOCK_NAME: &str = ".engine-bootstrap.lock";
-
-#[derive(Clone, Copy)]
-struct EngineRelease<'a> {
-    asset_name: &'a str,
-    asset_url: &'a str,
-    asset_size: u64,
-    asset_sha256: &'a str,
-    image: &'a str,
-    container: &'a str,
-}
-
-const ENGINE_RELEASE: EngineRelease<'static> = EngineRelease {
-    asset_name: ENGINE_ASSET_NAME,
-    asset_url: ENGINE_ASSET_URL,
-    asset_size: ENGINE_ASSET_SIZE,
-    asset_sha256: ENGINE_ASSET_SHA256,
-    image: ENGINE_IMAGE,
-    container: ENGINE_CONTAINER,
-};
+const ENGINE_RELEASE: DaggerRelease = DAGGER_RELEASE;
 
 #[derive(Clone, Debug)]
 struct BootstrapTools {
@@ -74,7 +49,7 @@ struct EngineBootstrap<E> {
     executor: E,
     tools: BootstrapTools,
     cache_root: PathBuf,
-    release: EngineRelease<'static>,
+    release: DaggerRelease,
     progress: Option<Arc<ImageBuildProgress>>,
 }
 
@@ -110,6 +85,38 @@ pub(super) async fn runner_host(
         .await
         .context("the Dagger engine bootstrap task did not complete")??;
     Ok(Some(host))
+}
+
+/// Return the pinned runner only when image bootstrap has already realized it.
+///
+/// CI is deliberately fail-closed: it must never turn a check into an engine
+/// provisioning operation. The image flow owns the checksum-verified bootstrap,
+/// and this read-only probe tells the operator exactly how to run it.
+pub(super) async fn running_runner_host() -> Result<String> {
+    let docker = required_tool("docker")?;
+    tokio::task::spawn_blocking(move || {
+        let output = Command::new(docker)
+            .args([
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                ENGINE_RELEASE.container,
+            ])
+            .output()
+            .context("could not inspect the pinned Dagger engine")?;
+        let running = output.status.success() && output.stdout == b"true\n";
+        if !running {
+            bail!(
+                "pinned Dagger engine {} is not running; run `{}` once to bootstrap the checksum-verified engine, then retry",
+                ENGINE_RELEASE.engine_version,
+                DAGGER_ENGINE_BOOTSTRAP_COMMAND
+            );
+        }
+        Ok(ENGINE_RELEASE.runner_host())
+    })
+    .await
+    .context("the pinned Dagger engine probe did not complete")?
 }
 
 fn required_tool(name: &str) -> Result<PathBuf> {
@@ -486,7 +493,7 @@ mod tests {
                 b"29077fa248530162d29cbb089b41435dcfb512741dc4b206df798ad886108254  engine.tar\n"
             )
             .expect("valid digest parses"),
-            ENGINE_ASSET_SHA256
+            ENGINE_RELEASE.asset_sha256
         );
         assert_eq!(
             parse_loaded_image(b"Loaded image ID: sha256:abc\n", b"").expect("image ID parses"),
@@ -498,9 +505,9 @@ mod tests {
             "dagger-engine:release"
         );
         assert_eq!(
-            parse_container(format!("false {ENGINE_IMAGE}\n").as_bytes())
+            parse_container(format!("false {}\n", ENGINE_RELEASE.image).as_bytes())
                 .expect("container state parses"),
-            (false, ENGINE_IMAGE.to_owned())
+            (false, ENGINE_RELEASE.image.to_owned())
         );
     }
 
@@ -515,12 +522,15 @@ mod tests {
 
     #[test]
     fn release_coordinates_match_the_published_companion_assets() {
-        assert_eq!(ENGINE_RELEASE.asset_name, ENGINE_ASSET_NAME);
-        assert!(ENGINE_RELEASE.asset_url.ends_with(ENGINE_ASSET_NAME));
+        assert!(
+            ENGINE_RELEASE
+                .asset_url
+                .ends_with(ENGINE_RELEASE.asset_name)
+        );
         assert_eq!(ENGINE_RELEASE.asset_size, 375_404_032);
         assert_eq!(ENGINE_RELEASE.asset_sha256.len(), 64);
         assert_eq!(
-            format!("docker-container://{}", ENGINE_RELEASE.container),
+            ENGINE_RELEASE.runner_host(),
             "docker-container://tokeira-dagger-engine-rust3-arm64"
         );
     }

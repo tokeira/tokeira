@@ -90,6 +90,28 @@ pub(crate) async fn dagger_session() -> Result<dagger_sdk::Client> {
     dagger_session_inner(None).await
 }
 
+/// Connect CI to the already-running pinned engine with an explicit lock policy.
+///
+/// Unlike image bootstrap, this path performs no provisioning. A missing runner
+/// therefore fails with the remediation owned by the checksum-verified image flow.
+pub(crate) async fn ci_dagger_session(
+    workspace_root: &std::path::Path,
+    lock_mode: dagger_sdk::LockMode,
+) -> Result<dagger_sdk::Client> {
+    let runner_host = engine_bootstrap::running_runner_host().await?;
+    let config = dagger_sdk::ClientConfig::builder()
+        .isolated_cli_session()
+        .runner_host(runner_host)
+        .workdir(workspace_root)
+        .lock_mode(lock_mode)
+        .session_startup_timeout(DAGGER_SESSION_STARTUP_TIMEOUT)
+        .build()
+        .context("configure the pinned Dagger CI session")?;
+    dagger_sdk::connect_with(config)
+        .await
+        .context("failed to connect the pinned Dagger CI session")
+}
+
 async fn dagger_session_with_progress(
     progress: Arc<ImageBuildProgress>,
 ) -> Result<dagger_sdk::Client> {
@@ -540,7 +562,7 @@ fn print_json_or_human(
     Ok(())
 }
 
-fn workspace_root_from_current_dir() -> Result<PathBuf> {
+pub(crate) fn workspace_root_from_current_dir() -> Result<PathBuf> {
     let mut dir = std::env::current_dir().context("failed to read current directory")?;
     loop {
         if dir.join("rust-toolchain.toml").exists() && dir.join("Cargo.toml").exists() {

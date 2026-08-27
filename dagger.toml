@@ -1,0 +1,2 @@
+# Tokeira CI uses the pinned in-process SDK session; this workspace file exists
+# solely to anchor Dagger's reviewed dependency lock at the repository root.

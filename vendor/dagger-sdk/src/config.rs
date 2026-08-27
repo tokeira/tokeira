@@ -44,6 +44,31 @@ pub(crate) struct ConfigExplicitness {
     pub(crate) graphql_execution_timeout: bool,
     pub(crate) allow_unverified_compatibility: bool,
     pub(crate) isolated_cli_session: bool,
+    pub(crate) lock_mode: bool,
+}
+
+/// Dependency-lock policy applied by an SDK-owned Dagger CLI session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LockMode {
+    /// Do not read or update the workspace lock.
+    Disabled,
+    /// Resolve live inputs and record their pins.
+    Live,
+    /// Use pinned entries while permitting unrecorded live inputs.
+    Pinned,
+    /// Refuse every live input absent from the reviewed workspace lock.
+    Frozen,
+}
+
+impl LockMode {
+    pub(crate) const fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Live => "live",
+            Self::Pinned => "pinned",
+            Self::Frozen => "frozen",
+        }
+    }
 }
 
 /// Immutable, validated inputs used to establish an owned Dagger client.
@@ -67,6 +92,7 @@ pub struct ClientConfig {
     graphql_execution_timeout: Option<Duration>,
     allow_unverified_compatibility: bool,
     isolated_cli_session: bool,
+    lock_mode: Option<LockMode>,
     explicit: ConfigExplicitness,
 }
 
@@ -90,6 +116,7 @@ pub(crate) struct ClientConfigParts {
     pub(crate) graphql_execution_timeout: Option<Duration>,
     pub(crate) allow_unverified_compatibility: bool,
     pub(crate) isolated_cli_session: bool,
+    pub(crate) lock_mode: Option<LockMode>,
     pub(crate) explicit: ConfigExplicitness,
 }
 
@@ -182,6 +209,11 @@ impl ClientConfig {
         self.isolated_cli_session
     }
 
+    /// Returns the dependency-lock policy for a newly started CLI session.
+    pub const fn lock_mode(&self) -> Option<LockMode> {
+        self.lock_mode
+    }
+
     pub(crate) fn into_parts(self) -> ClientConfigParts {
         ClientConfigParts {
             workdir: self.workdir,
@@ -198,6 +230,7 @@ impl ClientConfig {
             graphql_execution_timeout: self.graphql_execution_timeout,
             allow_unverified_compatibility: self.allow_unverified_compatibility,
             isolated_cli_session: self.isolated_cli_session,
+            lock_mode: self.lock_mode,
             explicit: self.explicit,
         }
     }
@@ -220,6 +253,7 @@ impl Default for ClientConfig {
             graphql_execution_timeout: None,
             allow_unverified_compatibility: false,
             isolated_cli_session: false,
+            lock_mode: None,
             explicit: ConfigExplicitness::default(),
         }
     }
@@ -263,6 +297,7 @@ impl fmt::Debug for ClientConfig {
                 &self.allow_unverified_compatibility,
             )
             .field("isolated_cli_session", &self.isolated_cli_session)
+            .field("lock_mode", &self.lock_mode)
             // Explicitness is lifecycle-planning state, not a second set of values;
             // rendering the bitset makes defaults reviewable without exposing inputs.
             .field("explicit_inputs", &self.explicit)
@@ -290,6 +325,7 @@ pub struct ClientConfigBuilder {
     graphql_execution_timeout: Option<Duration>,
     allow_unverified_compatibility: Option<bool>,
     isolated_cli_session: bool,
+    lock_mode: Option<LockMode>,
 }
 
 impl fmt::Debug for ClientConfigBuilder {
@@ -324,6 +360,7 @@ impl fmt::Debug for ClientConfigBuilder {
                 &self.allow_unverified_compatibility,
             )
             .field("isolated_cli_session", &self.isolated_cli_session)
+            .field("lock_mode", &self.lock_mode)
             .finish()
     }
 }
@@ -433,6 +470,13 @@ impl ClientConfigBuilder {
         self
     }
 
+    /// Selects the native Dagger workspace-lock policy for a newly owned CLI session.
+    #[must_use]
+    pub fn lock_mode(mut self, lock_mode: LockMode) -> Self {
+        self.lock_mode = Some(lock_mode);
+        self
+    }
+
     /// Validates and normalizes the candidate without performing external work.
     pub fn build(self) -> Result<ClientConfig, ConfigError> {
         validate_workdir(self.workdir.as_deref())?;
@@ -471,6 +515,7 @@ impl ClientConfigBuilder {
             graphql_execution_timeout: self.graphql_execution_timeout.is_some(),
             allow_unverified_compatibility: self.allow_unverified_compatibility.is_some(),
             isolated_cli_session: self.isolated_cli_session,
+            lock_mode: self.lock_mode.is_some(),
         };
 
         Ok(ClientConfig {
@@ -492,6 +537,7 @@ impl ClientConfigBuilder {
             graphql_execution_timeout: self.graphql_execution_timeout,
             allow_unverified_compatibility: self.allow_unverified_compatibility.unwrap_or(false),
             isolated_cli_session: self.isolated_cli_session,
+            lock_mode: self.lock_mode,
             explicit,
         })
     }
@@ -595,6 +641,8 @@ fn validate_explicit_connection_conflicts(
         Some(ConfigOption::AllowUnverifiedCompatibility)
     } else if builder.isolated_cli_session {
         Some(ConfigOption::IsolatedCliSession)
+    } else if builder.lock_mode.is_some() {
+        Some(ConfigOption::LockMode)
     } else {
         None
     };

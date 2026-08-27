@@ -6,9 +6,9 @@ Build the release-governance layer over the existing `temporal-compatibility` su
 provenance enforcement, the Dagger-hosted version-pin monotonicity + bump-trailer CI checks, and the
 `tkr compat bump` engine, plus the workspace bar as CI checks so `tkr ci check` is local CI whole.
 Order: provenance gate → CI checks + workspace bar (the gate the bump engine relies on) → bump engine →
-CLI wiring → baseline record → docs. The Dagger substrate this spec needs — the `dagger_reexec` helper
-and the pinned engine/SDK pair — is owned here (task 5.1) and by `tokeira-build`'s existing pin site;
-no unlanded external tasks are assumed. Remote triggers are out of scope (`pipeline-foundation`).
+CLI wiring → baseline record → docs. The Dagger substrate this spec needs — the in-process session
+plumbing and pinned engine/SDK pair — is owned here (task 5.1) and by `tokeira-build`'s existing pin
+site; no unlanded external tasks are assumed. Remote triggers are out of scope (`pipeline-foundation`).
 
 ## Tasks
 
@@ -20,37 +20,42 @@ no unlanded external tasks are assumed. Remote triggers are out of scope (`pipel
       and the image pipeline injects `CI`, `TOKEIRA_GIT_SHA`, and `TOKEIRA_SOURCE_TREE_HASH`
       before its locked release build.
 
-- [ ] 2. CI checks in `crates/tokeira-build/src/pipelines/ci.rs`
-  - [ ] 2.1 `run_ci_checks(request, dagger) -> CiCheckReport` + `CiCheck`/`CiCheckRequest`/`CiCheckResult`
+- [x] 2. CI checks in `crates/tokeira-build/src/pipelines/ci.rs`
+  - [x] 2.1 `run_ci_checks(request, dagger) -> CiCheckReport` + `CiCheck`/`CiCheckRequest`/`CiCheckResult`
     (serde), workspace mounted with the `target/`-excluding filter, pinned `debian:bookworm-slim`.
     - _Requirements: 2.4, 6.1, 6.2_
-  - [ ] 2.2 Proto + server-compat monotonicity checks (pin@tip vs pin@last-tag; override trailers
+  - [x] 2.2 Proto + server-compat monotonicity checks (pin@tip vs pin@last-tag; override trailers
     `Proto-Downgrade:` / `Server-Compat-Downgrade:`).
     - _Requirements: 2.1, 2.2, 2.3_
-  - [ ] 2.3 Bump-trailer check (any `pinned.rs` diff → `git interpret-trailers --parse` → validate
+  - [x] 2.3 Bump-trailer check (any `pinned.rs` diff → `git interpret-trailers --parse` → validate
     against the diff).
     - _Requirements: 3.3_
-  - [ ] 2.4 `trailer.rs`: `BumpTrailer` parse/render (Req 3.3 regex).
+  - [x] 2.4 `trailer.rs`: `BumpTrailer` parse/render (Req 3.3 regex).
     - _Requirements: 3.3_
-  - [ ] 2.5 Workspace-bar checks: the eight bar `CiCheck` entries in the builder toolchain container,
+  - [x] 2.5 Workspace-bar checks: the eight bar `CiCheck` entries in the builder toolchain container,
     named cache volumes (`tokeira-ci-registry` / `tokeira-ci-target`, keyed on the container
     definition only), `CI=1` in every container, `--locked` throughout, nextest for tests.
     - _Requirements: 1.5, 7.1, 7.3, 7.4, 7.5_
-  - [ ] 2.6 Monotonicity epoch handling: with no earlier tagged release, the checks pass and say so.
+  - [x] 2.6 Monotonicity epoch handling: with no earlier tagged release, the checks pass and say so.
     - _Requirements: 2.5_
+  - **DONE (2026-08-27, PR #133):** `run_ci_checks` now emits serde evidence for the three
+    governance checks and eight containerized workspace-bar checks, including the explicit
+    pre-release monotonicity epoch.
 
-- [ ] 3. Property tests for checks + trailer
-  - [ ] 3.1 P1 (pin regression detection + override), P2 (trailer/diff consistency), P6 (report
+- [x] 3. Property tests for checks + trailer
+  - [x] 3.1 P1 (pin regression detection + override), P2 (trailer/diff consistency), P6 (report
     round-trip).
     - _Feature: release-process, Property 1, Property 2, Property 6_
     - _Requirements: 2.1, 2.2, 2.3, 3.2, 3.3, 6.1, 6.2_
-  - [ ] 3.2 P3 trailer round-trip + regex.
+  - [x] 3.2 P3 trailer round-trip + regex.
     - _Feature: release-process, Property 3_
     - _Requirements: 3.3_
-  - [ ] 3.3 P7 bar parity: rendered bar command lines equal the finishing-bar table exactly; the
+  - [x] 3.3 P7 bar parity: rendered bar command lines equal the finishing-bar table exactly; the
     registry contains all eight bar checks.
     - _Feature: release-process, Property 7_
     - _Requirements: 7.1, 7.2_
+  - **DONE (2026-08-27, PR #133):** properties cover regression overrides, trailer/diff and
+    trailer round-trips, report serialization, and exact §10.4 command/registry parity.
 
 - [ ] 4. Bump engine `crates/tokeira-build/src/compat_bump/`
   - [ ] 4.1 `mod.rs` (`BumpRequest`/`BumpOutcome`/`run_bump`) + `BumpContext` + phase scaffolding.
@@ -68,11 +73,14 @@ no unlanded external tasks are assumed. Remote triggers are out of scope (`pipel
     - _Requirements: 4.1, 4.2_
 
 - [ ] 5. CLI wiring (`apps/tkr`)
-  - [ ] 5.1 Wire `tkr ci check [--check] [--json]` over an in-process Dagger session (the image and
+  - [x] 5.1 Wire `tkr ci check [--check] [--json]` over an in-process Dagger session (the image and
     bundle flows' pattern — no re-exec wrapper; the deprecated `dagger_reexec` framing is retired).
     Fail-closed on the pinned pair: refuse with the bootstrap remediation when the pinned engine is
     absent; never provision an upstream CLI implicitly.
     - _Requirements: 2.4, 6.2, 8.1, 8.2_
+    - **DONE (2026-08-27, PR #133):** `tkr ci check` owns an isolated pinned Dagger session,
+      defaults to frozen resolution, reports selected checks, and refuses a missing runner with
+      the checksum-verified image bootstrap remediation.
   - [ ] 5.2 Wire `tkr compat bump --to <version> [--dry-run] [--no-open] [--derive-surfaces] [--resume]`.
     - _Requirements: 4.1, 4.3_
 

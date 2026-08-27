@@ -51,11 +51,12 @@ use crate::{
     nexus::{
         CompletionCallbackScannerConfig, CompletionCallbackTrackingEntry,
         CompletionCallbackTrackingState, CompletionDeliveryOutcome, EndpointTarget,
-        NexusCancelResult, NexusCompletion, NexusCompletionClient, NexusCompletionFailureBody,
-        NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusHttpClient, NexusHttpFailureBody,
-        NexusNamespaceResolver, NexusQueueKey, NexusStartResult, NexusTaskBroker, NexusTaskRequest,
-        NexusTimeoutEntry, NexusTimeoutTrackingState, SYSTEM_CALLBACK_URL,
-        TEMPORAL_CALLBACK_TOKEN_HEADER, nexus_completion_backoff, nexus_operation_next_attempt_at,
+        NEXUS_OPERATION_TOKEN_HEADER, NexusCancelResult, NexusCompletion, NexusCompletionClient,
+        NexusCompletionFailureBody, NexusCompletionRuntimeConfig, NexusEndpointRegistry,
+        NexusHttpClient, NexusHttpFailureBody, NexusNamespaceResolver, NexusQueueKey,
+        NexusStartResult, NexusTaskBroker, NexusTaskRequest, NexusTimeoutEntry,
+        NexusTimeoutTrackingState, SYSTEM_CALLBACK_URL, TEMPORAL_CALLBACK_TOKEN_HEADER,
+        nexus_completion_backoff, nexus_operation_next_attempt_at,
     },
     scanner::pick_lane_for_run_key,
     shard::{ShardOwner, shard_for},
@@ -1615,6 +1616,21 @@ where
             .find(|(key, _)| key.eq_ignore_ascii_case(TEMPORAL_CALLBACK_TOKEN_HEADER))
             .map(|(_, value)| value.clone())
             .unwrap_or_default();
+        // WorkflowRunOperation stores its handler-issued operation token in the backing
+        // workflow's callback headers. Forward it on the completion POST so the receiver
+        // can fabricate Started when completion beats the async-start response. The SDK
+        // also writes the deprecated operation-id header for pre-1.27 servers; accept it
+        // as a fallback while always emitting the canonical header.
+        let operation_token = header
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(NEXUS_OPERATION_TOKEN_HEADER))
+            .or_else(|| {
+                header
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("nexus-operation-id"))
+            })
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
 
         // Map the kernel outcome onto the wire completion, synthesizing the Nexus
         // failure body for the non-success kinds (the kernel forwards bare variants; the
@@ -1657,7 +1673,13 @@ where
 
         let delivery = self
             .nexus_completion_client
-            .complete_operation(&target, &token, completion, &callback.links)
+            .complete_operation(
+                &target,
+                &token,
+                &operation_token,
+                completion,
+                &callback.links,
+            )
             .await;
 
         let now = OffsetDateTime::now_utc();

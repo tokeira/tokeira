@@ -267,8 +267,6 @@ where
             );
             let grpc_request = synthetic_grpc_request(&mut parts, metadata, &dispatch);
             let grpc_response = inner.call(grpc_request).await?;
-            #[cfg(feature = "conformance")]
-            conformance_signal_response_grace(&dispatch).await;
             Ok(render_grpc_response(grpc_response, &dispatch).await)
         })
     }
@@ -304,21 +302,6 @@ where
             })
         }
         Ok(false) | Err(_) => Box::pin(service.inner.call(request)),
-    }
-}
-
-#[cfg(feature = "conformance")]
-async fn conformance_signal_response_grace(dispatch: &HttpApiDispatch) {
-    if dispatch.grpc_path
-        == "/temporal.api.workflowservice.v1.WorkflowService/SignalWorkflowExecution"
-    {
-        // The upstream corpus sends a close-only, non-long-poll history request
-        // immediately after Signal and relies on v1.31.0's HTTP gateway/service
-        // boundary giving the already-dispatched worker a turn. Tokeira's direct
-        // in-process Tonic call removes that incidental boundary. Recreate it
-        // only in the conformance binary; the signal is already authoritative
-        // and published, and neither production HTTP nor native gRPC is delayed.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 

@@ -166,6 +166,17 @@ pub(crate) fn merge_priority_stats(
 struct ActivityBrokerState {
     ready: HashMap<QueueKey, OrderedReady<TimestampedActivityTask>>,
     enqueued: HashSet<(RunKey, String, u32, u64)>,
+    /// Last successful claim per physical queue.
+    ///
+    /// The grace scanner must distinguish an idle queue from a deep queue that
+    /// an active poller is steadily draining. Task age alone cannot make that
+    /// distinction: older entries in a healthy backlog naturally outlive the
+    /// grace window while earlier entries are processed. Temporal keeps such
+    /// spooled work in one reader/ack lifecycle until each task is completed
+    /// (`service/matching/backlog_manager.go:165-231 @ v1.31.0`); the
+    /// process-local timestamp preserves that progress property across
+    /// Tokeira's live-broker/durable-backlog split.
+    last_take_at: HashMap<QueueKey, Instant>,
     ordering: DeliveryOrdering,
     waiter_counts: HashMap<QueueKey, usize>,
     /// Per-queue wake handles (see the module's "Per-queue wake pattern").
@@ -180,6 +191,7 @@ impl Default for ActivityBrokerState {
         Self {
             ready: HashMap::new(),
             enqueued: HashSet::new(),
+            last_take_at: HashMap::new(),
             ordering: DeliveryOrdering::default(),
             waiter_counts: HashMap::new(),
             wakes: HashMap::new(),
@@ -195,6 +207,9 @@ struct BrokerState {
     sticky_ready: HashMap<QueueKey, OrderedReady<TimestampedWorkflowTask>>,
     general_ready: HashMap<QueueKey, OrderedReady<TimestampedWorkflowTask>>,
     enqueued: HashSet<(RunKey, LogicalTaskSeq)>,
+    /// Last successful claim per physical queue; see
+    /// [`ActivityBrokerState::last_take_at`].
+    last_take_at: HashMap<QueueKey, Instant>,
     ordering: DeliveryOrdering,
     waiter_counts: HashMap<QueueKey, usize>,
     /// Normal queue → sticky queues whose parked pollers may also consume it.
@@ -863,6 +878,11 @@ impl InMemoryBroker {
             inner
                 .enqueued
                 .remove(&(removed.task.run_key, removed.task.logical_seq));
+            let now = Instant::now();
+            inner.last_take_at.insert(queue.clone(), now);
+            if let Some(normal_queue) = normal_queue {
+                inner.last_take_at.insert(normal_queue.clone(), now);
+            }
             Self::emit_queue_depths(&inner, &removed.task.queue);
             drop(inner);
             if let Some(metric_key) = metric_key {
@@ -1473,16 +1493,37 @@ impl InMemoryBroker {
         grace_window: Duration,
     ) -> Vec<TimestampedWorkflowTask> {
         let mut inner = self.inner.lock().await;
+        let active_queues: HashSet<_> = inner
+            .last_take_at
+            .iter()
+            .filter_map(|(queue, taken_at)| {
+                (taken_at.elapsed() < grace_window).then_some(queue.clone())
+            })
+            .chain(
+                inner
+                    .waiter_counts
+                    .iter()
+                    .filter_map(|(queue, count)| (*count > 0).then_some(queue.clone())),
+            )
+            .chain(
+                inner
+                    .normal_alias_waiter_counts
+                    .iter()
+                    .filter_map(|(queue, count)| (*count > 0).then_some(queue.clone())),
+            )
+            .collect();
         let mut expired = Vec::new();
         let mut dedupe_keys = Vec::new();
         Self::drain_expired_workflow_queue(
             &mut inner.sticky_ready,
+            &active_queues,
             grace_window,
             &mut expired,
             &mut dedupe_keys,
         );
         Self::drain_expired_workflow_queue(
             &mut inner.general_ready,
+            &active_queues,
             grace_window,
             &mut expired,
             &mut dedupe_keys,
@@ -1549,6 +1590,11 @@ impl InMemoryBroker {
             inner
                 .enqueued
                 .remove(&(task.task.run_key, task.task.logical_seq));
+            let now = Instant::now();
+            inner.last_take_at.insert(queue.clone(), now);
+            if general_queue != queue {
+                inner.last_take_at.insert(general_queue.clone(), now);
+            }
             Self::emit_queue_depths(&inner, queue);
             if general_queue != queue {
                 Self::emit_queue_depths(&inner, general_queue);
@@ -1666,11 +1712,15 @@ impl InMemoryBroker {
 
     fn drain_expired_workflow_queue(
         queues: &mut HashMap<QueueKey, OrderedReady<TimestampedWorkflowTask>>,
+        active_queues: &HashSet<QueueKey>,
         grace_window: Duration,
         expired: &mut Vec<TimestampedWorkflowTask>,
         dedupe_keys: &mut Vec<(RunKey, LogicalTaskSeq)>,
     ) {
-        for ready in queues.values_mut() {
+        for (queue, ready) in queues {
+            if active_queues.contains(queue) {
+                continue;
+            }
             while let Some(entry) =
                 ready.remove_where(|entry| entry.entered_at.elapsed() >= grace_window)
             {
@@ -1790,6 +1840,22 @@ impl InMemoryActivityBroker {
             .ready
             .get(queue)
             .is_some_and(|ready| !ready.is_empty())
+    }
+
+    /// Whether this disposable broker still holds the exact durable dispatch offer.
+    ///
+    /// Reconciliation uses this only to avoid revalidating work that is already
+    /// available to pollers. A false result is never proof that the activity is
+    /// absent: after a take, authoritative state still decides whether the scanner
+    /// must republish it. A take racing a true result is therefore harmless — the
+    /// following scan observes the missing key and performs the full durable check.
+    pub async fn contains_activity_task(&self, task: &DispatchableActivityTask) -> bool {
+        self.inner.lock().await.enqueued.contains(&(
+            task.run_key,
+            task.activity_id.clone(),
+            task.attempt,
+            task.stamp,
+        ))
     }
 
     /// Snapshot activity backlog for `DescribeTaskQueue`.
@@ -1981,6 +2047,7 @@ impl InMemoryActivityBroker {
         if let Some(order) = removed.task.order {
             inner.ordering.served(&removed.task.queue, order);
         }
+        inner.last_take_at.insert(queue.clone(), Instant::now());
         inner.enqueued.remove(&(
             removed.task.run_key,
             removed.task.activity_id.clone(),
@@ -2187,9 +2254,25 @@ impl InMemoryActivityBroker {
         grace_window: Duration,
     ) -> Vec<TimestampedActivityTask> {
         let mut inner = self.inner.lock().await;
+        let active_queues: HashSet<_> = inner
+            .last_take_at
+            .iter()
+            .filter_map(|(queue, taken_at)| {
+                (taken_at.elapsed() < grace_window).then_some(queue.clone())
+            })
+            .chain(
+                inner
+                    .waiter_counts
+                    .iter()
+                    .filter_map(|(queue, count)| (*count > 0).then_some(queue.clone())),
+            )
+            .collect();
         let mut expired = Vec::new();
         let mut dedupe_keys = Vec::new();
-        for ready in inner.ready.values_mut() {
+        for (queue, ready) in &mut inner.ready {
+            if active_queues.contains(queue) {
+                continue;
+            }
             while let Some(entry) =
                 ready.remove_where(|entry| entry.entered_at.elapsed() >= grace_window)
             {
@@ -2251,6 +2334,7 @@ impl InMemoryActivityBroker {
                 task.task.attempt,
                 task.task.stamp,
             ));
+            inner.last_take_at.insert(queue.clone(), Instant::now());
         }
         Self::emit_queue_depth(&inner, queue);
         let outcome = task.map_or(ActivityTakeOutcome::Empty, |task| {
@@ -3706,6 +3790,95 @@ mod tests {
             .await;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].task, task);
+    }
+
+    #[tokio::test]
+    async fn active_queues_keep_aged_work_live_until_consumption_stops() {
+        let grace = std::time::Duration::from_secs(1);
+        let aged_at = Instant::now() - std::time::Duration::from_secs(2);
+
+        let workflow_broker = InMemoryBroker::default();
+        let workflow_queue = workflow_queue("workflow", None, None);
+        let first_workflow = workflow_task(workflow_queue.clone());
+        let second_workflow = DispatchableWorkflowTask {
+            run_key: RunKey::new(),
+            ..workflow_task(workflow_queue.clone())
+        };
+        workflow_broker
+            .publish_workflow_task(first_workflow, None)
+            .await;
+        workflow_broker
+            .publish_workflow_task(second_workflow, None)
+            .await;
+        workflow_broker
+            .poll_workflow_task(
+                &workflow_queue,
+                &WorkerIdentity("worker".into()),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap()
+            .expect("one workflow task is ready");
+        {
+            let mut inner = workflow_broker.inner.lock().await;
+            for task in inner
+                .general_ready
+                .get_mut(&workflow_queue)
+                .expect("second workflow task remains")
+                .iter_mut()
+            {
+                task.entered_at = aged_at;
+            }
+        }
+        assert!(workflow_broker.take_expired(grace).await.is_empty());
+        workflow_broker
+            .inner
+            .lock()
+            .await
+            .last_take_at
+            .insert(workflow_queue.clone(), aged_at);
+        assert_eq!(workflow_broker.take_expired(grace).await.len(), 1);
+
+        let activity_broker = InMemoryActivityBroker::default();
+        let activity_queue = activity_queue("activity");
+        let first_activity = activity_task(activity_queue.clone());
+        let second_activity = DispatchableActivityTask {
+            run_key: RunKey::new(),
+            activity_id: "second".into(),
+            ..activity_task(activity_queue.clone())
+        };
+        activity_broker
+            .publish_activity_task(first_activity, None)
+            .await
+            .unwrap();
+        activity_broker
+            .publish_activity_task(second_activity, None)
+            .await
+            .unwrap();
+        activity_broker
+            .poll_activity_task(&activity_queue, std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .expect("one activity task is ready");
+        {
+            let mut inner = activity_broker.inner.lock().await;
+            for task in inner
+                .ready
+                .get_mut(&activity_queue)
+                .expect("second activity task remains")
+                .iter_mut()
+            {
+                task.entered_at = aged_at;
+            }
+        }
+        assert!(activity_broker.take_expired(grace).await.is_empty());
+        activity_broker
+            .inner
+            .lock()
+            .await
+            .last_take_at
+            .insert(activity_queue, aged_at);
+        assert_eq!(activity_broker.take_expired(grace).await.len(), 1);
     }
 
     #[tokio::test]

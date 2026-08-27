@@ -14,11 +14,11 @@ use tokeira_kernel::{
     CompletionCallbackAttemptedRequest, ContinueAsNewVersioningBehavior, DispatchOp,
     ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
     ExternalSignalResult, ExternalWorkflowExecution, FieldChange, Link, LoadedRun,
-    NexusOperationCancellationState, NexusOperationResolvedRequest, NexusResolution,
-    NexusTimeoutType, ParentClosePolicy, PauseActivityRequest, PauseInfo, PauseWorkflowRequest,
-    PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
-    PendingWorkflowTask, Priority, Reject, ReplayContext, RequestDedupeOp, ResetActivityRequest,
-    ResetRequest, RetryContinuation, RetryState, SignalRequest, StartRequest,
+    NexusCompletionOutcome, NexusOperationCancellationState, NexusOperationResolvedRequest,
+    NexusResolution, NexusTimeoutType, ParentClosePolicy, PauseActivityRequest, PauseInfo,
+    PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
+    PendingUpdate, PendingWorkflowTask, Priority, Reject, ReplayContext, RequestDedupeOp,
+    ResetActivityRequest, ResetRequest, RetryContinuation, RetryState, SignalRequest, StartRequest,
     StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState, Transition,
     UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
     UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, UserMetadata, VersionTarget,
@@ -6832,6 +6832,48 @@ proptest! {
         prop_assert!(!transition.next_state.pending_nexus_operations.contains_key(&operation_id));
         prop_assert!(transition.next_state.pending_workflow_task.is_some());
         prop_assert!(transition.request_dedupe_ops.is_empty());
+    }
+
+    // Feature: nexus-async-completion, completion-before-start ordering invariant.
+    #[test]
+    fn completion_before_start_always_publishes_the_handler_token_first(
+        operation_id in arb_small_string(),
+        operation_token in arb_small_string(),
+    ) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(with_pending_nexus_operation(make_open_state(now), &operation_id)),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: operation_id.clone(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::CompletionReceived {
+                    operation_token: operation_token.clone(),
+                    outcome: NexusCompletionOutcome::Succeeded {
+                        result: Payloads::default(),
+                        links: Vec::new(),
+                    },
+                },
+                now,
+            }),
+        ).unwrap();
+
+        prop_assert_eq!(transition.history_events.len(), 3);
+        prop_assert_eq!(
+            matches!(
+                &transition.history_events[0].kind,
+                HistoryEventKind::NexusOperationStarted { operation_token: recorded, .. }
+                    if recorded == &operation_token
+            ),
+            true
+        );
+        prop_assert_eq!(
+            matches!(
+                &transition.history_events[1].kind,
+                HistoryEventKind::NexusOperationCompleted { result, .. } if result.0.is_empty()
+            ),
+            true
+        );
+        prop_assert!(!transition.next_state.pending_nexus_operations.contains_key(&operation_id));
     }
 
     #[test]

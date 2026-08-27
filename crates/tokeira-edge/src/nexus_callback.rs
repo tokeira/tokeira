@@ -12,6 +12,8 @@
 //!
 //! - the `nexus-operation-state` header selects the resolution shape (succeeded / failed /
 //!   canceled); any other value is a bad request;
+//! - the `Nexus-Operation-Token` header is retained so a completion that arrives before
+//!   the async-start response atomically records Started before the terminal event;
 //! - `failed`/`canceled` require `Content-Type: application/json` and a decodable failure
 //!   body, matching the server's `isMediaTypeJSON` + `json.Unmarshal` guards;
 //! - a missing / undecodable / wrong-version callback token is a bad request
@@ -25,7 +27,7 @@
 //! `tokeirad` hyper listener (Wave 5.3) only has to extract headers and map the
 //! [`CallbackResponse`] status onto the wire.
 
-use tokeira_kernel::NexusResolution;
+use tokeira_kernel::{NexusCompletionOutcome, NexusResolution};
 use tokeira_runtime::{NexusCompletionFailureBody, NexusCompletionToken, body_to_payloads};
 
 use crate::workflow_service::WorkflowRuntimeApi;
@@ -74,13 +76,14 @@ impl CallbackResponse {
 
 /// Handle an inbound Nexus completion `POST`, resolving the originator's pending operation.
 ///
-/// `callback_token_header` / `operation_state_header` / `content_type_header` are the
-/// extracted values of `Temporal-Callback-Token`, `nexus-operation-state`, and
-/// `Content-Type`; `body` is the raw request body. See the module docs for the
-/// status taxonomy.
+/// `callback_token_header` / `operation_token_header` / `operation_state_header` /
+/// `content_type_header` are the extracted values of `Temporal-Callback-Token`,
+/// `Nexus-Operation-Token`, `nexus-operation-state`, and `Content-Type`; `body` is the
+/// raw request body. See the module docs for the status taxonomy.
 pub async fn handle_nexus_callback(
     runtime: &dyn WorkflowRuntimeApi,
     callback_token_header: Option<&str>,
+    operation_token_header: Option<&str>,
     operation_state_header: Option<&str>,
     content_type_header: Option<&str>,
     body: &[u8],
@@ -99,6 +102,13 @@ pub async fn handle_nexus_callback(
             return CallbackResponse::bad_request(format!("invalid callback token: {error}"));
         }
     };
+    // The operation token may be empty for old senders, but it must still travel with
+    // the callback: if completion wins the race with the async-start response, v1.31.0
+    // uses this value to fabricate the Started event before the terminal event.
+    let operation_token = operation_token_header
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
 
     // The operation state selects the resolution shape; it is mandatory.
     let Some(state) = operation_state_header
@@ -108,8 +118,8 @@ pub async fn handle_nexus_callback(
         return CallbackResponse::bad_request("missing nexus-operation-state header");
     };
 
-    let resolution = match state {
-        "succeeded" => NexusResolution::Completed {
+    let outcome = match state {
+        "succeeded" => NexusCompletionOutcome::Succeeded {
             result: body_to_payloads(body, content_type_header),
             // Nexus-Link parsing is deferred to `nexus-multi-cluster` (design "Out of
             // Scope"); a single-cluster loopback carries no inbound links.
@@ -142,15 +152,18 @@ pub async fn handle_nexus_callback(
                 // needed here. v1.31.0 createNexusOperationFailure.
                 let cause =
                     tokeira_proto::conversions::common::payload_to_failure(&failure_body.failure);
-                crate::translate::nexus::wrap_handler_failure_as_resolution(
-                    cause,
-                    token.endpoint.clone(),
-                    token.service.clone(),
-                    token.operation.clone(),
-                    token.scheduled_event_id,
-                )
+                NexusCompletionOutcome::Failed {
+                    failure: crate::translate::nexus::wrap_completion_failure(
+                        cause,
+                        token.endpoint.clone(),
+                        token.service.clone(),
+                        token.operation.clone(),
+                        token.scheduled_event_id,
+                        operation_token.clone(),
+                    ),
+                }
             } else {
-                NexusResolution::Canceled
+                NexusCompletionOutcome::Canceled
             }
         }
         other => {
@@ -158,6 +171,10 @@ pub async fn handle_nexus_callback(
                 "unsupported nexus-operation-state: {other}"
             ));
         }
+    };
+    let resolution = NexusResolution::CompletionReceived {
+        operation_token,
+        outcome,
     };
 
     match runtime

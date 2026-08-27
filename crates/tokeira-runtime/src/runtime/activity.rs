@@ -1797,6 +1797,14 @@ where
 {
     let mut published = 0usize;
     for candidate in candidates {
+        // Broker-resident work needs no healing. Skipping it prevents every
+        // scanner tick from reloading authoritative state and workflow rules for
+        // the entire healthy backlog. The observation carries no correctness
+        // weight: once a poll takes the offer its dedupe key disappears, so a
+        // lost take is fully revalidated and republished on the following tick.
+        if deps.broker.contains_activity_task(&candidate.task).await {
+            continue;
+        }
         match prepare_activity_dispatch_publish(deps, &candidate.task, now).await {
             Ok(ActivityDispatchPreparation::Publish(task)) => {
                 if let Err(error) = deps
@@ -3271,6 +3279,38 @@ mod tests {
         let mut missing_scheduled = backoff_fixture_activity(2);
         missing_scheduled.last_attempt_complete_time = Some(now());
         assert!(activity_backoff_interval_seconds(&missing_scheduled).is_err());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_skips_activity_already_resident_in_broker() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let (state, queue, _task) = seed_scheduled_activity(&runtime, &repo).await;
+        let deps = runtime.activity_retry_deps();
+
+        let published = reconcile_due_activity_dispatches_once(
+            &deps,
+            tokeira_types::ShardId(0),
+            OffsetDateTime::now_utc(),
+            1,
+        )
+        .await;
+
+        assert_eq!(published, 0, "resident work needs no reconciliation");
+        let offered = deps
+            .broker
+            .poll_activity_task(&queue, std::time::Duration::ZERO)
+            .await
+            .expect("poll broker")
+            .expect("original broker offer remains available");
+        assert_eq!(offered.0.run_key, state.run_key);
     }
 
     #[tokio::test]

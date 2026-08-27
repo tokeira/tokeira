@@ -1955,6 +1955,7 @@ struct RecordingCompletionClient {
 struct RecordedCompletion {
     url: String,
     token: String,
+    operation_token: String,
     state: String,
 }
 
@@ -1981,12 +1982,14 @@ impl NexusCompletionClient for RecordingCompletionClient {
         &self,
         url: &str,
         token: &str,
+        operation_token: &str,
         completion: NexusCompletion,
         _links: &[tokeira_kernel::Link],
     ) -> Result<CompletionDeliveryOutcome> {
         self.calls.lock().unwrap().push(RecordedCompletion {
             url: url.to_string(),
             token: token.to_string(),
+            operation_token: operation_token.to_string(),
             state: completion.operation_state().to_string(),
         });
         Ok(self
@@ -2025,6 +2028,7 @@ impl NexusCompletionClient for ConcurrentRetryCompletionClient {
         &self,
         _url: &str,
         _token: &str,
+        _operation_token: &str,
         _completion: NexusCompletion,
         _links: &[tokeira_kernel::Link],
     ) -> Result<CompletionDeliveryOutcome> {
@@ -2076,16 +2080,19 @@ fn runtime_with_completion_client(
     )
 }
 
-/// A `temporal://system` Nexus completion callback carrying `token` in its
-/// `Temporal-Callback-Token` header — the shape tokeira attaches to a handler workflow.
+/// A `temporal://system` Nexus completion callback carrying its routing and operation
+/// tokens — the shape WorkflowRunOperation attaches to a handler workflow.
 fn system_completion_callback(token: &str) -> CompletionCallback {
     CompletionCallback {
         spec: CallbackSpec::Nexus {
             url: SYSTEM_CALLBACK_URL.to_string(),
-            header: std::collections::BTreeMap::from([(
-                "Temporal-Callback-Token".to_string(),
-                token.to_string(),
-            )]),
+            header: std::collections::BTreeMap::from([
+                ("Temporal-Callback-Token".to_string(), token.to_string()),
+                (
+                    "Nexus-Operation-Token".to_string(),
+                    "worker-operation-token".to_string(),
+                ),
+            ]),
         },
         links: Vec::new(),
         trigger: CallbackTrigger::WorkflowClosed,
@@ -2225,6 +2232,7 @@ async fn completion_callback_delivered_on_close_succeeds() -> Result<()> {
         )
     );
     assert_eq!(calls[0].state, "succeeded");
+    assert_eq!(calls[0].operation_token, "worker-operation-token");
     let decoded = NexusCompletionToken::decode(&calls[0].token).expect("token round-trips");
     assert_eq!(decoded.operation_id, "op-async");
     assert_eq!(decoded.scheduled_event_id, 7);
@@ -2263,10 +2271,13 @@ async fn completion_callback_fires_with_lowercased_token_header() -> Result<()> 
     let callback = CompletionCallback {
         spec: CallbackSpec::Nexus {
             url: SYSTEM_CALLBACK_URL.to_string(),
-            header: std::collections::BTreeMap::from([(
-                "temporal-callback-token".to_string(),
-                token.clone(),
-            )]),
+            header: std::collections::BTreeMap::from([
+                ("temporal-callback-token".to_string(), token.clone()),
+                (
+                    "nexus-operation-token".to_string(),
+                    "lowercase-operation-token".to_string(),
+                ),
+            ]),
         },
         links: Vec::new(),
         trigger: CallbackTrigger::WorkflowClosed,
@@ -2304,6 +2315,7 @@ async fn completion_callback_fires_with_lowercased_token_header() -> Result<()> 
         !calls[0].token.is_empty(),
         "the lowercased token header must still be found and forwarded"
     );
+    assert_eq!(calls[0].operation_token, "lowercase-operation-token");
     let decoded = NexusCompletionToken::decode(&calls[0].token)
         .expect("the forwarded token decodes (it was not dropped)");
     assert_eq!(decoded.operation_id, "op-lower");

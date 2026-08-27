@@ -12,17 +12,18 @@ use tokeira_kernel::{
     DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
     ExternalSignalResult, ExternalWorkflowExecution, FieldChange, LoadedRun, MemoPatch,
     NexusCancellationAttemptOutcome, NexusCancellationAttemptedRequest,
-    NexusCancellationRetryRequest, NexusOperationCancellationState, NexusOperationResolvedRequest,
-    NexusOperationRetryRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
-    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
-    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ProjectionOp,
-    Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState, SearchAttributesPatch,
-    SignalRequest, SignalWithStartRequest, StartDeploymentTransitionRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest, TerminateRequest,
-    TimerDueRequest, TimerState, Transition, UnpauseActivityRequest, UnpauseWorkflowRequest,
-    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
-    VersioningBehavior, VersioningOverride, VersioningOverrideChange,
-    WORKFLOW_START_DELAY_TIMER_ID, WorkerDeploymentVersionRef, WorkerVersionStamp, WorkflowCommand,
+    NexusCancellationRetryRequest, NexusCompletionOutcome, NexusOperationCancellationState,
+    NexusOperationResolvedRequest, NexusOperationRetryRequest, NexusResolution, NexusTimeoutType,
+    ParentClosePolicy, PauseActivityRequest, PauseInfo, PauseWorkflowRequest,
+    PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
+    PendingWorkflowTask, ProjectionOp, Reject, ReplayContext, ResetActivityRequest, ResetRequest,
+    RetryState, SearchAttributesPatch, SignalRequest, SignalWithStartRequest,
+    StartDeploymentTransitionRequest, StartRequest, StartWorkflowTaskRequest,
+    TerminateOnWorkflowTaskFailedRequest, TerminateRequest, TimerDueRequest, TimerState,
+    Transition, UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningBehavior,
+    VersioningOverride, VersioningOverrideChange, WORKFLOW_START_DELAY_TIMER_ID,
+    WorkerDeploymentVersionRef, WorkerVersionStamp, WorkflowCommand,
     WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest, WorkflowState,
     WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
     WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTaskWorkerVersion,
@@ -8067,6 +8068,93 @@ fn nexus_operation_resolved_completed() {
             .contains_key("op-1")
     );
     assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn nexus_completion_before_start_records_token_before_empty_result() {
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::CompletionReceived {
+                    operation_token: "worker-operation-token".into(),
+                    outcome: NexusCompletionOutcome::Succeeded {
+                        result: Payloads::default(),
+                        links: Vec::new(),
+                    },
+                },
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 3);
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::NexusOperationStarted {
+            scheduled_event_id: 12,
+            operation_token,
+            ..
+        } if operation_token == "worker-operation-token"
+    ));
+    assert!(matches!(
+        &transition.history_events[1].kind,
+        HistoryEventKind::NexusOperationCompleted {
+            scheduled_event_id: 12,
+            result,
+            ..
+        } if result.0.is_empty()
+    ));
+    assert!(matches!(
+        transition.history_events[2].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+    assert!(
+        !transition
+            .next_state
+            .pending_nexus_operations
+            .contains_key("op-1")
+    );
+}
+
+#[test]
+fn nexus_completion_after_start_does_not_duplicate_started_event() {
+    let mut state = with_started_nexus_operation(make_open_state(), "op-1");
+    state
+        .pending_nexus_operations
+        .get_mut("op-1")
+        .expect("operation is pending")
+        .operation_token = "worker-operation-token".into();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::CompletionReceived {
+                    operation_token: "worker-operation-token".into(),
+                    outcome: NexusCompletionOutcome::Succeeded {
+                        result: Payloads::default(),
+                        links: Vec::new(),
+                    },
+                },
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 2);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::NexusOperationCompleted { .. }
+    ));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
 }
 
 #[test]

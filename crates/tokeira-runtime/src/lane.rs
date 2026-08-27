@@ -887,6 +887,7 @@ where
                                 tokeira_kernel::NexusResolution::Completed { .. }
                                     | tokeira_kernel::NexusResolution::Failed { .. }
                                     | tokeira_kernel::NexusResolution::Canceled
+                                    | tokeira_kernel::NexusResolution::CompletionReceived { .. }
                                     | tokeira_kernel::NexusResolution::TimedOut { .. }
                             )
                         {

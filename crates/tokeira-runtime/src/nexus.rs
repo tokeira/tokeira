@@ -46,6 +46,12 @@ pub const COMPLETION_TOKEN_VERSION: u8 = 1;
 /// (`common/nexus/callback_token.go:17 @ v1.31.0`).
 pub const TEMPORAL_CALLBACK_TOKEN_HEADER: &str = "Temporal-Callback-Token";
 
+/// HTTP header carrying the handler-issued operation token on a completion callback.
+/// The receiver uses it to record a missing started event when completion beats the
+/// async-start response (`nexus.HeaderOperationToken`,
+/// `common/nexus/nexusrpc/completion.go @ v1.31.0`).
+pub const NEXUS_OPERATION_TOKEN_HEADER: &str = "Nexus-Operation-Token";
+
 /// HTTP header carrying the terminal operation state (`succeeded`/`failed`/`canceled`)
 /// on a completion `POST`. Verbatim from `headerOperationState = "nexus-operation-state"`
 /// (`common/nexus/nexusrpc/api.go:23 @ v1.31.0`). The firing client sets it; the inbound
@@ -906,8 +912,9 @@ pub trait NexusCompletionClient: Send + Sync {
     /// `POST {url}` a Nexus operation `completion`.
     ///
     /// Sets `Nexus-Operation-State` (from `completion`), `Temporal-Callback-Token` (the
-    /// already-encoded `token` string, sent verbatim), and `User-Agent: temporalio/server`
-    /// (the inbound handler validates this). The body follows the `completion` variant:
+    /// already-encoded `token` string, sent verbatim), `Nexus-Operation-Token` (the
+    /// handler-issued `operation_token`), and `User-Agent: temporalio/server` (the inbound
+    /// handler validates this). The body follows the `completion` variant:
     /// `Succeeded` sends the result `Payloads` (payload-serializer content-type);
     /// `Failed`/`Canceled` send the JSON Nexus failure with `Content-Type:
     /// application/json`. The `url` is always a resolved `http(s)://` address — the runtime
@@ -925,6 +932,7 @@ pub trait NexusCompletionClient: Send + Sync {
         &self,
         url: &str,
         token: &str,
+        operation_token: &str,
         completion: NexusCompletion,
         links: &[Link],
     ) -> Result<CompletionDeliveryOutcome>;
@@ -1966,6 +1974,7 @@ impl NexusCompletionClient for NoopNexusCompletionClient {
         &self,
         _url: &str,
         _token: &str,
+        _operation_token: &str,
         _completion: NexusCompletion,
         _links: &[Link],
     ) -> Result<CompletionDeliveryOutcome> {

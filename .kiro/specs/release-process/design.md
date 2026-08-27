@@ -79,15 +79,16 @@ invocations are `--locked`, tests run under nextest. The command lines are rende
 shared with the finishing-bar documentation — the one-definition invariant is enforced by a test, not
 by prose.
 
-**Pinned pair, fail-closed (Req 8).** `dagger_reexec` resolves the engine from `tokeira-build`'s pin
-site and refuses to run when it is absent or unreachable, printing the bootstrap remediation; the
-upstream CLI's implicit-provisioning path is never taken by `tkr ci`.
+**Pinned pair, fail-closed (Req 8).** The in-process session connects to the engine named by
+`tokeira-build`'s pin site and refuses to run when it is absent or unreachable, printing the bootstrap
+remediation; the upstream CLI's implicit-provisioning path is never taken by `tkr ci`.
 
 ### 2. CLI — `apps/tkr/src/commands/ci/` and `apps/tkr/src/commands/compat/bump.rs`
 
-`tkr ci check [--check <name>] [--json]` re-execs under `dagger run` (shared `dagger_reexec` helper,
-extracted from `commands/image/` into `apps/tkr/src/dagger_reexec.rs` so both groups consume it),
-invokes `run_ci_checks`, renders the report, and exits non-zero on any failure.
+`tkr ci check [--check <name>] [--json]` connects an in-process Dagger session — the settled pattern
+the image and bundle flows use: no wrapper process, no session environment variables (the earlier
+`dagger_reexec` re-exec framing is retired) — invokes `run_ci_checks`, renders the report, and exits
+non-zero on any failure.
 `tkr compat bump --to <version> [--dry-run] [--no-open] [--derive-surfaces] [--resume ...]` is a thin
 wrapper over the bump engine.
 

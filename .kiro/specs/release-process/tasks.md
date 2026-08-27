@@ -68,9 +68,10 @@ no unlanded external tasks are assumed. Remote triggers are out of scope (`pipel
     - _Requirements: 4.1, 4.2_
 
 - [ ] 5. CLI wiring (`apps/tkr`)
-  - [ ] 5.1 Extract the shared `dagger_reexec` helper into `apps/tkr/src/dagger_reexec.rs`; wire
-    `tkr ci check [--check] [--json]`. Fail-closed on the pinned pair: refuse with the bootstrap
-    remediation when the pinned engine is absent; never provision an upstream CLI implicitly.
+  - [ ] 5.1 Wire `tkr ci check [--check] [--json]` over an in-process Dagger session (the image and
+    bundle flows' pattern — no re-exec wrapper; the deprecated `dagger_reexec` framing is retired).
+    Fail-closed on the pinned pair: refuse with the bootstrap remediation when the pinned engine is
+    absent; never provision an upstream CLI implicitly.
     - _Requirements: 2.4, 6.2, 8.1, 8.2_
   - [ ] 5.2 Wire `tkr compat bump --to <version> [--dry-run] [--no-open] [--derive-surfaces] [--resume]`.
     - _Requirements: 4.1, 4.3_

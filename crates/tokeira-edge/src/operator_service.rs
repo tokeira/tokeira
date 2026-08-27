@@ -157,11 +157,16 @@ pub struct InMemoryOperatorApi {
 }
 
 impl InMemoryOperatorApi {
-    pub fn new(cluster_name: impl Into<String>) -> Self {
+    /// Builds the in-memory service with the caller's opaque server identity.
+    ///
+    /// Keeping composition above the compatibility edge prevents this crate from
+    /// acquiring build-environment policy while ensuring every discovery response
+    /// reports one consistent value.
+    pub fn new(cluster_name: impl Into<String>, server_version: impl Into<String>) -> Self {
         Self {
             cluster_info: RwLock::new(ClusterInfo {
                 cluster_name: cluster_name.into(),
-                version: "0.1.0-dev".to_string(),
+                version: server_version.into(),
                 notes: vec!["in-memory operator api".to_string()],
                 shard_count: 1,
                 supported_clients: BTreeMap::from([
@@ -527,6 +532,16 @@ mod tests {
 
     use super::*;
     use crate::namespace_cache::{InMemoryNamespaceCache, NamespaceCache};
+
+    #[tokio::test]
+    async fn cluster_info_preserves_the_caller_supplied_server_version() {
+        let api = InMemoryOperatorApi::new("tokeira-local", "0.1.0+abcdef12");
+
+        assert_eq!(
+            api.cluster_info().await.expect("cluster info").version,
+            "0.1.0+abcdef12"
+        );
+    }
 
     proptest! {
         /// Exactly one selector is accepted; invalid selector pairs are rejected by a

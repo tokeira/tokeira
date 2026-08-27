@@ -310,7 +310,7 @@ mod tests {
             .insert(crate::namespace_cache::ResolvedNamespace::active("default"))
             .await
             .unwrap();
-        let api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
         let service = OperatorService::new(
             api.clone(),
             Arc::new(EdgeInterceptors::permissive(namespaces)),
@@ -357,7 +357,7 @@ mod tests {
             .insert(crate::namespace_cache::ResolvedNamespace::active("default"))
             .await
             .unwrap();
-        let api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
         let service = OperatorService::new(api, Arc::new(EdgeInterceptors::permissive(namespaces)));
         let grpc = OperatorServiceGrpc::new(service);
 
@@ -392,7 +392,7 @@ mod tests {
             .await
             .unwrap();
         let deletion = Arc::new(RecordingNamespaceDeletion::default());
-        let api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
         let service = OperatorService::new(
             api,
             Arc::new(EdgeInterceptors::permissive(namespaces.clone())),
@@ -439,7 +439,7 @@ mod tests {
             .unwrap();
         let deletion = Arc::new(RecordingNamespaceDeletion::default());
         let service = OperatorService::new(
-            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
             Arc::new(EdgeInterceptors::permissive(namespaces.clone())),
         )
         .with_namespace_deletion(namespaces.clone(), deletion);

@@ -2366,6 +2366,7 @@ fn log_build_info(process: &'static str) {
     let info = tokeira_build_info::summary();
     tracing::info!(
         process,
+        server_version = tokeira_build_info::SERVER_VERSION,
         tokeira_version = info.tokeira_version,
         tokeira_git_sha = info.tokeira_git_sha,
         temporal_proto_version = info.temporal_proto_version,
@@ -2383,6 +2384,7 @@ fn render_build_info(verbose: bool, json: bool) -> String {
     let info = tokeira_build_info::summary();
     if json {
         return serde_json::json!({
+            "server_version": tokeira_build_info::SERVER_VERSION,
             "tokeira_version": info.tokeira_version,
             "tokeira_git_sha": info.tokeira_git_sha,
             "temporal_proto_version": info.temporal_proto_version,
@@ -2398,6 +2400,7 @@ fn render_build_info(verbose: bool, json: bool) -> String {
 
     if verbose {
         return [
+            format!("server_version: {}", tokeira_build_info::SERVER_VERSION),
             format!("tokeira_version: {}", info.tokeira_version),
             format!("tokeira_git_sha: {}", info.tokeira_git_sha),
             format!("temporal_proto_version: {}", info.temporal_proto_version),
@@ -2412,8 +2415,11 @@ fn render_build_info(verbose: bool, json: bool) -> String {
     }
 
     format!(
-        "tokeira {}\ngit {}\nbuild {}",
-        info.tokeira_version, info.tokeira_git_sha, info.build_mode
+        "tokeira {}\ngit {}\ntemporal_proto {}\ntemporal_server {}",
+        tokeira_build_info::SERVER_VERSION,
+        info.tokeira_git_sha,
+        info.temporal_proto_version,
+        info.temporal_server_compat
     )
 }
 
@@ -3235,7 +3241,7 @@ where
     let visibility = Arc::new(VisibilityQueryService::new(visibility_query_store));
     let long_polls = LongPollGate::new(LongPollConfig::default());
     let operator_api = Arc::new(VisibilityRegistryOperatorApi::new(
-        InMemoryOperatorApi::new("tokeira-local"),
+        InMemoryOperatorApi::new("tokeira-local", tokeira_build_info::SERVER_VERSION),
         operator_visibility_store,
     ));
 
@@ -5166,6 +5172,10 @@ mod tests {
         assert_eq!(short, render_build_info(false, false));
         assert_eq!(verbose, render_build_info(true, false));
         assert_eq!(json, render_build_info(false, true));
+        assert!(short.contains(tokeira_build_info::SERVER_VERSION));
+        assert!(short.contains(tokeira_build_info::TEMPORAL_PROTO_VERSION));
+        assert!(short.contains(tokeira_build_info::TEMPORAL_SERVER_COMPAT));
+        assert!(json.contains("server_version"));
         assert!(json.contains("temporal_proto_version"));
     }
 

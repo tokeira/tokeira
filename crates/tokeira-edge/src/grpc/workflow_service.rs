@@ -4588,7 +4588,7 @@ mod tests {
 
     fn versioning_test_service() -> (WorkflowServiceGrpc, tokeira_runtime::InMemoryBroker) {
         let cache = Arc::new(InMemoryNamespaceCache::new());
-        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
         let broker = tokeira_runtime::InMemoryBroker::default();
         let service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
             Arc::new(PollNoneRuntime),
@@ -4616,7 +4616,7 @@ mod tests {
             .insert(ResolvedNamespace::active("default"))
             .await
             .expect("default namespace should seed");
-        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
         let broker = tokeira_runtime::InMemoryBroker::default();
         let service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
             Arc::new(PollNoneRuntime),
@@ -4675,7 +4675,7 @@ mod tests {
                 Arc::new(NoopResolver),
                 Arc::new(EmptyVisibilityApi),
                 Arc::new(tokeira_storage::InMemoryStore::default()),
-                Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+                Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
                 cache.clone(),
                 Arc::new(EdgeInterceptors::configured(cache, authenticator, false)),
                 PollerRegistry::default(),
@@ -4713,7 +4713,7 @@ mod tests {
 
     fn worker_deployment_test_service() -> WorkflowServiceGrpc {
         let cache: Arc<dyn NamespaceCache> = Arc::new(StaticNamespaceCache);
-        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
         let service =
             WorkflowService::new_with_stores_and_buffered_queries_and_history_wait_registry(
                 Arc::new(PollNoneRuntime),
@@ -4784,7 +4784,7 @@ mod tests {
         store: Arc<dyn tokeira_runtime::TaskQueueConfigStore>,
     ) -> WorkflowServiceGrpc {
         let cache: Arc<dyn NamespaceCache> = Arc::new(StaticNamespaceCache);
-        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
         let service =
             WorkflowService::new_with_stores_and_buffered_queries_and_history_wait_registry(
                 Arc::new(PollNoneRuntime),
@@ -5139,7 +5139,7 @@ mod tests {
         nexus_http_waiters: crate::nexus_http::NexusHttpWaiterRegistry,
     ) -> (WorkflowServiceGrpc, NexusTaskBroker) {
         let cache = Arc::new(StaticNamespaceCache);
-        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
         let broker = tokeira_runtime::InMemoryBroker::default();
         let nexus_broker = NexusTaskBroker::default();
         let service =
@@ -5971,7 +5971,7 @@ mod tests {
             .insert(ResolvedNamespace::active("default"))
             .await
             .unwrap();
-        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
 
         let service = WorkflowService::new(
             Arc::new(PollNoneRuntime),
@@ -6020,7 +6020,7 @@ mod tests {
             .insert(ResolvedNamespace::active("default"))
             .await
             .unwrap();
-        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
 
         let service = WorkflowService::new(
             Arc::new(PollNoneRuntime),
@@ -6069,7 +6069,7 @@ mod tests {
             .insert(ResolvedNamespace::active("default"))
             .await
             .unwrap();
-        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
 
         // Create a gate with max_concurrent = 1 and
         // short admission timeout
@@ -6144,7 +6144,7 @@ mod tests {
             Arc::new(NoopResolver),
             Arc::new(EmptyVisibilityApi),
             Arc::new(tokeira_storage::InMemoryStore::default()),
-            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
@@ -6228,7 +6228,7 @@ mod tests {
             Arc::new(NoopResolver),
             Arc::new(EmptyVisibilityApi),
             Arc::new(tokeira_storage::InMemoryStore::default()),
-            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
@@ -6339,7 +6339,7 @@ mod tests {
             Arc::new(NoopResolver),
             Arc::new(EmptyVisibilityApi),
             Arc::new(tokeira_storage::InMemoryStore::default()),
-            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
@@ -6383,7 +6383,7 @@ mod tests {
             Arc::new(NoopResolver),
             Arc::new(EmptyVisibilityApi),
             Arc::new(tokeira_storage::InMemoryStore::default()),
-            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
@@ -6431,7 +6431,7 @@ mod tests {
             Arc::new(NoopResolver),
             Arc::new(EmptyVisibilityApi),
             Arc::new(tokeira_storage::InMemoryStore::default()),
-            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
@@ -6510,7 +6510,7 @@ mod tests {
             Arc::new(NoopResolver),
             Arc::new(EmptyVisibilityApi),
             repo.clone(),
-            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),

@@ -6,10 +6,16 @@
 
 pub mod pinned;
 
+#[cfg(test)]
+#[path = "provenance.rs"]
+mod provenance;
+
 /// Tokeira package version embedded in the binary.
 pub const TOKEIRA_VERSION: &str = env!("TOKEIRA_BUILD_INFO_VERSION");
 /// Short source revision, or a dev-mode fallback when git is unavailable.
 pub const TOKEIRA_GIT_SHA: &str = env!("TOKEIRA_BUILD_INFO_GIT_SHA");
+/// SDK-visible server version with source identity in SemVer build metadata.
+pub const SERVER_VERSION: &str = env!("TOKEIRA_BUILD_INFO_SERVER_VERSION");
 /// Vendored upstream Temporal proto version.
 pub const TEMPORAL_PROTO_VERSION: &str = env!("TOKEIRA_BUILD_INFO_PROTO_VERSION");
 /// Temporal server version whose SDK-visible behavior Tokeira claims to match.
@@ -101,6 +107,8 @@ const fn parse_decimal(value: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, process::Command};
+
     use super::*;
 
     #[test]
@@ -112,6 +120,43 @@ mod tests {
         assert_eq!(
             info.schema_migration_set_digest,
             "sha256:fb8d7c84c771a8cc9a9a8a53dca33a195d4ac7377e76df273171e7ee3d5e5892"
+        );
+    }
+
+    #[test]
+    fn server_version_is_semver_with_git_sha_build_metadata() {
+        let package = tempfile::tempdir().expect("temporary semver package");
+        fs::create_dir(package.path().join("src")).expect("create source directory");
+        fs::write(
+            package.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"server-version-check\"\nversion = \"{SERVER_VERSION}\"\nedition = \"2024\"\n"
+            ),
+        )
+        .expect("write semver manifest");
+        fs::write(package.path().join("src/lib.rs"), "").expect("write source");
+
+        let output = Command::new("cargo")
+            .args([
+                "metadata",
+                "--offline",
+                "--no-deps",
+                "--format-version=1",
+                "--manifest-path",
+            ])
+            .arg(package.path().join("Cargo.toml"))
+            .output()
+            .expect("run cargo metadata");
+        assert!(
+            output.status.success(),
+            "server version must parse as SemVer: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            SERVER_VERSION
+                .rsplit_once('+')
+                .map(|(_, metadata)| metadata),
+            Some(TOKEIRA_GIT_SHA)
         );
     }
 }

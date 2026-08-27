@@ -69,6 +69,8 @@ pub enum ConfigOption {
     AllowUnverifiedCompatibility,
     /// Selection of a newly owned exact-release CLI session.
     IsolatedCliSession,
+    /// Workspace dependency-lock policy.
+    LockMode,
 }
 
 impl fmt::Display for ConfigOption {
@@ -86,6 +88,7 @@ impl fmt::Display for ConfigOption {
             Self::HttpConnectTimeout => "HTTP connect timeout",
             Self::AllowUnverifiedCompatibility => "unverified compatibility bypass",
             Self::IsolatedCliSession => "isolated CLI session selection",
+            Self::LockMode => "workspace lock mode",
         })
     }
 }

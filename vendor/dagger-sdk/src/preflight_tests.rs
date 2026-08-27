@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use proptest::prelude::*;
 
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, LockMode};
 use crate::connection::{EngineConnection, EngineConnectionError};
 use crate::diagnostic::{
     Diagnostic, DiagnosticDispatcher, DiagnosticInput, DiagnosticSink, DiagnosticSinkError,
@@ -833,4 +833,29 @@ fn isolated_cli_session_ignores_ambient_source_selection() {
     assert!(request.ambient().runner().host().is_none());
     assert!(request.ambient().runner().token().is_none());
     assert!(request.ambient().propagation().values()[0].1.is_some());
+}
+
+#[test]
+fn owned_cli_session_passes_the_native_lock_mode() {
+    let counts = Arc::new(BoundaryCounts::default());
+    let context = RecordingContext {
+        directory: true,
+        inputs: ProcessInputs::for_test(None, None, None),
+        counts,
+    };
+    let config = ClientConfig::builder()
+        .isolated_cli_session()
+        .lock_mode(LockMode::Frozen)
+        .build()
+        .expect("the isolated CLI configuration is valid");
+
+    let plan = preflight_with(config, &context).expect("isolated source planning succeeds");
+    let ConnectionPlan::NewCli { request, .. } = plan else {
+        panic!("an isolated session must select a new CLI");
+    };
+
+    assert_eq!(
+        request.arguments(),
+        ["session", "--lock", "frozen"].map(OsString::from)
+    );
 }

@@ -1,8 +1,52 @@
 use std::{fs, path::PathBuf, process::Command};
 
-use dagger_sdk::{Client, HostDirectoryOpts};
+use dagger_sdk::{Client, Container, HostDirectoryOpts, Query};
 
-use crate::{Arch, BuildError, rust_toolchain_version};
+use crate::{Arch, BuildError, CI_FMT_NIGHTLY, rust_toolchain_version};
+
+pub(crate) const BUILDER_APT_LINE: &str = "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler libprotobuf-dev ca-certificates cmake clang git curl jq && rm -rf /var/lib/apt/lists/*";
+
+/// Construct the shared image/CI builder toolchain before source or caches are attached.
+///
+/// Source-dependent inputs stay outside this definition so CI cache names can be
+/// derived from the toolchain alone: editing Rust code must reuse warm registry
+/// and target volumes, while advancing the base image or fmt nightly re-keys them.
+pub(crate) fn builder_toolchain(query: &Query, toolchain: &str) -> Container {
+    query
+        .container()
+        .from(format!("rust:{toolchain}-slim-bookworm"))
+        .with_exec(vec!["sh", "-c", BUILDER_APT_LINE])
+        .with_exec(vec![
+            "rustup",
+            "toolchain",
+            "install",
+            CI_FMT_NIGHTLY,
+            "--profile",
+            "minimal",
+            "--component",
+            "rustfmt",
+        ])
+        .with_exec(vec![
+            "rustup",
+            "component",
+            "add",
+            "--toolchain",
+            toolchain,
+            "clippy",
+        ])
+        .with_env_variable("CARGO_TERM_COLOR", "never")
+        // The visible evidence stays aligned with the fleet's `+nightly`
+        // spelling, while the Dagger command names this dated pin so a new
+        // nightly release cannot silently change formatting.
+        .with_env_variable("NIGHTLY_FMT_TOOLCHAIN", CI_FMT_NIGHTLY)
+        .with_env_variable("RUSTUP_TOOLCHAIN", toolchain)
+}
+
+pub(crate) fn builder_definition(toolchain: &str) -> String {
+    format!(
+        "rust:{toolchain}-slim-bookworm\n{BUILDER_APT_LINE}\nrustfmt:{CI_FMT_NIGHTLY}\nclippy:{toolchain}"
+    )
+}
 
 /// Paths excluded from the workspace upload that feeds the Dagger build.
 ///
@@ -25,6 +69,7 @@ const TOKEIRAD_WORKSPACE_EXCLUDES: &[&str] = &[
     "target",
     "**/target",
     ".git",
+    ".tokeira-build",
     ".github",
     ".vscode",
     ".idea",
@@ -96,25 +141,13 @@ pub async fn build_tokeirad_image(
     let target_cache = query.cache_volume(format!("tokeira-build-target-{rust_target}"));
 
     let built_path = format!("target/{rust_target}/release/tokeirad");
-    let builder = query
-        .container()
-        .from(format!("rust:{toolchain}-slim-bookworm"))
-        .with_exec(vec![
-            "sh",
-            "-c",
-            "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler libprotobuf-dev ca-certificates && rm -rf /var/lib/apt/lists/*",
-        ])
-        .with_env_variable("CARGO_TERM_COLOR", "never")
-        .with_env_variable("RUSTUP_TOOLCHAIN", &toolchain)
+    let builder = builder_toolchain(&query, &toolchain)
         // The build script treats release+CI as the fail-closed provenance path. Resolve
         // these values before `.git` is excluded from the Dagger source upload so the
         // shipped binary identifies the exact host worktree that supplied its bytes.
         .with_env_variable("CI", "true")
         .with_env_variable("TOKEIRA_GIT_SHA", &provenance.git_sha)
-        .with_env_variable(
-            "TOKEIRA_SOURCE_TREE_HASH",
-            &provenance.source_tree_hash,
-        )
+        .with_env_variable("TOKEIRA_SOURCE_TREE_HASH", &provenance.source_tree_hash)
         .with_exec(vec!["rustup", "target", "add", rust_target])
         .with_mounted_cache(registry_cache, "/usr/local/cargo/registry")
         .with_mounted_cache(target_cache, "/app/target")

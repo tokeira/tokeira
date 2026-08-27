@@ -177,7 +177,7 @@ mod provisioning_control;
 mod provisioning_error;
 mod session_startup;
 
-pub use config::{ClientConfig, ClientConfigBuilder};
+pub use config::{ClientConfig, ClientConfigBuilder, LockMode};
 pub use connection::{EngineConnection, EngineConnectionError, EngineConnectionErrorKind};
 pub use diagnostic::{Diagnostic, DiagnosticSink, DiagnosticSinkError, DiagnosticStream};
 pub use errors::{

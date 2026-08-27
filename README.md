@@ -4,7 +4,10 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 <p align="center">
-  <img src="docs/assets/tokeira-signature.png" width="600" alt="Tokeira brand signature — a hand-brushed ink hare nosing a clay-orange dandelion clock, beside the hand-lettered Tokeira wordmark">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tokeira-signature-dark.png">
+    <img src="docs/assets/tokeira-signature.png" width="600" alt="Tokeira brand signature — a hand-brushed ink hare nosing a clay-orange dandelion clock, beside the hand-lettered Tokeira wordmark">
+  </picture>
 </p>
 
 A Temporal-compatible durable execution engine, built in Rust and specialized

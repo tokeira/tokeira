@@ -74,12 +74,12 @@ silently defaulted.
 The release gate is the in-scope ordered plan, not every top-level Go entrypoint in
 the fork. The plan expands to 64 test-bearing entrypoints:
 
-- Tier 5.32 is the public HSM callbacks mode, `TestCallbacksSuiteHSM`.
-  `TestCallbacksSuiteCHASM` is a whole-entrypoint registry exclusion because it enables
-  CHASM framework internals outside the default v1.31.0 compatibility gate.
 - Every discovered top-level entrypoint is either in the ordered plan or classified
   below, by name, with the reason it is out of scope; out-of-plan entrypoints are not
   included in release-gating totals.
+- Tier 5.32 is the public HSM callbacks mode, `TestCallbacksSuiteHSM`.
+  `TestCallbacksSuiteCHASM` is a whole-entrypoint registry exclusion because it enables
+  CHASM framework internals outside the default v1.31.0 compatibility gate.
 
 The intended ordered plan is clean: every test-bearing entrypoint completed, with no
 failure or unfinished outcome.
@@ -117,7 +117,7 @@ skip outcomes.
 | 10 | 3 | 7 | 1 | 8 | 0 | 0 | off¹ |
 | **Total** | **64** | **1,261** | **22** | **106** | **0** | **0** | **1,045** |
 
-¹ Tier 10.45 ran with wire coverage disabled under the pre-authorized observer-effect
+¹ Tier 10.45 ran with wire coverage disabled under the documented observer-effect
 exception described below.
 
 ## Per-entrypoint evidence
@@ -419,10 +419,10 @@ unmeasured. None contributes an outcome to the release-gating totals.
 | `TestAcquireShard_OwnershipLostErrorSuite` | Outside the ordered plan; history-shard fault-injection/in-process logging test. |
 | `TestAcquireShard_DeadlineExceededErrorSuite` | Outside the ordered plan; history-shard fault-injection/in-process logging test. |
 | `TestAcquireShard_EventualSuccess` | Outside the ordered plan; history-shard fault-injection/in-process logging test. |
-| `TestActivityAPIBatchResetClientTestSuite` | Not named by Tier 6.34's activity-control suite list. |
+| `TestActivityAPIBatchResetClientTestSuite` | Activity batch-control client variant outside Tier 6.34's activity-control scope. |
 | `TestScheduleActivityOnPerNSTQ_Blocked` | Standalone internal per-namespace-task-queue security test; not named by the ordered plan. |
-| `TestActivityApiBatchUnpauseClientTestSuite` | Not named by Tier 6.34's activity-control suite list. |
-| `TestActivityAPIPauseClientTestSuite` | Not named by Tier 6.34's activity-control suite list. |
+| `TestActivityApiBatchUnpauseClientTestSuite` | Activity batch-control client variant outside Tier 6.34's activity-control scope. |
+| `TestActivityAPIPauseClientTestSuite` | Activity batch-control client variant outside Tier 6.34's activity-control scope. |
 | `TestAdminRebuildMutableState_ChasmDisabled` | Admin/internal mutable-state rebuild surface; outside the public plan. |
 | `TestAdminRebuildMutableState_ChasmEnabled` | Admin/internal mutable-state rebuild plus CHASM; outside the public plan. |
 | `TestAdvancedVisibilitySuiteLegacy` | Legacy query-converter mode appears in historical readiness status, but is not named by the final ordered plan and was not imported into this run's totals. |
@@ -462,5 +462,5 @@ would exceed their upstream deadline. Their ordinary test evidence remains compl
 **CLEAN for the intended 64-entrypoint ordered plan:** 1,261 pass outcomes, 22
 corpus-native skips, 106 exact cited registry exclusions, 0 failures, and 0 unfinished
 outcomes, measured against engine `cecc27e6` and fork `5558d942`. This is not presented
-as proof that all 100 discovered top-level entrypoints pass; the denominator and its
-plan-boundary reconciliation are stated explicitly above.
+as proof that every discovered top-level entrypoint passes; the denominator and its
+plan-boundary classification are stated explicitly above.

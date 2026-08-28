@@ -9,7 +9,8 @@
 //! `temporal.api.workflowservice.v1`, `OperatorService` in `temporal.api.operatorservice.v1`).
 //! Rather than hardcode that mapping — which would silently rot if the vendored protos moved — it
 //! is derived at runtime from the `package` and `service` declarations in the vendored protos
-//! under `proto/upstream/`, the same source the matrix-completeness test
+//! (crate-local verbatim copies of `proto/upstream/`, kept in lockstep by `proto-sync` and a
+//! parity test), the same source the matrix-completeness test
 //! (`matrix_classifies_every_upstream_rpc`) trusts. Per AGENTS.md §8 the vendored protos are the
 //! authoritative wire shape; generated artifacts under `target/` are never read, as they can be
 //! stale. The parse is `include_str!` + line scanning: no new dependency, no I/O at runtime, no
@@ -18,15 +19,15 @@
 /// Vendored `WorkflowService` proto, the authoritative source for its package prefix.
 ///
 /// Sliced at compile time via `include_str!` so the package mapping is ground-truthed to
-/// `proto/upstream/` and never to a possibly-stale generated descriptor under `target/`
-/// (AGENTS.md §8). The relative path has one more `../` than `matrix.rs` because this file sits a
-/// directory deeper, under `src/coverage/`.
-const WORKFLOW_SERVICE_PROTO: &str =
-    include_str!("../../../../proto/upstream/temporal/api/workflowservice/v1/service.proto");
+/// the vendored proto tree and never to a possibly-stale generated descriptor under
+/// `target/` (AGENTS.md §8). The include reads the crate-local verbatim copy under
+/// `data/` rather than `proto/upstream/` directly, because the published archive cannot
+/// reach outside its own package; `proto-sync` refreshes the copies on every sync and a
+/// parity test fails the workspace build if they drift from `proto/upstream/`.
+const WORKFLOW_SERVICE_PROTO: &str = include_str!("../../data/workflowservice.service.proto");
 
 /// Vendored `OperatorService` proto, the authoritative source for its package prefix.
-const OPERATOR_SERVICE_PROTO: &str =
-    include_str!("../../../../proto/upstream/temporal/api/operatorservice/v1/service.proto");
+const OPERATOR_SERVICE_PROTO: &str = include_str!("../../data/operatorservice.service.proto");
 
 /// The vendored service protos scanned to build the service→package mapping.
 ///
@@ -248,6 +249,28 @@ mod tests {
                     "wire path shape mismatch for {rpc_id}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn crate_local_proto_copies_match_the_vendored_tree() {
+        // The packaged crate carries verbatim copies under data/; in the
+        // workspace the vendored tree is present and the copies must be
+        // byte-identical (refresh with `cargo run -p proto-sync -- generate`).
+        // A packaged test run has no vendored tree and skips.
+        let upstream = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../proto/upstream/temporal/api"
+        );
+        for (copy, upstream_rel) in [
+            (WORKFLOW_SERVICE_PROTO, "workflowservice/v1/service.proto"),
+            (OPERATOR_SERVICE_PROTO, "operatorservice/v1/service.proto"),
+        ] {
+            let path = format!("{upstream}/{upstream_rel}");
+            let Ok(vendored) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            assert_eq!(copy, vendored, "stale data/ copy of {upstream_rel}");
         }
     }
 }

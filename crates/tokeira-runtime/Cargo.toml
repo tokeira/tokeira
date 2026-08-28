@@ -1,10 +1,19 @@
 [package]
 name = "tokeira-runtime"
-publish = false
+description = "Task dispatch and execution runtime for the Tokeira durable execution engine"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "temporal", "workflow", "runtime"]
+categories = ["asynchronous", "concurrency"]
+publish = true
+# Repository-workflow files and property-test corpora stay out of the archive.
+exclude = ["AGENTS.md", "CLAUDE.md", "proptest-regressions"]
 
 [dependencies]
 anyhow.workspace = true
@@ -35,13 +44,13 @@ tonic.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 uuid.workspace = true
-tokeira-kernel = { path = "../tokeira-kernel" }
-tokeira-observability = { path = "../tokeira-observability" }
-tokeira-projection = { path = "../tokeira-projection" }
-tokeira-proto = { path = "../tokeira-proto" }
-tokeira-storage = { path = "../tokeira-storage" }
-tokeira-types = { path = "../tokeira-types" }
-tokeira-chasm = { path = "../tokeira-chasm" }
+tokeira-kernel = { path = "../tokeira-kernel", version = "0.1.1" }
+tokeira-observability = { path = "../tokeira-observability", version = "0.1.1" }
+tokeira-projection = { path = "../tokeira-projection", version = "0.1.1" }
+tokeira-proto = { path = "../tokeira-proto", version = "0.1.1" }
+tokeira-storage = { path = "../tokeira-storage", version = "0.1.1" }
+tokeira-types = { path = "../tokeira-types", version = "0.1.1" }
+tokeira-chasm = { path = "../tokeira-chasm", version = "0.1.1" }
 prost = "0.12"
 
 [features]

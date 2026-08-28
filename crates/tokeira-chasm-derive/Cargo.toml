@@ -1,12 +1,17 @@
 [package]
 name = "tokeira-chasm-derive"
-publish = false
+description = "Derive macro for Tokeira durable state-machine components"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "`#[derive(Component)]` proc-macro for Tokeira CHASM components (compile-time field registry, replacing reflection)"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "derive", "state-machine"]
+categories = ["development-tools::procedural-macro-helpers"]
+publish = true
 
 [lib]
 proc-macro = true

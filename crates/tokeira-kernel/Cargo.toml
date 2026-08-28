@@ -1,10 +1,19 @@
 [package]
 name = "tokeira-kernel"
-publish = false
+description = "The pure state-transition core of the Tokeira durable execution engine"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "temporal", "workflow", "state-machine"]
+categories = ["asynchronous"]
+publish = true
+# Repository-workflow files and property-test corpora stay out of the archive.
+exclude = ["AGENTS.md", "CLAUDE.md"]
 
 [dependencies]
 serde.workspace = true
@@ -13,7 +22,7 @@ smallvec.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
-tokeira-types = { path = "../tokeira-types" }
+tokeira-types = { path = "../tokeira-types", version = "0.1.1" }
 
 [dev-dependencies]
 postcard = { version = "1.0", features = ["alloc"] }

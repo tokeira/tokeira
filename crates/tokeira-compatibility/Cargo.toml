@@ -1,12 +1,17 @@
 [package]
 name = "tokeira-compatibility"
-publish = false
+description = "Temporal compatibility feature and SDK matrices for Tokeira"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Temporal compatibility feature and SDK matrices for Tokeira"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "temporal", "compatibility"]
+categories = ["development-tools"]
+publish = true
 
 [dependencies]
 serde.workspace = true

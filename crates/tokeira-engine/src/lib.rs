@@ -54,6 +54,7 @@ use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
 pub mod correlation_format;
+#[doc(hidden)]
 pub mod harness;
 mod http_api_transport;
 mod nexus_http_transport;

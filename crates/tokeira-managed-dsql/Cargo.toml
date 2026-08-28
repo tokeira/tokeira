@@ -1,10 +1,17 @@
 [package]
 name = "tokeira-managed-dsql"
-publish = false
+description = "Managed creation and adoption of a dedicated Aurora DSQL cluster for embedded Tokeira"
 version.workspace = true
-edition.workspace = true
 rust-version.workspace = true
+edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "aurora-dsql", "aws"]
+categories = ["database", "api-bindings"]
+publish = true
 
 [dependencies]
 async-trait.workspace = true

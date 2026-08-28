@@ -1,11 +1,17 @@
 [package]
 name = "tokeira-observability"
-publish = false
+description = "Tracing, metrics, and readiness plumbing shared by Tokeira processes"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "tracing", "metrics", "opentelemetry"]
+categories = ["development-tools"]
+publish = true
 
 [dependencies]
 async-trait.workspace = true
@@ -23,7 +29,7 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
-tokeira-types = { path = "../tokeira-types" }
+tokeira-types = { path = "../tokeira-types", version = "0.1.1" }
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true

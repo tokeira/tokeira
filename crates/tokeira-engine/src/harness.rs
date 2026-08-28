@@ -1,5 +1,7 @@
 //! Process-global hooks a test harness installs before serving.
 //!
+//! Harness assembly seam — not part of the supported public API.
+//!
 //! The functional-conformance harness (spec
 //! `.kiro/specs/conformance-config-override/`) needs to reshape a served
 //! engine in ways production never does: substitute an environment-driven

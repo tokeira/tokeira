@@ -1,11 +1,17 @@
 [package]
 name = "tokeira-proto"
-publish = false
-version = "0.1.0"
-edition = "2024"
-rust-version.workspace = true
 description = "Temporal-compatible and Tokeira-internal protobuf bindings"
-license = "Apache-2.0"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "temporal", "grpc", "protobuf"]
+categories = ["api-bindings", "encoding"]
+publish = true
 
 [dependencies]
 buffa = { version = "0.6", features = ["json"] }
@@ -23,6 +29,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 [dependencies.tokeira-types]
 path = "../tokeira-types"
+version = "0.1.1"
 
 [dev-dependencies]
 serde_yaml.workspace = true

@@ -9,7 +9,7 @@ authors.workspace = true
 
 [package.metadata.tokeira.platform]
 id = "ecs"
-engine = "0.1.0"
+engine = "0.1.1"
 default = false
 default-format = "tkd"
 definitions = ["deployment.tkd"]

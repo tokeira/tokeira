@@ -119,7 +119,7 @@ fn cancel_worker_polls_on_shutdown() -> bool {
 #[cfg(feature = "conformance")]
 #[inline]
 fn cancel_worker_polls_on_shutdown() -> bool {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_bool("frontend.enableCancelWorkerPollsOnShutdown")
         .unwrap_or(CANCEL_WORKER_POLLS_ON_SHUTDOWN)
 }
@@ -142,7 +142,7 @@ fn reported_problems_threshold() -> u32 {
 #[cfg(feature = "conformance")]
 #[inline]
 fn reported_problems_threshold() -> u32 {
-    let raw = tokeira_conformance::overrides()
+    let raw = crate::conformance::reads()
         .get_i64("system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute");
     raw.and_then(|value| u32::try_from(value).ok())
         .unwrap_or(REPORTED_PROBLEMS_THRESHOLD)
@@ -1888,6 +1888,7 @@ mod tests {
     #[cfg(feature = "conformance")]
     #[test]
     fn reported_problems_threshold_defaults_to_constant_without_override() {
+        crate::conformance::install_registry_reads();
         tokeira_conformance::overrides()
             .clear("system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute");
         assert_eq!(reported_problems_threshold(), REPORTED_PROBLEMS_THRESHOLD);

@@ -6575,6 +6575,9 @@ name = "proto-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "connectrpc-build 0.6.0",
+ "tonic-build 0.11.0",
+ "walkdir",
 ]
 
 [[package]]
@@ -9384,7 +9387,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
- "connectrpc 0.8.1",
  "http 1.4.0",
  "http-body 0.4.6",
  "http-body-util",
@@ -9401,8 +9403,6 @@ dependencies = [
  "proptest",
  "prost 0.12.6",
  "prost-types 0.12.6",
- "reqwest 0.12.28",
- "serde",
  "serde_json",
  "temporalio-client 0.7.0",
  "time",
@@ -9411,8 +9411,6 @@ dependencies = [
  "tokeira-chasm",
  "tokeira-chasm-activity",
  "tokeira-config",
- "tokeira-conformance",
- "tokeira-conformance-control",
  "tokeira-edge",
  "tokeira-kernel",
  "tokeira-managed-dsql",
@@ -9659,7 +9657,6 @@ dependencies = [
  "buffa 0.6.0",
  "buffa-types 0.6.0",
  "connectrpc 0.6.0",
- "connectrpc-build 0.6.0",
  "http-body 1.0.1",
  "prost 0.12.6",
  "prost-types 0.12.6",
@@ -9670,9 +9667,7 @@ dependencies = [
  "time",
  "tokeira-types",
  "tonic 0.11.0",
- "tonic-build 0.11.0",
  "uuid",
- "walkdir",
 ]
 
 [[package]]

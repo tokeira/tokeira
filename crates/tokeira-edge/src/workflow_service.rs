@@ -145,7 +145,7 @@ pub(crate) fn workflow_rule_crud_admitted(enabled: bool) -> bool {
 pub(crate) fn workflow_rules_enabled() -> bool {
     // v1.31.0 reads this namespace policy at every CRUD request
     // (`service/frontend/workflow_handler.go:6985-7088 @ v1.31.0`).
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_bool(WORKFLOW_RULES_ENABLED_KEY)
         .unwrap_or(false)
 }

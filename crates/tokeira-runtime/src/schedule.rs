@@ -463,7 +463,7 @@ fn schedule_namespace_start_workflow_rps() -> f64 {
 
 #[cfg(feature = "conformance")]
 fn schedule_namespace_start_workflow_rps() -> f64 {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_f64("worker.schedulerNamespaceStartWorkflowRPS")
         .filter(|rate| rate.is_finite() && *rate > 0.0)
         .unwrap_or(SCHEDULE_NAMESPACE_START_WORKFLOW_RPS)

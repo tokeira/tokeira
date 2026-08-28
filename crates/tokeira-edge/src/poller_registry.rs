@@ -36,7 +36,7 @@ fn poller_history_ttl() -> Duration {
 
 #[cfg(feature = "conformance")]
 fn poller_history_ttl() -> Duration {
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_duration("matching.PollerHistoryTTL")
         .and_then(|value| Duration::try_from(value).ok())
         .unwrap_or(POLLER_HISTORY_TTL)

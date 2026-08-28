@@ -65,16 +65,19 @@ path = "../tokeira-types"
 [dependencies.tokeira-projection]
 path = "../tokeira-projection"
 
-[dependencies.tokeira-conformance]
-workspace = true
-optional = true
-
 [features]
-conformance = ["dep:tokeira-conformance"]
+# Compiles the dynamic-override read seam into the admission sites
+# (`conformance::overrides`). The override registry itself is test-harness
+# machinery this crate never links; the serving application installs read
+# functions at boot. Absent from production builds.
+conformance = []
 
 [dev-dependencies]
 metrics-util.workspace = true
 proptest = "1"
+# Version-less on purpose: `cargo publish` strips path-only dev-dependencies,
+# so the never-published override registry stays test-only.
+tokeira-conformance = { path = "../tokeira-conformance" }
 tokeira-types = { path = "../tokeira-types", features = ["test-support"] }
 tracing-subscriber.workspace = true
 

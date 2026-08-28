@@ -936,7 +936,7 @@ impl PolicyAuthenticator {
 pub(crate) fn authorizer_errors_exposed(configured: bool) -> bool {
     #[cfg(feature = "conformance")]
     {
-        tokeira_conformance::overrides()
+        crate::conformance::overrides::reads()
             .get_bool("frontend.exposeAuthorizerErrors")
             .unwrap_or(configured)
     }
@@ -949,7 +949,7 @@ pub(crate) fn authorizer_errors_exposed(configured: bool) -> bool {
 fn token_namespace_enforcement_enabled() -> bool {
     #[cfg(feature = "conformance")]
     {
-        tokeira_conformance::overrides()
+        crate::conformance::overrides::reads()
             .get_bool("frontend.enableTokenNamespaceEnforcement")
             .unwrap_or(true)
     }
@@ -1070,7 +1070,7 @@ fn principal_propagation_enabled(configured: bool) -> bool {
 fn principal_propagation_enabled(configured: bool) -> bool {
     // The harness registry is process-global, so Tokeira deliberately
     // collapses v1.31.0's namespace-scoped gate to one live value.
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_bool("frontend.enablePrincipalPropagation")
         .unwrap_or(configured)
 }
@@ -1084,7 +1084,7 @@ pub(crate) fn cross_namespace_commands_enabled() -> bool {
 #[cfg(feature = "conformance")]
 #[inline]
 pub(crate) fn cross_namespace_commands_enabled() -> bool {
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_bool("system.enableCrossNamespaceCommands")
         .unwrap_or(false)
 }

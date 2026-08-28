@@ -53,19 +53,12 @@ use tonic_web::GrpcWebLayer;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
-#[cfg(feature = "conformance")]
-mod conformance_grpc_authenticator;
-#[cfg(feature = "conformance")]
-mod conformance_nexus_authorizer;
 pub mod correlation_format;
+pub mod harness;
 mod http_api_transport;
 mod nexus_http_transport;
 pub mod observability;
 
-#[cfg(feature = "conformance")]
-use conformance_grpc_authenticator::ConformanceGrpcAuthenticator;
-#[cfg(feature = "conformance")]
-use conformance_nexus_authorizer::ConformanceNexusHttpAuthorizer;
 use http_api_transport::HttpApiLayer;
 use nexus_http_transport::NexusHttpLayer;
 use tokeira_auth::{
@@ -113,12 +106,9 @@ async fn build_authorization_stack(config: &TokeiraConfig) -> Result<Authorizati
         .as_ref()
         .filter(|authorization| authorization.has_identity_source())
     else {
-        #[cfg(feature = "conformance")]
-        let grpc = ConformanceGrpcAuthenticator::from_environment()
-            .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
+        let grpc = harness::installed()
+            .and_then(|hooks| hooks.fallback_grpc_authenticator.clone())
             .unwrap_or_else(|| Arc::new(tokeira_edge::AllowAllAuthenticator));
-        #[cfg(not(feature = "conformance"))]
-        let grpc = Arc::new(tokeira_edge::AllowAllAuthenticator) as Arc<dyn Authenticator>;
         let stack = AuthorizationStack {
             grpc,
             nexus: Arc::new(tokeira_edge::nexus_http::PermissiveNexusHttpAuthorizer),
@@ -3322,20 +3312,11 @@ where
         .with_nexus_endpoints(nexus_endpoint_admin)
         .with_namespace_deletion(namespaces.clone(), Arc::new(workflow_service.clone()));
     let production_nexus_authorizer = authorization.nexus;
-    let nexus_http_authorizer: Arc<dyn tokeira_edge::nexus_http::NexusHttpAuthorizer> = {
-        #[cfg(feature = "conformance")]
-        {
-            ConformanceNexusHttpAuthorizer::from_environment(production_nexus_authorizer.clone())
-                .map(|authorizer| {
-                    Arc::new(authorizer) as Arc<dyn tokeira_edge::nexus_http::NexusHttpAuthorizer>
-                })
-                .unwrap_or(production_nexus_authorizer)
-        }
-        #[cfg(not(feature = "conformance"))]
-        {
-            production_nexus_authorizer
-        }
-    };
+    let nexus_http_authorizer: Arc<dyn tokeira_edge::nexus_http::NexusHttpAuthorizer> =
+        match harness::installed().and_then(|hooks| hooks.wrap_nexus_http_authorizer.as_ref()) {
+            Some(wrap) => wrap(production_nexus_authorizer),
+            None => production_nexus_authorizer,
+        };
     let nexus_http_layer =
         NexusHttpLayer::new(Arc::new(tokeira_edge::nexus_http::NexusHttpHandler::new(
             namespaces.clone(),
@@ -3423,11 +3404,13 @@ where
             background_cancel.clone(),
         );
         // Spawn the CHASM timer sweeper (`chasm-activity-timeouts-and-retry`): nothing
-        // else fires armed activity timeouts. A conformance build must keep it ready
+        // else fires armed activity timeouts. A conformance harness must keep it ready
         // even when the boot-time default is off, because the corpus enables
         // `activity.enableStandalone` live after server startup. Production retains
         // the configured gate and pays no idle sweep cost.
-        if standalone_enabled || cfg!(feature = "conformance") {
+        let sweeper_forced =
+            harness::installed().is_some_and(|hooks| hooks.force_chasm_timer_sweeper);
+        if standalone_enabled || sweeper_forced {
             spawn_chasm_timer_sweeper(
                 &engine_tasks,
                 sweeper_engine,
@@ -3569,37 +3552,13 @@ where
         Ok::<(), anyhow::Error>(())
     });
 
-    // Conformance-only dynamic-config control listener (spec
-    // `.kiro/specs/conformance-config-override/`). Mounted on a SEPARATE
-    // loopback listener — never the public gRPC router — and only when the fork
-    // harness set `TOKEIRA_CONFORMANCE_CONTROL_ADDR`. The whole block is behind
-    // the `conformance` feature, so a production build never contains it.
-    #[cfg(feature = "conformance")]
-    {
-        if let Some(control_addr) = conformance_control_addr() {
-            let control_cancel = background_cancel.clone();
-            tokio::spawn(async move {
-                let router = connectrpc::Router::new().add_service(std::sync::Arc::new(
-                    tokeira_conformance_control::ConformanceControlHandler,
-                ));
-                match connectrpc::Server::bind(control_addr).await {
-                    Ok(bound) => {
-                        if let Err(error) = bound
-                            .serve_with_graceful_shutdown(router, control_cancel.cancelled_owned())
-                            .await
-                        {
-                            tracing::error!(%error, "conformance control service exited with error");
-                        }
-                    }
-                    Err(error) => tracing::error!(
-                        %error,
-                        %control_addr,
-                        "failed to bind conformance control listener"
-                    ),
-                }
-            });
-            tracing::warn!(%control_addr, "conformance control service mounted (conformance build)");
-        }
+    // Harness-owned background work (the conformance dynamic-config control
+    // listener, spec `.kiro/specs/conformance-config-override/`) spawns at the
+    // same point the stack's own background tasks do, tied to the same
+    // cancellation token so a graceful drain also stops the harness side.
+    // Production installs no hooks, so this is a no-op outside a harness.
+    if let Some(task) = harness::installed().and_then(|hooks| hooks.background_task.as_ref()) {
+        task(background_cancel.clone());
     }
 
     startup_guard.disarm();
@@ -3844,23 +3803,6 @@ fn wire_coverage_out_path() -> PathBuf {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
         _ => PathBuf::from(WIRE_COVERAGE_DEFAULT_OUT),
     }
-}
-
-/// The loopback address the conformance dynamic-config control service binds to,
-/// if the fork harness enabled it.
-///
-/// Conformance-only (spec `.kiro/specs/conformance-config-override/`): the
-/// harness sets `TOKEIRA_CONFORMANCE_CONTROL_ADDR` to a concrete loopback
-/// address when booting `tokeirad` for the corpus; its presence enables the
-/// control listener and its value is the bind address. Read only in a
-/// `conformance` build — production never references it. Like the wire-coverage
-/// enable seam this is a test-harness switch, not a production configuration
-/// surface: it carries no dynamic-config value, only where to listen.
-#[cfg(feature = "conformance")]
-fn conformance_control_addr() -> Option<std::net::SocketAddr> {
-    std::env::var("TOKEIRA_CONFORMANCE_CONTROL_ADDR")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
 }
 
 /// Build the shared Nexus endpoint store, seeding any bootstrap-configured

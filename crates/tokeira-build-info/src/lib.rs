@@ -159,4 +159,43 @@ mod tests {
             Some(TOKEIRA_GIT_SHA)
         );
     }
+
+    // Both parity tests guard the packaged-build fallbacks: a registry archive
+    // carries no workspace, so `build.rs` reads a pinned toolchain constant and
+    // an in-crate copy of the storage crate's schema contract. In the
+    // workspace, the authoritative files exist and must match exactly.
+
+    #[test]
+    fn pinned_toolchain_matches_the_workspace_toolchain_file() {
+        let workspace_file = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../rust-toolchain.toml"
+        ))
+        .expect("read rust-toolchain.toml (workspace-only parity test)");
+        let channel = workspace_file
+            .lines()
+            .find_map(|line| line.strip_prefix("channel = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("rust-toolchain.toml carries a quoted channel");
+        assert_eq!(
+            pinned::PINNED_RUST_TOOLCHAIN,
+            channel,
+            "update PINNED_RUST_TOOLCHAIN alongside rust-toolchain.toml"
+        );
+    }
+
+    #[test]
+    fn packaged_schema_contract_matches_the_storage_owned_file() {
+        let packaged = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/schema-contract.toml"))
+            .expect("read the packaged schema-contract copy");
+        let authoritative = fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tokeira-storage/schema-contract.toml"
+        ))
+        .expect("read the storage schema contract (workspace-only parity test)");
+        assert_eq!(
+            packaged, authoritative,
+            "re-copy crates/tokeira-storage/schema-contract.toml into tokeira-build-info"
+        );
+    }
 }

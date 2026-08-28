@@ -62,7 +62,7 @@ fn target_version_changed_enabled() -> bool {
 
 #[cfg(feature = "conformance")]
 fn target_version_changed_enabled() -> bool {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_bool("system.enableSendTargetVersionChanged")
         .unwrap_or(true)
 }
@@ -81,7 +81,7 @@ fn pending_command_limit(_key: &str) -> Option<usize> {
 
 #[cfg(feature = "conformance")]
 fn pending_command_limit(key: &str) -> Option<usize> {
-    normalize_pending_command_limit(tokeira_conformance::overrides().get_i64(key))
+    normalize_pending_command_limit(crate::conformance::reads().get_i64(key))
 }
 
 fn workflow_task_completion_limits() -> WorkflowTaskCompletionLimits {

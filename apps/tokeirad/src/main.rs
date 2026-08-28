@@ -11,5 +11,12 @@ use anyhow::Result;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = tokeirad::__cli_parse();
-    tokeirad::run_from_cli(cli).await
+    #[cfg(feature = "conformance")]
+    {
+        tokeirad::conformance::run(cli).await
+    }
+    #[cfg(not(feature = "conformance"))]
+    {
+        tokeirad::run_from_cli(cli).await
+    }
 }

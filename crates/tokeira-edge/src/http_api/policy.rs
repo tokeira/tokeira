@@ -202,7 +202,8 @@ impl HttpApiPolicy {
 
     fn effective_allowed_hosts(&self) -> Vec<String> {
         #[cfg(feature = "conformance")]
-        if let Some(json) = tokeira_conformance::overrides().get_json(HTTP_ALLOWED_HOSTS_KEY) {
+        if let Some(json) = crate::conformance::overrides::reads().get_json(HTTP_ALLOWED_HOSTS_KEY)
+        {
             return serde_json::from_str::<Vec<String>>(&json).unwrap_or_else(|error| {
                 tracing::error!(
                     key = HTTP_ALLOWED_HOSTS_KEY,
@@ -346,6 +347,7 @@ mod tests {
         let _guard = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::conformance::overrides::install_registry_reads();
         let overrides = tokeira_conformance::overrides();
         overrides.reset();
         let policy =

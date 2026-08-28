@@ -8,6 +8,11 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1"
+# Pinned to the exact codegen stack the checked-in `tokeira-proto` bindings were
+# produced with; bumping either changes generated output and requires a regen.
+connectrpc-build = "0.6"
+tonic-build = "0.11"
+walkdir = "2"
 
 [lints]
 workspace = true

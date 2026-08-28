@@ -7,6 +7,12 @@
 //! - `connect`: Tokeira-internal controller surface (buffa + connect-rust)
 //! - `conversions`: small, explicit helpers between wire structs and `tokeira-types`
 //!
+//! The bindings are generated ahead of time and checked in under
+//! `src/generated/` (`upstream/` for the Temporal surface, `tokeira/` for
+//! Tokeira's own packages), so building this crate needs neither the vendored
+//! `proto/` tree nor `protoc`. Regenerate with `cargo run -p proto-sync --
+//! generate` after any change to the vendored protos or the codegen stack.
+//!
 //! The `connect` module is the preferred path for controller ↔ runtime/edge/autoscaler
 //! communication. It provides zero-copy view types and the connect-rust service traits.
 //! The `internal` module retains the tonic/prost output for code that hasn't migrated.
@@ -40,7 +46,7 @@ pub mod compute {
 
     /// Version-one worker-compute messages.
     pub mod v1 {
-        tonic::include_proto!("tokeira.compute.v1");
+        include!("generated/tokeira/tokeira.compute.v1.rs");
     }
 }
 
@@ -52,7 +58,7 @@ pub mod compute {
 pub mod connect {
     // Generated code: the codegen's unwraps are its own.
     #![allow(clippy::unwrap_used)]
-    connectrpc::include_generated!("_connectrpc_controller.rs");
+    include!("generated/tokeira/_connectrpc_controller.rs");
 }
 
 pub use internal::{admin, controller, runtime};

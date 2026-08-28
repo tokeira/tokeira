@@ -20,7 +20,7 @@ pub mod tokeira {
 
         pub mod controller {
             pub mod v1 {
-                tonic::include_proto!("tokeira.internal.controller.v1");
+                include!("generated/tokeira/tokeira.internal.controller.v1.rs");
             }
         }
 
@@ -32,7 +32,7 @@ pub mod tokeira {
 
 /// File descriptor set for the internal API surface.
 pub const FILE_DESCRIPTOR_SET: &[u8] =
-    tonic::include_file_descriptor_set!("tokeira_internal_descriptor");
+    include_bytes!("generated/tokeira/tokeira_internal_descriptor.bin");
 
 pub use tokeira::internal::{
     admin::v1 as admin, controller::v1 as controller, runtime::v1 as runtime,

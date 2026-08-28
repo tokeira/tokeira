@@ -21,6 +21,12 @@ single-suite runner against the exact engine commit that the release tag names.
 | Evidence archive | `/workspaces/ev1-final-evidence-cecc27e6-intended` |
 | Archive checksum manifest | `SHA256SUMS` · SHA-256 `cf8987d2c470bd2b05fc528b1894908a73f652c0028868617300519df3a97172` |
 
+The proto pin is deliberately ahead of the server claim: Temporal server 1.31.0 ships
+API `v1.62.8`, while Tokeira vendors `v1.62.11`. Protobuf wire shapes are
+backward-compatible across that range, and RPCs present only in the newer surface are
+outside the 1.31.0 behavioural claim — the two pins move independently by design
+(`crates/tokeira-build-info/src/pinned.rs`).
+
 The freshly cloned source built this binary and reported:
 
 ```text

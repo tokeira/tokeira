@@ -177,10 +177,7 @@ The agents carried a large share of the engineering — architecture drafts,
 implementation, tests, the conformance drive, and review of one another's
 work — and that contribution is recorded where engineering credit belongs:
 in the history. Every commit with agent involvement names its agents in
-`Co-authored-by:` / `Assisted-by:` trailers. Kiro deserves particular
-credit for the architecture, requirements specification, and technical
-design of the system, developed in close collaboration from the first
-commit. The fleet mechanics live in
+`Co-authored-by:` / `Assisted-by:` trailers. The fleet mechanics live in
 [docs/agents/](docs/agents/concurrent-agents.md).
 
 ## Contributing

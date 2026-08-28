@@ -83,12 +83,6 @@ them through `go test -skip`, so those names do not appear as runtime `skip` eve
 they are reported separately rather than silently folded into the 22 corpus-native
 skip outcomes.
 
-The 2026-06-09 baseline measured all 100 discovered top-level entrypoints and reported
-1,501 outcomes: 19 pass, 21 skip, 1,194 fail, and 267 unfinished. This release evidence
-uses the narrower, documented 64-entrypoint release-gate denominator, so it does not calculate a
-percentage or direct delta against that different baseline. Within the intended release-gate
-denominator, failures and unfinished outcomes fell to zero.
-
 ## Per-tier summary
 
 | Tier | Entrypoints | Pass | Native skip | Registry exclusions | Fail | Unfinished | Wire rows |

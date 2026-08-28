@@ -378,9 +378,16 @@ driving an external `tokeirad` over the public wire, per
 
 ## Whole-entrypoint and plan-boundary classifications
 
-`TestCallbacksSuiteCHASM` is classified as a whole entrypoint by the pinned registry:
-it runs the callbacks corpus with `EnableChasm` and `EnableCHASMCallbacks`, while CHASM
-framework internals are outside Tokeira's default v1.31.0 compatibility gate. The HSM
+`TestCallbacksSuiteCHASM` is classified as a whole entrypoint by the pinned registry
+because CHASM-backed callbacks are not released behavior at v1.31.0:
+`history.enableCHASMCallbacks` defaults to `false`, and its doc string names the HSM
+implementation as current ("instead of the previous HSM backed implementation" is the
+flag's forward direction, not the shipped default)
+(`common/dynamicconfig/constants.go:2870-2874 @ v1.31.0`). The suite opts in with
+`EnableChasm` and `EnableCHASMCallbacks`. This is a callbacks-mode gate, not a CHASM
+exclusion in general: where v1.31.0 ships CHASM-backed behavior, Tokeira covers it —
+standalone activities are CHASM-based upstream (`chasm/lib/activity @ v1.31.0`) and
+their suite ran actively in this report. The HSM
 sibling remains active and produced 14 pass outcomes. Invoking the CHASM name through
 the runner produced “no tests to run” and zero outcomes; it is not counted among the 64
 test-bearing entrypoints or the 106 exclusions beneath them.

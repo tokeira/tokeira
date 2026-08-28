@@ -458,16 +458,6 @@ The observer-effect exception is disclosed in the wire section: coverage was dis
 only for the three Tier 10.45 entrypoints because measured instrumentation overhead
 would exceed their upstream deadline. Their ordinary test evidence remains complete.
 
-### The gate found a release issue before release
-
-The evidence process surfaced the Nexus async-token/live-queue defect before the final
-capture. Engine PR #134 fixed that issue and is included in measured commit
-`cecc27e6`. The final Tier 7.37 active run produced 23 passes, zero corpus-native skips,
-zero failures, and zero unfinished outcomes; its 11 exact registry exclusions remain
-listed above. This is the intended value of the gate: a release-affecting finding was
-fixed before the measured commit was tagged, rather than explained away in the final
-report.
-
 ## Archive contents and integrity
 
 The intended archive named in the header is a scoped copy containing only the

@@ -1,6 +1,5 @@
 # Tokeira
 
-[![ci](https://github.com/tokeira/tokeira/actions/workflows/ci.yml/badge.svg)](https://github.com/tokeira/tokeira/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 <p align="center">
@@ -10,117 +9,210 @@
   </picture>
 </p>
 
-A Temporal-compatible durable execution engine, built in Rust and specialized
-for Amazon Aurora DSQL.
+**Tokeira is a Temporal-compatible durable execution service, built from
+scratch in Rust for Amazon Aurora DSQL.**
+
+Run existing Temporal applications against Tokeira using the SDKs and workflow
+model you already know. Or embed the same execution engine directly into a
+Rust application when a separate service is unnecessary.
+
+**Keep the workflow. Choose the engine.**
 
 ## Mission
 
-Preserve the public [Temporal](https://temporal.io) contract that SDKs,
-operators, and tooling depend on — WorkflowService, OperatorService, workflow
-history semantics, the replay model, task lifecycle, sticky execution,
-polling, retries, signals, timers, Continue-As-New. Collapse
-internal correctness around a single authoritative per-run transition log.
+Tokeira exists to preserve the public
+[Temporal](https://temporal.io) contract while exploring a different
+architecture beneath it.
 
-Tokeira is a product from scratch, not a fork: the architecture is informed by
-Temporal, but the implementation is original — where behaviour must match, it
-is verified against the pinned Temporal release, never copied from it. It is
-not a service-by-service port of Temporal's Frontend / History / Matching /
-Worker layout: per-workflow event history is the only semantic ordering
-domain, and everything else — queue ordering, delivery ordering, visibility
-ordering — is derived. Aurora DSQL is the design centre, not a pluggable
-afterthought.
+Temporal's SDKs, workflow model, event histories, replay semantics, task
+lifecycles, signals, timers, retries, Continue-As-New, WorkflowService,
+OperatorService, and the behaviours applications depend upon form the
+compatibility boundary. Behind that boundary, Tokeira is its own system.
 
-### Design Principles
+Tokeira is not a fork and does not port Temporal's server implementation.
+Where behaviour must match, it is established against a pinned Temporal
+release and verified through conformance testing.
 
-**History is the authority.** Every state-changing request becomes a per-run
-transition that appends history, updates the run summary, and emits derived
-effects atomically. The system never relies on an external queue write as the
-canonical record that work exists.
+Internally, Tokeira collapses correctness around one authoritative per-run
+transition log. Per-workflow event history is the semantic ordering domain;
+queue delivery, visibility, and other operational state are derived from it.
+The architecture does not reproduce Temporal's Frontend / History / Matching /
+Worker service topology.
 
-**Per-run total order, not global total order.** Tokeira enforces a total
-order per workflow run, plus explicit causal edges across runs and side
-effects. Queue delivery and visibility are derived domains.
+Amazon Aurora DSQL is the design centre rather than a storage backend added
+behind a generic persistence abstraction. Rust provides the execution
+environment in which the resulting engine is built.
 
-**Delivery is ephemeral-first.** Worker polling and sync matching live
-primarily in memory. Durable backlog is a fallback and recovery aid, not the
-default path.
+The goal is not to create a different workflow programming model.
 
-**Visibility is a projection.** The projection plane owns read models and
-operates outside the correctness path. A lagging projection is a quality
-problem, not a correctness failure.
+It is to give the existing one another engine.
 
-**The kernel is pure.** The deterministic state machine transforms commands
-into transitions with no I/O, no storage access, and no delivery concerns.
+## Design Principles
 
-**Configuration stays minimal.** Prefer policies and auto-tuning over exposed
-mechanical knobs.
+### History is the authority
+
+Every state-changing request becomes a per-run transition that appends
+history, updates the run summary, and emits derived effects atomically.
+Tokeira never relies on an external queue write as the canonical record that
+work exists.
+
+### Order only what correctness requires
+
+Tokeira enforces a total order per workflow run, with explicit causal edges
+across runs and side effects. It does not impose a global total order where
+the workflow model does not require one.
+
+Queue delivery and visibility remain derived ordering domains.
+
+### Delivery is ephemeral-first
+
+Worker polling and synchronous matching live primarily in memory. Durable
+backlog provides recovery and fallback rather than defining the normal
+delivery path.
+
+### Visibility is a projection
+
+The projection plane owns read models, SQL visibility, rollups, and custom
+sinks. It operates outside the correctness path and advances through
+independent checkpoints.
+
+A lagging projection is a quality problem, not a correctness failure.
+
+### The kernel is pure
+
+The deterministic state machine transforms commands into transitions without
+I/O, storage access, networking, metrics, or delivery concerns.
+
+Correctness can therefore be reasoned about and tested independently of the
+systems surrounding it.
+
+### Configuration stays small
+
+Tokeira prefers policy, measurement, and automatic adaptation over exposing
+the mechanics of its implementation as operator configuration.
+
+Complexity belongs inside the system.
 
 ## Temporal Conformance
 
-Tokeira carries two independent compatibility pins
-([`crates/tokeira-build-info/src/pinned.rs`](crates/tokeira-build-info/src/pinned.rs)):
+**Temporal compatibility is a continuing commitment, not a one-time target.**
+
+Tokeira intends to remain current with Temporal's public contract as Temporal
+evolves. Compatibility advances deliberately, release by release: a newer
+Temporal version becomes Tokeira's claimed compatibility level only after its
+behaviour has been implemented, measured, and evidenced.
+
+The current compatibility baseline is defined by two independent pins in
+[`crates/tokeira-build-info/src/pinned.rs`](crates/tokeira-build-info/src/pinned.rs):
 
 - **Temporal server compatibility: v1.31.0** — the release whose public API
-  *behaviour* Tokeira aims to match. Behaviour questions are resolved against
-  that release, not guessed.
-- **Temporal API: v1.62.11** — the vendored proto surface Tokeira builds
-  against ([`proto/upstream/`](proto/upstream/)).
+  behaviour Tokeira currently aims to match. Behaviour questions are resolved
+  against this release rather than inferred.
+- **Temporal API: v1.62.11** — the vendored protobuf surface against which
+  Tokeira builds, held in [`proto/upstream/`](proto/upstream/).
 
-The pins are tracked independently on purpose: vendored protos may advance
-ahead of the behavioural claim, and updating protos never silently raises it.
+They are independent by design. Protocol definitions can advance without
+silently advancing Tokeira's behavioural compatibility claim.
 
-v1.31.0 is the current target, not a ceiling. Tokeira tracks Temporal as it
-evolves: the pins advance release by release, and each raised claim is
-measured the same way before it is made.
+**v1.31.0 is a checkpoint, not a destination.**
 
-Conformance is measured, not asserted:
+As Temporal releases advance, Tokeira will continue advancing these pins and
+its conformance corpus. The project would rather publish an older,
+evidence-backed compatibility claim than call itself current before the
+evidence supports it.
 
-- **Compatibility matrices.** Every WorkflowService and OperatorService RPC is
-  classified (`Implemented` / `Partial` / `Experimental` / `Stubbed` /
-  `Unsupported`) in a checked-in `FEATURE_MATRIX`; SDK support claims live in
-  `SDK_MATRIX` with evidence and verification state. `tkr compat show`
-  inspects both. See
-  [docs/conformance/compatibility.md](docs/conformance/compatibility.md).
-- **Functional corpus replay.** Temporal's own functional Go test suites,
-  pinned at v1.31.0, are replayed over the real gRPC wire against a running
-  `tokeirad`. See
-  [docs/testing/functional-conformance-harness.md](docs/testing/functional-conformance-harness.md).
-- **The v0.1.0 release evidence.**
-  [docs/readiness/corpus-evidence.md](docs/readiness/corpus-evidence.md) — the
-  ordered corpus replay measured against the exact commit `v0.1.0` names:
-  1,261 passes, 0 failures, every exclusion cited to Temporal's source.
-- **A public ledger.**
-  [docs/readiness/conformance.md](docs/readiness/conformance.md) records
-  exactly what has been verified, what is implemented but unmeasured, and what
-  is outstanding — against
-  [docs/conformance/v1.31.0/](docs/conformance/v1.31.0/README.md), which
-  defines what full v1.31.0 compliance means.
+### Conformance is measured, not asserted
+
+**Compatibility matrices.** Every WorkflowService and OperatorService RPC is
+classified as `Implemented`, `Partial`, `Experimental`, `Stubbed`, or
+`Unsupported` in the checked-in `FEATURE_MATRIX`. SDK claims live separately
+in `SDK_MATRIX`, together with their evidence and verification state.
+`tkr compat show` exposes both.
+
+See [docs/conformance/compatibility.md](docs/conformance/compatibility.md).
+
+**Functional corpus replay.** Temporal's own functional Go test suites,
+pinned to the claimed server compatibility release, are exercised over the
+real gRPC wire against a running `tokeirad`.
+
+See
+[docs/testing/functional-conformance-harness.md](docs/testing/functional-conformance-harness.md).
+
+**Release evidence.** Tokeira publishes the evidence behind compatibility
+claims rather than asking users to take them on trust. For v0.1.0, the ordered
+corpus replay against the exact release commit produced **1,261 passes and
+0 failures**, with every exclusion cited back to Temporal's source.
+
+See [docs/readiness/corpus-evidence.md](docs/readiness/corpus-evidence.md).
+
+**Public conformance ledger.**
+[docs/readiness/conformance.md](docs/readiness/conformance.md) records what
+has been verified, what is implemented but not yet measured, and what remains
+outstanding. The corresponding
+[docs/conformance/v1.31.0/](docs/conformance/v1.31.0/README.md) corpus defines
+what full compatibility with the current baseline means.
 
 ## Architecture
 
-Tokeira is organized into three planes:
+Tokeira separates execution into three planes.
 
-- **Compatibility edge** — admits and translates requests. Exposes
-  WorkflowService, OperatorService, and health endpoints; performs
-  authn/authz, namespace lookup, and request-ID handling. Owns no workflow
-  semantics.
-- **Authoritative runtime and storage** — owns correctness: shard/bundle
-  ownership and fencing, lane-local execution of workflow actors, durable
-  state transitions, durable timers, and derived dispatch.
-- **Projection plane** — owns read models: SQL visibility, rollups, and
-  custom sinks with independent checkpoints and replay. Outside the
-  correctness path.
+### Compatibility edge
 
-Design documents live in
-[docs/architecture/](docs/architecture/000-overview.md), with a navigable
-reference for the seven engine crates in [docs/crates/](docs/crates/README.md).
+The edge presents the Temporal-facing contract: WorkflowService,
+OperatorService, health endpoints, authentication and authorization,
+namespace resolution, and request identity.
+
+It owns no workflow semantics.
+
+### Authoritative runtime and storage
+
+The runtime owns correctness: shard and bundle ownership, fencing, lane-local
+workflow actors, durable transitions, timers, and derived dispatch.
+
+A workflow run has one authoritative transition history.
+
+### Projection plane
+
+The projection plane owns read models: SQL visibility, rollups, and custom
+sinks with independent checkpoints and replay.
+
+It remains outside the correctness path.
+
+The architecture is documented in
+[docs/architecture/](docs/architecture/000-overview.md). A navigable reference
+for the seven engine crates lives in [docs/crates/](docs/crates/README.md).
 
 ## Run Tokeira
 
-### Embedded — inside your process
+The same execution engine can live behind a service boundary or inside your
+process.
 
-The engine runs in your application. No TCP listener, no port, no daemon —
-the Temporal Rust SDK connects over an in-memory duplex:
+### Tokeira service
+
+`tokeirad` runs Tokeira as a standalone Temporal-compatible service. Temporal
+SDK clients and workers communicate with it over gRPC using the familiar
+Temporal protocol.
+
+The conformance corpus exercises this path over the real wire.
+
+Tokeira's operator surface is being built around `tkr`, with named
+deployments and an explicit **plan → confirm → apply** lifecycle. Platform
+definitions currently cover bare-host `local`, Docker Compose, ECS, and EKS;
+the Compose platform can provision the accompanying
+Mimir · Loki · Grafana · Alloy observability stack.
+
+The service and its operational platform are the primary Tokeira deployment
+model. The operator lifecycle remains under active development and sits
+outside the v0.1.0 support claim while it hardens.
+
+Explore [docs/platforms/](docs/platforms/README.md).
+
+### Embedded Tokeira
+
+Tokeira can also disappear entirely inside a Rust process.
+
+The same engine runs without a TCP listener, daemon, or separate deployment.
+The Temporal Rust SDK connects to it over an in-memory duplex:
 
 ```rust
 // A Temporal-compatible engine, in-process.
@@ -131,61 +223,76 @@ let engine = tokeira_engine::Engine::embedded().await?;
 // and every SDK worker and client in the process speaks to it directly.
 ```
 
-Storage grows with you: in-memory with snapshots, then managed Aurora DSQL —
-the same engine either way, selected by configuration. Until the crates reach
-crates.io, take a git dependency on the
-[`v0.1.0` tag](https://github.com/tokeira/tokeira/releases/tag/v0.1.0).
+Embedded deployments can begin with in-memory storage and snapshots and move
+to managed Aurora DSQL without changing the execution model.
 
-Building AI agents? [Odori Agents](https://github.com/tokeira/tokeira-odori)
-is a minimal Rust agent framework built on embedded Tokeira.
+This makes durable execution practical for applications that want Temporal's
+programming model without operating a separate workflow service — while
+remaining the same Tokeira engine used by `tokeirad`.
 
-### The server and its platforms — in development
+Until the crates reach crates.io, use the
+[`v0.1.0` tag](https://github.com/tokeira/tokeira/releases/tag/v0.1.0) as a
+Git dependency.
 
-The same engine runs standalone as `tokeirad` — the conformance evidence
-drives it over live gRPC — and an operator lifecycle is taking shape in-tree
-around it: `tkr` manages named deployments under an explicit
-**plan → confirm → apply** contract, across platform definitions for
-bare-host `local`, Docker Compose (with a provisioned
-Mimir · Loki · Grafana · Alloy observability stack), ECS, and EKS.
-
-This operator surface is under active development and sits outside the
-v0.1.0 support claim; support statements will follow as it hardens.
-Explore: [docs/platforms/](docs/platforms/README.md).
+Building agents in Rust?
+[Tokeira Odori](https://github.com/tokeira/tokeira-odori) builds durable
+agentic workflows on Tokeira.
 
 ## Security
 
-Authentication and authorization live at the compatibility edge; secrets are
-redacted by default; `unsafe` Rust is denied workspace-wide.
-Vulnerability reporting and the full posture: [SECURITY.md](SECURITY.md).
+Authentication and authorization live at the compatibility edge. Secrets are
+redacted by default, and `unsafe` Rust is denied workspace-wide.
 
-## Development
-
-Standard cargo workflows on a pinned stable toolchain;
-`cargo test --workspace` needs no AWS credentials and no Docker. Guide:
-[docs/development.md](docs/development.md).
+The security model and vulnerability-reporting process are documented in
+[SECURITY.md](SECURITY.md).
 
 ## Built with Claude, Codex, and Kiro
 
-Tokeira was built by a fleet: one grateful owner ❤️ collaborating with three hugely capable agents —
-[Claude](https://claude.com) (Anthropic), [Codex](https://openai.com/codex)
-(OpenAI), and [Kiro](https://kiro.dev) (AWS) — working concurrently in this
-repository under a written contract, [AGENTS.md](AGENTS.md): spec-driven
-development, ground-truth verification against the pinned Temporal release,
-a compiler-enforced quality bar, and serial human review of every merge.
+Tokeira is also an experiment in how substantial systems software can be
+built with coding agents without lowering the engineering bar.
 
-The agents carried a large share of the engineering — architecture drafts,
-implementation, tests, the conformance drive, and review of one another's
-work — and that contribution is recorded where engineering credit belongs:
-in the history. Every commit with agent involvement names its agents in
-`Co-authored-by:` / `Assisted-by:` trailers. The fleet mechanics live in
+The repository has been developed by one grateful owner ❤️ collaborating with
+three hugely capable agents: [Claude](https://claude.com) from Anthropic,
+[Codex](https://openai.com/codex) from OpenAI, and
+[Kiro](https://kiro.dev) from AWS.
+
+The agents have made material contributions across architecture,
+implementation, testing, conformance, documentation, and review — often
+working concurrently and reviewing one another's work.
+
+Their work is governed by the repository's written engineering contract,
+[AGENTS.md](AGENTS.md): spec-driven development, ground-truth verification
+against the pinned Temporal release, compiler-enforced quality standards,
+isolated worktrees, and serial human review before integration.
+
+Credit is preserved in the engineering record. Commits involving agents name
+them through `Co-authored-by:` and `Assisted-by:` trailers rather than
+silently attributing their work to the human operator.
+
+The concurrency model and fleet mechanics are documented in
 [docs/agents/](docs/agents/concurrent-agents.md).
+
+## Development
+
+Tokeira uses standard Cargo workflows on a pinned stable Rust toolchain.
+
+```sh
+cargo test --workspace
+```
+
+The workspace test suite requires neither AWS credentials nor Docker.
+
+See [docs/development.md](docs/development.md) for the development environment,
+quality gates, and repository conventions.
 
 ## Contributing
 
-Issues and pull requests are welcome; discuss substantial changes in an issue
-first. The quality bar, PR process, and conformance-harness runbook are in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and pull requests are welcome. Please discuss substantial changes in an
+issue before beginning implementation.
+
+The quality bar, pull-request process, and conformance-harness runbook are
+documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[Apache-2.0](LICENSE)
+Tokeira is licensed under [Apache-2.0](LICENSE).

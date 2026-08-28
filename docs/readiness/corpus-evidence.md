@@ -373,7 +373,15 @@ the runner produced “no tests to run” and zero outcomes; it is not counted a
 test-bearing entrypoints or the 106 exclusions beneath them.
 
 `TestScheduleCHASM` is outside this release gate because the CHASM scheduler is not
-enabled in Temporal v1.31.0; Tier 5.30 covers the v1.31.0 scheduler, `TestScheduleV1`.
+released behavior at v1.31.0: it is off by default and experiment-gated —
+`history.enableCHASMSchedulerSentinels` defaults to `false`, and its doc string names
+staged-rollout machinery ("must be enabled and propagated in advance of
+`EnableCHASMSchedulerCreation`") (`common/dynamicconfig/constants.go:2864-2868 @
+v1.31.0`). The test opts in explicitly: its context factory sets that dynamic config
+`true` and routes every request with the `chasm-scheduler` experiment header
+(`tests/schedule_test.go:51-65 @ v1.31.0`) — Temporal's opt-in experiment mechanism.
+The released, default schedule implementation at v1.31.0 is the V1 scheduler, which is
+why Tier 5.30 covers `TestScheduleV1`.
 
 ### Reconciliation of the 21 unaccounted top-level names
 

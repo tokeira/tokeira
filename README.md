@@ -18,7 +18,7 @@ for Amazon Aurora DSQL.
 Preserve the public [Temporal](https://temporal.io) contract that SDKs,
 operators, and tooling depend on — WorkflowService, OperatorService, workflow
 history semantics, the replay model, task lifecycle, sticky execution,
-polling, retries, signals, timers, Continue-As-New, archival. Collapse
+polling, retries, signals, timers, Continue-As-New. Collapse
 internal correctness around a single authoritative per-run transition log.
 
 Tokeira is a product from scratch, not a fork: the architecture is informed by
@@ -69,6 +69,10 @@ Tokeira carries two independent compatibility pins
 The pins are tracked independently on purpose: vendored protos may advance
 ahead of the behavioural claim, and updating protos never silently raises it.
 
+v1.31.0 is the current target, not a ceiling. Tokeira tracks Temporal as it
+evolves: the pins advance release by release, and each raised claim is
+measured the same way before it is made.
+
 Conformance is measured, not asserted:
 
 - **Compatibility matrices.** Every WorkflowService and OperatorService RPC is
@@ -77,10 +81,14 @@ Conformance is measured, not asserted:
   `SDK_MATRIX` with evidence and verification state. `tkr compat show`
   inspects both. See
   [docs/conformance/compatibility.md](docs/conformance/compatibility.md).
-- **Functional corpus replay.** Temporal's own functional Go test suites —
-  unmodified, pinned at v1.31.0 — are replayed over the real gRPC wire against
-  a running `tokeirad`. See
+- **Functional corpus replay.** Temporal's own functional Go test suites,
+  pinned at v1.31.0, are replayed over the real gRPC wire against a running
+  `tokeirad`. See
   [docs/testing/functional-conformance-harness.md](docs/testing/functional-conformance-harness.md).
+- **The v0.1.0 release evidence.**
+  [docs/readiness/corpus-evidence.md](docs/readiness/corpus-evidence.md) — the
+  ordered corpus replay measured against the exact commit `v0.1.0` names:
+  1,261 passes, 0 failures, every exclusion cited to Temporal's source.
 - **A public ledger.**
   [docs/readiness/conformance.md](docs/readiness/conformance.md) records
   exactly what has been verified, what is implemented but unmeasured, and what
@@ -107,57 +115,47 @@ Design documents live in
 [docs/architecture/](docs/architecture/000-overview.md), with a navigable
 reference for the seven engine crates in [docs/crates/](docs/crates/README.md).
 
-## Quick Start
+## Run Tokeira
 
-Install `tkr`, create a `local` deployment, apply — a Temporal-compatible
-server is running on your host in minutes, with no containers, no cloud
-account, and no schema step. The same lifecycle then scales up through Docker
-Compose to ECS and EKS.
-Guide: [docs/platforms/quick-start.md](docs/platforms/quick-start.md).
+### Embedded — inside your process
 
-## Platform Support
+The engine runs in your application. No TCP listener, no port, no daemon —
+the Temporal Rust SDK connects over an in-memory duplex:
 
-| Platform | Runs `tokeirad` as | Storage | Observability |
-|----------|--------------------|---------|---------------|
-| [`local`](docs/platforms/local/README.md) | Bare host process | in-memory or DSQL | None |
-| [`compose`](docs/platforms/compose/README.md) | Docker Compose stack | in-memory or DSQL | Mimir · Loki · Grafana · Alloy |
-| [`ecs`](docs/platforms/ecs/README.md) | AWS ECS on Graviton4, private subnets | Aurora DSQL | Mimir · Loki · Grafana · Alloy |
-| [`eks`](docs/platforms/eks/README.md) | Kubernetes on AWS EKS (Auto Mode, Graviton), private subnets | Aurora DSQL | Mimir · Loki · Grafana · Alloy |
+```rust
+// A Temporal-compatible engine, in-process.
+let engine = tokeira_engine::Engine::embedded().await?;
 
-Full matrix and per-platform guides:
-[docs/platforms/](docs/platforms/README.md).
+// Hand its endpoint to the Temporal Rust SDK:
+//   ConnectionOptions::service_override(engine.service_override())
+// and every SDK worker and client in the process speaks to it directly.
+```
 
-## Deployment
+Storage grows with you: in-memory with snapshots, then managed Aurora DSQL —
+the same engine either way, selected by configuration. Until the crates reach
+crates.io, take a git dependency on the
+[`v0.1.0` tag](https://github.com/tokeira/tokeira/releases/tag/v0.1.0).
 
-`tkr` manages named deployments end to end — image build and mirroring,
-ordered infrastructure modules, DSQL schema migrations, service rollout — with
-an explicit **plan → confirm → apply** contract: mutations are previewed, and
-destructive operations never run without `--yes` or interactive confirmation.
-Guide:
-[docs/provisioning/deployment-configuration.md](docs/provisioning/deployment-configuration.md).
+Building AI agents? [Odori Agents](https://github.com/tokeira/tokeira-odori)
+is a minimal Rust agent framework built on embedded Tokeira.
 
-## Observability
+### The server and its platforms — in development
 
-Every process exposes `/metrics`, `/healthz`, and `/readyz`; the compose and
-ECS platforms provision a full stack — Alloy collection into Mimir (metrics)
-and Loki (logs), Grafana dashboards, and alert rules with bounded ownership and
-diagnostic annotations —
-validated by `tkr observability check`. Guide:
-[docs/platforms/observability.md](docs/platforms/observability.md).
+The same engine runs standalone as `tokeirad` — the conformance evidence
+drives it over live gRPC — and an operator lifecycle is taking shape in-tree
+around it: `tkr` manages named deployments under an explicit
+**plan → confirm → apply** contract, across platform definitions for
+bare-host `local`, Docker Compose (with a provisioned
+Mimir · Loki · Grafana · Alloy observability stack), ECS, and EKS.
 
-## Operations
-
-Day-2 operation goes through the same tooling: scaling, log streaming,
-SSM-based port forwarding and container exec (no public endpoints), one-shot
-admin commands, and schema management. The command surface is in the
-[deployment configuration guide](docs/provisioning/deployment-configuration.md), and
-each [platform guide](docs/platforms/README.md) shows its own operating loop.
+This operator surface is under active development and sits outside the
+v0.1.0 support claim; support statements will follow as it hardens.
+Explore: [docs/platforms/](docs/platforms/README.md).
 
 ## Security
 
-Authentication and authorization live at the compatibility edge; production
-platforms default to private networking with SSM-based operator access;
-secrets are redacted by default; `unsafe` Rust is denied workspace-wide.
+Authentication and authorization live at the compatibility edge; secrets are
+redacted by default; `unsafe` Rust is denied workspace-wide.
 Vulnerability reporting and the full posture: [SECURITY.md](SECURITY.md).
 
 ## Development
@@ -166,27 +164,27 @@ Standard cargo workflows on a pinned stable toolchain;
 `cargo test --workspace` needs no AWS credentials and no Docker. Guide:
 [docs/development.md](docs/development.md).
 
-## Working with Agents
+## Built with Claude, Codex, and Kiro
 
-This repository is engineered for concurrent development by humans and AI
-agents. [AGENTS.md](AGENTS.md) is the binding contract — engineering rules,
-Temporal ground-truthing discipline, and the fleet git protocol — with the
-mechanics in [docs/agents/](docs/agents/concurrent-agents.md). Agent
-contributions are credited in commit history with `Co-authored-by:` /
-`Assisted-by:` trailers.
+Tokeira was built by a fleet: one grateful owner ❤️ collaborating with three hugely capable agents —
+[Claude](https://claude.com) (Anthropic), [Codex](https://openai.com/codex)
+(OpenAI), and [Kiro](https://kiro.dev) (AWS) — working concurrently in this
+repository under a written contract, [AGENTS.md](AGENTS.md): spec-driven
+development, ground-truth verification against the pinned Temporal release,
+a compiler-enforced quality bar, and serial human review of every merge.
+
+The agents carried a large share of the engineering — architecture drafts,
+implementation, tests, the conformance drive, and review of one another's
+work — and that contribution is recorded where engineering credit belongs:
+in the history. Every commit with agent involvement names its agents in
+`Co-authored-by:` / `Assisted-by:` trailers. The fleet mechanics live in
+[docs/agents/](docs/agents/concurrent-agents.md).
 
 ## Contributing
 
 Issues and pull requests are welcome; discuss substantial changes in an issue
 first. The quality bar, PR process, and conformance-harness runbook are in
 [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Acknowledgements
-
-The architecture, requirements specification, and technical design of this
-project were developed in close collaboration with [Kiro](https://kiro.dev),
-which made significant contributions to the design and realisation of the
-system.
 
 ## License
 

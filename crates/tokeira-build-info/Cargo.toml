@@ -1,12 +1,17 @@
 [package]
 name = "tokeira-build-info"
-publish = false
+description = "Compile-time build and compatibility metadata for Tokeira"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Compile-time build and compatibility metadata for Tokeira"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "build-info", "metadata"]
+categories = ["development-tools"]
+publish = true
 
 [dependencies]
 

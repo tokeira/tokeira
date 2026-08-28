@@ -1,10 +1,19 @@
 [package]
 name = "tokeira-storage"
-publish = false
+description = "Storage interfaces and Aurora DSQL persistence for the Tokeira durable execution engine"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "aurora-dsql", "storage", "database"]
+categories = ["database", "asynchronous"]
+publish = true
+# Repository-workflow files and property-test corpora stay out of the archive.
+exclude = ["AGENTS.md", "CLAUDE.md", "proptest-regressions"]
 
 [dependencies]
 anyhow.workspace = true
@@ -24,10 +33,10 @@ thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tokeira-kernel = { path = "../tokeira-kernel" }
-tokeira-observability = { path = "../tokeira-observability" }
-tokeira-types = { path = "../tokeira-types" }
-tokeira-chasm = { path = "../tokeira-chasm" }
+tokeira-kernel = { path = "../tokeira-kernel", version = "0.1.1" }
+tokeira-observability = { path = "../tokeira-observability", version = "0.1.1" }
+tokeira-types = { path = "../tokeira-types", version = "0.1.1" }
+tokeira-chasm = { path = "../tokeira-chasm", version = "0.1.1" }
 uuid.workspace = true
 
 [features]

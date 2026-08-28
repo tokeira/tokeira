@@ -1,10 +1,17 @@
 [package]
 name = "tokeira-projection"
-publish = false
+description = "Visibility projections and read models for the Tokeira durable execution engine"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "temporal", "visibility"]
+categories = ["database", "asynchronous"]
+publish = true
 
 [dependencies]
 anyhow.workspace = true
@@ -21,10 +28,10 @@ time.workspace = true
 tokio.workspace = true
 tokio-util = "0.7"
 tracing.workspace = true
-tokeira-kernel = { path = "../tokeira-kernel" }
+tokeira-kernel = { path = "../tokeira-kernel", version = "0.1.1" }
 tokeira-observability.workspace = true
-tokeira-storage = { path = "../tokeira-storage" }
-tokeira-types = { path = "../tokeira-types" }
+tokeira-storage = { path = "../tokeira-storage", version = "0.1.1" }
+tokeira-types = { path = "../tokeira-types", version = "0.1.1" }
 uuid.workspace = true
 
 [features]

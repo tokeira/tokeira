@@ -1,21 +1,28 @@
 [package]
 name = "tokeira-chasm"
-publish = false
-version.workspace = true
-rust-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
 # Pure CHASM substrate. Dependencies are deliberately confined to value/wire
 # types (`tokeira-types`, `tokeira-proto`) plus serde/prost/thiserror. No async,
 # I/O, storage, or metrics deps may be added here — that is what keeps this crate
 # a pure peer of `tokeira-kernel` (Requirement 1.1, 1.2).
+description = "Durable state-machine framework underpinning Tokeira workflow and activity components"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokeira", "durable-execution", "state-machine"]
+categories = ["asynchronous"]
+publish = true
+
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
 prost = "0.12"
-tokeira-types = { path = "../tokeira-types" }
-tokeira-proto = { path = "../tokeira-proto" }
+tokeira-types = { path = "../tokeira-types", version = "0.1.1" }
+tokeira-proto = { path = "../tokeira-proto", version = "0.1.1" }
 
 [dev-dependencies]
 proptest = "1.6"

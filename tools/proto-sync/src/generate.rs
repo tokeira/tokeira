@@ -146,6 +146,27 @@ pub(crate) fn run(workspace_root: &Path) -> Result<()> {
         fs::remove_file(&path).with_context(|| format!("prune {}", path.display()))?;
     }
 
+    // ── Service protos vendored into tokeira-compatibility ──────────────────
+    // The coverage layer slices these at compile time and the published archive
+    // cannot reach the repository proto tree; the crate carries verbatim copies,
+    // refreshed here and parity-tested against `proto/upstream/` in that crate.
+    let compat_data = workspace_root.join("crates/tokeira-compatibility/data");
+    for (from, to) in [
+        (
+            "temporal/api/workflowservice/v1/service.proto",
+            "workflowservice.service.proto",
+        ),
+        (
+            "temporal/api/operatorservice/v1/service.proto",
+            "operatorservice.service.proto",
+        ),
+    ] {
+        let from = upstream_dir.join(from);
+        let to = compat_data.join(to);
+        fs::copy(&from, &to)
+            .with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
+    }
+
     // ── Upstream OpenAPI documents, copied verbatim ─────────────────────────
     let openapi_out = upstream_out.join("openapi");
     fs::create_dir_all(&openapi_out)

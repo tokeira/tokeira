@@ -384,10 +384,14 @@ because CHASM-backed callbacks are not released behavior at v1.31.0:
 implementation as current ("instead of the previous HSM backed implementation" is the
 flag's forward direction, not the shipped default)
 (`common/dynamicconfig/constants.go:2870-2874 @ v1.31.0`). The suite opts in with
-`EnableChasm` and `EnableCHASMCallbacks`. This is a callbacks-mode gate, not a CHASM
-exclusion in general: where v1.31.0 ships CHASM-backed behavior, Tokeira covers it —
-standalone activities are CHASM-based upstream (`chasm/lib/activity @ v1.31.0`) and
-their suite ran actively in this report. The HSM
+`EnableChasm` and `EnableCHASMCallbacks`. This is a callbacks-mode gate, and Tokeira's
+CHASM boundary is explicit: of the five CHASM components at v1.31.0 (`chasm/lib/
+{activity, callback, nexusoperation, scheduler, workflow}`), Tokeira supports
+**standalone activities only** — `chasm/lib/activity @ v1.31.0`, answered by Tokeira's
+own implementation, whose suite ran actively in this report. The other CHASM
+components are not supported; where the corpus exercises them it does so behind
+non-default flags (the scheduler and callback gates cited above), and the
+corresponding entrypoints are excluded by name. The HSM
 sibling remains active and produced 14 pass outcomes. Invoking the CHASM name through
 the runner produced “no tests to run” and zero outcomes; it is not counted among the 64
 test-bearing entrypoints or the 106 exclusions beneath them.

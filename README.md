@@ -69,6 +69,10 @@ Tokeira carries two independent compatibility pins
 The pins are tracked independently on purpose: vendored protos may advance
 ahead of the behavioural claim, and updating protos never silently raises it.
 
+v1.31.0 is the current target, not a ceiling. Tokeira tracks Temporal as it
+evolves: the pins advance release by release, and each raised claim is
+measured the same way before it is made.
+
 Conformance is measured, not asserted:
 
 - **Compatibility matrices.** Every WorkflowService and OperatorService RPC is

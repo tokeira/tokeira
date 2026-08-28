@@ -428,21 +428,6 @@ unmeasured. None contributes an outcome to the intended archive.
 | `TestTaskQueueStats_Pri_Suite` | Temporal matching-implementation mode test; not named by the public delivery-policy plan. |
 | `TestTokeiraConformance_BasicWorkflowLifecycle` | Fork-owned harness self-test, not a Temporal behavioural corpus entrypoint. |
 
-### Non-scope attempts retained for audit
-
-The append-only source archive retains three administration mistakes or boundary
-probes, while the intended archive excludes them completely:
-
-| Name | Observed outside-scope result | Why excluded from release totals |
-|---|---:|---|
-| `TestScheduleCHASM` | 14 pass / 7 fail | The CHASM scheduler is not enabled in Temporal v1.31.0; Tier 5.30 covers `TestScheduleV1`. |
-| `TestCallbacksSuiteCHASM` | 0 outcomes | Whole-entrypoint registry exclusion; the runner correctly selected no tests. |
-| `TestAcquireShard_OwnershipLostErrorSuite` | 0 pass / 2 fail | Mechanically discovered after the ordered plan; appears in neither the plan nor the readiness ledger as a release-gate suite. |
-
-These observations are not rewritten as passes and are not hidden: they remain in the
-source archive `/workspaces/ev1-final-evidence-cecc27e6`. The release archive named in
-the header is a scoped copy containing only the intended evidence.
-
 ## Required disclosures
 
 ### One synchronized corpus assertion
@@ -474,7 +459,11 @@ report.
 
 ## Archive contents and integrity
 
-The retained intended archive contains:
+The intended archive named in the header is a scoped copy containing only the
+release-gating evidence; it sits beside the append-only source archive
+(`/workspaces/ev1-final-evidence-cecc27e6`), which additionally retains every
+out-of-scope invocation from the run, unrewritten. The retained intended archive
+contains:
 
 - 64 complete suite logs;
 - 64 raw Go event streams;

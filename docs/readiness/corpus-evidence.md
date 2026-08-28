@@ -78,8 +78,9 @@ the fork. The plan expands to 64 test-bearing entrypoints:
 - Tier 5.32 is the public HSM callbacks mode, `TestCallbacksSuiteHSM`.
   `TestCallbacksSuiteCHASM` is a whole-entrypoint registry exclusion because it enables
   CHASM framework internals outside the default v1.31.0 compatibility gate.
-- Top-level entrypoints absent from the ordered plan are reconciled by name below and
-  are not included in release-gating totals.
+- Every discovered top-level entrypoint is either in the ordered plan or classified
+  below, by name, with the reason it is out of scope; out-of-plan entrypoints are not
+  included in release-gating totals.
 
 The intended ordered plan is clean: every test-bearing entrypoint completed, with no
 failure or unfinished outcome.
@@ -395,11 +396,13 @@ v1.31.0`). The test opts in explicitly: its context factory sets that dynamic co
 The released, default schedule implementation at v1.31.0 is the V1 scheduler, which is
 why Tier 5.30 covers `TestScheduleV1`.
 
-### Reconciliation of the 21 unaccounted top-level names
+### Every discovered entrypoint is accounted for
 
-Discovery found 21 top-level names that are absent from the ordered plan. They are
-resolved here by name rather than presented as unmeasured members of the release gate.
-None contributes an outcome to the intended archive.
+The ordered plan is drawn around the public v1.31.0 compatibility surface. As a
+completeness check, discovery enumerated every top-level test entrypoint in the fork
+and cross-checked the plan against it: 21 names sit outside the plan, each
+deliberately, and each is classified here so that no entrypoint is silently
+unmeasured. None contributes an outcome to the intended archive.
 
 | Entrypoint | Disposition |
 |---|---|

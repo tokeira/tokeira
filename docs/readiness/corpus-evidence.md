@@ -57,7 +57,6 @@ recorded start tips throughout the run.
 The release gate is the in-scope ordered plan, not every top-level Go entrypoint in
 the fork. The plan expands to 64 test-bearing entrypoints:
 
-- Tier 5.30 is `TestScheduleV1` only. `TestScheduleCHASM` is not in the ordered plan.
 - Tier 5.32 is the public HSM callbacks mode, `TestCallbacksSuiteHSM`.
   `TestCallbacksSuiteCHASM` is a whole-entrypoint registry exclusion because it enables
   CHASM framework internals outside the default v1.31.0 compatibility gate.
@@ -373,8 +372,8 @@ sibling remains active and produced 14 pass outcomes. Invoking the CHASM name th
 the runner produced “no tests to run” and zero outcomes; it is not counted among the 64
 test-bearing entrypoints or the 106 exclusions beneath them.
 
-`TestScheduleCHASM` is likewise outside this release gate by explicit operator scope: Tier
-5.30 is `TestScheduleV1` only.
+`TestScheduleCHASM` is outside this release gate because the CHASM scheduler is not
+enabled in Temporal v1.31.0; Tier 5.30 covers the v1.31.0 scheduler, `TestScheduleV1`.
 
 ### Reconciliation of the 21 unaccounted top-level names
 
@@ -413,7 +412,7 @@ probes, while the intended archive excludes them completely:
 
 | Name | Observed outside-scope result | Why excluded from release totals |
 |---|---:|---|
-| `TestScheduleCHASM` | 14 pass / 7 fail | The operator clarified that Tier 5.30 contains only `TestScheduleV1`. |
+| `TestScheduleCHASM` | 14 pass / 7 fail | The CHASM scheduler is not enabled in Temporal v1.31.0; Tier 5.30 covers `TestScheduleV1`. |
 | `TestCallbacksSuiteCHASM` | 0 outcomes | Whole-entrypoint registry exclusion; the runner correctly selected no tests. |
 | `TestAcquireShard_OwnershipLostErrorSuite` | 0 pass / 2 fail | Mechanically discovered after the ordered plan; appears in neither the plan nor the readiness ledger as a release-gate suite. |
 

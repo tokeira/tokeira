@@ -18,8 +18,7 @@ single-suite runner against the exact engine commit that the release tag names.
 | Temporal proto | `v1.62.11` |
 | Rust toolchain | `1.97.1` |
 | Go toolchain | `go1.26.2` |
-| Evidence archive | `/workspaces/ev1-final-evidence-cecc27e6-intended` |
-| Archive checksum manifest | `SHA256SUMS` · SHA-256 `cf8987d2c470bd2b05fc528b1894908a73f652c0028868617300519df3a97172` |
+| Retained evidence archive | operator-held (suite logs, event streams, distilled outcomes, wire coverage); `SHA256SUMS` manifest SHA-256 `cf8987d2c470bd2b05fc528b1894908a73f652c0028868617300519df3a97172` |
 
 The proto pin is deliberately ahead of the server claim: Temporal server 1.31.0 ships
 API `v1.62.8`, while Tokeira vendors `v1.62.11`. Protobuf wire shapes are
@@ -413,7 +412,7 @@ The ordered plan is drawn around the public v1.31.0 compatibility surface. As a
 completeness check, discovery enumerated every top-level test entrypoint in the fork
 and cross-checked the plan against it: 21 names sit outside the plan, each
 deliberately, and each is classified here so that no entrypoint is silently
-unmeasured. None contributes an outcome to the intended archive.
+unmeasured. None contributes an outcome to the release-gating totals.
 
 | Entrypoint | Disposition |
 |---|---|
@@ -457,27 +456,6 @@ skips, zero failures, and zero unfinished outcomes.
 The observer-effect exception is disclosed in the wire section: coverage was disabled
 only for the three Tier 10.45 entrypoints because measured instrumentation overhead
 would exceed their upstream deadline. Their ordinary test evidence remains complete.
-
-## Archive contents and integrity
-
-The intended archive named in the header is a scoped copy containing only the
-release-gating evidence; it sits beside the append-only source archive
-(`/workspaces/ev1-final-evidence-cecc27e6`), which additionally retains every
-out-of-scope invocation from the run, unrewritten. The retained intended archive
-contains:
-
-- 64 complete suite logs;
-- 64 raw Go event streams;
-- 64 distilled outcome JSON files;
-- 61 wire-coverage JSON files;
-- the scoped 64-row status ledger;
-- exact normal and verbose binary self-reports; and
-- a 260-entry `SHA256SUMS` manifest whose own SHA-256 is recorded in the header.
-
-Every suite log ends in `result: PASS`; every status-ledger tally matches its outcome
-JSON; each coverage-enabled wire file parses and contains `GetSystemInfo`; the three
-authorized coverage-off entries have no wire file. The original run workspace was
-tidied, the evidence archives were retained, and the run task marker was removed.
 
 ## Release-gating verdict
 

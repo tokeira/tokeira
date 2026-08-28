@@ -74,7 +74,7 @@ fn standalone_activities_enabled(configured: bool) -> bool {
     // The override is compiled out of production. Reading it live is required
     // because the functional corpus applies the namespace setting after the
     // out-of-process server has started.
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_bool(STANDALONE_ACTIVITIES_KEY)
         .unwrap_or(configured)
 }
@@ -86,7 +86,7 @@ fn activity_long_poll_timeout(configured: std::time::Duration) -> std::time::Dur
 
 #[cfg(feature = "conformance")]
 fn activity_long_poll_timeout(configured: std::time::Duration) -> std::time::Duration {
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_duration(ACTIVITY_LONG_POLL_TIMEOUT_KEY)
         .unwrap_or(configured)
 }
@@ -98,7 +98,7 @@ fn activity_long_poll_buffer(configured: std::time::Duration) -> std::time::Dura
 
 #[cfg(feature = "conformance")]
 fn activity_long_poll_buffer(configured: std::time::Duration) -> std::time::Duration {
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_duration(ACTIVITY_LONG_POLL_BUFFER_KEY)
         .unwrap_or(configured)
 }
@@ -1958,7 +1958,10 @@ mod tests {
             .lock()
             .expect("conformance override test lock");
         #[cfg(feature = "conformance")]
-        tokeira_conformance::overrides().clear(STANDALONE_ACTIVITIES_KEY);
+        {
+            crate::conformance::overrides::install_registry_reads();
+            tokeira_conformance::overrides().clear(STANDALONE_ACTIVITIES_KEY);
+        }
         let bridge = bridge(false);
         let err = bridge.start(start_request()).await.unwrap_err();
         assert!(
@@ -1972,6 +1975,7 @@ mod tests {
         let _override_guard = CONFORMANCE_OVERRIDE_TEST_LOCK
             .lock()
             .expect("conformance override test lock");
+        crate::conformance::overrides::install_registry_reads();
         let overrides = tokeira_conformance::overrides();
         overrides.clear(STANDALONE_ACTIVITIES_KEY);
         overrides.clear(ACTIVITY_LONG_POLL_TIMEOUT_KEY);

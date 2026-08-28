@@ -54,7 +54,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CI");
     println!("cargo:rerun-if-env-changed=PROFILE");
 
-    let root = workspace_root();
+    let Some(root) = workspace_root() else {
+        packaged_build();
+        return;
+    };
     println!(
         "cargo:rerun-if-changed={}",
         root.join("rust-toolchain.toml").display()
@@ -131,12 +134,64 @@ fn main() {
     emit_schema_contract(&schema_contract);
 }
 
-fn workspace_root() -> PathBuf {
-    manifest_dir()
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("../.."))
+/// Identity for a build of the published crate: a registry archive carries no
+/// workspace, no git repository, and no toolchain pin. Everything is derived
+/// from files packaged inside the crate, and the provenance gate deliberately
+/// does not run — it is a control on Tokeira's own release pipeline, and a
+/// downstream consumer's release CI (where `CI` is set but no
+/// `TOKEIRA_GIT_SHA` can exist) must not fail on it.
+fn packaged_build() {
+    let pinned_path = manifest_dir().join("src/pinned.rs");
+    let (proto_version, server_compat) = read_pinned_versions(&pinned_path)
+        .unwrap_or_else(|error| panic!("failed to read packaged pins: {error}"));
+    let pinned_source = fs::read_to_string(&pinned_path)
+        .unwrap_or_else(|error| panic!("failed to read packaged pinned.rs: {error}"));
+    let rust_toolchain = capture_const(&pinned_source, "PINNED_RUST_TOOLCHAIN")
+        .unwrap_or_else(|error| panic!("failed to read packaged toolchain pin: {error}"));
+
+    let manifest = Manifest {
+        version: env::var("CARGO_PKG_VERSION").expect("Cargo sets CARGO_PKG_VERSION"),
+        git_sha: "crates-io".to_owned(),
+        proto_version,
+        server_compat,
+        rust_toolchain,
+        source_tree_hash: dev_source_tree_hash(),
+        feature_matrix_digest: "dev".to_owned(),
+        sdk_matrix_digest: "dev".to_owned(),
+        build_mode: "dev".to_owned(),
+    };
+    // The packaged copy of the storage crate's schema contract; a parity test
+    // keeps the two byte-identical in the workspace.
+    let schema_contract = read_schema_contract(&manifest_dir().join("schema-contract.toml"))
+        .unwrap_or_else(|error| panic!("failed to read packaged schema contract: {error}"));
+
+    emit_manifest(&manifest);
+    emit_schema_contract(&schema_contract);
+}
+
+/// The Tokeira workspace root, or `None` when building outside it (a registry
+/// archive, or a copy vendored into some other project's workspace). A bare
+/// `[workspace]` ancestor is not enough — `cargo vendor` places this crate
+/// inside arbitrary downstream workspaces — so the root must also carry the
+/// storage crate's schema contract, the file workspace mode exists to read.
+fn workspace_root() -> Option<PathBuf> {
+    let mut dir = manifest_dir();
+    loop {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.is_file()
+            && fs::read_to_string(&manifest)
+                .map(|contents| contents.contains("[workspace]"))
+                .unwrap_or(false)
+            && dir
+                .join("crates/tokeira-storage/schema-contract.toml")
+                .is_file()
+        {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
 }
 
 fn manifest_dir() -> PathBuf {

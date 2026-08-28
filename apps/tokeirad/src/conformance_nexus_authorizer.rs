@@ -1,7 +1,8 @@
 //! Conformance-only adapter for Temporal's in-process `SetOnAuthorize` hook.
 //!
-//! Kept with engine construction so embedded and listener-backed stacks use the
-//! same admission policy under the conformance feature.
+//! Installed process-globally through `tokeira_engine::harness`, so embedded
+//! and listener-backed stacks built in a conformance process use the same
+//! admission policy.
 //!
 //! The functional corpus installs arbitrary Go closures on its onebox host. An
 //! out-of-process server cannot execute those closures directly, so the harness

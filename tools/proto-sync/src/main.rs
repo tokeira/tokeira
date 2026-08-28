@@ -8,6 +8,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 
+mod generate;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error:#}");
@@ -16,32 +18,47 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let version = parse_version_arg()?;
     let workspace_root = find_workspace_root()?;
-    let upstream_dir = workspace_root.join("proto/upstream");
-    let version_file = workspace_root.join("proto/UPSTREAM_VERSION");
+    match parse_mode_arg()? {
+        Mode::Sync(version) => {
+            let upstream_dir = workspace_root.join("proto/upstream");
+            let version_file = workspace_root.join("proto/UPSTREAM_VERSION");
 
-    clean_upstream_dir(&upstream_dir)?;
-    buf_export(&version, &upstream_dir)?;
-    write_version_file(&version_file, &version)?;
+            clean_upstream_dir(&upstream_dir)?;
+            buf_export(&version, &upstream_dir)?;
+            write_version_file(&version_file, &version)?;
 
-    println!(
-        "synced Temporal API protos {version} into {}",
-        upstream_dir.display()
-    );
+            println!(
+                "synced Temporal API protos {version} into {}",
+                upstream_dir.display()
+            );
+            generate::run(&workspace_root)?;
+        }
+        Mode::Generate => generate::run(&workspace_root)?,
+    }
     Ok(())
 }
 
-fn parse_version_arg() -> Result<String> {
+enum Mode {
+    /// Vendor the named Temporal API release, then regenerate bindings.
+    Sync(String),
+    /// Regenerate `tokeira-proto`'s checked-in bindings from the vendored protos.
+    Generate,
+}
+
+fn parse_mode_arg() -> Result<Mode> {
     let mut args = env::args();
     let program = args.next().unwrap_or_else(|| "proto-sync".to_string());
-    let Some(version) = args.next() else {
-        bail!("usage: {program} <version>");
+    let Some(argument) = args.next() else {
+        bail!("usage: {program} <version> | generate");
     };
     if args.next().is_some() {
-        bail!("usage: {program} <version>");
+        bail!("usage: {program} <version> | generate");
     }
-    Ok(version)
+    if argument == "generate" {
+        return Ok(Mode::Generate);
+    }
+    Ok(Mode::Sync(argument))
 }
 
 fn find_workspace_root() -> Result<PathBuf> {

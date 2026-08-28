@@ -37,6 +37,8 @@
 pub mod gates;
 pub mod layer;
 pub mod ledger;
+#[cfg(feature = "conformance")]
+pub mod overrides;
 pub mod pin;
 pub mod record;
 pub mod recorder;

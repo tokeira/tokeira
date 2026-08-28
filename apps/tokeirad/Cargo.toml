@@ -71,10 +71,19 @@ connectrpc = { version = "0.8.1", features = ["server"], optional = true }
 http = "1"
 
 [features]
-# Conformance-only: mounts the dynamic-config control service on a separate
-# loopback listener and enables the runtime's live override reads. Absent from
-# a production build.
-conformance = ["tokeira-engine/conformance"]
+# Conformance-only: links the never-published override machinery and installs
+# it into the engine's inert harness seams — the dynamic-config control
+# service on a separate loopback listener, the edge/runtime live override
+# reads, and the environment-driven authorization callbacks. Absent from a
+# production build.
+conformance = [
+    "dep:tokeira-conformance",
+    "dep:tokeira-conformance-control",
+    "dep:connectrpc",
+    "dep:reqwest",
+    "tokeira-edge/conformance",
+    "tokeira-runtime/conformance",
+]
 
 [dev-dependencies]
 metrics-util.workspace = true

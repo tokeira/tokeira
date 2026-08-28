@@ -164,7 +164,7 @@ fn frontend_visibility_max_page_size() -> usize {
 
 #[cfg(feature = "conformance")]
 fn frontend_visibility_max_page_size() -> usize {
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_i64(FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY)
         .and_then(|value| usize::try_from(value).ok())
         .filter(|value| *value > 0)
@@ -478,7 +478,7 @@ fn callback_url_max_length() -> usize {
 
 #[cfg(feature = "conformance")]
 fn callback_url_max_length() -> usize {
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_i64(CALLBACK_URL_MAX_LENGTH_KEY)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(CALLBACK_URL_MAX_LENGTH)
@@ -491,7 +491,7 @@ fn callback_header_max_size() -> usize {
 
 #[cfg(feature = "conformance")]
 fn callback_header_max_size() -> usize {
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_i64(CALLBACK_HEADER_MAX_SIZE_KEY)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(CALLBACK_HEADER_MAX_SIZE)
@@ -504,7 +504,7 @@ fn max_callbacks_per_workflow() -> usize {
 
 #[cfg(feature = "conformance")]
 fn max_callbacks_per_workflow() -> usize {
-    tokeira_conformance::overrides()
+    crate::conformance::overrides::reads()
         .get_i64(MAX_CALLBACKS_PER_WORKFLOW_KEY)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(MAX_CALLBACKS_PER_WORKFLOW)
@@ -526,7 +526,7 @@ fn callback_address_rules() -> Option<Vec<CallbackAddressRule>> {
 
 #[cfg(feature = "conformance")]
 fn callback_address_rules() -> Option<Vec<CallbackAddressRule>> {
-    let json = tokeira_conformance::overrides().get_json(CALLBACK_ALLOWED_ADDRESSES_KEY)?;
+    let json = crate::conformance::overrides::reads().get_json(CALLBACK_ALLOWED_ADDRESSES_KEY)?;
     Some(serde_json::from_str(&json).unwrap_or_else(|error| {
         // Temporal's typed-setting converter falls back when the configured
         // structure cannot be converted. Treating malformed conformance JSON as
@@ -10091,7 +10091,10 @@ mod tests {
             .lock()
             .expect("visibility page-size override test lock");
         #[cfg(feature = "conformance")]
-        tokeira_conformance::overrides().clear(FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY);
+        {
+            crate::conformance::overrides::install_registry_reads();
+            tokeira_conformance::overrides().clear(FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY);
+        }
         let translate = |page_size| {
             list_activity_request_to_edge(workflowservice::ListActivityExecutionsRequest {
                 page_size,
@@ -10160,6 +10163,7 @@ mod tests {
         let _override_guard = VISIBILITY_PAGE_SIZE_OVERRIDE_TEST_LOCK
             .lock()
             .expect("visibility page-size override test lock");
+        crate::conformance::overrides::install_registry_reads();
         let overrides = tokeira_conformance::overrides();
         overrides.clear(FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY);
         overrides

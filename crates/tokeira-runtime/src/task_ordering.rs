@@ -196,7 +196,7 @@ impl DeliveryModeProvider for ConfiguredDeliveryModeProvider {
 
     #[cfg(feature = "conformance")]
     fn scope_generation(&self) -> u64 {
-        tokeira_conformance::overrides().scope_generation()
+        crate::conformance::reads().scope_generation()
     }
 }
 
@@ -229,9 +229,9 @@ fn delivery_mode(policy: StaticDeliveryPolicy) -> DeliveryMode {
     resolve_delivery_mode(
         policy,
         DeliveryModeOverlay {
-            priority_enabled: tokeira_conformance::overrides().get_bool("matching.useNewMatcher"),
-            fairness_enabled: tokeira_conformance::overrides().get_bool("matching.enableFairness"),
-            auto_enable: tokeira_conformance::overrides().get_bool("matching.autoEnableV2"),
+            priority_enabled: crate::conformance::reads().get_bool("matching.useNewMatcher"),
+            fairness_enabled: crate::conformance::reads().get_bool("matching.enableFairness"),
+            auto_enable: crate::conformance::reads().get_bool("matching.autoEnableV2"),
         },
     )
 }

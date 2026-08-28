@@ -33,8 +33,6 @@ opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 percent-encoding = "2"
 serde_json.workspace = true
-serde = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
 time.workspace = true
 tokio.workspace = true
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -61,9 +59,6 @@ tokeira-runtime = { path = "../tokeira-runtime", version = "0.1.0" }
 tokeira-config = { path = "../tokeira-config", version = "0.1.0" }
 tokeira-storage = { path = "../tokeira-storage", version = "0.1.0", features = ["dsql"] }
 tokeira-types = { path = "../tokeira-types", version = "0.1.0" }
-tokeira-conformance-control = { path = "../tokeira-conformance-control", version = "0.1.0", optional = true }
-tokeira-conformance = { path = "../tokeira-conformance", version = "0.1.0", optional = true }
-connectrpc = { version = "0.8.1", features = ["server"], optional = true }
 http = "1"
 temporalio-client = { version = "0.7.0", default-features = false, optional = true }
 tonic-sdk = { package = "tonic", version = "0.14", default-features = false, optional = true }
@@ -76,17 +71,6 @@ temporalio-client = ["dep:temporalio-client", "dep:tonic-sdk"]
 dsql-integration = [
     "tokeira-projection/dsql-integration",
     "tokeira-storage/dsql-integration",
-]
-# Conformance-only: mounts the dynamic-config control service on a separate
-# loopback listener and enables the runtime's live override reads.
-conformance = [
-    "dep:tokeira-conformance-control",
-    "dep:tokeira-conformance",
-    "dep:connectrpc",
-    "dep:reqwest",
-    "dep:serde",
-    "tokeira-edge/conformance",
-    "tokeira-runtime/conformance",
 ]
 
 [dev-dependencies]

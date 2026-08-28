@@ -42,15 +42,19 @@ tokeira-proto = { path = "../tokeira-proto" }
 tokeira-storage = { path = "../tokeira-storage" }
 tokeira-types = { path = "../tokeira-types" }
 tokeira-chasm = { path = "../tokeira-chasm" }
-tokeira-conformance = { workspace = true, optional = true }
 prost = "0.12"
 
 [features]
-# Conformance-only: pulls in the override registry so the reported-problems
-# threshold (and future wired keys) is read live. Absent from production builds.
-conformance = ["dep:tokeira-conformance"]
+# Compiles the dynamic-override read seam (`conformance`) into the wired
+# admission sites. The override registry itself is test-harness machinery this
+# crate never links; the serving application installs read functions at boot.
+# Absent from production builds.
+conformance = []
 
 [dev-dependencies]
+# Version-less on purpose: `cargo publish` strips path-only dev-dependencies,
+# so the never-published override registry stays test-only.
+tokeira-conformance = { path = "../tokeira-conformance" }
 metrics-util.workspace = true
 proptest = "1"
 prost = "0.12"

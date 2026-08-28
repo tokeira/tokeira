@@ -77,7 +77,7 @@ fn max_versions_per_deployment() -> usize {
 
 #[cfg(feature = "conformance")]
 fn max_versions_per_deployment() -> usize {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_i64("matching.maxVersionsInDeployment")
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(MAX_VERSIONS_PER_DEPLOYMENT)
@@ -90,7 +90,7 @@ fn max_task_queue_families_per_version() -> usize {
 
 #[cfg(feature = "conformance")]
 fn max_task_queue_families_per_version() -> usize {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_i64("matching.maxTaskQueuesInDeploymentVersion")
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(MAX_TASK_QUEUE_FAMILIES_PER_VERSION)
@@ -103,7 +103,7 @@ fn active_poller_window() -> Duration {
 
 #[cfg(feature = "conformance")]
 fn active_poller_window() -> Duration {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_duration("matching.PollerHistoryTTL")
         .and_then(|value| Duration::try_from(value).ok())
         .unwrap_or(ACTIVE_POLLER_WINDOW)
@@ -116,7 +116,7 @@ fn drainage_visibility_grace_period() -> Duration {
 
 #[cfg(feature = "conformance")]
 fn drainage_visibility_grace_period() -> Duration {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_duration("matching.wv.VersionDrainageStatusVisibilityGracePeriod")
         .and_then(|value| Duration::try_from(value).ok())
         .unwrap_or(DRAINAGE_VISIBILITY_GRACE_PERIOD)
@@ -134,7 +134,7 @@ fn version_membership_cache_ttl() -> Duration {
 
 #[cfg(feature = "conformance")]
 fn version_membership_cache_ttl() -> Duration {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_duration("history.versionMembershipCacheTTL")
         .and_then(|value| Duration::try_from(value).ok())
         .unwrap_or(VERSION_MEMBERSHIP_CACHE_TTL)
@@ -148,7 +148,7 @@ fn version_reactivation_cache_ttl() -> Duration {
 
 #[cfg(feature = "conformance")]
 fn version_reactivation_cache_ttl() -> Duration {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_duration("history.versionReactivationSignalCacheTTL")
         .and_then(|value| Duration::try_from(value).ok())
         .unwrap_or(VERSION_REACTIVATION_CACHE_TTL)
@@ -162,7 +162,7 @@ fn version_reactivation_enabled() -> bool {
 
 #[cfg(feature = "conformance")]
 fn version_reactivation_enabled() -> bool {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_bool("history.enableVersionReactivationSignals")
         .unwrap_or(false)
 }
@@ -196,7 +196,7 @@ enum MissingTaskQueueGuard {
 
 #[cfg(feature = "conformance")]
 fn drainage_refresh_interval() -> Duration {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_duration("matching.wv.VersionDrainageStatusRefreshInterval")
         .and_then(|value| Duration::try_from(value).ok())
         .unwrap_or(DRAINAGE_REFRESH_INTERVAL)
@@ -6587,6 +6587,7 @@ mod tests {
     #[cfg(feature = "conformance")]
     #[test]
     fn conformance_worker_deployment_policy_reads_live_overrides() {
+        crate::conformance::install_registry_reads();
         let overrides = tokeira_conformance::overrides();
         overrides.reset();
         overrides

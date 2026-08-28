@@ -198,7 +198,7 @@ pub fn max_fairness_weight_overrides() -> usize {
 /// admission site; production remains pinned to the release default.
 #[cfg(feature = "conformance")]
 pub fn max_fairness_weight_overrides() -> usize {
-    tokeira_conformance::overrides()
+    crate::conformance::reads()
         .get_i64("matching.maxFairnessKeyWeightOverrides")
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(MAX_FAIRNESS_WEIGHT_OVERRIDES)

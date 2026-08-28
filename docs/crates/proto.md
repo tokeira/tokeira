@@ -6,7 +6,11 @@ Generated protobuf and gRPC bindings for Tokeira, covering both the public Tempo
 
 - `tokeira-types` — domain types for conversions
 - External: `prost`, `prost-types`, `tonic`, `serde`, `serde_json`, `thiserror`, `time`, `uuid`
-- Build: `tonic-build`, `walkdir`
+- No build script: the bindings are generated ahead of time and checked in
+  under `src/generated/` (`upstream/` for the Temporal surface, `tokeira/` for
+  Tokeira's own packages). Regenerate with `cargo run -p proto-sync --
+  generate` after changing the vendored protos or the codegen stack
+  (`tonic-build`, `connectrpc-build`, pinned in `tools/proto-sync`).
 
 ## Module Structure
 

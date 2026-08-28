@@ -230,9 +230,16 @@ This makes durable execution practical for applications that want Temporal's
 programming model without operating a separate workflow service — while
 remaining the same Tokeira engine used by `tokeirad`.
 
-Until the crates reach crates.io, use the
-[`v0.1.0` tag](https://github.com/tokeira/tokeira/releases/tag/v0.1.0) as a
-Git dependency.
+The engine is on crates.io:
+
+```console
+cargo add tokeira-engine
+```
+
+The [`v0.1.1` release](https://github.com/tokeira/tokeira/releases/tag/v0.1.1)
+is the published tree; the conformance evidence names
+[`v0.1.0`](https://github.com/tokeira/tokeira/releases/tag/v0.1.0), which it
+packages.
 
 Building agents in Rust?
 [Tokeira Odori](https://github.com/tokeira/tokeira-odori) builds durable

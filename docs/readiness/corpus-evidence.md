@@ -58,6 +58,18 @@ not represented as production provenance values.
 The engine main ref, the fork branch, and the Odori main ref remained fixed at their
 recorded start tips throughout the run.
 
+### The conformance harness interface
+
+The measured binary is built with the engine's conformance feature, which mounts two
+harness-only surfaces and nothing else: the wire-coverage recorder (enabled per boot by
+environment variable) and the configuration-override bridge, which delivers the
+corpus's `WithDynamicConfig` values for a wired key set
+(`.kiro/specs/conformance-config-override/`). Neither surface exists in a default
+build, and neither adds anything to the production configuration schema. Corpus keys
+outside the wired set are precisely the OverrideDynamicConfig-class registry exclusions
+listed below — wired keys are honored, unwired keys are excluded by name rather than
+silently defaulted.
+
 ## Scope and result
 
 The release gate is the in-scope ordered plan, not every top-level Go entrypoint in

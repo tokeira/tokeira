@@ -13,7 +13,7 @@ single-suite runner against the exact engine commit that the release tag names.
 | Run date | 2026-08-28 |
 | Release tag | annotated tag `v0.1.0` (`3c7c7c768e4972013af753f1aca4ff41838091e2`) |
 | Tag target / measured engine | `cecc27e6dceb5385a4608bf5d5d5172df498fb3d` |
-| Conformance fork | branch `tokeira/conformance-v1.31.0` at `5558d9422d33203d8aff9d42fe6b5663b4b1b1bc` |
+| Conformance fork | [`tokeira/temporal`](https://github.com/tokeira/temporal) (fork of `temporalio/temporal`), branch `tokeira/conformance-v1.31.0` at `5558d9422d33203d8aff9d42fe6b5663b4b1b1bc` |
 | Temporal server compatibility | `1.31.0` |
 | Temporal proto | `v1.62.11` |
 | Rust toolchain | `1.97.1` |

@@ -178,6 +178,11 @@ sinks with independent checkpoints and replay.
 
 It remains outside the correctness path.
 
+<p align="center">
+  <img src="docs/diagrams/three-planes.svg" width="780"
+       alt="The three planes: requests enter the compatibility edge, follow the commit path through the runtime's lanes and pure kernel into one authoritative history in Aurora DSQL, and everything else — broker delivery, projection — derives from that log.">
+</p>
+
 The architecture is documented in
 [docs/architecture/](docs/architecture/000-overview.md). A navigable reference
 for the seven engine crates lives in [docs/crates/](docs/crates/README.md).

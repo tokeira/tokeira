@@ -1,6 +1,6 @@
 # tokeira-kernel
 
-Pure deterministic state machine that owns workflow semantic correctness. The kernel derives the authoritative next state for a workflow run given its current state and a command. It produces history events, dispatch operations, and projection operations — but never executes I/O.
+Pure deterministic state machine that owns workflow semantic correctness. The kernel derives the authoritative next state for a workflow run given its current state and a command. It produces history events and explicit transition effects, but never executes I/O; storage derives visibility snapshots from the committed next state.
 
 ## Dependencies
 
@@ -15,7 +15,7 @@ Pure deterministic state machine that owns workflow semantic correctness. The ke
 | `command.rs` | `Command` enum (~27 top-level variants), `WorkflowCommand` enum (~16 worker-issued variants), all request structs, conflict/reuse policies, retry state, timeout types |
 | `event.rs` | `HistoryEvent`, `HistoryEventKind` (40+ variants including `ActivityTaskStarted`), `ActivityResolution`, `CloseInfo` |
 | `kernel.rs` | `Kernel` trait, `BasicKernel` implementation, `TransitionBuilder`, `Reject` error enum, `ReplayContext` |
-| `transition.rs` | `Transition`, `DispatchOp`, `ProjectionOp`, `ActivityOp`, `TimerOp`, `RequestDedupeOp` |
+| `transition.rs` | `Transition`, `DispatchOp`, `ActivityOp`, `TimerOp`, `RequestDedupeOp` |
 
 ## Command Variants
 

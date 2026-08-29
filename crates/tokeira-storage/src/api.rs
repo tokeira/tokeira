@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ActivityOp, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, RequestIdInfo, TimerOp,
-    Transition, WorkflowState,
+    ActivityOp, DispatchOp, HistoryEvent, LoadedRun, RequestIdInfo, TimerOp, Transition,
+    WorkflowState,
     state::{
         NexusOperationCancellationState, Priority, VersioningBehavior, VersioningOverride,
         WorkerDeploymentVersionRef,
@@ -701,8 +701,6 @@ pub struct TransitionAuditRecord {
     pub timer_ops: Vec<TimerOp>,
     /// Dispatch queue operations (enqueue tasks).
     pub dispatch_ops: Vec<DispatchOp>,
-    /// Projection log entries for visibility sinks.
-    pub projection_ops: Vec<ProjectionOp>,
 }
 
 /// One authoritative history event paired with its server-computed attribution.
@@ -1760,9 +1758,9 @@ pub struct ProjectionContext {
     pub search_attr_generation: u64,
     /// Full memo image after the transition.
     ///
-    /// The old projection contract emitted memo patches through
-    /// `ProjectionOp`. Snapshots carry the complete image so applying a later
-    /// version does not depend on seeing every earlier delta in order.
+    /// The old projection contract emitted incremental memo patches. Snapshots
+    /// carry the complete image so applying a later version does not depend on
+    /// seeing every earlier delta in order.
     #[serde(default)]
     pub memo: Memo,
     /// Full search-attribute image after the transition.

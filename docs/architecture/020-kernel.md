@@ -95,7 +95,6 @@ pub struct Transition {
     pub activity_ops: SmallVec<[ActivityOp; 4]>,
     pub timer_ops: SmallVec<[TimerOp; 4]>,
     pub dispatch_ops: SmallVec<[DispatchOp; 4]>,
-    pub projection_ops: SmallVec<[ProjectionOp; 8]>,
 }
 ```
 
@@ -132,7 +131,7 @@ Internally, the kernel assembles transitions through a `TransitionBuilder` that:
 1. takes ownership of the current `WorkflowState` and a `now` timestamp,
 2. provides an `emit(kind)` method that assigns the next contiguous event ID and appends a `HistoryEvent`,
 3. provides `schedule_workflow_task()` which emits a `WorkflowTaskScheduled` event, sets the pending WFT on state, and pushes a `DispatchOp`,
-4. provides `close(status)` which sets terminal status, clears pending WFT and sticky affinity, and emits a `ProjectionOp::CloseExecution`,
+4. provides `close(status)` which sets terminal status and clears pending WFT and sticky affinity,
 5. on `finish()`, increments `transition_seq` exactly once and returns the assembled `Transition`.
 
 This pattern ensures that a single transition may append multiple history events but only increments the transition sequence once.
@@ -366,12 +365,11 @@ The following sections describe the exact behavior for each command.
 1. Initialize `WorkflowState` with `ExecutionStatus::Running`, `TransitionSeq::ZERO`, `last_event_id: 0`, empty activity/timer maps, identity fields from the request, and timeout configuration (`workflow_execution_timeout`, `workflow_run_timeout`, `workflow_task_timeout`). If a retry policy or cron schedule is provided, record those on state as well.
 2. Emit `RequestDedupeOp` for the request ID.
 3. Emit `WorkflowExecutionStarted` event carrying workflow type, task queue, input, memo, and search attributes.
-4. Emit `ProjectionOp::UpsertExecution` with `Running` status and initial memo/search attributes.
-5. Schedule a workflow task (emit `WorkflowTaskScheduled`, set pending WFT, push `DispatchOp::EnqueueWorkflowTask`).
+4. Schedule a workflow task (emit `WorkflowTaskScheduled`, set pending WFT, push `DispatchOp::EnqueueWorkflowTask`).
 
 **Events produced:** `WorkflowExecutionStarted`, `WorkflowTaskScheduled`.
 
-**Rationale:** Start always schedules a WFT immediately because the workflow code must begin executing. The projection upsert ensures the execution is visible to list queries from the moment it is created. Timeout values are recorded on `WorkflowState` but enforced by the runtime (via timer scanners or dedicated timeout checks), not by the kernel.
+**Rationale:** Start always schedules a WFT immediately because the workflow code must begin executing. The fenced storage commit derives a full visibility snapshot from the resulting state, making the execution available to list queries without a second kernel output contract. Timeout values are recorded on `WorkflowState` but enforced by the runtime (via timer scanners or dedicated timeout checks), not by the kernel.
 
 ### `Signal`
 
@@ -469,9 +467,8 @@ Termination is a hard stop.[^terminate] The workflow code does not get a chance 
 1. Emit `RequestDedupeOp` for the request ID.
 2. Emit `WorkflowExecutionTerminated` event carrying the reason, optional details, and the identity of the caller.
 3. Close the run with `ExecutionStatus::Terminated`: set terminal status, clear pending WFT, clear sticky affinity.
-4. Emit `ProjectionOp::CloseExecution` with `Terminated` status.
-5. Clear activity and timer maps in `next_state`. Emit `ActivityOp::Delete` for each open activity and `TimerOp::Delete` for each open timer.
-6. For open child workflows, apply Parent Close Policy (see `ChildResolved`).
+4. Clear activity and timer maps in `next_state`. Emit `ActivityOp::Delete` for each open activity and `TimerOp::Delete` for each open timer.
+5. For open child workflows, apply Parent Close Policy (see `ChildResolved`).
 
 **Events produced:** `WorkflowExecutionTerminated`.
 
@@ -554,8 +551,8 @@ This command is issued by the runtime when a started workflow task exceeds its s
 |---|---|---|
 | `ScheduleActivity` | Emit `ActivityTaskScheduled`, create `ActivityState`, push `ActivityOp::Upsert` and `DispatchOp::EnqueueActivityTask`. Carries schedule-to-close, schedule-to-start, start-to-close, and heartbeat timeouts as pass-through fields in the event and dispatch op. Reject with `DuplicateActivityId` if already open. | No |
 | `StartTimer` | Emit `TimerStarted`, create `TimerState`, push `TimerOp::Upsert`. Reject with `DuplicateTimerId` if already open. | No |
-| `UpsertMemo` | Update memo on state, emit `ProjectionOp::UpsertExecution`. | No |
-| `UpsertSearchAttributes` | Update search attributes on state, emit `ProjectionOp::UpsertExecution`. | No |
+| `UpsertMemo` | Update memo on authoritative state; storage snapshots the full image on commit. | No |
+| `UpsertSearchAttributes` | Update search attributes on authoritative state; storage snapshots the full image on commit. | No |
 | `CompleteWorkflow` | Emit `WorkflowExecutionCompleted`, close run with `Completed`. | Yes |
 | `FailWorkflow` | Emit `WorkflowExecutionFailed`, close run with `Failed`. | Yes |
 | `CancelWorkflow` | Emit `WorkflowExecutionCanceled`, close run with `Canceled`. | Yes |
@@ -611,10 +608,9 @@ This command is issued by the runtime when the workflow's execution timeout or r
 
 1. Emit `WorkflowExecutionTimedOut` event carrying the timeout type and retry state.
 2. Close the run with `ExecutionStatus::TimedOut`.
-3. Emit `ProjectionOp::CloseExecution` with `TimedOut` status.
-4. Clean up open entities (same as `Terminate`).
-5. For open child workflows, apply Parent Close Policy.
-6. If the workflow has a retry policy and should be retried, emit metadata for the runtime to create a retry run.
+3. Clean up open entities (same as `Terminate`).
+4. For open child workflows, apply Parent Close Policy.
+5. If the workflow has a retry policy and should be retried, emit metadata for the runtime to create a retry run.
 
 **Rationale:** Workflow-level timeouts are enforced by the server, not by the worker. The kernel treats it as a terminal close.
 
@@ -657,8 +653,7 @@ This command allows updating workflow execution options on a running workflow, s
 4. Emit `WorkflowExecutionPaused` carrying identity, reason, and request ID.
 5. Set `status = Paused`, populate `pause_info`, and increment `wft_stamp`.
 6. Increment every open activity's `stamp` and emit `ActivityOp::Upsert` for each so stale deliveries can be invalidated.
-7. Emit `ProjectionOp::UpsertExecution` with `Paused` status.
-8. Do not schedule or redispatch a workflow task.
+7. Do not schedule or redispatch a workflow task.
 
 ### `UnpauseWorkflow`
 
@@ -671,8 +666,7 @@ This command allows updating workflow execution options on a running workflow, s
 3. Emit `WorkflowExecutionUnpaused` carrying identity, reason, and request ID.
 4. Set `status = Running`, clear `pause_info`, and increment `wft_stamp`.
 5. Increment every open activity's `stamp`, emit `ActivityOp::Upsert`, and emit `DispatchOp::EnqueueActivityTask` for each activity.
-6. Emit `ProjectionOp::UpsertExecution` with `Running` status.
-7. Schedule a new WFT only if no WFT is already pending.
+6. Schedule a new WFT only if no WFT is already pending.
 
 ### `UpdateActivityOptions`
 
@@ -910,7 +904,6 @@ Continue-As-New is expressed as a workflow command within `WorkflowTaskCompleted
 
 1. Emit `WorkflowExecutionContinuedAsNew` event carrying the new run ID, workflow type, task queue, input, memo, search attributes, workflow execution timeout, workflow run timeout, and workflow task timeout.
 2. Close the current run with `ExecutionStatus::ContinuedAsNew`.
-3. Emit `ProjectionOp::CloseExecution` with `ContinuedAsNew` status.
 
 **What the kernel does not do:** The kernel does not create the successor run. The runtime reads the event and issues a `Start` command for the successor.
 
@@ -1019,16 +1012,14 @@ This does not mean Tokeira has no resource controls. The distinction is between 
 
 The kernel does not accept a limits configuration and does not reject commands based on entity counts. The runtime does not reject individual workflow commands based on pending-entity counts either. If a workflow creates enough fan-out to stress the system, the response is backpressure on the workflow's task delivery and transaction throughput, not an artificial cap on what the workflow is allowed to express.
 
-## Projection ops belong here
+## Visibility snapshots stay outside the kernel
 
-Projection logic does **not** mean projection storage belongs in the kernel. But the *meaning* of a projection mutation does belong here.
-
-The kernel emits:
-
-- `ProjectionOp::UpsertExecution` (on start, memo/search-attr changes)
-- `ProjectionOp::CloseExecution` (on any terminal transition)
-
-The projection plane consumes these ops and applies them to whatever storage backend it uses.
+The kernel owns the authoritative post-transition `WorkflowState`; it does not
+also describe a visibility delta. During the fenced commit, storage derives a
+complete versioned visibility snapshot from `Transition.next_state` and appends
+it to the repairable projection log. This keeps visibility outside the
+correctness state machine while ensuring every committed transition has a
+reconstructible projection image.
 
 ## Dispatch ops
 
@@ -1168,7 +1159,7 @@ Key properties to model:
 
 ## Review questions
 
-1. Should `Transition` include a stronger typed outbox abstraction instead of separate `dispatch_ops` and `projection_ops`?
+1. Should `Transition` include a stronger typed outbox abstraction for dispatch effects, or are the current typed dispatch operations sufficient?
 2. Should `ContinueAsNew` be expressed as one command that emits a linked successor start, or as a terminal event plus a runtime-generated start command? (This document currently specifies the latter.)
 3. Do we want the kernel to assign final event IDs directly, or only event-count deltas while storage stamps final IDs? (This document currently specifies direct assignment.)
 4. Should `Update` acceptance and WFT scheduling be atomic within a single `apply` call, or should acceptance be a separate transition from WFT scheduling?

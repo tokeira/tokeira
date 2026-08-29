@@ -49,8 +49,7 @@ use crate::{
         WorkflowTaskProblem, WorkflowTaskType, WorkflowVersioningInfo, merge_priority,
     },
     transition::{
-        ActivityOp, CallbackCompletionOutcome, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp,
-        Transition,
+        ActivityOp, CallbackCompletionOutcome, DispatchOp, RequestDedupeOp, TimerOp, Transition,
     },
 };
 
@@ -610,11 +609,6 @@ impl BasicKernel {
                 buffered: false,
             },
         );
-        builder.projection_ops.push(ProjectionOp::UpsertExecution {
-            status: ExecutionStatus::Running,
-            memo_patch: req.memo,
-            search_attr_patch: req.search_attributes,
-        });
         if let Some(delay) = positive_start_delay(req.workflow_start_delay) {
             let timer = TimerState {
                 timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
@@ -774,11 +768,6 @@ impl BasicKernel {
             links: req.links,
             request_id: req.request.request_id.0,
             identity: req.request.caller_identity,
-        });
-        builder.projection_ops.push(ProjectionOp::UpsertExecution {
-            status: ExecutionStatus::Running,
-            memo_patch: req.memo,
-            search_attr_patch: req.search_attributes,
         });
         if let Some(delay) = positive_start_delay(req.workflow_start_delay) {
             let timer = TimerState {
@@ -1093,11 +1082,6 @@ impl BasicKernel {
             }
         }
 
-        builder.projection_ops.push(ProjectionOp::UpsertExecution {
-            status: ExecutionStatus::Paused,
-            memo_patch: builder.state.memo.clone(),
-            search_attr_patch: builder.state.search_attributes.clone(),
-        });
         Ok(builder.finish())
     }
 
@@ -1152,11 +1136,6 @@ impl BasicKernel {
             enqueue_activity_dispatch(&mut builder, &snapshot);
         }
 
-        builder.projection_ops.push(ProjectionOp::UpsertExecution {
-            status: ExecutionStatus::Running,
-            memo_patch: builder.state.memo.clone(),
-            search_attr_patch: builder.state.search_attributes.clone(),
-        });
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
         }
@@ -5102,21 +5081,11 @@ fn apply_workflow_command(
             Ok(false)
         }
         WorkflowCommand::UpsertMemo(memo) => {
-            builder.state.memo = memo.clone();
-            builder.projection_ops.push(ProjectionOp::UpsertExecution {
-                status: builder.state.status,
-                memo_patch: memo,
-                search_attr_patch: builder.state.search_attributes.clone(),
-            });
+            builder.state.memo = memo;
             Ok(false)
         }
         WorkflowCommand::UpsertSearchAttributes(search_attributes) => {
-            builder.state.search_attributes = search_attributes.clone();
-            builder.projection_ops.push(ProjectionOp::UpsertExecution {
-                status: builder.state.status,
-                memo_patch: builder.state.memo.clone(),
-                search_attr_patch: search_attributes,
-            });
+            builder.state.search_attributes = search_attributes;
             Ok(false)
         }
         WorkflowCommand::UpsertMemoPatch(patch) => {
@@ -5125,11 +5094,6 @@ fn apply_workflow_command(
                 patch: patch.clone(),
             });
             apply_memo_patch(&mut builder.state.memo, &patch);
-            builder.projection_ops.push(ProjectionOp::UpsertExecution {
-                status: builder.state.status,
-                memo_patch: builder.state.memo.clone(),
-                search_attr_patch: builder.state.search_attributes.clone(),
-            });
             Ok(false)
         }
         WorkflowCommand::UpsertSearchAttributesPatch(patch) => {
@@ -5138,11 +5102,6 @@ fn apply_workflow_command(
                 patch: patch.clone(),
             });
             apply_search_attributes_patch(&mut builder.state.search_attributes, &patch);
-            builder.projection_ops.push(ProjectionOp::UpsertExecution {
-                status: builder.state.status,
-                memo_patch: builder.state.memo.clone(),
-                search_attr_patch: builder.state.search_attributes.clone(),
-            });
             Ok(false)
         }
         WorkflowCommand::InvalidSearchAttributes { message } => {
@@ -6343,7 +6302,6 @@ struct TransitionBuilder {
     activity_ops: SmallVec<[ActivityOp; 4]>,
     timer_ops: SmallVec<[TimerOp; 4]>,
     dispatch_ops: SmallVec<[DispatchOp; 4]>,
-    projection_ops: SmallVec<[ProjectionOp; 8]>,
     /// The `TransitionSeq` captured at construction time,
     /// used as the optimistic concurrency fence.
     expected_seq: TransitionSeq,
@@ -6368,7 +6326,6 @@ impl TransitionBuilder {
             activity_ops: SmallVec::new(),
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
-            projection_ops: SmallVec::new(),
             expected_seq,
         }
     }
@@ -7047,10 +7004,6 @@ impl TransitionBuilder {
         // event, so this only drops events overtaken by a worker close
         // command. Keeps closed runs buffer-free (Req 6.3).
         self.state.buffered_events.clear();
-        self.projection_ops.push(ProjectionOp::CloseExecution {
-            status,
-            closed_at: self.now,
-        });
     }
 
     fn schedule_completion_callbacks(&mut self) {
@@ -7132,7 +7085,6 @@ impl TransitionBuilder {
             activity_ops: self.activity_ops,
             timer_ops: self.timer_ops,
             dispatch_ops: self.dispatch_ops,
-            projection_ops: self.projection_ops,
         }
     }
 
@@ -7149,7 +7101,6 @@ impl TransitionBuilder {
         debug_assert!(self.activity_ops.is_empty());
         debug_assert!(self.timer_ops.is_empty());
         debug_assert!(self.dispatch_ops.is_empty());
-        debug_assert!(self.projection_ops.is_empty());
         Transition {
             expected_seq: self.expected_seq,
             next_state: self.state,
@@ -7159,7 +7110,6 @@ impl TransitionBuilder {
             activity_ops: self.activity_ops,
             timer_ops: self.timer_ops,
             dispatch_ops: self.dispatch_ops,
-            projection_ops: self.projection_ops,
         }
     }
 }

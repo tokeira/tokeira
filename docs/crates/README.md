@@ -79,8 +79,8 @@ sequenceDiagram
     Runtime->>Kernel: apply(loaded, command)
     Kernel-->>Runtime: Transition
     Runtime->>Storage: commit_transition (fenced)
+    Storage-->>Projection: versioned visibility snapshot
     Storage-->>Runtime: committed
-    Runtime->>Projection: ProjectionOps
     Runtime-->>Edge: response
     Edge-->>Client: gRPC response
 ```

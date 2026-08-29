@@ -781,8 +781,8 @@ mod tests {
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{
         ActivityState, HistoryEvent, HistoryEventKind, PendingNexusOperation, PendingWorkflowTask,
-        ProjectionOp, TimerState, Transition, VersioningBehavior, WorkerDeploymentVersionRef,
-        WorkflowState, WorkflowVersioningInfo,
+        TimerState, Transition, VersioningBehavior, WorkerDeploymentVersionRef, WorkflowState,
+        WorkflowVersioningInfo,
     };
     use tokeira_types::{
         ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo,
@@ -1019,10 +1019,6 @@ mod tests {
             let activity_state = sample_activity_state(seed);
             let timer_state = sample_timer_state(seed);
             let projection_context = sample_projection_context(&workflow_state);
-            let projection_ops = vec![ProjectionOp::CloseExecution {
-                status: ExecutionStatus::Completed,
-                closed_at: fixed_now(),
-            }];
 
             prop_assert_eq!(
                 codec::decode_workflow_state(&codec::encode_workflow_state(&workflow_state).unwrap()).unwrap(),
@@ -1043,10 +1039,6 @@ mod tests {
             prop_assert_eq!(
                 codec::decode_projection_context(&codec::encode_projection_context(&projection_context).unwrap()).unwrap(),
                 projection_context
-            );
-            prop_assert_eq!(
-                codec::decode_projection_ops(&codec::encode_projection_ops(&projection_ops).unwrap()).unwrap(),
-                projection_ops
             );
         }
 
@@ -1794,7 +1786,6 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
-            projection_ops: Default::default(),
         }
     }
 

@@ -435,10 +435,9 @@ async fn write_transition(
         .execute(&mut **tx)
         .await?;
     }
-    // Visibility is now a post-transition snapshot, not a delta side effect.
-    // Even transitions with no semantic `ProjectionOp` must publish their
-    // context so list/count state can advance monotonically from the committed
-    // run image rather than from an incomplete stream of patches.
+    // Visibility is a post-transition snapshot, not a delta side effect. Every
+    // transition publishes its context so list/count state advances monotonically
+    // from the committed run image rather than an incomplete stream of patches.
     insert_projection_log(tx, run_key, state, projection_partition_count).await?;
     Ok(())
 }
@@ -800,7 +799,7 @@ async fn insert_projection_log(
         "transition_seq",
     )?)
     .bind(codec::encode_projection_context(&context)?)
-    .bind(codec::encode_projection_ops(&[])?)
+    .bind(codec::LEGACY_EMPTY_PROJECTION_OPS_DATA)
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -11,9 +11,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
-use tokeira_kernel::{
-    ActivityState, HistoryEvent, ProjectionOp, TimerState, WorkflowState, state::Priority,
-};
+use tokeira_kernel::{ActivityState, HistoryEvent, TimerState, WorkflowState, state::Priority};
 use tokeira_types::{EventPrincipal, Payloads, ProjectionCursor, WorkflowRuleRecord};
 
 use crate::{
@@ -23,6 +21,13 @@ use crate::{
 
 const BACKLOG_ENVELOPE_VERSION: u32 = 0x544B_4251;
 const TASK_QUEUE_CONFIG_DOCUMENT_VERSION: u32 = 1;
+
+/// Postcard's encoded empty sequence retained for the locked `projection_log.ops_data` column.
+///
+/// Snapshot projection records no longer carry delta operations, but V010 keeps
+/// this column `NOT NULL`. Writing the established one-byte representation keeps
+/// new rows compatible without retaining the retired kernel type or its codec.
+pub const LEGACY_EMPTY_PROJECTION_OPS_DATA: &[u8] = &[0];
 
 #[derive(Serialize, serde::Deserialize)]
 struct BacklogEnvelope {
@@ -186,16 +191,6 @@ pub fn decode_projection_context(bytes: &[u8]) -> Result<ProjectionContext> {
     decode(bytes)
 }
 
-/// Serialize the projection operations emitted by a transition.
-pub fn encode_projection_ops(ops: &[ProjectionOp]) -> Result<Vec<u8>> {
-    encode(&ops)
-}
-
-/// Deserialize projection operations for a projection worker batch.
-pub fn decode_projection_ops(bytes: &[u8]) -> Result<Vec<ProjectionOp>> {
-    decode(bytes)
-}
-
 /// Serialize projection cursors used by projector checkpoints.
 pub fn encode_projection_cursor(cursor: &ProjectionCursor) -> Result<Vec<u8>> {
     encode(cursor)
@@ -336,6 +331,13 @@ mod tests {
     ];
 
     #[test]
+    fn legacy_empty_projection_ops_data_is_postcard_empty_sequence() {
+        let decoded: Vec<()> = decode(LEGACY_EMPTY_PROJECTION_OPS_DATA).unwrap();
+        assert!(decoded.is_empty());
+        assert_eq!(encode(&decoded).unwrap(), LEGACY_EMPTY_PROJECTION_OPS_DATA);
+    }
+
+    #[test]
     fn legacy_workflow_started_fixture_decodes_and_v2_round_trips() {
         // Feature: edge-eager-dispatch, Property 7: Legacy started-event decoding.
         // The immediate pre-Tier-3.18 bytes remain readable as non-eager V1,
@@ -472,13 +474,6 @@ mod tests {
             let encoded = encode_projection_context(&ctx).unwrap();
             let decoded = decode_projection_context(&encoded).unwrap();
             prop_assert_eq!(decoded, ctx);
-        }
-
-        #[test]
-        fn projection_ops_round_trips(ops in proptest::collection::vec(arb_projection_op(), 0..8)) {
-            let encoded = encode_projection_ops(&ops).unwrap();
-            let decoded = decode_projection_ops(&encoded).unwrap();
-            prop_assert_eq!(decoded, ops);
         }
 
         #[test]
@@ -692,25 +687,6 @@ mod tests {
                 search_attr_generation: state_transition_count as u64,
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
-            }
-        }
-    }
-
-    prop_compose! {
-        fn arb_projection_op()(
-            status in arb_execution_status(),
-            memo_patch in arb_memo(),
-            closed_at in arb_timestamp(),
-            close in any::<bool>(),
-        ) -> ProjectionOp {
-            if close {
-                ProjectionOp::CloseExecution { status, closed_at }
-            } else {
-                ProjectionOp::UpsertExecution {
-                    status,
-                    memo_patch,
-                    search_attr_patch: SearchAttributes(BTreeMap::new()),
-                }
             }
         }
     }

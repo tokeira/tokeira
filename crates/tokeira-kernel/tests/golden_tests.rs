@@ -16,14 +16,13 @@ use tokeira_kernel::{
     NexusOperationResolvedRequest, NexusOperationRetryRequest, NexusResolution, NexusTimeoutType,
     ParentClosePolicy, PauseActivityRequest, PauseInfo, PauseWorkflowRequest,
     PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
-    PendingWorkflowTask, ProjectionOp, Reject, ReplayContext, ResetActivityRequest, ResetRequest,
-    RetryState, SearchAttributesPatch, SignalRequest, SignalWithStartRequest,
-    StartDeploymentTransitionRequest, StartRequest, StartWorkflowTaskRequest,
-    TerminateOnWorkflowTaskFailedRequest, TerminateRequest, TimerDueRequest, TimerState,
-    Transition, UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
-    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningBehavior,
-    VersioningOverride, VersioningOverrideChange, WORKFLOW_START_DELAY_TIMER_ID,
-    WorkerDeploymentVersionRef, WorkerVersionStamp, WorkflowCommand,
+    PendingWorkflowTask, Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState,
+    SearchAttributesPatch, SignalRequest, SignalWithStartRequest, StartDeploymentTransitionRequest,
+    StartRequest, StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest, TerminateRequest,
+    TimerDueRequest, TimerState, Transition, UnpauseActivityRequest, UnpauseWorkflowRequest,
+    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
+    VersioningBehavior, VersioningOverride, VersioningOverrideChange,
+    WORKFLOW_START_DELAY_TIMER_ID, WorkerDeploymentVersionRef, WorkerVersionStamp, WorkflowCommand,
     WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest, WorkflowState,
     WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
     WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTaskWorkerVersion,
@@ -1061,15 +1060,6 @@ fn start_from_absent() {
         HistoryEventKind::WorkflowTaskScheduled { .. }
     ));
     assert_eq!(transition.request_dedupe_ops.len(), 1);
-    assert_eq!(transition.projection_ops.len(), 1);
-    assert_eq!(
-        transition.projection_ops[0],
-        ProjectionOp::UpsertExecution {
-            status: ExecutionStatus::Running,
-            memo_patch: req.memo,
-            search_attr_patch: req.search_attributes,
-        }
-    );
     assert_eq!(transition.dispatch_ops.len(), 1);
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
@@ -1418,7 +1408,6 @@ fn signal_with_start_from_absent() {
         other => panic!("expected signaled event, got {other:?}"),
     }
     assert_eq!(transition.request_dedupe_ops.len(), 1);
-    assert_eq!(transition.projection_ops.len(), 1);
     assert!(
         transition
             .dispatch_ops
@@ -1689,7 +1678,6 @@ fn cancel_with_no_pending_wft() {
     assert_eq!(transition.request_dedupe_ops.len(), 1);
     assert_eq!(transition.activity_ops.len(), 0);
     assert_eq!(transition.timer_ops.len(), 0);
-    assert_eq!(transition.projection_ops.len(), 0);
     assert_eq!(transition.dispatch_ops.len(), 1);
     assert!(transition.next_state.pending_workflow_task.is_some());
     assert_eq!(transition.next_state.status, ExecutionStatus::Running);
@@ -1715,7 +1703,6 @@ fn cancel_with_pending_wft() {
     assert!(transition.dispatch_ops.is_empty());
     assert_eq!(transition.activity_ops.len(), 0);
     assert_eq!(transition.timer_ops.len(), 0);
-    assert_eq!(transition.projection_ops.len(), 0);
     assert_eq!(transition.next_state.pending_workflow_task, pending);
 }
 
@@ -1759,13 +1746,6 @@ fn terminate_no_open_entities() {
     assert!(transition.next_state.activities.is_empty());
     assert!(transition.next_state.timers.is_empty());
     assert_eq!(transition.request_dedupe_ops.len(), 1);
-    assert_eq!(
-        transition.projection_ops.last(),
-        Some(&ProjectionOp::CloseExecution {
-            status: ExecutionStatus::Terminated,
-            closed_at: now(),
-        })
-    );
     assert!(transition.dispatch_ops.is_empty());
     assert!(transition.activity_ops.is_empty());
     assert!(transition.timer_ops.is_empty());
@@ -2188,14 +2168,6 @@ fn pause_workflow_happy_path() {
             .all(|op| matches!(op, ActivityOp::Upsert(ActivityState { stamp: 1, .. })))
     );
     assert!(transition.dispatch_ops.is_empty());
-    assert_eq!(
-        transition.projection_ops.last(),
-        Some(&ProjectionOp::UpsertExecution {
-            status: ExecutionStatus::Paused,
-            memo_patch: transition.next_state.memo.clone(),
-            search_attr_patch: transition.next_state.search_attributes.clone(),
-        })
-    );
 }
 
 #[test]
@@ -2213,7 +2185,6 @@ fn pause_workflow_idempotent_same_request_id() {
     assert!(transition.history_events.is_empty());
     assert!(transition.activity_ops.is_empty());
     assert!(transition.dispatch_ops.is_empty());
-    assert!(transition.projection_ops.is_empty());
     assert_eq!(
         transition.next_state.transition_seq,
         state.transition_seq.next()
@@ -3267,13 +3238,6 @@ fn workflow_task_completed_with_complete_workflow() {
         event.kind,
         HistoryEventKind::WorkflowExecutionCompleted { .. }
     )));
-    assert_eq!(
-        transition.projection_ops.last(),
-        Some(&ProjectionOp::CloseExecution {
-            status: ExecutionStatus::Completed,
-            closed_at: now()
-        })
-    );
     assert_eq!(transition.next_state.status, ExecutionStatus::Completed);
     assert!(transition.next_state.closed_at.is_some());
     assert!(transition.next_state.pending_workflow_task.is_none());
@@ -3325,13 +3289,6 @@ fn workflow_task_completed_with_fail_workflow() {
             ..
         }
     )));
-    assert_eq!(
-        transition.projection_ops.last(),
-        Some(&ProjectionOp::CloseExecution {
-            status: ExecutionStatus::Failed,
-            closed_at: now()
-        })
-    );
     assert_eq!(transition.next_state.status, ExecutionStatus::Failed);
     assert!(transition.next_state.closed_at.is_some());
     assert!(transition.next_state.pending_workflow_task.is_none());
@@ -3912,7 +3869,6 @@ fn wft_failed_with_started_wft() {
     assert!(transition.request_dedupe_ops.is_empty());
     assert!(transition.activity_ops.is_empty());
     assert!(transition.timer_ops.is_empty());
-    assert!(transition.projection_ops.is_empty());
 }
 
 #[test]
@@ -3968,7 +3924,6 @@ fn wft_timed_out_with_started_wft() {
     assert!(transition.request_dedupe_ops.is_empty());
     assert!(transition.activity_ops.is_empty());
     assert!(transition.timer_ops.is_empty());
-    assert!(transition.projection_ops.is_empty());
 }
 
 #[test]
@@ -4875,13 +4830,6 @@ fn cancel_workflow_command() {
     assert!(transition.next_state.closed_at.is_some());
     assert!(transition.next_state.pending_workflow_task.is_none());
     assert!(transition.next_state.sticky.is_none());
-    assert_eq!(
-        transition.projection_ops.last(),
-        Some(&ProjectionOp::CloseExecution {
-            status: ExecutionStatus::Cancelled,
-            closed_at: now(),
-        })
-    );
     assert!(transition.request_dedupe_ops.is_empty());
     assert!(transition.activity_ops.is_empty());
     assert!(transition.timer_ops.is_empty());
@@ -6905,7 +6853,6 @@ fn record_marker_happy_path() {
     ));
     assert!(transition.next_state.is_open());
     assert!(transition.dispatch_ops.is_empty());
-    assert!(transition.projection_ops.is_empty());
     assert!(transition.request_dedupe_ops.is_empty());
 }
 

@@ -1983,9 +1983,9 @@ mod tests {
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{
         ActivityState, CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback,
-        ContinueAsNewVersioningBehavior, HistoryEvent, LoadedRun, PendingWorkflowTask,
-        ProjectionOp, Reject, RequestDedupeOp, TimerOp, Transition, VersionTarget,
-        VersioningBehavior, WorkerDeploymentVersionRef, WorkflowState, WorkflowVersioningInfo,
+        ContinueAsNewVersioningBehavior, HistoryEvent, LoadedRun, PendingWorkflowTask, Reject,
+        RequestDedupeOp, TimerOp, Transition, VersionTarget, VersioningBehavior,
+        WorkerDeploymentVersionRef, WorkflowState, WorkflowVersioningInfo,
     };
     use tokeira_storage::{
         BacklogEntry, CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
@@ -2170,7 +2170,6 @@ mod tests {
                     activity_ops: SmallVec::new(),
                     timer_ops: SmallVec::new(),
                     dispatch_ops: SmallVec::new(),
-                    projection_ops: SmallVec::new(),
                 });
             }
 
@@ -2212,7 +2211,6 @@ mod tests {
                 activity_ops: SmallVec::<[tokeira_kernel::ActivityOp; 4]>::new(),
                 timer_ops: SmallVec::<[TimerOp; 4]>::new(),
                 dispatch_ops: state.dispatch_ops.clone(),
-                projection_ops: SmallVec::<[ProjectionOp; 8]>::new(),
             })
         }
     }
@@ -2734,7 +2732,6 @@ mod tests {
                 activity_ops: SmallVec::new(),
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
-                projection_ops: SmallVec::new(),
             })
         }
     }
@@ -2769,7 +2766,6 @@ mod tests {
                 activity_ops: SmallVec::new(),
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
-                projection_ops: SmallVec::new(),
             })
         }
     }

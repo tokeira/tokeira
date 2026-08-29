@@ -253,7 +253,6 @@ impl DsqlRunRepository {
                             activity_ops: Vec::new(),
                             timer_ops: Vec::new(),
                             dispatch_ops: Vec::new(),
-                            projection_ops: Vec::new(),
                         })
                     })
                     .collect()

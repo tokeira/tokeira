@@ -51,9 +51,10 @@ Lane-based execution orchestration — the shell around the pure kernel. The run
 5. Check request dedup (via storage)
 6. Call `kernel.apply(loaded_state, command)`
 7. Commit transition (via storage, fenced by expected_seq)
-8. Publish DispatchOps → delivery broker
-9. Publish ProjectionOps → projection
-10. Park or evict actor
+8. Storage appends a full versioned visibility snapshot in the fenced commit
+9. Publish DispatchOps → delivery broker
+10. Projection workers consume the snapshot log asynchronously
+11. Park or evict actor
 
 On OCC conflict at step 7, the runtime reloads state and retries from step 6.
 

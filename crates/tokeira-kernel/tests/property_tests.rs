@@ -3177,7 +3177,6 @@ proptest! {
         prop_assert!(failed_transition.request_dedupe_ops.is_empty());
         prop_assert!(failed_transition.activity_ops.is_empty());
         prop_assert!(failed_transition.timer_ops.is_empty());
-        prop_assert!(failed_transition.projection_ops.is_empty());
         prop_assert_eq!(failed_transition.next_state.status, ExecutionStatus::Running);
 
         let timed_out_transition = kernel().apply(
@@ -3199,7 +3198,6 @@ proptest! {
         prop_assert!(timed_out_transition.request_dedupe_ops.is_empty());
         prop_assert!(timed_out_transition.activity_ops.is_empty());
         prop_assert!(timed_out_transition.timer_ops.is_empty());
-        prop_assert!(timed_out_transition.projection_ops.is_empty());
         prop_assert_eq!(timed_out_transition.next_state.status, ExecutionStatus::Running);
     }
 
@@ -3238,7 +3236,6 @@ proptest! {
         prop_assert_eq!(transition.next_state.status, ExecutionStatus::Running);
         prop_assert!(transition.next_state.cancel_requested);
         prop_assert_eq!(transition.next_state.closed_at, None);
-        prop_assert!(transition.projection_ops.is_empty());
         prop_assert!(transition.activity_ops.is_empty());
         prop_assert!(transition.timer_ops.is_empty());
     }
@@ -3982,7 +3979,6 @@ proptest! {
         prop_assert!(idempotent.request_dedupe_ops.is_empty());
         prop_assert!(idempotent.activity_ops.is_empty());
         prop_assert!(idempotent.dispatch_ops.is_empty());
-        prop_assert!(idempotent.projection_ops.is_empty());
 
         let conflicting = kernel().apply(
             LoadedRun::Existing(paused),
@@ -5778,7 +5774,6 @@ proptest! {
         ).unwrap();
 
         prop_assert_eq!(transition.dispatch_ops.len(), 0);
-        prop_assert_eq!(transition.projection_ops.len(), 0);
         prop_assert_eq!(transition.request_dedupe_ops.len(), 0);
         prop_assert!(transition.next_state.is_open());
         prop_assert_eq!(&transition.next_state.memo, &state.memo);

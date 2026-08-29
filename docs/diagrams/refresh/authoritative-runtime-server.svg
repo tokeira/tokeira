@@ -1,0 +1,353 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1600" viewBox="0 0 2400 1600">
+<defs>
+  
+  
+  
+  <marker id="arr_orange" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#B85C38"/></marker>
+  <marker id="arr_purple" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#0B7285"/></marker>
+  <marker id="arr_blue" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#33586E"/></marker>
+  <marker id="arr_cyan" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#9A4A2C"/></marker>
+  <marker id="arr_green" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#B85C38"/></marker>
+  <marker id="arr_red" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#A8402F"/></marker>
+  <marker id="arr_slate" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#5C564E"/></marker>
+  <marker id="arr_gold" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#B08D2E"/></marker>
+  <style>
+    .title { font: 800 38px 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; fill:#1B1714; letter-spacing:-.4px; }
+    .subtitle { font: 500 20px 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; fill:#5C564E; }
+    .section { font: 900 16px 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; fill:#5C564E; letter-spacing:2.2px; text-transform:uppercase; }
+    .boxtitle { font: 850 22px 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; fill:#1B1714; }
+    .subhead { font: 800 15px 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; fill:#4A443C; }
+    .body { font: 500 16px 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; fill:#5C564E; }
+    .small { font: 500 14px 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; fill:#5C564E; }
+    .tiny { font: 600 12.5px 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; fill:#6E6860; }
+    .code { font: 600 14px 'SF Mono', Menlo, Consolas, monospace; fill:#4A443C; }
+    .num { font: 900 15px 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; fill:white; }
+  </style>
+</defs>
+
+<rect width="100%" height="100%" fill="#F6F3EE"/>
+<text x="76" y="46" font-family="'SF Mono',Menlo,Consolas,monospace" font-size="15" letter-spacing="3.5" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+<text x="76" y="84" class="title">The authoritative runtime · server</text>
+<text x="76" y="116" class="subtitle">The runtime and storage core in review detail — the distributed tokeirad edition. Embedded shares this exact core with different coordination and storage corners; Nexus and CHASM have their own diagrams.</text>
+<rect x="1800" y="32" width="520" height="74" rx="18" fill="#ffffff" stroke="#D8D2C8" stroke-width="1.5" opacity="1"/>
+<text x="1826" y="61" class="small">
+<tspan x="1826" dy="0">Solid arrows: synchronous flow. Dashed: control / async.</tspan>
+<tspan x="1826" dy="22">Numbered badges reference the annotation panel.</tspan>
+</text>
+<text x="76" y="152" class="section">EDGE / FRONTEND ANALOGUE</text>
+<text x="480" y="152" class="section">RUNTIME AUTHORITY</text>
+<text x="1448" y="152" class="section">BROKER + STORAGE</text>
+<rect x="76" y="172" width="330" height="780" rx="22" fill="#ffffff" stroke="#D8D2C8" stroke-width="1.8" opacity="1"/>
+<rect x="108" y="392" width="266" height="138" rx="14" fill="#F6EDE5" stroke="#E2C3AE" stroke-width="1.4" opacity="1"/>
+<text x="128" y="424" class="subhead" fill="#B85C38">Edge: mutations</text>
+<text x="128" y="452" class="small">
+<tspan x="128" dy="0">lifecycle · signals/updates</tspan>
+<tspan x="128" dy="20">task completions · activity</tspan>
+<tspan x="128" dy="20">admin · batch (~200 RPCs)</tspan>
+</text>
+<rect x="108" y="220" width="266" height="126" rx="14" fill="#EFF4F5" stroke="#BCD6DB" stroke-width="1.4" opacity="1"/>
+<text x="128" y="252" class="subhead" fill="#0B7285">Edge: polls</text>
+<text x="128" y="280" class="small">
+<tspan x="128" dy="0">PollWorkflowTaskQueue</tspan>
+<tspan x="128" dy="20">long-poll / sync-match</tspan>
+</text>
+<rect x="108" y="600" width="266" height="126" rx="14" fill="#EDF1F3" stroke="#C3D2DB" stroke-width="1.4" opacity="1"/>
+<text x="128" y="632" class="subhead" fill="#33586E">Edge: history reads</text>
+<text x="128" y="660" class="small">
+<tspan x="128" dy="0">GetWorkflowExecutionHistory</tspan>
+<tspan x="128" dy="20">bypasses lanes · 20s long-poll</tspan>
+</text>
+<rect x="108" y="782" width="266" height="112" rx="14" fill="#F6F3EE" stroke="#D8D2C8" stroke-width="1.4" opacity="1"/>
+<text x="128" y="814" class="subhead" fill="#5C564E">Edge retry behaviour</text>
+<text x="128" y="842" class="small">
+<tspan x="128" dy="0">NotShardOwner → ABORTED +</tspan>
+<tspan x="128" dy="20">routing metadata; client retries</tspan>
+</text>
+<rect x="480" y="172" width="900" height="960" rx="24" fill="#ffffff" stroke="#DFBFA8" stroke-width="2.1" opacity="1"/>
+<rect x="520" y="220" width="380" height="170" rx="18" fill="#F6EDE5" stroke="#DFBFA8" stroke-width="1.8" opacity="1"/>
+<rect x="520" y="220" width="8" height="170" rx="4" fill="#B85C38"/>
+<text x="548" y="262" class="boxtitle">TokeiraRuntime.submit()</text>
+<text x="548" y="296" class="body">
+<tspan x="548" dy="0">Admission shard: shard_for(run_key).</tspan>
+<tspan x="548" dy="23">Reject draining / non-Active shards.</tspan>
+<tspan x="548" dy="23">Lane: blake3 hash of the run key.</tspan>
+<tspan x="548" dy="23">Send LaneMessage to the lane channel.</tspan>
+</text>
+<rect x="960" y="220" width="360" height="170" rx="18" fill="#F6EDE5" stroke="#CFA98B" stroke-width="1.8" opacity="1"/>
+<rect x="960" y="220" width="8" height="170" rx="4" fill="#B85C38"/>
+<text x="988" y="262" class="boxtitle">ShardOwner</text>
+<text x="988" y="296" class="body">
+<tspan x="988" dy="0">HashMap&lt;ShardId → {epoch, state}&gt;</tspan>
+<tspan x="988" dy="23">States: Sweeping → Active → Draining.</tspan>
+<tspan x="988" dy="23">Epoch comes from DSQL shard_lease.</tspan>
+</text>
+<rect x="960" y="420" width="360" height="120" rx="14" fill="#F6F3EE" stroke="#D8D2C8" stroke-width="1.4" opacity="1"/>
+<text x="980" y="452" class="subhead" fill="#5C564E">Membership client</text>
+<text x="980" y="480" class="small">
+<tspan x="980" dy="0">heartbeat + lane pressure → controller</tspan>
+<tspan x="980" dy="20">routing cache lives at the edge</tspan>
+<tspan x="980" dy="20">DSQL lease is still authority</tspan>
+</text>
+<rect x="520" y="590" width="800" height="410" rx="20" fill="#FBF9F5" stroke="#DFBFA8" stroke-width="1.8" opacity="1"/>
+<text x="552" y="628" class="boxtitle">Lane executors — lane_count (default 32)</text>
+<text x="552" y="656" class="body">Per-run serialization by construction: same run key ⇒ same lane ⇒ sequential processing.</text>
+<rect x="560" y="700" width="300" height="112" rx="14" fill="#ffffff" stroke="#D8D2C8" stroke-width="1.4" opacity="1"/>
+<text x="580" y="732" class="subhead" fill="#5C564E">Bounded lane channel</text>
+<text x="580" y="760" class="small">
+<tspan x="580" dy="0">many producers, one consumer — cap 1024</tspan>
+<tspan x="580" dy="20">LaneMessage { run_key, command,</tspan>
+<tspan x="580" dy="20">reply_tx, enqueued_at }</tspan>
+</text>
+<rect x="930" y="700" width="340" height="112" rx="14" fill="#ffffff" stroke="#D8D2C8" stroke-width="1.4" opacity="1"/>
+<text x="950" y="732" class="subhead" fill="#5C564E">handle_message()</text>
+<text x="950" y="760" class="small">
+<tspan x="950" dy="0">OCC retry loop, max 5</tspan>
+<tspan x="950" dy="20">load → apply → commit → reply</tspan>
+<tspan x="950" dy="20">commit fence: execution_home_bundle</tspan>
+</text>
+<rect x="560" y="858" width="300" height="108" rx="14" fill="#ECE8E0" stroke="#DFBFA8" stroke-width="1.4" opacity="1"/>
+<text x="580" y="890" class="subhead" fill="#B85C38">tokeira-kernel  (PURE)</text>
+<text x="580" y="918" class="small">
+<tspan x="580" dy="0">apply(LoadedRun, Command)</tspan>
+<tspan x="580" dy="20">→ Transition { expected_seq fence,</tspan>
+<tspan x="580" dy="20">next_state, history_events, ops… }</tspan>
+</text>
+<rect x="930" y="858" width="340" height="108" rx="14" fill="#ECE8E0" stroke="#DFBFA8" stroke-width="1.4" opacity="1"/>
+<text x="950" y="890" class="subhead" fill="#B85C38">One fenced transaction</text>
+<text x="950" y="918" class="small">
+<tspan x="950" dy="0">history + timers + visibility snapshot</tspan>
+<tspan x="950" dy="20">commit atomically; then dispatch_ops</tspan>
+<tspan x="950" dy="20">publish (non-fatal — sweepers recover)</tspan>
+</text>
+<rect x="520" y="1030" width="800" height="76" rx="18" fill="#F6EDE5" stroke="#DFBFA8" stroke-width="1.8" opacity="1"/>
+<rect x="520" y="1030" width="8" height="76" rx="4" fill="#B85C38"/>
+<text x="548" y="1072" class="boxtitle">Background loops ×10</text>
+<text x="548" y="1106" class="body">
+<tspan x="548" dy="0">timers · wf/wft/activity timeouts · grace · drain · fairness · heartbeat · nexus · callbacks. Most re-enter via lanes;</tspan>
+<tspan x="548" dy="20">activity timeouts commit off-lane through their own OCC loop — the second mutation door.</tspan>
+</text>
+<rect x="1448" y="220" width="800" height="180" rx="18" fill="#EFF4F5" stroke="#A8CBD2" stroke-width="1.8" opacity="1"/>
+<rect x="1448" y="220" width="8" height="180" rx="4" fill="#0B7285"/>
+<text x="1476" y="262" class="boxtitle">Brokers — WFT + activity  <tspan font-size="14" fill="#6E6860">(Nexus → its own diagram)</tspan></text>
+<text x="1476" y="296" class="body">
+<tspan x="1476" dy="0">Tier A: sync-match on eager start → instant handoff.</tspan>
+<tspan x="1476" dy="23">Tier B: live-ready in-memory queues (sticky beside general).</tspan>
+<tspan x="1476" dy="23">Tier C: durable backlog — demote/rehydrate lives in backlog.rs.</tspan>
+<tspan x="1476" dy="23">Key: namespace / task queue / kind / deployment / build_id.</tspan>
+</text>
+<rect x="1448" y="450" width="800" height="420" rx="24" fill="#FAF6F1" stroke="#C88D6F" stroke-width="2.1" stroke-dasharray="9 5" opacity="1"/>
+<text x="1484" y="492" class="boxtitle" fill="#33586E">tokeira-storage  (Aurora DSQL)</text>
+<rect x="1488" y="530" width="720" height="78" rx="14" fill="#F3E7DE" stroke="#DCBCA5" stroke-width="1.4" opacity="1"/>
+<text x="1508" y="562" class="subhead" fill="#33586E">ConnectionDirector</text>
+<text x="1508" y="590" class="small">
+<tspan x="1508" dy="0">acquire(DbClass) → permit; class-aware semaphores</tspan>
+<tspan x="1508" dy="20">Commit 23 · Read 10 · Proj 5 · Ctrl 5 · Maint 7 — ratios × target_ready(50)</tspan>
+</text>
+<rect x="1488" y="632" width="720" height="76" rx="14" fill="#F3E7DE" stroke="#DCBCA5" stroke-width="1.4" opacity="1"/>
+<text x="1508" y="664" class="subhead" fill="#33586E">Reservoir</text>
+<text x="1508" y="692" class="small">
+<tspan x="1508" dy="0">Rate-limited refiller · expiry scanner · leak detector; returns honor marked_bad — no ping</tspan>
+</text>
+<rect x="1488" y="732" width="720" height="108" rx="14" fill="#ffffff" stroke="#DCBCA5" stroke-width="1.4" opacity="1"/>
+<text x="1508" y="764" class="subhead" fill="#9A4A2C">DsqlRunRepository</text>
+<text x="1508" y="792" class="small">
+<tspan x="1508" dy="0">load_run(RunKey) → LoadedRun   |   commit_transition_for_bundle()</tspan>
+<tspan x="1508" dy="20">read_history(run_key, after, limit)   ·   ~45 methods, 9 submodules</tspan>
+<tspan x="1508" dy="20">try_acquire_bundle() / renew_bundle() — on LeaseRepository</tspan>
+</text>
+<rect x="1448" y="910" width="800" height="132" rx="18" fill="#F3E7DE" stroke="#DCBCA5" stroke-width="1.8" opacity="1"/>
+<rect x="1448" y="910" width="8" height="132" rx="4" fill="#33586E"/>
+<text x="1476" y="952" class="boxtitle">Aurora DSQL tables</text>
+<text x="1476" y="986" class="body">
+<tspan x="1476" dy="0">39 tables at migration V067 — the load-bearing set:</tspan>
+<tspan x="1476" dy="23">workflow_hot · history_batch · current_execution · shard_lease · timer_bucket</tspan>
+<tspan x="1476" dy="23">dispatch_backlog · projection_log · execution_visibility_* · sa_* indexes</tspan>
+</text>
+<rect x="1863" y="1080" width="385" height="88" rx="14" fill="#F7F0DC" stroke="#E3D394" stroke-width="1.4" opacity="1"/>
+<text x="1883" y="1112" class="subhead" fill="#B08D2E">DynamoDB token bucket — server mode only</text>
+<text x="1883" y="1140" class="small">
+<tspan x="1883" dy="0">Cluster connection creation rate.</tspan>
+<tspan x="1883" dy="20">Used only for connection budgeting.</tspan>
+</text>
+<rect x="1448" y="1080" width="385" height="88" rx="14" fill="#F7F0DC" stroke="#E3D394" stroke-width="1.4" opacity="1"/>
+<text x="1468" y="1112" class="subhead" fill="#B08D2E">DynamoDB slot blocks — server mode only</text>
+<text x="1468" y="1140" class="small">
+<tspan x="1468" dy="0">Reservoir envelope and hard caps.</tspan>
+<tspan x="1468" dy="20">Keeps DSQL below account limits.</tspan>
+</text>
+<rect x="76" y="1008" width="330" height="150" rx="18" fill="#EFF4F5" stroke="#A8CBD2" stroke-width="1.8" opacity="1"/>
+<rect x="76" y="1008" width="8" height="150" rx="4" fill="#0B7285"/>
+<text x="104" y="1050" class="boxtitle">Projection workers</text>
+<text x="104" y="1084" class="body">
+<tspan x="104" dy="0">Consume visibility snapshots —</tspan>
+<tspan x="104" dy="22">one full image per transition.</tspan>
+<tspan x="104" dy="22">Async; history is authority.</tspan>
+</text>
+<path d="M374 461 C450 461 478 348 516 330" fill="none" stroke="#B85C38" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_orange)" opacity="0.86"/>
+<circle cx="436" cy="453" r="17" fill="#B85C38" stroke="white" stroke-width="4"/>
+<text x="436" y="459" text-anchor="middle" class="num">1</text>
+<path d="M900 290 H960" fill="none" stroke="#A8402F" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_red)" opacity="0.86"/>
+<circle cx="930" cy="290" r="17" fill="#A8402F" stroke="white" stroke-width="4"/>
+<text x="930" y="296" text-anchor="middle" class="num">2</text>
+<path d="M960 335 H900" fill="none" stroke="#A8402F" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_red)" stroke-dasharray="7 6" opacity="0.7"/>
+<path d="M710 390 V700" fill="none" stroke="#B85C38" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_green)" opacity="0.86"/>
+<circle cx="710" cy="530" r="17" fill="#B85C38" stroke="white" stroke-width="4"/>
+<text x="710" y="536" text-anchor="middle" class="num">3</text>
+<path d="M860 756 H930" fill="none" stroke="#8A8378" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_slate)" opacity="0.86"/>
+<circle cx="895" cy="756" r="17" fill="#5C564E" stroke="white" stroke-width="4"/>
+<text x="895" y="762" text-anchor="middle" class="num">4</text>
+<path d="M1270 742 C1360 742 1390 786 1488 786" fill="none" stroke="#9A4A2C" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_cyan)" opacity="0.86"/>
+<circle cx="1377" cy="762" r="17" fill="#9A4A2C" stroke="white" stroke-width="4"/>
+<text x="1377" y="768" text-anchor="middle" class="num">5</text>
+<path d="M1488 820 C1390 820 1360 808 1270 808" fill="none" stroke="#9A4A2C" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_cyan)" stroke-dasharray="7 6" opacity="0.72"/>
+<circle cx="1370" cy="827" r="17" fill="#9A4A2C" stroke="white" stroke-width="4"/>
+<text x="1370" y="833" text-anchor="middle" class="num">6</text>
+<path d="M1096 812 C1096 840 722 828 710 858" fill="none" stroke="#B85C38" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_green)" opacity="0.86"/>
+<circle cx="924" cy="838" r="17" fill="#B85C38" stroke="white" stroke-width="4"/>
+<text x="924" y="844" text-anchor="middle" class="num">7</text>
+<path d="M860 912 H930" fill="none" stroke="#B85C38" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_green)" opacity="0.86"/>
+<circle cx="895" cy="912" r="17" fill="#B85C38" stroke="white" stroke-width="4"/>
+<text x="895" y="918" text-anchor="middle" class="num">8</text>
+<path d="M1100 858 C1160 610 1320 326 1448 326" fill="none" stroke="#0B7285" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_purple)" opacity="0.86"/>
+<circle cx="1210" cy="615" r="17" fill="#0B7285" stroke="white" stroke-width="4"/>
+<text x="1210" y="621" text-anchor="middle" class="num">9</text>
+<path d="M374 258 C720 138 1160 138 1452 252" fill="none" stroke="#0B7285" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_purple)" opacity="0.86"/>
+<circle cx="1010" cy="150" r="17" fill="#0B7285" stroke="white" stroke-width="4"/>
+<text x="1010" y="156" text-anchor="middle" class="num">10</text>
+<path d="M1448 360 C1360 430 1320 650 1270 718" fill="none" stroke="#0B7285" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_purple)" opacity="0.86"/>
+<circle cx="1372" cy="500" r="17" fill="#0B7285" stroke="white" stroke-width="4"/>
+<text x="1372" y="506" text-anchor="middle" class="num">11</text>
+<path d="M374 664 C520 692 660 700 960 700 C1240 700 1390 722 1486 788" fill="none" stroke="#33586E" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_blue)" stroke-dasharray="9 7" opacity="0.86"/>
+<circle cx="960" cy="700" r="17" fill="#33586E" stroke="white" stroke-width="4"/>
+<text x="960" y="706" text-anchor="middle" class="num">12</text>
+<path d="M1320 1070 C1380 1070 1398 1000 1448 992" fill="none" stroke="#33586E" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_blue)" stroke-dasharray="9 7" opacity="0.86"/>
+<circle cx="1384" cy="1034" r="17" fill="#33586E" stroke="white" stroke-width="4"/>
+<text x="1384" y="1040" text-anchor="middle" class="num">13</text>
+<path d="M710 1030 V966" fill="none" stroke="#B85C38" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_green)" opacity="0.86"/>
+<circle cx="710" cy="996" r="17" fill="#B85C38" stroke="white" stroke-width="4"/>
+<text x="710" y="1002" text-anchor="middle" class="num">14</text>
+<path d="M930 948 C720 1035 540 1068 406 1070" fill="none" stroke="#0B7285" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_purple)" stroke-dasharray="9 7" opacity="0.86"/>
+<circle cx="642" cy="1036" r="17" fill="#0B7285" stroke="white" stroke-width="4"/>
+<text x="642" y="1042" text-anchor="middle" class="num">15</text>
+<path d="M2248 1118 C2300 1100 2300 726 2212 694" fill="none" stroke="#B08D2E" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_gold)" stroke-dasharray="7 6" opacity="0.75"/>
+<circle cx="2348" cy="880" r="17" fill="#B08D2E" stroke="white" stroke-width="4"/>
+<text x="2348" y="886" text-anchor="middle" class="num">16</text>
+<path d="M1833 1152 C1920 1198 2180 1200 2290 1160 C2352 1130 2348 650 2216 570" fill="none" stroke="#B08D2E" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_gold)" stroke-dasharray="7 6" opacity="0.75"/>
+<path d="M1140 420 V390" fill="none" stroke="#8A8378" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_slate)" stroke-dasharray="7 6" opacity="0.8"/>
+<circle cx="1140" cy="405" r="17" fill="#5C564E" stroke="white" stroke-width="4"/>
+<text x="1140" y="411" text-anchor="middle" class="num">17</text>
+<path d="M1848 400 V450" fill="none" stroke="#9A4A2C" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_cyan)" stroke-dasharray="7 6" opacity="0.85"/>
+<circle cx="1848" cy="425" r="17" fill="#9A4A2C" stroke="white" stroke-width="4"/>
+<text x="1848" y="431" text-anchor="middle" class="num">18</text>
+<path d="M1270 928 C1354 928 1372 962 1448 974" fill="none" stroke="#33586E" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_blue)" opacity="0.86"/>
+<circle cx="1364" cy="940" r="17" fill="#33586E" stroke="white" stroke-width="4"/>
+<text x="1364" y="946" text-anchor="middle" class="num">19</text>
+<rect x="76" y="1220" width="360" height="270" rx="18" fill="#ffffff" stroke="#D8D2C8" stroke-width="1.4" opacity="1"/>
+<text x="104" y="1256" class="boxtitle">Flow key</text>
+<line x1="104" y1="1292" x2="148" y2="1292" stroke="#B85C38" stroke-width="5" stroke-linecap="round"/>
+<text x="164" y="1297" class="small">edge mutation</text>
+<line x1="104" y1="1316" x2="148" y2="1316" stroke="#0B7285" stroke-width="5" stroke-linecap="round"/>
+<text x="164" y="1321" class="small">poll / broker</text>
+<line x1="104" y1="1340" x2="148" y2="1340" stroke="#33586E" stroke-width="5" stroke-linecap="round"/>
+<text x="164" y="1345" class="small">read or async scan</text>
+<line x1="104" y1="1364" x2="148" y2="1364" stroke="#B85C38" stroke-width="5" stroke-linecap="round"/>
+<text x="164" y="1369" class="small">lane / kernel</text>
+<line x1="104" y1="1388" x2="148" y2="1388" stroke="#9A4A2C" stroke-width="5" stroke-linecap="round"/>
+<text x="164" y="1393" class="small">DSQL I/O</text>
+<line x1="104" y1="1412" x2="148" y2="1412" stroke="#A8402F" stroke-width="5" stroke-linecap="round"/>
+<text x="164" y="1417" class="small">ownership</text>
+<line x1="104" y1="1436" x2="148" y2="1436" stroke="#8A8378" stroke-width="5" stroke-linecap="round"/>
+<text x="164" y="1441" class="small">membership/control</text>
+<line x1="104" y1="1460" x2="148" y2="1460" stroke="#B08D2E" stroke-width="5" stroke-linecap="round"/>
+<text x="164" y="1465" class="small">connection budget</text>
+<rect x="470" y="1220" width="1778" height="270" rx="18" fill="#ffffff" stroke="#D8D2C8" stroke-width="1.4" opacity="1"/>
+<text x="500" y="1256" class="boxtitle">Interaction annotations</text>
+<circle cx="500" cy="1291" r="13" fill="#B85C38"/>
+<text x="500" y="1296" class="num" text-anchor="middle">1</text>
+<text x="524" y="1296" class="small">
+<tspan x="524" dy="0">Edge mutation enters Runtime.submit; this is the only entry</tspan>
+<tspan x="524" dy="18">for mutating workflow commands.</tspan>
+</text>
+<circle cx="500" cy="1327" r="13" fill="#A8402F"/>
+<text x="500" y="1332" class="num" text-anchor="middle">2</text>
+<text x="524" y="1332" class="small">
+<tspan x="524" dy="0">ShardOwner gates admission. Inactive/draining shards fail</tspan>
+<tspan x="524" dy="18">fast; edge invalidates routing and retries.</tspan>
+</text>
+<circle cx="500" cy="1363" r="13" fill="#B85C38"/>
+<text x="500" y="1368" class="num" text-anchor="middle">3</text>
+<text x="524" y="1368" class="small">
+<tspan x="524" dy="0">A run key hashes to exactly one lane — local per-run</tspan>
+<tspan x="524" dy="18">serialization before the storage boundary.</tspan>
+</text>
+<circle cx="500" cy="1399" r="13" fill="#5C564E"/>
+<text x="500" y="1404" class="num" text-anchor="middle">4</text>
+<text x="524" y="1404" class="small">
+<tspan x="524" dy="0">Lane channel is bounded; backpressure is explicit rather than</tspan>
+<tspan x="524" dy="18">hidden in unbounded futures.</tspan>
+</text>
+<circle cx="500" cy="1435" r="13" fill="#9A4A2C"/>
+<text x="500" y="1440" class="num" text-anchor="middle">5</text>
+<text x="524" y="1440" class="small">
+<tspan x="524" dy="0">handle_message loads state and commits transitions through</tspan>
+<tspan x="524" dy="18">DsqlRunRepository.</tspan>
+</text>
+<circle cx="1085" cy="1291" r="13" fill="#9A4A2C"/>
+<text x="1085" y="1296" class="num" text-anchor="middle">6</text>
+<text x="1109" y="1296" class="small">
+<tspan x="1109" dy="0">OCC conflicts retry on the lane (max 5); reply is sent only</tspan>
+<tspan x="1109" dy="18">after the durable outcome.</tspan>
+</text>
+<circle cx="1085" cy="1327" r="13" fill="#B85C38"/>
+<text x="1085" y="1332" class="num" text-anchor="middle">7</text>
+<text x="1109" y="1332" class="small">
+<tspan x="1109" dy="0">tokeira-kernel is pure: LoadedRun + Command → Transition, no</tspan>
+<tspan x="1109" dy="18">I/O.</tspan>
+</text>
+<circle cx="1085" cy="1363" r="13" fill="#B85C38"/>
+<text x="1085" y="1368" class="num" text-anchor="middle">8</text>
+<text x="1109" y="1368" class="small">
+<tspan x="1109" dy="0">History, timers, and the visibility snapshot commit in one</tspan>
+<tspan x="1109" dy="18">fenced transaction; only dispatch publishes after.</tspan>
+</text>
+<circle cx="1085" cy="1399" r="13" fill="#0B7285"/>
+<text x="1085" y="1404" class="num" text-anchor="middle">9</text>
+<text x="1109" y="1404" class="small">
+<tspan x="1109" dy="0">9–11 · Brokers handle poll matching and WFT start dispatch</tspan>
+<tspan x="1109" dy="18">without becoming workflow authority.</tspan>
+</text>
+<circle cx="1085" cy="1435" r="13" fill="#33586E"/>
+<text x="1085" y="1440" class="num" text-anchor="middle">12</text>
+<text x="1109" y="1440" class="small">
+<tspan x="1109" dy="0">History reads bypass lanes and read committed history directly</tspan>
+<tspan x="1109" dy="18">from DSQL.</tspan>
+</text>
+<circle cx="1670" cy="1291" r="13" fill="#33586E"/>
+<text x="1670" y="1296" class="num" text-anchor="middle">13</text>
+<text x="1694" y="1296" class="small">
+<tspan x="1694" dy="0">13–15 · Loops re-enter via lanes — except activity timeouts,</tspan>
+<tspan x="1694" dy="18">which commit off-lane: the drawn second door.</tspan>
+</text>
+<circle cx="1670" cy="1327" r="13" fill="#B08D2E"/>
+<text x="1670" y="1332" class="num" text-anchor="middle">16</text>
+<text x="1694" y="1332" class="small">
+<tspan x="1694" dy="0">16–18 · Connection budget and durable broker fallback are</tspan>
+<tspan x="1694" dy="18">explicit operational control surfaces.</tspan>
+</text>
+<circle cx="1670" cy="1363" r="13" fill="#5C564E"/>
+<text x="1670" y="1368" class="num" text-anchor="middle">17</text>
+<text x="1694" y="1368" class="small">
+<tspan x="1694" dy="0">Heartbeats carry lane pressure; the edge owns routing;</tspan>
+<tspan x="1694" dy="18">DSQL leases remain the source of authority.</tspan>
+</text>
+<circle cx="1670" cy="1399" r="13" fill="#33586E"/>
+<text x="1670" y="1404" class="num" text-anchor="middle">19</text>
+<text x="1694" y="1404" class="small">
+<tspan x="1694" dy="0">Snapshot rows ride the commit; consuming them lags freely —</tspan>
+<tspan x="1694" dy="18">projection lag cannot change workflow truth.</tspan>
+</text>
+<g transform="translate(2308,1512)" stroke="#B85C38" stroke-width="2.6" stroke-linecap="round" opacity=".8">
+  <path d="M0 44 C4 26 8 14 15 0" fill="none"/>
+  <g transform="translate(15,0)"><path d="M0 0 L15 -11 M0 0 L19 -2 M0 0 L15 9 M0 0 L6 -17 M0 0 L-6 -15" fill="none"/><circle cx="0" cy="0" r="3" fill="#B85C38" stroke="none"/></g>
+</g>
+</svg>

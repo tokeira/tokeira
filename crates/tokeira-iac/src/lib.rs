@@ -178,7 +178,7 @@ impl ResourceRecovery {
 
     /// Attempt to reconstruct the recorded resource. `None` means this
     /// recoverer does not claim the type — the caller stays fail-closed.
-    pub fn recover(&self, state: &ResourceState) -> Option<Box<dyn Resource>> {
+    pub(crate) fn recover(&self, state: &ResourceState) -> Option<Box<dyn Resource>> {
         (self.0)(state)
     }
 }
@@ -314,7 +314,7 @@ impl ProvisionContext {
     }
 
     /// Access the extensions map (used by `ModuleContext`).
-    pub fn extensions(&self) -> &HashMap<TypeId, Box<dyn Any + Send + Sync>> {
+    pub(crate) fn extensions(&self) -> &HashMap<TypeId, Box<dyn Any + Send + Sync>> {
         &self.extensions
     }
 

@@ -12,22 +12,22 @@ use crate::resources::ecs_cluster::{
 };
 
 /// Author-visible name of the realized cluster resource type.
-pub const CLUSTER_TYPE: &str = "EcsCluster";
+pub(crate) const CLUSTER_TYPE: &str = "EcsCluster";
 /// Author-visible name of the realized launch-template resource type.
-pub const LAUNCH_TEMPLATE_TYPE: &str = "LaunchTemplate";
+pub(crate) const LAUNCH_TEMPLATE_TYPE: &str = "LaunchTemplate";
 /// Author-visible name of the realized auto-scaling-group resource type.
-pub const ASG_TYPE: &str = "AutoScalingGroup";
+pub(crate) const ASG_TYPE: &str = "AutoScalingGroup";
 /// Author-visible name of the realized capacity-provider resource type.
-pub const CAPACITY_PROVIDER_TYPE: &str = "EcsCapacityProvider";
+pub(crate) const CAPACITY_PROVIDER_TYPE: &str = "EcsCapacityProvider";
 
 /// Reusable author input for the ECS cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EcsCluster {
     /// Cluster name.
-    pub name: String,
+    pub(crate) name: String,
     /// Service Connect namespace the cluster advertises.
-    pub service_connect_namespace: String,
+    pub(crate) service_connect_namespace: String,
 }
 
 impl Kind<EcsClusterResource> for EcsCluster {
@@ -46,15 +46,15 @@ impl Kind<EcsClusterResource> for EcsCluster {
 #[serde(deny_unknown_fields)]
 pub struct LaunchTemplate {
     /// Launch-template name (resource id `lt-<name>`).
-    pub name: String,
+    pub(crate) name: String,
     /// Cluster the instances join.
-    pub cluster_name: String,
+    pub(crate) cluster_name: String,
     /// EC2 instance type for this capacity plane.
-    pub instance_type: String,
+    pub(crate) instance_type: String,
     /// Workload attribute stamped into instance ECS attributes.
-    pub workload: String,
+    pub(crate) workload: String,
     /// IAM instance-profile name the instances assume.
-    pub instance_profile_name: String,
+    pub(crate) instance_profile_name: String,
 }
 
 impl Kind<LaunchTemplateResource> for LaunchTemplate {
@@ -79,16 +79,16 @@ impl Kind<LaunchTemplateResource> for LaunchTemplate {
 #[serde(deny_unknown_fields)]
 pub struct AutoScalingGroup {
     /// Group name (resource id `asg-<name>`).
-    pub name: String,
+    pub(crate) name: String,
     /// Minimum instance count.
-    pub min_size: u32,
+    pub(crate) min_size: u32,
     /// Desired instance count.
-    pub desired_capacity: u32,
+    pub(crate) desired_capacity: u32,
     /// Maximum instance count.
-    pub max_size: u32,
+    pub(crate) max_size: u32,
     /// Protect fresh instances from scale-in (managed draining planes).
     #[serde(default)]
-    pub new_instances_protected_from_scale_in: bool,
+    pub(crate) new_instances_protected_from_scale_in: bool,
 }
 
 impl Kind<AsgResource> for AutoScalingGroup {
@@ -115,7 +115,7 @@ impl Kind<AsgResource> for AutoScalingGroup {
 #[serde(deny_unknown_fields)]
 pub struct CapacityProvider {
     /// Capacity-provider name (resource id `cp-<name>`).
-    pub name: String,
+    pub(crate) name: String,
 }
 
 impl Kind<CapacityProviderResource> for CapacityProvider {

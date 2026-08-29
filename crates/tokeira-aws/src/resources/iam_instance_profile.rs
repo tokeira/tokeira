@@ -27,8 +27,8 @@ pub struct IamInstanceProfileConfig {
 /// Generic provider resource that provisions one IAM instance profile.
 #[derive(Debug)]
 pub struct IamInstanceProfile {
-    pub profile_name: String,
-    pub config: IamInstanceProfileConfig,
+    pub(crate) profile_name: String,
+    pub(crate) config: IamInstanceProfileConfig,
     pub project: String,
     pub region: String,
     pub tags: HashMap<String, String>,

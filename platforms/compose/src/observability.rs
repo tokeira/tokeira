@@ -100,7 +100,7 @@ impl ObservabilityContent {
     ///
     /// Absence is stated, never papered over: a missing directory or
     /// template names the exact path the deployment's description requires.
-    pub fn load(definition_dir: &Path) -> Result<Self, ConfigGenError> {
+    pub(crate) fn load(definition_dir: &Path) -> Result<Self, ConfigGenError> {
         let root = definition_dir.join(CONTENT_DIR);
         let templates = root.join(CONTENT_TEMPLATES);
         let read = |path: PathBuf| -> Result<String, ConfigGenError> {
@@ -153,15 +153,15 @@ impl ObservabilityContent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservabilityParams {
-    pub metrics_target_host: String,
-    pub metrics_target_port: u16,
-    pub cluster: String,
-    pub deployment: String,
-    pub mimir_remote_write_url: String,
-    pub loki_push_url: String,
-    pub mimir_http_port: u16,
-    pub loki_http_port: u16,
-    pub loki_retention_hours: u32,
+    pub(crate) metrics_target_host: String,
+    pub(crate) metrics_target_port: u16,
+    pub(crate) cluster: String,
+    pub(crate) deployment: String,
+    pub(crate) mimir_remote_write_url: String,
+    pub(crate) loki_push_url: String,
+    pub(crate) mimir_http_port: u16,
+    pub(crate) loki_http_port: u16,
+    pub(crate) loki_retention_hours: u32,
 }
 
 /// Engine identity of the rendered-configuration resource — the provider's
@@ -189,8 +189,8 @@ impl ObservabilityParams {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedConfigFile {
-    pub relative_path: PathBuf,
-    pub contents: String,
+    pub(crate) relative_path: PathBuf,
+    pub(crate) contents: String,
 }
 
 #[derive(Debug, Error)]
@@ -231,7 +231,7 @@ impl From<ConfigGenError> for iac::IacError {
 }
 
 /// Load the companion content and render the complete desired file set.
-pub fn desired_files(
+pub(crate) fn desired_files(
     definition_dir: &Path,
     params: &ObservabilityParams,
 ) -> Result<Vec<RenderedConfigFile>, ConfigGenError> {
@@ -239,7 +239,7 @@ pub fn desired_files(
 }
 
 /// Render the complete desired file set from loaded content.
-pub fn render_all(
+pub(crate) fn render_all(
     content: &ObservabilityContent,
     params: &ObservabilityParams,
 ) -> Result<Vec<RenderedConfigFile>, ConfigGenError> {
@@ -384,9 +384,9 @@ pub struct ObservabilityConfigFilesResource {
 impl ObservabilityConfigFilesResource {
     /// The resource's one word: engine resource type and author-visible kind
     /// name. The kind and the selection entry recover it from here.
-    pub const TYPE: &'static str = "ObservabilityConfiguration";
+    pub(crate) const TYPE: &'static str = "ObservabilityConfiguration";
 
-    pub fn new(
+    pub(crate) fn new(
         deployment_dir: PathBuf,
         definition_dir: PathBuf,
         params: ObservabilityParams,
@@ -398,11 +398,11 @@ impl ObservabilityConfigFilesResource {
         }
     }
 
-    pub fn resource_id_value() -> iac::ResourceId {
+    pub(crate) fn resource_id_value() -> iac::ResourceId {
         tokeira_compose::config_content_resource_id()
     }
 
-    pub fn desired_files(&self) -> Result<Vec<RenderedConfigFile>, ConfigGenError> {
+    pub(crate) fn desired_files(&self) -> Result<Vec<RenderedConfigFile>, ConfigGenError> {
         desired_files(&self.definition_dir, &self.params)
     }
 

@@ -33,12 +33,12 @@ pub enum RepositoryLocator {
 
 impl RepositoryLocator {
     /// The TUF metadata base URL (`…/metadata/`).
-    pub fn metadata_url(&self) -> Result<url::Url, LocatorError> {
+    pub(crate) fn metadata_url(&self) -> Result<url::Url, LocatorError> {
         self.join("metadata/")
     }
 
     /// The TUF targets base URL (`…/targets/`).
-    pub fn targets_url(&self) -> Result<url::Url, LocatorError> {
+    pub(crate) fn targets_url(&self) -> Result<url::Url, LocatorError> {
         self.join("targets/")
     }
 

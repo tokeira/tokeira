@@ -26,7 +26,7 @@ pub struct RemoteStateBucket {
 
 impl RemoteStateBucket {
     /// Author-visible and persisted resource type.
-    pub const TYPE: &'static str = "RemoteStateBucket";
+    pub(crate) const TYPE: &'static str = "RemoteStateBucket";
 
     /// Construct the foundation resource for one state prefix.
     pub fn new(

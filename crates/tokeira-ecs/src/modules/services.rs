@@ -23,7 +23,7 @@ pub struct ServicesModule {
 }
 
 impl ServicesModule {
-    pub fn new(config: EcsConfig) -> Self {
+    pub(crate) fn new(config: EcsConfig) -> Self {
         Self { config }
     }
 }

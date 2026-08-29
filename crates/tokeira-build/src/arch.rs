@@ -18,7 +18,7 @@ impl Arch {
         }
     }
 
-    pub fn rust_target(self) -> &'static str {
+    pub(crate) fn rust_target(self) -> &'static str {
         match self {
             Self::Arm64 => "aarch64-unknown-linux-gnu",
             Self::Amd64 => "x86_64-unknown-linux-gnu",

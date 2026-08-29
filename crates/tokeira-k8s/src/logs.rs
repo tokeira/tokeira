@@ -17,11 +17,11 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, Default)]
 pub struct LogOptions {
     /// Follow the log stream (`tail -f` semantics).
-    pub follow: bool,
+    pub(crate) follow: bool,
     /// Limit to the last N lines; `None` returns all available lines.
-    pub tail_lines: Option<i64>,
+    pub(crate) tail_lines: Option<i64>,
     /// Target a specific container; `None` uses the pod's default container.
-    pub container: Option<String>,
+    pub(crate) container: Option<String>,
 }
 
 impl LogOptions {

@@ -141,7 +141,7 @@ pub enum ComposeError {
 /// connection-refused error establishes that nothing accepted connections at
 /// the socket path, not that the daemon is stopped. The provider-SDK error
 /// audit extends this table class by class.
-pub fn docker_unreachable_issue(socket_path: &str, evidence: &str) -> iac::PlatformIssue {
+pub(crate) fn docker_unreachable_issue(socket_path: &str, evidence: &str) -> iac::PlatformIssue {
     // Both spellings of the same errno class: bollard/hyper say
     // "Connection refused"; other SDK stacks say "ECONNREFUSED".
     let refused = evidence.contains("ECONNREFUSED") || evidence.contains("Connection refused");
@@ -218,10 +218,10 @@ impl From<ComposeError> for deploy_engine::DeployError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Healthcheck {
-    pub test: Vec<String>,
-    pub interval: Option<String>,
-    pub timeout: Option<String>,
-    pub retries: Option<u32>,
+    pub(crate) test: Vec<String>,
+    pub(crate) interval: Option<String>,
+    pub(crate) timeout: Option<String>,
+    pub(crate) retries: Option<u32>,
 }
 
 /// One environment entry without tuple-shaped author data.
@@ -229,9 +229,9 @@ pub struct Healthcheck {
 #[serde(deny_unknown_fields)]
 pub struct Environment {
     /// Environment variable name.
-    pub name: String,
+    pub(crate) name: String,
     /// Environment variable value.
-    pub value: String,
+    pub(crate) value: String,
 }
 
 /// [Docker Compose-compatible policy][compose-pull-policy] controlling when a
@@ -396,9 +396,9 @@ pub enum Volume {
 #[serde(deny_unknown_fields)]
 pub struct StateVolume {
     /// Logical state subpath.
-    pub sub: String,
+    pub(crate) sub: String,
     /// Container mount target.
-    pub at: String,
+    pub(crate) at: String,
 }
 
 /// Generated configuration mount.
@@ -406,9 +406,9 @@ pub struct StateVolume {
 #[serde(deny_unknown_fields)]
 pub struct ConfigVolume {
     /// Logical configuration subpath.
-    pub sub: String,
+    pub(crate) sub: String,
     /// Container mount target.
-    pub at: String,
+    pub(crate) at: String,
 }
 
 /// The compose service resource: what manifests record and what the engine
@@ -421,54 +421,54 @@ pub struct ConfigVolume {
 pub struct ComposeService {
     /// Stable service name from the graph's logical id. Used as the compose
     /// service key, Docker label, and framework resource ID suffix.
-    pub name: String,
+    pub(crate) name: String,
     /// Container image reference to run.
-    pub image: String,
+    pub(crate) image: String,
     /// Docker Compose-compatible registry resolution policy.
     #[serde(default)]
-    pub pull_policy: PullPolicy,
+    pub(crate) pull_policy: PullPolicy,
     /// Desired container count. Applied by reconcile: replicas beyond the
     /// first run as `<name>-<index>` containers.
     #[serde(default = "default_replicas")]
-    pub replicas: u32,
+    pub(crate) replicas: u32,
     /// Published equal host/container ports.
     #[serde(default)]
-    pub publish: Vec<u16>,
+    pub(crate) publish: Vec<u16>,
     /// Logical volumes; lowered to bind strings at apply.
     #[serde(default)]
-    pub volumes: Vec<Volume>,
+    pub(crate) volumes: Vec<Volume>,
     /// Explicit environment entries.
     #[serde(default)]
-    pub environment: Vec<Environment>,
+    pub(crate) environment: Vec<Environment>,
     /// Names of compose services that should exist before this service.
     #[serde(default)]
-    pub depends_on: Vec<String>,
+    pub(crate) depends_on: Vec<String>,
     /// Optional Docker healthcheck definition.
     #[serde(default)]
-    pub healthcheck: Option<Healthcheck>,
+    pub(crate) healthcheck: Option<Healthcheck>,
     /// Command to run in the container (overrides image CMD).
     #[serde(default)]
-    pub command: Vec<String>,
+    pub(crate) command: Vec<String>,
     /// Mount the non-secret AWS runtime selectors for this region. The
     /// host's credential paths and profile are resolved at apply, never
     /// recorded.
     #[serde(default)]
-    pub aws_region: Option<String>,
+    pub(crate) aws_region: Option<String>,
     /// Desired-content identity of the deployment's server-config node,
     /// when this service declared a dependency on it. In the manifest so a
     /// `tokeirad.toml` edit surfaces as a diff on this service.
     #[serde(default)]
-    pub server_config_digest: Option<String>,
+    pub(crate) server_config_digest: Option<String>,
     /// Desired-content identity of the rendered config-files resource, when
     /// a `Config` volume couples this service to it. Same contract as
     /// [`server_config_digest`](Self::server_config_digest).
     #[serde(default)]
-    pub config_digest: Option<String>,
+    pub(crate) config_digest: Option<String>,
     /// Owning logical module. Not part of the manifest: recovery answers
     /// module questions from the recorded state row, and a recovered value
     /// falls back to the service name.
     #[serde(skip)]
-    pub module: String,
+    pub(crate) module: String,
 }
 
 fn default_replicas() -> u32 {
@@ -476,16 +476,16 @@ fn default_replicas() -> u32 {
 }
 
 /// Incremental Docker log output for one service.
-pub type LogStream = Pin<Box<dyn Stream<Item = Result<String, ComposeError>> + Send>>;
+pub(crate) type LogStream = Pin<Box<dyn Stream<Item = Result<String, ComposeError>> + Send>>;
 
 impl ComposeService {
     /// The resource's one word: engine resource type and author-visible
     /// name, stated once here.
-    pub const TYPE: &'static str = "Service";
+    pub(crate) const TYPE: &'static str = "Service";
 
     /// Convert the service into the provider-agnostic manifest shape used by
     /// the runtime deploy engine.
-    pub fn to_manifest(&self) -> serde_json::Value {
+    pub(crate) fn to_manifest(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("compose service serializes")
     }
 
@@ -545,7 +545,7 @@ impl deploy_engine::Service for ComposeService {
 /// boundary here and any consumer comparing desired manifests against each
 /// other (desired-snapshot paths) call this one function — two independently
 /// maintained canonicalizations would drift and manufacture phantom diffs.
-pub fn canonicalize_manifest(mut manifest: serde_json::Value) -> serde_json::Value {
+pub(crate) fn canonicalize_manifest(mut manifest: serde_json::Value) -> serde_json::Value {
     if let Some(object) = manifest.as_object_mut() {
         for key in ["publish", "volumes", "environment", "depends_on"] {
             if let Some(array) = object.get_mut(key).and_then(|v| v.as_array_mut()) {
@@ -605,7 +605,7 @@ pub struct ComposePlatform {
 impl ComposePlatform {
     /// Connect to Docker using the local default socket and write compose state
     /// to the supplied file.
-    pub fn connect(
+    pub(crate) fn connect(
         compose_file: impl Into<PathBuf>,
         deployment_dir: impl Into<PathBuf>,
         project_name: impl Into<String>,
@@ -634,7 +634,7 @@ impl ComposePlatform {
     /// questions (logs, port mappings, running containers). The compose-file
     /// path is empty by construction — the ops paths never touch it, and
     /// reconcile/scale/remove must never be called on this handle.
-    pub fn ops(project_name: impl Into<String>) -> Result<Self, ComposeError> {
+    pub(crate) fn ops(project_name: impl Into<String>) -> Result<Self, ComposeError> {
         Self::connect(
             std::path::PathBuf::new(),
             std::path::PathBuf::new(),
@@ -665,7 +665,7 @@ impl ComposePlatform {
     }
 
     /// Verify that Docker is reachable before performing an operation.
-    pub async fn ensure_reachable(&self) -> Result<(), ComposeError> {
+    pub(crate) async fn ensure_reachable(&self) -> Result<(), ComposeError> {
         self.docker
             .version()
             .await
@@ -901,7 +901,7 @@ impl ComposePlatform {
     /// resource while leaving the rest of the local stack intact.
     /// Tear down a single service: remove it from compose state and force-remove
     /// its container. Idempotent — an already-absent container is success.
-    pub async fn remove_service(&self, service: &str) -> Result<(), ComposeError> {
+    pub(crate) async fn remove_service(&self, service: &str) -> Result<(), ComposeError> {
         self.ensure_reachable().await?;
         let mut state = self.load_compose_state()?;
         state.services.remove(service);
@@ -939,7 +939,7 @@ impl ComposePlatform {
     /// with no Docker runtime equivalent. Changes to `depends_on` in the
     /// desired config will still trigger an update because the desired
     /// manifest includes it and the live manifest does not.
-    pub async fn running_service(
+    pub(crate) async fn running_service(
         &self,
         service: &str,
     ) -> Result<Option<ComposeService>, ComposeError> {
@@ -1000,7 +1000,7 @@ impl ComposePlatform {
     }
 
     /// Open service logs as an incremental stream.
-    pub async fn log_stream(
+    pub(crate) async fn log_stream(
         &self,
         service: &str,
         follow: bool,
@@ -1049,7 +1049,7 @@ impl ComposePlatform {
     }
 
     /// Return every host/container port mapping for a running service.
-    pub async fn port_mappings(
+    pub(crate) async fn port_mappings(
         &self,
         service: &str,
     ) -> Result<Vec<(String, u16, u16, String)>, ComposeError> {
@@ -1068,7 +1068,7 @@ impl ComposePlatform {
     /// This is a direct Docker implementation used by local ops. It creates
     /// containers named `{project}_{service}-{index}` and records those entries
     /// in the generated compose file; it does not rely on `deploy.replicas`.
-    pub async fn scale_service(
+    pub(crate) async fn scale_service(
         &self,
         service: &ComposeService,
         replicas: u32,
@@ -1114,7 +1114,10 @@ impl ComposePlatform {
 
     /// The recorded spec for one service, from the deployment's compose
     /// state — the container configuration a scale-up replicates.
-    pub fn recorded_service(&self, name: &str) -> Result<Option<ComposeService>, ComposeError> {
+    pub(crate) fn recorded_service(
+        &self,
+        name: &str,
+    ) -> Result<Option<ComposeService>, ComposeError> {
         Ok(self.load_compose_state()?.services.get(name).cloned())
     }
 

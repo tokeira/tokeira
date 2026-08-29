@@ -11,9 +11,9 @@ use crate::definition::DefinitionSourceName;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceRange {
     /// Inclusive byte offset.
-    pub start: usize,
+    pub(crate) start: usize,
     /// Exclusive byte offset.
-    pub end: usize,
+    pub(crate) end: usize,
 }
 
 impl SourceRange {
@@ -31,9 +31,9 @@ impl SourceRange {
 #[error("source range end {end} is before start {start}")]
 pub struct SourceRangeError {
     /// Inclusive start supplied by the caller.
-    pub start: usize,
+    pub(crate) start: usize,
     /// Exclusive end supplied by the caller.
-    pub end: usize,
+    pub(crate) end: usize,
 }
 
 /// Stable category used by shells to render a frontend-neutral diagnostic.
@@ -215,7 +215,7 @@ pub enum VerificationFinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationReport {
     /// Findings in resource declaration order.
-    pub findings: Vec<VerificationFinding>,
+    pub(crate) findings: Vec<VerificationFinding>,
 }
 
 impl fmt::Display for VerificationReport {
@@ -231,11 +231,11 @@ impl std::error::Error for VerificationReport {}
 #[error("failed to realize `{resource}` as `{provider_kind}`: {message}")]
 pub struct ProjectionError {
     /// Logical resource identity.
-    pub resource: String,
+    pub(crate) resource: String,
     /// Concrete provider kind identity.
-    pub provider_kind: String,
+    pub(crate) provider_kind: String,
     /// Provider-owned failure detail.
-    pub message: String,
+    pub(crate) message: String,
 }
 
 /// Failure to atomically publish deterministic inspection bytes.

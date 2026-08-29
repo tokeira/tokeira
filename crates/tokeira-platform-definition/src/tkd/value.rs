@@ -59,8 +59,8 @@ pub enum VariantBody<H> {
 /// disambiguates a config enum from any future host enum sharing a leaf name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnumPath {
-    pub ty: String,
-    pub segments: Vec<String>,
+    pub(crate) ty: String,
+    pub(crate) segments: Vec<String>,
 }
 
 // `PartialEq` on values (config diff domain). Impl'd manually with NO `H:
@@ -115,7 +115,7 @@ impl<H> PartialEq for VariantBody<H> {
 impl<H> Value<H> {
     /// Does this value (transitively) contain a host handle? Guards the
     /// `#[create]`/`#[require]` diff domain, which must be config-only.
-    pub fn contains_host(&self) -> bool {
+    pub(crate) fn contains_host(&self) -> bool {
         match self {
             Value::Host(_) => true,
             Value::Vec(xs) | Value::Tuple(xs) => xs.iter().any(Value::contains_host),
@@ -181,7 +181,7 @@ impl EvalError {
     }
 
     /// Attach an evaluator span only when a lower layer did not locate the failure.
-    pub fn at_if_missing(mut self, span: proc_macro2::Span) -> Self {
+    pub(crate) fn at_if_missing(mut self, span: proc_macro2::Span) -> Self {
         if self.span.is_none() {
             self.span = Some(span);
         }
@@ -189,7 +189,7 @@ impl EvalError {
     }
 
     /// Attach an optional parser/checker span without discarding an existing location.
-    pub fn with_optional_span(mut self, span: Option<proc_macro2::Span>) -> Self {
+    pub(crate) fn with_optional_span(mut self, span: Option<proc_macro2::Span>) -> Self {
         if self.span.is_none() {
             self.span = span;
         }

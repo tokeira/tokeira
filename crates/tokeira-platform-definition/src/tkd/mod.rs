@@ -28,7 +28,7 @@ pub use value::{EnumPath, EvalError, FieldMap, FieldMapExt, Value, VariantBody};
 /// realized deployment ([`HostBridge::Output`]) and the resolved config value the
 /// operator authored. The subset is enforced *before* evaluation, so a definition
 /// outside the allow-list is rejected, never run.
-pub fn interpret<B: HostBridge>(
+pub(crate) fn interpret<B: HostBridge>(
     src: &str,
     bridge: &B,
     cx: &B::Cx,
@@ -62,7 +62,7 @@ pub fn interpret<B: HostBridge>(
 
 /// Validate a `.tkd` against the interpreted subset, returning all violation
 /// messages (no parse/eval). The allow-list is reject-by-default.
-pub fn validate<B: HostBridge>(
+pub(crate) fn validate<B: HostBridge>(
     src: &str,
     bridge: &B,
     part_sources: &dyn tokeira_platform::definition::SourceResolver,
@@ -80,7 +80,7 @@ pub fn validate<B: HostBridge>(
 /// subset without evaluating it. Platform vocabulary is deliberately not
 /// checked here; kind, method, and associated-function membership is settled
 /// when the engine interprets the definition for a deployment's platform.
-pub fn validate_syntax(
+pub(crate) fn validate_syntax(
     src: &str,
     part_sources: &dyn tokeira_platform::definition::SourceResolver,
 ) -> Result<(), Vec<String>> {
@@ -107,7 +107,7 @@ pub(crate) fn located_parse_error(e: &syn::Error) -> String {
 /// `#[create]` may sit in any document of the set — a model part carries the
 /// configuration types — so the annotation scan resolves the root's declared
 /// parts and reads the whole set (a parse-only pass; nothing evaluates).
-pub fn retarget_check<H>(
+pub(crate) fn retarget_check<H>(
     src: &str,
     part_sources: &dyn tokeira_platform::definition::SourceResolver,
     old: &Value<H>,
@@ -136,7 +136,7 @@ pub fn retarget_check<H>(
 
 /// Evaluate just `deployment(cfg, cx)` against a (possibly operator-edited)
 /// config value, unwrapping the return host into the platform's deployment.
-pub fn eval_deployment<B: HostBridge>(
+pub(crate) fn eval_deployment<B: HostBridge>(
     interp: &eval::Interp<B>,
     cfg: Value<B::Host>,
 ) -> Result<B::Output, EvalError> {

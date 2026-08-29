@@ -12,7 +12,7 @@ pub struct CompatibilityVersion {
 
 impl CompatibilityVersion {
     /// Construct one protocol version from its numeric components.
-    pub const fn new(major: u64, minor: u64, patch: u64) -> Self {
+    pub(crate) const fn new(major: u64, minor: u64, patch: u64) -> Self {
         Self {
             major,
             minor,
@@ -65,7 +65,7 @@ pub enum BumpTrigger {
 
 impl BumpTrigger {
     /// Return the stable digit used in commit trailers and audit records.
-    pub const fn digit(self) -> char {
+    pub(crate) const fn digit(self) -> char {
         match self {
             Self::ExistingCoverage => '1',
             Self::NewlyImplemented => '2',
@@ -87,11 +87,11 @@ impl BumpTrigger {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BumpTrailer {
     /// Compatibility claim in the commit's parent.
-    pub old: CompatibilityVersion,
+    pub(crate) old: CompatibilityVersion,
     /// Compatibility claim in the bump commit.
-    pub new: CompatibilityVersion,
+    pub(crate) new: CompatibilityVersion,
     /// Protocol trigger that justifies the transition.
-    pub trigger: BumpTrigger,
+    pub(crate) trigger: BumpTrigger,
 }
 
 impl fmt::Display for BumpTrailer {

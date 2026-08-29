@@ -93,7 +93,7 @@ impl Engine {
     }
 
     /// Plan using a separate known-managed resource set.
-    pub async fn plan_with_known(
+    pub(crate) async fn plan_with_known(
         &self,
         desired: &[&dyn Resource],
         known: &[&dyn Resource],
@@ -211,7 +211,7 @@ impl Engine {
     /// `known` must be a superset of `desired`. Resources in `known` but not
     /// in `desired` that exist in state will be deleted through their
     /// `Resource::delete()` implementation.
-    pub async fn apply_with_known(
+    pub(crate) async fn apply_with_known(
         &self,
         desired: &[&dyn Resource],
         known: &[&dyn Resource],
@@ -319,7 +319,7 @@ impl Engine {
     }
 
     /// Destroy using a known-managed resource set.
-    pub async fn destroy_known(
+    pub(crate) async fn destroy_known(
         &self,
         known: &[&dyn Resource],
         ctx: &mut ProvisionContext,
@@ -344,7 +344,7 @@ impl Engine {
     /// from state is skipped (idempotent). Unlike
     /// [`destroy_known`](Self::destroy_known), it does **not** refresh or
     /// reconcile the full known set — only the named ids.
-    pub async fn destroy_selected(
+    pub(crate) async fn destroy_selected(
         &self,
         known: &[&dyn Resource],
         ids: &HashSet<ResourceId>,
@@ -370,7 +370,7 @@ impl Engine {
     /// and validated from the composition — the rollback B-pass entry
     /// point. Collection and validation here; the fail-closed,
     /// reverse-dependency-ordered, idempotent semantics live in
-    /// [`destroy_selected`](Self::destroy_selected).
+    /// `destroy_selected`.
     pub async fn destroy_selected_in(
         &self,
         composition: &InfraComposition,
@@ -1340,7 +1340,7 @@ fn filter_changes_by_modules(
 
 /// Kahn's algorithm for topological sort on resource dependencies.
 /// Returns resource IDs in creation order (dependencies first).
-pub fn topological_sort(resources: &[&dyn Resource]) -> Result<Vec<ResourceId>, IacError> {
+pub(crate) fn topological_sort(resources: &[&dyn Resource]) -> Result<Vec<ResourceId>, IacError> {
     let ids: HashSet<ResourceId> = resources.iter().map(|r| r.resource_id()).collect();
 
     let mut in_degree: HashMap<ResourceId, usize> = HashMap::new();

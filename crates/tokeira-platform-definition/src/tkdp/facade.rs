@@ -21,18 +21,18 @@
 
 /// The facade's registered-module name: the `tokeira` the dialect imports
 /// from.
-pub const FACADE_MODULE_NAME: &str = "tokeira";
+pub(crate) const FACADE_MODULE_NAME: &str = "tokeira";
 
 /// File name facade frames carry in Monty tracebacks. The translator renders
 /// frames from this file as internal rather than mapping them to operator
 /// source.
-pub const FACADE_FILE_NAME: &str = "<tokeira-facade>";
+pub(crate) const FACADE_FILE_NAME: &str = "<tokeira-facade>";
 
 /// Names the facade publishes besides the kind inventory.
-pub const BUILDER_NAMES: &[&str] = &["Context", "Deployment"];
+pub(crate) const BUILDER_NAMES: &[&str] = &["Context", "Deployment"];
 
 /// The complete importable surface: builders plus the engine kind inventory.
-pub fn facade_names<'a>(kind_names: &'a [&'a str]) -> Vec<&'a str> {
+pub(crate) fn facade_names<'a>(kind_names: &'a [&'a str]) -> Vec<&'a str> {
     BUILDER_NAMES
         .iter()
         .copied()
@@ -183,7 +183,7 @@ class __tokeira_internal_Deployment:
 /// Renders the complete facade module source: core, context class, kind
 /// shells for every inventory name, and public bindings for the whole
 /// importable surface.
-pub fn render(kind_names: &[&str], context: &serde_json::Value) -> String {
+pub(crate) fn render(kind_names: &[&str], context: &serde_json::Value) -> String {
     let mut out = String::with_capacity(FACADE_CORE.len() + 1024);
     out.push_str(FACADE_CORE);
 

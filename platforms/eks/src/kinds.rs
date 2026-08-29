@@ -103,8 +103,8 @@ fn eks_cluster_id(cx: &Cx) -> ResourceId {
 /// cluster and the interface endpoints.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vpc {
-    pub cidr: String,
-    pub availability_zones: Vec<String>,
+    pub(crate) cidr: String,
+    pub(crate) availability_zones: Vec<String>,
 }
 
 impl Kind for Vpc {
@@ -126,11 +126,11 @@ impl Kind for Vpc {
 /// `0.0.0.0/0` source anywhere in the realized plan).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IngressRule {
-    pub description: String,
-    pub protocol: String,
-    pub from_port: u16,
-    pub to_port: u16,
-    pub source: String,
+    pub(crate) description: String,
+    pub(crate) protocol: String,
+    pub(crate) from_port: u16,
+    pub(crate) to_port: u16,
+    pub(crate) source: String,
 }
 
 impl IngressRule {
@@ -152,9 +152,9 @@ impl IngressRule {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecurityGroup {
     /// Project-relative name suffix, e.g. `eks-nodes-sg` or `vpc-endpoints-sg`.
-    pub suffix: String,
-    pub description: String,
-    pub ingress: Vec<IngressRule>,
+    pub(crate) suffix: String,
+    pub(crate) description: String,
+    pub(crate) ingress: Vec<IngressRule>,
 }
 
 impl Kind for SecurityGroup {
@@ -183,10 +183,10 @@ impl Kind for SecurityGroup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VpcEndpoint {
     /// Short service token, e.g. `s3`, `dynamodb`, `ecr.api`, `dsql`.
-    pub service: String,
+    pub(crate) service: String,
     /// `true` for an Interface endpoint (ENI + SG), `false` for a Gateway
     /// endpoint (route-table entry; s3/dynamodb only).
-    pub interface: bool,
+    pub(crate) interface: bool,
 }
 
 impl Kind for VpcEndpoint {
@@ -226,13 +226,13 @@ impl Kind for VpcEndpoint {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IamRole {
     /// Project-relative role suffix, e.g. `eks-cluster-role`, `tokeira-task`.
-    pub suffix: String,
+    pub(crate) suffix: String,
     /// The assume-role (trust) policy JSON.
-    pub trust_policy: String,
+    pub(crate) trust_policy: String,
     /// Named inline policy documents (name → JSON).
-    pub inline_policies: Vec<(String, String)>,
+    pub(crate) inline_policies: Vec<(String, String)>,
     /// AWS-managed policy ARNs to attach (empty for the least-privilege roles).
-    pub managed_policy_arns: Vec<String>,
+    pub(crate) managed_policy_arns: Vec<String>,
 }
 
 impl Kind for IamRole {
@@ -260,8 +260,8 @@ impl Kind for IamRole {
 /// its id is `dsql-{project}` — the id the connection endpoint depends on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DsqlCluster {
-    pub endpoint: Option<String>,
-    pub arn: Option<String>,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) arn: Option<String>,
 }
 
 impl Kind for DsqlCluster {
@@ -322,9 +322,9 @@ impl Kind for DsqlConnectionEndpoint {
 /// tables. Its `table_name` output feeds the writeback coordination-table keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DynamoDbTable {
-    pub table: String,
-    pub hash_key: String,
-    pub ttl: Option<String>,
+    pub(crate) table: String,
+    pub(crate) hash_key: String,
+    pub(crate) ttl: Option<String>,
 }
 
 impl Kind for DynamoDbTable {
@@ -350,8 +350,8 @@ impl Kind for DynamoDbTable {
 /// An S3 bucket (→ `tokeira_aws::S3Bucket`) — the Mimir/Loki object stores.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct S3Bucket {
-    pub bucket: String,
-    pub versioning: bool,
+    pub(crate) bucket: String,
+    pub(crate) versioning: bool,
 }
 
 impl Kind for S3Bucket {
@@ -373,9 +373,9 @@ impl Kind for S3Bucket {
 /// password is generated once at create and never recomputed on update.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretsManagerSecret {
-    pub name: String,
-    pub username: String,
-    pub password_length: i32,
+    pub(crate) name: String,
+    pub(crate) username: String,
+    pub(crate) password_length: i32,
 }
 
 impl Kind for SecretsManagerSecret {
@@ -398,7 +398,7 @@ impl Kind for SecretsManagerSecret {
 /// An ECR repository (→ `tokeira_aws::EcrRepository`) for a tokeira image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EcrRepository {
-    pub name: String,
+    pub(crate) name: String,
 }
 
 impl Kind for EcrRepository {
@@ -425,12 +425,12 @@ impl Kind for EcrRepository {
 /// matching `{project}-…` names (module doc). Owned by the `cluster` module.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EksCluster {
-    pub version: String,
-    pub namespace: String,
-    pub kms_key_arn: Option<String>,
-    pub deletion_protection: bool,
-    pub bootstrap_admin_permissions: bool,
-    pub cluster_admin_principal_arn: Option<String>,
+    pub(crate) version: String,
+    pub(crate) namespace: String,
+    pub(crate) kms_key_arn: Option<String>,
+    pub(crate) deletion_protection: bool,
+    pub(crate) bootstrap_admin_permissions: bool,
+    pub(crate) cluster_admin_principal_arn: Option<String>,
 }
 
 impl Kind for EksCluster {
@@ -456,10 +456,10 @@ impl Kind for EksCluster {
 /// role is referenced by its project-prefixed id (`iam-role-{project}-{role_suffix}`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PodIdentityAssociation {
-    pub namespace: String,
-    pub service_account: String,
+    pub(crate) namespace: String,
+    pub(crate) service_account: String,
     /// Project-relative suffix of the target task role (e.g. `tokeira-task`).
-    pub role_suffix: String,
+    pub(crate) role_suffix: String,
 }
 
 impl Kind for PodIdentityAssociation {
@@ -488,7 +488,7 @@ impl Kind for PodIdentityAssociation {
 /// exists).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Namespace {
-    pub name: String,
+    pub(crate) name: String,
 }
 
 impl Kind for Namespace {
@@ -509,7 +509,7 @@ impl Kind for Namespace {
 /// control plane).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodePool {
-    pub node_families: Vec<String>,
+    pub(crate) node_families: Vec<String>,
 }
 
 impl Kind for NodePool {
@@ -531,12 +531,12 @@ impl Kind for NodePool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceDeployment {
     /// The per-service pod/service shape (name, image, ports, resources, SA).
-    pub spec: ServiceManifest,
+    pub(crate) spec: ServiceManifest,
     /// The rendered server config file (`tokeirad.toml`/`controller.toml`/
     /// `autoscaler.toml`); its DSQL endpoint is filled by writeback (Req 9).
-    pub config_content: String,
+    pub(crate) config_content: String,
     /// The rendered Alloy sidecar config (`config.alloy`).
-    pub alloy_config_content: String,
+    pub(crate) alloy_config_content: String,
 }
 
 impl Kind for ServiceDeployment {

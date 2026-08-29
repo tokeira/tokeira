@@ -11,7 +11,7 @@ use crate::resources::security_group::{
 };
 
 /// Author-visible name of the realized resource type.
-pub const TYPE: &str = "SecurityGroup";
+pub(crate) const TYPE: &str = "SecurityGroup";
 
 /// One authored ingress rule. Mirrors the resource's rule shape so the
 /// authored input stays a plain serializable value.
@@ -19,15 +19,15 @@ pub const TYPE: &str = "SecurityGroup";
 #[serde(deny_unknown_fields)]
 pub struct IngressRule {
     /// Human-readable rule purpose.
-    pub description: String,
+    pub(crate) description: String,
     /// IP protocol (`tcp`, `udp`, `-1`).
-    pub protocol: String,
+    pub(crate) protocol: String,
     /// Inclusive start of the port range.
-    pub from_port: u16,
+    pub(crate) from_port: u16,
     /// Inclusive end of the port range.
-    pub to_port: u16,
+    pub(crate) to_port: u16,
     /// CIDR or security-group source.
-    pub source: String,
+    pub(crate) source: String,
 }
 
 /// Reusable author input for a VPC security group. The owning VPC is the
@@ -36,14 +36,14 @@ pub struct IngressRule {
 #[serde(deny_unknown_fields)]
 pub struct SecurityGroup {
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Security-group name (also determines the resource id `sg-<name>`).
-    pub name: String,
+    pub(crate) name: String,
     /// Group description.
-    pub description: String,
+    pub(crate) description: String,
     /// Authored ingress rules.
     #[serde(default)]
-    pub ingress: Vec<IngressRule>,
+    pub(crate) ingress: Vec<IngressRule>,
 }
 
 impl Kind<Resource> for SecurityGroup {

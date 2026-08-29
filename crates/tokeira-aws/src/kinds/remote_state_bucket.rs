@@ -9,7 +9,7 @@ use tokeira_platform::{
 use crate::resources::remote_state_bucket::RemoteStateBucket as Resource;
 
 /// Author-visible name of the realized resource type.
-pub const TYPE: &str = Resource::TYPE;
+pub(crate) const TYPE: &str = Resource::TYPE;
 
 /// Reusable author input for the shared remote-state bucket. Versioning is
 /// always on and deployment destruction never removes the bucket; those are
@@ -18,12 +18,12 @@ pub const TYPE: &str = Resource::TYPE;
 #[serde(deny_unknown_fields)]
 pub struct RemoteStateBucket {
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Full bucket name.
-    pub bucket: String,
+    pub(crate) bucket: String,
     /// Key prefix recorded for state consumers.
     #[serde(default)]
-    pub key_prefix: Option<String>,
+    pub(crate) key_prefix: Option<String>,
 }
 
 impl Kind<Resource> for RemoteStateBucket {

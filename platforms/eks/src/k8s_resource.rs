@@ -46,7 +46,7 @@ impl K8sManifestResource {
     /// `dependencies` are the IaC resources that must exist first — typically the
     /// EKS cluster and the target namespace, so a workload is never applied
     /// before its cluster/namespace exist.
-    pub fn new(
+    pub(crate) fn new(
         id: impl Into<String>,
         module: impl Into<String>,
         dependencies: Vec<ResourceId>,

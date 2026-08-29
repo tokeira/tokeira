@@ -92,7 +92,7 @@ impl BuildMode {
     /// Parse the `tokeira-build-info` `BUILD_MODE` string (`"versioned"` /
     /// `"dev"`). Anything unrecognized is the advisory [`Dev`](Self::Dev) — the
     /// safe, non-authoritative default.
-    pub fn from_build_info(mode: &str) -> Self {
+    pub(crate) fn from_build_info(mode: &str) -> Self {
         match mode {
             "versioned" => BuildMode::Versioned,
             _ => BuildMode::Dev,

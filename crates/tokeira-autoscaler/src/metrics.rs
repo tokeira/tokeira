@@ -12,14 +12,16 @@ use tokeira_types::MetricType;
 #[cfg(test)]
 use tokeira_types::validate_metric_name;
 
-pub const LOOP_DURATION_SECONDS: &str = "tokeira_autoscaler_loop_duration_seconds";
-pub const SCALING_DECISIONS_TOTAL: &str = "tokeira_autoscaler_scaling_decisions_total";
+pub(crate) const LOOP_DURATION_SECONDS: &str = "tokeira_autoscaler_loop_duration_seconds";
+pub(crate) const SCALING_DECISIONS_TOTAL: &str = "tokeira_autoscaler_scaling_decisions_total";
 pub const METRIC_FRESHNESS_AGE_SECONDS: &str = "tokeira_autoscaler_metric_freshness_age_seconds";
-pub const STALE_METRICS_TOTAL: &str = "tokeira_autoscaler_stale_metrics_total";
-pub const DESIRED_REPLICAS: &str = "tokeira_autoscaler_service_desired_replicas";
-pub const NOMINATION_TOTAL: &str = "tokeira_autoscaler_scale_in_nomination_total";
-pub const ACTIVE_RECONCILER_LEASE_HELD: &str = "tokeira_autoscaler_active_reconciler_lease_held";
-pub const MIMIR_QUERY_DURATION_SECONDS: &str = "tokeira_autoscaler_mimir_query_duration_seconds";
+pub(crate) const STALE_METRICS_TOTAL: &str = "tokeira_autoscaler_stale_metrics_total";
+pub(crate) const DESIRED_REPLICAS: &str = "tokeira_autoscaler_service_desired_replicas";
+pub(crate) const NOMINATION_TOTAL: &str = "tokeira_autoscaler_scale_in_nomination_total";
+pub(crate) const ACTIVE_RECONCILER_LEASE_HELD: &str =
+    "tokeira_autoscaler_active_reconciler_lease_held";
+pub(crate) const MIMIR_QUERY_DURATION_SECONDS: &str =
+    "tokeira_autoscaler_mimir_query_duration_seconds";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (LOOP_DURATION_SECONDS, MetricType::DurationHistogram),
@@ -70,7 +72,7 @@ pub fn set_active_reconciler_lease_held(held: bool) {
     gauge!(ACTIVE_RECONCILER_LEASE_HELD).set(if held { 1.0 } else { 0.0 });
 }
 
-pub fn record_mimir_query_duration(
+pub(crate) fn record_mimir_query_duration(
     query_kind: &'static str,
     outcome: OutcomeLabel,
     duration: std::time::Duration,

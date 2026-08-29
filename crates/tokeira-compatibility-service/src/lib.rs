@@ -16,8 +16,8 @@ use tokeira_compatibility_proto::connect::tokeira::compatibility::v1 as proto;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompatibilityServiceConfig {
-    pub process_kind: String,
-    pub process_identity: String,
+    pub(crate) process_kind: String,
+    pub(crate) process_identity: String,
 }
 
 #[derive(Clone, Debug)]
@@ -30,7 +30,7 @@ impl CompatibilityServiceHandler {
         Self { config }
     }
 
-    pub fn compatibility_response(&self) -> proto::GetCompatibilityResponse {
+    pub(crate) fn compatibility_response(&self) -> proto::GetCompatibilityResponse {
         proto::GetCompatibilityResponse {
             build_info: MessageField::some(build_info_to_proto(tokeira_build_info::summary())),
             features: FEATURE_MATRIX.iter().map(feature_to_proto).collect(),
@@ -43,7 +43,7 @@ impl CompatibilityServiceHandler {
         }
     }
 
-    pub fn surfaces_response(&self) -> proto::ListCompatibilitySurfacesResponse {
+    pub(crate) fn surfaces_response(&self) -> proto::ListCompatibilitySurfacesResponse {
         proto::ListCompatibilitySurfacesResponse {
             surfaces: FEATURE_MATRIX
                 .iter()
@@ -58,7 +58,7 @@ impl CompatibilityServiceHandler {
         }
     }
 
-    pub fn feature_response(&self, feature_id: &str) -> Option<proto::GetFeatureResponse> {
+    pub(crate) fn feature_response(&self, feature_id: &str) -> Option<proto::GetFeatureResponse> {
         FEATURE_MATRIX
             .iter()
             .find(|feature| feature.id == feature_id)
@@ -68,7 +68,7 @@ impl CompatibilityServiceHandler {
             })
     }
 
-    pub fn sdk_response(&self, language: &str) -> proto::GetSdkCompatibilityResponse {
+    pub(crate) fn sdk_response(&self, language: &str) -> proto::GetSdkCompatibilityResponse {
         proto::GetSdkCompatibilityResponse {
             sdk_matrix: SDK_MATRIX
                 .iter()

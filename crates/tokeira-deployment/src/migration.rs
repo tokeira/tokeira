@@ -49,14 +49,14 @@ pub struct MigrationRegistry {
 }
 
 impl MigrationRegistry {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Register a forward migration `from_schema → to_schema`. Panics if the
     /// transition is not forward, or a migration is already registered from
     /// `from_schema` (the chain must be unambiguous).
-    pub fn register(mut self, from_schema: u32, to_schema: u32, apply: MigrationFn) -> Self {
+    pub(crate) fn register(mut self, from_schema: u32, to_schema: u32, apply: MigrationFn) -> Self {
         assert!(
             to_schema > from_schema,
             "migrations are forward-only ({from_schema} → {to_schema})"

@@ -9,14 +9,14 @@ use tokeira_platform::{
 use crate::resources::ecr_repository::EcrRepository as Resource;
 
 /// Author-visible name of the realized resource type.
-pub const TYPE: &str = "EcrRepository";
+pub(crate) const TYPE: &str = "EcrRepository";
 
 /// Reusable author input for an ECR repository.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EcrRepository {
     /// Full repository name.
-    pub repository: String,
+    pub(crate) repository: String,
 }
 
 impl Kind<Resource> for EcrRepository {

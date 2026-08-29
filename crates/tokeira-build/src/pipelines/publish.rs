@@ -12,7 +12,7 @@ impl RegistryPassword {
         Self(password.into())
     }
 
-    pub fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         &self.0
     }
 }

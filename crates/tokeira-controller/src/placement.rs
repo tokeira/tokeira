@@ -15,21 +15,21 @@ use crate::membership::LiveMembership;
 /// Runtime placement directive for one membership stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesiredPlacementDirective {
-    pub acquire_bundles: Vec<ShardId>,
-    pub relinquish_bundles: Vec<ShardId>,
+    pub(crate) acquire_bundles: Vec<ShardId>,
+    pub(crate) relinquish_bundles: Vec<ShardId>,
 }
 
 /// Per-node DSQL connection budget share.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectionBudgetDirective {
-    pub rate_per_second: f64,
-    pub capacity: u64,
-    pub max_reservoir_size: u32,
-    pub valid_until: OffsetDateTime,
+    pub(crate) rate_per_second: f64,
+    pub(crate) capacity: u64,
+    pub(crate) max_reservoir_size: u32,
+    pub(crate) valid_until: OffsetDateTime,
 }
 
 /// Compute actual routing state from DSQL lease rows alone.
-pub fn compute_routing_snapshot(
+pub(crate) fn compute_routing_snapshot(
     leases: &[BundleLease],
     placement_config: PlacementConfig,
     previous: &RoutingSnapshot,
@@ -121,7 +121,7 @@ fn diff_snapshot(previous: &RoutingSnapshot, next: &RoutingSnapshot) -> RoutingD
 }
 
 /// Compute simple desired placement for currently unowned bundles.
-pub fn compute_desired_placement(
+pub(crate) fn compute_desired_placement(
     membership: &LiveMembership,
     leases: &[BundleLease],
     bundle_count: u32,
@@ -162,7 +162,7 @@ pub fn compute_desired_placement(
 }
 
 /// Split cluster connection budget across active nodes deterministically.
-pub fn compute_connection_budget(
+pub(crate) fn compute_connection_budget(
     cluster_rate: f64,
     cluster_capacity: u64,
     active_nodes_sorted: &[IncarnationId],
@@ -195,7 +195,7 @@ pub fn compute_connection_budget(
         .collect()
 }
 
-pub fn empty_previous_snapshot(placement_config: PlacementConfig) -> RoutingSnapshot {
+pub(crate) fn empty_previous_snapshot(placement_config: PlacementConfig) -> RoutingSnapshot {
     RoutingSnapshot {
         execution_bundle_owners: HashMap::new(),
         node_endpoints: HashMap::new(),

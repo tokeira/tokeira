@@ -33,7 +33,7 @@ pub trait Kind {
 }
 
 /// A handle to a declared module (carries only its name), returned by
-/// [`Deployment::module`] and passed back to [`Deployment::resource`].
+/// `Deployment::module` and passed back to [`Deployment::resource`].
 #[derive(Clone, Debug)]
 pub struct ModuleRef {
     name: String,
@@ -51,7 +51,7 @@ impl ResourceRef {
     /// `InfraState` after apply. The handle *is* the binding to the resource id,
     /// so writeback never names a magic `"module.resource.output"` string
     /// (Proposal 003 §5).
-    pub fn output(&self, name: &str) -> Output {
+    pub(crate) fn output(&self, name: &str) -> Output {
         Output {
             module: self.module.clone(),
             resource: self.resource.clone(),
@@ -64,11 +64,11 @@ impl ResourceRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Output {
     /// Owning module of the referenced resource.
-    pub module: String,
+    pub(crate) module: String,
     /// Logical id of the referenced resource within its module.
-    pub resource: String,
+    pub(crate) resource: String,
     /// The named output/property to read from the resource's post-apply state.
-    pub output: String,
+    pub(crate) output: String,
 }
 
 /// A writeback value: a literal, or a deferred resource output resolved against
@@ -136,7 +136,7 @@ impl std::fmt::Debug for Deployment {
 
 impl Deployment {
     /// Start a deployment with the given required Kubernetes namespaces.
-    pub fn new(namespaces: &[&str]) -> Self {
+    pub(crate) fn new(namespaces: &[&str]) -> Self {
         Self {
             namespaces: namespaces.iter().map(|s| s.to_string()).collect(),
             modules: Vec::new(),
@@ -145,7 +145,7 @@ impl Deployment {
     }
 
     /// Declare a module (a resource grouping) and its module-level deps (names).
-    pub fn module(&mut self, name: &str, needs: &[&str]) -> ModuleRef {
+    pub(crate) fn module(&mut self, name: &str, needs: &[&str]) -> ModuleRef {
         self.modules.push(Module {
             name: name.to_string(),
             needs: needs.iter().map(|s| s.to_string()).collect(),
@@ -169,7 +169,7 @@ impl Deployment {
     /// Add an already-boxed kind to a module. The interpreter bridge constructs
     /// kinds as `Box<dyn Kind>` (it cannot name the concrete type), so it needs
     /// this object-safe entry point; [`resource`](Self::resource) delegates here.
-    pub fn resource_dyn(
+    pub(crate) fn resource_dyn(
         &mut self,
         module: &ModuleRef,
         id: &str,
@@ -192,7 +192,7 @@ impl Deployment {
 
     /// Record a writeback into the server config: a dotted key sourced from a
     /// literal or a resource output (the `collect_writeback` source).
-    pub fn writeback(&mut self, key: &str, value: impl Into<WbValue>) {
+    pub(crate) fn writeback(&mut self, key: &str, value: impl Into<WbValue>) {
         self.writeback.push((key.to_string(), value.into()));
     }
 

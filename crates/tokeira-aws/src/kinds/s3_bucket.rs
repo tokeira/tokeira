@@ -9,22 +9,22 @@ use tokeira_platform::{
 use crate::resources::s3_bucket::{S3Bucket as Resource, S3BucketConfig};
 
 /// Author-visible name of the realized resource type.
-pub const TYPE: &str = "S3Bucket";
+pub(crate) const TYPE: &str = "S3Bucket";
 
 /// Reusable author input for an S3 bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3Bucket {
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Full bucket name.
-    pub bucket: String,
+    pub(crate) bucket: String,
     /// Enable object versioning.
     #[serde(default)]
-    pub versioning: bool,
+    pub(crate) versioning: bool,
     /// Optional key prefix recorded for consumers of the bucket.
     #[serde(default)]
-    pub key_prefix: Option<String>,
+    pub(crate) key_prefix: Option<String>,
 }
 
 impl Kind<Resource> for S3Bucket {

@@ -43,7 +43,7 @@ pub fn render_all() -> Result<RenderedDocumentation> {
 
 /// Render the complete source-aware Temporal configuration denominator.
 #[must_use]
-pub fn render_temporal_configuration(ledger: &VerifiedConfigurationLedger) -> String {
+pub(crate) fn render_temporal_configuration(ledger: &VerifiedConfigurationLedger) -> String {
     let mut dynamic = ledger.dynamic_settings.clone();
     dynamic.sort_by(|left, right| left.0.key.cmp(&right.0.key));
     let mut static_groups = ledger.static_groups.clone();
@@ -132,7 +132,7 @@ Counts below include dynamic settings and the separately audited static groups.\
 
 /// Render Tokeira's canonical operator-facing feature and config reference.
 #[must_use]
-pub fn render_tokeira_configuration(
+pub(crate) fn render_tokeira_configuration(
     features: &[FeatureEntry],
     fields: &[ConfigFieldDocumentation],
 ) -> String {
@@ -332,7 +332,7 @@ and treatment of all 613 source declarations.\n",
 
 /// Render the canonical annotated configuration without enabling optional
 /// identity sources or emergency behavior.
-pub fn render_config_example(fields: &[ConfigFieldDocumentation]) -> Result<String> {
+pub(crate) fn render_config_example(fields: &[ConfigFieldDocumentation]) -> Result<String> {
     let mut fields = fields.to_vec();
     fields.sort_by(|left, right| left.path.cmp(right.path));
 

@@ -111,7 +111,7 @@ impl<F> fmt::Debug for Engine<F> {
 impl<F: DefinitionFrontend> Engine<F> {
     /// Marry platform and frontend. The one agreement checked here: the
     /// frontend evaluates the format the platform was bound as.
-    pub fn new(platform: BoundPlatform, frontend: F) -> Result<Self> {
+    pub(crate) fn new(platform: BoundPlatform, frontend: F) -> Result<Self> {
         if platform.format() != frontend.format() {
             bail!(
                 "the bound platform records format `{}` but the assembled frontend evaluates `{}`",
@@ -123,7 +123,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     }
 
     /// The platform, for the shell's identity and capability reads.
-    pub fn platform(&self) -> &BoundPlatform {
+    pub(crate) fn platform(&self) -> &BoundPlatform {
         &self.platform
     }
 
@@ -146,7 +146,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     /// platform's namespaces. `definition_path` overrides only the file
     /// read — a retained revision's copy of the same recorded document —
     /// never the recorded identity.
-    pub fn evaluate_recorded(
+    pub(crate) fn evaluate_recorded(
         &self,
         admitted: &Admitted,
         definition_path: Option<&Path>,
@@ -183,7 +183,10 @@ impl<F: DefinitionFrontend> Engine<F> {
     /// Evaluate a standalone authored source: pre-create checking, where no
     /// deployment exists to admit. The project name is the file stem —
     /// placement-bound values never escape a check.
-    pub fn evaluate_authoring(&self, path: &Path) -> Result<EvaluatedDefinition<DecodedKind>> {
+    pub(crate) fn evaluate_authoring(
+        &self,
+        path: &Path,
+    ) -> Result<EvaluatedDefinition<DecodedKind>> {
         let source = self.source(
             path,
             DefinitionSourceName::AuthoringPath(path.to_path_buf()),
@@ -219,7 +222,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     /// Desired-source companions resolve against the interpreted source's
     /// own directory: a baseline realization from a retained revision folder
     /// digests that folder's companions, not the live ones.
-    pub fn execution(
+    pub(crate) fn execution(
         &self,
         admitted: &Admitted,
         definition_path: Option<&Path>,
@@ -301,7 +304,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     /// verb: the outcome blocks — no planned changes, the platform issue
     /// as its only content — because describing the live substrate is a
     /// precondition of comparing against the record.
-    pub async fn plan(
+    pub(crate) async fn plan(
         &self,
         admitted: &Admitted,
         module: Option<&str>,
@@ -329,7 +332,11 @@ impl<F: DefinitionFrontend> Engine<F> {
     }
 
     /// Reconcile to desired. Refuses on a provider issue.
-    pub async fn apply(&self, admitted: &Admitted, module: Option<&str>) -> Result<AppliedOutcome> {
+    pub(crate) async fn apply(
+        &self,
+        admitted: &Admitted,
+        module: Option<&str>,
+    ) -> Result<AppliedOutcome> {
         let execution = self.execution(admitted, None)?;
         self.refuse_on_issue(admitted).await?;
         let mut engine = self.open(admitted, &execution).await?;
@@ -353,7 +360,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     }
 
     /// Tear down. Refuses on a provider issue.
-    pub async fn destroy(&self, admitted: &Admitted, module: Option<&str>) -> Result<usize> {
+    pub(crate) async fn destroy(&self, admitted: &Admitted, module: Option<&str>) -> Result<usize> {
         let execution = self.execution(admitted, None)?;
         self.refuse_on_issue(admitted).await?;
         let mut engine = self.open(admitted, &execution).await?;
@@ -371,7 +378,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     /// Delete exactly the named resource ids (the rollback delete pass):
     /// fail-closed, reverse-dependency-ordered, idempotent. Refuses on a
     /// provider issue.
-    pub async fn destroy_selected(
+    pub(crate) async fn destroy_selected(
         &self,
         admitted: &Admitted,
         ids: &[String],
@@ -394,7 +401,7 @@ impl<F: DefinitionFrontend> Engine<F> {
 
     /// Canonical desired manifests for one definition source, in memory —
     /// no provider access, no state.
-    pub fn desired_snapshot(
+    pub(crate) fn desired_snapshot(
         &self,
         admitted: &Admitted,
         definition: &Path,
@@ -403,7 +410,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     }
 
     /// The recorded infrastructure state as the last apply persisted it.
-    pub async fn recorded_state(&self, admitted: &Admitted) -> Result<iac::InfraState> {
+    pub(crate) async fn recorded_state(&self, admitted: &Admitted) -> Result<iac::InfraState> {
         let (state, _) = crate::described::infra_store(&admitted.deployment_ref.dir)
             .load()
             .await
@@ -418,7 +425,7 @@ impl<F: DefinitionFrontend> Engine<F> {
     /// definition set, each side resolving its parts through its own
     /// resolver: the retained revision's set for the prior, the live
     /// directory's for the current.
-    pub fn retarget_check(
+    pub(crate) fn retarget_check(
         &self,
         admitted: &Admitted,
         prior_source: &str,

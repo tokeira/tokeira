@@ -170,7 +170,7 @@ impl BoundProvisionerSource {
     }
 
     /// Materialize the generated package inside one frozen source staging tree.
-    pub fn materialize_in(&self, source_root: &Path) -> Result<PathBuf, CompositionError> {
+    pub(crate) fn materialize_in(&self, source_root: &Path) -> Result<PathBuf, CompositionError> {
         let root = source_root.join(GENERATED_ROOT_RELATIVE_PATH);
         let source_dir = root.join("src");
         std::fs::create_dir_all(&source_dir).map_err(|source| {
@@ -192,7 +192,7 @@ impl BoundProvisionerSource {
     /// — exact scoped-lock membership is cargo's feature unification over
     /// the scoped member set, which no derivation short of cargo's own
     /// resolution reproduces. Materializing the resulting tree and overlaying
-    /// [`materialize_in`](Self::materialize_in) yields a workspace plain
+    /// `materialize_in` yields a workspace plain
     /// `cargo build`/`cargo test --locked` accept.
     pub fn snapshot_request(
         &self,

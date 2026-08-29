@@ -18,8 +18,8 @@ use crate::tkd::{bridge::HostBridge, parts::Tables, schema::TypeTable};
 /// One subset violation.
 #[derive(Debug)]
 pub struct Diagnostic {
-    pub msg: String,
-    pub span: Span,
+    pub(crate) msg: String,
+    pub(crate) span: Span,
 }
 
 /// All violations found in a `.tkd` (non-empty ⇒ rejected).
@@ -61,7 +61,7 @@ pub enum SubsetScope<'a> {
 }
 
 /// Validate that `file` is within the interpreted subset.
-pub fn check<B: HostBridge>(
+pub(crate) fn check<B: HostBridge>(
     file: &File,
     bridge: &B,
     types: &TypeTable,

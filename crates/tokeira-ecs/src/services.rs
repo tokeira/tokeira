@@ -16,18 +16,18 @@ pub enum EcsScheduling {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EcsWorkload {
-    pub name: String,
+    pub(crate) name: String,
     /// AWS region the workload deploys into. Carried on the workload so its
     /// manifests are self-describing: the deploy platform admits exactly one
     /// region per deployment from the manifests themselves.
-    pub region: String,
+    pub(crate) region: String,
     /// ECS cluster the service runs on, carried for the same reason.
-    pub cluster: String,
-    pub scheduling: EcsScheduling,
-    pub capacity_provider: String,
-    pub task_definition: TaskDefinitionSpec,
-    pub service_connect: ServiceConnectSpec,
-    pub placement_constraints: Vec<PlacementConstraint>,
+    pub(crate) cluster: String,
+    pub(crate) scheduling: EcsScheduling,
+    pub(crate) capacity_provider: String,
+    pub(crate) task_definition: TaskDefinitionSpec,
+    pub(crate) service_connect: ServiceConnectSpec,
+    pub(crate) placement_constraints: Vec<PlacementConstraint>,
     /// Infrastructure identity of the IAM role assumed by the task's
     /// containers. Definition-realized workloads resolve its provider ARN
     /// from the recorded infrastructure state when manifests are produced;
@@ -42,92 +42,92 @@ pub struct EcsWorkload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDefinitionSpec {
-    pub family: String,
-    pub cpu: u32,
-    pub memory_mb: u32,
-    pub containers: Vec<ContainerSpec>,
-    pub volumes: Vec<VolumeSpec>,
+    pub(crate) family: String,
+    pub(crate) cpu: u32,
+    pub(crate) memory_mb: u32,
+    pub(crate) containers: Vec<ContainerSpec>,
+    pub(crate) volumes: Vec<VolumeSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerSpec {
-    pub name: String,
-    pub image: String,
-    pub essential: bool,
-    pub cpu: u32,
-    pub memory_mb: u32,
-    pub command: Vec<String>,
-    pub port_mappings: Vec<PortMappingSpec>,
-    pub mount_points: Vec<MountPointSpec>,
-    pub depends_on: Vec<ContainerDependencySpec>,
-    pub linux_parameters: Option<LinuxParametersSpec>,
+    pub(crate) name: String,
+    pub(crate) image: String,
+    pub(crate) essential: bool,
+    pub(crate) cpu: u32,
+    pub(crate) memory_mb: u32,
+    pub(crate) command: Vec<String>,
+    pub(crate) port_mappings: Vec<PortMappingSpec>,
+    pub(crate) mount_points: Vec<MountPointSpec>,
+    pub(crate) depends_on: Vec<ContainerDependencySpec>,
+    pub(crate) linux_parameters: Option<LinuxParametersSpec>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub environment: Vec<EnvironmentVar>,
+    pub(crate) environment: Vec<EnvironmentVar>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub secrets: Vec<SecretEnvVar>,
+    pub(crate) secrets: Vec<SecretEnvVar>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinuxParametersSpec {
-    pub init_process_enabled: bool,
+    pub(crate) init_process_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentVar {
-    pub name: String,
-    pub value: String,
+    pub(crate) name: String,
+    pub(crate) value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretEnvVar {
-    pub name: String,
-    pub value_from: String,
+    pub(crate) name: String,
+    pub(crate) value_from: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMappingSpec {
-    pub name: String,
-    pub container_port: u16,
-    pub protocol: String,
+    pub(crate) name: String,
+    pub(crate) container_port: u16,
+    pub(crate) protocol: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountPointSpec {
-    pub source_volume: String,
-    pub container_path: String,
-    pub read_only: bool,
+    pub(crate) source_volume: String,
+    pub(crate) container_path: String,
+    pub(crate) read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerDependencySpec {
-    pub container_name: String,
-    pub condition: String,
+    pub(crate) container_name: String,
+    pub(crate) condition: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeSpec {
-    pub name: String,
-    pub host_path: Option<String>,
+    pub(crate) name: String,
+    pub(crate) host_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceConnectSpec {
-    pub grpc: Option<ServiceConnectPort>,
-    pub metrics: ServiceConnectPort,
+    pub(crate) grpc: Option<ServiceConnectPort>,
+    pub(crate) metrics: ServiceConnectPort,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceConnectPort {
-    pub port_name: String,
-    pub container_port: u16,
-    pub discovery_name: String,
-    pub dns_name: String,
+    pub(crate) port_name: String,
+    pub(crate) container_port: u16,
+    pub(crate) discovery_name: String,
+    pub(crate) dns_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementConstraint {
-    pub r#type: String,
-    pub expression: String,
+    pub(crate) r#type: String,
+    pub(crate) expression: String,
 }
 
 impl EcsWorkload {

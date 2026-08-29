@@ -28,7 +28,7 @@ pub struct DsqlModule {
 }
 
 impl DsqlModule {
-    pub fn new(config: EcsConfig) -> Self {
+    pub(crate) fn new(config: EcsConfig) -> Self {
         Self { config }
     }
 }

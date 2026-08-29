@@ -19,11 +19,11 @@ impl std::fmt::Debug for GenerationManager {
 }
 
 impl GenerationManager {
-    pub fn new(control_repo: Arc<dyn ControlRepository>) -> Self {
+    pub(crate) fn new(control_repo: Arc<dyn ControlRepository>) -> Self {
         Self { control_repo }
     }
 
-    pub async fn advance_generation(
+    pub(crate) async fn advance_generation(
         &self,
         expected: GenerationCounter,
     ) -> Result<GenerationAdvanceResult> {
@@ -34,11 +34,11 @@ impl GenerationManager {
         self.control_repo.current_generation().await
     }
 
-    pub async fn current_budget_version(&self) -> Result<u64> {
+    pub(crate) async fn current_budget_version(&self) -> Result<u64> {
         self.control_repo.current_budget_version().await
     }
 
-    pub async fn allocate_budget(
+    pub(crate) async fn allocate_budget(
         &self,
         expected_version: u64,
         allocator_id: IncarnationId,

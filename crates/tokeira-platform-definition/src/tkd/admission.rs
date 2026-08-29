@@ -12,21 +12,21 @@ use crate::tkd::{
 /// A `#[require(expr)]` clause attached to a config type.
 #[derive(Debug)]
 pub struct RequireClause {
-    pub scope: String,
-    pub expr: syn::Expr,
+    pub(crate) scope: String,
+    pub(crate) expr: syn::Expr,
 }
 
 /// The admission schema extracted from the `.tkd`'s attributes.
 #[derive(Debug)]
 pub struct Admission {
     /// `(type, field)` pairs marked `#[create]` (create-time-immutable).
-    pub creates: Vec<(String, String)>,
+    pub(crate) creates: Vec<(String, String)>,
     /// `#[require(...)]` constraint clauses.
-    pub requires: Vec<RequireClause>,
+    pub(crate) requires: Vec<RequireClause>,
 }
 
 /// Extract `#[create]`/`#[require]` from a parsed file.
-pub fn extract(file: &syn::File) -> Admission {
+pub(crate) fn extract(file: &syn::File) -> Admission {
     let mut creates = Vec::new();
     let mut requires = Vec::new();
     for item in &file.items {
@@ -78,7 +78,11 @@ fn push_requires(attrs: &[syn::Attribute], scope: &str, out: &mut Vec<RequireCla
 /// `#[create]` retarget check: every create-time-immutable field must be
 /// structurally unchanged between the recorded config and the new one. A change
 /// is a *retarget* — refused, not reconciled (003 §7).
-pub fn check_retarget<H>(adm: &Admission, old: &Value<H>, new: &Value<H>) -> Result<(), EvalError> {
+pub(crate) fn check_retarget<H>(
+    adm: &Admission,
+    old: &Value<H>,
+    new: &Value<H>,
+) -> Result<(), EvalError> {
     // The diff domain must be config-only. A host handle here means a kind leaked
     // into config (rejected at interpret-time, but guard anyway so this can never
     // panic on an adversarial recorded config).
@@ -150,7 +154,7 @@ fn diff<H>(creates: &[(String, String)], old: &Value<H>, new: &Value<H>) -> Resu
 
 /// `#[require]` check: each clause's expression, evaluated against the config in
 /// the scope type's field environment, must be `true`.
-pub fn check_requires<B: HostBridge>(
+pub(crate) fn check_requires<B: HostBridge>(
     interp: &Interp<B>,
     adm: &Admission,
     cfg: &Value<B::Host>,

@@ -143,14 +143,14 @@ pub fn control_plane_semantics(
 
 #[derive(Debug)]
 pub struct PollTarget<'a> {
-    pub resource_desc: &'a str,
-    pub resource_id: &'a ResourceId,
-    pub resource_type: ResourceType,
-    pub phase: &'a str,
+    pub(crate) resource_desc: &'a str,
+    pub(crate) resource_id: &'a ResourceId,
+    pub(crate) resource_type: ResourceType,
+    pub(crate) phase: &'a str,
 }
 
 /// Poll an async condition at `interval` until it returns `Ok(true)` or `timeout` expires.
-pub async fn poll_until<F, Fut>(
+pub(crate) async fn poll_until<F, Fut>(
     interval: Duration,
     timeout: Duration,
     ctx: &ProvisionContext,
@@ -189,14 +189,14 @@ where
 // ── Tag conversion helpers ───────────────────────────────────────
 
 /// Convert a tag map to EC2 tag format.
-pub fn ec2_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_ec2::types::Tag> {
+pub(crate) fn ec2_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_ec2::types::Tag> {
     tags.iter()
         .map(|(k, v)| aws_sdk_ec2::types::Tag::builder().key(k).value(v).build())
         .collect()
 }
 
 /// Convert a tag map to IAM tag format.
-pub fn iam_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_iam::types::Tag> {
+pub(crate) fn iam_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_iam::types::Tag> {
     tags.iter()
         .map(|(k, v)| {
             aws_sdk_iam::types::Tag::builder()
@@ -209,7 +209,7 @@ pub fn iam_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_iam::types::Tag> 
 }
 
 /// Convert a tag map to ECR tag format.
-pub fn ecr_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_ecr::types::Tag> {
+pub(crate) fn ecr_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_ecr::types::Tag> {
     tags.iter()
         .map(|(k, v)| {
             aws_sdk_ecr::types::Tag::builder()
@@ -222,7 +222,7 @@ pub fn ecr_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_ecr::types::Tag> 
 }
 
 /// Convert a tag map to S3 tag format.
-pub fn s3_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_s3::types::Tag> {
+pub(crate) fn s3_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_s3::types::Tag> {
     tags.iter()
         .map(|(k, v)| {
             aws_sdk_s3::types::Tag::builder()
@@ -235,7 +235,7 @@ pub fn s3_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_s3::types::Tag> {
 }
 
 /// Convert a tag map to DynamoDB tag format.
-pub fn dynamodb_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_dynamodb::types::Tag> {
+pub(crate) fn dynamodb_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_dynamodb::types::Tag> {
     tags.iter()
         .map(|(k, v)| {
             aws_sdk_dynamodb::types::Tag::builder()
@@ -248,7 +248,7 @@ pub fn dynamodb_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_dynamodb::ty
 }
 
 /// Convert a tag map to Elastic Load Balancing v2 tag format.
-pub fn elbv2_tags(
+pub(crate) fn elbv2_tags(
     tags: &HashMap<String, String>,
 ) -> Result<Vec<aws_sdk_elasticloadbalancingv2::types::Tag>, IacError> {
     Ok(tags
@@ -263,7 +263,7 @@ pub fn elbv2_tags(
 }
 
 /// Convert a tag map to Secrets Manager tag format.
-pub fn secretsmanager_tags(
+pub(crate) fn secretsmanager_tags(
     tags: &HashMap<String, String>,
 ) -> Vec<aws_sdk_secretsmanager::types::Tag> {
     tags.iter()

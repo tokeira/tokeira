@@ -165,9 +165,9 @@ pub enum Cause {
 /// Feature 4 populates it; Feature 4's amendment adds the attribution basis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceLocation {
-    pub file: String,
-    pub line: u32,
-    pub column: u32,
+    pub(crate) file: String,
+    pub(crate) line: u32,
+    pub(crate) column: u32,
 }
 
 /// An operational consequence of the plan as a whole, derived
@@ -207,7 +207,7 @@ pub enum ImpactClass {
 
 impl ImpactClass {
     /// The stable kebab tag used in evidence identity (`impact:{tag}:…`).
-    pub fn tag(&self) -> &'static str {
+    pub(crate) fn tag(&self) -> &'static str {
         match self {
             ImpactClass::DataDestroyed => "data-destroyed",
             ImpactClass::DependencyLoss => "dependency-loss",
@@ -279,7 +279,7 @@ pub enum UncertaintyReason {
 
 impl UncertaintyReason {
     /// The stable tag used in evidence ids.
-    pub fn tag(&self) -> &'static str {
+    pub(crate) fn tag(&self) -> &'static str {
         match self {
             UncertaintyReason::LiveStateUnconfirmed => "live-state-unconfirmed",
             UncertaintyReason::LiveStateNotExamined => "live-state-not-examined",

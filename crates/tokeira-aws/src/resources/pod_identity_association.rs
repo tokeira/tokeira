@@ -21,7 +21,7 @@ pub struct PodIdentityAssociationConfig {
 /// that service account automatically receive the role's credentials.
 #[derive(Debug)]
 pub struct PodIdentityAssociation {
-    pub config: PodIdentityAssociationConfig,
+    pub(crate) config: PodIdentityAssociationConfig,
     pub project: String,
     pub region: String,
     pub tags: HashMap<String, String>,

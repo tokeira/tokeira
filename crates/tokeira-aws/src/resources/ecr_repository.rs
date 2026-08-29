@@ -8,7 +8,7 @@ use tokeira_iac::{
 
 use crate::{EcrError, ImageTagMutability, RepositoryDescription, clients::ecr::ecr_client};
 
-pub const ECR_LIFECYCLE_POLICY: &str = r#"{
+pub(crate) const ECR_LIFECYCLE_POLICY: &str = r#"{
   "rules": [
     {
       "rulePriority": 1,
@@ -279,7 +279,7 @@ impl From<EcrError> for IacError {
     }
 }
 
-pub fn state_from_live(
+pub(crate) fn state_from_live(
     name: &str,
     desc: &RepositoryDescription,
     live_tags: std::collections::HashMap<String, String>,
@@ -304,7 +304,7 @@ pub fn state_from_live(
     }
 }
 
-pub fn normalize_lifecycle_policy(policy: &str) -> String {
+pub(crate) fn normalize_lifecycle_policy(policy: &str) -> String {
     match serde_json::from_str::<Value>(policy) {
         Ok(value) => canonical_json_string(&normalize_lifecycle_value(value)),
         Err(_) => policy.trim().to_owned(),

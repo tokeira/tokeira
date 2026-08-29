@@ -22,9 +22,9 @@ pub struct DsqlConnectionEndpointConfig {
 #[derive(Debug)]
 pub struct DsqlConnectionEndpoint {
     /// Logical identity (for example `proj-monitored`).
-    pub endpoint_identity: String,
-    pub config: DsqlConnectionEndpointConfig,
-    pub project: String,
+    pub(crate) endpoint_identity: String,
+    pub(crate) config: DsqlConnectionEndpointConfig,
+    pub(crate) project: String,
     pub region: String,
     pub tags: HashMap<String, String>,
 }

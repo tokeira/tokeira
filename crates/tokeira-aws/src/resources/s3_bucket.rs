@@ -18,12 +18,12 @@ pub struct S3BucketConfig {
 /// Generic provider resource that provisions exactly one S3 bucket.
 #[derive(Debug)]
 pub struct S3Bucket {
-    pub bucket_name: String,
-    pub config: S3BucketConfig,
+    pub(crate) bucket_name: String,
+    pub(crate) config: S3BucketConfig,
     pub project: String,
-    pub region: String,
+    pub(crate) region: String,
     pub tags: HashMap<String, String>,
-    pub key_prefix: Option<String>,
+    pub(crate) key_prefix: Option<String>,
 }
 
 impl S3Bucket {

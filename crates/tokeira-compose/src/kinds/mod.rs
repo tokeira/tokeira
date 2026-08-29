@@ -5,7 +5,7 @@
 //! [`ComposeService`] model in the crate root; the two local marker kinds
 //! realize their node resources beside them. Each resource owns its one
 //! word as a `TYPE` const; the kinds recover it. The namespace facts at the
-//! bottom — [`NAMESPACE`], [`KINDS`], [`decode`] — are what the assembled
+//! bottom — `NAMESPACE`, `KINDS`, `decode` — are what the assembled
 //! binary lists for the frontend; nothing is registered anywhere else.
 
 use std::path::PathBuf;
@@ -29,34 +29,34 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub struct Service {
     /// Image reference.
-    pub image: String,
+    pub(crate) image: String,
     /// Registry resolution policy carried into the service manifest.
     #[serde(default)]
-    pub pull_policy: PullPolicy,
+    pub(crate) pull_policy: PullPolicy,
     /// Desired replicas.
     #[serde(default = "crate::kinds::default_replicas")]
-    pub replicas: u32,
+    pub(crate) replicas: u32,
     /// Published equal host/container ports.
     #[serde(default)]
-    pub publish: Vec<u16>,
+    pub(crate) publish: Vec<u16>,
     /// Platform-resolved logical volumes.
     #[serde(default)]
-    pub volumes: Vec<Volume>,
+    pub(crate) volumes: Vec<Volume>,
     /// Explicit environment entries.
     #[serde(default)]
-    pub environment: Vec<Environment>,
+    pub(crate) environment: Vec<Environment>,
     /// Container command.
     #[serde(default)]
-    pub command: Vec<String>,
+    pub(crate) command: Vec<String>,
     /// Compose service start-order dependencies.
     #[serde(default)]
-    pub depends_on: Vec<String>,
+    pub(crate) depends_on: Vec<String>,
     /// Optional Docker healthcheck definition.
     #[serde(default)]
-    pub healthcheck: Option<Healthcheck>,
+    pub(crate) healthcheck: Option<Healthcheck>,
     /// Add the non-secret AWS runtime selectors for this region.
     #[serde(default)]
-    pub aws_region: Option<String>,
+    pub(crate) aws_region: Option<String>,
 }
 
 fn default_replicas() -> u32 {
@@ -247,7 +247,7 @@ impl tokeira_iac::Resource for LocalStateResource {
 }
 
 /// The engine identity of the deployment's server-config node.
-pub fn server_config_resource_id() -> tokeira_iac::ResourceId {
+pub(crate) fn server_config_resource_id() -> tokeira_iac::ResourceId {
     tokeira_iac::ResourceId("server-config".to_string())
 }
 
@@ -483,11 +483,11 @@ fn local_marker_semantics(
 }
 
 /// The namespace word: the normalized crate name definitions import from.
-pub const NAMESPACE: &str = "tokeira_compose";
+pub(crate) const NAMESPACE: &str = "tokeira_compose";
 
 /// The provider's author-visible kind names, each the word its resource
 /// owns.
-pub const KINDS: &[&str] = &[
+pub(crate) const KINDS: &[&str] = &[
     LocalStateResource::TYPE,
     ServerConfigResource::TYPE,
     ComposeService::TYPE,
@@ -496,7 +496,7 @@ pub const KINDS: &[&str] = &[
 /// Authoring-only empty shapes for frontends with explicit struct-update
 /// syntax. The values mirror this kind's Serde defaults; they do not carry
 /// validation, outputs, realization, or lifecycle behaviour.
-pub fn defaults(name: &str) -> Option<LocatedValue> {
+pub(crate) fn defaults(name: &str) -> Option<LocatedValue> {
     (name == ComposeService::TYPE).then(|| {
         LocatedValue::new(tokeira_platform::author::ValueShape::Struct {
             name: ComposeService::TYPE.to_string(),
@@ -542,7 +542,7 @@ pub fn defaults(name: &str) -> Option<LocatedValue> {
 
 /// Decode one authored kind of this namespace; `None` when the name is not
 /// ours.
-pub fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, KindError>> {
+pub(crate) fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, KindError>> {
     Some(match name {
         LocalStateResource::TYPE => kind::decode_resource::<LocalStateDir, LocalStateResource>(
             LocalStateResource::TYPE,

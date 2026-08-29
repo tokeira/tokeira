@@ -10,7 +10,7 @@
 use crate::tkdp::{preflight::Finding, source_map::LineTable};
 
 /// Renders all findings of one preflight pass, one block per finding.
-pub fn render(label: &str, source: &str, findings: &[Finding]) -> String {
+pub(crate) fn render(label: &str, source: &str, findings: &[Finding]) -> String {
     let table = LineTable::new(source);
     let mut out = format!(
         "definition rejected with {} finding{}:",

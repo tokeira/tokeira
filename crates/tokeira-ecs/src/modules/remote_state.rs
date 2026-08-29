@@ -11,7 +11,7 @@ pub struct RemoteStateModule {
 }
 
 impl RemoteStateModule {
-    pub fn new(config: EcsConfig) -> Self {
+    pub(crate) fn new(config: EcsConfig) -> Self {
         Self { config }
     }
 }

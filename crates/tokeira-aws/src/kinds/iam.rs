@@ -14,26 +14,26 @@ use crate::resources::{
 };
 
 /// Author-visible name of the realized role resource type.
-pub const ROLE_TYPE: &str = "IamRole";
+pub(crate) const ROLE_TYPE: &str = "IamRole";
 /// Author-visible name of the realized instance-profile resource type.
-pub const INSTANCE_PROFILE_TYPE: &str = "IamInstanceProfile";
+pub(crate) const INSTANCE_PROFILE_TYPE: &str = "IamInstanceProfile";
 
 /// Reusable author input for one IAM role.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IamRole {
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Role name (resource id `iam-role-<name>`).
-    pub name: String,
+    pub(crate) name: String,
     /// Trust policy document (JSON).
-    pub trust_policy: String,
+    pub(crate) trust_policy: String,
     /// Inline policies by name (JSON documents).
     #[serde(default)]
-    pub inline_policies: HashMap<String, String>,
+    pub(crate) inline_policies: HashMap<String, String>,
     /// Managed policy ARNs to attach.
     #[serde(default)]
-    pub managed_policy_arns: Vec<String>,
+    pub(crate) managed_policy_arns: Vec<String>,
 }
 
 impl Kind<RoleResource> for IamRole {
@@ -57,11 +57,11 @@ impl Kind<RoleResource> for IamRole {
 #[serde(deny_unknown_fields)]
 pub struct IamInstanceProfile {
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Profile name.
-    pub profile_name: String,
+    pub(crate) profile_name: String,
     /// Name of the role this profile wraps (a declared dependency).
-    pub role_name: String,
+    pub(crate) role_name: String,
 }
 
 impl Kind<ProfileResource> for IamInstanceProfile {

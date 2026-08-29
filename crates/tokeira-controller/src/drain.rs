@@ -14,21 +14,21 @@ pub struct DrainCoordinator {
 }
 
 impl DrainCoordinator {
-    pub fn mark_draining(&mut self, node_id: IncarnationId) {
+    pub(crate) fn mark_draining(&mut self, node_id: IncarnationId) {
         self.draining_nodes.insert(node_id);
         self.drain_states.insert(node_id, NodeDrainState::Draining);
     }
 
-    pub fn clear(&mut self, node_id: IncarnationId) {
+    pub(crate) fn clear(&mut self, node_id: IncarnationId) {
         self.draining_nodes.remove(&node_id);
         self.drain_states.remove(&node_id);
     }
 
-    pub fn is_draining(&self, node_id: IncarnationId) -> bool {
+    pub(crate) fn is_draining(&self, node_id: IncarnationId) -> bool {
         self.draining_nodes.contains(&node_id)
     }
 
-    pub fn record_progress(&mut self, node_id: IncarnationId, state: NodeDrainState) {
+    pub(crate) fn record_progress(&mut self, node_id: IncarnationId, state: NodeDrainState) {
         match state {
             NodeDrainState::Active => self.clear(node_id),
             NodeDrainState::Draining => self.mark_draining(node_id),
@@ -43,7 +43,7 @@ impl DrainCoordinator {
         self.drain_states.get(&node_id).copied()
     }
 
-    pub fn active_count(&self) -> usize {
+    pub(crate) fn active_count(&self) -> usize {
         self.draining_nodes.len()
     }
 

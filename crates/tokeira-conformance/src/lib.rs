@@ -66,7 +66,7 @@ pub enum OverrideValue {
 
 impl OverrideValue {
     /// The value's kind, used to type-check a `set` against the key's declared type.
-    pub fn value_type(&self) -> ValueType {
+    pub(crate) fn value_type(&self) -> ValueType {
         match self {
             Self::Int(_) => ValueType::Int,
             Self::Double(_) => ValueType::Double,
@@ -409,7 +409,7 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
 /// spells the keys in the canonical mixed case of `constants.go`. Both spellings
 /// therefore resolve to the same [`KeySpec`], whose `key` is the canonical
 /// storage identity every consult site reads back under.
-pub fn classification(key: &str) -> Option<&'static KeySpec> {
+pub(crate) fn classification(key: &str) -> Option<&'static KeySpec> {
     KEY_CLASSIFICATION
         .iter()
         .find(|spec| spec.key.eq_ignore_ascii_case(key))

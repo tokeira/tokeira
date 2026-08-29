@@ -71,7 +71,7 @@ pub enum CiCheck {
 
 impl CiCheck {
     /// Registry order used by local and future remote CI.
-    pub const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::ProtoMonotonicity,
         Self::ServerCompatMonotonicity,
         Self::BumpTrailer,
@@ -184,9 +184,7 @@ impl DaggerClient for Client {
     ) -> Result<CiCheckResult, BuildError> {
         let layout = GitLayout::resolve(&request.workspace_root)?;
         let result: Result<CiCheckResult, BuildError> = if check.is_governance() {
-            execute_governance(self, &request.workspace_root, &layout, check)
-                .await
-                .map_err(BuildError::from)
+            execute_governance(self, &request.workspace_root, &layout, check).await
         } else {
             execute_bar(self, &request.workspace_root, &layout, check).await
         };

@@ -7,9 +7,9 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentIdentity {
     /// Domain preventing equal bytes in different roles from sharing identity.
-    pub domain: String,
+    pub(crate) domain: String,
     /// Lowercase SHA-256 digest.
-    pub sha256: String,
+    pub(crate) sha256: String,
 }
 
 impl ContentIdentity {

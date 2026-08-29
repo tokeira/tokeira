@@ -10,14 +10,15 @@ use tokeira_types::MetricType;
 #[cfg(test)]
 use tokeira_types::validate_metric_name;
 
-pub const PLACEMENT_LOOP_DURATION_SECONDS: &str =
+pub(crate) const PLACEMENT_LOOP_DURATION_SECONDS: &str =
     "tokeira_controller_placement_loop_duration_seconds";
-pub const GENERATION_CAS_TOTAL: &str = "tokeira_controller_generation_cas_total";
-pub const ROUTING_SNAPSHOT_SIZE: &str = "tokeira_controller_routing_snapshot_size";
-pub const BUNDLE_OWNERSHIP_CHURN_TOTAL: &str = "tokeira_controller_bundle_ownership_churn_total";
-pub const DRAIN_ACTIVE_NODES: &str = "tokeira_controller_drain_active_nodes";
-pub const BUDGET_ALLOCATION_TOTAL: &str = "tokeira_controller_budget_allocation_total";
-pub const MEMBERSHIP_NODES_TOTAL: &str = "tokeira_controller_membership_nodes_total";
+pub(crate) const GENERATION_CAS_TOTAL: &str = "tokeira_controller_generation_cas_total";
+pub(crate) const ROUTING_SNAPSHOT_SIZE: &str = "tokeira_controller_routing_snapshot_size";
+pub(crate) const BUNDLE_OWNERSHIP_CHURN_TOTAL: &str =
+    "tokeira_controller_bundle_ownership_churn_total";
+pub(crate) const DRAIN_ACTIVE_NODES: &str = "tokeira_controller_drain_active_nodes";
+pub(crate) const BUDGET_ALLOCATION_TOTAL: &str = "tokeira_controller_budget_allocation_total";
+pub(crate) const MEMBERSHIP_NODES_TOTAL: &str = "tokeira_controller_membership_nodes_total";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (
@@ -36,29 +37,29 @@ pub fn record_placement_loop_duration(duration: std::time::Duration) {
     histogram!(PLACEMENT_LOOP_DURATION_SECONDS).record(duration.as_secs_f64());
 }
 
-pub fn record_generation_cas(outcome: ControllerCasOutcomeLabel) {
+pub(crate) fn record_generation_cas(outcome: ControllerCasOutcomeLabel) {
     counter!(GENERATION_CAS_TOTAL, "outcome" => outcome.as_str()).increment(1);
 }
 
-pub fn set_routing_snapshot_size(size: usize) {
+pub(crate) fn set_routing_snapshot_size(size: usize) {
     gauge!(ROUTING_SNAPSHOT_SIZE).set(size as f64);
 }
 
-pub fn record_bundle_ownership_churn(count: usize) {
+pub(crate) fn record_bundle_ownership_churn(count: usize) {
     if count > 0 {
         counter!(BUNDLE_OWNERSHIP_CHURN_TOTAL).increment(count as u64);
     }
 }
 
-pub fn set_drain_active_nodes(count: usize) {
+pub(crate) fn set_drain_active_nodes(count: usize) {
     gauge!(DRAIN_ACTIVE_NODES).set(count as f64);
 }
 
-pub fn record_budget_allocation(outcome: OutcomeLabel) {
+pub(crate) fn record_budget_allocation(outcome: OutcomeLabel) {
     counter!(BUDGET_ALLOCATION_TOTAL, "outcome" => outcome.as_str()).increment(1);
 }
 
-pub fn set_membership_nodes_total(count: usize) {
+pub(crate) fn set_membership_nodes_total(count: usize) {
     gauge!(MEMBERSHIP_NODES_TOTAL).set(count as f64);
 }
 

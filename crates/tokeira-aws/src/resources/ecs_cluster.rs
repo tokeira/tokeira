@@ -8,9 +8,9 @@ use tokeira_iac::{
 /// ECS cluster with ECS Exec configured for private Session Manager access.
 #[derive(Debug)]
 pub struct EcsClusterResource {
-    pub cluster_name: String,
-    pub service_connect_namespace: String,
-    pub module: String,
+    pub(crate) cluster_name: String,
+    pub(crate) service_connect_namespace: String,
+    pub(crate) module: String,
 }
 
 impl EcsClusterResource {

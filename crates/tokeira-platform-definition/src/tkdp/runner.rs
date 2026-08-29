@@ -29,13 +29,13 @@ const CAPTURED_OUTPUT_LIMIT: usize = 64 * 1024;
 #[derive(Debug)]
 pub struct RunFailure {
     /// Multi-line operator-facing rendering (summary plus mapped frames).
-    pub message: String,
+    pub(crate) message: String,
     /// Most specific operator-source range, when one frame mapped.
-    pub range: Option<TextRange>,
+    pub(crate) range: Option<TextRange>,
 }
 
 /// Compiles and runs the program; failures translate through the maps.
-pub fn execute(program: &Program, original: &str) -> Result<MontyObject, RunFailure> {
+pub(crate) fn execute(program: &Program, original: &str) -> Result<MontyObject, RunFailure> {
     let translator = Translator {
         root: FileContext {
             map: &program.map,

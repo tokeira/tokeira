@@ -24,7 +24,7 @@ pub struct AwsSecretsProvider {
 impl AwsSecretsProvider {
     /// Build from an already-loaded SDK config, the same shape every other
     /// AWS client in the workspace takes.
-    pub fn new(sdk_config: &aws_config::SdkConfig) -> Self {
+    pub(crate) fn new(sdk_config: &aws_config::SdkConfig) -> Self {
         Self {
             secrets_manager: aws_sdk_secretsmanager::Client::new(sdk_config),
             ssm: aws_sdk_ssm::Client::new(sdk_config),

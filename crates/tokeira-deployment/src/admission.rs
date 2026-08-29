@@ -39,10 +39,10 @@ use crate::{AuthorityTier, IntegrityError, IntegrityManifest, Sha256Digest, Targ
 pub struct RevocationList {
     /// Revoked engine identities, by [`EngineIdentity::digest`](crate::EngineIdentity::digest).
     #[serde(default)]
-    pub revoked_identities: BTreeSet<Sha256Digest>,
+    pub(crate) revoked_identities: BTreeSet<Sha256Digest>,
     /// Revoked artifact byte digests.
     #[serde(default)]
-    pub revoked_artifacts: BTreeSet<Sha256Digest>,
+    pub(crate) revoked_artifacts: BTreeSet<Sha256Digest>,
 }
 
 impl RevocationList {

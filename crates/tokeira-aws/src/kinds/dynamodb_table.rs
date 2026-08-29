@@ -15,13 +15,13 @@ use crate::resources::dynamodb_table::{
 #[serde(deny_unknown_fields)]
 pub struct DynamoDbTable {
     /// Full table name.
-    pub table: String,
+    pub(crate) table: String,
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// String hash-key attribute.
-    pub hash_key: String,
+    pub(crate) hash_key: String,
     /// Optional TTL attribute.
-    pub ttl: Option<String>,
+    pub(crate) ttl: Option<String>,
 }
 
 impl Kind<Resource> for DynamoDbTable {

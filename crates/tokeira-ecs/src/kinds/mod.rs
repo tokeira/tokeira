@@ -3,7 +3,7 @@
 //! This module is the ECS implementation crate's kind export, mirroring
 //! `tokeira_aws::kinds`: each kind is the authored face of one concrete
 //! resource or service owned by this crate. The namespace facts —
-//! [`NAMESPACE`], [`KINDS`], [`decode`], [`namespace`] — are what the
+//! `NAMESPACE`, `KINDS`, `decode`, [`namespace`] — are what the
 //! platform declaration lists for the frontend.
 
 pub mod dsql;
@@ -24,11 +24,11 @@ use crate::{
 };
 
 /// The namespace word: the normalized crate name definitions import from.
-pub const NAMESPACE: &str = "tokeira_ecs";
+pub(crate) const NAMESPACE: &str = "tokeira_ecs";
 
 /// The crate's author-visible kind names, each the word its resource or
 /// service owns.
-pub const KINDS: &[&str] = &[
+pub(crate) const KINDS: &[&str] = &[
     dsql::ENDPOINT_TYPE,
     dsql::ROLE_TYPE,
     roles::EXECUTION_ROLE_TYPE,
@@ -39,7 +39,7 @@ pub const KINDS: &[&str] = &[
 
 /// Decode one authored kind of this namespace; `None` when the name is not
 /// ours.
-pub fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, KindError>> {
+pub(crate) fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, KindError>> {
     Some(match name {
         n if n == dsql::ENDPOINT_TYPE => kind::decode_resource::<
             dsql::AdoptedDsqlEndpoint,

@@ -23,7 +23,7 @@ pub enum RealizedResource {
 
 impl RealizedResource {
     /// The resource type supplied by the concrete lifecycle contract.
-    pub fn resource_type(&self) -> String {
+    pub(crate) fn resource_type(&self) -> String {
         match self {
             Self::Infra(resource) => resource.resource_type().0,
             Self::Service(service) => service.resource_type().to_string(),
@@ -31,7 +31,7 @@ impl RealizedResource {
     }
 
     /// Validate the complete resource before its owning engine sees it.
-    pub fn validate_input(&self) -> Result<(), String> {
+    pub(crate) fn validate_input(&self) -> Result<(), String> {
         match self {
             Self::Infra(resource) => resource.validate_input(),
             Self::Service(service) => service.validate_input(),
@@ -39,7 +39,7 @@ impl RealizedResource {
     }
 
     /// Complete output names supplied by the concrete resource.
-    pub fn declared_outputs(&self) -> &'static [&'static str] {
+    pub(crate) fn declared_outputs(&self) -> &'static [&'static str] {
         match self {
             Self::Infra(resource) => resource.declared_outputs(),
             Self::Service(service) => service.declared_outputs(),
@@ -89,7 +89,7 @@ impl DecodedKind {
     }
 
     /// Erase a service kind for heterogeneous graph storage.
-    pub fn service<K, R>(name: &'static str, kind: K) -> Self
+    pub(crate) fn service<K, R>(name: &'static str, kind: K) -> Self
     where
         K: Kind<R> + 'static,
         R: tokeira_deploy_engine::Service + 'static,

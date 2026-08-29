@@ -10,7 +10,7 @@ pub struct ImagesModule {
 }
 
 impl ImagesModule {
-    pub fn new(config: EcsConfig) -> Self {
+    pub(crate) fn new(config: EcsConfig) -> Self {
         Self { config }
     }
 }

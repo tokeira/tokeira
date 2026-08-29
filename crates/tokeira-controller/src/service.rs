@@ -71,7 +71,7 @@ impl PlacementControllerState {
         }
     }
 
-    pub async fn current_snapshot(&self) -> Result<RoutingSnapshot, Status> {
+    pub(crate) async fn current_snapshot(&self) -> Result<RoutingSnapshot, Status> {
         let leases = self
             .leases
             .list_bundle_leases()
@@ -164,7 +164,7 @@ impl PlacementControllerState {
     }
 
     /// Public accessor for the connect-rust service impl.
-    pub fn placement_config_value(&self) -> PlacementConfig {
+    pub(crate) fn placement_config_value(&self) -> PlacementConfig {
         self.placement_config()
     }
 }

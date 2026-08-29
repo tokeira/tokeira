@@ -54,6 +54,6 @@ impl Image for TokeiradImage {
     }
 }
 
-pub fn all() -> Vec<Box<dyn Image>> {
+pub(crate) fn all() -> Vec<Box<dyn Image>> {
     vec![Box::new(TokeiradImage)]
 }

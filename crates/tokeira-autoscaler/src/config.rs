@@ -58,9 +58,9 @@ pub struct AutoscalerServiceConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceScaleConfig {
-    pub min: u32,
-    pub max: u32,
-    pub step: u32,
+    pub(crate) min: u32,
+    pub(crate) max: u32,
+    pub(crate) step: u32,
 }
 
 impl Default for AutoscalerServiceConfig {

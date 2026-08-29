@@ -18,7 +18,7 @@ pub enum DsqlClusterMode {
 }
 
 /// Return whether the cluster should be treated as provider-managed for delete.
-pub fn effective_managed(config_mode: DsqlClusterMode, state_mode: &str) -> bool {
+pub(crate) fn effective_managed(config_mode: DsqlClusterMode, state_mode: &str) -> bool {
     config_mode == DsqlClusterMode::Managed || state_mode == "managed"
 }
 
@@ -51,7 +51,7 @@ pub struct DsqlCluster {
 impl DsqlCluster {
     /// The resource's one word: engine resource type and author-visible
     /// name, stated once here.
-    pub const TYPE: &'static str = "DsqlCluster";
+    pub(crate) const TYPE: &'static str = "DsqlCluster";
 
     fn resolve_identifier(&self, state: Option<&ResourceState>) -> Option<String> {
         state

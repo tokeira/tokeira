@@ -5,7 +5,7 @@
 //! lookup plus inspect — scoped by the deployment name the framework already
 //! admitted. No compose-file ledger and no recorded state is consulted: an
 //! ops question is about live containers, so the handle behind it is the
-//! ledger-free [`ComposePlatform::ops`] constructor.
+//! ledger-free `ComposePlatform::ops` constructor.
 
 use tokeira_platform::declaration::{DeploymentRef, LogStream, Ops, PortMapping};
 

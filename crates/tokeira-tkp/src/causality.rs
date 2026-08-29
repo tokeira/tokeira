@@ -28,10 +28,10 @@ use crate::{DesiredSnapshot, config_history, engine::Engine, platform::Admitted}
 /// than a shell-local mirror: one typed resolution, not two agreeing ones
 /// (recorded deviation from the design's `BaselineSnapshot` sketch).
 pub(crate) struct GatheredCausality {
-    pub desired: Option<DesiredSnapshot>,
-    pub baseline: BaselineView,
-    pub baseline_revision: u64,
-    pub recorded: tokeira_iac::InfraState,
+    pub(crate) desired: Option<DesiredSnapshot>,
+    pub(crate) baseline: BaselineView,
+    pub(crate) baseline_revision: u64,
+    pub(crate) recorded: tokeira_iac::InfraState,
 }
 
 /// Gather D, P, and S for one verb. Never fails on causality's own account:

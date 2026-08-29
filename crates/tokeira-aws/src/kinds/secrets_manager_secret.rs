@@ -11,7 +11,7 @@ use crate::resources::secrets_manager_secret::{
 };
 
 /// Author-visible name of the realized resource type.
-pub const TYPE: &str = "SecretsManagerSecret";
+pub(crate) const TYPE: &str = "SecretsManagerSecret";
 
 /// Authored secret material source, mirroring the resource's
 /// [`SecretValue`]. Generated material is produced once at first apply and
@@ -22,9 +22,9 @@ pub const TYPE: &str = "SecretsManagerSecret";
 #[serde(deny_unknown_fields)]
 pub struct GeneratedPassword {
     /// Username recorded beside the generated password.
-    pub username: String,
+    pub(crate) username: String,
     /// Generated password length.
-    pub password_length: i32,
+    pub(crate) password_length: i32,
 }
 
 /// Tuple variants, not struct variants: the definition frontend does not
@@ -42,14 +42,14 @@ pub enum SecretSource {
 #[serde(deny_unknown_fields)]
 pub struct SecretsManagerSecret {
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Full secret name (resource id `secret-<name>`).
-    pub name: String,
+    pub(crate) name: String,
     /// Secret material source.
-    pub source: SecretSource,
+    pub(crate) source: SecretSource,
     /// Recovery window in days; `None` uses the provider default.
     #[serde(default)]
-    pub recovery_window_days: Option<i64>,
+    pub(crate) recovery_window_days: Option<i64>,
 }
 
 impl Kind<Resource> for SecretsManagerSecret {

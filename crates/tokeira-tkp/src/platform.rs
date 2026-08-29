@@ -36,16 +36,16 @@ const METADATA_JSON: &str = "metadata.json";
 #[derive(Debug)]
 pub struct Admitted {
     /// The deployment's recorded binding metadata, as admitted.
-    pub metadata: DeploymentBindingMetadata,
+    pub(crate) metadata: DeploymentBindingMetadata,
     /// The deployment's coordinates: identity, never state.
-    pub deployment_ref: DeploymentRef,
+    pub(crate) deployment_ref: DeploymentRef,
     content_roots: Vec<RelativeDefinitionPath>,
 }
 
 impl Admitted {
     /// The recorded desired source, from the admitted metadata. Admission
     /// guaranteed the definition record exists, so this cannot miss.
-    pub fn config_source(&self) -> crate::ConfigSource {
+    pub(crate) fn config_source(&self) -> crate::ConfigSource {
         let definition = self
             .metadata
             .definition
@@ -92,7 +92,7 @@ impl BoundPlatform {
 
     /// Bind the declaration and its generated, descriptor-owned authored
     /// content roots to the built-as identity pair.
-    pub fn bind_with_content(
+    pub(crate) fn bind_with_content(
         id: &'static str,
         format: &'static str,
         content_roots: &[&str],
@@ -131,7 +131,7 @@ impl BoundPlatform {
     ///
     /// Called once per command; the returned [`Admitted`] value threads
     /// through every engine verb the command drives.
-    pub fn admit_deployment(&self, deployment_dir: &Path) -> Result<Admitted> {
+    pub(crate) fn admit_deployment(&self, deployment_dir: &Path) -> Result<Admitted> {
         let metadata = self.metadata(deployment_dir)?;
         self.validate_bundle(deployment_dir, &metadata)?;
         let deployment_ref = DeploymentRef {
@@ -209,12 +209,12 @@ impl BoundPlatform {
     // ------------------------------------------------------------------
 
     /// The platform identity this binary was built as ("compose").
-    pub fn id(&self) -> &PlatformId {
+    pub(crate) fn id(&self) -> &PlatformId {
         &self.id
     }
 
     /// The definition format this binary was built as ("tkd").
-    pub fn format(&self) -> &DefinitionFormatId {
+    pub(crate) fn format(&self) -> &DefinitionFormatId {
         &self.format
     }
 
@@ -225,12 +225,12 @@ impl BoundPlatform {
     // ------------------------------------------------------------------
 
     /// Resource namespaces visible to the selected definition frontend.
-    pub fn namespaces(&self) -> &[Namespace] {
+    pub(crate) fn namespaces(&self) -> &[Namespace] {
         &self.declaration.namespaces
     }
 
     /// The platform's reachability seam, invoked by the engine.
-    pub fn execution(&self) -> &dyn PlatformExecution {
+    pub(crate) fn execution(&self) -> &dyn PlatformExecution {
         self.declaration.execution.as_ref()
     }
 
@@ -238,18 +238,18 @@ impl BoundPlatform {
     /// mappings), when it declares one. The shell calls it directly — these
     /// are questions about live containers, not lifecycle, so the engine is
     /// not in the path.
-    pub fn ops(&self) -> Option<&dyn Ops> {
+    pub(crate) fn ops(&self) -> Option<&dyn Ops> {
         self.declaration.ops.as_deref()
     }
 
     /// The platform implementation delegated to by the described deployment.
-    pub fn implementation(&self) -> Arc<dyn PlatformIntegration> {
+    pub(crate) fn implementation(&self) -> Arc<dyn PlatformIntegration> {
         Arc::clone(&self.declaration.implementation)
     }
 
     /// Construct the platform that applies this deployment's service
     /// manifests.
-    pub fn service_platform(
+    pub(crate) fn service_platform(
         &self,
         deployment: &DeploymentRef,
     ) -> Result<Box<dyn tokeira_deploy_engine::Platform>> {

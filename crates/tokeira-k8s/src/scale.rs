@@ -40,15 +40,15 @@ pub(crate) async fn patch_replicas(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentStatus {
     /// Deployment name.
-    pub name: String,
+    pub(crate) name: String,
     /// Desired replicas from the spec.
-    pub desired: u32,
+    pub(crate) desired: u32,
     /// Replicas that have passed their readiness probe.
-    pub ready: u32,
+    pub(crate) ready: u32,
     /// Replicas available for at least `minReadySeconds`.
-    pub available: u32,
+    pub(crate) available: u32,
     /// Replicas running the latest pod template.
-    pub updated: u32,
+    pub(crate) updated: u32,
 }
 
 /// Read a Deployment's current status, or `None` if it does not exist.

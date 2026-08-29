@@ -16,11 +16,11 @@ use crate::BUNDLE_MANIFEST_BASENAME;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     /// Deployment-relative destination path.
-    pub relative_path: String,
+    pub(crate) relative_path: String,
     /// The verified target to read.
-    pub target: String,
+    pub(crate) target: String,
     /// Whether the file must be executable (`tkp`).
-    pub executable: bool,
+    pub(crate) executable: bool,
 }
 
 /// The ordered placements one fetch performs.

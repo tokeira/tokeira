@@ -20,22 +20,22 @@ use crate::tkdp::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxFinding {
     /// Companion part name without an extension, or `None` for the root.
-    pub part: Option<String>,
+    pub(crate) part: Option<String>,
     /// Stable finding code followed by its actionable message.
-    pub message: String,
+    pub(crate) message: String,
     /// One-based source line.
-    pub line: u32,
+    pub(crate) line: u32,
     /// One-based source column.
-    pub column: u32,
+    pub(crate) column: u32,
 }
 
 /// Deterministic result of validating one complete `.tkdp` source set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxValidation {
     /// Resolvable companion part names, sorted lexically.
-    pub parts: Vec<String>,
+    pub(crate) parts: Vec<String>,
     /// Findings in discovery order; an empty list admits the source set.
-    pub findings: Vec<SyntaxFinding>,
+    pub(crate) findings: Vec<SyntaxFinding>,
 }
 
 /// Validate a `.tkdp` root and every resolvable transitive companion part

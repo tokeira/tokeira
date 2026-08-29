@@ -17,19 +17,19 @@ use crate::ResourceContext;
 /// Configuration for a single EBS volume.
 #[derive(Debug)]
 pub struct EbsVolumeConfig {
-    pub size_gib: u32,
-    pub availability_zone: String,
-    pub volume_type: String,
-    pub encrypted: bool,
-    pub module: String,
+    pub(crate) size_gib: u32,
+    pub(crate) availability_zone: String,
+    pub(crate) volume_type: String,
+    pub(crate) encrypted: bool,
+    pub(crate) module: String,
 }
 
 /// Generic provider resource that provisions one EBS volume.
 #[derive(Debug)]
 pub struct EbsVolume {
     /// Logical name for resource ID derivation (e.g. "workstation-cache").
-    pub name: String,
-    pub config: EbsVolumeConfig,
+    pub(crate) name: String,
+    pub(crate) config: EbsVolumeConfig,
     pub project: String,
     pub region: String,
     pub tags: HashMap<String, String>,

@@ -13,7 +13,7 @@
 //!   (design → "Single apply path"), mirroring how compose containers apply via
 //!   `ComposePlatform`.
 //! - Shared, provider-agnostic manifest helpers ([`standard_labels`],
-//!   [`build_node_pool`], [`manifest_metadata`], [`plan_manifests`]) that
+//!   [`build_node_pool`], `manifest_metadata`, `plan_manifests`) that
 //!   consuming crates call to construct and classify manifests before apply.
 //!
 //! The crate depends only on `tokeira-iac` (for the [`NamespaceResource`]
@@ -22,7 +22,7 @@
 //! knowledge.
 //!
 //! All server-side apply and delete traffic is attributed to the field manager
-//! [`FIELD_MANAGER`] (`tkp`) so field ownership is stable and 409 conflicts are
+//! `FIELD_MANAGER` (`tkp`) so field ownership is stable and 409 conflicts are
 //! actionable rather than silently clobbering another manager's fields.
 
 mod apply;
@@ -52,7 +52,7 @@ use serde::Serialize;
 /// overwriting it. Apply fails closed on a 409 conflict unless takeover is
 /// explicitly requested via [`ApplyOptions::force_conflicts`] — this is the
 /// review-before-mutation guarantee at the Kubernetes boundary.
-pub const FIELD_MANAGER: &str = "tkp";
+pub(crate) const FIELD_MANAGER: &str = "tkp";
 
 /// Errors surfaced by the Kubernetes platform's public API.
 #[derive(Debug, thiserror::Error)]
@@ -86,33 +86,33 @@ pub enum ManifestScope {
 /// Operator-facing metadata extracted from a manifest before apply.
 ///
 /// This is the classification used by both the review/apply flow and the
-/// dynamic API routing: presence of [`namespace`](Self::namespace) is the sole
+/// dynamic API routing: presence of `namespace` is the sole
 /// signal for namespaced vs. cluster scope, matching how the apply/delete/get
 /// paths select their `Api` endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManifestMetadata {
     /// The manifest's `apiVersion` (e.g. `apps/v1`, `v1`, `karpenter.sh/v1`).
-    pub api_version: String,
+    pub(crate) api_version: String,
     /// The manifest's `kind` (e.g. `Deployment`).
-    pub kind: String,
+    pub(crate) kind: String,
     /// The manifest's `metadata.name`.
-    pub name: String,
+    pub(crate) name: String,
     /// The manifest's `metadata.namespace`, if any.
-    pub namespace: Option<String>,
+    pub(crate) namespace: Option<String>,
     /// Derived scope, driven solely by [`namespace`](Self::namespace) presence.
-    pub scope: ManifestScope,
+    pub(crate) scope: ManifestScope,
 }
 
 /// A deploy-time manifest paired with parsed metadata for review/apply flows.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlannedManifest {
     /// Parsed classification of [`manifest`](Self::manifest).
-    pub metadata: ManifestMetadata,
+    pub(crate) metadata: ManifestMetadata,
     /// The raw manifest body. Skipped in serialized review output because the
     /// review surface shows the classification, not the (potentially large)
     /// object body — the body is applied, not printed.
     #[serde(skip_serializing)]
-    pub manifest: serde_json::Value,
+    pub(crate) manifest: serde_json::Value,
 }
 
 impl PlannedManifest {
@@ -120,7 +120,7 @@ impl PlannedManifest {
     ///
     /// Fails with [`K8sError::InvalidManifest`] if the manifest is missing a
     /// field required to route it.
-    pub fn try_from_value(manifest: serde_json::Value) -> Result<Self, K8sError> {
+    pub(crate) fn try_from_value(manifest: serde_json::Value) -> Result<Self, K8sError> {
         let metadata = manifest_metadata(&manifest)?;
         Ok(Self { metadata, manifest })
     }
@@ -133,7 +133,7 @@ pub struct ApplyOptions {
     ///
     /// Off by default so a conflict is surfaced for review; enabling it is the
     /// explicit operator opt-in to seize field ownership.
-    pub force_conflicts: bool,
+    pub(crate) force_conflicts: bool,
 }
 
 /// Extract operator-facing metadata from a raw manifest.
@@ -141,7 +141,9 @@ pub struct ApplyOptions {
 /// The three required fields (`kind`, `metadata.name`, `apiVersion`) are exactly
 /// those needed to build a `GroupVersionKind` and select an `Api`; a manifest
 /// missing any of them cannot be routed, hence the hard error.
-pub fn manifest_metadata(manifest: &serde_json::Value) -> Result<ManifestMetadata, K8sError> {
+pub(crate) fn manifest_metadata(
+    manifest: &serde_json::Value,
+) -> Result<ManifestMetadata, K8sError> {
     let kind = manifest
         .get("kind")
         .and_then(|v| v.as_str())
@@ -176,7 +178,9 @@ pub fn manifest_metadata(manifest: &serde_json::Value) -> Result<ManifestMetadat
 ///
 /// All-or-nothing: if any manifest fails to parse, the whole batch fails, so a
 /// malformed manifest can never be silently dropped from an apply set.
-pub fn plan_manifests(manifests: Vec<serde_json::Value>) -> Result<Vec<PlannedManifest>, K8sError> {
+pub(crate) fn plan_manifests(
+    manifests: Vec<serde_json::Value>,
+) -> Result<Vec<PlannedManifest>, K8sError> {
     manifests
         .into_iter()
         .map(PlannedManifest::try_from_value)

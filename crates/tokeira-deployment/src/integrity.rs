@@ -154,7 +154,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 impl BinaryArtifactDescriptor {
     /// Parse and validate this descriptor's recorded checksum, mapping a format
     /// error to the target-scoped [`IntegrityError::InvalidChecksumFormat`].
-    pub fn expected_sha256(&self) -> Result<Sha256Digest, IntegrityError> {
+    pub(crate) fn expected_sha256(&self) -> Result<Sha256Digest, IntegrityError> {
         Sha256Digest::parse_manifest_hex(&self.sha256).map_err(|reason| {
             IntegrityError::InvalidChecksumFormat {
                 target: self.target.0.clone(),
@@ -171,7 +171,7 @@ impl BinaryArtifactDescriptor {
     /// A recorded `size_bytes` of `0` means "unrecorded" and skips the size check
     /// (a real provisioner binary is never zero-length); any non-zero size is
     /// checked before hashing so an obviously wrong artifact fails fast.
-    pub fn verify(&self, bytes: &[u8]) -> Result<(), IntegrityError> {
+    pub(crate) fn verify(&self, bytes: &[u8]) -> Result<(), IntegrityError> {
         if self.size_bytes != 0 {
             let actual = bytes.len() as u64;
             if actual != self.size_bytes {

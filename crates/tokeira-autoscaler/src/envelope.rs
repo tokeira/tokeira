@@ -47,7 +47,7 @@ impl ScalingEnvelope {
     }
 
     /// Check whether a target host count is within the envelope.
-    pub fn allows_scale_to(&self, target_hosts: u32) -> bool {
+    pub(crate) fn allows_scale_to(&self, target_hosts: u32) -> bool {
         target_hosts <= self.effective_max_runtime_hosts()
     }
 }

@@ -26,13 +26,13 @@ const LOCK_SKEW_TOLERANCE: Duration = Duration::from_secs(5);
 /// The persisted lock record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationLease {
-    pub holder: String,
-    pub token: String,
-    pub acquired_at: DateTime<Utc>,
-    pub renewed_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub(crate) holder: String,
+    pub(crate) token: String,
+    pub(crate) acquired_at: DateTime<Utc>,
+    pub(crate) renewed_at: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
     /// Set on clean release so the next acquirer takes over immediately.
-    pub released: bool,
+    pub(crate) released: bool,
 }
 
 impl OperationLease {
@@ -54,7 +54,7 @@ fn lease_expired(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 pub struct OperationLockGuard {
     pub holder: String,
     pub token: String,
-    pub expires_at: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
     version: String,
 }
 

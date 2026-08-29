@@ -26,19 +26,19 @@ use tokeira_platform::{
 };
 
 /// Author-visible name of the artifact-tree resource type.
-pub const ARTIFACTS_TYPE: &str = "ObservabilityArtifacts";
+pub(crate) const ARTIFACTS_TYPE: &str = "ObservabilityArtifacts";
 /// Author-visible name of the rendered Alloy parameter resource type.
-pub const ALLOY_CONFIG_TYPE: &str = "AlloyConfig";
+pub(crate) const ALLOY_CONFIG_TYPE: &str = "AlloyConfig";
 
 /// The platform package's namespace word.
-pub const NAMESPACE: &str = "tokeira_ecs_deployment";
+pub(crate) const NAMESPACE: &str = "tokeira_ecs_deployment";
 
 /// The package's author-visible kind names.
-pub const KINDS: &[&str] = &[ALLOY_CONFIG_TYPE, ARTIFACTS_TYPE];
+pub(crate) const KINDS: &[&str] = &[ALLOY_CONFIG_TYPE, ARTIFACTS_TYPE];
 
 /// Decode one authored kind of this namespace; `None` when the name is not
 /// ours.
-pub fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, KindError>> {
+pub(crate) fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, KindError>> {
     Some(match name {
         n if n == ALLOY_CONFIG_TYPE => {
             kind::decode_resource::<AlloyConfig, AlloyConfigResource>(ALLOY_CONFIG_TYPE, value)
@@ -52,7 +52,7 @@ pub fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKind, Kin
 }
 
 /// The assembled namespace for the platform declaration.
-pub fn namespace() -> Namespace {
+pub(crate) fn namespace() -> Namespace {
     Namespace {
         name: NAMESPACE,
         kinds: KINDS,
@@ -263,9 +263,9 @@ impl Resource for ObservabilityArtifactsResource {
 #[serde(deny_unknown_fields)]
 pub struct AlloyConfig {
     /// Canonical service name the sidecar scrapes.
-    pub service: String,
+    pub(crate) service: String,
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
 }
 
 impl Kind<AlloyConfigResource> for AlloyConfig {

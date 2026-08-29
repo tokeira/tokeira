@@ -33,9 +33,9 @@ use tokeira_report::{Depth, Report};
 #[derive(Debug)]
 pub(crate) struct ExplanationReport {
     /// Whether the deployment carries a Day-0 binding stamp yet.
-    pub initialized: bool,
-    pub binding: BindingVerdict,
-    pub explanation: DeploymentExplanation,
+    pub(crate) initialized: bool,
+    pub(crate) binding: BindingVerdict,
+    pub(crate) explanation: DeploymentExplanation,
 }
 
 impl serde::Serialize for ExplanationReport {
@@ -386,7 +386,7 @@ fn service_identity(change: &ReportedServiceChange) -> String {
 /// between artifact and flag).
 #[derive(Debug)]
 pub(crate) struct UpgradeReport {
-    pub explanation: DeploymentExplanation,
+    pub(crate) explanation: DeploymentExplanation,
 }
 
 impl serde::Serialize for UpgradeReport {

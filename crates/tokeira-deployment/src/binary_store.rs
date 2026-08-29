@@ -85,7 +85,7 @@ impl BinaryStore {
     }
 
     /// Retrieve a binary blob (unverified — prefer [`retrieve_verified`](Self::retrieve_verified)).
-    pub async fn retrieve(
+    pub(crate) async fn retrieve(
         &self,
         identity: &EngineIdentity,
         target: &Target,

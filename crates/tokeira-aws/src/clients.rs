@@ -12,20 +12,20 @@ use tokeira_iac::ProvisionContext;
 #[derive(Debug, Clone)]
 pub struct AwsClients {
     sdk_config: aws_config::SdkConfig,
-    pub ec2: aws_sdk_ec2::Client,
-    pub eks: aws_sdk_eks::Client,
+    pub(crate) ec2: aws_sdk_ec2::Client,
+    pub(crate) eks: aws_sdk_eks::Client,
     pub ecs: aws_sdk_ecs::Client,
-    pub iam: aws_sdk_iam::Client,
+    pub(crate) iam: aws_sdk_iam::Client,
     pub ecr: aws_sdk_ecr::Client,
-    pub autoscaling: aws_sdk_autoscaling::Client,
+    pub(crate) autoscaling: aws_sdk_autoscaling::Client,
     pub s3: aws_sdk_s3::Client,
     pub dsql: aws_sdk_dsql::Client,
     pub dynamodb: aws_sdk_dynamodb::Client,
-    pub elbv2: aws_sdk_elasticloadbalancingv2::Client,
-    pub secretsmanager: aws_sdk_secretsmanager::Client,
-    pub servicediscovery: aws_sdk_servicediscovery::Client,
-    pub ssm: aws_sdk_ssm::Client,
-    pub sts: aws_sdk_sts::Client,
+    pub(crate) elbv2: aws_sdk_elasticloadbalancingv2::Client,
+    pub(crate) secretsmanager: aws_sdk_secretsmanager::Client,
+    pub(crate) servicediscovery: aws_sdk_servicediscovery::Client,
+    pub(crate) ssm: aws_sdk_ssm::Client,
+    pub(crate) sts: aws_sdk_sts::Client,
 }
 
 impl AwsClients {
@@ -51,12 +51,12 @@ impl AwsClients {
     }
 
     /// Return a DSQL client using the resource-selected region.
-    pub fn dsql_for(&self, region: &str) -> aws_sdk_dsql::Client {
+    pub(crate) fn dsql_for(&self, region: &str) -> aws_sdk_dsql::Client {
         aws_sdk_dsql::Client::new(&self.sdk_config_for(region))
     }
 
     /// Return a DynamoDB client using the resource-selected region.
-    pub fn dynamodb_for(&self, region: &str) -> aws_sdk_dynamodb::Client {
+    pub(crate) fn dynamodb_for(&self, region: &str) -> aws_sdk_dynamodb::Client {
         aws_sdk_dynamodb::Client::new(&self.sdk_config_for(region))
     }
 

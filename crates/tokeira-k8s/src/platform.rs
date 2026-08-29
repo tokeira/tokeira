@@ -58,7 +58,7 @@ impl KubePlatform {
 
     /// Borrow the underlying client for resource impls needing the raw `kube` API
     /// (e.g. [`crate::NamespaceResource`], which uses the typed `Namespace` API).
-    pub fn client(&self) -> &Client {
+    pub(crate) fn client(&self) -> &Client {
         &self.client
     }
 
@@ -81,7 +81,7 @@ impl KubePlatform {
     }
 
     /// Server-side-apply pre-planned manifests with explicit options (e.g. to
-    /// take over conflicting fields via [`ApplyOptions::force_conflicts`]).
+    /// take over conflicting fields via `ApplyOptions::force_conflicts`).
     pub async fn apply_planned(
         &self,
         manifests: &[PlannedManifest],

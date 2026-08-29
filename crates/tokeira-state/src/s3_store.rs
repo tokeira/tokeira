@@ -97,7 +97,11 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
     /// An empty expected version permits only the first write. The returned ETag
     /// belongs to the exact manifest CAS that committed this document and must
     /// be passed to the next save derived from it.
-    pub async fn save(&self, state: &T, expected_version: &str) -> Result<String, StateError> {
+    pub(crate) async fn save(
+        &self,
+        state: &T,
+        expected_version: &str,
+    ) -> Result<String, StateError> {
         let bytes = serialize_validated_state(state)?;
         let guard = self
             .acquire_save_lock(expected_version, Self::DEFAULT_LEASE_DURATION)
@@ -175,7 +179,7 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
     /// version tag (empty when no manifest exists yet). Used by the
     /// [`DeploymentStore`](crate::DeploymentStore) seam so a caller that threads a
     /// version between load and save can treat this store like the CAS store.
-    pub async fn load_with_version(&self) -> Result<(T, String), StateError> {
+    pub(crate) async fn load_with_version(&self) -> Result<(T, String), StateError> {
         match self.get_manifest().await? {
             Some(manifest_state) => {
                 let state = self.load_snapshot(&manifest_state).await?;
@@ -326,7 +330,7 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
     }
 
     /// Release a held manifest lease without moving the head pointer.
-    pub async fn unlock(&self, guard: &LockGuard) -> Result<(), StateError> {
+    pub(crate) async fn unlock(&self, guard: &LockGuard) -> Result<(), StateError> {
         let current = self.ensure_manifest().await?;
         let current_lock = current
             .manifest

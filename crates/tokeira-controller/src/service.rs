@@ -1,44 +1,31 @@
-//! Controller service assembly types.
+//! Shared placement-controller state and directive publication.
 //!
-//! The tonic transport implementation is intentionally kept as a thin layer
-//! over these primitives so active-active behavior stays testable without a
-//! running gRPC server.
+//! Transport handling lives in `connect_service`; this module owns the stateful
+//! operations used by both RPC handlers and the controller's periodic loops.
+//! Keeping one served transport implementation prevents membership behavior
+//! from diverging between a wired server and an unused protocol twin.
 
-use std::{pin::Pin, str::FromStr, sync::Arc};
+use std::sync::Arc;
 
 use tokeira_observability::{ControllerCasOutcomeLabel, OutcomeLabel};
-use tokeira_proto::controller::{
-    self as proto, BundleOwnerMessage, BundleOwnershipEntry,
-    ConnectionBudgetDirective as ProtoConnectionBudgetDirective,
-    ControllerDirective as ProtoControllerDirective,
-    DesiredPlacementDirective as ProtoDesiredPlacementDirective, FullRoutingSnapshot,
-    MarkDrainingRequest, MarkDrainingResponse, NodeEndpointEntry, NodeEndpointMessage,
-    NominateRequest, NominateResponse, PlacementConfigMessage, RefreshBundleRequest,
-    RefreshBundleResponse, RoutingUpdate, ScaleInCandidate, SubscribeRoutingRequest,
-    controller_directive::Directive, placement_controller_server::PlacementController,
-    routing_update::Update, runtime_membership_request::Request as MembershipRequest,
-};
 use tokeira_storage::{
-    BudgetAllocationResult, BundleLease, ControlRepository, GenerationAdvanceResult,
-    LeaseRepository,
+    BudgetAllocationResult, ControlRepository, GenerationAdvanceResult, LeaseRepository,
 };
-use tokeira_types::{
-    BundleOwner, IncarnationId, NodeEndpoint, PlacementConfig, RoutingSnapshot, ShardId,
-};
-use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
-use tonic::{Request, Response, Status};
+use tokeira_types::{IncarnationId, PlacementConfig, RoutingSnapshot};
+use tonic::Status;
 
 use crate::{
     ControllerConfig, DrainCoordinator, GenerationManager, LiveMembership,
-    membership::{LanePressure, NodeDrainState, RuntimeHeartbeat, RuntimeRegistration},
+    membership::ControllerDirective,
     metrics,
     placement::{
-        ConnectionBudgetDirective, compute_connection_budget, compute_desired_placement,
-        compute_routing_snapshot, empty_previous_snapshot,
+        ConnectionBudgetDirective, DesiredPlacementDirective, compute_connection_budget,
+        compute_desired_placement, compute_routing_snapshot, empty_previous_snapshot,
     },
 };
 
-/// Shared controller state used by the future tonic service.
+/// Shared controller state used by the served Connect/gRPC implementation and
+/// its periodic placement and budget loops.
 #[derive(Clone)]
 pub struct PlacementControllerState {
     pub config: ControllerConfig,
@@ -154,6 +141,96 @@ impl PlacementControllerState {
         }
     }
 
+    /// Compute desired placement from durable lease truth and publish one
+    /// directive to every connected active runtime.
+    ///
+    /// The membership lock is released before awaiting channel capacity. A
+    /// slow runtime stream therefore cannot stall heartbeat processing or node
+    /// registration for the rest of the controller.
+    pub async fn publish_desired_placements(&self) -> Result<usize, Status> {
+        let leases = self
+            .leases
+            .list_bundle_leases()
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let outbound = {
+            let membership = self.membership.read().await;
+            compute_desired_placement(&membership, &leases, self.config.bundle_count)
+                .into_iter()
+                .filter_map(|(node_id, directive)| {
+                    membership
+                        .directive_sender(node_id)
+                        .map(|sender| (sender, ControllerDirective::DesiredPlacement(directive)))
+                })
+                .collect::<Vec<_>>()
+        };
+        Ok(send_directives(outbound).await)
+    }
+
+    /// Allocate the cluster-wide connection budget through the controller CAS
+    /// and publish the resulting per-node shares to live runtime streams.
+    pub async fn allocate_and_publish_connection_budgets(
+        &self,
+        allocator_id: IncarnationId,
+    ) -> Result<usize, Status> {
+        let budgets = self.allocate_connection_budgets(allocator_id).await?;
+        let outbound = {
+            let membership = self.membership.read().await;
+            budgets
+                .into_iter()
+                .filter_map(|(node_id, directive)| {
+                    membership
+                        .directive_sender(node_id)
+                        .map(|sender| (sender, ControllerDirective::ConnectionBudget(directive)))
+                })
+                .collect::<Vec<_>>()
+        };
+        Ok(send_directives(outbound).await)
+    }
+
+    /// Queue the required placement and connection-budget baseline for a newly
+    /// registered runtime before its response stream is returned.
+    pub(crate) async fn publish_initial_directives(
+        &self,
+        node_id: IncarnationId,
+    ) -> Result<(), Status> {
+        let leases = self
+            .leases
+            .list_bundle_leases()
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let (sender, desired) = {
+            let membership = self.membership.read().await;
+            let sender = membership
+                .directive_sender(node_id)
+                .ok_or_else(|| Status::internal("membership directive stream is unavailable"))?;
+            let desired = compute_desired_placement(&membership, &leases, self.config.bundle_count)
+                .remove(&node_id)
+                .unwrap_or_else(empty_desired_placement);
+            (sender, desired)
+        };
+        let budget = self
+            .allocate_connection_budgets(node_id)
+            .await?
+            .into_iter()
+            .find_map(|(candidate, budget)| (candidate == node_id).then_some(budget))
+            .ok_or_else(|| {
+                Status::aborted(
+                    "connection-budget allocation lost its CAS; retry the membership stream",
+                )
+            })?;
+
+        sender
+            .send(ControllerDirective::DesiredPlacement(desired))
+            .await
+            .map_err(|_| Status::internal("membership directive stream closed"))?;
+        sender
+            .send(ControllerDirective::ConnectionBudget(budget))
+            .await
+            .map_err(|_| Status::internal("membership directive stream closed"))?;
+        Ok(())
+    }
+
     fn placement_config(&self) -> PlacementConfig {
         PlacementConfig {
             shard_count: self.config.shard_count,
@@ -169,348 +246,26 @@ impl PlacementControllerState {
     }
 }
 
-#[tonic::async_trait]
-impl PlacementController for PlacementControllerState {
-    type RuntimeMembershipStream =
-        Pin<Box<dyn Stream<Item = Result<ProtoControllerDirective, Status>> + Send + 'static>>;
-    type SubscribeRoutingStream =
-        Pin<Box<dyn Stream<Item = Result<RoutingUpdate, Status>> + Send + 'static>>;
-
-    async fn runtime_membership(
-        &self,
-        request: Request<tonic::Streaming<proto::RuntimeMembershipRequest>>,
-    ) -> Result<Response<Self::RuntimeMembershipStream>, Status> {
-        let mut stream = request.into_inner();
-        let Some(first) = stream.next().await else {
-            return Err(Status::invalid_argument(
-                "membership stream closed before registration",
-            ));
-        };
-        let first = first?;
-        let Some(MembershipRequest::Registration(registration)) = first.request else {
-            return Err(Status::invalid_argument(
-                "first membership message must be registration",
-            ));
-        };
-        let registration = decode_registration(registration)?;
-        let node_id = registration.node_id;
-        {
-            let mut membership = self.membership.write().await;
-            membership.register_node(registration, RuntimeHeartbeat::empty(), None);
-            metrics::set_membership_nodes_total(membership.nodes().count());
+async fn send_directives(
+    outbound: Vec<(
+        tokio::sync::mpsc::Sender<ControllerDirective>,
+        ControllerDirective,
+    )>,
+) -> usize {
+    let mut delivered = 0;
+    for (sender, directive) in outbound {
+        if sender.send(directive).await.is_ok() {
+            delivered += 1;
         }
-
-        let state = self.clone();
-        tokio::spawn(async move {
-            while let Some(next) = stream.next().await {
-                match next {
-                    Ok(message) => {
-                        if let Some(MembershipRequest::Heartbeat(heartbeat)) = message.request {
-                            match decode_heartbeat(heartbeat) {
-                                Ok(heartbeat) => {
-                                    let mut drain = state.drain.write().await;
-                                    drain.record_progress(node_id, heartbeat.drain_state);
-                                    metrics::set_drain_active_nodes(drain.active_count());
-                                    drop(drain);
-                                    let mut membership = state.membership.write().await;
-                                    membership.update_heartbeat(node_id, heartbeat);
-                                    metrics::set_membership_nodes_total(membership.nodes().count());
-                                }
-                                Err(err) => {
-                                    tracing::warn!(%err, "dropping invalid runtime heartbeat");
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(%err, "runtime membership stream failed");
-                        break;
-                    }
-                }
-            }
-            let mut membership = state.membership.write().await;
-            membership.mark_grace_period(node_id);
-            metrics::set_membership_nodes_total(membership.nodes().count());
-        });
-
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let desired = {
-            let membership = self.membership.read().await;
-            let leases = self
-                .leases
-                .list_bundle_leases()
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?;
-            compute_desired_placement(&membership, &leases, self.config.bundle_count)
-                .remove(&node_id)
-        };
-        if let Some(desired) = desired {
-            let directive = ProtoControllerDirective {
-                directive: Some(Directive::DesiredPlacement(
-                    ProtoDesiredPlacementDirective {
-                        acquire_bundles: desired
-                            .acquire_bundles
-                            .into_iter()
-                            .map(|id| id.0)
-                            .collect(),
-                        relinquish_bundles: desired
-                            .relinquish_bundles
-                            .into_iter()
-                            .map(|id| id.0)
-                            .collect(),
-                    },
-                )),
-            };
-            tx.send(Ok(directive))
-                .await
-                .map_err(|_| Status::internal("membership directive stream closed"))?;
-        }
-        let budgets = self.allocate_connection_budgets(node_id).await?;
-        if let Some((_node_id, budget)) = budgets.into_iter().find(|(id, _)| *id == node_id) {
-            tx.send(Ok(ProtoControllerDirective {
-                directive: Some(Directive::ConnectionBudget(encode_budget_directive(budget))),
-            }))
-            .await
-            .map_err(|_| Status::internal("membership directive stream closed"))?;
-        }
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
-
-    async fn subscribe_routing(
-        &self,
-        _request: Request<SubscribeRoutingRequest>,
-    ) -> Result<Response<Self::SubscribeRoutingStream>, Status> {
-        let snapshot = self.current_snapshot().await?;
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        tx.send(Ok(RoutingUpdate {
-            update: Some(Update::Full(encode_snapshot(snapshot))),
-        }))
-        .await
-        .map_err(|_| Status::internal("routing subscriber closed"))?;
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-
-    async fn refresh_bundle(
-        &self,
-        request: Request<RefreshBundleRequest>,
-    ) -> Result<Response<RefreshBundleResponse>, Status> {
-        let bundle_id = ShardId(request.into_inner().bundle_id);
-        let leases = self
-            .leases
-            .list_bundle_leases()
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-        let lease = leases
-            .iter()
-            .find(|lease| lease.bundle_id == bundle_id)
-            .cloned();
-        Ok(Response::new(refresh_response(bundle_id, lease)?))
-    }
-
-    async fn nominate_scale_in_candidates(
-        &self,
-        request: Request<NominateRequest>,
-    ) -> Result<Response<NominateResponse>, Status> {
-        let limit = request.into_inner().limit as usize;
-        let membership = self.membership.read().await;
-        let drain = self.drain.read().await;
-        let mut nodes = membership
-            .active_nodes()
-            .filter(|node| !drain.is_draining(node.node_id))
-            .map(|node| ScaleInCandidate {
-                node_id: node.node_id.to_string(),
-                owned_bundle_count: node.heartbeat.owned_bundle_count,
-                runnable_transitions: node.heartbeat.runnable_transitions,
-                active_actor_count: node.heartbeat.active_actor_count,
-                backlog_depth: node.heartbeat.backlog_depth,
-            })
-            .collect::<Vec<_>>();
-        nodes.sort_by_key(|node| {
-            (
-                node.owned_bundle_count,
-                node.runnable_transitions,
-                node.active_actor_count,
-                node.backlog_depth,
-            )
-        });
-        if limit > 0 {
-            nodes.truncate(limit);
-        }
-        let aggregate_available_connections = membership
-            .nodes()
-            .map(|node| node.heartbeat.available_connections)
-            .sum();
-        let aggregate_connection_rate_headroom = membership
-            .nodes()
-            .map(|node| node.heartbeat.connection_rate_headroom)
-            .sum();
-        Ok(Response::new(NominateResponse {
-            candidates: nodes,
-            aggregate_available_connections,
-            aggregate_connection_rate_headroom,
-        }))
-    }
-
-    async fn mark_node_draining(
-        &self,
-        request: Request<MarkDrainingRequest>,
-    ) -> Result<Response<MarkDrainingResponse>, Status> {
-        let node_id = IncarnationId::from_str(&request.into_inner().node_id)
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        self.membership.write().await.mark_draining(node_id);
-        let mut drain = self.drain.write().await;
-        drain.mark_draining(node_id);
-        metrics::set_drain_active_nodes(drain.active_count());
-        Ok(Response::new(MarkDrainingResponse { accepted: true }))
-    }
+    delivered
 }
 
-fn decode_registration(
-    registration: proto::RuntimeRegistration,
-) -> Result<RuntimeRegistration, Status> {
-    let node_id = IncarnationId::from_str(&registration.node_id)
-        .map_err(|err| Status::invalid_argument(err.to_string()))?;
-    let port = u16::try_from(registration.port)
-        .map_err(|_| Status::invalid_argument("registration port exceeds u16"))?;
-    Ok(RuntimeRegistration {
-        node_id,
-        host: registration.host,
-        port,
-        zone: (!registration.zone.is_empty()).then_some(registration.zone),
-        version: registration.version,
-        build_id: registration.build_id,
-    })
-}
-
-fn decode_heartbeat(heartbeat: proto::RuntimeHeartbeat) -> Result<RuntimeHeartbeat, Status> {
-    Ok(RuntimeHeartbeat {
-        owned_bundle_count: heartbeat.owned_bundle_count,
-        owned_bundles: heartbeat.owned_bundles.into_iter().map(ShardId).collect(),
-        runnable_transitions: heartbeat.runnable_transitions,
-        active_actor_count: heartbeat.active_actor_count,
-        backlog_depth: heartbeat.backlog_depth,
-        available_connections: heartbeat.available_connections,
-        connection_rate_headroom: heartbeat.connection_rate_headroom,
-        drain_state: match heartbeat.drain_state {
-            value if value == proto::NodeDrainState::Draining as i32 => NodeDrainState::Draining,
-            value if value == proto::NodeDrainState::SafeToTerminate as i32 => {
-                NodeDrainState::SafeToTerminate
-            }
-            _ => NodeDrainState::Active,
-        },
-        lane_pressures: heartbeat
-            .lane_pressures
-            .into_iter()
-            .map(|lane| LanePressure {
-                lane_id: lane.lane_id,
-                runnable_depth: lane.runnable_depth,
-                active_actors: lane.active_actors,
-                utilization: lane.utilization,
-            })
-            .collect(),
-    })
-}
-
-fn encode_snapshot(snapshot: RoutingSnapshot) -> FullRoutingSnapshot {
-    FullRoutingSnapshot {
-        bundles: snapshot
-            .execution_bundle_owners
-            .into_iter()
-            .map(|(bundle_id, owner)| encode_bundle_owner(bundle_id, Some(owner)))
-            .collect(),
-        nodes: snapshot
-            .node_endpoints
-            .into_iter()
-            .map(|(node_id, endpoint)| encode_node_endpoint(node_id, Some(endpoint)))
-            .collect(),
-        placement_config: Some(PlacementConfigMessage {
-            shard_count: snapshot.placement_config.shard_count,
-            bundle_count: snapshot.placement_config.bundle_count,
-            partition_count: snapshot.placement_config.partition_count,
-            hash_version: snapshot.placement_config.hash_version,
-        }),
-        generation: snapshot.generation.0,
+fn empty_desired_placement() -> DesiredPlacementDirective {
+    DesiredPlacementDirective {
+        acquire_bundles: Vec::new(),
+        relinquish_bundles: Vec::new(),
     }
-}
-
-fn encode_bundle_owner(bundle_id: ShardId, owner: Option<BundleOwner>) -> BundleOwnershipEntry {
-    BundleOwnershipEntry {
-        bundle_id: bundle_id.0,
-        state: Some(match owner {
-            Some(owner) => proto::bundle_ownership_entry::State::Owner(BundleOwnerMessage {
-                owner_node_id: owner.node_id.to_string(),
-                epoch: owner.epoch.0,
-            }),
-            None => proto::bundle_ownership_entry::State::Unowned(true),
-        }),
-    }
-}
-
-fn encode_node_endpoint(
-    node_id: IncarnationId,
-    endpoint: Option<NodeEndpoint>,
-) -> NodeEndpointEntry {
-    NodeEndpointEntry {
-        node_id: node_id.to_string(),
-        state: Some(match endpoint {
-            Some(endpoint) => proto::node_endpoint_entry::State::Endpoint(NodeEndpointMessage {
-                host: endpoint.host,
-                port: u32::from(endpoint.port),
-            }),
-            None => proto::node_endpoint_entry::State::Removed(true),
-        }),
-    }
-}
-
-fn encode_budget_directive(budget: ConnectionBudgetDirective) -> ProtoConnectionBudgetDirective {
-    ProtoConnectionBudgetDirective {
-        rate_per_second: budget.rate_per_second,
-        capacity: budget.capacity,
-        max_reservoir_size: budget.max_reservoir_size,
-        valid_until: Some(prost_types::Timestamp {
-            seconds: budget.valid_until.unix_timestamp(),
-            nanos: budget.valid_until.nanosecond() as i32,
-        }),
-    }
-}
-
-fn refresh_response(
-    bundle_id: ShardId,
-    lease: Option<BundleLease>,
-) -> Result<RefreshBundleResponse, Status> {
-    let Some(lease) = lease else {
-        return Ok(RefreshBundleResponse {
-            bundle: Some(encode_bundle_owner(bundle_id, None)),
-            node: None,
-        });
-    };
-    let owner = lease
-        .owner_node_id
-        .as_deref()
-        .map(IncarnationId::from_str)
-        .transpose()
-        .map_err(|err| Status::internal(err.to_string()))?;
-    let endpoint = lease
-        .node_endpoint
-        .as_deref()
-        .map(NodeEndpoint::from_str)
-        .transpose()
-        .map_err(|err| Status::internal(err.to_string()))?;
-    let bundle = encode_bundle_owner(
-        bundle_id,
-        owner.map(|node_id| BundleOwner {
-            node_id,
-            epoch: lease.epoch,
-        }),
-    );
-    let node = match (owner, endpoint) {
-        (Some(node_id), endpoint) => Some(encode_node_endpoint(node_id, endpoint)),
-        _ => None,
-    };
-    Ok(RefreshBundleResponse {
-        bundle: Some(bundle),
-        node,
-    })
 }
 
 #[cfg(test)]
@@ -519,9 +274,10 @@ mod tests {
 
     use time::OffsetDateTime;
     use tokeira_storage::{ControlRepository, InMemoryStore, LeaseRepository};
+    use tokeira_types::ShardId;
 
     use super::*;
-    use crate::membership::{NodeMembershipState, RuntimeHeartbeat};
+    use crate::membership::{ControllerDirective, RuntimeHeartbeat};
 
     fn state() -> PlacementControllerState {
         let store = Arc::new(InMemoryStore::default());
@@ -539,8 +295,28 @@ mod tests {
         )
     }
 
+    async fn register_with_directives(
+        state: &PlacementControllerState,
+        node_id: IncarnationId,
+    ) -> tokio::sync::mpsc::Receiver<ControllerDirective> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        state.membership.write().await.register_node(
+            crate::RuntimeRegistration {
+                node_id,
+                host: "127.0.0.1".to_owned(),
+                port: 7233,
+                zone: None,
+                version: "v".to_owned(),
+                build_id: "b".to_owned(),
+            },
+            RuntimeHeartbeat::empty(),
+            Some(tx),
+        );
+        rx
+    }
+
     #[tokio::test]
-    async fn refresh_bundle_returns_current_owner_with_epoch_and_endpoint() {
+    async fn current_snapshot_returns_current_owner_with_epoch_and_endpoint() {
         let state = state();
         let node_id = IncarnationId::new();
         let epoch = match state
@@ -553,80 +329,38 @@ mod tests {
             other => panic!("unexpected lease outcome: {other:?}"),
         };
 
-        let response = state
-            .refresh_bundle(Request::new(RefreshBundleRequest { bundle_id: 1 }))
-            .await
-            .unwrap()
-            .into_inner();
+        let snapshot = state.current_snapshot().await.unwrap();
 
-        let bundle = response.bundle.unwrap();
-        let Some(proto::bundle_ownership_entry::State::Owner(owner)) = bundle.state else {
-            panic!("expected owned bundle");
-        };
-        assert_eq!(owner.owner_node_id, node_id.to_string());
-        assert_eq!(owner.epoch, epoch.0);
-        let node = response.node.unwrap();
-        let Some(proto::node_endpoint_entry::State::Endpoint(endpoint)) = node.state else {
-            panic!("expected endpoint");
-        };
-        assert_eq!(endpoint.host, "127.0.0.1");
-        assert_eq!(endpoint.port, 7233);
+        assert_eq!(
+            snapshot.lookup_bundle_owner(ShardId(1)).copied(),
+            Some(tokeira_types::BundleOwner { node_id, epoch })
+        );
+        let endpoint = snapshot
+            .node_endpoints_iter()
+            .find_map(|(candidate, endpoint)| (candidate == node_id).then_some(endpoint));
+        assert_eq!(endpoint, Some(&"127.0.0.1:7233".parse().unwrap()));
     }
 
     #[tokio::test]
-    async fn scale_in_candidates_exclude_draining_and_report_headroom() {
+    async fn stream_open_queues_placement_then_budget() {
         let state = state();
-        let draining = IncarnationId::new();
-        let healthy = IncarnationId::new();
-        {
-            let mut membership = state.membership.write().await;
-            membership.register_node(
-                crate::RuntimeRegistration {
-                    node_id: draining,
-                    host: "127.0.0.1".to_owned(),
-                    port: 7233,
-                    zone: None,
-                    version: "v".to_owned(),
-                    build_id: "b".to_owned(),
-                },
-                RuntimeHeartbeat {
-                    owned_bundle_count: 2,
-                    available_connections: 3,
-                    connection_rate_headroom: 1.5,
-                    ..RuntimeHeartbeat::empty()
-                },
-                None,
-            );
-            membership.register_node(
-                crate::RuntimeRegistration {
-                    node_id: healthy,
-                    host: "127.0.0.1".to_owned(),
-                    port: 7234,
-                    zone: None,
-                    version: "v".to_owned(),
-                    build_id: "b".to_owned(),
-                },
-                RuntimeHeartbeat {
-                    owned_bundle_count: 1,
-                    available_connections: 5,
-                    connection_rate_headroom: 2.5,
-                    ..RuntimeHeartbeat::empty()
-                },
-                None,
-            );
-        }
-        state.drain.write().await.mark_draining(draining);
+        let node_id = IncarnationId::new();
+        let mut rx = register_with_directives(&state, node_id).await;
 
-        let response = state
-            .nominate_scale_in_candidates(Request::new(NominateRequest { limit: 10 }))
-            .await
-            .unwrap()
-            .into_inner();
+        state.publish_initial_directives(node_id).await.unwrap();
 
-        assert_eq!(response.candidates.len(), 1);
-        assert_eq!(response.candidates[0].node_id, healthy.to_string());
-        assert_eq!(response.aggregate_available_connections, 8);
-        assert_eq!(response.aggregate_connection_rate_headroom, 4.0);
+        let ControllerDirective::DesiredPlacement(desired) = rx.recv().await.unwrap() else {
+            panic!("placement must be the first stream directive");
+        };
+        assert_eq!(
+            desired.acquire_bundles,
+            vec![ShardId(0), ShardId(1), ShardId(2), ShardId(3)]
+        );
+        let ControllerDirective::ConnectionBudget(budget) = rx.recv().await.unwrap() else {
+            panic!("budget must be the second stream directive");
+        };
+        assert_eq!(budget.rate_per_second, 10.0);
+        assert_eq!(budget.capacity, 11);
     }
 
     #[tokio::test]
@@ -662,39 +396,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_node_draining_updates_membership_and_drain_state() {
+    async fn periodic_loops_publish_fresh_placement_and_budgets() {
         let state = state();
         let node_id = IncarnationId::new();
-        state.membership.write().await.register_node(
-            crate::RuntimeRegistration {
-                node_id,
-                host: "127.0.0.1".to_owned(),
-                port: 7233,
-                zone: None,
-                version: "v".to_owned(),
-                build_id: "b".to_owned(),
-            },
-            RuntimeHeartbeat::empty(),
-            None,
-        );
+        let mut rx = register_with_directives(&state, node_id).await;
 
-        state
-            .mark_node_draining(Request::new(MarkDrainingRequest {
-                node_id: node_id.to_string(),
-            }))
-            .await
-            .unwrap();
+        assert_eq!(state.publish_desired_placements().await.unwrap(), 1);
+        assert!(matches!(
+            rx.recv().await,
+            Some(ControllerDirective::DesiredPlacement(_))
+        ));
 
         assert_eq!(
             state
-                .membership
-                .read()
+                .allocate_and_publish_connection_budgets(node_id)
                 .await
-                .get(node_id)
-                .unwrap()
-                .membership_state,
-            NodeMembershipState::Draining
+                .unwrap(),
+            1
         );
-        assert!(state.drain.read().await.is_draining(node_id));
+        assert!(matches!(
+            rx.recv().await,
+            Some(ControllerDirective::ConnectionBudget(_))
+        ));
     }
 }

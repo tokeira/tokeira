@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use tokeira_types::{IncarnationId, NodeReachability, ShardId};
 use tokio::sync::mpsc;
 
+use crate::placement::{ConnectionBudgetDirective, DesiredPlacementDirective};
+
 /// Runtime registration sent as the first membership-stream message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeRegistration {
@@ -51,10 +53,13 @@ pub struct RuntimeHeartbeat {
     pub(crate) lane_pressures: Vec<LanePressure>,
 }
 
-/// Controller directive placeholder used by membership stream state.
+/// Transport-neutral directive queued for one runtime membership stream.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ControllerDirective {
-    Drain,
+    /// The bundles this runtime should acquire or relinquish.
+    DesiredPlacement(DesiredPlacementDirective),
+    /// This runtime's share of the cluster-wide DSQL connection budget.
+    ConnectionBudget(ConnectionBudgetDirective),
 }
 
 /// Local stream state for one runtime node.
@@ -134,6 +139,27 @@ impl LiveMembership {
         }
     }
 
+    /// Mark a disconnected stream suspect only if it is still the registered
+    /// stream for this node incarnation.
+    ///
+    /// A reconnect replaces the channel in the membership map. Without this
+    /// identity check, the old reader task can finish later and incorrectly
+    /// demote the healthy replacement stream to `GracePeriod`.
+    pub(crate) fn mark_grace_period_for_stream(
+        &mut self,
+        node_id: IncarnationId,
+        directive_tx: &mpsc::Sender<ControllerDirective>,
+    ) {
+        let is_current = self
+            .nodes
+            .get(&node_id)
+            .and_then(|node| node.directive_tx.as_ref())
+            .is_some_and(|current| current.same_channel(directive_tx));
+        if is_current {
+            self.mark_grace_period(node_id);
+        }
+    }
+
     pub fn mark_unavailable(&mut self, node_id: IncarnationId) {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.membership_state = NodeMembershipState::Unavailable;
@@ -166,6 +192,15 @@ impl LiveMembership {
 
     pub fn get(&self, node_id: IncarnationId) -> Option<&LiveNode> {
         self.nodes.get(&node_id)
+    }
+
+    pub(crate) fn directive_sender(
+        &self,
+        node_id: IncarnationId,
+    ) -> Option<mpsc::Sender<ControllerDirective>> {
+        self.nodes
+            .get(&node_id)
+            .and_then(|node| node.directive_tx.clone())
     }
 
     pub(crate) fn active_node_ids_sorted(&self) -> Vec<IncarnationId> {

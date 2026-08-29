@@ -54,7 +54,10 @@ use crate::{
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     heartbeat::{InMemoryHeartbeatStore, spawn_heartbeat_maintenance},
     lane::{LaneConfig, LaneHandle, spawn_lane_with_id},
-    membership::{ConnectionBudgetApplier, HeartbeatInputs, MembershipClient, MembershipConfig},
+    membership::{
+        ConnectionBudgetApplier, HeartbeatInputs, MembershipClient, MembershipConfig,
+        MembershipShardLifecycle,
+    },
     metrics as runtime_metrics,
     nexus::{
         CompletionCallbackTrackingState, NexusCompletionDeps, NexusEndpointRegistry,

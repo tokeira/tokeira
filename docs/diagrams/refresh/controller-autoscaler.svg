@@ -37,7 +37,7 @@
 <rect x="1600" y="30" width="730" height="94" rx="18" fill="#FFFFFF" stroke="#D8D2C8" stroke-width="1.2"/>
 <text x="1626" y="60" class="subhead" fill="#1B1714">Flow key</text>
 <path d="M1630,84 L1695,84" fill="none" stroke="#0B7285" stroke-width="3" opacity="1" marker-end="url(#arr_cyan)" marker-start="url(#arr_cyan_start)"/>
-<text x="1710" y="88" class="micro">bidi gRPC stream</text>
+<text x="1710" y="88" class="micro">bidi Connect stream</text>
 <path d="M1870,84 L1935,84" fill="none" stroke="#B85C38" stroke-width="3" opacity="1" stroke-dasharray="8 7" marker-end="url(#arr_purple)"/>
 <text x="1950" y="88" class="micro">DSQL read/write or leader lease</text>
 <path d="M1630,110 L1695,110" fill="none" stroke="#8A8378" stroke-width="3" opacity="1" stroke-dasharray="7 7" marker-end="url(#arr_gray)"/>
@@ -371,6 +371,7 @@
 <rect x="70" y="1506" width="2260" height="52" rx="18" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.5"/>
 <text x="100" y="1538" class="subhead" fill="#9A4A2C">Core invariant:</text>
 <text x="216" y="1538" class="small" fill="#4A443C">autoscaler may add/remove capacity, but only controller placement + DSQL epoch fencing define who may own and commit bundles.</text>
+<text x="1560" y="1538" class="small" fill="#6E6860">internal control plane: Connect protocol via connect-rust</text>
 <text x="2330" y="1582" class="micro" fill="#6E6860" text-anchor="end">Editable SVG • Tokeira controller/autoscaler coordination model</text>
 <g transform="translate(2308,1512)" stroke="#B85C38" stroke-width="2.4" stroke-linecap="round" opacity=".8">
   <path d="M0 40 C3 24 7 12 13 0" fill="none"/>

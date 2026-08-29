@@ -59,13 +59,28 @@ where
                 self.node_endpoint.clone(),
             )
             .await?;
-        let epoch = match outcome {
-            LeaseOutcome::Acquired { epoch } => epoch,
+        let (epoch, renewed) = match outcome {
+            LeaseOutcome::Acquired { epoch } => (epoch, false),
             LeaseOutcome::Rejected { .. } => {
                 return Err(lease_rejected_error(shard_id));
             }
-            LeaseOutcome::Renewed { epoch } => epoch,
+            LeaseOutcome::Renewed { epoch } => (epoch, true),
         };
+
+        // Placement is level-triggered, so reconnects and periodic controller
+        // loops can repeat a directive already enacted by this runtime. Renew
+        // against durable truth first, then leave the existing recovery state
+        // and renewer alone when this exact epoch is already Active.
+        if renewed
+            && self
+                .shard_owner
+                .read()
+                .expect("shard_owner lock poisoned")
+                .owns(shard_id)
+                == Some(epoch)
+        {
+            return Ok(epoch);
+        }
 
         let cancel = {
             let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
@@ -162,6 +177,36 @@ where
     }
 }
 
+#[async_trait::async_trait]
+impl<R> MembershipShardLifecycle for TokeiraRuntime<R>
+where
+    R: RunRepository + LeaseRepository + 'static,
+{
+    async fn acquire_shard(&self, shard_id: ShardId) -> Result<ShardEpoch> {
+        TokeiraRuntime::acquire_shard(self, shard_id).await
+    }
+
+    async fn relinquish_shard(&self, shard_id: ShardId) -> Result<()> {
+        let epoch = self
+            .shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .epoch_of(shard_id)
+            .unwrap_or(ShardEpoch::ZERO);
+        if epoch == ShardEpoch::ZERO {
+            return Ok(());
+        }
+        let outcome = self
+            .repo
+            .relinquish_bundle(shard_id, self.owner_identity.clone(), epoch)
+            .await?;
+        if matches!(outcome, LeaseOutcome::Acquired { .. }) {
+            TokeiraRuntime::relinquish_shard(self, shard_id).await;
+        }
+        Ok(())
+    }
+}
+
 impl<R> TokeiraRuntime<R>
 where
     R: RunRepository + LeaseRepository + 'static,
@@ -170,24 +215,182 @@ where
     /// handle.
     ///
     /// The client streams registration and heartbeats to the controller and
-    /// applies the directives it receives (placement, connection budget, drain)
-    /// by mutating the shared `ShardOwner`, `RuntimeDrain`, and the supplied
-    /// `budget_applier`. It runs until `shutdown` is cancelled. Available only
-    /// when the repository is also a [`LeaseRepository`], since acting on
+    /// applies the directives it receives (placement, connection budget, drain).
+    /// Placement delegates back to this runtime so acquisition includes lease
+    /// renewal, durable recovery, and activation; budget and drain state use the
+    /// supplied collaborators. It runs until `shutdown` is cancelled. Available
+    /// only when the repository is also a [`LeaseRepository`], since acting on
     /// placement directives requires lease operations.
     pub fn spawn_membership_client(
-        &self,
+        self: &Arc<Self>,
         config: MembershipConfig,
         budget_applier: Arc<dyn ConnectionBudgetApplier>,
         shutdown: CancellationToken,
     ) -> tokio::task::JoinHandle<Result<()>> {
         let client = MembershipClient::new(
             config,
-            self.repo.clone(),
+            Arc::clone(self) as Arc<dyn MembershipShardLifecycle>,
             self.shard_owner.clone(),
             self.runtime_drain.clone(),
             budget_applier,
         );
         tokio::spawn(client.run(shutdown))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokeira_proto::connect::tokeira::internal::controller::v1::{
+        self as pb, controller_directive,
+    };
+    use tokeira_storage::InMemoryStore;
+    use tokeira_types::{
+        Memo, NodeEndpoint, RequestId, SearchAttributes, WorkflowId, WorkflowType,
+    };
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct NoopBudgetApplier;
+
+    impl ConnectionBudgetApplier for NoopBudgetApplier {
+        fn apply_budget(
+            &self,
+            _rate_per_second: f64,
+            _capacity: u64,
+            _max_reservoir_size: u32,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn directive_takeover_activates_shard_and_passes_commit_fence() -> Result<()> {
+        let store = Arc::new(InMemoryStore::default());
+        let node_id = IncarnationId::new();
+        let endpoint = NodeEndpoint {
+            host: "127.0.0.1".to_owned(),
+            port: 7233,
+        };
+        let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
+            Arc::clone(&store),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+            ActivityTimeoutScannerConfig::default(),
+            NexusTimeoutScannerConfig::default(),
+            NexusEndpointRegistry::default(),
+            Arc::new(NoopNexusHttpClient),
+            NexusCompletionDeps::default(),
+            1,
+            node_id.to_string(),
+            endpoint.as_authority(),
+            false,
+            None,
+        ));
+        let client = MembershipClient::new(
+            MembershipConfig {
+                controller_endpoint: "http://127.0.0.1:7240".to_owned(),
+                heartbeat_interval: std::time::Duration::from_secs(5),
+                reconnect_base_delay: std::time::Duration::from_secs(1),
+                reconnect_max_delay: std::time::Duration::from_secs(30),
+                node_id,
+                node_endpoint: endpoint,
+                zone: None,
+                version: "test".to_owned(),
+                build_id: "test".to_owned(),
+            },
+            Arc::clone(&runtime) as Arc<dyn MembershipShardLifecycle>,
+            Arc::clone(&runtime.shard_owner),
+            Arc::clone(&runtime.runtime_drain),
+            Arc::new(NoopBudgetApplier),
+        );
+
+        client
+            .handle_directive(pb::ControllerDirective {
+                directive: Some(controller_directive::Directive::DesiredPlacement(
+                    pb::DesiredPlacementDirective {
+                        acquire_bundles: vec![0],
+                        ..Default::default()
+                    }
+                    .into(),
+                )),
+                ..Default::default()
+            })
+            .await?;
+
+        let epoch = runtime
+            .shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .owns(ShardId(0))
+            .expect("directive takeover must finish in Active");
+        let request = start_request();
+        let run_key = request.run_key;
+        let result = runtime.start_workflow(request).await?;
+        assert!(matches!(result, CommitResult::Applied { .. }));
+        assert_eq!(runtime.current_shard_epoch(run_key).await?, epoch);
+        Ok(())
+    }
+
+    fn start_request() -> StartRequest {
+        let run_id = tokeira_types::RunId::new();
+        StartRequest {
+            initiator: None,
+            run_key: RunKey::new(),
+            namespace_id: NamespaceId::new(),
+            workflow_id: WorkflowId("directive-takeover".to_owned()),
+            run_id,
+            workflow_type: WorkflowType("test".to_owned()),
+            task_queue: TaskQueueName("test".to_owned()),
+            input: Payloads::default(),
+            header: None,
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: Duration::seconds(10),
+            retry_policy: None,
+            conflict_policy: WorkflowIdConflictPolicy::Fail,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            deployment: None,
+            build_id: None,
+            versioning_override: None,
+            workflow_start_delay: None,
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            on_conflict_options: None,
+            priority: None,
+            attempt: 1,
+            continued_execution_run_id: None,
+            first_execution_run_id: None,
+            parent_run_key: None,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_namespace_name: None,
+            parent_initiated_event_id: 0,
+            root_workflow_id: None,
+            root_run_id: None,
+            original_execution_run_id: Some(run_id),
+            continued_failure: None,
+            last_completion_result: None,
+            first_run_started_at: None,
+            request: RequestContext {
+                request_id: RequestId("directive-takeover".to_owned()),
+                caller_identity: None,
+                principal: None,
+                received_at: OffsetDateTime::now_utc(),
+            },
+            now: OffsetDateTime::now_utc(),
+            client_cron_schedule: None,
+            cron_schedule: None,
+            eager_execution_accepted: false,
+            reserved_poller_identity: None,
+            inherited_versioning_info: None,
+        }
     }
 }

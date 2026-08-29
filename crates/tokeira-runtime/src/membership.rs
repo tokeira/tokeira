@@ -14,9 +14,9 @@
 //!
 //! Invariants this client upholds:
 //! - **The controller owns placement; bundle ownership is lease-gated.** Acquiring
-//!   or relinquishing a bundle is mediated by the [`LeaseRepository`]: local
-//!   [`ShardOwner`] state is only updated after the lease store confirms the
-//!   acquire/relinquish, so two nodes cannot both believe they own a bundle.
+//!   or relinquishing a bundle is delegated to one runtime lifecycle unit: local
+//!   [`ShardOwner`] state is only made active after the lease store confirms the
+//!   acquire and durable recovery completes.
 //! - **Disconnects must not silently keep a stale connection budget.** A budget
 //!   directive carries an expiry; on reconnect, if the last budget has expired the
 //!   client resets to a safe minimal budget rather than continuing to honour a
@@ -31,6 +31,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokeira_proto::connect::tokeira::internal::controller::v1::{
@@ -38,7 +39,6 @@ use tokeira_proto::connect::tokeira::internal::controller::v1::{
     RuntimeMembershipRequest, RuntimeRegistration, controller_directive,
     runtime_membership_request,
 };
-use tokeira_storage::{LeaseOutcome, LeaseRepository};
 use tokeira_types::{IncarnationId, NodeEndpoint, ShardEpoch, ShardId};
 use tokio_util::sync::CancellationToken;
 
@@ -78,18 +78,31 @@ impl MembershipConfig {
     }
 }
 
+/// Runtime-owned shard takeover and relinquishment unit used by membership
+/// directives.
+///
+/// Implementations must not report acquisition success until the shard is
+/// ready for admission. In production that means the durable lease is held,
+/// lease renewal is running, recovery has swept durable history, and the local
+/// owner state has transitioned from `Sweeping` to `Active`.
+#[async_trait]
+pub trait MembershipShardLifecycle: Send + Sync + std::fmt::Debug {
+    /// Acquire and fully activate one controller-assigned shard.
+    async fn acquire_shard(&self, shard_id: ShardId) -> Result<ShardEpoch>;
+
+    /// Relinquish one controller-assigned shard and its durable lease.
+    async fn relinquish_shard(&self, shard_id: ShardId) -> Result<()>;
+}
+
 /// Client that drives the runtime's placement-controller membership stream.
 ///
-/// Holds the runtime-owned dependencies directive handling needs: the lease
-/// repository (placement is lease-gated), the local [`ShardOwner`] view, the
-/// drain coordinator, and the connection-budget applier. Generic over the
-/// [`LeaseRepository`] so it can run against any storage backend.
-pub struct MembershipClient<R>
-where
-    R: LeaseRepository + 'static,
-{
+/// Placement directives cross a lifecycle boundary rather than manipulating
+/// leases and [`ShardOwner`] independently. Production supplies the enclosing
+/// `TokeiraRuntime`, whose acquisition unit performs the recovery sweep and
+/// starts lease renewal before making a shard active.
+pub struct MembershipClient {
     config: MembershipConfig,
-    leases: Arc<R>,
+    shard_lifecycle: Arc<dyn MembershipShardLifecycle>,
     shard_owner: Arc<RwLock<ShardOwner>>,
     drain: Arc<RuntimeDrain>,
     budget_applier: Arc<dyn ConnectionBudgetApplier>,
@@ -102,14 +115,11 @@ struct BudgetExpiry {
     seconds: i64,
 }
 
-impl<R> Clone for MembershipClient<R>
-where
-    R: LeaseRepository + 'static,
-{
+impl Clone for MembershipClient {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            leases: Arc::clone(&self.leases),
+            shard_lifecycle: Arc::clone(&self.shard_lifecycle),
             shard_owner: Arc::clone(&self.shard_owner),
             drain: Arc::clone(&self.drain),
             budget_applier: Arc::clone(&self.budget_applier),
@@ -118,10 +128,7 @@ where
     }
 }
 
-impl<R> std::fmt::Debug for MembershipClient<R>
-where
-    R: LeaseRepository + 'static,
-{
+impl std::fmt::Debug for MembershipClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MembershipClient")
             .field("config", &self.config)
@@ -129,21 +136,18 @@ where
     }
 }
 
-impl<R> MembershipClient<R>
-where
-    R: LeaseRepository + 'static,
-{
+impl MembershipClient {
     /// Construct a client. Does not open the stream — call [`run`](Self::run).
     pub fn new(
         config: MembershipConfig,
-        leases: Arc<R>,
+        shard_lifecycle: Arc<dyn MembershipShardLifecycle>,
         shard_owner: Arc<RwLock<ShardOwner>>,
         drain: Arc<RuntimeDrain>,
         budget_applier: Arc<dyn ConnectionBudgetApplier>,
     ) -> Self {
         Self {
             config,
-            leases,
+            shard_lifecycle,
             shard_owner,
             drain,
             budget_applier,
@@ -396,10 +400,7 @@ impl HeartbeatInputs {
     }
 }
 
-impl<R> MembershipClient<R>
-where
-    R: LeaseRepository + 'static,
-{
+impl MembershipClient {
     /// Handle a controller directive from the zero-copy view.
     /// Only allocates when storing data (lease owner strings for DSQL operations).
     pub async fn handle_directive_view(
@@ -411,24 +412,12 @@ where
         match &directive.directive {
             Some(Directive::DesiredPlacement(desired)) => {
                 for &bundle in desired.acquire_bundles.iter() {
-                    let bundle = ShardId(bundle);
-                    let outcome = self
-                        .leases
-                        .try_acquire_bundle(
-                            bundle,
-                            self.config.owner_identity(),
-                            self.config.node_endpoint.as_authority(),
-                        )
-                        .await?;
-                    if let LeaseOutcome::Acquired { epoch } = outcome {
-                        self.shard_owner
-                            .write()
-                            .expect("shard_owner lock poisoned")
-                            .record_acquired(bundle, epoch);
-                    }
+                    self.shard_lifecycle.acquire_shard(ShardId(bundle)).await?;
                 }
                 for &bundle in desired.relinquish_bundles.iter() {
-                    self.relinquish_owned_bundle(ShardId(bundle)).await?;
+                    self.shard_lifecycle
+                        .relinquish_shard(ShardId(bundle))
+                        .await?;
                 }
             }
             Some(Directive::ConnectionBudget(budget)) => {
@@ -458,7 +447,7 @@ where
                     .owned_shards()
                     .collect::<Vec<_>>();
                 for bundle in bundles {
-                    self.relinquish_owned_bundle(bundle).await?;
+                    self.shard_lifecycle.relinquish_shard(bundle).await?;
                 }
                 let owned_bundle_count = self
                     .shard_owner
@@ -479,24 +468,12 @@ where
         match directive.directive {
             Some(controller_directive::Directive::DesiredPlacement(desired)) => {
                 for bundle in desired.acquire_bundles {
-                    let bundle = ShardId(bundle);
-                    let outcome = self
-                        .leases
-                        .try_acquire_bundle(
-                            bundle,
-                            self.config.owner_identity(),
-                            self.config.node_endpoint.as_authority(),
-                        )
-                        .await?;
-                    if let LeaseOutcome::Acquired { epoch } = outcome {
-                        self.shard_owner
-                            .write()
-                            .expect("shard_owner lock poisoned")
-                            .record_acquired(bundle, epoch);
-                    }
+                    self.shard_lifecycle.acquire_shard(ShardId(bundle)).await?;
                 }
                 for bundle in desired.relinquish_bundles {
-                    self.relinquish_owned_bundle(ShardId(bundle)).await?;
+                    self.shard_lifecycle
+                        .relinquish_shard(ShardId(bundle))
+                        .await?;
                 }
             }
             Some(controller_directive::Directive::ConnectionBudget(budget)) => {
@@ -511,7 +488,7 @@ where
                     .owned_shards()
                     .collect::<Vec<_>>();
                 for bundle in bundles {
-                    self.relinquish_owned_bundle(bundle).await?;
+                    self.shard_lifecycle.relinquish_shard(bundle).await?;
                 }
                 let owned_bundle_count = self
                     .shard_owner
@@ -566,26 +543,6 @@ where
             }
         }
     }
-
-    async fn relinquish_owned_bundle(&self, bundle: ShardId) -> Result<()> {
-        let epoch = {
-            let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
-            owner.epoch_of(bundle).unwrap_or(ShardEpoch::ZERO)
-        };
-        if epoch == ShardEpoch::ZERO {
-            return Ok(());
-        }
-        let outcome = self
-            .leases
-            .relinquish_bundle(bundle, self.config.owner_identity(), epoch)
-            .await?;
-        if matches!(outcome, LeaseOutcome::Acquired { .. }) {
-            let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
-            owner.mark_draining(bundle);
-            owner.remove(bundle);
-        }
-        Ok(())
-    }
 }
 
 /// Runtime boundary for controller-provided DSQL connection budgets.
@@ -624,7 +581,7 @@ pub fn budget_valid_until_expired(valid_until_seconds: Option<i64>) -> bool {
 mod tests {
     use std::sync::Mutex;
 
-    use tokeira_storage::{InMemoryStore, LeaseRepository};
+    use tokeira_storage::{InMemoryStore, LeaseOutcome, LeaseRepository};
 
     use super::*;
 
@@ -649,6 +606,58 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TestShardLifecycle {
+        store: Arc<InMemoryStore>,
+        shard_owner: Arc<RwLock<ShardOwner>>,
+        owner_identity: String,
+        node_endpoint: String,
+    }
+
+    #[async_trait]
+    impl MembershipShardLifecycle for TestShardLifecycle {
+        async fn acquire_shard(&self, shard_id: ShardId) -> Result<ShardEpoch> {
+            let outcome = self
+                .store
+                .try_acquire_bundle(
+                    shard_id,
+                    self.owner_identity.clone(),
+                    self.node_endpoint.clone(),
+                )
+                .await?;
+            let epoch = match outcome {
+                LeaseOutcome::Acquired { epoch } | LeaseOutcome::Renewed { epoch } => epoch,
+                LeaseOutcome::Rejected { .. } => return Err(anyhow!("test lease rejected")),
+            };
+            let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
+            let _ = owner.record_acquired(shard_id, epoch);
+            owner.mark_active(shard_id);
+            Ok(epoch)
+        }
+
+        async fn relinquish_shard(&self, shard_id: ShardId) -> Result<()> {
+            let epoch = self
+                .shard_owner
+                .read()
+                .expect("shard_owner lock poisoned")
+                .epoch_of(shard_id)
+                .unwrap_or(ShardEpoch::ZERO);
+            if epoch == ShardEpoch::ZERO {
+                return Ok(());
+            }
+            let outcome = self
+                .store
+                .relinquish_bundle(shard_id, self.owner_identity.clone(), epoch)
+                .await?;
+            if matches!(outcome, LeaseOutcome::Acquired { .. }) {
+                let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
+                owner.mark_draining(shard_id);
+                owner.remove(shard_id);
+            }
+            Ok(())
+        }
+    }
+
     fn config() -> MembershipConfig {
         MembershipConfig {
             controller_endpoint: "http://127.0.0.1:7240".to_owned(),
@@ -669,11 +678,19 @@ mod tests {
     fn client(
         store: Arc<InMemoryStore>,
         budget_applier: Arc<RecordingBudgetApplier>,
-    ) -> MembershipClient<InMemoryStore> {
-        MembershipClient::new(
-            config(),
+    ) -> MembershipClient {
+        let config = config();
+        let shard_owner = Arc::new(RwLock::new(ShardOwner::new(4)));
+        let shard_lifecycle = Arc::new(TestShardLifecycle {
             store,
-            Arc::new(RwLock::new(ShardOwner::new(4))),
+            shard_owner: Arc::clone(&shard_owner),
+            owner_identity: config.owner_identity(),
+            node_endpoint: config.node_endpoint.as_authority(),
+        });
+        MembershipClient::new(
+            config,
+            shard_lifecycle,
+            shard_owner,
             Arc::new(RuntimeDrain::default()),
             budget_applier,
         )

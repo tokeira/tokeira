@@ -7,18 +7,20 @@
 use connectrpc::{RequestContext, Response, ServiceResult, ServiceStream};
 use futures::StreamExt;
 use tokeira_proto::connect::tokeira::internal::controller::v1::{
-    self as pb, BundleOwnerMessage, BundleOwnershipEntry, ControllerDirective, FullRoutingSnapshot,
-    MarkDrainingResponse, NodeEndpointEntry, NodeEndpointMessage, NominateResponse,
-    OwnedMarkDrainingRequestView, OwnedNominateRequestView, OwnedRefreshBundleRequestView,
-    OwnedRuntimeMembershipRequestView, OwnedSubscribeRoutingRequestView, PlacementConfigMessage,
-    PlacementController, RefreshBundleResponse, RoutingUpdate, ScaleInCandidate,
-    bundle_ownership_entry, node_endpoint_entry, routing_update,
+    self as pb, BundleOwnerMessage, BundleOwnershipEntry,
+    ControllerDirective as WireControllerDirective, FullRoutingSnapshot, MarkDrainingResponse,
+    NodeEndpointEntry, NodeEndpointMessage, NominateResponse, OwnedMarkDrainingRequestView,
+    OwnedNominateRequestView, OwnedRefreshBundleRequestView, OwnedRuntimeMembershipRequestView,
+    OwnedSubscribeRoutingRequestView, PlacementConfigMessage, PlacementController,
+    RefreshBundleResponse, RoutingUpdate, ScaleInCandidate, bundle_ownership_entry,
+    node_endpoint_entry, routing_update,
 };
 use tokeira_types::{IncarnationId, PlacementConfig, ShardId};
 
 use crate::{
     PlacementControllerState,
-    membership::{NodeDrainState, RuntimeHeartbeat, RuntimeRegistration},
+    membership::{ControllerDirective, NodeDrainState, RuntimeHeartbeat, RuntimeRegistration},
+    metrics,
 };
 
 /// Connect-rust service wrapper around the shared controller state.
@@ -38,67 +40,74 @@ impl PlacementController for ConnectPlacementController {
         &self,
         _ctx: RequestContext,
         requests: ServiceStream<OwnedRuntimeMembershipRequestView>,
-    ) -> ServiceResult<ServiceStream<ControllerDirective>> {
-        let state = self.state.clone();
+    ) -> ServiceResult<ServiceStream<WireControllerDirective>> {
+        use pb::runtime_membership_request::Request;
+
+        let mut stream = requests;
+        let Some(first) = stream.next().await else {
+            return Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::InvalidArgument,
+                "membership stream closed before registration",
+            ));
+        };
+        let first = first?;
+        let Some(Request::Registration(registration)) = first.to_owned_message().request else {
+            return Err(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::InvalidArgument,
+                "first membership message must be registration",
+            ));
+        };
+        let registration = decode_registration(*registration)?;
+        let node_id = registration.node_id;
         let (tx, rx) = tokio::sync::mpsc::channel::<ControllerDirective>(16);
+        {
+            let mut membership = self.state.membership.write().await;
+            membership.register_node(registration, RuntimeHeartbeat::empty(), Some(tx.clone()));
+            metrics::set_membership_nodes_total(membership.nodes().count());
+        }
+        if let Err(error) = self.state.publish_initial_directives(node_id).await {
+            self.state
+                .membership
+                .write()
+                .await
+                .mark_grace_period_for_stream(node_id, &tx);
+            return Err(connectrpc::ConnectError::internal(error.to_string()));
+        }
 
+        let state = self.state.clone();
+        let stream_tx = tx.clone();
         tokio::spawn(async move {
-            use pb::runtime_membership_request::Request;
-
-            let mut stream = requests;
-            let mut node_id: Option<IncarnationId> = None;
-
             while let Some(msg) = stream.next().await {
-                let Ok(msg) = msg else { break };
+                let Ok(msg) = msg else {
+                    break;
+                };
                 let owned = msg.to_owned_message();
 
                 match owned.request {
-                    Some(Request::Registration(reg)) => {
-                        let incarnation = match reg.node_id.parse::<uuid::Uuid>() {
-                            Ok(uuid) => IncarnationId(uuid),
-                            Err(_) => break,
-                        };
-                        node_id = Some(incarnation);
-                        let registration = RuntimeRegistration {
-                            node_id: incarnation,
-                            host: reg.host,
-                            port: reg.port as u16,
-                            zone: if reg.zone.is_empty() {
-                                None
-                            } else {
-                                Some(reg.zone)
-                            },
-                            version: reg.version,
-                            build_id: reg.build_id,
-                        };
-                        state.membership.write().await.register_node(
-                            registration,
-                            RuntimeHeartbeat::empty(),
-                            None,
-                        );
-                    }
                     Some(Request::Heartbeat(hb)) => {
-                        if let Some(nid) = node_id {
-                            let heartbeat = decode_heartbeat(&hb);
-                            state
-                                .drain
-                                .write()
-                                .await
-                                .record_progress(nid, heartbeat.drain_state);
-                            state
-                                .membership
-                                .write()
-                                .await
-                                .update_heartbeat(nid, heartbeat);
-                        }
+                        let heartbeat = decode_heartbeat(&hb);
+                        let mut drain = state.drain.write().await;
+                        drain.record_progress(node_id, heartbeat.drain_state);
+                        metrics::set_drain_active_nodes(drain.active_count());
+                        drop(drain);
+                        let mut membership = state.membership.write().await;
+                        membership.update_heartbeat(node_id, heartbeat);
+                        metrics::set_membership_nodes_total(membership.nodes().count());
                     }
+                    // Registration is a stream-opening frame. Re-registration
+                    // uses a new stream so its response channel and disconnect
+                    // fencing are replaced atomically in LiveMembership.
+                    Some(Request::Registration(_)) => {}
                     None => {}
                 }
             }
-            drop(tx);
+            let mut membership = state.membership.write().await;
+            membership.mark_grace_period_for_stream(node_id, &stream_tx);
+            metrics::set_membership_nodes_total(membership.nodes().count());
         });
 
-        let response_stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok);
+        let response_stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+            .map(|directive| Ok(encode_controller_directive(directive)));
         Response::stream_ok(response_stream)
     }
 
@@ -241,6 +250,74 @@ fn decode_heartbeat(hb: &pb::RuntimeHeartbeat) -> RuntimeHeartbeat {
     }
 }
 
+fn decode_registration(
+    registration: pb::RuntimeRegistration,
+) -> Result<RuntimeRegistration, connectrpc::ConnectError> {
+    let node_id = registration
+        .node_id
+        .parse::<uuid::Uuid>()
+        .map(IncarnationId)
+        .map_err(|_| {
+            connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::InvalidArgument,
+                "registration node_id must be a UUID",
+            )
+        })?;
+    let port = u16::try_from(registration.port).map_err(|_| {
+        connectrpc::ConnectError::new(
+            connectrpc::ErrorCode::InvalidArgument,
+            "registration port exceeds u16",
+        )
+    })?;
+    Ok(RuntimeRegistration {
+        node_id,
+        host: registration.host,
+        port,
+        zone: (!registration.zone.is_empty()).then_some(registration.zone),
+        version: registration.version,
+        build_id: registration.build_id,
+    })
+}
+
+fn encode_controller_directive(directive: ControllerDirective) -> WireControllerDirective {
+    use pb::controller_directive::Directive;
+
+    let directive = match directive {
+        ControllerDirective::DesiredPlacement(desired) => Directive::DesiredPlacement(
+            pb::DesiredPlacementDirective {
+                acquire_bundles: desired
+                    .acquire_bundles
+                    .into_iter()
+                    .map(|bundle| bundle.0)
+                    .collect(),
+                relinquish_bundles: desired
+                    .relinquish_bundles
+                    .into_iter()
+                    .map(|bundle| bundle.0)
+                    .collect(),
+                ..Default::default()
+            }
+            .into(),
+        ),
+        ControllerDirective::ConnectionBudget(budget) => {
+            let mut encoded = pb::ConnectionBudgetDirective {
+                rate_per_second: budget.rate_per_second,
+                capacity: budget.capacity,
+                max_reservoir_size: budget.max_reservoir_size,
+                ..Default::default()
+            };
+            let valid_until = encoded.valid_until.get_or_insert_default();
+            valid_until.seconds = budget.valid_until.unix_timestamp();
+            valid_until.nanos = budget.valid_until.nanosecond() as i32;
+            Directive::ConnectionBudget(encoded.into())
+        }
+    };
+    WireControllerDirective {
+        directive: Some(directive),
+        ..Default::default()
+    }
+}
+
 fn encode_routing_update(
     snapshot: &tokeira_types::RoutingSnapshot,
     config: &PlacementConfig,
@@ -342,4 +419,92 @@ fn encode_lease_entry(
     };
 
     (bundle, node)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures::{StreamExt, stream};
+    use tokeira_storage::{ControlRepository, InMemoryStore, LeaseRepository};
+
+    use super::*;
+    use crate::ControllerConfig;
+
+    fn service() -> ConnectPlacementController {
+        let store = Arc::new(InMemoryStore::default());
+        ConnectPlacementController::new(PlacementControllerState::new(
+            ControllerConfig {
+                bundle_count: 1,
+                shard_count: 1,
+                dsql_connection_rate_budget: 10.0,
+                dsql_connection_capacity_budget: 10,
+                ..ControllerConfig::default()
+            },
+            Arc::clone(&store) as Arc<dyn LeaseRepository>,
+            store as Arc<dyn ControlRepository>,
+        ))
+    }
+
+    #[tokio::test]
+    async fn served_membership_stream_delivers_initial_and_loop_directives() {
+        use pb::{controller_directive, runtime_membership_request};
+
+        let service = service();
+        let node_id = IncarnationId::new();
+        let request = pb::RuntimeMembershipRequest {
+            request: Some(runtime_membership_request::Request::Registration(
+                pb::RuntimeRegistration {
+                    node_id: node_id.to_string(),
+                    host: "127.0.0.1".to_owned(),
+                    port: 7233,
+                    version: "test".to_owned(),
+                    build_id: "test".to_owned(),
+                    ..Default::default()
+                }
+                .into(),
+            )),
+            ..Default::default()
+        };
+        let request = OwnedRuntimeMembershipRequestView::from_owned(&request).unwrap();
+        // Keep the request side open: closing it represents a disconnected
+        // runtime and correctly moves the node out of active placement.
+        let requests: ServiceStream<OwnedRuntimeMembershipRequestView> =
+            Box::pin(stream::once(async move { Ok(request) }).chain(stream::pending()));
+
+        let mut directives = service
+            .runtime_membership(RequestContext::default(), requests)
+            .await
+            .unwrap()
+            .body;
+
+        let first = directives.next().await.unwrap().unwrap();
+        let Some(controller_directive::Directive::DesiredPlacement(desired)) = first.directive
+        else {
+            panic!("first directive must be desired placement");
+        };
+        assert_eq!(desired.acquire_bundles, vec![0]);
+        assert!(matches!(
+            directives.next().await.unwrap().unwrap().directive,
+            Some(controller_directive::Directive::ConnectionBudget(_))
+        ));
+
+        assert_eq!(service.state.publish_desired_placements().await.unwrap(), 1);
+        assert!(matches!(
+            directives.next().await.unwrap().unwrap().directive,
+            Some(controller_directive::Directive::DesiredPlacement(_))
+        ));
+        assert_eq!(
+            service
+                .state
+                .allocate_and_publish_connection_budgets(node_id)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            directives.next().await.unwrap().unwrap().directive,
+            Some(controller_directive::Directive::ConnectionBudget(_))
+        ));
+    }
 }

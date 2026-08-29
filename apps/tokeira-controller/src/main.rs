@@ -126,8 +126,8 @@ async fn main() -> Result<()> {
     // Unique identity for this controller instance's CAS budget allocations.
     let allocator_id = IncarnationId::new();
 
-    // Spawn the placement loop: scan leases → compute snapshot → CAS advance
-    // generation → publish to subscribers → send desired placement directives.
+    // Spawn the placement loop: scan leases → CAS advance generation → send
+    // desired placement directives.
     let placement_state = state.clone();
     let placement_cancel = cancel.clone();
     let placement_interval =
@@ -202,9 +202,8 @@ fn log_build_info(process: &'static str) {
 /// Periodic placement loop.
 ///
 /// Each tick: read lease state from DSQL, compute the routing snapshot,
-/// advance the generation counter via CAS, and log the result. Directive
-/// publication to connected runtimes happens reactively through the
-/// membership stream (handled by `PlacementControllerState`).
+/// advance the generation counter via CAS, then push current desired placement
+/// through every connected runtime's membership stream.
 async fn run_placement_loop(
     state: PlacementControllerState,
     interval: tokio::time::Duration,
@@ -230,17 +229,30 @@ async fn run_placement_loop(
             }
         };
 
-        match state.advance_snapshot_generation(generation).await {
+        let advanced = match state.advance_snapshot_generation(generation).await {
             Ok(new_gen) => {
                 tracing::debug!(
                     previous = generation.0,
                     current = new_gen.0,
                     "placement loop: generation advanced"
                 );
+                true
             }
             Err(err) => {
                 mark_error_biased_sample(ErrorBiasedSamplingReason::ControllerPlacementError);
                 warn!(%err, "placement loop: generation advance failed");
+                false
+            }
+        };
+        if advanced {
+            match state.publish_desired_placements().await {
+                Ok(delivered) => {
+                    tracing::debug!(delivered, "placement loop: directives published");
+                }
+                Err(err) => {
+                    mark_error_biased_sample(ErrorBiasedSamplingReason::ControllerPlacementError);
+                    warn!(%err, "placement loop: directive publication failed");
+                }
             }
         }
         controller_metrics::record_placement_loop_duration(loop_started.elapsed());
@@ -269,12 +281,12 @@ async fn run_budget_loop(
             _ = ticker.tick() => {}
         }
 
-        match state.allocate_connection_budgets(allocator_id).await {
-            Ok(budgets) if !budgets.is_empty() => {
-                tracing::debug!(
-                    node_count = budgets.len(),
-                    "budget loop: allocated connection budgets"
-                );
+        match state
+            .allocate_and_publish_connection_budgets(allocator_id)
+            .await
+        {
+            Ok(delivered) if delivered > 0 => {
+                tracing::debug!(delivered, "budget loop: connection budgets published");
             }
             Ok(_) => {
                 // CAS conflict — another controller won this cycle.

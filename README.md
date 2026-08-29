@@ -293,16 +293,10 @@ The concurrency model and fleet mechanics are documented in
 
 ## Development
 
-Tokeira uses standard Cargo workflows on a pinned stable Rust toolchain.
-
-```sh
-cargo test --workspace
-```
-
-The workspace test suite requires neither AWS credentials nor Docker.
-
-See [docs/development.md](docs/development.md) for the development environment,
-quality gates, and repository conventions.
+Tokeira builds with standard Cargo on a pinned stable Rust toolchain, and the
+workspace test suite runs without AWS credentials or Docker. The development
+environment, quality gates, and repository conventions are documented in
+[docs/development.md](docs/development.md).
 
 ## Contributing
 

@@ -51,7 +51,7 @@ impl EcsDeployment {
         }
     }
 
-    pub fn default_config_toml() -> String {
+    pub(crate) fn default_config_toml() -> String {
         annotate_image_lifecycle_fields(
             tokeira_config::write_config_toml(&EcsConfig::default()).expect("serializes"),
         )

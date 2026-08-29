@@ -31,8 +31,8 @@ pub enum SecretValue {
 /// Generic provider resource that provisions exactly one Secrets Manager secret.
 #[derive(Debug)]
 pub struct SecretsManagerSecret {
-    pub secret_name: String,
-    pub config: SecretsManagerSecretConfig,
+    pub(crate) secret_name: String,
+    pub(crate) config: SecretsManagerSecretConfig,
     pub project: String,
     pub region: String,
     pub tags: HashMap<String, String>,

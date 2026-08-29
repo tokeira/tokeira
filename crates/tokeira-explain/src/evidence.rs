@@ -19,17 +19,17 @@ pub struct EvidenceId(String);
 
 impl EvidenceId {
     /// The change to one resource: `change:{module}::{resource_id}`.
-    pub fn change(module: &str, resource_id: &str) -> Self {
+    pub(crate) fn change(module: &str, resource_id: &str) -> Self {
         Self(format!("change:{module}::{resource_id}"))
     }
 
     /// One uncertainty: `uncertainty:{reason_tag}:{subject}`.
-    pub fn uncertainty(reason_tag: &str, subject: &EvidenceId) -> Self {
+    pub(crate) fn uncertainty(reason_tag: &str, subject: &EvidenceId) -> Self {
         Self(format!("uncertainty:{reason_tag}:{}", subject.0))
     }
 
     /// One operational impact: `impact:{class_tag}:{subject}`.
-    pub fn impact(class_tag: &str, subject: &EvidenceId) -> Self {
+    pub(crate) fn impact(class_tag: &str, subject: &EvidenceId) -> Self {
         Self(format!("impact:{class_tag}:{}", subject.0))
     }
 
@@ -48,7 +48,7 @@ impl EvidenceId {
     /// group's natural root identity (`revision-comparison:{n}`,
     /// `resource:{change id}`, `provisioner-advance`) — never a member
     /// ordinal, for the same determinism reason as every other id here.
-    pub fn group(root_key: &str) -> Self {
+    pub(crate) fn group(root_key: &str) -> Self {
         Self(format!("group:{root_key}"))
     }
 
@@ -78,7 +78,7 @@ pub enum EvidenceKind {
 pub struct EvidenceIndex(BTreeMap<EvidenceId, EvidenceKind>);
 
 impl EvidenceIndex {
-    pub fn insert(&mut self, id: EvidenceId, kind: EvidenceKind) {
+    pub(crate) fn insert(&mut self, id: EvidenceId, kind: EvidenceKind) {
         self.0.insert(id, kind);
     }
 

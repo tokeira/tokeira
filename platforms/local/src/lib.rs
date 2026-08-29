@@ -14,7 +14,7 @@ use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 /// No compose file, no observability images, no replicas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalConfig {
-    pub project_name: String,
+    pub(crate) project_name: String,
 }
 
 impl Default for LocalConfig {

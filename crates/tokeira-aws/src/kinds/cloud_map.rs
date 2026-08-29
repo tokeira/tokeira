@@ -9,14 +9,14 @@ use tokeira_platform::{
 use crate::resources::ecs_service::CloudMapNamespaceResource as Resource;
 
 /// Author-visible name of the realized resource type.
-pub const TYPE: &str = "CloudMapNamespace";
+pub(crate) const TYPE: &str = "CloudMapNamespace";
 
 /// Reusable author input for the Service Connect private DNS namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloudMapNamespace {
     /// Namespace name.
-    pub name: String,
+    pub(crate) name: String,
 }
 
 impl Kind<Resource> for CloudMapNamespace {

@@ -12,9 +12,9 @@ pub struct EcrAuthorization {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryDescription {
-    pub name: String,
-    pub arn: String,
-    pub uri: String,
+    pub(crate) name: String,
+    pub(crate) arn: String,
+    pub(crate) uri: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +59,7 @@ pub struct DefaultEcrClient {
 }
 
 impl DefaultEcrClient {
-    pub fn new(client: aws_sdk_ecr::Client) -> Self {
+    pub(crate) fn new(client: aws_sdk_ecr::Client) -> Self {
         Self { client }
     }
 

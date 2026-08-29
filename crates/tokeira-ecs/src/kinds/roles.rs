@@ -13,11 +13,11 @@ use tokeira_platform::{
 use crate::{EcsConfig, roles::PlatformRoleResource};
 
 /// Author-visible name of the realized task-role resource type.
-pub const TASK_ROLE_TYPE: &str = "EcsTaskRole";
+pub(crate) const TASK_ROLE_TYPE: &str = "EcsTaskRole";
 /// Author-visible name of the realized execution-role resource type.
-pub const EXECUTION_ROLE_TYPE: &str = "EcsExecutionRole";
+pub(crate) const EXECUTION_ROLE_TYPE: &str = "EcsExecutionRole";
 /// Author-visible name of the realized storage-role resource type.
-pub const STORAGE_ROLE_TYPE: &str = "ObservabilityStorageRole";
+pub(crate) const STORAGE_ROLE_TYPE: &str = "ObservabilityStorageRole";
 
 fn base_config(placement: &PlacementContext, region: &str) -> EcsConfig {
     EcsConfig {
@@ -34,9 +34,9 @@ fn base_config(placement: &PlacementContext, region: &str) -> EcsConfig {
 #[serde(deny_unknown_fields)]
 pub struct TaskRole {
     /// Canonical service name the role serves.
-    pub service: String,
+    pub(crate) service: String,
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
 }
 
 impl Kind<PlatformRoleResource> for TaskRole {
@@ -61,9 +61,9 @@ impl Kind<PlatformRoleResource> for TaskRole {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionRole {
     /// Canonical service name the role serves.
-    pub service: String,
+    pub(crate) service: String,
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
 }
 
 impl Kind<PlatformRoleResource> for ExecutionRole {
@@ -81,11 +81,11 @@ impl Kind<PlatformRoleResource> for ExecutionRole {
 #[serde(deny_unknown_fields)]
 pub struct StorageRole {
     /// Full role name.
-    pub name: String,
+    pub(crate) name: String,
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Bucket the role's S3 policy is scoped to.
-    pub bucket: String,
+    pub(crate) bucket: String,
 }
 
 impl Kind<PlatformRoleResource> for StorageRole {

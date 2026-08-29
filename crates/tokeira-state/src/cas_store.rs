@@ -40,7 +40,7 @@ where
 
     /// Load the current state document, or Default if none exists.
     /// Returns `(document, version_tag)` for CAS on subsequent save.
-    pub async fn load(&self) -> Result<(T, String), StateError> {
+    pub(crate) async fn load(&self) -> Result<(T, String), StateError> {
         match self.backend.read_manifest(&self.key_prefix).await? {
             Some((bytes, version)) => {
                 let doc: T = serde_json::from_slice(&bytes).map_err(|e| {
@@ -55,7 +55,7 @@ where
 
     /// Save a state document with CAS semantics.
     /// Returns the new version tag on success.
-    pub async fn save(&self, doc: &T, expected_version: &str) -> Result<String, StateError> {
+    pub(crate) async fn save(&self, doc: &T, expected_version: &str) -> Result<String, StateError> {
         doc.validate()?;
         let bytes = serde_json::to_vec_pretty(doc)
             .map_err(|e| StateError::Corrupted(format!("failed to serialize state: {e}")))?;

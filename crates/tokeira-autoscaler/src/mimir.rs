@@ -39,8 +39,8 @@ pub struct MimirClient {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MetricSample {
-    pub value: f64,
-    pub timestamp: OffsetDateTime,
+    pub(crate) value: f64,
+    pub(crate) timestamp: OffsetDateTime,
 }
 
 impl MimirClient {
@@ -132,7 +132,7 @@ impl MimirClient {
     /// Returns `None` when the query succeeds but produces no samples (e.g.,
     /// the metric doesn't exist yet). Callers use this for threshold-based
     /// pressure classification where the raw value matters.
-    pub async fn query_instant_value(&self, query: &str) -> Result<Option<f64>> {
+    pub(crate) async fn query_instant_value(&self, query: &str) -> Result<Option<f64>> {
         let started = std::time::Instant::now();
         let result = async {
             let response: PromQueryResponse = self

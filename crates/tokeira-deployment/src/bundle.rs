@@ -201,7 +201,7 @@ impl ProvisionerBundle {
 
     /// Verify that a bundle loaded from an identity-addressed store still
     /// records the identity used to address it.
-    pub fn admit_engine_identity(
+    pub(crate) fn admit_engine_identity(
         &self,
         expected: &EngineIdentity,
     ) -> Result<(), BoundProvisionerAdmissionError> {

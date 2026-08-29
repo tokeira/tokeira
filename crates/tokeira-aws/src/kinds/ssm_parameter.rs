@@ -9,19 +9,19 @@ use tokeira_platform::{
 use crate::resources::ssm_parameter::SsmParameterResource as Resource;
 
 /// Author-visible name of the realized resource type.
-pub const TYPE: &str = "SsmParameter";
+pub(crate) const TYPE: &str = "SsmParameter";
 
 /// Reusable author input for one SSM parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SsmParameter {
     /// Full parameter name (resource id `ssm-parameter:<name>`).
-    pub name: String,
+    pub(crate) name: String,
     /// Parameter value.
-    pub value: String,
+    pub(crate) value: String,
     /// Store as a SecureString.
     #[serde(default)]
-    pub secure: bool,
+    pub(crate) secure: bool,
 }
 
 impl Kind<Resource> for SsmParameter {

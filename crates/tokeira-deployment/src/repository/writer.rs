@@ -62,7 +62,7 @@ pub trait RepositoryWriter: Send + Sync {
 }
 
 /// Select the home's writer from the locator.
-pub fn writer_for(
+pub(crate) fn writer_for(
     locator: &RepositoryLocator,
     s3: Option<Client>,
 ) -> Result<Box<dyn RepositoryWriter>, WriteError> {

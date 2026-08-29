@@ -11,7 +11,7 @@ use crate::{
 };
 
 /// Author-visible name of the realized service type.
-pub const TYPE: &str = "EcsWorkload";
+pub(crate) const TYPE: &str = "EcsWorkload";
 
 /// Reusable author input for one ECS workload, selected by canonical
 /// service name from the platform's derived workload set.
@@ -26,25 +26,25 @@ pub const TYPE: &str = "EcsWorkload";
 #[serde(deny_unknown_fields)]
 pub struct Workload {
     /// Canonical workload name (e.g. `tokeira-runtime`, `tokeira-grafana`).
-    pub service: String,
+    pub(crate) service: String,
     /// Deployment environment (e.g. `dev`, `prod`).
-    pub environment: String,
+    pub(crate) environment: String,
     /// AWS region the workload deploys into.
-    pub region: String,
+    pub(crate) region: String,
     /// ECS cluster name.
-    pub cluster: String,
+    pub(crate) cluster: String,
     /// Service Connect namespace.
-    pub service_connect_namespace: String,
+    pub(crate) service_connect_namespace: String,
     /// Container image for the workload's primary container.
-    pub image: String,
+    pub(crate) image: String,
     /// Desired replicas; `None` keeps the service's own scheduling policy
     /// (daemon services stay daemons, replica services keep their default).
     #[serde(default)]
-    pub replicas: Option<u32>,
+    pub(crate) replicas: Option<u32>,
     /// Task CPU units.
-    pub cpu: u32,
+    pub(crate) cpu: u32,
     /// Task memory in MiB.
-    pub memory_mb: u32,
+    pub(crate) memory_mb: u32,
 }
 
 impl Workload {

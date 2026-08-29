@@ -84,7 +84,7 @@ pub enum HostKind {
 
 impl HostObj {
     /// The dispatch tag (variant) of this handle.
-    pub fn kind(&self) -> HostKind {
+    pub(crate) fn kind(&self) -> HostKind {
         match self {
             HostObj::Deployment(_) => HostKind::Deployment,
             HostObj::Module(_) => HostKind::Module,

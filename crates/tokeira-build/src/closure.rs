@@ -103,7 +103,7 @@ impl ProvisionerClosure {
     /// Every snapshot path: the crate directories, the workspace build
     /// files, and the non-member path-dependency directories, in one sorted
     /// list for [`SnapshotRequest::closure_paths`](crate::SnapshotRequest).
-    pub fn closure_paths(&self) -> Vec<PathBuf> {
+    pub(crate) fn closure_paths(&self) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = self
             .crate_dirs
             .iter()

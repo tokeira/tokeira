@@ -24,7 +24,7 @@ use crate::{
 /// Connect-rust service wrapper around the shared controller state.
 #[derive(Debug)]
 pub struct ConnectPlacementController {
-    pub state: PlacementControllerState,
+    pub(crate) state: PlacementControllerState,
 }
 
 impl ConnectPlacementController {

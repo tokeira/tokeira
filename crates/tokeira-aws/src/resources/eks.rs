@@ -52,7 +52,7 @@ impl EksClusterResource {
 
     /// Returns a deterministic idempotency token for CreateCluster.
     /// Same cluster name always produces the same token.
-    pub fn idempotency_token(&self) -> String {
+    pub(crate) fn idempotency_token(&self) -> String {
         format!("{}-create", self.cluster_name())
     }
 

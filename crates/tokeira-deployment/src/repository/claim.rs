@@ -14,13 +14,13 @@ use tokeira_platform::definition::ConfigurationIdentity;
 use uuid::Uuid;
 
 /// Custom-metadata key carrying the claim on the definition root's target.
-pub const CLAIM_KEY: &str = "tokeira:deployment";
+pub(crate) const CLAIM_KEY: &str = "tokeira:deployment";
 /// Custom-metadata key marking definition companion targets.
-pub const COMPANION_KEY: &str = "tokeira:definition-companion";
+pub(crate) const COMPANION_KEY: &str = "tokeira:definition-companion";
 /// Custom-metadata key marking engine binary targets.
-pub const ENGINE_ARTIFACT_KEY: &str = "tokeira:engine-artifact";
+pub(crate) const ENGINE_ARTIFACT_KEY: &str = "tokeira:engine-artifact";
 /// Custom-metadata key marking platform config-tree targets.
-pub const CONFIG_KEY: &str = "tokeira:config";
+pub(crate) const CONFIG_KEY: &str = "tokeira:config";
 
 /// The committed transition a publication captures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,7 +99,7 @@ pub struct DeploymentClaim {
 
 impl DeploymentClaim {
     /// The `<name>.<format>` target name a claimed companion resolves to.
-    pub fn companion_target(&self, companion: &str) -> String {
+    pub(crate) fn companion_target(&self, companion: &str) -> String {
         format!("{companion}.{}", self.format)
     }
 }

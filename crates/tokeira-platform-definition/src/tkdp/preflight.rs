@@ -20,10 +20,10 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 /// Prefix reserved for lowering-generated names. Rejecting it in every
 /// user-authored identifier position is what makes generated names
 /// collision-proof without a renaming pass.
-pub const RESERVED_PREFIX: &str = "__tokeira_internal_";
+pub(crate) const RESERVED_PREFIX: &str = "__tokeira_internal_";
 
 /// The facade module name the import contract admits.
-pub const FACADE_MODULE: &str = "tokeira";
+pub(crate) const FACADE_MODULE: &str = "tokeira";
 
 /// One spanned preflight finding against the original source.
 #[derive(Debug, Clone)]
@@ -65,11 +65,11 @@ pub struct FacadeImport {
 #[derive(Debug, Clone)]
 pub struct CallSite {
     /// `module`, `resource`, or `writeback`.
-    pub verb: &'static str,
+    pub(crate) verb: &'static str,
     /// The literal string first argument.
-    pub name: String,
+    pub(crate) name: String,
     /// Range of the whole call expression.
-    pub range: TextRange,
+    pub(crate) range: TextRange,
 }
 
 /// A validated definition plus everything later stages need.
@@ -97,19 +97,19 @@ pub struct Preflight {
 #[derive(Debug)]
 pub struct PartPreflight {
     /// Parsed module, reused by the lowering.
-    pub module: ModModule,
+    pub(crate) module: ModModule,
     /// Non-facade module names this part imports (part-to-part edges and
     /// built-ins alike), in source order.
-    pub part_imports: Vec<PartImport>,
+    pub(crate) part_imports: Vec<PartImport>,
 }
 
 /// One non-facade import: a candidate definition part.
 #[derive(Debug)]
 pub struct PartImport {
     /// The imported module name.
-    pub name: String,
+    pub(crate) name: String,
     /// The import statement's range in this file.
-    pub range: TextRange,
+    pub(crate) range: TextRange,
 }
 
 /// Parses and validates a definition against the facade surface
@@ -172,7 +172,10 @@ fn preflight_with_facade(
 
 /// Parses and validates a definition part: the root's admission surface
 /// without the entrypoint requirement.
-pub fn preflight_part(source: &str, facade_names: &[&str]) -> Result<PartPreflight, Vec<Finding>> {
+pub(crate) fn preflight_part(
+    source: &str,
+    facade_names: &[&str],
+) -> Result<PartPreflight, Vec<Finding>> {
     preflight_part_with_facade(source, Some(facade_names))
 }
 

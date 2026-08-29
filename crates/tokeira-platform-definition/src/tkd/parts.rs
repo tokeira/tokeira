@@ -34,23 +34,23 @@ use crate::tkd::{
 /// One document's item tables — the root's or one part's.
 #[derive(Debug)]
 pub struct Tables {
-    pub types: TypeTable,
-    pub fns: FnTable,
+    pub(crate) types: TypeTable,
+    pub(crate) fns: FnTable,
     /// The document's `use` takes: local type name → source part. `use`
     /// admits no renames, so the local name is the item's name in the
     /// source part.
-    pub uses: BTreeMap<String, String>,
+    pub(crate) uses: BTreeMap<String, String>,
 }
 
 /// The complete loaded program: the root plus every declared part, with the
 /// set's merged admission schema.
 #[derive(Debug)]
 pub struct Scopes {
-    pub root: Tables,
-    pub parts: BTreeMap<String, Tables>,
+    pub(crate) root: Tables,
+    pub(crate) parts: BTreeMap<String, Tables>,
     /// `#[create]`/`#[require]` over the whole set — the root's first, then
     /// each part's in name order. Admission reads the set, not one file.
-    pub admission: Admission,
+    pub(crate) admission: Admission,
 }
 
 /// One parsed-but-not-yet-admitted part, held between the discovery pass
@@ -67,7 +67,7 @@ struct PendingPart {
 /// validate every document's `use` takes and their acyclicity, subset-check
 /// each document against its effective types, and merge the set's
 /// admission.
-pub fn load<B: HostBridge>(
+pub(crate) fn load<B: HostBridge>(
     root_file: &File,
     root_types: TypeTable,
     root_fns: FnTable,

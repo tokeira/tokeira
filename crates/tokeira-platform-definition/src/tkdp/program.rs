@@ -36,13 +36,13 @@ __tokeira_internal_dep = deployment(__tokeira_internal_cfg, __tokeira_internal_C
 #[derive(Debug)]
 pub struct PartUnit {
     /// The importable module name.
-    pub name: String,
+    pub(crate) name: String,
     /// The part's file name, shown in tracebacks (`<name>.tkdp`).
-    pub file_name: String,
+    pub(crate) file_name: String,
     /// The part's original source, for position translation and previews.
-    pub original: String,
+    pub(crate) original: String,
     /// The part's lowered form (match splice applied).
-    pub lowered: Lowered,
+    pub(crate) lowered: Lowered,
 }
 
 /// Per-part translation data: everything the runner needs to render a frame
@@ -50,13 +50,13 @@ pub struct PartUnit {
 #[derive(Debug)]
 pub struct PartTranslation {
     /// The part's file name — the key Monty traceback frames carry.
-    pub file_name: String,
+    pub(crate) file_name: String,
     /// The part's original source.
-    pub original: String,
+    pub(crate) original: String,
     /// The lowered text Monty executes for this part.
-    pub lowered: String,
+    pub(crate) lowered: String,
     /// Map over exactly `lowered`, back to `original` positions.
-    pub map: SourceMap,
+    pub(crate) map: SourceMap,
 }
 
 /// A fully assembled program: the main text with its byte-covering map, the
@@ -77,7 +77,7 @@ pub struct Program {
 /// Composes the lowered operator region and driver into the main program,
 /// with the rendered facade as the first registered module and each part as
 /// a further one.
-pub fn assemble(facade: String, lowered: Lowered, parts: Vec<PartUnit>) -> Program {
+pub(crate) fn assemble(facade: String, lowered: Lowered, parts: Vec<PartUnit>) -> Program {
     let mut text = String::with_capacity(lowered.text.len() + DRIVER.len());
     let mut map = SourceMapBuilder::new();
 

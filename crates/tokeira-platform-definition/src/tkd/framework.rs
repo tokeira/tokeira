@@ -31,7 +31,7 @@ pub struct TkdFrontend {
 
 impl TkdFrontend {
     /// Construct the canonical first-party `.tkd` frontend.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             format: DefinitionFormatId::new("tkd")
                 .expect("the built-in tkd definition-format id is canonical"),

@@ -10,9 +10,9 @@ use tokeira_platform::{
 use crate::modules::dsql::{AdoptedDsqlResource, DsqlIamRoleResource};
 
 /// Author-visible name of the realized adopted-endpoint resource type.
-pub const ENDPOINT_TYPE: &str = "DsqlEndpoint";
+pub(crate) const ENDPOINT_TYPE: &str = "DsqlEndpoint";
 /// Author-visible name of the realized DSQL IAM role resource type.
-pub const ROLE_TYPE: &str = "DsqlIamRole";
+pub(crate) const ROLE_TYPE: &str = "DsqlIamRole";
 
 /// Reusable author input for a record-only adopted DSQL endpoint
 /// (preexisting mode): the endpoint is referenced, never managed.
@@ -21,9 +21,9 @@ pub const ROLE_TYPE: &str = "DsqlIamRole";
 pub struct AdoptedDsqlEndpoint {
     /// Well-known resource id (`dsql:management-endpoint` or
     /// `dsql:connection-endpoint`).
-    pub id: String,
+    pub(crate) id: String,
     /// The preexisting endpoint's provider id.
-    pub endpoint_id: String,
+    pub(crate) endpoint_id: String,
 }
 
 impl Kind<AdoptedDsqlResource> for AdoptedDsqlEndpoint {
@@ -45,13 +45,13 @@ impl Kind<AdoptedDsqlResource> for AdoptedDsqlEndpoint {
 #[serde(deny_unknown_fields)]
 pub struct ManagedRole {
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Role name.
-    pub role_name: String,
+    pub(crate) role_name: String,
     /// Inline policy name.
-    pub policy_name: String,
+    pub(crate) policy_name: String,
     /// DSQL action the policy grants (e.g. `dsql:DbConnect`).
-    pub action: String,
+    pub(crate) action: String,
 }
 
 /// An adopted role: exactly an ARN.
@@ -59,7 +59,7 @@ pub struct ManagedRole {
 #[serde(deny_unknown_fields)]
 pub struct PreexistingRole {
     /// The adopted role's ARN.
-    pub role_arn: String,
+    pub(crate) role_arn: String,
 }
 
 /// Tuple variants, not struct variants: the definition frontend does not
@@ -77,9 +77,9 @@ pub enum RoleMode {
 #[serde(deny_unknown_fields)]
 pub struct DsqlIamRole {
     /// Well-known resource id (`dsql:runtime-role` or `dsql:admin-role`).
-    pub id: String,
+    pub(crate) id: String,
     /// Role provenance and its mode-specific facts.
-    pub mode: RoleMode,
+    pub(crate) mode: RoleMode,
 }
 
 impl Kind<DsqlIamRoleResource> for DsqlIamRole {

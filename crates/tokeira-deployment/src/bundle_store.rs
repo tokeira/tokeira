@@ -133,7 +133,7 @@ impl BundleStore {
     /// The store's revocation deny-list (absent → empty). Revocation is one
     /// CAS write to this key; every subsequent [`resolve`](Self::resolve)
     /// honours it.
-    pub async fn load_revocations(&self) -> Result<RevocationList, BundleStoreError> {
+    pub(crate) async fn load_revocations(&self) -> Result<RevocationList, BundleStoreError> {
         match self.backend.read_snapshot(&self.revocations_key()).await {
             Ok(bytes) => {
                 serde_json::from_slice(&bytes).map_err(|e| BundleStoreError::CorruptManifest {

@@ -15,9 +15,9 @@ use crate::{content::ContentIdentity, error::InspectionError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectionPublication {
     /// Validated deployment-relative target.
-    pub path: RelativeDefinitionPath,
+    pub(crate) path: RelativeDefinitionPath,
     /// Identity of the exact published bytes.
-    pub identity: ContentIdentity,
+    pub(crate) identity: ContentIdentity,
 }
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);

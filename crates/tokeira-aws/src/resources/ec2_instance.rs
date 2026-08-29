@@ -25,33 +25,33 @@ use crate::ResourceContext;
 #[derive(Debug, Clone)]
 pub struct VolumeAttachment {
     /// Resource ID of the EBS volume to attach.
-    pub volume_resource_id: ResourceId,
+    pub(crate) volume_resource_id: ResourceId,
     /// Device name (e.g. "/dev/sdf").
-    pub device: String,
+    pub(crate) device: String,
 }
 
 /// Configuration for a single EC2 instance.
 #[derive(Debug)]
 pub struct Ec2InstanceConfig {
-    pub instance_type: String,
-    pub ami_id: String,
-    pub subnet_id: String,
-    pub security_group_resource_id: ResourceId,
-    pub instance_profile_resource_id: ResourceId,
-    pub instance_profile_name: String,
-    pub root_volume_gib: u32,
-    pub user_data_base64: String,
-    pub associate_public_ip: bool,
+    pub(crate) instance_type: String,
+    pub(crate) ami_id: String,
+    pub(crate) subnet_id: String,
+    pub(crate) security_group_resource_id: ResourceId,
+    pub(crate) instance_profile_resource_id: ResourceId,
+    pub(crate) instance_profile_name: String,
+    pub(crate) root_volume_gib: u32,
+    pub(crate) user_data_base64: String,
+    pub(crate) associate_public_ip: bool,
     /// EBS volumes to attach after the instance is running.
-    pub volume_attachments: Vec<VolumeAttachment>,
-    pub module: String,
+    pub(crate) volume_attachments: Vec<VolumeAttachment>,
+    pub(crate) module: String,
 }
 
 /// Generic provider resource that provisions one EC2 instance.
 #[derive(Debug)]
 pub struct Ec2Instance {
-    pub name: String,
-    pub config: Ec2InstanceConfig,
+    pub(crate) name: String,
+    pub(crate) config: Ec2InstanceConfig,
     pub project: String,
     pub region: String,
     pub tags: HashMap<String, String>,

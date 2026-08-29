@@ -11,18 +11,18 @@ use crate::resources::vpc::{VpcConfig, VpcResource as Resource};
 /// Author-visible name of the realized resource type. Lives on the kind
 /// because `crates/tokeira-aws/src/kinds` is the authoring surface; the
 /// namespace self-test pins it to the realized `resource_type()`.
-pub const TYPE: &str = "Vpc";
+pub(crate) const TYPE: &str = "Vpc";
 
 /// Reusable author input for the project's private VPC.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Vpc {
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// VPC CIDR block.
-    pub cidr: String,
+    pub(crate) cidr: String,
     /// Availability zones the private subnets spread across.
-    pub availability_zones: Vec<String>,
+    pub(crate) availability_zones: Vec<String>,
 }
 
 impl Kind<Resource> for Vpc {

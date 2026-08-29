@@ -20,13 +20,13 @@ use tracing::{error, info, warn};
 #[derive(Debug, Clone)]
 pub struct PortForwardConfig {
     /// Namespace of the target service.
-    pub namespace: String,
+    pub(crate) namespace: String,
     /// Service name; the backing pod is found via `app={service_name}`.
-    pub service_name: String,
+    pub(crate) service_name: String,
     /// Remote port on the pod to forward to.
-    pub remote_port: u16,
+    pub(crate) remote_port: u16,
     /// Local port to bind (on loopback only).
-    pub local_port: u16,
+    pub(crate) local_port: u16,
 }
 
 /// A running port-forward session handle.

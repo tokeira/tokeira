@@ -17,7 +17,7 @@ pub struct NetworkingModule {
 }
 
 impl NetworkingModule {
-    pub fn new(config: EcsConfig) -> Self {
+    pub(crate) fn new(config: EcsConfig) -> Self {
         Self { config }
     }
 }
@@ -160,12 +160,12 @@ impl Module for NetworkingModule {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointSpec {
-    pub short_name: String,
-    pub service_name: String,
-    pub endpoint_type: EndpointType,
+    pub(crate) short_name: String,
+    pub(crate) service_name: String,
+    pub(crate) endpoint_type: EndpointType,
 }
 
-pub fn required_endpoint_specs(region: &str) -> Vec<EndpointSpec> {
+pub(crate) fn required_endpoint_specs(region: &str) -> Vec<EndpointSpec> {
     [
         ("ecs", "ecs", EndpointType::Interface),
         ("ecs-agent", "ecs-agent", EndpointType::Interface),

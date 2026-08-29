@@ -101,7 +101,7 @@ pub struct S3Transport {
 impl S3Transport {
     /// Wrap a configured S3 client (region, credentials, and any test
     /// endpoint already applied).
-    pub fn new(client: Client) -> Self {
+    pub(crate) fn new(client: Client) -> Self {
         Self { client }
     }
 }

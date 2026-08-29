@@ -32,9 +32,9 @@ pub struct DesiredState {
 /// The platform's actual state, read via the actuator before reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CurrentState {
-    pub service_counts: BTreeMap<String, u32>,
-    pub asg_capacities: BTreeMap<String, u32>,
-    pub drain_intents: BTreeMap<String, DrainPhase>,
+    pub(crate) service_counts: BTreeMap<String, u32>,
+    pub(crate) asg_capacities: BTreeMap<String, u32>,
+    pub(crate) drain_intents: BTreeMap<String, DrainPhase>,
 }
 
 /// Phases of the instance retirement state machine.

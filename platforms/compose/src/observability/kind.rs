@@ -15,23 +15,23 @@ use super::{ObservabilityConfigFilesResource, ObservabilityParams};
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityConfiguration {
     /// Metrics scrape host.
-    pub scrape_host: String,
+    pub(crate) scrape_host: String,
     /// Metrics scrape port.
-    pub scrape_port: u16,
+    pub(crate) scrape_port: u16,
     /// Cluster label.
-    pub cluster: String,
+    pub(crate) cluster: String,
     /// Deployment label.
-    pub deployment: String,
+    pub(crate) deployment: String,
     /// Mimir remote-write endpoint.
-    pub mimir_remote_write: String,
+    pub(crate) mimir_remote_write: String,
     /// Loki push endpoint.
-    pub loki_push: String,
+    pub(crate) loki_push: String,
     /// Mimir HTTP port.
-    pub mimir_http_port: u16,
+    pub(crate) mimir_http_port: u16,
     /// Loki HTTP port.
-    pub loki_http_port: u16,
+    pub(crate) loki_http_port: u16,
     /// Loki retention period.
-    pub retention_hours: u32,
+    pub(crate) retention_hours: u32,
 }
 
 impl ObservabilityConfiguration {

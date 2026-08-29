@@ -46,24 +46,24 @@ pub struct SnapshotRef {
 /// Operators need reasonably synchronized clocks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateLeaseLock {
-    pub owner_id: String,
-    pub token: String,
-    pub acquired_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub(crate) owner_id: String,
+    pub(crate) token: String,
+    pub(crate) acquired_at: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
 }
 
 /// Manifest bytes plus the ETag required for CAS updates.
 #[derive(Debug, Clone)]
 pub struct ManifestState {
-    pub manifest: StateManifest,
-    pub etag: String,
+    pub(crate) manifest: StateManifest,
+    pub(crate) etag: String,
     pub version_id: Option<String>,
 }
 
 /// In-memory representation of a held lease.
 #[derive(Debug, Clone)]
 pub struct LockGuard {
-    pub owner_id: String,
-    pub token: String,
-    pub expires_at: DateTime<Utc>,
+    pub(crate) owner_id: String,
+    pub(crate) token: String,
+    pub(crate) expires_at: DateTime<Utc>,
 }

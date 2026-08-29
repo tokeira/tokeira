@@ -45,7 +45,7 @@ pub enum KeySourceConfig {
 
 impl KeySourceConfig {
     /// Construct the shareable key source this configuration names.
-    pub fn source(&self) -> SharedKeySource {
+    pub(crate) fn source(&self) -> SharedKeySource {
         match self {
             Self::File { path } => SharedKeySource::new(LocalKeySource { path: path.clone() }),
             Self::Kms { key_id, profile } => SharedKeySource::new(tough_kms::KmsKeySource {
@@ -63,13 +63,13 @@ impl KeySourceConfig {
 #[serde(deny_unknown_fields)]
 pub struct RoleKeyConfig {
     /// Offline trust anchor; exercised only when authoring/rotating root.
-    pub root: KeySourceConfig,
+    pub(crate) root: KeySourceConfig,
     /// Online role: signs the target inventory.
-    pub targets: KeySourceConfig,
+    pub(crate) targets: KeySourceConfig,
     /// Online role: signs the metadata snapshot.
-    pub snapshot: KeySourceConfig,
+    pub(crate) snapshot: KeySourceConfig,
     /// Online role: signs the freshness statement.
-    pub timestamp: KeySourceConfig,
+    pub(crate) timestamp: KeySourceConfig,
 }
 
 impl RoleKeyConfig {
@@ -102,7 +102,7 @@ impl RoleKeyConfig {
     }
 
     /// The online-role sources handed to the repository editor's signer.
-    pub fn online_sources(&self) -> Vec<Box<dyn KeySource>> {
+    pub(crate) fn online_sources(&self) -> Vec<Box<dyn KeySource>> {
         vec![
             self.targets.source().boxed(),
             self.snapshot.source().boxed(),
@@ -119,12 +119,12 @@ pub struct SharedKeySource(Arc<dyn KeySource>);
 
 impl SharedKeySource {
     /// Wrap a concrete key source.
-    pub fn new(source: impl KeySource + 'static) -> Self {
+    pub(crate) fn new(source: impl KeySource + 'static) -> Self {
         Self(Arc::new(source))
     }
 
     /// Mint a boxed clone for APIs that want ownership.
-    pub fn boxed(&self) -> Box<dyn KeySource> {
+    pub(crate) fn boxed(&self) -> Box<dyn KeySource> {
         Box::new(self.clone())
     }
 }

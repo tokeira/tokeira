@@ -34,7 +34,7 @@ use tokeira_types::{ShardEpoch, ShardId};
 ///
 /// Uses the top of the u32 range to avoid collision with runtime placement
 /// bundles which occupy the lower range.
-pub const AUTOSCALER_LEASE_BUNDLE: ShardId = ShardId(u32::MAX);
+pub(crate) const AUTOSCALER_LEASE_BUNDLE: ShardId = ShardId(u32::MAX);
 
 pub struct AutoscalerLeader {
     lease_repo: Arc<dyn LeaseRepository>,
@@ -42,8 +42,8 @@ pub struct AutoscalerLeader {
     node_endpoint: String,
     lease_bundle: ShardId,
     current_epoch: Option<ShardEpoch>,
-    pub lease_duration: Duration,
-    pub renewal_interval: Duration,
+    pub(crate) lease_duration: Duration,
+    pub(crate) renewal_interval: Duration,
 }
 
 impl fmt::Debug for AutoscalerLeader {

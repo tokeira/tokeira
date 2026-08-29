@@ -262,7 +262,7 @@ pub struct Change {
 
 impl Change {
     /// Whether this change destroys live infrastructure (Delete or Replace).
-    pub fn is_destructive(&self) -> bool {
+    pub(crate) fn is_destructive(&self) -> bool {
         self.kind.is_destructive()
     }
 }

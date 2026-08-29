@@ -20,7 +20,7 @@ pub struct SecurityRule {
 /// Returns (to_add, to_remove) where:
 /// - to_add: rules in `desired` but not in `current`
 /// - to_remove: rules in `current` but not in `desired`
-pub fn diff_rules(
+pub(crate) fn diff_rules(
     current: &[SecurityRule],
     desired: &[SecurityRule],
 ) -> (Vec<SecurityRule>, Vec<SecurityRule>) {
@@ -174,11 +174,11 @@ pub struct SecurityGroupConfig {
 /// Generic provider resource that provisions exactly one EC2 security group.
 #[derive(Debug)]
 pub struct SecurityGroup {
-    pub name: String,
-    pub config: SecurityGroupConfig,
-    pub project: String,
+    pub(crate) name: String,
+    pub(crate) config: SecurityGroupConfig,
+    pub(crate) project: String,
     pub region: String,
-    pub tags: HashMap<String, String>,
+    pub(crate) tags: HashMap<String, String>,
 }
 
 impl SecurityGroup {

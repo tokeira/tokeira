@@ -152,7 +152,8 @@ where
 /// source, in memory: the comparison value revision-level causality is built
 /// on. Keys are the engine's own resource identities, so a snapshot joins the
 /// plan's changes without translation.
-pub type DesiredSnapshot = std::collections::BTreeMap<tokeira_iac::ResourceId, serde_json::Value>;
+pub(crate) type DesiredSnapshot =
+    std::collections::BTreeMap<tokeira_iac::ResourceId, serde_json::Value>;
 
 /// The platform declaration surface: what a platform's entry point returns
 /// and everything it carries. The framework defines what it consumes; the
@@ -182,18 +183,18 @@ impl std::error::Error for ReportEmitted {}
 /// What an apply committed, under the identity the engine executed it with.
 ///
 /// The persisted audit vocabulary stays ids-only —
-/// [`change_log_entries`] distills `changes` wherever an audit record is
+/// `change_log_entries` distills `changes` wherever an audit record is
 /// needed. The full engine identity (module, resource type, a `Replace`
 /// kind the audit log folds away) and the operator nouns exist here because
 /// the applied report states what committed in the operator's language, and
 /// reading them back from anywhere else would be re-derivation or invention.
 #[derive(Debug, Clone, Default)]
 pub struct AppliedOutcome {
-    pub changes: Vec<tokeira_iac::Change>,
-    pub display_by_id: std::collections::BTreeMap<tokeira_iac::ResourceId, String>,
+    pub(crate) changes: Vec<tokeira_iac::Change>,
+    pub(crate) display_by_id: std::collections::BTreeMap<tokeira_iac::ResourceId, String>,
     /// Declared writeback resolved against the applied state — the pairs
     /// the shell persists into the server configuration document.
-    pub writeback: Vec<(String, String)>,
+    pub(crate) writeback: Vec<(String, String)>,
 }
 
 /// The explanation's deployment context, assembled from what the envelope
@@ -224,7 +225,7 @@ pub(crate) fn explain_context<F: tokeira_platform::definition::DefinitionFronten
 /// `Replace` records as `Updated` (the id survives a delete-then-recreate;
 /// the audit log tracks identities, not mechanics), and `NoChange` records
 /// nothing.
-pub fn change_log_entries(changes: &[Change]) -> Vec<ChangeLogEntry> {
+pub(crate) fn change_log_entries(changes: &[Change]) -> Vec<ChangeLogEntry> {
     changes
         .iter()
         .filter_map(|change| {

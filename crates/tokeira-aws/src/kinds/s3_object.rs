@@ -9,18 +9,18 @@ use tokeira_platform::{
 use crate::resources::s3_object::S3Object as Resource;
 
 /// Author-visible name of the realized resource type.
-pub const TYPE: &str = "S3Object";
+pub(crate) const TYPE: &str = "S3Object";
 
 /// Reusable author input for one S3 object in a declared bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3Object {
     /// Object key within the bucket.
-    pub key: String,
+    pub(crate) key: String,
     /// Object content.
-    pub content: String,
+    pub(crate) content: String,
     /// MIME content type.
-    pub content_type: String,
+    pub(crate) content_type: String,
 }
 
 impl Kind<Resource> for S3Object {

@@ -30,9 +30,9 @@ use crate::tkdp::preflight::CallSite;
 #[derive(Debug)]
 pub struct ConvertError {
     /// Actionable detail.
-    pub message: String,
+    pub(crate) message: String,
     /// Declaring call's range when correlation found one.
-    pub range: TextRange,
+    pub(crate) range: TextRange,
 }
 
 impl ConvertError {
@@ -45,7 +45,7 @@ impl ConvertError {
 }
 
 /// Decodes the driver's result into the frontend output.
-pub fn convert(
+pub(crate) fn convert(
     result: MontyObject,
     namespaces: &[Namespace],
     sites: &[CallSite],
@@ -240,7 +240,7 @@ fn located_graph_error(error: GraphError, sites: &[CallSite], fallback: TextRang
 
 /// Converts a sandbox value to a host-free located value (ranges absent:
 /// Monty objects carry no construction sites — the documented v1 boundary).
-pub fn to_located(value: MontyObject, at: TextRange) -> Result<LocatedValue, ConvertError> {
+pub(crate) fn to_located(value: MontyObject, at: TextRange) -> Result<LocatedValue, ConvertError> {
     let shape = match value {
         MontyObject::None => ValueShape::Option(None),
         MontyObject::Bool(value) => ValueShape::Bool(value),

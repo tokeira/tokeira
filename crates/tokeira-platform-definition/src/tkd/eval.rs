@@ -51,9 +51,9 @@ impl<H: Clone> Env<H> {
 /// The evaluator — borrows the bridge, the type/fn tables, and the context.
 #[derive(Debug)]
 pub struct Interp<'a, B: HostBridge> {
-    pub bridge: &'a B,
-    pub scope: Scope<'a>,
-    pub cx: &'a B::Cx,
+    pub(crate) bridge: &'a B,
+    pub(crate) scope: Scope<'a>,
+    pub(crate) cx: &'a B::Cx,
 }
 
 /// One evaluation scope over the loaded program: the root, or one part.
@@ -85,7 +85,7 @@ pub enum PartFnLookup<'a> {
 
 impl<'a> Scope<'a> {
     /// The root scope over a loaded program.
-    pub fn root(scopes: &'a Scopes) -> Self {
+    pub(crate) fn root(scopes: &'a Scopes) -> Self {
         Self {
             scopes,
             current: None,
@@ -124,36 +124,36 @@ impl<'a> Scope<'a> {
         None
     }
 
-    pub fn is_struct(&self, name: &str) -> bool {
+    pub(crate) fn is_struct(&self, name: &str) -> bool {
         self.type_home(name).is_some_and(|t| t.is_struct(name))
     }
 
-    pub fn is_enum(&self, name: &str) -> bool {
+    pub(crate) fn is_enum(&self, name: &str) -> bool {
         self.type_home(name).is_some_and(|t| t.is_enum(name))
     }
 
-    pub fn enum_has_unit_variant(&self, ty: &str, variant: &str) -> bool {
+    pub(crate) fn enum_has_unit_variant(&self, ty: &str, variant: &str) -> bool {
         self.type_home(ty)
             .is_some_and(|t| t.enum_has_unit_variant(ty, variant))
     }
 
-    pub fn enum_has_variant(&self, ty: &str, variant: &str) -> bool {
+    pub(crate) fn enum_has_variant(&self, ty: &str, variant: &str) -> bool {
         self.type_home(ty)
             .is_some_and(|t| t.enum_has_variant(ty, variant))
     }
 
-    pub fn struct_field_names(&self, name: &str) -> Option<Vec<String>> {
+    pub(crate) fn struct_field_names(&self, name: &str) -> Option<Vec<String>> {
         self.type_home(name)?.struct_field_names(name)
     }
 
     /// The current scope's own function, for bare-name calls.
-    pub fn local_fn(&self, name: &str) -> Option<&'a syn::ItemFn> {
+    pub(crate) fn local_fn(&self, name: &str) -> Option<&'a syn::ItemFn> {
         self.tables().fns.get(name)
     }
 
     /// Resolve `part::function` from the root. Parts get `NotAPart` for
     /// everything: wiring flows through the root.
-    pub fn part_fn(&self, part: &str, name: &str) -> PartFnLookup<'a> {
+    pub(crate) fn part_fn(&self, part: &str, name: &str) -> PartFnLookup<'a> {
         if self.in_part() {
             return PartFnLookup::NotAPart;
         }
@@ -169,7 +169,7 @@ impl<'a> Scope<'a> {
 
     /// The named part's scope; the key borrow comes from the program map so
     /// the scope stays `Copy`.
-    pub fn enter(&self, part: &str) -> Option<Scope<'a>> {
+    pub(crate) fn enter(&self, part: &str) -> Option<Scope<'a>> {
         let (key, _) = self.scopes.parts.get_key_value(part)?;
         Some(Scope {
             scopes: self.scopes,
@@ -180,7 +180,7 @@ impl<'a> Scope<'a> {
 
 impl<B: HostBridge> Interp<'_, B> {
     /// Evaluate a `.tkd` function with the given argument values.
-    pub fn eval_fn(
+    pub(crate) fn eval_fn(
         &self,
         name: &str,
         args: Vec<Value<B::Host>>,
@@ -218,7 +218,7 @@ impl<B: HostBridge> Interp<'_, B> {
 
     /// Evaluate a standalone expression (a `#[require]` clause) with the given
     /// fields bound — the admission pass uses this to check config constraints.
-    pub fn eval_with_fields(
+    pub(crate) fn eval_with_fields(
         &self,
         e: &Expr,
         fields: &FieldMap<B::Host>,

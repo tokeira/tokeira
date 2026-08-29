@@ -58,37 +58,37 @@ const ALLOY_MOUNT_DIR: &str = "/etc/alloy";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceManifest {
     /// Kubernetes object name and `app` selector value, e.g. `tokeirad`.
-    pub name: String,
+    pub(crate) name: String,
     /// Namespace all the service's objects live in.
-    pub namespace: String,
+    pub(crate) namespace: String,
     /// Project name (label `app.kubernetes.io/part-of`).
-    pub project: String,
+    pub(crate) project: String,
     /// Container image reference.
-    pub image: String,
+    pub(crate) image: String,
     /// Desired replica count.
-    pub replicas: u32,
+    pub(crate) replicas: u32,
     /// CPU request/limit as a Kubernetes quantity (e.g. `500m`, `2`).
-    pub cpu: String,
+    pub(crate) cpu: String,
     /// Memory request/limit as a Kubernetes quantity (e.g. `1Gi`).
-    pub memory: String,
+    pub(crate) memory: String,
     /// gRPC port, if the service exposes one (`tokeira-autoscaler` does not).
-    pub grpc_port: Option<u16>,
+    pub(crate) grpc_port: Option<u16>,
     /// Prometheus metrics port (all services expose one).
-    pub metrics_port: u16,
+    pub(crate) metrics_port: u16,
     /// Pod-Identity ServiceAccount name the pod runs as.
-    pub service_account: String,
+    pub(crate) service_account: String,
     /// Alloy sidecar image.
-    pub alloy_image: String,
+    pub(crate) alloy_image: String,
     /// Name of the ConfigMap holding this service's config file.
-    pub config_map: String,
+    pub(crate) config_map: String,
     /// The config file's key within the ConfigMap (e.g. `tokeirad.toml`), also
     /// its filename under the config mount directory (`/etc/tokeira`). Passed to the binary as
     /// `--config <mount_dir>/<config_file>`.
-    pub config_file: String,
+    pub(crate) config_file: String,
     /// Whether the pod must advertise its own IP as the membership address.
     /// Only `tokeirad` (a runtime node) does; the controller is reached via its
     /// Service and the autoscaler has no inbound endpoint.
-    pub advertise_node_host: bool,
+    pub(crate) advertise_node_host: bool,
 }
 
 /// The `app` selector for a service — matched by its Deployment, Service, and
@@ -236,7 +236,7 @@ fn container_ports(spec: &ServiceManifest) -> Vec<ContainerPort> {
 /// Build a service's `Deployment`: main container (`--config <mounted file>`) +
 /// the Alloy native sidecar, arm64/anti-affinity, the Pod-Identity ServiceAccount,
 /// and the config + alloy-config ConfigMap volumes.
-pub fn deployment(spec: &ServiceManifest) -> serde_json::Value {
+pub(crate) fn deployment(spec: &ServiceManifest) -> serde_json::Value {
     let labels = standard_labels(&spec.name, &spec.project);
     let config_path = format!("{CONFIG_MOUNT_DIR}/{}", spec.config_file);
 
@@ -321,7 +321,7 @@ pub fn deployment(spec: &ServiceManifest) -> serde_json::Value {
 /// Build a service's ClusterIP `Service`: gRPC (if any) + metrics, topology-aware
 /// routing. No `LoadBalancer`/headless variant (private-only; controller-based
 /// membership).
-pub fn service(spec: &ServiceManifest) -> serde_json::Value {
+pub(crate) fn service(spec: &ServiceManifest) -> serde_json::Value {
     let labels = standard_labels(&spec.name, &spec.project);
     let mut ports = vec![ServicePort {
         name: Some("metrics".to_string()),
@@ -362,7 +362,7 @@ pub fn service(spec: &ServiceManifest) -> serde_json::Value {
 }
 
 /// Build the Pod-Identity `ServiceAccount` a service's pods run as.
-pub fn service_account(name: &str, namespace: &str, project: &str) -> serde_json::Value {
+pub(crate) fn service_account(name: &str, namespace: &str, project: &str) -> serde_json::Value {
     let sa = ServiceAccount {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -380,7 +380,7 @@ pub fn service_account(name: &str, namespace: &str, project: &str) -> serde_json
 /// This is the vehicle for the server config: the hydrated `tokeirad.toml` (DSQL
 /// endpoint filled by writeback) is the `content`, mounted at
 /// `/etc/tokeira/<file_name>` and passed via `--config` (Req 6.2/9).
-pub fn config_map(
+pub(crate) fn config_map(
     name: &str,
     namespace: &str,
     project: &str,
@@ -406,7 +406,7 @@ pub fn config_map(
 /// Build the Karpenter `NodePool` (arm64/on-demand → EKS Auto Mode default
 /// NodeClass). Delegates to the shared `tokeira-k8s` helper so the shape is
 /// single-sourced (Property 13).
-pub fn node_pool(node_families: &[String]) -> serde_json::Value {
+pub(crate) fn node_pool(node_families: &[String]) -> serde_json::Value {
     tokeira_k8s::build_node_pool(node_families)
 }
 

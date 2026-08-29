@@ -30,7 +30,10 @@ pub struct ServiceContext {
 }
 
 impl ServiceContext {
-    pub fn new(state: tokeira_iac::RuntimeState, infra_state: tokeira_iac::InfraState) -> Self {
+    pub(crate) fn new(
+        state: tokeira_iac::RuntimeState,
+        infra_state: tokeira_iac::InfraState,
+    ) -> Self {
         Self {
             state,
             infra_state,

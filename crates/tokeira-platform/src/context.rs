@@ -6,9 +6,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvocationContext {
     /// Stable operator-visible deployment identity.
-    pub deployment_id: String,
+    pub(crate) deployment_id: String,
     /// Stable UUID recorded for the deployment.
-    pub deployment_uuid: uuid::Uuid,
+    pub(crate) deployment_uuid: uuid::Uuid,
     /// Host deployment root.
-    pub deployment_dir: PathBuf,
+    pub(crate) deployment_dir: PathBuf,
 }

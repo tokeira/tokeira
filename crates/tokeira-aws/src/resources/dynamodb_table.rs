@@ -57,7 +57,7 @@ pub struct DynamoDbTable {
 impl DynamoDbTable {
     /// The resource's one word: engine resource type and author-visible
     /// name, stated once here.
-    pub const TYPE: &'static str = "DynamoDbTable";
+    pub(crate) const TYPE: &'static str = "DynamoDbTable";
 
     fn sdk_key_type(kt: KeyType) -> aws_sdk_dynamodb::types::KeyType {
         match kt {

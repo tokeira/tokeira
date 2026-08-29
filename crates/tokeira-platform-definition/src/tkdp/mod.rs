@@ -19,8 +19,8 @@
 //! `isinstance` — config variants form a closed algebraic set).
 
 pub mod convert;
-pub mod diagnostics;
-pub mod facade;
+pub(crate) mod diagnostics;
+pub(crate) mod facade;
 pub mod frontend;
 pub mod lower;
 pub mod preflight;

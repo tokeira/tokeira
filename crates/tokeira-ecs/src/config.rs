@@ -72,104 +72,104 @@ pub struct ClusterConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkingConfig {
-    pub vpc_cidr: String,
-    pub availability_zones: Vec<String>,
-    pub private_dns_zone: String,
-    pub optional_endpoints: OptionalEndpoints,
+    pub(crate) vpc_cidr: String,
+    pub(crate) availability_zones: Vec<String>,
+    pub(crate) private_dns_zone: String,
+    pub(crate) optional_endpoints: OptionalEndpoints,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OptionalEndpoints {
-    pub sts: bool,
-    pub kms: bool,
-    pub secrets_manager: bool,
-    pub cloudwatch_logs: bool,
-    pub ec2: bool,
+    pub(crate) sts: bool,
+    pub(crate) kms: bool,
+    pub(crate) secrets_manager: bool,
+    pub(crate) cloudwatch_logs: bool,
+    pub(crate) ec2: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapacityProviderConfigs {
-    pub edge_api: CapacityProviderConfig,
-    pub edge_poll: CapacityProviderConfig,
-    pub runtime: RuntimeCapacityProviderConfig,
-    pub projection: CapacityProviderConfig,
-    pub control: CapacityProviderConfig,
-    pub mimir: CapacityProviderConfig,
-    pub loki: CapacityProviderConfig,
-    pub grafana: CapacityProviderConfig,
+    pub(crate) edge_api: CapacityProviderConfig,
+    pub(crate) edge_poll: CapacityProviderConfig,
+    pub(crate) runtime: RuntimeCapacityProviderConfig,
+    pub(crate) projection: CapacityProviderConfig,
+    pub(crate) control: CapacityProviderConfig,
+    pub(crate) mimir: CapacityProviderConfig,
+    pub(crate) loki: CapacityProviderConfig,
+    pub(crate) grafana: CapacityProviderConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapacityProviderConfig {
-    pub instance_type: String,
-    pub min_capacity: u32,
-    pub desired_capacity: u32,
-    pub max_capacity: u32,
+    pub(crate) instance_type: String,
+    pub(crate) min_capacity: u32,
+    pub(crate) desired_capacity: u32,
+    pub(crate) max_capacity: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeCapacityProviderConfig {
-    pub instance_type: String,
-    pub min_capacity: u32,
-    pub desired_capacity: u32,
-    pub max_capacity: u32,
-    pub scale_in_protection: bool,
+    pub(crate) instance_type: String,
+    pub(crate) min_capacity: u32,
+    pub(crate) desired_capacity: u32,
+    pub(crate) max_capacity: u32,
+    pub(crate) scale_in_protection: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfigs {
-    pub edge_api: ReplicaServiceConfig,
-    pub edge_poll: ReplicaServiceConfig,
-    pub runtime: DaemonServiceConfig,
-    pub projection: ReplicaServiceConfig,
-    pub controller: ReplicaServiceConfig,
-    pub autoscaler: ReplicaServiceConfig,
-    pub admin: ReplicaServiceConfig,
+    pub(crate) edge_api: ReplicaServiceConfig,
+    pub(crate) edge_poll: ReplicaServiceConfig,
+    pub(crate) runtime: DaemonServiceConfig,
+    pub(crate) projection: ReplicaServiceConfig,
+    pub(crate) controller: ReplicaServiceConfig,
+    pub(crate) autoscaler: ReplicaServiceConfig,
+    pub(crate) admin: ReplicaServiceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplicaServiceConfig {
-    pub image: String,
-    pub desired_count: u32,
-    pub cpu: u32,
-    pub memory_mb: u32,
-    pub grpc_port: Option<u16>,
-    pub metrics_port: u16,
-    pub http_port: Option<u16>,
+    pub(crate) image: String,
+    pub(crate) desired_count: u32,
+    pub(crate) cpu: u32,
+    pub(crate) memory_mb: u32,
+    pub(crate) grpc_port: Option<u16>,
+    pub(crate) metrics_port: u16,
+    pub(crate) http_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonServiceConfig {
-    pub image: String,
-    pub cpu: u32,
-    pub memory_mb: u32,
-    pub grpc_port: u16,
-    pub metrics_port: u16,
-    pub http_port: Option<u16>,
+    pub(crate) image: String,
+    pub(crate) cpu: u32,
+    pub(crate) memory_mb: u32,
+    pub(crate) grpc_port: u16,
+    pub(crate) metrics_port: u16,
+    pub(crate) http_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutoscalerConfig {
-    pub image: String,
-    pub polling_interval_secs: u64,
+    pub(crate) image: String,
+    pub(crate) polling_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlbConfig {
-    pub name: String,
-    pub listener_protocol: AlbListenerProtocol,
-    pub certificate_arn: Option<String>,
-    pub health_check_path: String,
-    pub health_check_interval_secs: u64,
+    pub(crate) name: String,
+    pub(crate) listener_protocol: AlbListenerProtocol,
+    pub(crate) certificate_arn: Option<String>,
+    pub(crate) health_check_path: String,
+    pub(crate) health_check_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,12 +182,12 @@ pub enum AlbListenerProtocol {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DsqlConfig {
-    pub mode: DsqlClusterMode,
-    pub endpoint: Option<String>,
-    pub management_endpoint_id: Option<String>,
-    pub connection_endpoint_id: Option<String>,
-    pub runtime_role_arn: Option<String>,
-    pub admin_role_arn: Option<String>,
+    pub(crate) mode: DsqlClusterMode,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) management_endpoint_id: Option<String>,
+    pub(crate) connection_endpoint_id: Option<String>,
+    pub(crate) runtime_role_arn: Option<String>,
+    pub(crate) admin_role_arn: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,30 +201,30 @@ pub enum DsqlClusterMode {
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
     #[serde(default = "default_mimir_image")]
-    pub mimir_image: String,
-    pub mimir_cpu: u32,
-    pub mimir_memory_mb: u32,
+    pub(crate) mimir_image: String,
+    pub(crate) mimir_cpu: u32,
+    pub(crate) mimir_memory_mb: u32,
     #[serde(default = "default_loki_image")]
-    pub loki_image: String,
-    pub loki_cpu: u32,
-    pub loki_memory_mb: u32,
+    pub(crate) loki_image: String,
+    pub(crate) loki_cpu: u32,
+    pub(crate) loki_memory_mb: u32,
     #[serde(default = "default_grafana_image")]
-    pub grafana_image: String,
-    pub grafana_cpu: u32,
-    pub grafana_memory_mb: u32,
+    pub(crate) grafana_image: String,
+    pub(crate) grafana_cpu: u32,
+    pub(crate) grafana_memory_mb: u32,
     #[serde(default = "default_alloy_image")]
-    pub alloy_image: String,
-    pub alloy_cpu: u32,
-    pub alloy_memory_mb: u32,
+    pub(crate) alloy_image: String,
+    pub(crate) alloy_cpu: u32,
+    pub(crate) alloy_memory_mb: u32,
     #[serde(default = "default_aws_cli_image")]
-    pub aws_cli_image: String,
+    pub(crate) aws_cli_image: String,
     #[serde(default = "default_busybox_image")]
-    pub busybox_image: String,
-    pub retention_days: u32,
+    pub(crate) busybox_image: String,
+    pub(crate) retention_days: u32,
     /// Loki query endpoint for `tkr logs`. Defaults to localhost:3100
     /// (reachable when `tkr port-forward loki` is active).
     #[serde(default = "default_loki_query_url")]
-    pub loki_query_url: String,
+    pub(crate) loki_query_url: String,
 }
 
 impl EcsConfig {
@@ -521,7 +521,7 @@ pub fn required_vpc_endpoints(region: &str) -> Vec<String> {
     .collect()
 }
 
-pub fn optional_vpc_endpoints(config: &EcsConfig) -> Vec<String> {
+pub(crate) fn optional_vpc_endpoints(config: &EcsConfig) -> Vec<String> {
     let mut endpoints = Vec::new();
     if config.networking.optional_endpoints.sts {
         endpoints.push(format!("com.amazonaws.{}.sts", config.region));

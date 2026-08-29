@@ -99,7 +99,7 @@ impl EngineIdentity {
     /// serialize identically. The form opens with
     /// `IDENTITY_CANONICAL_VERSION`, so evolving the field set re-keys
     /// explicitly rather than colliding silently.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
         fn field(buf: &mut Vec<u8>, tag: &str, value: &str) {
             buf.extend_from_slice(tag.as_bytes());
             buf.push(b'=');

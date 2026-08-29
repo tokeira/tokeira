@@ -12,11 +12,11 @@ use crate::resources::elbv2::{
 };
 
 /// Author-visible name of the realized load-balancer resource type.
-pub const ALB_TYPE: &str = "Alb";
+pub(crate) const ALB_TYPE: &str = "Alb";
 /// Author-visible name of the realized target-group resource type.
-pub const TARGET_GROUP_TYPE: &str = "AlbTargetGroup";
+pub(crate) const TARGET_GROUP_TYPE: &str = "AlbTargetGroup";
 /// Author-visible name of the realized listener resource type.
-pub const LISTENER_TYPE: &str = "AlbListener";
+pub(crate) const LISTENER_TYPE: &str = "AlbListener";
 
 /// Reusable author input for the internal ALB. Declares its VPC and
 /// security group as dependencies.
@@ -24,7 +24,7 @@ pub const LISTENER_TYPE: &str = "AlbListener";
 #[serde(deny_unknown_fields)]
 pub struct Alb {
     /// Load-balancer name (resource id `alb-<name>`).
-    pub name: String,
+    pub(crate) name: String,
 }
 
 impl Kind<AlbResource> for Alb {
@@ -46,13 +46,13 @@ impl Kind<AlbResource> for Alb {
 #[serde(deny_unknown_fields)]
 pub struct AlbTargetGroup {
     /// Target-group name (resource id `alb-tg-<name>`).
-    pub name: String,
+    pub(crate) name: String,
     /// Traffic port.
-    pub port: u16,
+    pub(crate) port: u16,
     /// Health-check request path.
-    pub health_check_path: String,
+    pub(crate) health_check_path: String,
     /// Health-check interval in seconds.
-    pub health_check_interval_secs: u64,
+    pub(crate) health_check_interval_secs: u64,
 }
 
 impl Kind<AlbTargetGroupResource> for AlbTargetGroup {
@@ -86,18 +86,18 @@ pub enum ListenerProtocol {
 #[serde(deny_unknown_fields)]
 pub struct AlbListener {
     /// Listener name (resource id `alb-listener-<name>`).
-    pub name: String,
+    pub(crate) name: String,
     /// Listener protocol.
-    pub protocol: ListenerProtocol,
+    pub(crate) protocol: ListenerProtocol,
     /// Certificate ARN, required for HTTPS.
     #[serde(default)]
-    pub certificate_arn: Option<String>,
+    pub(crate) certificate_arn: Option<String>,
     /// Private DNS zone for host-header rules.
-    pub private_dns_zone: String,
+    pub(crate) private_dns_zone: String,
     /// Name of the edge-api target group (a declared dependency).
-    pub edge_api_target_group: String,
+    pub(crate) edge_api_target_group: String,
     /// Name of the edge-poll target group (a declared dependency).
-    pub edge_poll_target_group: String,
+    pub(crate) edge_poll_target_group: String,
 }
 
 impl Kind<AlbListenerResource> for AlbListener {

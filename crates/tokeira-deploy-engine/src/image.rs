@@ -53,7 +53,7 @@ pub struct ImageContext {
 }
 
 impl ImageContext {
-    pub fn new(state: tokeira_iac::RuntimeState) -> Self {
+    pub(crate) fn new(state: tokeira_iac::RuntimeState) -> Self {
         Self {
             state,
             extensions: HashMap::new(),

@@ -33,7 +33,7 @@ use crate::reconciler::{DesiredState, DrainPhase};
 /// A host that has been selected for retirement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetirementCandidate {
-    pub instance_id: String,
+    pub(crate) instance_id: String,
 }
 
 /// Begin the retirement process for a candidate instance.

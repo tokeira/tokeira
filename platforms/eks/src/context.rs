@@ -24,13 +24,13 @@ use std::path::PathBuf;
 pub struct Cx {
     /// Deployment identity, from `metadata.json` (set at `tkr deployment create`).
     /// Seeds resource names/tags and is readable as `cx.project_name`.
-    pub project_name: String,
+    pub(crate) project_name: String,
     /// The AWS region the deployment targets. `None` before an identity is
     /// recorded (e.g. a bare in-memory context in tests); readable as `cx.region`.
-    pub region: Option<String>,
+    pub(crate) region: Option<String>,
     /// The AWS account id, when known. Used where an ARN or Pod-Identity
     /// association needs it; `None` until resolved. Readable as `cx.account_id`.
-    pub account_id: Option<String>,
+    pub(crate) account_id: Option<String>,
     /// Host-supplied ambient directory for the deployment (state/config on disk).
     /// Never surfaced to the `.tkd` — it is realize-time plumbing only, kept off
     /// the operator surface so the definition stays hermetic (Proposal 003 §4).

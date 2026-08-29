@@ -8,7 +8,7 @@ pub use ensure::ensure_ecr_repositories_from_images;
 
 use tokeira_deploy_engine::{Image, ImageContext, RuntimeError, validate_registry};
 
-pub fn construct() -> Vec<Box<dyn Image>> {
+pub(crate) fn construct() -> Vec<Box<dyn Image>> {
     let mut images = tokeirad::all();
     images.extend(observability::all());
     images

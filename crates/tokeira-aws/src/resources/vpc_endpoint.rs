@@ -35,9 +35,9 @@ pub struct VpcEndpointConfig {
 #[derive(Debug)]
 pub struct VpcEndpoint {
     /// Short name used for ResourceId (e.g., "s3", "ecr-api", "ecr-dkr").
-    pub service_short_name: String,
-    pub config: VpcEndpointConfig,
-    pub project: String,
+    pub(crate) service_short_name: String,
+    pub(crate) config: VpcEndpointConfig,
+    pub(crate) project: String,
     pub region: String,
     pub tags: HashMap<String, String>,
 }

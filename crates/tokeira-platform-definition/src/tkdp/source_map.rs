@@ -34,7 +34,7 @@ pub enum OriginKind {
 
 impl OriginKind {
     /// Operator-facing description used when annotating mapped tracebacks.
-    pub fn describe(self) -> &'static str {
+    pub(crate) fn describe(self) -> &'static str {
         match self {
             Self::MatchSubject => "while evaluating the match subject",
             Self::Pattern => "while probing a case pattern",
@@ -126,7 +126,7 @@ impl SourceMap {
         })
     }
 
-    pub fn segments(&self) -> &[Segment] {
+    pub(crate) fn segments(&self) -> &[Segment] {
         &self.segments
     }
 }
@@ -144,7 +144,7 @@ impl SourceMapBuilder {
     }
 
     /// Current end offset of the covered generated text.
-    pub fn cursor(&self) -> TextSize {
+    pub(crate) fn cursor(&self) -> TextSize {
         self.cursor
     }
 
@@ -200,7 +200,7 @@ pub struct LineTable {
 }
 
 impl LineTable {
-    pub fn new(text: &str) -> Self {
+    pub(crate) fn new(text: &str) -> Self {
         let mut starts = vec![0u32];
         for (i, b) in text.bytes().enumerate() {
             if b == b'\n' {
@@ -213,13 +213,13 @@ impl LineTable {
     }
 
     /// Byte offset of the start of a 1-based line, clamped to the last line.
-    pub fn line_start(&self, line: u32) -> TextSize {
+    pub(crate) fn line_start(&self, line: u32) -> TextSize {
         let idx = (line.max(1) as usize - 1).min(self.starts.len() - 1);
         TextSize::new(self.starts[idx])
     }
 
     /// 1-based (line, column) for a byte offset.
-    pub fn line_column(&self, offset: TextSize) -> (u32, u32) {
+    pub(crate) fn line_column(&self, offset: TextSize) -> (u32, u32) {
         let off = offset.to_u32();
         let line_idx = self.starts.partition_point(|&s| s <= off).saturating_sub(1);
         let col = off - self.starts[line_idx] + 1;

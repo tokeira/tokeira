@@ -10,7 +10,7 @@ use tokeira_platform::{
 use crate::resources::vpc_endpoint::{EndpointType, VpcEndpoint as Resource, VpcEndpointConfig};
 
 /// Author-visible name of the realized resource type.
-pub const TYPE: &str = "VpcEndpoint";
+pub(crate) const TYPE: &str = "VpcEndpoint";
 
 /// Authored endpoint flavour, mirroring the resource's [`EndpointType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -28,18 +28,18 @@ pub enum EndpointKind {
 #[serde(deny_unknown_fields)]
 pub struct VpcEndpoint {
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Short name used in the default resource id (`vpce-<short>`).
-    pub short_name: String,
+    pub(crate) short_name: String,
     /// Full provider service name (`com.amazonaws.<region>.<service>`).
-    pub service_name: String,
+    pub(crate) service_name: String,
     /// Endpoint flavour.
-    pub endpoint_type: EndpointKind,
+    pub(crate) endpoint_type: EndpointKind,
     /// Stable resource-id override for endpoints that carry a well-known
     /// identity (e.g. the DSQL management endpoint); defaults to the
     /// resource's own `vpce-<short>` convention.
     #[serde(default)]
-    pub id: Option<String>,
+    pub(crate) id: Option<String>,
 }
 
 impl Kind<Resource> for VpcEndpoint {

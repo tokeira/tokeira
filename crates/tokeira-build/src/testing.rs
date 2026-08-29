@@ -179,7 +179,7 @@ fn selection_path(query: &str) -> Vec<String> {
 
 /// The deterministic bytes a [`CannedWire`] export writes for a host path —
 /// tests derive expected checksums from this.
-pub fn canned_artifact_bytes(host_path: &str) -> Vec<u8> {
+pub(crate) fn canned_artifact_bytes(host_path: &str) -> Vec<u8> {
     format!("canned-artifact:{host_path}").into_bytes()
 }
 

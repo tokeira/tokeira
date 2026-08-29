@@ -18,7 +18,7 @@ pub struct ClusterModule {
 }
 
 impl ClusterModule {
-    pub fn new(config: EcsConfig) -> Self {
+    pub(crate) fn new(config: EcsConfig) -> Self {
         Self { config }
     }
 }
@@ -108,16 +108,16 @@ impl Module for ClusterModule {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapacityProviderEntry {
-    pub name: &'static str,
-    pub workload: &'static str,
-    pub instance_type: String,
-    pub min_capacity: u32,
-    pub desired_capacity: u32,
-    pub max_capacity: u32,
-    pub protect_from_scale_in: bool,
+    pub(crate) name: &'static str,
+    pub(crate) workload: &'static str,
+    pub(crate) instance_type: String,
+    pub(crate) min_capacity: u32,
+    pub(crate) desired_capacity: u32,
+    pub(crate) max_capacity: u32,
+    pub(crate) protect_from_scale_in: bool,
 }
 
-pub fn capacity_provider_entries(config: &EcsConfig) -> Vec<CapacityProviderEntry> {
+pub(crate) fn capacity_provider_entries(config: &EcsConfig) -> Vec<CapacityProviderEntry> {
     vec![
         replica_entry(
             "cp-edge-api",

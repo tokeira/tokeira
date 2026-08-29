@@ -12,7 +12,7 @@ use crate::resources::dsql_connection_endpoint::{
 };
 
 /// Author-visible name of the realized resource type.
-pub const TYPE: &str = "DsqlConnectionEndpoint";
+pub(crate) const TYPE: &str = "DsqlConnectionEndpoint";
 
 /// Reusable author input for the DSQL connection endpoint. Declares the
 /// VPC, an endpoint security group, and the DSQL cluster as dependencies.
@@ -20,14 +20,14 @@ pub const TYPE: &str = "DsqlConnectionEndpoint";
 #[serde(deny_unknown_fields)]
 pub struct DsqlConnectionEndpoint {
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Endpoint identity used in provider naming.
-    pub identity: String,
+    pub(crate) identity: String,
     /// Stable resource-id override for the well-known
     /// `dsql:connection-endpoint` identity; defaults to the resource's own
     /// convention.
     #[serde(default)]
-    pub id: Option<String>,
+    pub(crate) id: Option<String>,
 }
 
 impl Kind<Resource> for DsqlConnectionEndpoint {

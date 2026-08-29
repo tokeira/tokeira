@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::{error::PublishError, keys::RoleKeyConfig, locator::RepositoryLocator};
 
 /// The publisher configuration, relative to a deployment dir.
-pub const PUBLISHER_JSON: &str = "state/repository/publisher.json";
+pub(crate) const PUBLISHER_JSON: &str = "state/repository/publisher.json";
 
 /// The pinned trust anchor, relative to a deployment dir.
 pub const TRUST_ANCHOR: &str = "state/repository/root.json";
@@ -36,7 +36,7 @@ pub struct RepositoryConfig {
 
 impl RepositoryConfig {
     /// The publisher.json path inside `deployment_dir`.
-    pub fn path_in(deployment_dir: &Path) -> PathBuf {
+    pub(crate) fn path_in(deployment_dir: &Path) -> PathBuf {
         deployment_dir.join(PUBLISHER_JSON)
     }
 
@@ -81,11 +81,11 @@ impl RepositoryConfig {
 #[serde(deny_unknown_fields)]
 pub struct RoleLifetimes {
     /// root.json lifetime.
-    pub root_hours: u32,
+    pub(crate) root_hours: u32,
     /// targets.json / snapshot.json lifetime.
-    pub metadata_hours: u32,
+    pub(crate) metadata_hours: u32,
     /// timestamp.json lifetime — the freshness window; shortest by design.
-    pub timestamp_hours: u32,
+    pub(crate) timestamp_hours: u32,
 }
 
 impl Default for RoleLifetimes {
@@ -100,17 +100,17 @@ impl Default for RoleLifetimes {
 
 impl RoleLifetimes {
     /// root lifetime as a span.
-    pub fn root(&self) -> Span {
+    pub(crate) fn root(&self) -> Span {
         Span::new().hours(i64::from(self.root_hours))
     }
 
     /// metadata lifetime as a span.
-    pub fn metadata(&self) -> Span {
+    pub(crate) fn metadata(&self) -> Span {
         Span::new().hours(i64::from(self.metadata_hours))
     }
 
     /// freshness window as a span.
-    pub fn timestamp(&self) -> Span {
+    pub(crate) fn timestamp(&self) -> Span {
         Span::new().hours(i64::from(self.timestamp_hours))
     }
 }

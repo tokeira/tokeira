@@ -41,21 +41,21 @@ pub type Document = (String, Vec<u8>);
 #[derive(Debug)]
 pub struct PublicationInput {
     /// The signed statement binding both halves.
-    pub claim: DeploymentClaim,
+    pub(crate) claim: DeploymentClaim,
     /// Definition root + companions + config-tree files, by target name.
     /// The root document MUST be present under `claim.definition.root`;
     /// config-tree files use their relative paths as target names.
-    pub documents: Vec<Document>,
+    pub(crate) documents: Vec<Document>,
     /// Which documents are config-tree files (by target name); the rest are
     /// definition documents.
-    pub config_tree: Vec<String>,
+    pub(crate) config_tree: Vec<String>,
     /// The committed bundle manifest, published exactly as committed —
     /// `retrieval_ref`s stay the seat-invariant retention keys; the engine
     /// binary target names are derived from the triples.
-    pub bundle_manifest: ProvisionerBundle,
+    pub(crate) bundle_manifest: ProvisionerBundle,
     /// Per-target engine binaries: (target triple, path to the bytes).
     /// Streamed, never buffered whole.
-    pub bundle_artifacts: Vec<(String, PathBuf)>,
+    pub(crate) bundle_artifacts: Vec<(String, PathBuf)>,
 }
 
 /// What a completed publication looked like.

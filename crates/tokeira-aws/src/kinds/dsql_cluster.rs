@@ -15,22 +15,22 @@ use crate::resources::dsql_cluster::{DsqlCluster as Resource, DsqlClusterMode};
 #[serde(deny_unknown_fields)]
 pub struct DsqlCluster {
     /// Stable AWS cluster identity.
-    pub identity: String,
+    pub(crate) identity: String,
     /// AWS region.
-    pub region: String,
+    pub(crate) region: String,
     /// Managed or adopted lifecycle.
-    pub mode: DsqlClusterMode,
+    pub(crate) mode: DsqlClusterMode,
     /// Required endpoint for an adopted cluster.
     #[serde(default)]
-    pub endpoint: Option<String>,
+    pub(crate) endpoint: Option<String>,
     /// Required ARN for an adopted cluster.
     #[serde(default)]
-    pub arn: Option<String>,
+    pub(crate) arn: Option<String>,
     /// Stable resource-id override for clusters that carry a well-known
     /// identity (e.g. the ECS platform's `dsql:cluster`); defaults to the
     /// resource's own convention.
     #[serde(default)]
-    pub id: Option<String>,
+    pub(crate) id: Option<String>,
 }
 
 impl Kind<Resource> for DsqlCluster {

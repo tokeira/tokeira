@@ -12,21 +12,21 @@ use tokio::sync::mpsc;
 /// Runtime registration sent as the first membership-stream message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeRegistration {
-    pub node_id: IncarnationId,
-    pub host: String,
-    pub port: u16,
-    pub zone: Option<String>,
-    pub version: String,
-    pub build_id: String,
+    pub(crate) node_id: IncarnationId,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) zone: Option<String>,
+    pub(crate) version: String,
+    pub(crate) build_id: String,
 }
 
 /// Per-lane pressure metric reported by runtimes.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LanePressure {
-    pub lane_id: u32,
-    pub runnable_depth: u64,
-    pub active_actors: u64,
-    pub utilization: f32,
+    pub(crate) lane_id: u32,
+    pub(crate) runnable_depth: u64,
+    pub(crate) active_actors: u64,
+    pub(crate) utilization: f32,
 }
 
 /// Runtime drain state reported in heartbeats.
@@ -40,15 +40,15 @@ pub enum NodeDrainState {
 /// Periodic runtime pressure and ownership report.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeHeartbeat {
-    pub owned_bundle_count: u32,
-    pub owned_bundles: Vec<ShardId>,
-    pub runnable_transitions: u64,
-    pub active_actor_count: u64,
-    pub backlog_depth: u64,
-    pub available_connections: u32,
-    pub connection_rate_headroom: f32,
-    pub drain_state: NodeDrainState,
-    pub lane_pressures: Vec<LanePressure>,
+    pub(crate) owned_bundle_count: u32,
+    pub(crate) owned_bundles: Vec<ShardId>,
+    pub(crate) runnable_transitions: u64,
+    pub(crate) active_actor_count: u64,
+    pub(crate) backlog_depth: u64,
+    pub(crate) available_connections: u32,
+    pub(crate) connection_rate_headroom: f32,
+    pub(crate) drain_state: NodeDrainState,
+    pub(crate) lane_pressures: Vec<LanePressure>,
 }
 
 /// Controller directive placeholder used by membership stream state.
@@ -69,12 +69,12 @@ pub enum NodeMembershipState {
 /// Live node state tracked by a controller instance.
 #[derive(Debug)]
 pub struct LiveNode {
-    pub node_id: IncarnationId,
+    pub(crate) node_id: IncarnationId,
     pub registration: RuntimeRegistration,
-    pub last_heartbeat: Instant,
-    pub heartbeat: RuntimeHeartbeat,
-    pub membership_state: NodeMembershipState,
-    pub reachability: NodeReachability,
+    pub(crate) last_heartbeat: Instant,
+    pub(crate) heartbeat: RuntimeHeartbeat,
+    pub(crate) membership_state: NodeMembershipState,
+    pub(crate) reachability: NodeReachability,
     pub directive_tx: Option<mpsc::Sender<ControllerDirective>>,
 }
 
@@ -87,15 +87,15 @@ pub struct LiveMembership {
 /// A node nominated for scale-in retirement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScaleInCandidate {
-    pub node_id: IncarnationId,
-    pub owned_bundle_count: u32,
-    pub runnable_transitions: u64,
-    pub active_actor_count: u64,
-    pub backlog_depth: u64,
+    pub(crate) node_id: IncarnationId,
+    pub(crate) owned_bundle_count: u32,
+    pub(crate) runnable_transitions: u64,
+    pub(crate) active_actor_count: u64,
+    pub(crate) backlog_depth: u64,
 }
 
 impl LiveMembership {
-    pub fn register_node(
+    pub(crate) fn register_node(
         &mut self,
         registration: RuntimeRegistration,
         heartbeat: RuntimeHeartbeat,
@@ -116,7 +116,7 @@ impl LiveMembership {
         );
     }
 
-    pub fn update_heartbeat(&mut self, node_id: IncarnationId, heartbeat: RuntimeHeartbeat) {
+    pub(crate) fn update_heartbeat(&mut self, node_id: IncarnationId, heartbeat: RuntimeHeartbeat) {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.last_heartbeat = Instant::now();
             node.heartbeat = heartbeat;
@@ -127,7 +127,7 @@ impl LiveMembership {
         }
     }
 
-    pub fn mark_grace_period(&mut self, node_id: IncarnationId) {
+    pub(crate) fn mark_grace_period(&mut self, node_id: IncarnationId) {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.membership_state = NodeMembershipState::GracePeriod;
             node.reachability = NodeReachability::Suspect;
@@ -141,7 +141,7 @@ impl LiveMembership {
         }
     }
 
-    pub fn mark_draining(&mut self, node_id: IncarnationId) -> bool {
+    pub(crate) fn mark_draining(&mut self, node_id: IncarnationId) -> bool {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.membership_state = NodeMembershipState::Draining;
             true
@@ -154,13 +154,13 @@ impl LiveMembership {
         self.nodes.remove(&node_id)
     }
 
-    pub fn active_nodes(&self) -> impl Iterator<Item = &LiveNode> {
+    pub(crate) fn active_nodes(&self) -> impl Iterator<Item = &LiveNode> {
         self.nodes
             .values()
             .filter(|node| node.membership_state == NodeMembershipState::Active)
     }
 
-    pub fn nodes(&self) -> impl Iterator<Item = &LiveNode> {
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = &LiveNode> {
         self.nodes.values()
     }
 
@@ -168,7 +168,7 @@ impl LiveMembership {
         self.nodes.get(&node_id)
     }
 
-    pub fn active_node_ids_sorted(&self) -> Vec<IncarnationId> {
+    pub(crate) fn active_node_ids_sorted(&self) -> Vec<IncarnationId> {
         let mut ids = self
             .active_nodes()
             .map(|node| node.node_id)
@@ -191,7 +191,7 @@ impl LiveMembership {
 
     /// Rank active nodes by bundle count and pressure for scale-in nomination.
     /// Excludes draining nodes. Returns up to `limit` candidates.
-    pub fn nominate_scale_in(&self, limit: u32) -> Vec<ScaleInCandidate> {
+    pub(crate) fn nominate_scale_in(&self, limit: u32) -> Vec<ScaleInCandidate> {
         let mut candidates: Vec<_> = self
             .nodes
             .values()
@@ -211,7 +211,7 @@ impl LiveMembership {
     }
 
     /// Aggregate connection headroom across all active nodes.
-    pub fn aggregate_headroom(&self) -> (u32, f32) {
+    pub(crate) fn aggregate_headroom(&self) -> (u32, f32) {
         let mut total_connections: u32 = 0;
         let mut total_rate: f32 = 0.0;
         for node in self.active_nodes() {
@@ -223,7 +223,7 @@ impl LiveMembership {
 }
 
 impl RuntimeHeartbeat {
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             owned_bundle_count: 0,
             owned_bundles: Vec::new(),

@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1240" viewBox="0 0 1900 1240" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="dv_clay" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1.5,1.5 L7,4.5 L1.5,7.5 Z" fill="#B85C38"/></marker>
+    <marker id="dv_teal" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1.5,1.5 L7,4.5 L1.5,7.5 Z" fill="#0B7285"/></marker>
+    <style>
+      .title { font: 700 32px 'Avenir Next',Avenir,'Segoe UI',sans-serif; fill:#1B1714; }
+      .subtitle { font: 500 17px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .section { font: 700 13.5px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:2px; }
+      .boxtitle { font: 700 18px 'Avenir Next',Avenir,sans-serif; fill:#1B1714; }
+      .small { font: 500 13px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .mono { font: 600 12px 'SF Mono',Menlo,monospace; fill:#4A443C; }
+    </style>
+  </defs>
+  <rect width="1900" height="1240" rx="14" fill="#F6F3EE"/>
+
+  <text x="56" y="46" font-family="'SF Mono',Menlo,monospace" font-size="12" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+  <text x="56" y="84" class="title">Deployments &amp; versioning</text>
+  <text x="56" y="112" class="subtitle">Worker versions live in the delivery key, never in workflow semantics — a version decides where work routes, not what it means.</text>
+
+  <!-- vocabulary -->
+  <text x="56" y="168" class="section">THE VOCABULARY</text>
+  <rect x="56" y="188" width="560" height="230" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.5"/>
+  <text x="80" y="220" class="boxtitle">Versioning is a key dimension</text>
+  <text x="80" y="248" class="mono">QueueKey { namespace · task queue · kind ·</text>
+  <text x="80" y="268" class="mono">           deployment · build_id }</text>
+  <text x="80" y="298" class="small">A worker deployment (name + build) extends every queue</text>
+  <text x="80" y="318" class="small">it polls. Two builds of one queue are two queues — no</text>
+  <text x="80" y="338" class="small">flag on the task, no branch in the workflow, just routing.</text>
+  <text x="80" y="368" class="small" fill="#8A8378">unversioned workers use the bare key — versioning is</text>
+  <text x="80" y="388" class="small" fill="#8A8378">opt-in per queue, not a mode switch</text>
+
+  <!-- registries -->
+  <text x="672" y="168" class="section">WHO REMEMBERS WHAT</text>
+  <rect x="672" y="188" width="560" height="110" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="696" y="220" class="boxtitle" font-size="16">Edge — the operator surface</text>
+  <text x="696" y="248" class="small">The WorkerDeployment RPC family (~20 surfaces): describe,</text>
+  <text x="696" y="268" class="small">list, set current/ramping — Temporal's versioning grammar.</text>
+
+  <rect x="672" y="322" width="560" height="110" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="696" y="354" class="boxtitle" font-size="16">Runtime — the live view</text>
+  <text x="696" y="382" class="small">The deployment registry plus version-membership and</text>
+  <text x="696" y="402" class="small">reactivation caches — hot answers for routing decisions.</text>
+
+  <rect x="672" y="456" width="560" height="110" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="696" y="488" class="boxtitle" font-size="16">Storage — the record</text>
+  <text x="696" y="516" class="mono">worker_deployments · worker_deployment_token_seq</text>
+  <text x="696" y="540" class="small">Durable deployment state behind WorkerDeploymentRepository.</text>
+
+  <!-- behaviors -->
+  <text x="1288" y="168" class="section">THE THREE BEHAVIOURS</text>
+  <rect x="1288" y="188" width="556" height="120" rx="10" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".45"/>
+  <text x="1312" y="220" class="boxtitle" font-size="16">Polling registers</text>
+  <text x="1312" y="248" class="small">Every versioned poll registers its deployment as it arrives —</text>
+  <text x="1312" y="268" class="small">the system learns the fleet's builds from the fleet itself.</text>
+
+  <rect x="1288" y="332" width="556" height="130" rx="10" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".45"/>
+  <text x="1312" y="364" class="boxtitle" font-size="16">Transitions re-key</text>
+  <text x="1312" y="392" class="small">When a queue's current version changes, unversioned backlog</text>
+  <text x="1312" y="412" class="small">is promoted into the new version's queue — or absorbed back —</text>
+  <text x="1312" y="432" class="small">so waiting work follows the rollout instead of stranding.</text>
+
+  <rect x="1288" y="486" width="556" height="120" rx="10" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".45"/>
+  <text x="1312" y="518" class="boxtitle" font-size="16">Sticky respects rollouts</text>
+  <text x="1312" y="546" class="small">Sticky delivery re-routes when a deployment changes beneath</text>
+  <text x="1312" y="566" class="small">it — a workflow's affinity never pins it to a retired build.</text>
+
+  <!-- flows -->
+  <g stroke-width="2.6" fill="none" stroke-linecap="round">
+    <path d="M616 300 H666" stroke="#B85C38" marker-end="url(#dv_clay)"/>
+    <path d="M1232 244 H1282" stroke="#0B7285" marker-end="url(#dv_teal)"/>
+    <path d="M1232 392 H1282" stroke="#0B7285" marker-end="url(#dv_teal)"/>
+    <path d="M1232 528 H1282" stroke="#0B7285" marker-end="url(#dv_teal)"/>
+  </g>
+
+  <!-- the worked example -->
+  <rect x="56" y="660" width="1788" height="224" rx="12" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="80" y="692" class="boxtitle">A rollout, in one line of key changes</text>
+  <text x="80" y="724" class="mono">before:   orders / checkout / wft / payments-svc / build-41   ← current</text>
+  <text x="80" y="748" class="mono">rollout:  orders / checkout / wft / payments-svc / build-42   ← workers polling build-42 register it</text>
+  <text x="80" y="772" class="mono">cutover:  current → build-42 · unversioned backlog promoted · sticky re-routes · build-41 drains its last tasks</text>
+  <text x="80" y="804" class="small">No workflow noticed. History carries no build number in its semantics — the version only ever decided which workers were offered the work.</text>
+  <text x="80" y="828" class="small" fill="#8A8378">A caveat this corner has earned: upstream's worker-versioning surface was itself mid-evolution at the pin — the vendored protos carry in-place</text>
+  <text x="80" y="846" class="small" fill="#8A8378">deprecations pointing at successor fields. Tokeira implements the pinned shape; the compatibility matrix tracks verification, and this is the</text>
+  <text x="80" y="864" class="small" fill="#8A8378">corner most likely to move when the pins next advance.</text>
+
+  <!-- footer -->
+  <rect x="56" y="920" width="1788" height="56" rx="12" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.4"/>
+  <text x="80" y="944" class="boxtitle" fill="#9A4A2C" font-size="14">The principle:</text>
+  <text x="80" y="964" class="small">deployments are a delivery concern wearing an operator API — the commit path, the kernel, and history never learn what a build id is.</text>
+
+  <text x="56" y="1026" class="small" fill="#8A8378">Companions: the delivery plane (the key in action) · the compatibility edge (where the RPC family is served).</text>
+
+  <g transform="translate(1808,1168)" stroke="#B85C38" stroke-width="2.2" stroke-linecap="round" opacity=".8">
+    <path d="M0 36 C3 22 6 11 12 0" fill="none"/>
+    <g transform="translate(12,0)"><path d="M0 0 L12 -9 M0 0 L15 -1 M0 0 L12 7 M0 0 L4 -13 M0 0 L-5 -12" fill="none"/><circle cx="0" cy="0" r="2.4" fill="#B85C38" stroke="none"/></g>
+  </g>
+</svg>

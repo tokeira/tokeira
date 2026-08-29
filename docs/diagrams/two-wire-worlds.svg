@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1240" viewBox="0 0 1900 1240" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="ww_clay" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1.5,1.5 L7,4.5 L1.5,7.5 Z" fill="#B85C38"/></marker>
+    <marker id="ww_teal" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1.5,1.5 L7,4.5 L1.5,7.5 Z" fill="#0B7285"/></marker>
+    <style>
+      .title { font: 700 32px 'Avenir Next',Avenir,'Segoe UI',sans-serif; fill:#1B1714; }
+      .subtitle { font: 500 17px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .section { font: 700 13.5px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:2px; }
+      .boxtitle { font: 700 18px 'Avenir Next',Avenir,sans-serif; fill:#1B1714; }
+      .small { font: 500 13px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .mono { font: 600 12px 'SF Mono',Menlo,monospace; fill:#4A443C; }
+    </style>
+  </defs>
+  <rect width="1900" height="1240" rx="14" fill="#F6F3EE"/>
+
+  <text x="56" y="46" font-family="'SF Mono',Menlo,monospace" font-size="12" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+  <text x="56" y="84" class="title">The two wire worlds</text>
+  <text x="56" y="112" class="subtitle">One crate, two protobuf surfaces with different constitutions: Temporal's contract, preserved exactly — and Tokeira's own, versioned on its own terms.</text>
+
+  <!-- public world -->
+  <text x="56" y="168" class="section">THE COMPATIBILITY WORLD — TEMPORAL'S WIRE</text>
+  <rect x="56" y="188" width="880" height="470" rx="12" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.6"/>
+  <text x="84" y="222" class="boxtitle">Vendored, versioned, never extended</text>
+  <text x="84" y="250" class="mono">proto/upstream/ — Temporal API v1.62.11 · tonic + prost</text>
+  <text x="84" y="282" class="small">WorkflowService, OperatorService, and every message SDKs already speak,</text>
+  <text x="84" y="302" class="small">compiled exactly as Temporal published them. The behavioural contract is</text>
+  <text x="84" y="322" class="small">pinned to server v1.31.0 and verified by the conformance corpus.</text>
+  <rect x="84" y="352" width="820" height="90" rx="9" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".16"/>
+  <text x="108" y="382" class="boxtitle" font-size="15">The constitution: fidelity</text>
+  <text x="108" y="408" class="small">No Tokeira extension fields, ever — compatibility metadata that needs the wire</text>
+  <text x="108" y="428" class="small">gets its own packages instead of touching upstream messages.</text>
+  <rect x="84" y="466" width="820" height="90" rx="9" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".16"/>
+  <text x="108" y="496" class="boxtitle" font-size="15">Who speaks it</text>
+  <text x="108" y="522" class="small">Every SDK and worker, over gRPC · the HTTP/JSON gateway, transcoding the same</text>
+  <text x="108" y="542" class="small">descriptors · the functional conformance harness, over the real wire.</text>
+  <text x="84" y="600" class="small" fill="#8A8378">changes arrive only by vendoring a new upstream version — a reviewed, pinned event</text>
+
+  <!-- internal world -->
+  <text x="964" y="168" class="section">THE FIRST-PARTY WORLD — TOKEIRA'S WIRE</text>
+  <rect x="964" y="188" width="880" height="470" rx="12" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".55" stroke-width="1.6"/>
+  <text x="992" y="222" class="boxtitle">Owned, Connect-spoken, public in its own right</text>
+  <text x="992" y="250" class="mono">proto/tokeira/ — buffa codegen + connect-rust · the Connect protocol</text>
+  <text x="992" y="282" class="small">Tokeira's own interface: fleet coordination (membership, routing, drain),</text>
+  <text x="992" y="302" class="small">the conformance control service, and operator-facing compatibility metadata</text>
+  <text x="992" y="322" class="small">— tkr already speaks it. This is where Tokeira-native capability lands.</text>
+  <rect x="992" y="352" width="820" height="90" rx="9" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".16"/>
+  <text x="1016" y="382" class="boxtitle" font-size="15">The constitution: ownership</text>
+  <text x="1016" y="408" class="small">The contract is Tokeira's to version — v1 packages under proto/tokeira/,</text>
+  <text x="1016" y="428" class="small">evolved deliberately, at Tokeira's pace.</text>
+  <rect x="992" y="466" width="820" height="90" rx="9" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".16"/>
+  <text x="1016" y="496" class="boxtitle" font-size="15">Standing on governed ground</text>
+  <text x="1016" y="522" class="small">connect-rust — Anthropic-built, now under official Connect governance — passes</text>
+  <text x="1016" y="542" class="small">the complete Connect conformance suite. A dependency validated like tokeira is.</text>
+  <text x="992" y="600" class="small" fill="#8A8378">legacy corner, stated honestly: some internal runtime/admin packages still ride tonic/prost</text>
+
+  <!-- the crate spine -->
+  <rect x="480" y="716" width="940" height="150" rx="12" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".2" stroke-width="1.5"/>
+  <text x="508" y="750" class="boxtitle">tokeira-proto — one crate, both worlds</text>
+  <text x="508" y="778" class="mono">modules: public · internal · connect · conversions</text>
+  <text x="508" y="806" class="small">Bindings are generated ahead of time and checked in — building needs neither protoc nor the</text>
+  <text x="508" y="826" class="small">proto tree. cargo run -p proto-sync -- generate regenerates both worlds in one deterministic pass.</text>
+  <path d="M700 712 C640 690 590 676 540 662" stroke="#B85C38" stroke-width="2.6" fill="none" marker-end="url(#ww_clay)" stroke-linecap="round"/>
+  <path d="M1200 712 C1260 690 1310 676 1360 662" stroke="#0B7285" stroke-width="2.6" fill="none" marker-end="url(#ww_teal)" stroke-linecap="round"/>
+
+  <!-- why -->
+  <rect x="56" y="920" width="1788" height="110" rx="12" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".55" stroke-width="1.6"/>
+  <text x="80" y="952" class="boxtitle">Why the split exists</text>
+  <text x="80" y="980" class="small">The compatibility world holds still by design: Temporal's surface changes only when the pins move, so "your SDKs already speak this" stays checkable.</text>
+  <text x="80" y="1000" class="small">The first-party world is Tokeira's own product surface — it evolves at Tokeira's pace and is where the platform grows beyond compatibility. One crate</text>
+  <text x="80" y="1020" class="small">holds both so a single conversion layer — not scattered glue — is the only place the worlds meet.</text>
+
+  <text x="56" y="1090" class="small" fill="#8A8378">Companions: the compatibility edge (where the public world is served) · two authorities (the internal world's biggest speaker) · docs/crates/proto.md.</text>
+
+  <g transform="translate(1808,1168)" stroke="#B85C38" stroke-width="2.2" stroke-linecap="round" opacity=".8">
+    <path d="M0 36 C3 22 6 11 12 0" fill="none"/>
+    <g transform="translate(12,0)"><path d="M0 0 L12 -9 M0 0 L15 -1 M0 0 L12 7 M0 0 L4 -13 M0 0 L-5 -12" fill="none"/><circle cx="0" cy="0" r="2.4" fill="#B85C38" stroke="none"/></g>
+  </g>
+</svg>

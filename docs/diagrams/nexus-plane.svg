@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="1400" viewBox="0 0 2000 1400" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="nx_clay" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#B85C38"/></marker>
+    <marker id="nx_teal" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#0B7285"/></marker>
+    <marker id="nx_slate" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#8A8378"/></marker>
+    <style>
+      .title { font: 700 34px 'Avenir Next',Avenir,'Segoe UI',sans-serif; fill:#1B1714; }
+      .subtitle { font: 500 18px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .section { font: 700 14px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:2px; }
+      .boxtitle { font: 700 19px 'Avenir Next',Avenir,sans-serif; fill:#1B1714; }
+      .subhead { font: 700 14px 'Avenir Next',Avenir,sans-serif; fill:#4A443C; }
+      .body { font: 500 14.5px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .small { font: 500 13px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .mono { font: 600 12.5px 'SF Mono',Menlo,monospace; fill:#4A443C; }
+      .num { font: 800 13px 'Avenir Next',Avenir,sans-serif; fill:#FFFFFF; }
+    </style>
+  </defs>
+  <rect width="2000" height="1400" rx="14" fill="#F6F3EE"/>
+
+  <text x="60" y="48" font-family="'SF Mono',Menlo,monospace" font-size="13" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+  <text x="60" y="88" class="title">The Nexus plane</text>
+  <text x="60" y="118" class="subtitle">How Tokeira serves and calls Nexus operations — two entry surfaces, a broker of its own, and completions that survive restarts. A sibling of the authoritative-runtime diagrams.</text>
+
+  <text x="60" y="168" class="section">ENTRY SURFACES</text>
+  <text x="540" y="168" class="section">RUNTIME MACHINERY</text>
+  <text x="1480" y="168" class="section">WORKERS + PERSISTENCE</text>
+
+  <!-- caller HTTP surface -->
+  <rect x="60" y="188" width="400" height="164" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="84" y="220" class="boxtitle">Caller surface — Nexus HTTP</text>
+  <text x="84" y="246" class="mono">tokeira-edge · nexus_http</text>
+  <text x="84" y="274" class="small">Nexus RPC grammar over HTTP; authorization ordered</text>
+  <text x="84" y="294" class="small">before dispatch; bounded payloads. Sync callers wait on</text>
+  <text x="84" y="314" class="small">an operation → oneshot map (NexusHttpWaiterRegistry);</text>
+  <text x="84" y="334" class="small">async callers leave with an operation token.</text>
+
+  <!-- workflow callers -->
+  <rect x="60" y="392" width="400" height="128" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".45" stroke-width="1.4"/>
+  <text x="84" y="424" class="boxtitle">Workflow callers</text>
+  <text x="84" y="452" class="small">The kernel emits ScheduleNexusOperation /</text>
+  <text x="84" y="472" class="small">CancelNexusOperation as dispatch ops — published</text>
+  <text x="84" y="492" class="small">post-commit, like every derived effect.</text>
+
+  <!-- completion into the lane -->
+  <rect x="60" y="580" width="400" height="120" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".45" stroke-width="1.4"/>
+  <text x="84" y="612" class="boxtitle">Back into history</text>
+  <text x="84" y="640" class="small">A delivered completion re-enters through the lane —</text>
+  <text x="84" y="660" class="small">NexusOperationCompleted lands in workflow history,</text>
+  <text x="84" y="680" class="small">the only place outcomes become truth.</text>
+
+  <!-- endpoint registry -->
+  <rect x="560" y="188" width="400" height="110" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="584" y="220" class="boxtitle">NexusEndpointRegistry</text>
+  <text x="584" y="248" class="small">Resolves endpoint → target (service / operation) before</text>
+  <text x="584" y="268" class="small">anything is enqueued; operator CRUD via OperatorService.</text>
+
+  <!-- Nexus broker -->
+  <rect x="560" y="338" width="400" height="150" rx="10" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".55" stroke-width="1.6"/>
+  <text x="584" y="370" class="boxtitle">NexusTaskBroker</text>
+  <text x="584" y="396" class="small">The third broker — its own queues, beside WFT and</text>
+  <text x="584" y="416" class="small">activity. Live in-memory delivery; pending operations</text>
+  <text x="584" y="436" class="small">reconstructed from storage on restart —</text>
+  <text x="584" y="456" class="mono">list_pending_nexus_operations_for_shard</text>
+
+  <!-- completion clients -->
+  <rect x="560" y="528" width="400" height="132" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="584" y="560" class="boxtitle">Completion delivery</text>
+  <text x="584" y="588" class="small">HTTP POST to the caller's callback URL —</text>
+  <text x="584" y="608" class="mono">/nexus/callback · token + state headers</text>
+  <text x="584" y="632" class="small">Embedded loops its own callback base in-process.</text>
+
+  <!-- scanners -->
+  <rect x="560" y="700" width="400" height="122" rx="10" fill="#F6F3EE" stroke="#8A8378" stroke-opacity=".55" stroke-width="1.3" stroke-dasharray="5 5"/>
+  <text x="584" y="732" class="boxtitle" fill="#4A443C">Two of the ten loops</text>
+  <text x="584" y="760" class="small">Nexus-timeout scanner fires operation deadlines;</text>
+  <text x="584" y="780" class="small">completion-callback scanner retries undelivered</text>
+  <text x="584" y="800" class="small">completions through a durable retry state machine.</text>
+
+  <!-- workers -->
+  <rect x="1480" y="188" width="460" height="170" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="1504" y="220" class="boxtitle">Nexus workers</text>
+  <text x="1504" y="248" class="mono">poll_nexus_task_queue → respond_nexus_task_*</text>
+  <text x="1504" y="276" class="small">A handler answers synchronously, or starts work and</text>
+  <text x="1504" y="296" class="small">returns an operation token — the async path. Cancel</text>
+  <text x="1504" y="316" class="small">and error chains stay decoupled from the caller's fate.</text>
+
+  <!-- persistence -->
+  <rect x="1480" y="418" width="460" height="188" rx="10" fill="#F6F3EE" stroke="#C88D6F" stroke-opacity=".6" stroke-width="1.5" stroke-dasharray="8 5"/>
+  <text x="1504" y="450" class="boxtitle">No tables of its own</text>
+  <text x="1504" y="478" class="small">Nexus state rides the activity machinery —</text>
+  <text x="1504" y="498" class="mono">activity_state · activity_dispatch · dispatch_backlog</text>
+  <text x="1504" y="526" class="small">Async tokens and live queues are preserved across</text>
+  <text x="1504" y="546" class="small">restart: reconstruction is a read, not a guess. History</text>
+  <text x="1504" y="566" class="small">remains the only authority on outcomes.</text>
+
+  <!-- flows -->
+  <g stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M460 250 H556" stroke="#0B7285" marker-end="url(#nx_teal)"/>
+    <path d="M760 298 V334" stroke="#0B7285" marker-end="url(#nx_teal)"/>
+    <path d="M460 448 C520 448 530 420 556 410" stroke="#B85C38" marker-end="url(#nx_clay)"/>
+    <path d="M960 400 C1240 400 1300 262 1476 250" stroke="#0B7285" marker-end="url(#nx_teal)"/>
+    <path d="M1476 300 C1300 320 1240 430 964 430" stroke="#0B7285" stroke-dasharray="7 6" opacity=".8" marker-end="url(#nx_teal)"/>
+    <path d="M1480 340 C1200 480 1050 540 964 570" stroke="#B85C38" marker-end="url(#nx_clay)"/>
+    <path d="M556 600 C520 610 490 620 464 630" stroke="#B85C38" marker-end="url(#nx_clay)"/>
+    <path d="M760 660 V696" stroke="#8A8378" stroke-dasharray="4 5" marker-end="url(#nx_slate)"/>
+    <path d="M960 750 C1240 750 1380 640 1478 600" stroke="#8A8378" stroke-dasharray="4 5" marker-end="url(#nx_slate)"/>
+    <path d="M460 300 C520 330 520 350 556 368" stroke="#0B7285" opacity=".7" marker-end="url(#nx_teal)"/>
+  </g>
+  <g>
+    <circle cx="508" cy="250" r="16" fill="#0B7285" stroke="#fff" stroke-width="4"/><text x="508" y="256" text-anchor="middle" class="num">1</text>
+    <circle cx="508" cy="452" r="16" fill="#B85C38" stroke="#fff" stroke-width="4"/><text x="508" y="458" text-anchor="middle" class="num">2</text>
+    <circle cx="1230" cy="382" r="16" fill="#0B7285" stroke="#fff" stroke-width="4"/><text x="1230" y="388" text-anchor="middle" class="num">3</text>
+    <circle cx="1230" cy="404" r="16" fill="#0B7285" stroke="#fff" stroke-width="4"/><text x="1230" y="410" text-anchor="middle" class="num">4</text>
+    <circle cx="1180" cy="500" r="16" fill="#B85C38" stroke="#fff" stroke-width="4"/><text x="1180" y="506" text-anchor="middle" class="num">5</text>
+    <circle cx="502" cy="618" r="16" fill="#B85C38" stroke="#fff" stroke-width="4"/><text x="502" y="624" text-anchor="middle" class="num">6</text>
+    <circle cx="1230" cy="726" r="16" fill="#8A8378" stroke="#fff" stroke-width="4"/><text x="1230" y="732" text-anchor="middle" class="num">7</text>
+  </g>
+
+  <!-- annotations -->
+  <rect x="60" y="880" width="1880" height="360" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".14" stroke-width="1.3"/>
+  <text x="88" y="916" class="boxtitle">Flow annotations</text>
+  <g class="small">
+    <circle cx="96" cy="948" r="13" fill="#0B7285"/><text x="96" y="953" text-anchor="middle" class="num">1</text>
+    <text x="120" y="953">An external caller speaks the Nexus grammar to the HTTP surface; authorization runs before anything else. The endpoint registry resolves the target.</text>
+    <circle cx="96" cy="984" r="13" fill="#B85C38"/><text x="96" y="989" text-anchor="middle" class="num">2</text>
+    <text x="120" y="989">A workflow schedules an operation: the kernel's dispatch op publishes after the fenced commit — the caller's intent is history before it is work.</text>
+    <circle cx="96" cy="1020" r="13" fill="#0B7285"/><text x="96" y="1025" text-anchor="middle" class="num">3</text>
+    <text x="120" y="1025">Workers long-poll the NexusTaskBroker — its own queues, so Nexus demand never competes with workflow tasks for delivery.</text>
+    <circle cx="96" cy="1056" r="13" fill="#0B7285"/><text x="96" y="1061" text-anchor="middle" class="num">4</text>
+    <text x="120" y="1061">A synchronous answer resolves the caller's parked oneshot; an asynchronous handler returns an operation token and the caller carries on.</text>
+    <circle cx="96" cy="1092" r="13" fill="#B85C38"/><text x="96" y="1097" text-anchor="middle" class="num">5</text>
+    <text x="120" y="1097">When async work finishes, the handler side posts the completion to the caller's callback URL — token and state ride the headers.</text>
+    <circle cx="96" cy="1128" r="13" fill="#B85C38"/><text x="96" y="1133" text-anchor="middle" class="num">6</text>
+    <text x="120" y="1133">A delivered completion re-enters through the lane: NexusOperationCompleted appends to history, and only then is the outcome true.</text>
+    <circle cx="96" cy="1164" r="13" fill="#8A8378"/><text x="96" y="1169" text-anchor="middle" class="num">7</text>
+    <text x="120" y="1169">The two Nexus loops keep promises honest: deadlines fire even if nobody is watching, and undelivered completions retry durably until they land.</text>
+    <text x="120" y="1210" class="mono">Key: teal = poll / broker dispatch · clay = the commit path · dashed grey = scanners and async side paths</text>
+  </g>
+
+  <g transform="translate(1908,1332)" stroke="#B85C38" stroke-width="2.2" stroke-linecap="round" opacity=".8">
+    <path d="M0 36 C3 22 6 11 12 0" fill="none"/>
+    <g transform="translate(12,0)"><path d="M0 0 L12 -9 M0 0 L15 -1 M0 0 L12 7 M0 0 L4 -13 M0 0 L-5 -12" fill="none"/><circle cx="0" cy="0" r="2.4" fill="#B85C38" stroke="none"/></g>
+  </g>
+</svg>

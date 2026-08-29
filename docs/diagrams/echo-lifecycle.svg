@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1700" height="1330" viewBox="0 0 1700 1330" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="ec_clay" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#B85C38"/></marker>
+    <marker id="ec_teal" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#0B7285"/></marker>
+    <marker id="ec_blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#33586E"/></marker>
+    <style>
+      .title { font: 700 32px 'Avenir Next',Avenir,'Segoe UI',sans-serif; fill:#1B1714; }
+      .subtitle { font: 500 17px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .lane { font: 700 14px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:1.5px; }
+      .boxtitle { font: 700 16px 'Avenir Next',Avenir,sans-serif; fill:#1B1714; }
+      .small { font: 500 13px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .mono { font: 600 12px 'SF Mono',Menlo,monospace; fill:#4A443C; }
+      .commit { font: 700 15px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:1px; }
+    </style>
+  </defs>
+  <rect width="1700" height="1330" rx="14" fill="#F6F3EE"/>
+
+  <text x="56" y="46" font-family="'SF Mono',Menlo,monospace" font-size="12" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+  <text x="56" y="84" class="title">An echo workflow, in two commits</text>
+  <text x="56" y="112" class="subtitle">The eager-start lifecycle: with a worker already waiting, the workflow task starts inside the same fenced commit that starts the run.</text>
+
+  <!-- swimlane headers + guides -->
+  <g class="lane">
+    <text x="120" y="176" text-anchor="middle">CLIENT</text>
+    <text x="470" y="176" text-anchor="middle">EDGE</text>
+    <text x="850" y="176" text-anchor="middle">LANE + KERNEL</text>
+    <text x="1230" y="176" text-anchor="middle">BROKER</text>
+    <text x="1520" y="176" text-anchor="middle">WORKER</text>
+  </g>
+  <g stroke="#1B1714" stroke-opacity=".1" stroke-width="1.5">
+    <line x1="120" y1="192" x2="120" y2="1080"/><line x1="470" y1="192" x2="470" y2="1080"/>
+    <line x1="850" y1="192" x2="850" y2="1080"/><line x1="1230" y1="192" x2="1230" y2="1080"/>
+    <line x1="1520" y1="192" x2="1520" y2="1080"/>
+  </g>
+
+  <!-- 0: worker parked -->
+  <rect x="1330" y="210" width="330" height="58" rx="9" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".45"/>
+  <text x="1350" y="234" class="boxtitle" font-size="14">Already long-polling</text>
+  <text x="1350" y="254" class="small">a parked poller waits on the queue's Notify</text>
+
+  <!-- 1: start -->
+  <path d="M120 320 H460" stroke="#B85C38" stroke-width="3.2" fill="none" marker-end="url(#ec_clay)" stroke-linecap="round"/>
+  <text x="290" y="308" class="mono" text-anchor="middle">StartWorkflowExecution("echo", input)</text>
+  <path d="M470 350 H840" stroke="#B85C38" stroke-width="3.2" fill="none" marker-end="url(#ec_clay)" stroke-linecap="round"/>
+  <text x="655" y="338" class="mono" text-anchor="middle">interceptors.begin → runtime.submit(Start)</text>
+
+  <!-- reserve -->
+  <path d="M850 400 H1220" stroke="#0B7285" stroke-width="2.6" fill="none" marker-end="url(#ec_teal)" stroke-linecap="round" stroke-dasharray="7 5"/>
+  <text x="1035" y="388" class="mono" text-anchor="middle">try_reserve_start_poller → reserved</text>
+  <text x="1035" y="420" class="small" text-anchor="middle">the reserved identity rides into the Start command</text>
+
+  <!-- COMMIT 1 -->
+  <rect x="620" y="452" width="460" height="120" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".6" stroke-width="1.8"/>
+  <text x="644" y="482" class="commit">COMMIT 1 — one fenced transaction</text>
+  <text x="644" y="508" class="small">WorkflowExecutionStarted · WorkflowTaskScheduled ·</text>
+  <text x="644" y="528" class="small">WorkflowTaskStarted (reserved identity) — plus the</text>
+  <text x="644" y="548" class="small">open-run visibility snapshot. Broker enqueue suppressed.</text>
+
+  <!-- deliver -->
+  <path d="M1080 520 C1280 520 1400 490 1512 470" stroke="#0B7285" stroke-width="3.2" fill="none" marker-end="url(#ec_teal)" stroke-linecap="round"/>
+  <text x="1300" y="478" class="mono" text-anchor="middle">sync-match: the activation, hand-delivered</text>
+  <path d="M840 620 H480" stroke="#B85C38" stroke-width="3.2" fill="none" marker-end="url(#ec_clay)" stroke-linecap="round"/>
+  <text x="660" y="608" class="mono" text-anchor="middle">CommitResult → Start returns: run_id</text>
+  <path d="M460 650 H130" stroke="#B85C38" stroke-width="3.2" fill="none" marker-end="url(#ec_clay)" stroke-linecap="round"/>
+
+  <!-- client waits -->
+  <rect x="60" y="690" width="330" height="58" rx="9" fill="#EDF1F3" stroke="#33586E" stroke-opacity=".45"/>
+  <text x="80" y="714" class="boxtitle" font-size="14">Waiting on history</text>
+  <text x="80" y="734" class="small">get-history long-poll parks on the run's watch</text>
+
+  <!-- worker computes + responds -->
+  <rect x="1330" y="560" width="330" height="58" rx="9" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18"/>
+  <text x="1350" y="584" class="boxtitle" font-size="14">The whole workflow runs</text>
+  <text x="1350" y="604" class="small">echo decides: complete with the input as result</text>
+  <path d="M1510 680 C1200 700 900 700 660 720 C580 726 520 730 480 734" stroke="#B85C38" stroke-width="3.2" fill="none" marker-end="url(#ec_clay)" stroke-linecap="round"/>
+  <text x="1000" y="690" class="mono" text-anchor="middle">RespondWorkflowTaskCompleted [ CompleteWorkflowExecution(result) ]</text>
+  <path d="M470 780 H840" stroke="#B85C38" stroke-width="3.2" fill="none" marker-end="url(#ec_clay)" stroke-linecap="round"/>
+  <text x="655" y="768" class="mono" text-anchor="middle">submit_for_owned_shard(WftCompleted)</text>
+
+  <!-- COMMIT 2 -->
+  <rect x="620" y="820" width="460" height="120" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".6" stroke-width="1.8"/>
+  <text x="644" y="850" class="commit">COMMIT 2 — one fenced transaction</text>
+  <text x="644" y="876" class="small">WorkflowTaskCompleted · WorkflowExecutionCompleted —</text>
+  <text x="644" y="896" class="small">plus the closed-run visibility snapshot. History waiters</text>
+  <text x="644" y="916" class="small">are notified as part of the committed transition.</text>
+
+  <!-- result to client -->
+  <path d="M620 900 C450 920 300 950 135 985" stroke="#33586E" stroke-width="3.2" fill="none" stroke-dasharray="9 7" marker-end="url(#ec_blue)" stroke-linecap="round"/>
+  <text x="380" y="928" class="mono" text-anchor="middle">the parked long-poll wakes → result</text>
+
+  <rect x="60" y="1010" width="330" height="52" rx="9" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5"/>
+  <text x="80" y="1032" class="boxtitle" font-size="14">echo("hello") → "hello"</text>
+  <text x="80" y="1050" class="small">two round trips, two commits, one truth</text>
+
+  <!-- queued-path note -->
+  <rect x="56" y="1110" width="1604" height="76" rx="12" fill="#FBF9F5" stroke="#8A8378" stroke-opacity=".5" stroke-dasharray="5 5"/>
+  <text x="80" y="1140" class="boxtitle" font-size="15" fill="#4A443C">When nobody is waiting — the queued path</text>
+  <text x="80" y="1164" class="small">No reservable poller ⇒ Commit 1 carries only Started + Scheduled and the broker enqueues; the eventual poll commits WorkflowTaskStarted as its own transition before delivery — three commits, same truth. If sync-match delivery ever fails, the WFT timeout scanner recovers from committed state.</text>
+
+  <!-- footer -->
+  <rect x="56" y="1214" width="1604" height="56" rx="12" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.4"/>
+  <text x="80" y="1238" class="boxtitle" fill="#9A4A2C" font-size="14">The teaching:</text>
+  <text x="80" y="1258" class="small">every observable fact — started, task taken, completed, result — exists because a fenced commit made it true; delivery is just how workers find out.</text>
+
+  <g transform="translate(1612,1268)" stroke="#B85C38" stroke-width="2" stroke-linecap="round" opacity=".8">
+    <path d="M0 32 C3 20 5 10 11 0" fill="none"/>
+    <g transform="translate(11,0)"><path d="M0 0 L11 -8 M0 0 L14 -1 M0 0 L11 6 M0 0 L4 -12 M0 0 L-4 -11" fill="none"/><circle cx="0" cy="0" r="2.2" fill="#B85C38" stroke="none"/></g>
+  </g>
+</svg>

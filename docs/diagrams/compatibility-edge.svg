@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1330" viewBox="0 0 1900 1330" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="ed_clay" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#B85C38"/></marker>
+    <marker id="ed_teal" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#0B7285"/></marker>
+    <style>
+      .title { font: 700 32px 'Avenir Next',Avenir,'Segoe UI',sans-serif; fill:#1B1714; }
+      .subtitle { font: 500 17px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .section { font: 700 13.5px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:2px; }
+      .boxtitle { font: 700 18px 'Avenir Next',Avenir,sans-serif; fill:#1B1714; }
+      .small { font: 500 13px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .mono { font: 600 12px 'SF Mono',Menlo,monospace; fill:#4A443C; }
+    </style>
+  </defs>
+  <rect width="1900" height="1330" rx="14" fill="#F6F3EE"/>
+
+  <text x="56" y="46" font-family="'SF Mono',Menlo,monospace" font-size="12" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+  <text x="56" y="84" class="title">The compatibility edge</text>
+  <text x="56" y="112" class="subtitle">Three doors, one chokepoint, and a shelf of caches — the edge admits, translates, and routes. It owns no workflow semantics.</text>
+
+  <text x="56" y="164" class="section">THE DOORS</text>
+  <text x="720" y="164" class="section">THE CHOKEPOINT</text>
+  <text x="1400" y="164" class="section">THE SHELF</text>
+
+  <!-- doors -->
+  <rect x="56" y="184" width="600" height="150" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="80" y="216" class="boxtitle">Temporal gRPC</text>
+  <text x="80" y="244" class="small">WorkflowService + OperatorService — ~200 RPCs across the</text>
+  <text x="80" y="264" class="small">entry classes: lifecycle · completions · activity · queries &amp;</text>
+  <text x="80" y="284" class="small">updates · schedules &amp; batch · deployments · admin.</text>
+  <text x="80" y="312" class="mono">the contract SDKs already speak</text>
+
+  <rect x="56" y="366" width="600" height="128" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="80" y="398" class="boxtitle">HTTP / JSON gateway</text>
+  <text x="80" y="426" class="small">Descriptor-derived route catalog, protobuf ⇄ JSON transcoding,</text>
+  <text x="80" y="446" class="small">4 MiB body cap — Temporal's public HTTP surface, mirrored.</text>
+  <text x="80" y="474" class="mono">enabled by default; policy-gated</text>
+
+  <rect x="56" y="526" width="600" height="108" rx="10" fill="#F6F3EE" stroke="#8A8378" stroke-opacity=".55" stroke-width="1.3" stroke-dasharray="5 5"/>
+  <text x="80" y="558" class="boxtitle" fill="#4A443C">Nexus HTTP · CHASM ActivityBridge</text>
+  <text x="80" y="586" class="small">Two more doors with their own diagrams — the Nexus caller</text>
+  <text x="80" y="606" class="small">grammar, and the gated standalone-activity surface.</text>
+
+  <!-- chokepoint -->
+  <rect x="720" y="184" width="600" height="200" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".55" stroke-width="1.7"/>
+  <text x="744" y="216" class="boxtitle">interceptors.begin — every request, one gate</text>
+  <text x="744" y="244" class="small">Authentication, then authorization, then namespace resolution,</text>
+  <text x="744" y="264" class="small">then request-id threading — in that order, for all doors alike.</text>
+  <text x="744" y="292" class="mono">begin(headers, namespace, Action, is_long_poll)</text>
+  <text x="744" y="320" class="small">Worker polls take the stricter preflight: the worker's target</text>
+  <text x="744" y="340" class="small">queue is authorized before any task can reach it.</text>
+  <text x="744" y="366" class="mono">begin_worker_preflight · authorize_worker_target</text>
+
+  <rect x="720" y="416" width="600" height="120" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="744" y="448" class="boxtitle">LongPollGate — admission for the patient</text>
+  <text x="744" y="476" class="small">A 10,000-permit semaphore with a 250ms fail-fast acquire:</text>
+  <text x="744" y="496" class="small">the three task polls take permits; history's 20s long-poll,</text>
+  <text x="744" y="516" class="small">deliberately, does not.</text>
+
+  <rect x="720" y="568" width="600" height="164" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="744" y="600" class="boxtitle">Routing — cached, refreshable, honest</text>
+  <text x="744" y="628" class="small">The routing cache (lock-free swap) holds the controller's</text>
+  <text x="744" y="648" class="small">snapshot; RefreshBundle and a direct DSQL lease read cover</text>
+  <text x="744" y="668" class="small">staleness. A wrong guess costs one retry, never a wrong commit:</text>
+  <text x="744" y="696" class="mono">NotShardOwner → ABORTED + bundle/epoch/owner metadata</text>
+  <text x="744" y="720" class="small">— the client retries with fresh routing.</text>
+
+  <!-- shelf -->
+  <rect x="1400" y="184" width="444" height="330" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="1424" y="216" class="boxtitle">The registries</text>
+  <text x="1424" y="248" class="mono">PollerRegistry</text>
+  <text x="1424" y="268" class="small">who polled what, 5-minute memory — DescribeTaskQueue's source</text>
+  <text x="1424" y="296" class="mono">NamespaceCache</text>
+  <text x="1424" y="316" class="small">resolution without a round trip</text>
+  <text x="1424" y="344" class="mono">HistoryWaitRegistry</text>
+  <text x="1424" y="364" class="small">per-run watch — commits wake the history long-polls</text>
+  <text x="1424" y="392" class="mono">PendingQueryStore · ScopedWorkerSessionRegistry</text>
+  <text x="1424" y="412" class="small">in-flight queries; scoped worker sessions</text>
+  <text x="1424" y="440" class="mono">task tokens · request ids</text>
+  <text x="1424" y="460" class="small">opaque to workers, verified on the way back in</text>
+
+  <rect x="1400" y="546" width="444" height="108" rx="10" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".5" stroke-width="1.4"/>
+  <text x="1424" y="578" class="boxtitle">Translation, both ways</text>
+  <text x="1424" y="606" class="small">Wire shapes (tokeira-proto) ⇄ internal identity (tokeira-types).</text>
+  <text x="1424" y="626" class="small">Behaviour questions defer to the pinned Temporal release.</text>
+
+  <!-- flows -->
+  <g stroke-width="3.2" fill="none" stroke-linecap="round">
+    <path d="M656 260 H714" stroke="#B85C38" marker-end="url(#ed_clay)"/>
+    <path d="M656 430 C690 430 700 300 716 280" stroke="#B85C38" marker-end="url(#ed_clay)"/>
+    <path d="M1320 284 H1394" stroke="#0B7285" marker-end="url(#ed_teal)" stroke-dasharray="7 5"/>
+    <path d="M1320 640 C1360 640 1370 620 1394 604" stroke="#0B7285" marker-end="url(#ed_teal)" stroke-dasharray="7 5"/>
+  </g>
+
+  <!-- what it is not -->
+  <rect x="56" y="790" width="1788" height="130" rx="12" fill="#FBF9F5" stroke="#8A8378" stroke-opacity=".5" stroke-dasharray="5 5"/>
+  <text x="80" y="822" class="boxtitle" fill="#4A443C">What the edge deliberately is not</text>
+  <text x="80" y="850" class="small">It holds no run state, makes no workflow decisions, and writes no history — every mutating request becomes a runtime command, and every fact it</text>
+  <text x="80" y="870" class="small">reports was made true by a fenced commit elsewhere. Cross-node request forwarding is unwired by design: routing metadata makes the client the</text>
+  <text x="80" y="890" class="small">router, and the DSQL lease stays the only authority worth consulting.</text>
+
+  <!-- footer -->
+  <rect x="56" y="960" width="1788" height="56" rx="12" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.4"/>
+  <text x="80" y="984" class="boxtitle" fill="#9A4A2C" font-size="14">The edge's one job:</text>
+  <text x="80" y="1004" class="small">make Temporal's contract true at the wire — and hand everything else, untouched, to the authority behind it.</text>
+
+  <text x="56" y="1070" class="small" fill="#8A8378">Companion diagrams: the authoritative runtime (server · embedded) for where commands go · the Nexus and CHASM planes for the other two doors.</text>
+
+  <g transform="translate(1808,1258)" stroke="#B85C38" stroke-width="2.2" stroke-linecap="round" opacity=".8">
+    <path d="M0 36 C3 22 6 11 12 0" fill="none"/>
+    <g transform="translate(12,0)"><path d="M0 0 L12 -9 M0 0 L15 -1 M0 0 L12 7 M0 0 L4 -13 M0 0 L-5 -12" fill="none"/><circle cx="0" cy="0" r="2.4" fill="#B85C38" stroke="none"/></g>
+  </g>
+</svg>

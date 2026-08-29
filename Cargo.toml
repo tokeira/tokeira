@@ -57,6 +57,7 @@ members = [
 exclude = [
     "scenarios/worker-versioning",
     "scenarios/standalone-activities",
+    "spikes/dagger-module-ci/shape",
     "spikes/dagger-rust-sdk",
     "spikes/temporal-rust-sdk-v0-7-embedded",
     "tools/simulation/engine",

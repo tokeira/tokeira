@@ -1,0 +1,8 @@
+# Spike-only workaround (finding #3, spikes/dagger-module-ci/README.md): the rust.3
+# engine's packaged SDK dependency selects crates-io at 1.0.0-beta.11.rust.3, which is
+# not published there. Patch both SDK crates to the release revision on the public fork
+# so the packaged selection can resolve. Remove once engine content selects the Git
+# source (PublishedSdkDependency::Git) or the crates are published to a real registry.
+[patch.crates-io]
+dagger-sdk = { git = "https://github.com/iw/dagger", rev = "c5f7dc771b76cb4719c1820c031570909232d539" }
+dagger-sdk-macros = { git = "https://github.com/iw/dagger", rev = "c5f7dc771b76cb4719c1820c031570909232d539" }

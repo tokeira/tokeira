@@ -1,0 +1,18 @@
+# Spike: compile-verified authored surface for a Tokeira CI Dagger module against the
+# pinned fork SDK (iw/dagger, sdk/rust/v1.0.0-beta.11.rust.3). Workspace-excluded; own
+# lockfile — the same standalone-project shape the engine requires of real Rust module
+# sources (registry/git SDK dependency, never a path; see ../README.md finding F2).
+[package]
+name = "dagger-module-ci-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+dagger-sdk = { path = "../../../vendor/dagger-sdk" }
+
+[patch.crates-io]
+dagger-sdk-macros = { path = "../../../vendor/dagger-sdk-macros" }

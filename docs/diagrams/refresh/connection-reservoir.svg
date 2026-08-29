@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1420" viewBox="0 0 1900 1420" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="cr_clay" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#B85C38"/></marker>
+    <marker id="cr_gold" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#B08D2E"/></marker>
+    <style>
+      .title { font: 700 32px 'Avenir Next',Avenir,'Segoe UI',sans-serif; fill:#1B1714; }
+      .subtitle { font: 500 17px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .section { font: 700 13.5px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:2px; }
+      .boxtitle { font: 700 18px 'Avenir Next',Avenir,sans-serif; fill:#1B1714; }
+      .small { font: 500 13px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .mono { font: 600 12px 'SF Mono',Menlo,monospace; fill:#4A443C; }
+      .chip { font: 600 11.5px 'SF Mono',Menlo,monospace; fill:#6E6860; }
+    </style>
+  </defs>
+  <rect width="1900" height="1420" rx="14" fill="#F6F3EE"/>
+
+  <text x="56" y="46" font-family="'SF Mono',Menlo,monospace" font-size="12" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+  <text x="56" y="84" class="title">The connection reservoir</text>
+  <text x="56" y="112" class="subtitle">DSQL connections as a governed pool — one shared machine, two coordination worlds. The mode fork is a single enum at acquire time.</text>
+
+  <text x="56" y="164" class="section">THE SHARED MACHINE — IDENTICAL IN BOTH MODES</text>
+
+  <!-- director -->
+  <rect x="56" y="184" width="880" height="180" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.6"/>
+  <text x="80" y="216" class="boxtitle">ConnectionDirector — class-aware admission</text>
+  <text x="80" y="244" class="mono">acquire(DbClass) → permit · priority: Control &gt; Commit &gt; Read &gt; Projection &gt; Maintenance</text>
+  <text x="80" y="272" class="small">Budgets are ratios of target_ready, not constants — Control 10% · Commit 50% · Read 20% ·</text>
+  <text x="80" y="292" class="small">Projection 10% · Maintenance the remainder, every class floored at one. Reconfigurable at runtime.</text>
+  <text x="80" y="320" class="mono">server target_ready(50) ⇒ 5 · 23 · 10 · 5 · 7      embedded target_ready(8) ⇒ 1 · 2 · 1 · 1 · 3</text>
+  <text x="80" y="346" class="chip">⏱ pool_checkout_duration_seconds</text>
+
+  <!-- reservoir -->
+  <rect x="964" y="184" width="880" height="180" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="988" y="216" class="boxtitle">Reservoir — four background keepers</text>
+  <text x="988" y="244" class="small"><tspan font-weight="600" fill="#1B1714">Refiller</tspan> creates connections — a slot first, then a creation token, never the reverse.</text>
+  <text x="988" y="266" class="small"><tspan font-weight="600" fill="#1B1714">Scanner</tspan> retires by lifetime and guard window, in bounded batches that cannot drain the pool.</text>
+  <text x="988" y="288" class="small"><tspan font-weight="600" fill="#1B1714">Return processor</tspan> honors the caller's marked_bad flag and the guard window — it does not ping.</text>
+  <text x="988" y="310" class="small"><tspan font-weight="600" fill="#1B1714">Leak detector</tspan> flags checkouts held past 30s, scanning every 5s.</text>
+  <text x="988" y="340" class="chip">⏱ reservoir_utilization_ratio · pool_connections_total</text>
+
+  <!-- fork -->
+  <rect x="700" y="416" width="500" height="64" rx="14" fill="#ECE8E0" stroke="#1B1714" stroke-opacity=".22" stroke-width="1.4"/>
+  <text x="950" y="443" class="boxtitle" text-anchor="middle" font-size="16">The fork: ReservoirController</text>
+  <text x="950" y="466" class="mono" text-anchor="middle">enum { Distributed, Embedded } — decided at acquire()</text>
+  <path d="M760 480 C600 520 480 540 400 566" stroke="#B85C38" stroke-width="3.5" fill="none" marker-end="url(#cr_clay)" stroke-linecap="round"/>
+  <path d="M1140 480 C1300 520 1420 540 1500 566" stroke="#B85C38" stroke-width="3.5" fill="none" marker-end="url(#cr_clay)" stroke-linecap="round"/>
+
+  <!-- SERVER half -->
+  <text x="56" y="560" class="section">SERVER — COORDINATED ACROSS NODES</text>
+  <rect x="56" y="580" width="880" height="560" rx="12" fill="#FBF9F5" stroke="#1B1714" stroke-opacity=".16" stroke-width="1.4"/>
+
+  <rect x="88" y="612" width="816" height="128" rx="10" fill="#F7F0DC" stroke="#E3D394" stroke-width="1.3"/>
+  <text x="112" y="644" class="boxtitle">Slot blocks — DynamoDB</text>
+  <text x="112" y="672" class="small">Capacity claimed in blocks of 50 under 60s leases, renewed every 20s. The fleet's</text>
+  <text x="112" y="692" class="small">total footprint stays under the account envelope because every slot is leased.</text>
+  <text x="112" y="720" class="chip">⏱ slot_blocks_owned</text>
+
+  <rect x="88" y="768" width="816" height="128" rx="10" fill="#F7F0DC" stroke="#E3D394" stroke-width="1.3"/>
+  <text x="112" y="800" class="boxtitle">Creation token bucket — DynamoDB</text>
+  <text x="112" y="828" class="small">One shared row, conditionally written: cluster-wide connection-creation rate</text>
+  <text x="112" y="848" class="small">(default 100/s, burst 1000). Every node's refiller drinks from the same bucket.</text>
+  <text x="112" y="876" class="chip">⏱ rate_limiter_tokens_remaining</text>
+
+  <rect x="88" y="924" width="816" height="96" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".16"/>
+  <text x="112" y="956" class="boxtitle" font-size="15">Mandatory, not optional</text>
+  <text x="112" y="982" class="small">Distributed mode refuses to run without its DynamoDB coordination — there is no local fallback.</text>
+
+  <rect x="88" y="1048" width="816" height="64" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".45"/>
+  <text x="112" y="1074" class="small"><tspan font-weight="600" fill="#9A4A2C">Why:</tspan> many nodes, one Aurora DSQL account envelope — the budget must live somewhere every node can see.</text>
+
+  <!-- EMBEDDED half -->
+  <text x="964" y="560" class="section">EMBEDDED — ONE OWNER, NO DYNAMODB</text>
+  <rect x="964" y="580" width="880" height="560" rx="12" fill="#FBF9F5" stroke="#1B1714" stroke-opacity=".16" stroke-width="1.4"/>
+
+  <rect x="996" y="612" width="816" height="128" rx="10" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".45" stroke-width="1.3"/>
+  <text x="1020" y="644" class="boxtitle">Process-local coordinator</text>
+  <text x="1020" y="672" class="small">An atomic slot budget and a monotonic-clock token bucket — the DynamoDB machinery</text>
+  <text x="1020" y="692" class="small">replaced one-for-one, in-process, with nothing to provision.</text>
+  <text x="1020" y="720" class="mono">ProcessLocalConnectionCoordinator</text>
+
+  <rect x="996" y="768" width="816" height="128" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.4"/>
+  <text x="1020" y="800" class="boxtitle">The control lease — exclusion lives in DSQL</text>
+  <text x="1020" y="828" class="small">tokeira_control_lease with fence tokens; the OwnershipAdmissionGate re-checks Open</text>
+  <text x="1020" y="848" class="small">under the admission lock on every checkout. A second owner cannot borrow a connection.</text>
+  <text x="1020" y="876" class="mono">one narrow bypass: acquire_shutdown_control()</text>
+
+  <rect x="996" y="924" width="816" height="96" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".16"/>
+  <text x="1020" y="956" class="boxtitle" font-size="15">The embedded reservoir</text>
+  <text x="1020" y="982" class="small">Deadline-aware warmup and shutdown wrap the same four keepers — no idle machinery, no cloud.</text>
+
+  <rect x="996" y="1048" width="816" height="64" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".45"/>
+  <text x="1020" y="1074" class="small"><tspan font-weight="600" fill="#9A4A2C">Why:</tspan> one process owns the cluster — the budget can be an atomic, and exclusion belongs to the database itself.</text>
+
+  <!-- footer -->
+  <rect x="56" y="1188" width="1788" height="60" rx="14" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.5"/>
+  <text x="80" y="1214" class="boxtitle" fill="#9A4A2C" font-size="15">One machine, two worlds:</text>
+  <text x="80" y="1236" class="small">the director, the keepers, and the class budgets never change — only who is allowed to create a connection, and who proves they own the cluster.</text>
+
+  <text x="56" y="1300" class="small" fill="#8A8378">Aurora DSQL constraints both worlds honor: IAM auth per connection, bounded connection lifetime — the scanner's guard window exists because of it.</text>
+
+  <g transform="translate(1808,1348)" stroke="#B85C38" stroke-width="2.2" stroke-linecap="round" opacity=".8">
+    <path d="M0 36 C3 22 6 11 12 0" fill="none"/>
+    <g transform="translate(12,0)"><path d="M0 0 L12 -9 M0 0 L15 -1 M0 0 L12 7 M0 0 L4 -13 M0 0 L-5 -12" fill="none"/><circle cx="0" cy="0" r="2.4" fill="#B85C38" stroke="none"/></g>
+  </g>
+</svg>

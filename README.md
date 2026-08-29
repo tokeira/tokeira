@@ -183,6 +183,13 @@ It remains outside the correctness path.
        alt="The three planes: requests enter the compatibility edge, follow the commit path through the runtime's lanes and pure kernel into one authoritative history in Aurora DSQL, and everything else — broker delivery, projection — derives from that log.">
 </p>
 
+And one command's whole journey through them:
+
+<p align="center">
+  <img src="docs/diagrams/lane-commit-pipeline.svg" width="600"
+       alt="One command, start to durable: submit gates and lane pick, the bounded channel, the single-threaded lane executor, load through the cache, the pure kernel's decision, one fenced transaction writing history, timers, and the visibility snapshot together, then dispatch publishing and the reply — with OCC retries looping back at most five times.">
+</p>
+
 The architecture is documented in
 [docs/architecture/](docs/architecture/000-overview.md). A navigable reference
 for the seven engine crates lives in [docs/crates/](docs/crates/README.md).
@@ -286,16 +293,10 @@ The concurrency model and fleet mechanics are documented in
 
 ## Development
 
-Tokeira uses standard Cargo workflows on a pinned stable Rust toolchain.
-
-```sh
-cargo test --workspace
-```
-
-The workspace test suite requires neither AWS credentials nor Docker.
-
-See [docs/development.md](docs/development.md) for the development environment,
-quality gates, and repository conventions.
+Tokeira builds with standard Cargo on a pinned stable Rust toolchain, and the
+workspace test suite runs without AWS credentials or Docker. The development
+environment, quality gates, and repository conventions are documented in
+[docs/development.md](docs/development.md).
 
 ## Contributing
 

@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1960" height="1500" viewBox="0 0 1960 1500" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="hp_clay" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1.5,1.5 L7,4.5 L1.5,7.5 Z" fill="#B85C38"/></marker>
+    <marker id="hp_teal" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1.5,1.5 L7,4.5 L1.5,7.5 Z" fill="#0B7285"/></marker>
+    <style>
+      .title { font: 700 32px 'Avenir Next',Avenir,'Segoe UI',sans-serif; fill:#1B1714; }
+      .subtitle { font: 500 17px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .section { font: 700 13.5px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:2px; }
+      .boxtitle { font: 700 16.5px 'Avenir Next',Avenir,sans-serif; fill:#1B1714; }
+      .small { font: 500 12.5px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .mono { font: 600 11.5px 'SF Mono',Menlo,monospace; fill:#4A443C; }
+      .metric { font: 600 10.5px 'SF Mono',Menlo,monospace; fill:#6E6860; }
+    </style>
+  </defs>
+  <rect width="1960" height="1500" rx="14" fill="#F6F3EE"/>
+
+  <text x="56" y="46" font-family="'SF Mono',Menlo,monospace" font-size="12" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+  <text x="56" y="84" class="title">The hot path, instrumented</text>
+  <text x="56" y="112" class="subtitle">One mutation's synchronous latency, stage by stage — no proportions asserted, no numbers claimed: every stage names the metric that measures it on your cluster.</text>
+
+  <!-- stages: two rows of equal cards -->
+  <text x="56" y="164" class="section">THE STAGES — EQUAL BOXES, BECAUSE THE SHAPE IS YOURS TO MEASURE</text>
+
+  <rect x="56" y="184" width="440" height="150" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.3"/>
+  <text x="78" y="212" class="boxtitle">1 · Edge admission</text>
+  <text x="78" y="238" class="small">Interceptors first — authn, authz, namespace, request-id —</text>
+  <text x="78" y="256" class="small">then the routing lookup: a lock-free snapshot read, no DSQL.</text>
+  <text x="78" y="282" class="metric">tokeira_edge_grpc_request_duration_seconds</text>
+  <text x="78" y="300" class="metric">tokeira_edge_authorization_duration_seconds</text>
+  <text x="78" y="318" class="metric">tokeira_runtime_not_shard_owner_total</text>
+
+  <rect x="528" y="184" width="440" height="150" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.3"/>
+  <text x="550" y="212" class="boxtitle">2 · Submit + the lane channel</text>
+  <text x="550" y="238" class="small">Drain and Active gates, blake3 lane pick, the bounded</text>
+  <text x="550" y="256" class="small">channel — backpressure lives here, explicitly.</text>
+  <text x="550" y="282" class="metric">tokeira_runtime_lane_queue_wait_seconds</text>
+  <text x="550" y="300" class="metric">tokeira_runtime_lane_submit_duration_seconds  (end-to-end)</text>
+
+  <rect x="1000" y="184" width="440" height="150" rx="10" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".45" stroke-width="1.3"/>
+  <text x="1022" y="212" class="boxtitle">eager start · pre-commit</text>
+  <text x="1022" y="238" class="small">On Start, a waiting poller is reserved before the commit —</text>
+  <text x="1022" y="256" class="small">the broker interaction that happens ahead of durability,</text>
+  <text x="1022" y="274" class="small">so delivery is instant when the commit lands.</text>
+  <text x="1022" y="300" class="metric">tokeira_runtime_broker_sync_match_total</text>
+  <text x="1022" y="318" class="metric">vs tokeira_runtime_broker_non_sync_match_total</text>
+
+  <rect x="1472" y="184" width="432" height="150" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.3"/>
+  <text x="1494" y="212" class="boxtitle">3 · Load — or don't</text>
+  <text x="1494" y="238" class="small">The lane cache (4096 entries, 60s idle) serves hot runs and</text>
+  <text x="1494" y="256" class="small">bypasses storage entirely; a miss reads one workflow_hot row.</text>
+  <text x="1494" y="282" class="metric">tokeira_storage_load_run_duration_seconds</text>
+  <text x="1494" y="300" class="small" fill="#8A8378">cache evicts on OCC conflict — correctness first</text>
+
+  <rect x="56" y="366" width="440" height="150" rx="10" fill="#ECE8E0" stroke="#1B1714" stroke-opacity=".22" stroke-width="1.3"/>
+  <text x="78" y="394" class="boxtitle">4 · The pure kernel</text>
+  <text x="78" y="420" class="small">A synchronous, deterministic decision — no I/O, no await.</text>
+  <text x="78" y="438" class="small">Its cost is compute; its span is the instrument.</text>
+  <text x="78" y="464" class="mono">span: kernel.transition</text>
+  <text x="78" y="488" class="small" fill="#8A8378">a no-op transition ends the path here — nothing written</text>
+
+  <rect x="528" y="366" width="440" height="150" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".6" stroke-width="1.6"/>
+  <text x="550" y="394" class="boxtitle">5 · One fenced transaction</text>
+  <text x="550" y="420" class="small">Seven tables in one txn: hot state, history batch, dedupe,</text>
+  <text x="550" y="438" class="small">activity state + dispatch, timers, current-execution, the</text>
+  <text x="550" y="456" class="small">visibility snapshot. Fences first; a Commit-class permit gates entry.</text>
+  <text x="550" y="482" class="metric">tokeira_storage_commit_transition_duration_seconds</text>
+  <text x="550" y="500" class="metric">tokeira_storage_dsql_statement_duration_seconds{statement=…}</text>
+
+  <rect x="1000" y="366" width="440" height="150" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.3"/>
+  <text x="1022" y="394" class="boxtitle">6 · Publish — inside your latency</text>
+  <text x="1022" y="420" class="small">Dispatch fans out to the brokers and is awaited before the</text>
+  <text x="1022" y="438" class="small">reply: broker time is part of what the caller feels. Failure</text>
+  <text x="1022" y="456" class="small">is non-fatal — sweepers recover — but success is on the clock.</text>
+  <text x="1022" y="482" class="metric">tokeira_runtime_broker_publish_total · _queue_depth</text>
+
+  <rect x="1472" y="366" width="432" height="150" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.3"/>
+  <text x="1494" y="394" class="boxtitle">7 · Reply</text>
+  <text x="1494" y="420" class="small">After the durable outcome, after publish — the caller hears</text>
+  <text x="1494" y="438" class="small">a truth that already survived a crash. WFT timeout tracking</text>
+  <text x="1494" y="456" class="small">arms inline here too — real per-commit work.</text>
+  <text x="1494" y="482" class="metric">tokeira_runtime_lane_processing_duration_seconds</text>
+
+  <g stroke="#B85C38" stroke-width="2.6" fill="none" stroke-linecap="round">
+    <path d="M496 259 H522" marker-end="url(#hp_clay)"/>
+    <path d="M968 259 H994" marker-end="url(#hp_clay)"/>
+    <path d="M1440 259 H1466" marker-end="url(#hp_clay)"/>
+    <path d="M1688 334 C1688 350 280 350 276 362" marker-end="url(#hp_clay)"/>
+    <path d="M496 441 H522" marker-end="url(#hp_clay)"/>
+    <path d="M968 441 H994" marker-end="url(#hp_clay)"/>
+    <path d="M1440 441 H1466" marker-end="url(#hp_clay)"/>
+  </g>
+
+  <!-- OCC loop -->
+  <path d="M748 516 C748 552 1560 552 1688 520" stroke="#8A8378" stroke-width="2.2" fill="none" stroke-dasharray="6 5" stroke-linecap="round" opacity="0"/>
+  <rect x="56" y="556" width="912" height="64" rx="10" fill="#F7EBDA" stroke="#B4690E" stroke-opacity=".5"/>
+  <text x="80" y="582" class="mono" fill="#8A5A10">OCC conflict → evict cache → reload → re-apply, at most 5 attempts</text>
+  <text x="80" y="602" class="metric">tokeira_runtime_occ_retry_total · tokeira_storage_dsql_occ_conflict_total</text>
+
+  <rect x="1000" y="556" width="904" height="64" rx="10" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".45"/>
+  <text x="1024" y="582" class="mono" fill="#096A7C">side path: speculative WFTs — precise in-memory timers, zero DSQL commits, never on this page's clock</text>
+  <text x="1024" y="602" class="metric">tokeira_runtime_query_buffer_wait_seconds (buffered consistent queries — the other synchronous barrier)</text>
+
+  <!-- the plumbing beneath -->
+  <text x="56" y="686" class="section">THE PLUMBING BENEATH THE COMMIT</text>
+  <rect x="56" y="706" width="912" height="160" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.3"/>
+  <text x="80" y="736" class="boxtitle">Connection permits, by class</text>
+  <text x="80" y="762" class="small">The commit hop acquires a Commit-class permit — its wait is a first-class stage of your</text>
+  <text x="80" y="782" class="small">latency, isolated from reads, projection, control, and maintenance by design.</text>
+  <text x="80" y="810" class="metric">tokeira_dsql_class_permit_wait_duration_seconds · _pool_class_in_use · _class_waiters</text>
+  <text x="80" y="830" class="metric">tokeira_dsql_connection_leak_suspects · _connection_checkout_overdue_seconds</text>
+
+  <rect x="1000" y="706" width="904" height="160" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.3"/>
+  <text x="1024" y="736" class="boxtitle">The projection consumer runs off-clock</text>
+  <text x="1024" y="762" class="small">The snapshot row is written inside the commit — but its consumers never touch this path:</text>
+  <text x="1024" y="782" class="small">worker lag is a quality signal, not a latency stage.</text>
+  <text x="1024" y="810" class="metric">tokeira_projection_worker_lag_records · _checkpoint_lag_seconds · _sink_error_total</text>
+
+  <!-- levers -->
+  <text x="56" y="932" class="section">THE LEVERS — WHAT ACTUALLY MOVES THE SHAPE</text>
+  <rect x="56" y="952" width="1848" height="196" rx="12" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.5"/>
+  <text x="80" y="984" class="boxtitle">Four knobs, one warning</text>
+  <text x="80" y="1012" class="mono">bundle_count — independent ownership cells. DEFAULT IS 1: out of the box, a single lease row serializes ownership. The first lever to check at scale.</text>
+  <text x="80" y="1038" class="mono">lane_count (default 32) — more local executors; per-run order is preserved by construction.</text>
+  <text x="80" y="1064" class="mono">id spread — deterministic wide UUIDs spread runs across bundles and lanes; blake3 home hashing spreads commits.</text>
+  <text x="80" y="1090" class="mono">reservoir — target_ready 50 · lifetime 10m ± 2m jitter · guard 45s · hard cutoff 15m · creation 100/s burst 1000 (embedded: 8 conns, 8/s burst 2).</text>
+  <text x="80" y="1122" class="small">Every lever's effect shows up in the metrics above — turn one, watch the shape move, keep the evidence.</text>
+
+  <!-- footer -->
+  <rect x="56" y="1188" width="1848" height="56" rx="12" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.4"/>
+  <text x="80" y="1212" class="boxtitle" fill="#9A4A2C" font-size="14">The rule this page lives by:</text>
+  <text x="80" y="1232" class="small">latency claims belong to benchmarks on your hardware — this page tells you where to point the ruler, never what it will read.</text>
+
+  <text x="56" y="1302" class="small" fill="#8A8378">Companions: the lane commit pipeline (the same journey, taught) · the connection reservoir (the permits' world) · the delivery plane (where publish goes).</text>
+
+  <g transform="translate(1868,1428)" stroke="#B85C38" stroke-width="2.2" stroke-linecap="round" opacity=".8">
+    <path d="M0 36 C3 22 6 11 12 0" fill="none"/>
+    <g transform="translate(12,0)"><path d="M0 0 L12 -9 M0 0 L15 -1 M0 0 L12 7 M0 0 L4 -13 M0 0 L-5 -12" fill="none"/><circle cx="0" cy="0" r="2.4" fill="#B85C38" stroke="none"/></g>
+  </g>
+</svg>

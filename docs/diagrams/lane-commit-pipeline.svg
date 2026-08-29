@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1560" viewBox="0 0 1000 1560" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="lp_clay" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#B85C38"/></marker>
+    <marker id="lp_slate" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#8A8378"/></marker>
+    <style>
+      .title { font: 700 30px 'Avenir Next',Avenir,'Segoe UI',sans-serif; fill:#1B1714; }
+      .subtitle { font: 500 16px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .boxtitle { font: 700 17px 'Avenir Next',Avenir,sans-serif; fill:#1B1714; }
+      .small { font: 500 13px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .mono { font: 600 12px 'SF Mono',Menlo,monospace; fill:#4A443C; }
+      .chip { font: 600 11.5px 'SF Mono',Menlo,monospace; fill:#6E6860; }
+    </style>
+  </defs>
+  <rect width="1000" height="1560" rx="14" fill="#F6F3EE"/>
+
+  <text x="56" y="46" font-family="'SF Mono',Menlo,monospace" font-size="12" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+  <text x="56" y="82" class="title">One command, start to durable</text>
+  <text x="56" y="108" class="subtitle">The lane commit pipeline — every mutating command makes this exact journey.</text>
+
+  <!-- 1 submit -->
+  <rect x="56" y="140" width="560" height="118" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="80" y="172" class="boxtitle">runtime.submit(run_key, command)</text>
+  <text x="80" y="198" class="small">Two gates, then a lane: reject if draining or the admission shard</text>
+  <text x="80" y="218" class="small">(shard_for(run_key)) is not Active; pick the lane by blake3 of the</text>
+  <text x="80" y="238" class="small">run key — same run, same lane, forever.</text>
+
+  <path d="M336 258 V296" stroke="#B85C38" stroke-width="3.5" fill="none" marker-end="url(#lp_clay)" stroke-linecap="round"/>
+
+  <!-- 2 channel -->
+  <rect x="56" y="300" width="560" height="96" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="80" y="332" class="boxtitle">The lane channel</text>
+  <text x="80" y="358" class="small">Bounded: many producers, one consumer — capacity 1024.</text>
+  <text x="80" y="378" class="small">Backpressure is explicit, never hidden in unbounded futures.</text>
+  <rect x="648" y="322" width="296" height="30" rx="15" fill="#EAE5DC"/>
+  <text x="668" y="341" class="chip">⏱ tokeira_runtime_lane_queue_wait_seconds</text>
+
+  <path d="M336 396 V434" stroke="#B85C38" stroke-width="3.5" fill="none" marker-end="url(#lp_clay)" stroke-linecap="round"/>
+
+  <!-- 3 lane executor -->
+  <rect x="56" y="438" width="560" height="96" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="80" y="470" class="boxtitle">The lane executor — single-threaded</text>
+  <text x="80" y="496" class="small">One message at a time, in arrival order. Per-run serialization</text>
+  <text x="80" y="516" class="small">is by construction, before storage is ever involved.</text>
+
+  <path d="M336 534 V572" stroke="#B85C38" stroke-width="3.5" fill="none" marker-end="url(#lp_clay)" stroke-linecap="round"/>
+
+  <!-- 4 load -->
+  <rect x="56" y="576" width="560" height="96" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="80" y="608" class="boxtitle">load — cache first, then the repository</text>
+  <text x="80" y="634" class="small">The lane's run cache (4096 entries) serves hot runs;</text>
+  <text x="80" y="654" class="small">otherwise repo.load_run(run_key) reads committed state.</text>
+
+  <path d="M336 672 V710" stroke="#B85C38" stroke-width="3.5" fill="none" marker-end="url(#lp_clay)" stroke-linecap="round"/>
+
+  <!-- 5 kernel -->
+  <rect x="56" y="714" width="560" height="110" rx="10" fill="#ECE8E0" stroke="#1B1714" stroke-opacity=".22" stroke-width="1.4"/>
+  <text x="80" y="746" class="boxtitle">kernel.apply(loaded, command) — pure</text>
+  <text x="80" y="772" class="small">Deterministic decision, no I/O: returns a Transition carrying the</text>
+  <text x="80" y="792" class="small">expected_seq fence, next state, history events, and the ops.</text>
+  <text x="80" y="812" class="mono">a no-op transition short-circuits here — nothing is written</text>
+
+  <path d="M336 824 V862" stroke="#B85C38" stroke-width="3.5" fill="none" marker-end="url(#lp_clay)" stroke-linecap="round"/>
+
+  <!-- 6 fenced commit -->
+  <rect x="56" y="866" width="560" height="164" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".55" stroke-width="1.8"/>
+  <text x="80" y="898" class="boxtitle">One fenced transaction</text>
+  <text x="80" y="924" class="small">commit_transition_for_bundle, fenced on the bundle's epoch and</text>
+  <text x="80" y="944" class="small">the run's expected_seq. Inside the same transaction:</text>
+  <text x="80" y="972" class="mono">history events · timer writes · the visibility snapshot</text>
+  <text x="80" y="1000" class="small">A stale owner cannot commit. There is no second write to lose.</text>
+  <!-- OCC loop-back -->
+  <path d="M616 948 C700 948 700 620 616 620" stroke="#8A8378" stroke-width="2.6" fill="none" stroke-dasharray="6 5" marker-end="url(#lp_slate)" stroke-linecap="round"/>
+  <rect x="656" y="762" width="288" height="46" rx="10" fill="#F7EBDA" stroke="#B4690E" stroke-opacity=".5"/>
+  <text x="672" y="781" class="chip" fill="#8A5A10">OCC conflict → evict cache, reload,</text>
+  <text x="672" y="798" class="chip" fill="#8A5A10">re-apply — at most 5 attempts</text>
+
+  <path d="M336 1030 V1068" stroke="#B85C38" stroke-width="3.5" fill="none" marker-end="url(#lp_clay)" stroke-linecap="round"/>
+
+  <!-- 7 publish -->
+  <rect x="56" y="1072" width="560" height="118" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="80" y="1104" class="boxtitle">Then — and only then — dispatch publishes</text>
+  <text x="80" y="1130" class="small">dispatch_ops fan out to the brokers, child lanes, and callbacks.</text>
+  <text x="80" y="1150" class="small">Publish failure is non-fatal: the sweepers reconstruct</text>
+  <text x="80" y="1170" class="small">dispatchable work from what was durably committed.</text>
+
+  <path d="M336 1190 V1228" stroke="#B85C38" stroke-width="3.5" fill="none" marker-end="url(#lp_clay)" stroke-linecap="round"/>
+
+  <!-- 8 reply -->
+  <rect x="56" y="1232" width="560" height="96" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="80" y="1264" class="boxtitle">reply_tx.send(CommitResult)</text>
+  <text x="80" y="1290" class="small">The caller hears back only after the durable outcome — commit</text>
+  <text x="80" y="1310" class="small">first, publish next, reply last.</text>
+  <rect x="648" y="1252" width="296" height="30" rx="15" fill="#EAE5DC"/>
+  <text x="668" y="1271" class="chip">⏱ tokeira_runtime_lane_submit_duration_seconds</text>
+
+  <!-- footer thesis -->
+  <rect x="56" y="1380" width="888" height="64" rx="14" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.5"/>
+  <text x="80" y="1406" class="boxtitle" fill="#9A4A2C" font-size="15">Why this shape:</text>
+  <text x="80" y="1428" class="small">the lane serializes, the kernel decides, the fence proves ownership, and the transaction makes history, timers, and visibility one indivisible fact.</text>
+
+  <text x="56" y="1502" class="small" fill="#8A8378">Timings belong to benchmarks, not diagrams — the two metric chips above are where to measure your own.</text>
+
+  <g transform="translate(908,1494)" stroke="#B85C38" stroke-width="2" stroke-linecap="round" opacity=".8">
+    <path d="M0 32 C3 20 5 10 11 0" fill="none"/>
+    <g transform="translate(11,0)"><path d="M0 0 L11 -8 M0 0 L14 -1 M0 0 L11 6 M0 0 L4 -12 M0 0 L-4 -11" fill="none"/><circle cx="0" cy="0" r="2.2" fill="#B85C38" stroke="none"/></g>
+  </g>
+</svg>

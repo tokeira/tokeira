@@ -9640,7 +9640,6 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "time",
- "tokeira-kernel",
  "tokeira-observability",
  "tokeira-storage",
  "tokeira-types",

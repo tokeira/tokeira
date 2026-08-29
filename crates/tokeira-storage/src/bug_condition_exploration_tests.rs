@@ -123,7 +123,6 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
-            projection_ops: Default::default(),
         }
     }
 
@@ -193,7 +192,6 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
-            projection_ops: Default::default(),
         };
 
         // Runtime A (stale) calls commit_transition_for_bundle with its old epoch.
@@ -289,7 +287,6 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
-                    projection_ops: Default::default(),
                 };
 
                 // Stale caller uses commit_transition_for_bundle with old epoch.

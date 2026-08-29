@@ -61,9 +61,9 @@ impl ProjectionLog for DsqlProjectionLog {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
         let rows = match (cursor.last_run_key, cursor.last_transition_seq) {
             (None, None) => {
-                sqlx::query_as::<_, (Uuid, i64, Vec<u8>, Vec<u8>)>(
+                sqlx::query_as::<_, (Uuid, i64, Vec<u8>)>(
                     r#"
-                    SELECT run_key, transition_seq, context_data, ops_data
+                    SELECT run_key, transition_seq, context_data
                     FROM projection_log
                     WHERE partition_id = $1 AND fanout = $2
                     ORDER BY run_key ASC, transition_seq ASC
@@ -84,9 +84,9 @@ impl ProjectionLog for DsqlProjectionLog {
                 // Tuple comparison gives a stable strict-after cursor over the
                 // same ordering used by the SELECT. This avoids duplicate
                 // delivery without requiring wall-clock timestamps.
-                sqlx::query_as::<_, (Uuid, i64, Vec<u8>, Vec<u8>)>(
+                sqlx::query_as::<_, (Uuid, i64, Vec<u8>)>(
                     r#"
-                    SELECT run_key, transition_seq, context_data, ops_data
+                    SELECT run_key, transition_seq, context_data
                     FROM projection_log
                     WHERE partition_id = $1
                       AND fanout = $2
@@ -141,15 +141,11 @@ fn validate_cursor_position(cursor: &ProjectionCursor) -> Result<()> {
 fn decode_projection_rows(
     partition_id: u32,
     fanout: u16,
-    rows: Vec<(Uuid, i64, Vec<u8>, Vec<u8>)>,
+    rows: Vec<(Uuid, i64, Vec<u8>)>,
 ) -> Result<Vec<ProjectionRecord>> {
     rows.into_iter()
-        .map(|(run_key, transition_seq, context_data, _ops_data)| {
+        .map(|(run_key, transition_seq, context_data)| {
             let context: ProjectionContext = codec::decode_projection_context(&context_data)?;
-            // `ops_data` remains in the DSQL projection log for build-phase
-            // compatibility with existing rows, but the CHASM visibility
-            // contract is snapshot-only. Decoding it here would re-expose the
-            // retired delta surface to projection consumers.
             Ok(ProjectionRecord {
                 partition_id,
                 fanout,

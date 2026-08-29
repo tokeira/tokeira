@@ -5,7 +5,6 @@ Projection worker and visibility-oriented sink abstractions. Projection is inten
 ## Dependencies
 
 - `tokeira-edge` — `VisibilityApi` trait, list/count request/response types
-- `tokeira-kernel` — `ProjectionOp` enum
 - `tokeira-storage` — `ProjectionLog`, `ProjectionRecord`, `ProjectionContext`
 - `tokeira-types` — identity types, search attributes, execution status, projection cursors
 - External: `anyhow`, `async-trait`, `async-recursion`, `base64`, `ordered-float`, `serde`, `serde_json`, `time`, `tokio`, `tokio-util`, `tracing`, `uuid`

@@ -2722,7 +2722,6 @@ mod tests {
                 activity_ops: SmallVec::new(),
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
-                projection_ops: SmallVec::new(),
             },
             ShardEpoch::ZERO,
         )

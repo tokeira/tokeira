@@ -130,7 +130,6 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
-            projection_ops: Default::default(),
         }
     }
 
@@ -147,7 +146,6 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
-            projection_ops: Default::default(),
         }
     }
 
@@ -375,7 +373,6 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
-                    projection_ops: Default::default(),
                 };
 
                 // Choose epoch based on the property parameter

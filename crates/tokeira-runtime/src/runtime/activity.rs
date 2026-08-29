@@ -590,7 +590,6 @@ where
                 activity_ops: smallvec![ActivityOp::Upsert(next_activity)],
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
-                projection_ops: SmallVec::new(),
             };
 
             let (bundle, commit_epoch) = {
@@ -784,7 +783,6 @@ where
                 activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
-                projection_ops: SmallVec::new(),
             };
 
             // Same commit-epoch rule as start_activity_task: ZERO without a
@@ -1151,7 +1149,6 @@ where
                 activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
-                projection_ops: SmallVec::new(),
             };
 
             // Mirror the lane's commit-epoch rule (see lane.rs): with no
@@ -1547,7 +1544,6 @@ where
             activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
             timer_ops: SmallVec::new(),
             dispatch_ops,
-            projection_ops: SmallVec::new(),
         };
 
         // Same commit-epoch rule as start_activity_task: ZERO without a
@@ -1962,7 +1958,6 @@ where
             activity_ops: smallvec![ActivityOp::Upsert(next_activity)],
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
-            projection_ops: SmallVec::new(),
         };
         let (bundle, commit_epoch) = {
             let owner = deps.shard_owner.read().expect("shard_owner lock poisoned");
@@ -2322,7 +2317,6 @@ mod tests {
             activity_ops: smallvec![ActivityOp::Upsert(activity.clone())],
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
-            projection_ops: SmallVec::new(),
         };
         repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
             .await
@@ -2448,7 +2442,6 @@ mod tests {
                 heartbeat_timeout: activity.heartbeat_timeout,
                 priority: None,
             }],
-            projection_ops: SmallVec::new(),
         };
         repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
             .await
@@ -3371,7 +3364,6 @@ mod tests {
                 heartbeat_timeout: None,
                 priority: None,
             }],
-            projection_ops: Default::default(),
         };
         repo.commit_transition(zombie_run, zombie_transition, ShardEpoch::ZERO)
             .await

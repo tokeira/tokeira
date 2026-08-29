@@ -287,7 +287,7 @@ impl TestContext {
             .bind(run_key.0)
             .bind((index + 1) as i64)
             .bind(codec::encode_projection_context(&sample_context(*run_key))?)
-            .bind(codec::encode_projection_ops(&[])?)
+            .bind(codec::LEGACY_EMPTY_PROJECTION_OPS_DATA)
             .execute(&self.pool)
             .await?;
         }

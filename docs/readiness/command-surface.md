@@ -77,8 +77,8 @@ These are commands issued by worker code during a workflow task, processed seque
 | 10 | `COMMAND_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION` | `SignalExternalWorkflowExecution` | ✅ Implemented | F6. Tracks in pending map. |
 | 11 | `COMMAND_TYPE_CONTINUE_AS_NEW_WORKFLOW_EXECUTION` | `ContinueAsNew` | ✅ Implemented | F4. Terminal close with linkage. |
 | 12 | `COMMAND_TYPE_START_CHILD_WORKFLOW_EXECUTION` | `StartChildWorkflow` | ✅ Implemented | F5. Parent close policy. |
-| 13 | `COMMAND_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES` | `UpsertSearchAttributes` | ✅ Implemented | F1. ProjectionOp emission. |
-| 14 | `COMMAND_TYPE_MODIFY_WORKFLOW_PROPERTIES` | `UpsertMemo` | ✅ Implemented | F1. ProjectionOp emission. |
+| 13 | `COMMAND_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES` | `UpsertSearchAttributes` | ✅ Implemented | F1. Authoritative state update; full visibility snapshot on commit. |
+| 14 | `COMMAND_TYPE_MODIFY_WORKFLOW_PROPERTIES` | `UpsertMemo` | ✅ Implemented | F1. Authoritative state update; full visibility snapshot on commit. |
 | 15 | `COMMAND_TYPE_PROTOCOL_MESSAGE` | `ProtocolMessage` | ✅ Implemented | F7. Carries UpdateProtocolBody inline. |
 | 16 | `COMMAND_TYPE_SCHEDULE_NEXUS_OPERATION` | `ScheduleNexusOperation` | ✅ Implemented | F9. Duplicate rejection. |
 | 17 | `COMMAND_TYPE_REQUEST_CANCEL_NEXUS_OPERATION` | `CancelNexusOperation` | ✅ Implemented | F9. Validates pending operation. |
@@ -129,8 +129,8 @@ Cross-reference of Temporal's HistoryBuilder event factory methods against Tokei
 | 31 | `AddRequestCancelExternalWorkflowExecutionFailedEvent` | `RequestCancelExternalWorkflowExecutionFailed` | ✅ |
 | 32 | `AddExternalWorkflowExecutionCancelRequested` | `ExternalWorkflowExecutionCancelRequested` | ✅ |
 | 33 | `AddSignalExternalWorkflowExecutionInitiatedEvent` | `SignalExternalWorkflowExecutionInitiated` | ✅ |
-| 34 | `AddUpsertWorkflowSearchAttributesEvent` | (emitted via ProjectionOp) | ✅ Semantic equivalent |
-| 35 | `AddWorkflowPropertiesModifiedEvent` | (emitted via ProjectionOp) | ✅ Semantic equivalent |
+| 34 | `AddUpsertWorkflowSearchAttributesEvent` | `UpsertWorkflowSearchAttributes` | ✅ |
+| 35 | `AddWorkflowPropertiesModifiedEvent` | `WorkflowPropertiesModified` | ✅ |
 | 36 | `AddSignalExternalWorkflowExecutionFailedEvent` | `SignalExternalWorkflowExecutionFailed` | ✅ |
 | 37 | `AddExternalWorkflowExecutionSignaled` | `ExternalWorkflowExecutionSignaled` | ✅ |
 | 38 | `AddMarkerRecordedEvent` | `MarkerRecorded` | ✅ |

@@ -421,7 +421,11 @@ impl InMemoryStore {
 /// compatibility surface.
 // v2: `ActivityDispatchEntry.dispatch_at` and
 // `ActivityState.last_attempt_complete_time` (durable activity dispatch).
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+// v3: retired the `TransitionAuditRecord.projection_ops` delta field. Version
+// mismatch is checked before postcard decodes the changed document, so v2
+// snapshots are refused with the existing actionable `VersionMismatch` error
+// instead of being interpreted with the v3 layout.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// Errors from the [`InMemoryStore`] snapshot persist/restore surface.
 #[derive(Debug, thiserror::Error)]
@@ -1037,7 +1041,6 @@ impl RunRepository for InMemoryStore {
                 activity_ops: transition.activity_ops.iter().cloned().collect(),
                 timer_ops: transition.timer_ops.iter().cloned().collect(),
                 dispatch_ops: transition.dispatch_ops.iter().cloned().collect(),
-                projection_ops: transition.projection_ops.iter().cloned().collect(),
             });
 
         for op in &transition.request_dedupe_ops {
@@ -2902,7 +2905,6 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
-            projection_ops: Default::default(),
         }
     }
 
@@ -2948,7 +2950,6 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
-                    projection_ops: Default::default(),
                 },
                 ShardEpoch::ZERO,
             )
@@ -3884,7 +3885,6 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
-                    projection_ops: Default::default(),
                 };
                 delete_transition.next_state.transition_seq = TransitionSeq(2);
                 delete_transition
@@ -3942,7 +3942,6 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
-                    projection_ops: Default::default(),
                 };
                 conflict.next_state.namespace_id = queue.namespace_id;
                 conflict.next_state.transition_seq = TransitionSeq(2);
@@ -4214,7 +4213,6 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
-                    projection_ops: Default::default(),
                 };
                 delete.next_state.transition_seq = TransitionSeq(2);
                 delete.activity_ops.push(ActivityOp::Delete { activity_id });
@@ -4250,7 +4248,6 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
-                    projection_ops: Default::default(),
                 };
                 close.next_state.namespace_id = namespace_id;
                 close.next_state.workflow_id = workflow_id.clone();
@@ -4395,7 +4392,6 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
-            projection_ops: Default::default(),
         };
         close.next_state.namespace_id = namespace_id;
         close.next_state.workflow_id = workflow_id.clone();
@@ -4628,7 +4624,6 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
-            projection_ops: Default::default(),
         };
         duplicate.next_state.namespace_id = namespace_id;
         duplicate.next_state.workflow_id = workflow_id;
@@ -5167,7 +5162,6 @@ mod tests {
                         activity_ops: Default::default(),
                         timer_ops: Default::default(),
                         dispatch_ops: Default::default(),
-                        projection_ops: Default::default(),
                     };
                     t2.next_state.transition_seq =
                         TransitionSeq(2);
@@ -5459,7 +5453,6 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
-            projection_ops: Default::default(),
         };
         store
             .commit_transition(run_key, close, ShardEpoch::ZERO)
@@ -6402,6 +6395,18 @@ mod tests {
         match InMemoryStore::from_snapshot(&bytes) {
             Err(SnapshotError::VersionMismatch { found, supported }) => {
                 assert_eq!(found, SNAPSHOT_FORMAT_VERSION + 1);
+                assert_eq!(supported, SNAPSHOT_FORMAT_VERSION);
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_snapshot_refuses_v2_before_decoding_changed_document() {
+        let bytes = postcard::to_allocvec(&2_u32).unwrap();
+        match InMemoryStore::from_snapshot(&bytes) {
+            Err(SnapshotError::VersionMismatch { found, supported }) => {
+                assert_eq!(found, 2);
                 assert_eq!(supported, SNAPSHOT_FORMAT_VERSION);
             }
             other => panic!("expected VersionMismatch, got {other:?}"),

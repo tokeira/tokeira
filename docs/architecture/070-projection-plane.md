@@ -18,7 +18,7 @@ It is **not** responsible for deciding whether a workflow transition happened.
 
 ## Design claim
 
-Tokeira should produce a **typed projection log** from authoritative run transitions and then let one or more sinks consume that log independently.
+Tokeira should produce a **typed, versioned snapshot log** from authoritative run transitions and then let one or more sinks consume that log independently.
 
 This generalizes Temporal’s documented separation between core persistence and visibility, and it fits naturally with Temporal’s existing ideas around Visibility and Dual Visibility.[^visibility][^dual-visibility]
 
@@ -35,19 +35,19 @@ Temporal’s docs describe visibility as the subsystem that lets operators list,
 
 ## Projection envelope
 
-Every committed authoritative transition should be able to emit one or more `ProjectionOp`s, which are then wrapped into a projection-log record with enough identity to replay safely.
+Every committed authoritative transition appends a complete post-transition visibility snapshot with enough identity and version information to replay safely. The snapshot is derived during the fenced storage commit from authoritative state rather than emitted as a second kernel delta.
 
 A projection envelope should carry at least:
 
 - namespace ID,
-- workflow ID,
+- archetype and business/workflow ID,
 - run ID / run key,
-- transition sequence,
+- authority epoch and source transition sequence,
 - event/history counters needed for debugging,
-- projection ops,
+- the complete visibility image, including status, lifecycle, memo, and search attributes,
 - partitioning metadata for replay.
 
-The key design idea is that the projection plane should not have to *look back into runtime state* to understand what changed. The authoritative transition already knows that.
+The key design idea is that the projection plane should not have to *look back into runtime state* to reconstruct an image or fold an ordered patch stream. Each record is self-contained, and sinks apply it only when its `(authority_epoch, source_transition_seq)` is newer than the stored version.
 
 ## Projection substreams
 

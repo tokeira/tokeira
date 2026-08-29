@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    EventPrincipal, ExecutionStatus, Headers, Memo, NamespaceId, Payload, Payloads, QueueKey,
-    RequestId, RetryPolicy, RunId, RunKey, SearchAttributes, TaskQueueName, TransitionSeq,
-    WorkflowId, WorkflowType,
+    EventPrincipal, Headers, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestId,
+    RetryPolicy, RunId, RunKey, SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId,
+    WorkflowType,
 };
 
 use crate::{
@@ -45,8 +45,6 @@ pub struct Transition {
     /// Side-effect dispatch operations (task enqueue, child
     /// start, external signal, etc.).
     pub dispatch_ops: SmallVec<[DispatchOp; 4]>,
-    /// Projection-plane mutations for the read model.
-    pub projection_ops: SmallVec<[ProjectionOp; 8]>,
 }
 
 impl Transition {
@@ -63,7 +61,6 @@ impl Transition {
             && self.activity_ops.is_empty()
             && self.timer_ops.is_empty()
             && self.dispatch_ops.is_empty()
-            && self.projection_ops.is_empty()
     }
 }
 
@@ -339,22 +336,4 @@ pub enum CallbackCompletionOutcome {
     /// to a `failed` completion so the caller is resolved rather than left to time
     /// out — a documented deviation.
     ContinuedAsNew,
-}
-
-/// Projection operations are the contract between the correctness path and the
-/// read-model plane. They are intentionally semantic, not SQL-shaped.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum ProjectionOp {
-    /// Update the execution's status and metadata in the
-    /// read model.
-    UpsertExecution {
-        status: ExecutionStatus,
-        memo_patch: Memo,
-        search_attr_patch: SearchAttributes,
-    },
-    /// Mark the execution as closed in the read model.
-    CloseExecution {
-        status: ExecutionStatus,
-        closed_at: OffsetDateTime,
-    },
 }

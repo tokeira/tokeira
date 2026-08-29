@@ -95,7 +95,7 @@ Tokeira maintains the following invariant:
 1. `seq(r)` increases strictly monotonically.
 2. Every committed transition `seq = n + 1` appends a contiguous range of history events after `last_event_id` at `seq = n`.
 3. Every open activity, timer, and pending task recorded after `seq = n + 1` is derivable from the history prefix through `seq = n + 1`.
-4. Every dispatch or projection effect associated with `seq = n + 1` is emitted in the same transaction or reconstructible from that transaction’s durable outcome.
+4. Every dispatch effect or visibility snapshot associated with `seq = n + 1` is emitted in the same transaction or reconstructible from that transaction’s durable outcome.
 5. A stale owner, identified by an old shard epoch, cannot commit `seq = n + 1`.
 
 If this invariant holds, then crash recovery reduces to “load the latest durable prefix and resume.”
@@ -111,10 +111,9 @@ LoadedRun + Command
        hot_patch,
        activity_ops,
        timer_ops,
-       dispatch_ops,
-       projection_ops
+       dispatch_ops
      }
-  -> fenced DSQL commit
+  -> fenced DSQL commit + versioned visibility snapshot
 ```
 
 This is a better boundary than “write queue row + later make history consistent” because it makes the unit of correctness identical to the unit of persistence.

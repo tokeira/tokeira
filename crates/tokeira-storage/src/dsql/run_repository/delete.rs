@@ -154,7 +154,7 @@ impl DsqlRunRepository {
                     "delete tombstone transition_seq",
                 )?)
                 .bind(codec::encode_projection_context(&tombstone.context)?)
-                .bind(codec::encode_projection_ops(&[])?)
+                .bind(codec::LEGACY_EMPTY_PROJECTION_OPS_DATA)
                 .execute(&mut *tx)
                 .await?;
 

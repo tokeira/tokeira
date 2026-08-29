@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="1300" viewBox="0 0 2000 1300" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="pj_clay" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1.5,1.5 L7,4.5 L1.5,7.5 Z" fill="#B85C38"/></marker>
+    <marker id="pj_blue" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1.5,1.5 L7,4.5 L1.5,7.5 Z" fill="#33586E"/></marker>
+    <marker id="pj_teal" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1.5,1.5 L7,4.5 L1.5,7.5 Z" fill="#0B7285"/></marker>
+    <style>
+      .title { font: 700 34px 'Avenir Next',Avenir,'Segoe UI',sans-serif; fill:#1B1714; }
+      .subtitle { font: 500 18px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .section { font: 700 14px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:2px; }
+      .boxtitle { font: 700 19px 'Avenir Next',Avenir,sans-serif; fill:#1B1714; }
+      .small { font: 500 13px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .mono { font: 600 12.5px 'SF Mono',Menlo,monospace; fill:#4A443C; }
+      .num { font: 800 13px 'Avenir Next',Avenir,sans-serif; fill:#FFFFFF; }
+    </style>
+  </defs>
+  <rect width="2000" height="1300" rx="14" fill="#F6F3EE"/>
+
+  <text x="60" y="48" font-family="'SF Mono',Menlo,monospace" font-size="13" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+  <text x="60" y="88" class="title">The projection plane</text>
+  <text x="60" y="118" class="subtitle">Visibility as versioned snapshots — written with the commit, consumed at leisure, never the truth. Lag here is a quality problem, not a correctness failure.</text>
+
+  <text x="60" y="168" class="section">THE SOURCE</text>
+  <text x="700" y="168" class="section">THE WORKERS</text>
+  <text x="1400" y="168" class="section">THE INDEX + READS</text>
+
+  <!-- source -->
+  <rect x="60" y="188" width="540" height="180" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.6"/>
+  <text x="84" y="220" class="boxtitle">The row rides the commit</text>
+  <text x="84" y="248" class="small">Every committed transition inserts one projection row inside</text>
+  <text x="84" y="268" class="small">the same fenced transaction as history and timers. There is</text>
+  <text x="84" y="288" class="small">no separate publish to lose.</text>
+  <text x="84" y="318" class="mono">projection_log — PK (partition, fanout, run_key, seq)</text>
+  <text x="84" y="342" class="mono">payload: one full VisibilitySnapshot per transition</text>
+
+  <!-- snapshot contract -->
+  <rect x="60" y="408" width="540" height="204" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="84" y="440" class="boxtitle">The snapshot contract</text>
+  <text x="84" y="468" class="small">A complete post-transition image — status, lifecycle, times,</text>
+  <text x="84" y="488" class="small">lineage, full memo and search-attribute images — tagged with</text>
+  <text x="84" y="508" class="mono">archetype_id · authority_epoch · source_transition_seq</text>
+  <text x="84" y="536" class="small">Applying a later version never depends on having seen an</text>
+  <text x="84" y="556" class="small">earlier one: retries and out-of-order delivery are harmless.</text>
+  <text x="84" y="584" class="small">Archetype-neutral — workflows and CHASM components share it.</text>
+
+  <!-- workers -->
+  <rect x="700" y="188" width="560" height="220" rx="10" fill="#FFFFFF" stroke="#33586E" stroke-opacity=".5" stroke-width="1.5"/>
+  <text x="724" y="220" class="boxtitle">ProjectionWorker — one per partition</text>
+  <text x="724" y="248" class="mono">batch 256 · run_from_cursor(checkpoint)</text>
+  <text x="724" y="276" class="small">Reads the log in order, hands snapshots to the sink, saves its</text>
+  <text x="724" y="296" class="small">checkpoint on an interval — and never advances past a sink</text>
+  <text x="724" y="316" class="small">error. Restart resumes from the stored cursor; replay is the</text>
+  <text x="724" y="336" class="small">same read, again.</text>
+  <text x="724" y="366" class="mono">projection_checkpoint — keyed by partition</text>
+  <text x="724" y="390" class="mono">property-tested: no advance on failure</text>
+
+  <!-- sink -->
+  <rect x="700" y="448" width="560" height="150" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="724" y="480" class="boxtitle">The monotonic sink</text>
+  <text x="724" y="508" class="small">Upsert-iff-newer on (authority_epoch, source_transition_seq):</text>
+  <text x="724" y="528" class="small">the newest snapshot replaces the visible generation; stale or</text>
+  <text x="724" y="548" class="small">repeated deliveries change nothing. Idempotent by contract.</text>
+  <text x="724" y="576" class="mono">search-attribute images land as one generation</text>
+
+  <!-- repair -->
+  <rect x="700" y="638" width="560" height="142" rx="10" fill="#F6F3EE" stroke="#8A8378" stroke-opacity=".55" stroke-width="1.3" stroke-dasharray="5 5"/>
+  <text x="724" y="670" class="boxtitle" fill="#4A443C">VisibilityRepairScanner — CHASM-side</text>
+  <text x="724" y="698" class="small">Rebuilds a component's snapshot from its persisted root node and</text>
+  <text x="724" y="718" class="small">re-applies it, version-keyed: a still-projected execution is a no-op,</text>
+  <text x="724" y="738" class="small">a dropped one is repaired. Workflow rows ride the commit — they</text>
+  <text x="724" y="758" class="small">cannot go missing in the first place.</text>
+
+  <!-- index -->
+  <rect x="1400" y="188" width="540" height="250" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="1424" y="220" class="boxtitle">One shared index, two generations</text>
+  <text x="1424" y="248" class="mono">execution_visibility_current · _attr_index · _rollup</text>
+  <text x="1424" y="276" class="small">The archetype-aware generation: typed attribute index with</text>
+  <text x="1424" y="296" class="small">generations, rollups striped 16 ways by run key.</text>
+  <text x="1424" y="324" class="mono">vis_execution · vis_rollup — the legacy pair, still present</text>
+  <text x="1424" y="352" class="small">Both live in DSQL beside the authoritative tables — visibility</text>
+  <text x="1424" y="372" class="small">is SQL, not a second datastore.</text>
+  <text x="1424" y="400" class="mono">9-table sa_* search-attribute index family</text>
+
+  <!-- query -->
+  <rect x="1400" y="478" width="540" height="140" rx="10" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".5" stroke-width="1.5"/>
+  <text x="1424" y="510" class="boxtitle">VisibilityQueryService</text>
+  <text x="1424" y="538" class="small">List, count, and describe surfaces — the Temporal visibility</text>
+  <text x="1424" y="558" class="small">grammar answered from the index. Reads never touch the</text>
+  <text x="1424" y="578" class="small">commit path.</text>
+
+  <!-- thesis bar -->
+  <rect x="60" y="820" width="1880" height="52" rx="18" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.5"/>
+  <text x="88" y="852" class="boxtitle" font-size="16" fill="#9A4A2C">The plane's one rule:</text>
+  <text x="310" y="852" class="small" font-size="14">history is the record and the snapshot is a copy — every component here may lag, fail, or replay freely, because none of them can change what happened.</text>
+
+  <!-- flows -->
+  <g stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M330 368 V404" stroke="#B85C38" marker-end="url(#pj_clay)"/>
+    <path d="M600 278 H696" stroke="#33586E" stroke-dasharray="9 7" marker-end="url(#pj_blue)"/>
+    <path d="M980 408 V444" stroke="#33586E" stroke-dasharray="9 7" marker-end="url(#pj_blue)"/>
+    <path d="M1260 520 C1320 520 1340 320 1396 300" stroke="#33586E" stroke-dasharray="9 7" marker-end="url(#pj_blue)"/>
+    <path d="M1396 548 H1264" stroke="#0B7285" marker-end="url(#pj_teal)"/>
+    <path d="M980 638 C980 620 980 612 980 602" stroke="#8A8378" stroke-dasharray="4 5" marker-end="url(#pj_blue)"/>
+  </g>
+  <g>
+    <circle cx="284" cy="388" r="16" fill="#B85C38" stroke="#fff" stroke-width="4"/><text x="284" y="393" text-anchor="middle" class="num">1</text>
+    <circle cx="648" cy="278" r="16" fill="#33586E" stroke="#fff" stroke-width="4"/><text x="648" y="283" text-anchor="middle" class="num">2</text>
+    <circle cx="1330" cy="420" r="16" fill="#33586E" stroke="#fff" stroke-width="4"/><text x="1330" y="425" text-anchor="middle" class="num">3</text>
+    <circle cx="1330" cy="548" r="16" fill="#0B7285" stroke="#fff" stroke-width="4"/><text x="1330" y="553" text-anchor="middle" class="num">4</text>
+  </g>
+
+  <!-- annotations -->
+  <rect x="60" y="920" width="1880" height="290" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".14" stroke-width="1.3"/>
+  <text x="88" y="956" class="boxtitle">Flow annotations</text>
+  <g class="small">
+    <circle cx="96" cy="988" r="13" fill="#B85C38"/><text x="96" y="993" text-anchor="middle" class="num">1</text>
+    <text x="120" y="993">The snapshot is derived from committed state at commit time — its contents and the history it summarizes cannot disagree, by construction.</text>
+    <circle cx="96" cy="1024" r="13" fill="#33586E"/><text x="96" y="1029" text-anchor="middle" class="num">2</text>
+    <text x="120" y="1029">Workers consume the log asynchronously, one per partition, in order — a worker that dies resumes from its checkpoint and re-reads the same rows.</text>
+    <circle cx="96" cy="1060" r="13" fill="#33586E"/><text x="96" y="1065" text-anchor="middle" class="num">3</text>
+    <text x="120" y="1065">The sink writes into the shared index; upsert-iff-newer makes every delivery safe to repeat and every ordering safe to receive.</text>
+    <circle cx="96" cy="1096" r="13" fill="#0B7285"/><text x="96" y="1101" text-anchor="middle" class="num">4</text>
+    <text x="120" y="1101">Queries answer from the index alone. A lagging projection returns slightly old truth — never wrong truth, and never blocks a commit.</text>
+    <text x="120" y="1140" class="mono">Key: clay = rides the fenced commit · dashed slate-blue = derived consumption · teal = reads · dashed grey = repair</text>
+    <text x="120" y="1178" class="small">Until chasm-foundation Stage 1, this plane spoke a delta contract (ProjectionOp). Snapshots replaced it: self-sufficient rows beat replayed folds.</text>
+  </g>
+
+  <g transform="translate(1908,1232)" stroke="#B85C38" stroke-width="2.2" stroke-linecap="round" opacity=".8">
+    <path d="M0 36 C3 22 6 11 12 0" fill="none"/>
+    <g transform="translate(12,0)"><path d="M0 0 L12 -9 M0 0 L15 -1 M0 0 L12 7 M0 0 L4 -13 M0 0 L-5 -12" fill="none"/><circle cx="0" cy="0" r="2.4" fill="#B85C38" stroke="none"/></g>
+  </g>
+</svg>

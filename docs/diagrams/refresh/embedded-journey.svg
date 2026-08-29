@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1960" height="1160" viewBox="0 0 1960 1160" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="ej_clay" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1.5,1.5 L7,4.5 L1.5,7.5 Z" fill="#B85C38"/></marker>
+    <style>
+      .title { font: 700 32px 'Avenir Next',Avenir,'Segoe UI',sans-serif; fill:#1B1714; }
+      .subtitle { font: 500 17px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .section { font: 700 13.5px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:2px; }
+      .boxtitle { font: 700 18px 'Avenir Next',Avenir,sans-serif; fill:#1B1714; }
+      .small { font: 500 13px 'Avenir Next',Avenir,sans-serif; fill:#5C564E; }
+      .mono { font: 600 12px 'SF Mono',Menlo,monospace; fill:#4A443C; }
+      .rung { font: 700 13px 'SF Mono',Menlo,monospace; fill:#9A4A2C; letter-spacing:1px; }
+    </style>
+  </defs>
+  <rect width="1960" height="1160" rx="14" fill="#F6F3EE"/>
+
+  <text x="56" y="46" font-family="'SF Mono',Menlo,monospace" font-size="12" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
+  <text x="56" y="84" class="title">The embedded journey</text>
+  <text x="56" y="112" class="subtitle">From a durable engine inside your process to a managed cluster — you change the storage line, and nothing else. The execution model never moves.</text>
+
+  <!-- the constant -->
+  <rect x="56" y="152" width="1848" height="120" rx="12" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".55" stroke-width="1.7"/>
+  <text x="80" y="184" class="boxtitle">The part that never changes</text>
+  <text x="80" y="212" class="mono">let engine = tokeira_engine::Engine::embedded().await?;   ·   ConnectionOptions::service_override(engine.service_override())</text>
+  <text x="80" y="240" class="small">The Temporal Rust SDK connects over an in-memory duplex — no TCP, no ports, no daemon. Workflows, activities, signals, timers: the full contract,</text>
+  <text x="80" y="258" class="small">with every state change a fenced commit. Storage is a configuration decision underneath it.</text>
+
+  <text x="56" y="322" class="section">THE STORAGE LADDER — EmbeddedStorageConfig, A CLOSED SET</text>
+
+  <!-- rung 1 -->
+  <rect x="56" y="344" width="430" height="240" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="80" y="374" class="rung">RUNG 1 · THE DEFAULT</text>
+  <text x="80" y="402" class="boxtitle">In-memory</text>
+  <text x="80" y="428" class="mono">EmbeddedStorageConfig::InMemory</text>
+  <text x="80" y="456" class="small">Ephemeral and instant — tests, examples, day one.</text>
+  <text x="80" y="476" class="small">Everything durable-execution about the engine is</text>
+  <text x="80" y="496" class="small">already true; only the process boundary is the</text>
+  <text x="80" y="516" class="small">blast radius.</text>
+  <text x="80" y="548" class="small" fill="#8A8378">restart ⇒ a fresh world</text>
+
+  <!-- rung 1.5: snapshot policy -->
+  <rect x="530" y="344" width="430" height="240" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="554" y="374" class="rung">+ A POLICY, NOT A MODE</text>
+  <text x="554" y="402" class="boxtitle">Snapshots on top</text>
+  <text x="554" y="428" class="mono">SnapshotPolicyConfig { location, interval_ms }</text>
+  <text x="554" y="456" class="small">Restore at boot, capture on a cadence, one final</text>
+  <text x="554" y="476" class="small">write on graceful shutdown — the in-memory world</text>
+  <text x="554" y="496" class="small">survives restarts. The file is atomically replaced;</text>
+  <text x="554" y="516" class="small">the format is versioned and refuses a mismatched</text>
+  <text x="554" y="536" class="small">document rather than misreading it.</text>
+  <text x="554" y="562" class="small" fill="#8A8378">graceful stop ⇒ nothing lost (the final write)</text>
+  <text x="554" y="580" class="small" fill="#8A8378">hard crash ⇒ at most one interval rewound</text>
+
+  <!-- rung 2 -->
+  <rect x="1004" y="344" width="430" height="240" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.5"/>
+  <text x="1028" y="374" class="rung">RUNG 2 · MANAGED</text>
+  <text x="1028" y="402" class="boxtitle">Managed Aurora DSQL</text>
+  <text x="1028" y="428" class="mono">EmbeddedStorageConfig::ManagedDsql(…)</text>
+  <text x="1028" y="456" class="small">tokeira-managed-dsql owns the cluster lifecycle:</text>
+  <text x="1028" y="476" class="small">create or recover a dedicated single-Region cluster,</text>
+  <text x="1028" y="496" class="small">wake it when idle — with a durable creation token so</text>
+  <text x="1028" y="516" class="small">a crashed first boot never strands or duplicates a</text>
+  <text x="1028" y="536" class="small">cluster.</text>
+  <text x="1028" y="566" class="small" fill="#8A8378">restart ⇒ the cluster is found, woken, resumed</text>
+
+  <!-- rung 3 -->
+  <rect x="1478" y="344" width="426" height="240" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.5"/>
+  <text x="1502" y="374" class="rung">RUNG 3 · ADOPTED</text>
+  <text x="1502" y="402" class="boxtitle">Your Aurora DSQL</text>
+  <text x="1502" y="428" class="mono">EmbeddedStorageConfig::ExistingDsql(…)</text>
+  <text x="1502" y="456" class="small">An operator-supplied cluster, used without lifecycle</text>
+  <text x="1502" y="476" class="small">mutation — the engine is a guest: it migrates schema</text>
+  <text x="1502" y="496" class="small">forward-only and never creates, wakes, or destroys.</text>
+  <text x="1502" y="546" class="small" fill="#8A8378">restart ⇒ reconnect and carry on</text>
+
+  <!-- ladder arrows -->
+  <g stroke="#B85C38" stroke-width="2.6" fill="none" stroke-linecap="round">
+    <path d="M486 464 H524" marker-end="url(#ej_clay)"/>
+    <path d="M960 464 H998" marker-end="url(#ej_clay)"/>
+    <path d="M1434 464 H1472" marker-end="url(#ej_clay)"/>
+  </g>
+
+  <!-- guarantees under DSQL rungs -->
+  <rect x="1004" y="620" width="900" height="130" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
+  <text x="1028" y="652" class="boxtitle">What both DSQL rungs get for free</text>
+  <text x="1028" y="680" class="small">Single-owner exclusion enforced in the database itself — the control lease fences every connection checkout, so a</text>
+  <text x="1028" y="700" class="small">second engine on the same cluster cannot corrupt it. Connection budgeting runs process-local: no DynamoDB, nothing</text>
+  <text x="1028" y="720" class="small">to provision. The full 39-table schema, migrated forward-only on first contact.</text>
+
+  <!-- the growth arrow -->
+  <rect x="56" y="620" width="900" height="130" rx="10" fill="#EFF4F5" stroke="#0B7285" stroke-opacity=".5" stroke-width="1.5"/>
+  <text x="80" y="652" class="boxtitle">And when one process stops being enough</text>
+  <text x="80" y="680" class="small">The same engine runs as tokeirad — same commit path, same schema, same behaviours the conformance corpus measured.</text>
+  <text x="80" y="700" class="small">An embedded DSQL-backed application and a tokeirad fleet are two deployments of one engine, not two systems.</text>
+  <text x="80" y="728" class="mono">grow into the server; never migrate away from your workflows</text>
+
+  <!-- footer -->
+  <rect x="56" y="800" width="1848" height="56" rx="12" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".5" stroke-width="1.4"/>
+  <text x="80" y="824" class="boxtitle" fill="#9A4A2C" font-size="14">The journey's promise:</text>
+  <text x="80" y="844" class="small">durability is not a migration event — each rung changes where truth is stored, never what is true or how it is decided.</text>
+
+  <text x="56" y="910" class="small" fill="#8A8378">Companions: the authoritative runtime · embedded (the machinery), the connection reservoir (the DSQL rungs' plumbing), the README's Run Tokeira section.</text>
+
+  <g transform="translate(1868,1088)" stroke="#B85C38" stroke-width="2.2" stroke-linecap="round" opacity=".8">
+    <path d="M0 36 C3 22 6 11 12 0" fill="none"/>
+    <g transform="translate(12,0)"><path d="M0 0 L12 -9 M0 0 L15 -1 M0 0 L12 7 M0 0 L4 -13 M0 0 L-5 -12" fill="none"/><circle cx="0" cy="0" r="2.4" fill="#B85C38" stroke="none"/></g>
+  </g>
+</svg>

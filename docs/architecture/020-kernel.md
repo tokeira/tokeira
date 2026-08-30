@@ -245,11 +245,11 @@ pub struct WorkflowState {
     pub pending_external_signals: BTreeMap<i64, PendingExternalSignal>,
     pub pending_external_cancels: BTreeMap<i64, PendingExternalCancel>,
 
-    // Open entities (not yet implemented)
+    // Open entities
     pub pending_updates: BTreeMap<String, PendingUpdate>,
     pub pending_nexus_operations: BTreeMap<String, PendingNexusOperation>,
 
-    // Execution options (not yet implemented)
+    // Execution options
     pub versioning_override: Option<VersioningOverride>,
     pub completion_callbacks: Vec<CompletionCallback>,
 }

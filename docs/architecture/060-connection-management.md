@@ -51,6 +51,8 @@ The default allocation is derived from the target ready count and preserves at l
 
 ## Distributed Rate Bucket
 
+Coordination has two modes, selected by the deployment shape rather than configuration: served multi-node `tokeirad` coordinates through the DynamoDB-backed machinery below; a single-owner embedded engine coordinates process-locally (see [Embedded Coordination](#embedded-coordination)).
+
 DSQL connection creation is limited cluster-wide. A local token bucket per process would only move the thundering-herd problem from one process to many processes, so Tokeira uses a DynamoDB-backed token bucket.
 
 The table is `{project}-dsql-rate-limiter` with partition key `pk` and TTL attribute `ttl_epoch`. The global bucket row stores tokens and the last refill timestamp. Refiller tasks use consistent reads and conditional writes. Conditional-write conflicts are expected and treated as retry pressure, not as hard errors.
@@ -81,6 +83,21 @@ Slot release happens when:
 - `DsqlPermit::drop` cannot send the connection to the return processor.
 
 If renewal loses a block because another node claimed it, the manager removes the block from local ownership, reduces total slot capacity, emits `tokeira_dsql_slot_block_lost_total`, and continues. Existing in-flight connections are not killed; refill naturally stops if used slots exceed remaining capacity.
+
+## Embedded Coordination
+
+A single-owner embedded engine has no peer processes to coordinate with, so it
+constructs no DynamoDB resources. `Engine::embedded()` installs a process-local
+coordinator (`ProcessLocalConnectionCoordinator`,
+`crates/tokeira-storage/src/dsql/connection_coordinator.rs`): a monotonic token
+bucket admits connection creation and an atomic slot budget caps active
+connections, behind the same acquire-slot-then-token order the distributed path
+uses. The module is deliberately absent from the distributed `tokeirad` path —
+the reservoir, rate limiter, and slot-block manager above are unchanged by it.
+
+This applies to every embedded storage mode: in-memory, managed DSQL, and
+adopted DSQL. The embedded engine is the sole owner of its cluster's connection
+budget, so process-local admission is the whole coordination problem.
 
 ## Lifetime Rules
 

@@ -1,4 +1,4 @@
-// The networking module: the private VPC, the six workload-family security
+// The networking module: the private VPC, the workload-family security
 // groups, the AWS service endpoints private tasks reach, and the internal
 // ALB stack routing the two edge services.
 //
@@ -9,7 +9,16 @@ use platform::{AlbProtocol, Ecs, EndpointKind, IngressRule, ListenerProtocol};
 
 // The VPC and the endpoint security group arrive from the root, which owns
 // the resources several parts stand on. This part declares the rest.
-pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module, vpc: Resource, endpoint_sg: Resource) {
+pub fn define(
+    d: Deployment,
+    cfg: Ecs,
+    cx: Context,
+    networking: Module,
+    vpc: Resource,
+    endpoint_sg: Resource,
+    edge_api_tg: Resource,
+    edge_poll_tg: Resource,
+) {
     // The ALB group listens on the listener's own port; the others carry
     // their family's canonical gRPC port.
     let listener_port = match &cfg.alb.protocol {
@@ -24,16 +33,15 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module, vpc: Res
             name: "alb".into(),
             description: "Tokeira ECS internal ALB security group".into(),
             ingress: vec![IngressRule {
-                description: "self internal ALB traffic".into(),
+                description: "private VPC internal ALB traffic".into(),
                 protocol: "tcp".into(),
                 from_port: listener_port,
                 to_port: listener_port,
-                source: "self".into(),
+                source: cfg.networking.vpc_cidr.clone(),
             }],
         },
         vec![vpc],
     );
-
 
     // The private substrate's required AWS endpoints. Interface endpoints
     // attach the endpoint security group; the S3 gateway rides the route
@@ -52,28 +60,10 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module, vpc: Res
     // The internal ALB and its two edge routes.
     let alb = networking.resource(
         "alb",
-        Alb { name: "tokeira".into() },
+        Alb {
+            name: "tokeira".into(),
+        },
         vec![vpc, alb_sg],
-    );
-    let edge_api_tg = networking.resource(
-        "tg-edge-api",
-        AlbTargetGroup {
-            name: "tokeira-edge-api".into(),
-            port: 7233,
-            health_check_path: cfg.alb.health_check_path.clone(),
-            health_check_interval_secs: cfg.alb.health_check_interval_secs,
-        },
-        vec![vpc],
-    );
-    let edge_poll_tg = networking.resource(
-        "tg-edge-poll",
-        AlbTargetGroup {
-            name: "tokeira-edge-poll".into(),
-            port: 7234,
-            health_check_path: cfg.alb.health_check_path.clone(),
-            health_check_interval_secs: cfg.alb.health_check_interval_secs,
-        },
-        vec![vpc],
     );
     networking.resource(
         "listener",
@@ -84,7 +74,7 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module, vpc: Res
                 AlbProtocol::Https(_) => ListenerProtocol::Https,
             },
             certificate_arn: match &cfg.alb.protocol {
-                AlbProtocol::Https(arn) => Some(arn.clone()),
+                AlbProtocol::Https(tls) => Some(tls.certificate_arn.clone()),
                 AlbProtocol::Http2 => None,
             },
             private_dns_zone: cfg.networking.private_dns_zone.clone(),

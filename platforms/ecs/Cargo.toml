@@ -11,8 +11,11 @@ authors.workspace = true
 id = "ecs"
 engine = "0.1.1"
 default = false
+# The Rust root is seeded when no format is requested; the Python root is a
+# peer projection of the same modular definition and is selected explicitly.
 default-format = "tkd"
-definitions = ["deployment.tkd"]
+definitions = ["deployment.tkd", "definition.tkdp"]
+content = ["observability"]
 
 [dependencies]
 async-trait.workspace = true
@@ -22,12 +25,13 @@ serde_json.workspace = true
 sha2.workspace = true
 tokeira-aws = { path = "../../crates/tokeira-aws" }
 tokeira-ecs = { path = "../../crates/tokeira-ecs" }
+tokeira-deployment = { workspace = true }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
 tokeira-platform = { path = "../../crates/tokeira-platform" }
 
 [dev-dependencies]
 tokeira-observability = { workspace = true }
-tokeira-platform-definition = { workspace = true, features = ["tkd"] }
+tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
 
 [lints]
 workspace = true

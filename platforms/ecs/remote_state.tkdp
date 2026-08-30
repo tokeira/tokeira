@@ -1,0 +1,15 @@
+# The remote-state bootstrap. Its bucket and key prefix derive from stable
+# deployment coordinates so every operator invocation finds the same state.
+
+from tokeira import RemoteStateBucket
+
+
+def define(d, cfg, cx, remote_state):
+    remote_state.resource(
+        "bucket",
+        RemoteStateBucket(
+            region=cfg.aws.region,
+            bucket=cx.project_name + "-state-" + cfg.aws.region,
+            key_prefix=cx.project_name + "/" + cfg.environment,
+        ),
+    )

@@ -1,0 +1,35 @@
+# The services module owns the Service Connect namespace and the autoscaler
+# workload. The root declares the remaining workloads so it can wire their
+# cross-module role, network, target-group, and ServerConfig dependencies.
+
+from tokeira import CloudMapNamespace, EcsTaskRole, EcsWorkload
+
+
+def define(d, cfg, cx, services, vpc, control_sg):
+    services.resource(
+        "namespace",
+        CloudMapNamespace(name=cfg.cluster.service_connect_namespace),
+        [vpc],
+    )
+    task_role = services.resource(
+        "task-role-tokeira-autoscaler",
+        EcsTaskRole(service="tokeira-autoscaler", region=cfg.aws.region),
+    )
+    services.resource(
+        "tokeira-autoscaler",
+        EcsWorkload(
+            service="tokeira-autoscaler",
+            environment=cfg.environment,
+            region=cfg.aws.region,
+            cluster=cfg.cluster.name,
+            service_connect_namespace=cfg.cluster.service_connect_namespace,
+            image=cfg.services.autoscaler.image,
+            replicas=cfg.services.autoscaler.replicas,
+            cpu=cfg.services.autoscaler.cpu,
+            memory_mb=cfg.services.autoscaler.memory_mb,
+            alloy_image=cfg.observability.alloy_image,
+            aws_cli_image=cfg.observability.aws_cli_image,
+            busybox_image=cfg.observability.busybox_image,
+        ),
+        [task_role, vpc, control_sg],
+    )

@@ -4,8 +4,18 @@
 
 use platform::{CapacityPlane, DaemonPolicy, Ecs, EndpointKind, IngressRule, ReplicaPolicy};
 
-// A workload-family security group on its canonical port.
-pub fn edge_group(networking: Module, vpc: Resource, region: String, name: String, description: String, port: u16) {
+// A workload-family security group on its canonical port. Tasks communicate
+// across family groups, so the private VPC CIDR — not `self` — is the ingress
+// source. The resource is returned for the workload's explicit dependency.
+pub fn edge_group(
+    networking: Module,
+    vpc: Resource,
+    region: String,
+    vpc_cidr: String,
+    name: String,
+    description: String,
+    port: u16,
+) -> Resource {
     networking.resource(
         format!("sg-{}", name),
         SecurityGroup {
@@ -13,19 +23,26 @@ pub fn edge_group(networking: Module, vpc: Resource, region: String, name: Strin
             name: name.clone(),
             description: format!("Tokeira ECS {} security group", description),
             ingress: vec![IngressRule {
-                description: format!("self {} traffic", description),
+                description: format!("private VPC {} traffic", description),
                 protocol: "tcp".into(),
                 from_port: port,
                 to_port: port,
-                source: "self".into(),
+                source: vpc_cidr,
             }],
         },
         vec![vpc],
-    );
+    )
 }
 
 // One interface endpoint for a private AWS service.
-pub fn interface(networking: Module, vpc: Resource, endpoint_sg: Resource, region: String, short: String, service: String) {
+pub fn interface(
+    networking: Module,
+    vpc: Resource,
+    endpoint_sg: Resource,
+    region: String,
+    short: String,
+    service: String,
+) {
     networking.resource(
         format!("vpce-{}", short),
         VpcEndpoint {
@@ -41,7 +58,19 @@ pub fn interface(networking: Module, vpc: Resource, endpoint_sg: Resource, regio
 // One capacity plane: role, profile, launch template, auto-scaling group,
 // capacity provider. `protect` guards fresh instances from scale-in — the
 // runtime plane's managed-draining policy.
-pub fn plane(cluster: Module, cx: Context, vpc: Resource, runtime_sg: Resource, ecs_cluster: Resource, region: String, cluster_name: String, name: String, workload: String, policy: CapacityPlane, protect: bool) {
+pub fn plane(
+    cluster: Module,
+    cx: Context,
+    vpc: Resource,
+    runtime_sg: Resource,
+    ecs_cluster: Resource,
+    region: String,
+    cluster_name: String,
+    name: String,
+    workload: String,
+    policy: CapacityPlane,
+    protect: bool,
+) {
     let profile_name = format!("{}-{}-instance", cx.project_name, name);
     let role_name = format!("{}-role", profile_name);
     let role = cluster.resource(
@@ -98,7 +127,10 @@ pub fn plane(cluster: Module, cx: Context, vpc: Resource, runtime_sg: Resource, 
 pub fn alloy(observability: Module, region: String, service: String) {
     observability.resource(
         format!("alloy-{}", service),
-        AlloyConfig { service: service, region: region },
+        AlloyConfig {
+            service: service,
+            region: region,
+        },
     );
 }
 
@@ -107,12 +139,21 @@ pub fn alloy(observability: Module, region: String, service: String) {
 pub fn task_role(services: Module, region: String, service: String) -> Resource {
     services.resource(
         format!("task-role-{}", service),
-        EcsTaskRole { service: service, region: region },
+        EcsTaskRole {
+            service: service,
+            region: region,
+        },
     )
 }
 
 // One replica-scheduled workload.
-pub fn replica(services: Module, cfg: Ecs, service: String, policy: ReplicaPolicy, roles: Vec<Resource>) {
+pub fn replica(
+    services: Module,
+    cfg: Ecs,
+    service: String,
+    policy: ReplicaPolicy,
+    roles: Vec<Resource>,
+) {
     services.resource(
         service.clone(),
         EcsWorkload {
@@ -125,13 +166,22 @@ pub fn replica(services: Module, cfg: Ecs, service: String, policy: ReplicaPolic
             replicas: policy.replicas,
             cpu: policy.cpu,
             memory_mb: policy.memory_mb,
+            alloy_image: cfg.observability.alloy_image.clone(),
+            aws_cli_image: cfg.observability.aws_cli_image.clone(),
+            busybox_image: cfg.observability.busybox_image.clone(),
         },
         roles,
     );
 }
 
 // One daemon-scheduled workload: no replica count to author.
-pub fn daemon(services: Module, cfg: Ecs, service: String, policy: DaemonPolicy, roles: Vec<Resource>) {
+pub fn daemon(
+    services: Module,
+    cfg: Ecs,
+    service: String,
+    policy: DaemonPolicy,
+    roles: Vec<Resource>,
+) {
     services.resource(
         service.clone(),
         EcsWorkload {
@@ -143,6 +193,9 @@ pub fn daemon(services: Module, cfg: Ecs, service: String, policy: DaemonPolicy,
             image: policy.image.clone(),
             cpu: policy.cpu,
             memory_mb: policy.memory_mb,
+            alloy_image: cfg.observability.alloy_image.clone(),
+            aws_cli_image: cfg.observability.aws_cli_image.clone(),
+            busybox_image: cfg.observability.busybox_image.clone(),
         },
         roles,
     );

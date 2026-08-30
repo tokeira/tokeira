@@ -1,11 +1,12 @@
-//! The shipped ECS definition set, evaluated whole: the nine `.tkd`
-//! documents resolve as parts beside the root and build the deployment
-//! through the real platform namespaces, with nothing stubbed.
+//! The shipped ECS definition sets, evaluated whole: both modular frontends
+//! resolve their companion parts and build the deployment through the real
+//! platform namespaces, with nothing stubbed.
 
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokeira_platform::{
+    author::from_located_value,
     definition::{
         DefinitionFrontend, DefinitionSource, DefinitionSourceName, DirectoryPartSources,
         EvaluatedDefinition, evaluate_definition, verify_definition,
@@ -18,14 +19,168 @@ struct Ctx {
     project_name: String,
 }
 
-fn evaluate(root_text: &str) -> Result<EvaluatedDefinition<DecodedKind>, String> {
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedConfig {
+    environment: String,
+    aws: ShippedAws,
+    cluster: ShippedCluster,
+    networking: ShippedNetworking,
+    dsql: ShippedDsql,
+    services: ShippedServices,
+    capacity: ShippedCapacity,
+    alb: ShippedAlb,
+    observability: ShippedObservability,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedAws {
+    region: String,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedCluster {
+    name: String,
+    service_connect_namespace: String,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedNetworking {
+    vpc_cidr: String,
+    availability_zones: Vec<String>,
+    private_dns_zone: String,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+enum ShippedDsql {
+    Managed,
+    Preexisting(ShippedPreexistingDsql),
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedPreexistingDsql {
+    endpoint: String,
+    arn: String,
+    management_endpoint_id: String,
+    connection_endpoint_id: String,
+    runtime_role_arn: String,
+    admin_role_arn: String,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedServices {
+    edge_api: ShippedReplicaPolicy,
+    edge_poll: ShippedReplicaPolicy,
+    runtime: ShippedDaemonPolicy,
+    projection: ShippedReplicaPolicy,
+    controller: ShippedReplicaPolicy,
+    autoscaler: ShippedReplicaPolicy,
+    admin: ShippedReplicaPolicy,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedReplicaPolicy {
+    image: String,
+    replicas: u32,
+    cpu: u32,
+    memory_mb: u32,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedDaemonPolicy {
+    image: String,
+    cpu: u32,
+    memory_mb: u32,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedCapacity {
+    edge_api: ShippedCapacityPlane,
+    edge_poll: ShippedCapacityPlane,
+    runtime: ShippedCapacityPlane,
+    projection: ShippedCapacityPlane,
+    control: ShippedCapacityPlane,
+    mimir: ShippedCapacityPlane,
+    loki: ShippedCapacityPlane,
+    grafana: ShippedCapacityPlane,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedCapacityPlane {
+    instance_type: String,
+    min: u32,
+    desired: u32,
+    max: u32,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedAlb {
+    protocol: ShippedAlbProtocol,
+    health_check_path: String,
+    health_check_interval_secs: u64,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+enum ShippedAlbProtocol {
+    Http2,
+    Https(ShippedHttps),
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedHttps {
+    certificate_arn: String,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedObservability {
+    mimir: ShippedImage,
+    loki: ShippedImage,
+    grafana: ShippedImage,
+    alloy_image: String,
+    aws_cli_image: String,
+    busybox_image: String,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedImage {
+    image: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GraphProjection {
+    namespaces: Vec<String>,
+    modules: Vec<ModuleProjection>,
+    resources: Vec<ResourceProjection>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ModuleProjection {
+    name: String,
+    dependencies: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResourceProjection {
+    module: String,
+    logical_id: String,
+    kind: String,
+    dependencies: Vec<(String, String)>,
+}
+
+fn evaluate<F>(
+    root_text: &str,
+    root_name: &str,
+    extension: &str,
+    frontend: &F,
+) -> Result<EvaluatedDefinition<DecodedKind>, String>
+where
+    F: DefinitionFrontend,
+{
     let package = Path::new(env!("CARGO_MANIFEST_DIR"));
     let platform = tokeira_ecs_deployment::platform();
-    let parts = DirectoryPartSources::new(package, "tkd");
-    let source_name = DefinitionSourceName::AuthoringPath(package.join("deployment.tkd"));
-    let frontend = tokeira_platform_definition::tkd::frontend();
+    let parts = DirectoryPartSources::new(package, extension);
+    let source_name = DefinitionSourceName::AuthoringPath(package.join(root_name));
     evaluate_definition(
-        &frontend,
+        frontend,
         DefinitionSource {
             format: frontend.format().clone(),
             source_name,
@@ -40,9 +195,95 @@ fn evaluate(root_text: &str) -> Result<EvaluatedDefinition<DecodedKind>, String>
     .map_err(|diagnostic| diagnostic.to_string())
 }
 
-fn shipped_root() -> String {
+fn evaluate_tkd(root_text: &str) -> Result<EvaluatedDefinition<DecodedKind>, String> {
+    evaluate(
+        root_text,
+        "deployment.tkd",
+        "tkd",
+        &tokeira_platform_definition::tkd::frontend(),
+    )
+}
+
+fn evaluate_tkdp(root_text: &str) -> Result<EvaluatedDefinition<DecodedKind>, String> {
+    evaluate(
+        root_text,
+        "definition.tkdp",
+        "tkdp",
+        &tokeira_platform_definition::tkdp::frontend(),
+    )
+}
+
+fn shipped_tkd_root() -> String {
     std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("deployment.tkd"))
-        .expect("the shipped root document reads")
+        .expect("the shipped TKD root document reads")
+}
+
+fn shipped_tkdp_root() -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("definition.tkdp"))
+        .expect("the shipped TKDP root document reads")
+}
+
+fn decode_config(output: &EvaluatedDefinition<DecodedKind>) -> ShippedConfig {
+    from_located_value(output.config.clone()).expect("the shipped config admits")
+}
+
+fn graph_projection(output: &EvaluatedDefinition<DecodedKind>) -> GraphProjection {
+    let namespaces = output.graph.namespaces().to_vec();
+    let modules = output
+        .graph
+        .modules()
+        .iter()
+        .map(|module| ModuleProjection {
+            name: module.name().to_string(),
+            dependencies: module.dependencies().to_vec(),
+        })
+        .collect();
+    let resources = output
+        .graph
+        .resources()
+        .iter()
+        .map(|resource| ResourceProjection {
+            module: resource.module().to_string(),
+            logical_id: resource.logical_id().to_string(),
+            kind: resource.kind().name().to_string(),
+            dependencies: resource
+                .dependencies()
+                .iter()
+                .map(|dependency| {
+                    (
+                        dependency.module().to_string(),
+                        dependency.logical_id().to_string(),
+                    )
+                })
+                .collect(),
+        })
+        .collect();
+    GraphProjection {
+        namespaces,
+        modules,
+        resources,
+    }
+}
+
+fn realize(
+    output: &EvaluatedDefinition<DecodedKind>,
+) -> tokeira_platform::definition::RealizedResources {
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"));
+    verify_definition(output)
+        .realize("demo", package, package, &BTreeMap::new())
+        .expect("the verified definition realizes every resource and service")
+}
+
+fn assert_definition_parity(
+    tkd: &EvaluatedDefinition<DecodedKind>,
+    tkdp: &EvaluatedDefinition<DecodedKind>,
+) {
+    assert_eq!(decode_config(tkd), decode_config(tkdp));
+    assert_eq!(graph_projection(tkd), graph_projection(tkdp));
+    assert_eq!(tkd.graph.writeback(), tkdp.graph.writeback());
+    assert_eq!(realize(tkd).manifests(), realize(tkdp).manifests());
+    assert_eq!(tkd.served_companions.len(), 9);
+    assert_eq!(tkdp.served_companions.len(), 9);
 }
 
 #[test]
@@ -61,11 +302,39 @@ fn cluster_uses_the_authored_service_connect_namespace() {
     );
 }
 
+#[test]
+fn the_shipped_set_pins_current_observability_images() {
+    for output in [
+        evaluate_tkd(&shipped_tkd_root()).expect("the shipped TKD set evaluates"),
+        evaluate_tkdp(&shipped_tkdp_root()).expect("the shipped TKDP set evaluates"),
+    ] {
+        let config: ShippedConfig =
+            from_located_value(output.config).expect("the shipped config admits");
+
+        assert_eq!(config.observability.mimir.image, "grafana/mimir:3.2.0");
+        assert_eq!(config.observability.loki.image, "grafana/loki:3.7.6");
+        assert_eq!(config.observability.grafana.image, "grafana/grafana:12.4.9");
+        assert_eq!(config.observability.alloy_image, "grafana/alloy:v1.19.0");
+        assert_eq!(config.observability.aws_cli_image, "amazon/aws-cli:2.17.0");
+        assert_eq!(config.observability.busybox_image, "busybox:1.36");
+    }
+}
+
+// The two source sets are interchangeable authoring projections: a frontend
+// choice cannot alter operator configuration or provider intent.
+#[test]
+fn the_shipped_definition_formats_are_exact_peers() {
+    let tkd = evaluate_tkd(&shipped_tkd_root()).expect("the shipped TKD set evaluates");
+    let tkdp = evaluate_tkdp(&shipped_tkdp_root()).expect("the shipped TKDP set evaluates");
+
+    assert_definition_parity(&tkd, &tkdp);
+}
+
 // The shipped defaults select managed DSQL: seven modules in dependency
-// order, and all five DSQL writeback declarations.
+// order, and the complete canonical server-config writeback surface.
 #[test]
 fn the_shipped_set_evaluates_with_managed_defaults() {
-    let output = evaluate(&shipped_root()).expect("the shipped definition set evaluates");
+    let output = evaluate_tkd(&shipped_tkd_root()).expect("the shipped definition set evaluates");
     let modules: Vec<&str> = output
         .graph
         .modules()
@@ -96,11 +365,13 @@ fn the_shipped_set_evaluates_with_managed_defaults() {
     assert_eq!(
         keys,
         [
-            "dsql.admin_role_arn",
-            "dsql.connection_endpoint_id",
-            "dsql.endpoint",
-            "dsql.management_endpoint_id",
-            "dsql.runtime_role_arn"
+            "infrastructure.dsql.admin_role_arn",
+            "infrastructure.dsql.conn_lease_table",
+            "infrastructure.dsql.endpoint",
+            "infrastructure.dsql.rate_limiter_table",
+            "infrastructure.dsql.region",
+            "infrastructure.dsql.runtime_role_arn",
+            "infrastructure.storage",
         ]
     );
 
@@ -110,8 +381,8 @@ fn the_shipped_set_evaluates_with_managed_defaults() {
     assert_realizes(&output);
 }
 
-/// Both DSQL modes realize the same five well-known identities in the dsql
-/// module — the invariant every consumer and writeback binds against.
+/// Both DSQL modes realize the same DSQL and coordination identities in the
+/// dsql module — the invariant every consumer and writeback binds against.
 fn assert_dsql_identities(output: &EvaluatedDefinition<DecodedKind>) {
     let mut dsql: Vec<&str> = output
         .graph
@@ -126,8 +397,10 @@ fn assert_dsql_identities(output: &EvaluatedDefinition<DecodedKind>) {
         [
             "admin_role",
             "cluster",
+            "conn_lease",
             "connection_endpoint",
             "management_endpoint",
+            "rate_limiter",
             "runtime_role",
         ]
     );
@@ -171,10 +444,10 @@ fn assert_plane_separation(output: &EvaluatedDefinition<DecodedKind>) {
     }
 }
 
-/// Every deploy-plane workload explicitly stands on its infrastructure-owned
-/// task role; Grafana also stands on the execution role its secret requires.
-/// The definition graph therefore establishes the phase bridge before the
-/// service reads recorded ARNs.
+/// Every deploy-plane workload stands on its VPC, workload security group,
+/// and task role. Edge services also stand on their ALB target group;
+/// TokeiraConfig consumers stand on ServerConfig; Grafana stands on the
+/// execution role its secret requires.
 fn assert_workload_role_dependencies(output: &EvaluatedDefinition<DecodedKind>) {
     for workload in output
         .graph
@@ -197,33 +470,42 @@ fn assert_workload_role_dependencies(output: &EvaluatedDefinition<DecodedKind>) 
             })
             .collect::<Vec<_>>();
         dependency_kinds.sort_unstable();
-        let expected = if workload.logical_id() == "tokeira-grafana" {
-            vec!["EcsExecutionRole", "EcsTaskRole"]
-        } else {
-            vec!["EcsTaskRole"]
-        };
+        let mut expected = vec!["EcsTaskRole", "SecurityGroup", "Vpc"];
+        if workload.logical_id() == "tokeira-grafana" {
+            expected.push("EcsExecutionRole");
+        }
+        if matches!(
+            workload.logical_id(),
+            "tokeira-edge-api"
+                | "tokeira-edge-poll"
+                | "tokeira-runtime"
+                | "tokeira-projection"
+                | "tokeira-admin"
+        ) {
+            expected.push("ServerConfig");
+        }
+        if matches!(
+            workload.logical_id(),
+            "tokeira-edge-api" | "tokeira-edge-poll"
+        ) {
+            expected.push("AlbTargetGroup");
+        }
+        expected.sort_unstable();
         assert_eq!(dependency_kinds, expected, "{}", workload.logical_id());
     }
 }
 
 fn assert_realizes(output: &EvaluatedDefinition<DecodedKind>) {
-    let package = Path::new(env!("CARGO_MANIFEST_DIR"));
-    verify_definition(output)
-        .realize("demo", package, package, &std::collections::BTreeMap::new())
-        .expect("the verified definition realizes every resource and service");
+    realize(output);
 }
 
-// Selecting preexisting DSQL in the root's config keeps the same module
-// set and the same five well-known dsql identities, and declares all five
-// writebacks from the platform's own adopters.
-#[test]
-fn selecting_preexisting_dsql_keeps_identities_and_writes_five_back() {
-    let shipped = shipped_root();
+fn preexisting_tkd_root() -> String {
+    let shipped = shipped_tkd_root();
     let managed = "dsql: Dsql::Managed,";
     assert!(shipped.contains(managed), "the dsql literal is as shipped");
     let root = shipped.replace(
         managed,
-        "dsql: Dsql::Preexisting(PreexistingDsql {\n            endpoint: \"adopted.dsql.example\".into(),\n            management_endpoint_id: \"vpce-mgmt\".into(),\n            connection_endpoint_id: \"vpce-conn\".into(),\n            runtime_role_arn: \"arn:aws:iam::1:role/runtime\".into(),\n            admin_role_arn: \"arn:aws:iam::1:role/admin\".into(),\n        }),",
+        "dsql: Dsql::Preexisting(PreexistingDsql {\n            endpoint: \"adopted.dsql.example\".into(),\n            arn: \"arn:aws:dsql:eu-west-2:1:cluster/adopted\".into(),\n            management_endpoint_id: \"vpce-mgmt\".into(),\n            connection_endpoint_id: \"vpce-conn\".into(),\n            runtime_role_arn: \"arn:aws:iam::1:role/runtime\".into(),\n            admin_role_arn: \"arn:aws:iam::1:role/admin\".into(),\n        }),",
     );
     let root = root.replace("PreexistingRole,", "PreexistingDsql, PreexistingRole,");
     assert!(
@@ -231,28 +513,78 @@ fn selecting_preexisting_dsql_keeps_identities_and_writes_five_back() {
         "the root's use line gained the adopted-DSQL type"
     );
     assert_ne!(root, shipped, "the dsql literal was rewritten");
-    let output = evaluate(&root).expect("the preexisting-DSQL set evaluates");
-    let mut keys: Vec<&str> = output
-        .graph
-        .writeback()
-        .iter()
-        .map(|entry| entry.key())
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(
-        keys,
-        [
-            "dsql.admin_role_arn",
-            "dsql.connection_endpoint_id",
-            "dsql.endpoint",
-            "dsql.management_endpoint_id",
-            "dsql.runtime_role_arn",
-        ]
+    root
+}
+
+fn preexisting_tkdp_root() -> String {
+    let shipped = shipped_tkdp_root();
+    let managed = "dsql=ManagedDsql(),";
+    assert!(shipped.contains(managed), "the dsql literal is as shipped");
+    let root = shipped.replace(
+        managed,
+        "dsql=PreexistingDsql(\n            endpoint=\"adopted.dsql.example\",\n            arn=\"arn:aws:dsql:eu-west-2:1:cluster/adopted\",\n            management_endpoint_id=\"vpce-mgmt\",\n            connection_endpoint_id=\"vpce-conn\",\n            runtime_role_arn=\"arn:aws:iam::1:role/runtime\",\n            admin_role_arn=\"arn:aws:iam::1:role/admin\",\n        ),",
     );
-    assert_dsql_identities(&output);
-    assert_plane_separation(&output);
-    assert_workload_role_dependencies(&output);
-    // The preexisting configuration currently has no authored cluster ARN,
-    // so its DsqlCluster kind cannot realize. Closing that separate config
-    // contract gap must be an explicit compatibility decision.
+    assert_ne!(root, shipped, "the dsql literal was rewritten");
+    root
+}
+
+fn https_tkd_root() -> String {
+    let shipped = shipped_tkd_root();
+    shipped.replace(
+        "protocol: AlbProtocol::Http2,",
+        "protocol: AlbProtocol::Https(HttpsAlb {\n                certificate_arn: \"arn:aws:acm:eu-west-2:1:certificate/test\".into(),\n            }),",
+    )
+}
+
+fn https_tkdp_root() -> String {
+    let shipped = shipped_tkdp_root();
+    shipped.replace(
+        "protocol=Http2(),",
+        "protocol=Https(\n                certificate_arn=\"arn:aws:acm:eu-west-2:1:certificate/test\",\n            ),",
+    )
+}
+
+// Variant payloads are part of the operator contract too; parity must hold
+// beyond the default unit variants.
+#[test]
+fn selecting_https_keeps_the_definition_formats_exact_peers() {
+    let tkd = evaluate_tkd(&https_tkd_root()).expect("the TKD HTTPS set evaluates");
+    let tkdp = evaluate_tkdp(&https_tkdp_root()).expect("the TKDP HTTPS set evaluates");
+
+    assert_definition_parity(&tkd, &tkdp);
+}
+
+// Selecting preexisting DSQL in either root keeps the same module set, DSQL
+// identities, canonical writebacks, and cross-format provider projection.
+#[test]
+fn selecting_preexisting_dsql_keeps_identities_and_canonical_writeback() {
+    let tkd = evaluate_tkd(&preexisting_tkd_root()).expect("the TKD adopted set evaluates");
+    let tkdp = evaluate_tkdp(&preexisting_tkdp_root()).expect("the TKDP adopted set evaluates");
+
+    for output in [&tkd, &tkdp] {
+        let mut keys: Vec<&str> = output
+            .graph
+            .writeback()
+            .iter()
+            .map(|entry| entry.key())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "infrastructure.dsql.admin_role_arn",
+                "infrastructure.dsql.conn_lease_table",
+                "infrastructure.dsql.endpoint",
+                "infrastructure.dsql.rate_limiter_table",
+                "infrastructure.dsql.region",
+                "infrastructure.dsql.runtime_role_arn",
+                "infrastructure.storage",
+            ]
+        );
+        assert_dsql_identities(output);
+        assert_plane_separation(output);
+        assert_workload_role_dependencies(output);
+        assert_realizes(output);
+    }
+    assert_definition_parity(&tkd, &tkdp);
 }

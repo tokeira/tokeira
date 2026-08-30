@@ -2,8 +2,8 @@
 //!
 //! Kinds and resources are distinct: each kind here is the authored face of
 //! one resource and realizes it directly — [`Service`] realizes the
-//! [`ComposeService`] model in the crate root; the two local marker kinds
-//! realize their node resources beside them. Each resource owns its one
+//! [`ComposeService`] model in the crate root; the local-state marker realizes
+//! its node resource beside it. Each resource owns its one
 //! word as a `TYPE` const; the kinds recover it. The namespace facts at the
 //! bottom — `NAMESPACE`, `KINDS`, `decode` — are what the assembled
 //! binary lists for the frontend; nothing is registered anywhere else.
@@ -87,7 +87,7 @@ impl Service {
             config_digest: None,
             module: placement.module.clone(),
         };
-        let server_config_id = server_config_resource_id();
+        let server_config_id = tokeira_deployment::server_config::resource_id();
         if let Some(identity) = placement.dependency_content.get(&server_config_id) {
             service.server_config_digest = Some(identity.prefixed_sha256());
         }
@@ -246,183 +246,9 @@ impl tokeira_iac::Resource for LocalStateResource {
     }
 }
 
-/// The engine identity of the deployment's server-config node.
-pub(crate) fn server_config_resource_id() -> tokeira_iac::ResourceId {
-    tokeira_iac::ResourceId("server-config".to_string())
-}
-
-/// The deployment's server configuration (`tokeirad.toml`) as an authored
-/// graph node. The file is operator-authored: the node's desired manifest
-/// digests the interpreted source set's copy (`definition_dir`, so a
-/// baseline realization digests the retained bytes), and consumers couple
-/// through the framework's dependency-content identity — a `tokeirad.toml`
-/// edit diffs every declared consumer, and the graph names the server
-/// configuration for ordering, dependants, and dependency loss. The node
-/// itself never diffs: its live truth is the same file its desired state
-/// reads, so content movement is the consumers' manifests' business.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerConfig {}
-
-impl Kind<ServerConfigResource> for ServerConfig {
-    fn realize(&self, placement: &PlacementContext) -> Result<ServerConfigResource, KindError> {
-        Ok(ServerConfigResource {
-            path: placement.deployment_dir.join("tokeirad.toml"),
-            definition_path: placement.definition_dir.join("tokeirad.toml"),
-            module: placement.module.clone(),
-        })
-    }
-}
-
-/// The server-config node resource the [`ServerConfig`] kind realizes.
-#[derive(Debug)]
-struct ServerConfigResource {
-    /// The live file the containers bind-mount.
-    path: PathBuf,
-    /// The interpreted source-set copy used for retained-revision evidence.
-    definition_path: PathBuf,
-    module: String,
-}
-
-impl ServerConfigResource {
-    /// The resource's one word: engine resource type and author-visible
-    /// name, stated once here.
-    const TYPE: &'static str = "ServerConfig";
-
-    fn state(&self) -> tokeira_iac::ResourceState {
-        tokeira_iac::ResourceState {
-            resource_type: tokeira_iac::Resource::resource_type(self),
-            physical_id: self.path.display().to_string(),
-            // Constant properties, equal in `create` and `describe`: the
-            // node's record must never read as departed — content movement
-            // is the consumers' manifests' business.
-            properties: serde_json::json!({ "path": "tokeirad.toml" }),
-            dependencies: Vec::new(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            module: self.module.clone(),
-        }
-    }
-}
-
-#[async_trait]
-impl tokeira_iac::Resource for ServerConfigResource {
-    fn resource_type(&self) -> tokeira_iac::ResourceType {
-        tokeira_iac::ResourceType::new(Self::TYPE)
-    }
-
-    fn desired_manifest(&self) -> serde_json::Value {
-        // A retained source-set copy wins; history predating companion-file
-        // retention falls back to the live file instead of inventing an edit.
-        let content = [&self.definition_path, &self.path]
-            .into_iter()
-            .find_map(|path| std::fs::read(path).ok())
-            .map(|bytes| {
-                tokeira_platform::content::ContentIdentity::new("compose/server-config", &bytes)
-                    .prefixed_sha256()
-            });
-        serde_json::json!({ "path": "tokeirad.toml", "content_digest": content })
-    }
-
-    fn resource_id(&self) -> tokeira_iac::ResourceId {
-        server_config_resource_id()
-    }
-
-    fn dependencies(&self) -> Vec<tokeira_iac::ResourceId> {
-        Vec::new()
-    }
-
-    fn module(&self) -> &str {
-        &self.module
-    }
-
-    fn display_kind(&self) -> Option<&'static str> {
-        Some("server configuration")
-    }
-
-    async fn create(
-        &self,
-        _context: &tokeira_iac::ProvisionContext,
-    ) -> Result<tokeira_iac::ResourceState, tokeira_iac::IacError> {
-        // The file is operator-authored; creation records the node, writes
-        // nothing — and a definition that declares the node while the file
-        // is missing is refused here with the fact, not mounted as a Docker
-        // directory stub.
-        if !self.path.is_file() {
-            return Err(tokeira_iac::IacError::Other(anyhow::anyhow!(
-                "the definition declares ServerConfig but {} does not exist",
-                self.path.display()
-            )));
-        }
-        Ok(self.state())
-    }
-
-    async fn update(
-        &self,
-        current: &tokeira_iac::ResourceState,
-        _context: &tokeira_iac::ProvisionContext,
-    ) -> Result<tokeira_iac::ResourceState, tokeira_iac::IacError> {
-        Ok(current.clone())
-    }
-
-    async fn delete(
-        &self,
-        _current: &tokeira_iac::ResourceState,
-        _context: &tokeira_iac::ProvisionContext,
-    ) -> Result<(), tokeira_iac::IacError> {
-        // Deliberate no-op: the record retires; the operator's file survives.
-        Ok(())
-    }
-
-    async fn describe(
-        &self,
-        _context: &tokeira_iac::ProvisionContext,
-    ) -> Result<tokeira_iac::DescribeResult, tokeira_iac::IacError> {
-        Ok(if self.path.is_file() {
-            tokeira_iac::DescribeResult::Present(self.state())
-        } else {
-            tokeira_iac::DescribeResult::Absent
-        })
-    }
-
-    fn diff(
-        &self,
-        _current: &tokeira_iac::ResourceState,
-        _context: &tokeira_iac::ProvisionContext,
-    ) -> tokeira_iac::InternalChange {
-        tokeira_iac::InternalChange::NoChange {
-            resource_id: tokeira_iac::Resource::resource_id(self),
-        }
-    }
-
-    /// What a server-config-node change does, read from this file's own
-    /// lifecycle paths. Everything mirrors [`LocalStateDir`]: the node
-    /// records and retires; the operator's `tokeirad.toml` is never written
-    /// or removed by any path here.
-    fn change_semantics(
-        &self,
-        ctx: &tokeira_iac::SemanticsContext<'_>,
-    ) -> tokeira_iac::ChangeSemantics {
-        // Cited by module identity, never repo layout; every name is a real
-        // identifier in this module.
-        const CREATE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
-            module_path!(),
-            "::ServerConfigResource::create — records the node; writes nothing"
-        ));
-        const DELETE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
-            module_path!(),
-            "::ServerConfigResource::delete — deliberate no-op (returns Ok(())): \
-             the record retires; the operator's tokeirad.toml survives"
-        ));
-        local_marker_semantics(ctx.kind, CREATE, DELETE)
-    }
-}
-
-/// Shared declaration shape for the two local marker nodes (state dir,
-/// server config): every lifecycle path records or retires without touching
-/// the operator's filesystem contents, so every field is an engine fact from
-/// the cited no-op paths. The diff of both kinds only ever answers NoChange;
-/// Update/Replace are declared anyway — totality — from the no-op update.
+/// Shared declaration shape for the local-state marker node. Every lifecycle
+/// path records or retires without deleting the directory's contents, so each
+/// field is an engine fact from the cited paths.
 fn local_marker_semantics(
     kind: tokeira_iac::ChangeKind,
     create: tokeira_iac::Citation,
@@ -487,11 +313,7 @@ pub(crate) const NAMESPACE: &str = "tokeira_compose";
 
 /// The provider's author-visible kind names, each the word its resource
 /// owns.
-pub(crate) const KINDS: &[&str] = &[
-    LocalStateResource::TYPE,
-    ServerConfigResource::TYPE,
-    ComposeService::TYPE,
-];
+pub(crate) const KINDS: &[&str] = &[LocalStateResource::TYPE, ComposeService::TYPE];
 
 /// Authoring-only empty shapes for frontends with explicit struct-update
 /// syntax. The values mirror this kind's Serde defaults; they do not carry
@@ -546,10 +368,6 @@ pub(crate) fn decode(name: &str, value: LocatedValue) -> Option<Result<DecodedKi
     Some(match name {
         LocalStateResource::TYPE => kind::decode_resource::<LocalStateDir, LocalStateResource>(
             LocalStateResource::TYPE,
-            value,
-        ),
-        ServerConfigResource::TYPE => kind::decode_resource::<ServerConfig, ServerConfigResource>(
-            ServerConfigResource::TYPE,
             value,
         ),
         ComposeService::TYPE => {

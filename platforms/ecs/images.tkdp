@@ -1,0 +1,22 @@
+# The private image repositories. Operators choose upstream/build images in
+# configuration; repository identities derive from the deployment project.
+
+from tokeira import EcrRepository
+
+
+def define(d, cfg, cx, images):
+    images.resource(
+        "tokeirad", EcrRepository(repository=cx.project_name + "/tokeirad")
+    )
+    images.resource("mimir", EcrRepository(repository=cx.project_name + "/mimir"))
+    images.resource("loki", EcrRepository(repository=cx.project_name + "/loki"))
+    images.resource(
+        "grafana", EcrRepository(repository=cx.project_name + "/grafana")
+    )
+    images.resource("alloy", EcrRepository(repository=cx.project_name + "/alloy"))
+    images.resource(
+        "aws-cli", EcrRepository(repository=cx.project_name + "/aws-cli")
+    )
+    images.resource(
+        "busybox", EcrRepository(repository=cx.project_name + "/busybox")
+    )

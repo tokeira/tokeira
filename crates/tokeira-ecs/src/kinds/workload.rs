@@ -7,7 +7,9 @@ use tokeira_platform::{
 };
 
 use crate::{
-    EcsConfig, modules::services::task_definition_needs_execution_role, services::EcsWorkload,
+    EcsConfig,
+    modules::services::task_definition_needs_execution_role,
+    services::{EcsScheduling, EcsWorkload},
 };
 
 /// Author-visible name of the realized service type.
@@ -45,6 +47,12 @@ pub struct Workload {
     pub(crate) cpu: u32,
     /// Task memory in MiB.
     pub(crate) memory_mb: u32,
+    /// Alloy image shared by the workload's collection sidecar.
+    pub(crate) alloy_image: String,
+    /// AWS CLI image used by the Alloy configuration init container.
+    pub(crate) aws_cli_image: String,
+    /// BusyBox image used by dependency-readiness init containers.
+    pub(crate) busybox_image: String,
 }
 
 impl Workload {
@@ -58,6 +66,9 @@ impl Workload {
         };
         config.cluster.name = self.cluster.clone();
         config.cluster.service_connect_namespace = self.service_connect_namespace.clone();
+        config.observability.alloy_image = self.alloy_image.clone();
+        config.observability.aws_cli_image = self.aws_cli_image.clone();
+        config.observability.busybox_image = self.busybox_image.clone();
 
         let replicas = self.replicas;
         match self.service.as_str() {
@@ -113,6 +124,16 @@ impl Workload {
                 }
             }
             "tokeira-autoscaler" => {
+                let service = &mut config.services.autoscaler;
+                service.image = self.image.clone();
+                service.cpu = self.cpu;
+                service.memory_mb = self.memory_mb;
+                if let Some(replicas) = replicas {
+                    service.desired_count = replicas;
+                }
+                // The legacy configuration retains this duplicate image
+                // coordinate. Keep it aligned until that unused surface is
+                // removed so no alternate builder can observe stale policy.
                 config.autoscaler.image = self.image.clone();
             }
             "tokeira-mimir" => {
@@ -161,6 +182,38 @@ impl Workload {
             .find(|dependency| dependency.0 == expected)
             .cloned()
     }
+
+    fn dependency(placement: &PlacementContext, expected: &str) -> Option<tokeira_iac::ResourceId> {
+        placement
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.0 == expected)
+            .cloned()
+    }
+
+    fn security_group_name(&self) -> &str {
+        match self.service.as_str() {
+            "tokeira-edge-api" | "tokeira-edge-poll" => "edge",
+            "tokeira-runtime" => "runtime",
+            "tokeira-projection" => "projection",
+            "tokeira-controller" | "tokeira-autoscaler" | "tokeira-admin" => "control",
+            "tokeira-mimir" => "mimir",
+            "tokeira-loki" => "loki",
+            "tokeira-grafana" => "grafana",
+            _ => "unknown",
+        }
+    }
+
+    fn uses_server_config(&self) -> bool {
+        matches!(
+            self.service.as_str(),
+            "tokeira-edge-api"
+                | "tokeira-edge-poll"
+                | "tokeira-runtime"
+                | "tokeira-projection"
+                | "tokeira-admin"
+        )
+    }
 }
 
 impl Kind<EcsWorkload> for Workload {
@@ -168,7 +221,7 @@ impl Kind<EcsWorkload> for Workload {
         let config = self.configured()?;
         let mut workloads = EcsWorkload::build_all(&config);
         workloads.extend(EcsWorkload::build_observability(&config));
-        let workload = workloads
+        let mut workload = workloads
             .iter()
             .position(|workload| workload.name == self.service)
             .map(|index| workloads.swap_remove(index))
@@ -178,6 +231,15 @@ impl Kind<EcsWorkload> for Workload {
                     self.service
                 ))
             })?;
+        // Observability defaults are built as fixed replicas rather than
+        // carrying a second desired-count config graph. Apply the common
+        // authored replica field after selection so every replica workload
+        // has the same definition contract.
+        if let (Some(replicas), EcsScheduling::Replica { desired_count }) =
+            (self.replicas, &mut workload.scheduling)
+        {
+            *desired_count = replicas;
+        }
         let task_role = self.role_dependency(placement, "task").ok_or_else(|| {
             KindError::new(format!(
                 "ECS workload `{}` needs its EcsTaskRole declared as a dependency",
@@ -193,6 +255,47 @@ impl Kind<EcsWorkload> for Workload {
                 self.service
             )));
         }
-        Ok(workload.with_role_dependencies(task_role, execution_role))
+        let vpc = Self::dependency(placement, &format!("{}-vpc", placement.deployment_id))
+            .ok_or_else(|| {
+                KindError::new(format!(
+                    "ECS workload `{}` needs its Vpc declared as a dependency",
+                    self.service
+                ))
+            })?;
+        let security_group_id = format!("sg-{}", self.security_group_name());
+        let security_group = Self::dependency(placement, &security_group_id).ok_or_else(|| {
+            KindError::new(format!(
+                "ECS workload `{}` needs security group `{security_group_id}` declared as a dependency",
+                self.service
+            ))
+        })?;
+        let target_group_id = format!("alb-tg-{}", self.service);
+        let target_group = self
+            .service
+            .starts_with("tokeira-edge-")
+            .then(|| {
+                Self::dependency(placement, &target_group_id).ok_or_else(|| {
+                    KindError::new(format!(
+                        "ECS workload `{}` needs target group `{target_group_id}` declared as a dependency",
+                        self.service
+                    ))
+                })
+            })
+            .transpose()?;
+        let server_config = self
+            .uses_server_config()
+            .then(|| {
+                let id = tokeira_deployment::server_config::resource_id();
+                Self::dependency(placement, &id.0).ok_or_else(|| {
+                    KindError::new(format!(
+                        "ECS workload `{}` needs ServerConfig declared as a dependency",
+                        self.service
+                    ))
+                })
+            })
+            .transpose()?;
+        Ok(workload
+            .with_role_dependencies(task_role, execution_role)
+            .with_infrastructure_dependencies(vpc, security_group, target_group, server_config))
     }
 }

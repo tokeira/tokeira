@@ -1,0 +1,73 @@
+# Private networking beyond the root-owned shared handles: the S3 gateway
+# endpoint and internal ALB listener. Canonical service ports are topology,
+# not operator policy, and therefore remain definition literals.
+
+from platform import Http2
+from tokeira import Alb, AlbListener, SecurityGroup, VpcEndpoint
+
+
+def define(
+    d,
+    cfg,
+    cx,
+    networking,
+    vpc,
+    endpoint_sg,
+    edge_api_tg,
+    edge_poll_tg,
+):
+    # Resolve the authored listener variant once so port, protocol, and
+    # certificate cannot disagree.
+    if isinstance(cfg.alb.protocol, Http2):
+        listener_port = 80
+        listener_protocol = "Http2"
+        certificate_arn = None
+    else:
+        listener_port = 443
+        listener_protocol = "Https"
+        certificate_arn = cfg.alb.protocol.certificate_arn
+
+    alb_sg = networking.resource(
+        "sg-alb",
+        SecurityGroup(
+            region=cfg.aws.region,
+            name="alb",
+            description="Tokeira ECS internal ALB security group",
+            ingress=[
+                {
+                    "description": "private VPC internal ALB traffic",
+                    "protocol": "tcp",
+                    "from_port": listener_port,
+                    "to_port": listener_port,
+                    "source": cfg.networking.vpc_cidr,
+                }
+            ],
+        ),
+        [vpc],
+    )
+
+    # S3 is the only gateway endpoint; interface endpoints are declared by
+    # the root through the shared helper and carry endpoint_sg.
+    networking.resource(
+        "vpce-s3",
+        VpcEndpoint(
+            region=cfg.aws.region,
+            short_name="s3",
+            service_name="com.amazonaws." + cfg.aws.region + ".s3",
+            endpoint_type="Gateway",
+        ),
+        [vpc],
+    )
+    alb = networking.resource("alb", Alb(name="tokeira"), [vpc, alb_sg])
+    networking.resource(
+        "listener",
+        AlbListener(
+            name="tokeira",
+            protocol=listener_protocol,
+            certificate_arn=certificate_arn,
+            private_dns_zone=cfg.networking.private_dns_zone,
+            edge_api_target_group="tokeira-edge-api",
+            edge_poll_target_group="tokeira-edge-poll",
+        ),
+        [alb, edge_api_tg, edge_poll_tg],
+    )

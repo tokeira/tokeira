@@ -1,0 +1,182 @@
+# Shared declaration helpers for repeated ECS assemblies. Keeping these
+# constructions in one part makes every capacity plane and workload follow
+# the same dependency and manifest contract.
+
+from tokeira import (
+    AlloyConfig,
+    AutoScalingGroup,
+    EcsCapacityProvider,
+    EcsTaskRole,
+    EcsWorkload,
+    IamInstanceProfile,
+    IamRole,
+    LaunchTemplate,
+    SecurityGroup,
+    VpcEndpoint,
+)
+
+
+def edge_group(networking, vpc, region, vpc_cidr, name, description, port):
+    # Workload families use different groups, so ingress is from the private
+    # VPC CIDR rather than a same-group self reference.
+    return networking.resource(
+        "sg-" + name,
+        SecurityGroup(
+            region=region,
+            name=name,
+            description="Tokeira ECS " + description + " security group",
+            ingress=[
+                {
+                    "description": "private VPC " + description + " traffic",
+                    "protocol": "tcp",
+                    "from_port": port,
+                    "to_port": port,
+                    "source": vpc_cidr,
+                }
+            ],
+        ),
+        [vpc],
+    )
+
+
+def interface(networking, vpc, endpoint_sg, region, short, service):
+    # Interface endpoints keep AWS API traffic on the private substrate and
+    # carry the endpoint security group explicitly.
+    networking.resource(
+        "vpce-" + short,
+        VpcEndpoint(
+            region=region,
+            short_name=short,
+            service_name="com.amazonaws." + region + "." + service,
+            endpoint_type="Interface",
+        ),
+        [vpc, endpoint_sg],
+    )
+
+
+def plane(
+    cluster,
+    cx,
+    vpc,
+    runtime_sg,
+    ecs_cluster,
+    region,
+    cluster_name,
+    name,
+    workload,
+    policy,
+    protect,
+):
+    # One plane is an EC2 role/profile, launch template, Auto Scaling group,
+    # and ECS capacity provider. Runtime protects new hosts while managed
+    # draining establishes ownership; the other planes do not.
+    profile_name = cx.project_name + "-" + name + "-instance"
+    role_name = profile_name + "-role"
+    role = cluster.resource(
+        "role-" + name,
+        IamRole(
+            region=region,
+            name=role_name,
+            trust_policy='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}',
+            managed_policy_arns=[
+                "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role",
+                "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+            ],
+        ),
+    )
+    profile = cluster.resource(
+        "profile-" + name,
+        IamInstanceProfile(
+            region=region,
+            profile_name=profile_name,
+            role_name=role_name,
+        ),
+        [role],
+    )
+    launch_template = cluster.resource(
+        "lt-" + name,
+        LaunchTemplate(
+            name=name,
+            cluster_name=cluster_name,
+            instance_type=policy.instance_type,
+            workload=workload,
+            instance_profile_name=profile_name,
+        ),
+        [runtime_sg, profile],
+    )
+    asg = cluster.resource(
+        "asg-" + name,
+        AutoScalingGroup(
+            name=name,
+            min_size=policy.min,
+            desired_capacity=policy.desired,
+            max_size=policy.max,
+            new_instances_protected_from_scale_in=protect,
+        ),
+        [launch_template, vpc],
+    )
+    cluster.resource(
+        "cp-" + name,
+        EcsCapacityProvider(name=name),
+        [ecs_cluster, asg],
+    )
+
+
+def alloy(observability, region, service):
+    # Each workload receives its own rendered Alloy parameter.
+    observability.resource(
+        "alloy-" + service,
+        AlloyConfig(service=service, region=region),
+    )
+
+
+def task_role(services, region, service):
+    # Return the role handle so the deploy-plane workload records the
+    # infrastructure dependency that supplies its ARN.
+    return services.resource(
+        "task-role-" + service,
+        EcsTaskRole(service=service, region=region),
+    )
+
+
+def replica(services, cfg, service, policy, roles):
+    # Replica scheduling carries an explicit desired count.
+    services.resource(
+        service,
+        EcsWorkload(
+            service=service,
+            environment=cfg.environment,
+            region=cfg.aws.region,
+            cluster=cfg.cluster.name,
+            service_connect_namespace=cfg.cluster.service_connect_namespace,
+            image=policy.image,
+            replicas=policy.replicas,
+            cpu=policy.cpu,
+            memory_mb=policy.memory_mb,
+            alloy_image=cfg.observability.alloy_image,
+            aws_cli_image=cfg.observability.aws_cli_image,
+            busybox_image=cfg.observability.busybox_image,
+        ),
+        roles,
+    )
+
+
+def daemon(services, cfg, service, policy, roles):
+    # Daemon scheduling omits replicas: ECS runs one task per eligible host.
+    services.resource(
+        service,
+        EcsWorkload(
+            service=service,
+            environment=cfg.environment,
+            region=cfg.aws.region,
+            cluster=cfg.cluster.name,
+            service_connect_namespace=cfg.cluster.service_connect_namespace,
+            image=policy.image,
+            cpu=policy.cpu,
+            memory_mb=policy.memory_mb,
+            alloy_image=cfg.observability.alloy_image,
+            aws_cli_image=cfg.observability.aws_cli_image,
+            busybox_image=cfg.observability.busybox_image,
+        ),
+        roles,
+    )

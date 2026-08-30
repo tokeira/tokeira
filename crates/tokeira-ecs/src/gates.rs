@@ -167,12 +167,12 @@ mod tests {
 
     fn set_observability_refs(config: &mut EcsConfig, valid: bool) {
         let prefix = if valid { REGISTRY } else { "docker.io" };
-        config.observability.mimir_image = format!("{prefix}/tokeira/mimir:latest");
-        config.observability.loki_image = format!("{prefix}/tokeira/loki:latest");
-        config.observability.grafana_image = format!("{prefix}/tokeira/grafana:latest");
-        config.observability.alloy_image = format!("{prefix}/tokeira/alloy:latest");
-        config.observability.aws_cli_image = format!("{prefix}/tokeira/aws-cli:latest");
-        config.observability.busybox_image = format!("{prefix}/tokeira/busybox:latest");
+        config.observability.mimir_image = format!("{prefix}/tokeira/mimir:3.2.0");
+        config.observability.loki_image = format!("{prefix}/tokeira/loki:3.7.6");
+        config.observability.grafana_image = format!("{prefix}/tokeira/grafana:12.4.9");
+        config.observability.alloy_image = format!("{prefix}/tokeira/alloy:v1.19.0");
+        config.observability.aws_cli_image = format!("{prefix}/tokeira/aws-cli:2.17.0");
+        config.observability.busybox_image = format!("{prefix}/tokeira/busybox:1.36");
     }
 
     fn set_service_refs(config: &mut EcsConfig, valid: bool) {

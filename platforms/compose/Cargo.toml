@@ -36,6 +36,7 @@ content = ["observability"]
 # pipeline (the framework owns it).
 [dependencies]
 tokeira-compose = { path = "../../crates/tokeira-compose" }
+tokeira-deployment = { workspace = true }
 tokeira-aws = { workspace = true }
 # The platform-owned observability kind's machinery.
 tokeira-platform = { workspace = true }

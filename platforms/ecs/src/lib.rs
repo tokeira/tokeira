@@ -2,10 +2,10 @@
 //! observability content.
 //!
 //! Realization lives in `tokeira-ecs` (`crates/tokeira-ecs`); this package
-//! assembles the definition-driven platform — the shipped `.tkd` documents,
-//! the platform-owned observability kinds, and the one entry point — and
-//! re-exports the implementation crate's legacy surface so existing callers
-//! keep their import paths.
+//! assembles the definition-driven platform — modular `.tkd` and `.tkdp`
+//! source sets describing the same graph, the platform-owned observability
+//! kinds, and the one entry point — and re-exports the implementation crate's
+//! legacy surface so existing callers keep their import paths.
 
 use std::sync::Arc;
 
@@ -27,6 +27,7 @@ pub fn platform() -> PlatformDeclaration {
     PlatformDeclaration {
         namespaces: vec![
             tokeira_ecs::kinds::namespace(),
+            tokeira_deployment::server_config::namespace(),
             observability::namespace(),
             Namespace {
                 name: tokeira_aws::kinds::NAMESPACE,
@@ -49,10 +50,10 @@ pub fn platform() -> PlatformDeclaration {
 mod declaration_tests {
     use super::*;
 
-    // The declaration is pure assembly: three namespaces, no ops, and the
+    // The declaration is pure assembly: four namespaces, no ops, and the
     // execution seams — constructed with no I/O to fail.
     #[test]
-    fn platform_declares_three_namespaces_and_no_ops() {
+    fn platform_declares_four_namespaces_and_no_ops() {
         let declaration = platform();
         let names: Vec<&str> = declaration
             .namespaces
@@ -61,7 +62,12 @@ mod declaration_tests {
             .collect();
         assert_eq!(
             names,
-            ["tokeira_ecs", "tokeira_ecs_deployment", "tokeira_aws"]
+            [
+                "tokeira_ecs",
+                "tokeira_deployment",
+                "tokeira_ecs_deployment",
+                "tokeira_aws"
+            ]
         );
         assert!(declaration.ops.is_none());
     }

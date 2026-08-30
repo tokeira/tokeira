@@ -1,0 +1,49 @@
+# Observability infrastructure: durable backend buckets, scoped storage
+# roles, and the versioned dashboard/alert artifact tree. Workload roles and
+# sidecar parameters remain in the root because downstream services use
+# their handles directly.
+
+from tokeira import (
+    ObservabilityArtifacts,
+    ObservabilityStorageRole,
+    S3Bucket,
+)
+
+
+def define(d, cfg, cx, observability):
+    mimir_bucket = cx.project_name + "-mimir-data"
+    loki_bucket = cx.project_name + "-loki-data"
+    artifacts_bucket_name = cx.project_name + "-observability-artifacts"
+
+    observability.resource(
+        "mimir_data", S3Bucket(region=cfg.aws.region, bucket=mimir_bucket)
+    )
+    observability.resource(
+        "loki_data", S3Bucket(region=cfg.aws.region, bucket=loki_bucket)
+    )
+    artifacts_bucket = observability.resource(
+        "artifacts_bucket",
+        S3Bucket(region=cfg.aws.region, bucket=artifacts_bucket_name),
+    )
+    observability.resource(
+        "mimir_storage_role",
+        ObservabilityStorageRole(
+            name=cx.project_name + "-mimir-storage",
+            region=cfg.aws.region,
+            bucket=mimir_bucket,
+        ),
+    )
+    observability.resource(
+        "loki_storage_role",
+        ObservabilityStorageRole(
+            name=cx.project_name + "-loki-storage",
+            region=cfg.aws.region,
+            bucket=loki_bucket,
+        ),
+    )
+
+    # The upload is fenced by the companion content digest and depends on
+    # the destination bucket's recorded identity.
+    observability.resource(
+        "artifacts", ObservabilityArtifacts(), [artifacts_bucket]
+    )

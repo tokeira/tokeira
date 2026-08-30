@@ -52,10 +52,10 @@ use tokeira_platform::{declaration::PlatformDeclaration, definition::Namespace};
 
 /// The platform entry point: the one declaration `tkp` invokes.
 ///
-/// The declaration exposes three authoring namespaces: Compose resources,
-/// this platform's observability resource, and the AWS resources used by the
-/// optional DSQL configuration. Operational capabilities are integrated here
-/// rather than exported wholesale by `tokeira-compose`.
+/// The declaration exposes Compose resources, deployment-owned document
+/// nodes, this platform's observability resource, and the AWS resources used
+/// by the optional DSQL configuration. Operational capabilities are
+/// integrated here rather than exported wholesale by `tokeira-compose`.
 ///
 /// Construction is pure: no filesystem, no network, no Docker. Connections
 /// happen when the framework runs an operation, never when the platform is
@@ -64,6 +64,7 @@ pub fn platform() -> PlatformDeclaration {
     PlatformDeclaration {
         namespaces: vec![
             tokeira_compose::namespace(),
+            tokeira_deployment::server_config::namespace(),
             observability::namespace(),
             Namespace {
                 name: tokeira_aws::kinds::NAMESPACE,

@@ -1,0 +1,14 @@
+# The ECS cluster identity. Capacity planes are declared by the root through
+# the shared helper because all eight use the same five-resource assembly.
+
+from tokeira import EcsCluster
+
+
+def define(d, cfg, cx, cluster):
+    return cluster.resource(
+        "cluster",
+        EcsCluster(
+            name=cfg.cluster.name,
+            service_connect_namespace=cfg.cluster.service_connect_namespace,
+        ),
+    )

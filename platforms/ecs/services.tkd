@@ -6,10 +6,19 @@
 
 use platform::{DaemonPolicy, Ecs, ReplicaPolicy};
 
-pub fn define(d: Deployment, cfg: Ecs, cx: Context, services: Module, vpc: Resource) {
+pub fn define(
+    d: Deployment,
+    cfg: Ecs,
+    cx: Context,
+    services: Module,
+    vpc: Resource,
+    control_sg: Resource,
+) {
     services.resource(
         "namespace",
-        CloudMapNamespace { name: cfg.cluster.service_connect_namespace.clone() },
+        CloudMapNamespace {
+            name: cfg.cluster.service_connect_namespace.clone(),
+        },
         vec![vpc],
     );
 
@@ -29,10 +38,13 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, services: Module, vpc: Resou
             cluster: cfg.cluster.name.clone(),
             service_connect_namespace: cfg.cluster.service_connect_namespace.clone(),
             image: cfg.services.autoscaler.image.clone(),
+            replicas: cfg.services.autoscaler.replicas,
             cpu: cfg.services.autoscaler.cpu,
             memory_mb: cfg.services.autoscaler.memory_mb,
+            alloy_image: cfg.observability.alloy_image.clone(),
+            aws_cli_image: cfg.observability.aws_cli_image.clone(),
+            busybox_image: cfg.observability.busybox_image.clone(),
         },
-        vec![task_role],
+        vec![task_role, vpc, control_sg],
     );
-
 }

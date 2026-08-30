@@ -38,6 +38,19 @@ pub struct EcsWorkload {
     /// needs agent-side ECR or Secrets Manager access.
     #[serde(skip)]
     pub(crate) execution_role_dependency: Option<ResourceId>,
+    /// Private VPC whose recorded subnet set the `awsvpc` service uses.
+    #[serde(skip)]
+    pub(crate) vpc_dependency: Option<ResourceId>,
+    /// Workload-family security group attached to every task ENI.
+    #[serde(skip)]
+    pub(crate) security_group_dependency: Option<ResourceId>,
+    /// Internal ALB target group for edge workloads.
+    #[serde(skip)]
+    pub(crate) target_group_dependency: Option<ResourceId>,
+    /// Shared deployment-owned server configuration, for workloads that load
+    /// [`tokeira_config::TokeiraConfig`].
+    #[serde(skip)]
+    pub(crate) server_config_dependency: Option<ResourceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +143,20 @@ pub struct PlacementConstraint {
     pub(crate) expression: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkSpec {
+    pub(crate) subnets: Vec<String>,
+    pub(crate) security_groups: Vec<String>,
+    pub(crate) assign_public_ip: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadBalancerSpec {
+    pub(crate) target_group_arn: String,
+    pub(crate) container_name: String,
+    pub(crate) container_port: u16,
+}
+
 impl EcsWorkload {
     /// Bind the infrastructure roles explicitly declared as this workload's
     /// definition dependencies.
@@ -140,6 +167,23 @@ impl EcsWorkload {
     ) -> Self {
         self.task_role_dependency = Some(task_role);
         self.execution_role_dependency = execution_role;
+        self
+    }
+
+    /// Bind the definition graph's networking, ingress, and configuration
+    /// identities. Keeping these as resource ids makes the phase bridge
+    /// explicit: manifests can only be produced from applied infrastructure.
+    pub(crate) fn with_infrastructure_dependencies(
+        mut self,
+        vpc: ResourceId,
+        security_group: ResourceId,
+        target_group: Option<ResourceId>,
+        server_config: Option<ResourceId>,
+    ) -> Self {
+        self.vpc_dependency = Some(vpc);
+        self.security_group_dependency = Some(security_group);
+        self.target_group_dependency = target_group;
+        self.server_config_dependency = server_config;
         self
     }
 
@@ -287,11 +331,30 @@ impl deploy_engine::Service for EcsWorkload {
             &self.name,
             "execution",
         )?;
+        let network = network_spec(
+            &ctx.infra_state,
+            self.vpc_dependency.as_ref(),
+            self.security_group_dependency.as_ref(),
+            &self.name,
+        )?;
+        let load_balancer = load_balancer_spec(
+            &ctx.infra_state,
+            self.target_group_dependency.as_ref(),
+            &self.name,
+            &self.task_definition,
+        )?;
+        let mut spec = self.task_definition.clone();
+        inject_server_config(
+            &ctx.infra_state,
+            self.server_config_dependency.as_ref(),
+            &self.name,
+            &mut spec,
+        )?;
         let task_definition = serde_json::json!({
             "kind": "ecs-task-definition",
             "service": self.name,
             "region": self.region,
-            "spec": self.task_definition,
+            "spec": spec,
             "task_role_arn": task_role_arn,
             "execution_role_arn": execution_role_arn,
         });
@@ -305,9 +368,163 @@ impl deploy_engine::Service for EcsWorkload {
             "service_connect": self.service_connect,
             "placement_constraints": self.placement_constraints,
             "enable_execute_command": true,
+            "network": network,
+            "load_balancer": load_balancer,
         });
         Ok(vec![task_definition, service])
     }
+}
+
+fn network_spec(
+    state: &tokeira_iac::InfraState,
+    vpc: Option<&ResourceId>,
+    security_group: Option<&ResourceId>,
+    service: &str,
+) -> Result<Option<NetworkSpec>, deploy_engine::DeployError> {
+    let Some(vpc) = vpc else {
+        return Ok(None);
+    };
+    let security_group = security_group.ok_or_else(|| {
+        deploy_engine::RuntimeError::Service(format!(
+            "ECS workload `{service}` declares VPC `{}` but no workload security-group dependency",
+            vpc.0
+        ))
+    })?;
+    let vpc_state = required_state(state, vpc, service, "VPC")?;
+    let subnets = vpc_state
+        .properties
+        .get("subnet_ids")
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+        .filter(|subnets| !subnets.is_empty())
+        .ok_or_else(|| missing_output(service, vpc, "subnet_ids"))?;
+    let security_group_state = required_state(state, security_group, service, "security group")?;
+    let security_group_id = security_group_state
+        .properties
+        .get("security_group_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| missing_output(service, security_group, "security_group_id"))?;
+    Ok(Some(NetworkSpec {
+        subnets,
+        security_groups: vec![security_group_id.to_owned()],
+        // The platform has no Internet gateway or public subnets. This is an
+        // invariant of its private-only VPC, not an operator toggle.
+        assign_public_ip: false,
+    }))
+}
+
+fn load_balancer_spec(
+    state: &tokeira_iac::InfraState,
+    target_group: Option<&ResourceId>,
+    service: &str,
+    task: &TaskDefinitionSpec,
+) -> Result<Option<LoadBalancerSpec>, deploy_engine::DeployError> {
+    let Some(target_group) = target_group else {
+        return Ok(None);
+    };
+    let target_group_state = required_state(state, target_group, service, "target group")?;
+    let target_group_arn = target_group_state
+        .properties
+        .get("target_group_arn")
+        .and_then(serde_json::Value::as_str)
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| missing_output(service, target_group, "target_group_arn"))?;
+    let primary = task
+        .containers
+        .iter()
+        .find(|container| container.name == service)
+        .ok_or_else(|| {
+            deploy_engine::RuntimeError::Service(format!(
+                "ECS workload `{service}` has no primary container named `{service}`"
+            ))
+        })?;
+    let container_port = primary
+        .port_mappings
+        .iter()
+        .find(|port| port.name == "grpc")
+        .map(|port| port.container_port)
+        .ok_or_else(|| {
+            deploy_engine::RuntimeError::Service(format!(
+                "ECS workload `{service}` has an ALB target group but no `grpc` container port"
+            ))
+        })?;
+    Ok(Some(LoadBalancerSpec {
+        target_group_arn: target_group_arn.to_owned(),
+        container_name: service.to_owned(),
+        container_port,
+    }))
+}
+
+fn inject_server_config(
+    state: &tokeira_iac::InfraState,
+    dependency: Option<&ResourceId>,
+    service: &str,
+    task: &mut TaskDefinitionSpec,
+) -> Result<(), deploy_engine::DeployError> {
+    let Some(dependency) = dependency else {
+        return Ok(());
+    };
+    let config_state = required_state(state, dependency, service, "server configuration")?;
+    let content = std::fs::read_to_string(&config_state.physical_id).map_err(|error| {
+        deploy_engine::RuntimeError::Service(format!(
+            "ECS workload `{service}` cannot read server configuration `{}`: {error}",
+            config_state.physical_id
+        ))
+    })?;
+    let digest = tokeira_platform::content::ContentIdentity::new(
+        "deployment/server-config",
+        content.as_bytes(),
+    )
+    .prefixed_sha256();
+    let primary = task
+        .containers
+        .iter_mut()
+        .find(|container| container.name == service)
+        .ok_or_else(|| {
+            deploy_engine::RuntimeError::Service(format!(
+                "ECS workload `{service}` has no primary container named `{service}`"
+            ))
+        })?;
+    primary.environment.extend([
+        EnvironmentVar {
+            name: "TOKEIRA_CONFIG".into(),
+            value: "env:TOKEIRA_CONFIG_CONTENT".into(),
+        },
+        EnvironmentVar {
+            name: "TOKEIRA_CONFIG_CONTENT".into(),
+            value: content,
+        },
+        EnvironmentVar {
+            name: "TOKEIRA_SERVER_CONFIG_DIGEST".into(),
+            value: digest,
+        },
+    ]);
+    Ok(())
+}
+
+fn required_state<'a>(
+    state: &'a tokeira_iac::InfraState,
+    dependency: &ResourceId,
+    service: &str,
+    kind: &str,
+) -> Result<&'a tokeira_iac::ResourceState, deploy_engine::DeployError> {
+    state.resources.get(dependency).ok_or_else(|| {
+        deploy_engine::RuntimeError::Service(format!(
+            "ECS workload `{service}` needs its {kind} `{}` in recorded infrastructure state; run `infra apply` before `deploy apply`",
+            dependency.0
+        ))
+    })
+}
+
+fn missing_output(
+    service: &str,
+    dependency: &ResourceId,
+    property: &str,
+) -> deploy_engine::DeployError {
+    deploy_engine::RuntimeError::Service(format!(
+        "ECS workload `{service}` found `{}` without its `{property}` output in recorded infrastructure state",
+        dependency.0
+    ))
 }
 
 fn role_arn(
@@ -511,6 +728,10 @@ fn workload_from_parts(
         }],
         task_role_dependency: None,
         execution_role_dependency: None,
+        vpc_dependency: None,
+        security_group_dependency: None,
+        target_group_dependency: None,
+        server_config_dependency: None,
     }
 }
 
@@ -723,6 +944,22 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             module: id.0.clone(),
+        }
+    }
+
+    fn infrastructure_state(
+        resource_type: &str,
+        physical_id: &str,
+        properties: serde_json::Value,
+    ) -> ResourceState {
+        ResourceState {
+            resource_type: ResourceType::new(resource_type),
+            physical_id: physical_id.to_owned(),
+            properties,
+            dependencies: Vec::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            module: "test".into(),
         }
     }
 
@@ -972,6 +1209,97 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("arn:aws:iam::1:role/runtime-execution")
         );
+    }
+
+    #[test]
+    fn definition_workload_resolves_private_network_alb_and_server_config() {
+        let task = ResourceId("iam-role-demo-tokeira-edge-api-task".into());
+        let vpc = ResourceId("demo-vpc".into());
+        let security_group = ResourceId("sg-edge".into());
+        let target_group = ResourceId("alb-tg-tokeira-edge-api".into());
+        let server_config = tokeira_deployment::server_config::resource_id();
+        let workload = EcsWorkload::build_all(&EcsConfig::default())
+            .into_iter()
+            .find(|workload| workload.name == "tokeira-edge-api")
+            .expect("edge workload")
+            .with_role_dependencies(task.clone(), None)
+            .with_infrastructure_dependencies(
+                vpc.clone(),
+                security_group.clone(),
+                Some(target_group.clone()),
+                Some(server_config.clone()),
+            );
+        let mut ctx = deploy_engine::ServiceContext::default();
+        ctx.infra_state.resources.insert(
+            task.clone(),
+            role_state(&task, "arn:aws:iam::1:role/edge-task"),
+        );
+        ctx.infra_state.resources.insert(
+            vpc,
+            infrastructure_state(
+                "Vpc",
+                "vpc-1",
+                serde_json::json!({ "subnet_ids": ["subnet-a", "subnet-b"] }),
+            ),
+        );
+        ctx.infra_state.resources.insert(
+            security_group,
+            infrastructure_state(
+                "SecurityGroup",
+                "sg-1",
+                serde_json::json!({ "security_group_id": "sg-1" }),
+            ),
+        );
+        ctx.infra_state.resources.insert(
+            target_group,
+            infrastructure_state(
+                "AlbTargetGroup",
+                "arn:aws:elasticloadbalancing:tg/edge",
+                serde_json::json!({
+                    "target_group_arn": "arn:aws:elasticloadbalancing:tg/edge"
+                }),
+            ),
+        );
+        let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        ctx.infra_state.resources.insert(
+            server_config,
+            infrastructure_state(
+                "ServerConfig",
+                &config_path.display().to_string(),
+                serde_json::json!({ "path": "tokeirad.toml" }),
+            ),
+        );
+
+        let manifests = workload.manifests(&ctx).expect("dependencies resolve");
+
+        assert_eq!(
+            manifests[1]["network"],
+            serde_json::json!({
+                "subnets": ["subnet-a", "subnet-b"],
+                "security_groups": ["sg-1"],
+                "assign_public_ip": false
+            })
+        );
+        assert_eq!(
+            manifests[1]["load_balancer"]["target_group_arn"],
+            "arn:aws:elasticloadbalancing:tg/edge"
+        );
+        let environment = manifests[0]["spec"]["containers"]
+            .as_array()
+            .expect("containers")
+            .iter()
+            .find(|container| container["name"] == "tokeira-edge-api")
+            .and_then(|container| container["environment"].as_array())
+            .expect("primary environment");
+        assert!(environment.iter().any(|entry| {
+            entry["name"] == "TOKEIRA_CONFIG" && entry["value"] == "env:TOKEIRA_CONFIG_CONTENT"
+        }));
+        assert!(environment.iter().any(|entry| {
+            entry["name"] == "TOKEIRA_CONFIG_CONTENT"
+                && entry["value"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("name = \"tokeira-ecs\""))
+        }));
     }
 
     #[test]

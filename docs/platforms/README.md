@@ -6,11 +6,11 @@ platform-specific, provenance-bound `tkp` that interprets and realizes it. `tkr`
 constructs or obtains that engine, applies admission policy, places it with the
 deployment, and verifies the married bytes for versioned mutation.
 
-Current operator coverage does not yet implement that contract uniformly. Compose has
-the complete definition-backed TKD/TKP chain. Local and ECS remain available through
-compiled in-process `tkr` handlers, while EKS currently supplies bridge and kind
-components without a complete platform engine or operator route. The matrix below is a
-statement of present mechanics, not an alternative platform architecture.
+Current operator coverage does not yet implement that contract uniformly. Compose and
+ECS have definition-backed TKD/TKP chains. Local remains available through compiled
+in-process `tkr` handlers, while EKS currently supplies bridge and kind components
+without a complete platform engine or operator route. The matrix below is a statement
+of present mechanics, not an alternative platform architecture.
 
 New here? Start with the [quick start](quick-start.md). For the language binding,
 provenance chain, and command model, read [Provisioning](../provisioning/README.md).
@@ -21,7 +21,7 @@ provenance chain, and command model, read [Provisioning](../provisioning/README.
 |---|---|---|---|---|
 | [`local`](local/README.md) | Bare host process | In-memory or Aurora DSQL | `deployment.toml`, in-process `tkr` handlers | Available |
 | [`compose`](compose/README.md) | Docker containers with Mimir, Loki, Grafana, and Alloy | In-memory or Aurora DSQL | `definition.tkd`, deployment-local Compose `tkp` | Available |
-| [`ecs`](ecs/README.md) | AWS ECS services in private subnets | Aurora DSQL | `deployment.toml`, in-process `tkr` handlers | Available |
+| [`ecs`](ecs/README.md) | AWS ECS services in private subnets | Aurora DSQL | `deployment.tkd`, deployment-local ECS `tkp` | Available (M1; live-AWS acceptance pending) |
 | [EKS components](eks/README.md) | Kubernetes-oriented platform vocabulary | Aurora DSQL model | TKD bridge and kinds only | No complete provisioner or operator route |
 
 Create one of the available operator platforms with:
@@ -33,9 +33,9 @@ tkr deployment create \
   --storage <in-memory|dsql>
 ```
 
-Compose creation seeds `definition.tkd`, places a deployment-local `tkp`, and forwards
-supported lifecycle commands. Local and ECS creation seed `deployment.toml` and execute
-inside `tkr`. The file layouts and routing table are in
+Compose and ECS creation seed their TKD source set, place a deployment-local `tkp`, and
+forward supported lifecycle commands. Local creation seeds `deployment.toml` and
+executes inside `tkr`. The file layouts and routing table are in
 [deployment configuration](../provisioning/deployment-configuration.md).
 
 ## Platform crates
@@ -44,7 +44,7 @@ inside `tkr`. The file layouts and routing table are in
 |---|---|
 | `platforms/local` | Bare-process local execution and in-process platform configuration. |
 | `platforms/compose` | Interpreted Compose definition, `HostBridge`, orchestrator adapter, `ProvisionerPlatform`, and `tkp` binary. |
-| `platforms/ecs` | Compiled AWS ECS networking, DSQL, cluster, observability, image, and service modules. |
+| `platforms/ecs` | Interpreted ECS definition, AWS bridge, orchestrator adapter, `ProvisionerPlatform`, and `tkp` binary. |
 | `platforms/eks` | EKS `HostBridge` and AWS/Kubernetes kind vocabulary; it does not assemble a complete `ProvisionerPlatform` or `tkp`. |
 
 A platform bridge is one implementation component, not an availability claim. A complete

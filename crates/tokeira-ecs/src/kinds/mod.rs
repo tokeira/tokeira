@@ -192,15 +192,76 @@ mod tests {
             replicas: None,
             cpu: 1024,
             memory_mb: 2048,
+            alloy_image: "grafana/alloy:latest".into(),
+            aws_cli_image: "amazon/aws-cli:latest".into(),
+            busybox_image: "busybox:latest".into(),
         }
-        .realize(&placement(vec![tokeira_iac::ResourceId(
-            "iam-role-demo-tokeira-runtime-task".into(),
-        )]))
+        .realize(&placement(vec![
+            tokeira_iac::ResourceId("iam-role-demo-tokeira-runtime-task".into()),
+            tokeira_iac::ResourceId("demo-vpc".into()),
+            tokeira_iac::ResourceId("sg-runtime".into()),
+            tokeira_deployment::server_config::resource_id(),
+        ]))
         .expect("runtime workload");
         assert_eq!(
             tokeira_deploy_engine::Service::resource_type(&workload),
             workload::TYPE
         );
+    }
+
+    // The definition's autoscaler policy must reach the task model instead
+    // of stopping at the legacy duplicate image coordinate.
+    #[test]
+    fn authored_autoscaler_resources_reach_the_realized_workload() {
+        use tokeira_platform::kind::Kind as _;
+
+        let workload = workload::Workload {
+            service: "tokeira-autoscaler".into(),
+            environment: "dev".into(),
+            region: "eu-west-2".into(),
+            cluster: "tokeira".into(),
+            service_connect_namespace: "tokeira.internal".into(),
+            image: "autoscaler:authored".into(),
+            replicas: Some(3),
+            cpu: 384,
+            memory_mb: 768,
+            alloy_image: "alloy:authored".into(),
+            aws_cli_image: "aws-cli:authored".into(),
+            busybox_image: "busybox:authored".into(),
+        }
+        .realize(&placement(vec![
+            tokeira_iac::ResourceId("iam-role-demo-tokeira-autoscaler-task".into()),
+            tokeira_iac::ResourceId("demo-vpc".into()),
+            tokeira_iac::ResourceId("sg-control".into()),
+        ]))
+        .expect("autoscaler workload");
+
+        assert_eq!(workload.task_definition.cpu, 384);
+        assert_eq!(workload.task_definition.memory_mb, 768);
+        assert!(matches!(
+            workload.scheduling,
+            crate::services::EcsScheduling::Replica { desired_count: 3 }
+        ));
+        let primary = workload
+            .task_definition
+            .containers
+            .iter()
+            .find(|container| container.name == "tokeira-autoscaler")
+            .expect("autoscaler primary container");
+        assert_eq!(primary.image, "autoscaler:authored");
+        assert!(
+            workload
+                .task_definition
+                .containers
+                .iter()
+                .any(|container| container.name == "alloy" && container.image == "alloy:authored")
+        );
+        assert!(workload.task_definition.containers.iter().any(|container| {
+            container.name == "alloy-config-init" && container.image == "aws-cli:authored"
+        }));
+        assert!(workload.task_definition.containers.iter().any(|container| {
+            container.name.starts_with("wait-for-") && container.image == "busybox:authored"
+        }));
     }
 
     // A managed role without its cluster dependency and an unknown workload
@@ -236,6 +297,9 @@ mod tests {
             replicas: None,
             cpu: 1024,
             memory_mb: 2048,
+            alloy_image: "grafana/alloy:latest".into(),
+            aws_cli_image: "amazon/aws-cli:latest".into(),
+            busybox_image: "busybox:latest".into(),
         }
         .realize(&placement(Vec::new()))
         .expect_err("unknown workload");
@@ -255,6 +319,9 @@ mod tests {
             replicas: None,
             cpu: 1024,
             memory_mb: 2048,
+            alloy_image: "grafana/alloy:latest".into(),
+            aws_cli_image: "amazon/aws-cli:latest".into(),
+            busybox_image: "busybox:latest".into(),
         }
         .realize(&placement(Vec::new()))
         .expect_err("no task role declared");

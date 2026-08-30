@@ -21,6 +21,7 @@ tracing.workspace = true
 tokeira-aws = { path = "../tokeira-aws" }
 tokeira-config.workspace = true
 tokeira-deploy-engine = { path = "../tokeira-deploy-engine" }
+tokeira-deployment.workspace = true
 tokeira-iac = { path = "../tokeira-iac" }
 tokeira-orchestrator = { path = "../tokeira-orchestrator" }
 tokeira-platform = { path = "../tokeira-platform" }

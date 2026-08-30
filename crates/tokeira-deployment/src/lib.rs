@@ -36,6 +36,7 @@ pub mod lock;
 pub mod marker;
 pub mod migration;
 pub mod repository;
+pub mod server_config;
 pub mod upgrade;
 mod version;
 pub use admission::{AdmissionError, RevocationList, admit_artifact};

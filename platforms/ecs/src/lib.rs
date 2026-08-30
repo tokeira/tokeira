@@ -27,6 +27,7 @@ pub fn platform() -> PlatformDeclaration {
     PlatformDeclaration {
         namespaces: vec![
             tokeira_ecs::kinds::namespace(),
+            tokeira_deployment::server_config::namespace(),
             observability::namespace(),
             Namespace {
                 name: tokeira_aws::kinds::NAMESPACE,
@@ -49,10 +50,10 @@ pub fn platform() -> PlatformDeclaration {
 mod declaration_tests {
     use super::*;
 
-    // The declaration is pure assembly: three namespaces, no ops, and the
+    // The declaration is pure assembly: four namespaces, no ops, and the
     // execution seams — constructed with no I/O to fail.
     #[test]
-    fn platform_declares_three_namespaces_and_no_ops() {
+    fn platform_declares_four_namespaces_and_no_ops() {
         let declaration = platform();
         let names: Vec<&str> = declaration
             .namespaces
@@ -61,7 +62,12 @@ mod declaration_tests {
             .collect();
         assert_eq!(
             names,
-            ["tokeira_ecs", "tokeira_ecs_deployment", "tokeira_aws"]
+            [
+                "tokeira_ecs",
+                "tokeira_deployment",
+                "tokeira_ecs_deployment",
+                "tokeira_aws"
+            ]
         );
         assert!(declaration.ops.is_none());
     }

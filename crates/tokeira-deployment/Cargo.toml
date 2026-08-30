@@ -34,6 +34,7 @@ aws-sdk-s3 = "1"
 aws-lc-rs = { workspace = true }
 jiff = { workspace = true }
 tokeira-platform = { workspace = true }
+tokeira-iac = { workspace = true }
 async-trait = { workspace = true }
 url = { workspace = true }
 futures = "0.3"

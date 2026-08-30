@@ -1,16 +1,16 @@
 // The dsql module: workflow storage in both provenances, always realizing
 // the same five well-known identities — cluster, management endpoint,
-// connection endpoint, runtime role, admin role — so every consumer and
-// writeback binds the same names in either mode.
+// connection endpoint, runtime role, and admin role — so every consumer
+// binds the same names in either mode. Canonical server-config writebacks
+// live in the root beside the shared DynamoDB coordination tables.
 //
 // The role resources and their writebacks live in the root: their mode
 // carries a tuple-variant payload, and the frontend admits tuple-variant
 // construction in the root document only. This part declares the cluster
-// and endpoint identities and the writebacks they source.
+// and endpoint identities.
 //
-// Both provenances write all three endpoint facts back from the same logical
-// identities. Managed resources publish provider-assigned endpoint IDs;
-// preexisting adopters publish the authored IDs.
+// Managed resources publish provider-assigned endpoint IDs; preexisting
+// adopters publish the authored IDs under the same infrastructure identities.
 
 use platform::{Dsql, DsqlClusterMode, Ecs, EndpointKind};
 
@@ -46,9 +46,6 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource,
                 },
                 vec![vpc, endpoint_sg, cluster],
             );
-            d.writeback("dsql.endpoint", cluster.output("cluster_endpoint"));
-            d.writeback("dsql.management_endpoint_id", management.output("endpoint_id"));
-            d.writeback("dsql.connection_endpoint_id", connection.output("endpoint_id"));
             cluster
         }
         Dsql::Preexisting(adopted) => {
@@ -59,6 +56,7 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource,
                     region: cfg.aws.region.clone(),
                     mode: DsqlClusterMode::Preexisting,
                     endpoint: adopted.endpoint.clone(),
+                    arn: adopted.arn.clone(),
                     id: "dsql:cluster".into(),
                 },
             );
@@ -76,9 +74,6 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource,
                     endpoint_id: adopted.connection_endpoint_id.clone(),
                 },
             );
-            d.writeback("dsql.endpoint", cluster.output("cluster_endpoint"));
-            d.writeback("dsql.management_endpoint_id", management.output("endpoint_id"));
-            d.writeback("dsql.connection_endpoint_id", connection.output("endpoint_id"));
             cluster
         }
     }

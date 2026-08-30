@@ -62,7 +62,7 @@ fn cluster_uses_the_authored_service_connect_namespace() {
 }
 
 // The shipped defaults select managed DSQL: seven modules in dependency
-// order, and all five DSQL writeback declarations.
+// order, and the complete canonical server-config writeback surface.
 #[test]
 fn the_shipped_set_evaluates_with_managed_defaults() {
     let output = evaluate(&shipped_root()).expect("the shipped definition set evaluates");
@@ -96,11 +96,13 @@ fn the_shipped_set_evaluates_with_managed_defaults() {
     assert_eq!(
         keys,
         [
-            "dsql.admin_role_arn",
-            "dsql.connection_endpoint_id",
-            "dsql.endpoint",
-            "dsql.management_endpoint_id",
-            "dsql.runtime_role_arn"
+            "infrastructure.dsql.admin_role_arn",
+            "infrastructure.dsql.conn_lease_table",
+            "infrastructure.dsql.endpoint",
+            "infrastructure.dsql.rate_limiter_table",
+            "infrastructure.dsql.region",
+            "infrastructure.dsql.runtime_role_arn",
+            "infrastructure.storage",
         ]
     );
 
@@ -110,8 +112,8 @@ fn the_shipped_set_evaluates_with_managed_defaults() {
     assert_realizes(&output);
 }
 
-/// Both DSQL modes realize the same five well-known identities in the dsql
-/// module — the invariant every consumer and writeback binds against.
+/// Both DSQL modes realize the same DSQL and coordination identities in the
+/// dsql module — the invariant every consumer and writeback binds against.
 fn assert_dsql_identities(output: &EvaluatedDefinition<DecodedKind>) {
     let mut dsql: Vec<&str> = output
         .graph
@@ -126,8 +128,10 @@ fn assert_dsql_identities(output: &EvaluatedDefinition<DecodedKind>) {
         [
             "admin_role",
             "cluster",
+            "conn_lease",
             "connection_endpoint",
             "management_endpoint",
+            "rate_limiter",
             "runtime_role",
         ]
     );
@@ -171,10 +175,10 @@ fn assert_plane_separation(output: &EvaluatedDefinition<DecodedKind>) {
     }
 }
 
-/// Every deploy-plane workload explicitly stands on its infrastructure-owned
-/// task role; Grafana also stands on the execution role its secret requires.
-/// The definition graph therefore establishes the phase bridge before the
-/// service reads recorded ARNs.
+/// Every deploy-plane workload stands on its VPC, workload security group,
+/// and task role. Edge services also stand on their ALB target group;
+/// TokeiraConfig consumers stand on ServerConfig; Grafana stands on the
+/// execution role its secret requires.
 fn assert_workload_role_dependencies(output: &EvaluatedDefinition<DecodedKind>) {
     for workload in output
         .graph
@@ -197,11 +201,27 @@ fn assert_workload_role_dependencies(output: &EvaluatedDefinition<DecodedKind>) 
             })
             .collect::<Vec<_>>();
         dependency_kinds.sort_unstable();
-        let expected = if workload.logical_id() == "tokeira-grafana" {
-            vec!["EcsExecutionRole", "EcsTaskRole"]
-        } else {
-            vec!["EcsTaskRole"]
-        };
+        let mut expected = vec!["EcsTaskRole", "SecurityGroup", "Vpc"];
+        if workload.logical_id() == "tokeira-grafana" {
+            expected.push("EcsExecutionRole");
+        }
+        if matches!(
+            workload.logical_id(),
+            "tokeira-edge-api"
+                | "tokeira-edge-poll"
+                | "tokeira-runtime"
+                | "tokeira-projection"
+                | "tokeira-admin"
+        ) {
+            expected.push("ServerConfig");
+        }
+        if matches!(
+            workload.logical_id(),
+            "tokeira-edge-api" | "tokeira-edge-poll"
+        ) {
+            expected.push("AlbTargetGroup");
+        }
+        expected.sort_unstable();
         assert_eq!(dependency_kinds, expected, "{}", workload.logical_id());
     }
 }
@@ -213,17 +233,16 @@ fn assert_realizes(output: &EvaluatedDefinition<DecodedKind>) {
         .expect("the verified definition realizes every resource and service");
 }
 
-// Selecting preexisting DSQL in the root's config keeps the same module
-// set and the same five well-known dsql identities, and declares all five
-// writebacks from the platform's own adopters.
+// Selecting preexisting DSQL in the root's config keeps the same module set,
+// DSQL identities, and canonical writebacks.
 #[test]
-fn selecting_preexisting_dsql_keeps_identities_and_writes_five_back() {
+fn selecting_preexisting_dsql_keeps_identities_and_canonical_writeback() {
     let shipped = shipped_root();
     let managed = "dsql: Dsql::Managed,";
     assert!(shipped.contains(managed), "the dsql literal is as shipped");
     let root = shipped.replace(
         managed,
-        "dsql: Dsql::Preexisting(PreexistingDsql {\n            endpoint: \"adopted.dsql.example\".into(),\n            management_endpoint_id: \"vpce-mgmt\".into(),\n            connection_endpoint_id: \"vpce-conn\".into(),\n            runtime_role_arn: \"arn:aws:iam::1:role/runtime\".into(),\n            admin_role_arn: \"arn:aws:iam::1:role/admin\".into(),\n        }),",
+        "dsql: Dsql::Preexisting(PreexistingDsql {\n            endpoint: \"adopted.dsql.example\".into(),\n            arn: \"arn:aws:dsql:eu-west-2:1:cluster/adopted\".into(),\n            management_endpoint_id: \"vpce-mgmt\".into(),\n            connection_endpoint_id: \"vpce-conn\".into(),\n            runtime_role_arn: \"arn:aws:iam::1:role/runtime\".into(),\n            admin_role_arn: \"arn:aws:iam::1:role/admin\".into(),\n        }),",
     );
     let root = root.replace("PreexistingRole,", "PreexistingDsql, PreexistingRole,");
     assert!(
@@ -242,17 +261,17 @@ fn selecting_preexisting_dsql_keeps_identities_and_writes_five_back() {
     assert_eq!(
         keys,
         [
-            "dsql.admin_role_arn",
-            "dsql.connection_endpoint_id",
-            "dsql.endpoint",
-            "dsql.management_endpoint_id",
-            "dsql.runtime_role_arn",
+            "infrastructure.dsql.admin_role_arn",
+            "infrastructure.dsql.conn_lease_table",
+            "infrastructure.dsql.endpoint",
+            "infrastructure.dsql.rate_limiter_table",
+            "infrastructure.dsql.region",
+            "infrastructure.dsql.runtime_role_arn",
+            "infrastructure.storage",
         ]
     );
     assert_dsql_identities(&output);
     assert_plane_separation(&output);
     assert_workload_role_dependencies(&output);
-    // The preexisting configuration currently has no authored cluster ARN,
-    // so its DsqlCluster kind cannot realize. Closing that separate config
-    // contract gap must be an explicit compatibility decision.
+    assert_realizes(&output);
 }

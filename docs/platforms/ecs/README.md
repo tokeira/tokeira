@@ -1,167 +1,110 @@
-# ECS Platform
+# ECS platform
 
-The ECS platform deploys Tokeira on AWS ECS with Graviton4 instances, Aurora
-DSQL persistence, and a full observability stack (Mimir, Loki, Grafana, Alloy).
-All services run in private subnets with no public ingress — operator access is
-via SSM Session Manager port forwarding and ECS Exec.
+The ECS platform is a definition-backed AWS provider for a private ECS-on-EC2
+deployment: Aurora DSQL, one capacity provider per workload family, Service Connect,
+an internal ALB for the two edge services, and Mimir/Loki/Grafana/Alloy observability.
+The bound `tkp` owns interpretation and lifecycle; `platforms/ecs` supplies the source
+set and declaration, while `crates/tokeira-ecs` supplies realization.
 
-Its current operator implementation uses `deployment.toml` and compiled in-process `tkr`
-handlers. It does not yet supply the custom TKD vocabulary and provenance-bound platform
-`tkp` required by the uniform platform architecture; this page documents the available
-current route rather than a second platform contract.
+This page records the M1 audit against the reusable
+[platform provider contract](../provider-contract.md). It is an implementation status
+statement, not a live-AWS acceptance result.
 
-## Lifecycle
+## Definition source set
 
-```bash
-# Create
-tkr deployment create --name prod --platform ecs --storage dsql --region eu-west-2
+The default TKD source is modular:
 
-# Mirror upstream observability images into project-owned ECR
-tkr image mirror --yes
+- `deployment.tkd` — operator defaults and the cross-part wiring diagram;
+- `platform.tkd` — configuration-only structs and enums;
+- `helpers.tkd` — repeated security-group, capacity-plane, role, and workload
+  assemblies;
+- `remote_state.tkd` — the bootstrap bucket;
+- `images.tkd` — project-owned ECR repositories;
+- `networking.tkd` — private endpoints and internal ALB listener;
+- `dsql.tkd` — managed/adopted DSQL and private endpoint identities;
+- `cluster.tkd` — ECS cluster defaults;
+- `observability.tkd` — storage and shipped observability content; and
+- `services.tkd` — Service Connect and autoscaler wiring.
 
-# Build and push tokeirad to ECR
-tkr image build --tag v2026-05-22
-tkr image push --tag v2026-05-22 --yes
+The catalog also stages `observability/` as companion content, so retained revisions
+render and upload their own dashboards and alert rules. The definition tests evaluate,
+verify, and realize both DSQL provenance modes through the real declaration without AWS
+credentials.
 
-# Provision infrastructure (VPC, DSQL, ECS cluster, ALB, observability)
-tkr infra plan
-tkr infra apply --yes
+ECS does not yet advertise a `.tkdp` root. The Python frontend supports companion
+parts, but its create-time retarget admission surface has not landed yet. A faithful
+peer is therefore a larger slice: the complete ten-document translation, exact
+graph/config/manifest parity tests, and frontend admission rather than a partial or
+monolithic source that weakens the shipped TKD contract.
 
-# Apply DSQL schema migrations
-tkr schema setup --yes
+## Configuration and writeback
 
-# Deploy services (starts at 0 replicas, then scales up)
-tkr deploy apply --yes
-tkr scale up
+`tokeirad.toml` is represented by the deployment-owned `ServerConfig` kind. DSQL infra
+apply writes only canonical `TokeiraConfig` paths:
 
-# Operations
-tkr scale status
-tkr logs edge-api --follow --tail 50
-tkr logs runtime --tail 20
+- `infrastructure.storage`;
+- `infrastructure.dsql.endpoint` and `.region`;
+- `infrastructure.dsql.runtime_role_arn` and `.admin_role_arn`; and
+- `infrastructure.dsql.rate_limiter_table` and `.conn_lease_table`.
 
-# Port forwarding (via SSM — no public endpoints)
-tkr port-forward grafana                    # localhost:3000 → Grafana
-tkr port-forward edge-api                   # localhost:7233 → gRPC frontend
-tkr port-forward edge-api --local-port 8080 # custom local port
-tkr port-forward mimir                      # localhost:9009 → Mimir query
-tkr port-forward loki                       # localhost:3100 → Loki query
+Core server workloads declare the `ServerConfig` resource as an infrastructure
+dependency. Their ECS task definitions receive the same generic loader contract used by
+the binaries: `TOKEIRA_CONFIG=env:TOKEIRA_CONFIG_CONTENT`, the document content, and a
+digest that makes configuration movement explicit in the desired manifest. Controller
+and autoscaler use different config schemas and remain a named follow-up; injecting
+`TokeiraConfig` into them would be a type error, not reuse.
 
-# Remote exec into a running container
-tkr exec runtime                            # interactive shell in runtime container
-tkr exec edge-api -- cat /etc/tokeirad.toml # run a command
-tkr exec grafana --container grafana        # specify container name
+## Network and workload realization
 
-# Admin commands (scales admin service 0→1, executes, scales back to 0)
-tkr admin schema status
-tkr admin diagnostics runtime
+All tasks use `awsvpc` in private subnets with public IP assignment disabled. Every
+workload manifest resolves its subnet set and workload-family security group from
+recorded infrastructure state. Security-group ingress uses the private VPC CIDR because
+Service Connect, ALB, and dependency traffic crosses workload-family groups; a
+self-source rule would admit only same-group traffic.
 
-# Module-scoped infrastructure operations
-tkr infra apply --yes --module dsql
-tkr infra apply --yes --module observability
-tkr infra destroy --yes --module observability
+The edge API and poll services resolve and attach their IP target groups. Create and
+update reconcile task definition, capacity provider, scheduling, placement constraint,
+Service Connect, private network configuration, load balancer, execute-command policy,
+and desired replicas. Live drift compares the same owned surface against the latest task
+definition revision. Delete is idempotent and treats an absent or inactive service as
+complete.
 
-# Observability smoke test
-tkr observability check
+## Provider-contract verdict
 
-# Tear down
-tkr scale down
-tkr infra destroy --yes
-tkr deployment destroy --name prod --yes
-```
+| Contract item | Verdict | Current evidence |
+|---|---|---|
+| Pure declaration | **MEETS** | [`platform()`](../../../platforms/ecs/src/lib.rs) assembles four namespaces plus execution/integration without I/O. |
+| Typed kinds and explicit graph dependencies | **MEETS** | [`kinds`](../../../crates/tokeira-ecs/src/kinds/mod.rs), [`EcsWorkload`](../../../crates/tokeira-ecs/src/kinds/workload.rs), and the evaluated [definition test](../../../platforms/ecs/tests/definition.rs). |
+| Probe semantics | **MEETS, documented substrate deviation** | [`EcsExecution`](../../../crates/tokeira-ecs/src/execution.rs) returns no deployment-wide issue because region is manifest-owned and AWS reachability is operation-local. |
+| Standard integration contexts | **MEETS** | [`EcsIntegration`](../../../crates/tokeira-ecs/src/execution.rs) relies on the framework-installed `AwsClients` bundle selected by the `tokeira_aws` namespace. |
+| Logs/ports/scale operations | **FALLS SHORT — framework finding** | The declaration deliberately has `ops: None`: [`DeploymentRef`](../../../crates/tokeira-platform/src/declaration.rs) carries name and directory, not the authored region/cluster required for an AWS query. Smallest follow-up: give `Ops` a read-only admitted-definition/config view, then implement all three verbs together. |
+| Canonical server config and writeback | **MEETS for `TokeiraConfig` consumers** | Shared [`ServerConfig`](../../../crates/tokeira-deployment/src/server_config.rs), ECS [manifest delivery](../../../crates/tokeira-ecs/src/services.rs), and canonical writebacks in [`deployment.tkd`](../../../platforms/ecs/deployment.tkd). Controller/autoscaler documents remain below. |
+| IaC lifecycle and describe honesty | **FALLS SHORT** | Core AWS resources describe live state, but [`ObservabilityArtifacts`](../../../platforms/ecs/src/observability.rs) and its SSM-backed Alloy config can return `DescribeResult::Unsupported`; persisted state is retained honestly, but out-of-band object/parameter drift is not visible. |
+| Self-describing deploy plane | **MEETS** | [`EcsWorkload::manifests`](../../../crates/tokeira-ecs/src/services.rs) resolves roles, private network, edge target group, and config content from recorded infra state. |
+| Rollout, live drift, and delete | **MEETS** | [`EcsPlatform`](../../../crates/tokeira-ecs/src/execution.rs) reconciles create/update, compares live service ownership including the latest task revision, and implements idempotent delete. |
+| Catalog and companion content | **MEETS for TKD** | [`Cargo.toml`](../../../platforms/ecs/Cargo.toml) declares the default root and `observability` content; the source set is retained by the framework. |
+| Modular, documented, realized definition | **MEETS for TKD** | The root and nine focused parts describe ownership and dependencies; tests evaluate both managed and adopted DSQL and realize every kind. |
+| TKD/TKDP parity and cross-format retarget | **ABSENT — frontend finding** | No ECS `.tkdp` source is advertised, and [`DefinitionFrontend::retarget_check`](../../../crates/tokeira-platform/src/definition.rs) records that TKDP create-time admission has not landed. This is a sized follow-up, not an inferred parity claim. |
 
-## Infrastructure modules
+## Named follow-ups
 
-The ECS platform organizes infrastructure into ordered modules:
-
-| Module | Resources |
-|--------|-----------|
-| **networking** | VPC, private subnets, NAT Gateway, VPC interface endpoints (ECS, ECR, S3, SSM, Cloud Map) |
-| **dsql** | Aurora DSQL cluster (managed or preexisting), DSQL VPC endpoints, IAM roles (runtime + admin) |
-| **cluster** | ECS cluster, capacity providers (ASGs per service class), Service Connect namespace |
-| **observability** | Mimir, Loki, Grafana, Alloy services + dashboards + alert rules |
-| **services** | Tokeira application services (edge-api, edge-poll, runtime, projection, controller, autoscaler, admin) |
-
-Modules are applied in dependency order and destroyed in reverse.
-
-## Service topology
-
-| Service | Capacity Provider | Instance Type | Replicas | Purpose |
-|---------|-------------------|---------------|----------|---------|
-| edge-api | edge-api | c8g.large | 2 | gRPC frontend (SDK clients) |
-| edge-poll | edge-poll | c8g.large | 2 | Worker polling endpoint |
-| runtime | runtime | c8g.large | 3 (daemon) | Lane execution, timers, dispatch |
-| projection | projection | c8g.large | 1 | Visibility workers |
-| controller | control | c8g.large | 1 | Placement controller |
-| autoscaler | control | c8g.large | 1 (co-located) | Scaling decisions |
-| admin | control | c8g.large | 0 (on-demand) | Schema migrations, diagnostics |
-| mimir | mimir | m8g.large | 1 | Metrics store |
-| loki | loki | m8g.large | 1 | Log store |
-| grafana | grafana | c8g.medium | 1 | Dashboards |
-
-## Recommended ECS + DSQL lifecycle
-
-```bash
-# 1. Create deployment config
-tkr deployment create --name prod --platform ecs --storage dsql --region eu-west-2
-
-# 2. Mirror observability images to ECR (Mimir, Loki, Grafana, Alloy, AWS CLI, BusyBox)
-tkr image mirror --yes
-
-# 3. Build and push tokeirad
-tkr image build --tag v2026-05-22
-tkr image push --tag v2026-05-22 --yes
-
-# 4. Provision infrastructure
-tkr infra apply --yes
-
-# 5. Apply schema
-tkr schema setup --yes
-
-# 6. Deploy and scale
-tkr deploy apply --yes
-tkr scale up
-
-# 7. Verify
-tkr observability check
-tkr port-forward grafana
-```
-
-## Port forwarding
-
-Port forwarding uses SSM Session Manager — no public endpoints, no SSH keys, no
-bastion hosts. Requires `session-manager-plugin` installed locally and VPC
-network access (the NAT Gateway provides outbound for SSM).
-
-Available services: `grafana`, `edge-api`, `edge-poll`, `controller`, `mimir`,
-`loki`.
-
-## Remote exec
-
-`tkr exec` uses ECS Exec (backed by SSM) to run commands inside running
-containers. Each service's task definition has `enableExecuteCommand = true`
-and the init process enabled.
-
-```bash
-tkr exec <service>                    # interactive /bin/sh
-tkr exec <service> -- <command...>    # run a command and exit
-tkr exec <service> --container <name> # target a specific container (e.g., alloy sidecar)
-```
-
-## Admin commands
-
-`tkr admin` is a convenience wrapper for one-shot administrative operations. It
-scales the `admin` service from 0→1, waits for the task to reach RUNNING,
-executes the command via ECS Exec, streams output, then scales back to 0. This
-avoids keeping an admin container running permanently.
-
-```bash
-tkr admin schema setup
-tkr admin schema migrate 5
-tkr admin diagnostics runtime
-```
+1. **ECS definition TKDP peer and admission:** land TKDP create-time retarget admission,
+   translate the complete modular source set, and add exact config, graph, writeback,
+   desired-manifest, and retarget parity tests.
+2. **Service-owned auxiliary config documents:** add deployment-owned graph nodes and
+   ECS delivery for `controller.toml` and `autoscaler.toml`; do not pass
+   `TokeiraConfig` to binaries that reject that schema.
+3. **AWS generated-content describes:** use `HeadObject`/`GetParameter` to make
+   observability artifact and Alloy parameter drift live-visible.
+4. **Definition-aware Ops framework seam:** expose admitted read-only authored
+   coordinates to `Ops`, then restore ECS logs, port mappings, and scale through the
+   declaration rather than the legacy route.
+5. **M2 live-AWS acceptance:** validate endpoint reachability, IAM policy sufficiency,
+   ALB registration/health, Service Connect, rollout convergence, and teardown in an
+   operator-driven AWS environment.
 
 ## See also
 
-- [Platform support matrix](../README.md)
+- [Definition-backed provider contract](../provider-contract.md)
+- [Deployment definition programming guide](../../provisioning/deployment-definitions.md)
 - [Production observability](../observability.md)
-- [Deployment configuration and the `tkr` command surface](../../provisioning/deployment-configuration.md)

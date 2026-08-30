@@ -29,6 +29,7 @@ pub struct Networking {
 // catch later, it is unrepresentable here.
 pub struct PreexistingDsql {
     pub endpoint: String,
+    pub arn: String,
     pub management_endpoint_id: String,
     pub connection_endpoint_id: String,
     pub runtime_role_arn: String,
@@ -58,14 +59,6 @@ pub struct DaemonPolicy {
     pub memory_mb: u32,
 }
 
-// The autoscaler's policy: its image and how often it evaluates.
-pub struct Autoscaler {
-    pub image: String,
-    pub polling_interval_secs: u64,
-    pub cpu: u32,
-    pub memory_mb: u32,
-}
-
 // The application services' authored policies.
 pub struct Services {
     pub edge_api: ReplicaPolicy,
@@ -73,7 +66,7 @@ pub struct Services {
     pub runtime: DaemonPolicy,
     pub projection: ReplicaPolicy,
     pub controller: ReplicaPolicy,
-    pub autoscaler: Autoscaler,
+    pub autoscaler: ReplicaPolicy,
     pub admin: ReplicaPolicy,
 }
 
@@ -112,16 +105,15 @@ pub struct Alb {
     pub health_check_interval_secs: u64,
 }
 
-// The observability stack's authored policies: the three backends, the
-// collection sidecar images, and metric/log retention.
+// The observability stack's authored policies: the three backends and the
+// collection sidecar images.
 pub struct Observability {
-    pub mimir: DaemonPolicy,
-    pub loki: DaemonPolicy,
-    pub grafana: DaemonPolicy,
+    pub mimir: ReplicaPolicy,
+    pub loki: ReplicaPolicy,
+    pub grafana: ReplicaPolicy,
     pub alloy_image: String,
     pub aws_cli_image: String,
     pub busybox_image: String,
-    pub retention_days: u32,
 }
 
 // Provider vocabulary for the DSQL cluster kind's lifecycle mode.

@@ -76,7 +76,14 @@
 - [ ] 4.4 [PBT] `// Feature: platform-eks, Property 5` — manifest serde round-trip + acyclic service
   graph in startup order.
 - [ ] 4.5 Gated (non-default) live integration tests for the `KubePlatform` paths.
-- [ ] 4.6 **Checkpoint** — full §10.4 bar green; provider-contract checklist satisfied item-by-item in
+- [ ] 4.6 Operator access (Req 13): the `operator_access` config enum in both definition sets; under
+  `Ssm`, the relay (keyless arm64 nano, SSM-parameter AMI resolution, ingress-free SG, SSM-core
+  profile) + the three SSM interface endpoints in the networking module; the shared relay-anchored
+  connection mechanism (lazy first-use connect, TLS server-name handling) used by live apply and
+  every day-2 verb; the named-condition errors (plugin absent, relay unregistered, External-mode
+  route assumption).
+- [ ] 4.7 [PBT] `// Feature: platform-eks, Property 12` — access-mode exactness across both modes.
+- [ ] 4.8 **Checkpoint** — full §10.4 bar green; provider-contract checklist satisfied item-by-item in
   the PR.
 
 ## 5. Live acceptance (operator-driven)

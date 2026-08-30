@@ -55,7 +55,8 @@ metric source required for automatic wake-up. Manual scale-to-zero (`replicas: 0
 admitted by Kubernetes and is the path this spec's day-2 scale verb takes; tokeira is unusually
 well-suited to it — execution state is durable in DSQL, so an idle deployment's `tokeirad` replicas
 can genuinely reach zero without loss (Requirement 9.3). Automatic scale-to-zero is an operator
-affordance 1.36 unlocks, outside this spec.
+affordance 1.36 unlocks, outside this spec. Auto Mode consolidates its own nodes to zero when
+nothing is scheduled, so a scaled-to-zero deployment's compute cost genuinely approaches zero.
 
 ## Glossary
 
@@ -100,7 +101,7 @@ affordance 1.36 unlocks, outside this spec.
 - **Module staging** — the ordered infra module set:
   `remote_state → images → networking → dsql → cluster → observability → services`, mirroring the ECS
   definition's modular decomposition. The bootstrap `remote_state` module creates the S3 state bucket.
-- **Writeback / hydration** — projecting discovered infra outputs (DSQL endpoint/ARN, region,
+- **Writeback / hydration** — projecting discovered infra outputs (the DSQL endpoint, region, and
   coordination table names) into the deployment's `TokeiraConfig` through the definition's declared
   writebacks, persisted platform-side after infra apply.
 - **tokeira topology** — tokeira's real process set: `tokeirad` (the monolithic edge+runtime+projection
@@ -194,13 +195,16 @@ node; the `max_idle_conns == max_conns` invariant is enforced by `TokeiraConfig`
 | `services` (per-service: image, replicas, cpu, memory) | tokeira's real topology only (Requirement 6) | Non-canonical gRPC/metrics ports rejected | ecs `services.tkd` |
 | `observability` ({mimir,loki,grafana,alloy} image + cpu/memory + retention) | Carried; images pinned to the workspace-current observability pins | — | model.rs `ObservabilitySection`; ecs `observability.tkd` |
 | `debug` (cloudwatch_logs, log_retention_days) | Carried; gates the optional `logs` VPC endpoint | — | model.rs `DebugSection` |
+| `operator_access` (shaped enum: `Ssm` default / `External`) | `Ssm` provisions the relay instance + SSM interface endpoints (Requirement 13); `External` provisions neither — the operator brings VPN/Direct Connect | — | source operator model (SSM/VPN); ecs-deployment SSM-session precedent |
 
 ## AWS Resource Kind Policy (all reused from `tokeira-aws`)
 
 | Kind | `tokeira-aws` resource | Module | Notes |
 |---|---|---|---|
 | `Vpc` | `vpc` | networking | private-only; emits `subnet_ids` |
-| `VpcEndpoint` (Gateway/Interface) | `vpc_endpoint` | networking | s3+dynamodb gateway; ecr/sts/eks-auth/dsql/secretsmanager interface; logs iff `debug.cloudwatch_logs` |
+| `VpcEndpoint` (Gateway/Interface) | `vpc_endpoint` | networking | s3+dynamodb gateway; `ec2`/`eks`/`ecr.api`/`ecr.dkr`/`sts`/`eks-auth`/`dsql`/`secretsmanager` interface (the fully-private set — `ec2` and `eks` are required for a no-NAT Auto Mode cluster); `logs` iff `debug.cloudwatch_logs`; `ssm`/`ssmmessages`/`ec2messages` iff `operator_access = Ssm`. Private DNS enabled on every interface endpoint |
+| `Ec2Instance` (SSM relay) | `ec2_instance` | networking | iff `operator_access = Ssm`: the stateless tunnel anchor (Requirement 13.1) |
+| `IamInstanceProfile` + relay `IamRole` | `iam_instance_profile`, `iam_role` | networking | iff `operator_access = Ssm`: SSM core policy only |
 | `SecurityGroup` | `security_group` | networking | eks-nodes-sg (membership+grpc+metrics self) and vpc-endpoints-sg (443, 5432) |
 | `IamRole` | `iam_role` | dsql / cluster | cluster-role, auto-node-role, and per-service Pod-Identity task roles (the tokeirad task role carries DSQL + DynamoDB access) |
 | `DsqlCluster` | `dsql_cluster` | dsql | Managed vs Preexisting per the shaped config enum |
@@ -231,7 +235,6 @@ node; the `max_idle_conns == max_conns` invariant is enforced by `TokeiraConfig`
 | `infrastructure.storage = "dsql"` | (const, under DSQL) | mirrors compose + ecs |
 | `infrastructure.dsql.endpoint` | connection-endpoint `private_hostname`, else cluster `cluster_endpoint` | endpoint-preferred |
 | `infrastructure.dsql.region` | config region | |
-| `infrastructure.dsql.arn` | cluster `cluster_arn` | |
 | `infrastructure.dsql.rate_limiter_table` / `conn_lease_table` | DynamoDb table `name` | coordination tables |
 
 ## Requirements
@@ -309,7 +312,9 @@ resource implementations rather than port new ones, so that the AWS layer stays 
    SHALL be filed and fixed in `tokeira-aws` (a shared-crate change), NOT worked around inside
    `platforms/eks`.
 3. THE cluster/node IAM roles and per-service task roles SHALL carry only the trust and inline policies
-   the deployed services require; the tokeirad task role SHALL include DSQL and DynamoDB access.
+   the deployed services require; the tokeirad task role SHALL include DSQL and DynamoDB access. THE
+   cluster and node roles SHALL carry exactly the managed policies Auto Mode documents as required
+   (verified against the EKS Auto Mode user guide at implementation).
 4. THE DSQL cluster kind SHALL operate managed or adopt a preexisting cluster per the shaped config
    enum (never inferred from optional-field presence).
 5. THE EKS cluster version SHALL default to the latest EKS-supported Kubernetes version (1.36 as
@@ -399,7 +404,10 @@ through the standard operations seam, so that a running deployment is fully oper
 1. THE declaration SHALL supply `Ops` implemented in provider terms: scale patches Deployment replicas
    and waits for readiness in tokeira's startup order (reverse order scaling down); logs return the
    service's recent logs from the live cluster; port-forward establishes a live forward via the `kube`
-   client.
+   client, reached through the operator-access path of Requirement 13. The coordinates `Ops` needs
+   beyond `DeploymentRef` (the admitted namespace, the derived cluster name) SHALL be recovered from
+   the deployment directory the `DeploymentRef` carries — reading the admitted revision is the
+   sanctioned path for a definition-backed platform's operations.
 2. WHERE a day-2 verb requires a reachable cluster, THE platform SHALL surface a clear, actionable
    error when the cluster or credentials are unavailable, and SHALL NOT silently succeed.
 3. THE scale verb SHALL admit zero as a target replica count for `tokeirad` and the observability
@@ -417,7 +425,9 @@ least-privilege identity, so that it exposes no public surface and uses no long-
 #### Acceptance Criteria
 
 1. THE VPC SHALL have no public subnets and no internet gateway; AWS service access SHALL be via VPC
-   endpoints, and the EKS API SHALL be private.
+   endpoints, and the EKS API SHALL be private. THE VPC SHALL set `enableDnsSupport` and
+   `enableDnsHostnames` explicitly (private-endpoint DNS depends on them), and the endpoint and
+   cluster-API security groups SHALL admit exactly the node and relay security groups on 443.
 2. THE deployment SHALL create no `Ingress`, `LoadBalancer` Service, or other internet-facing surface;
    operator access SHALL be via `port-forward` only.
 3. Security-group ingress rules SHALL be scoped to specific sources (VPC CIDR or self-reference) and
@@ -456,3 +466,43 @@ composition validated, so that the platform's desired state is trustworthy befor
    admission; non-`#[create]` changes SHALL reconcile.
 4. Generated Kubernetes manifests SHALL round-trip through `serde_json` without loss, and the service
    dependency graph SHALL be acyclic.
+
+### Requirement 13: Operator access to the private cluster (SSM-first)
+
+**User Story:** As an operator with no VPN or Direct Connect, I want to reach my private-only EKS
+deployment — for apply, kubectl, and every day-2 verb — through AWS SSM Session Manager alone, so
+that private-only never means inaccessible.
+
+_Ground truth: the SSM-session pattern is established in-repo by the ECS deployment
+(`AmazonSSMManagedInstanceCore` on its instance profiles, `ssm`/`ssmmessages`/`ec2messages` in its
+required endpoints — `.kiro/specs/ecs-deployment/tasks.md` 3.2, 5.1) — but it does **not** transfer
+to the nodes here: EKS Auto Mode **disallows SSH and SSM access to its nodes by design** (SELinux
+enforcing, read-only root; [Auto Mode](https://docs.aws.amazon.com/eks/latest/userguide/automode.html),
+the Auto Mode security whitepaper). The tunnel anchor is therefore a **dedicated relay instance**:
+one stateless arm64 nano instance in a private subnet, SSM-managed, no key pair, no ingress. It is
+provisioned by the `networking` module — before the cluster exists — which is what lets the very
+first apply complete its Kubernetes plane through the tunnel._
+
+#### Acceptance Criteria
+
+1. WHERE `operator_access = Ssm` (the default), THE networking module SHALL provision the relay —
+   one arm64 nano instance (current-generation Amazon Linux minimal AMI resolved at apply time via
+   the public SSM parameter, the ECS launch-template precedent), no key pair, an ingress-free
+   security group, and an instance profile carrying only the AWS-managed SSM core policy — plus the
+   `ssm`, `ssmmessages`, and `ec2messages` interface endpoints. Sessions are agent-initiated and
+   outbound-only, preserving Requirement 10. The relay is stateless and replaceable; no other
+   standing access instance SHALL exist.
+2. WHEN a kube connection is needed from a seat with no VPC route (live apply and every day-2 verb
+   alike), THE platform SHALL establish it through an SSM port-forwarding session anchored on the
+   relay, layered to the private EKS API endpoint — one shared mechanism, not per-verb
+   reimplementations, owning the TLS server-name handling a locally-terminated tunnel requires.
+3. THE registered Kubernetes handle SHALL defer its connection to first use: module ordering places
+   `networking` (the relay) and `cluster` before every Kubernetes consumer, so a deployment's first
+   apply completes its Kubernetes plane in the same operation with no pre-registered live
+   connection.
+4. IF the local AWS Session Manager plugin is absent or the relay is not yet SSM-registered, THEN
+   the operation SHALL fail with an error naming exactly that condition and its remedy, and SHALL
+   NOT silently fall back to a direct connection attempt's timeout.
+5. WHERE `operator_access = External`, THE platform SHALL provision no relay and no SSM endpoints,
+   and connection failures SHALL state that the deployment assumes an operator-provided route
+   (VPN/Direct Connect).

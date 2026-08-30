@@ -94,6 +94,25 @@ extension bag (the one sanctioned `Box<dyn Any>` seam). K8s resource lifecycle m
 fail with a remediation-bearing error when absent during apply; `describe` with no reachable cluster
 reports absent, so plan yields Creates without a cluster — mirroring compose-without-Docker.
 
+### Operator access (SSM-first)
+
+A private-only cluster is only as usable as its access story, and the access story is owned here,
+not left as a prerequisite. Auto Mode disallows SSH and SSM to its own nodes by design, so the
+tunnel anchor is a **dedicated relay**: one stateless arm64 nano instance, SSM-managed, ingress-free,
+provisioned by the networking module — before the cluster — under the default
+`operator_access = Ssm`, together with the three SSM interface endpoints. One shared connection
+mechanism serves live apply and every day-2 verb: an SSM port-forwarding session anchored on the
+relay, layered to the private EKS API endpoint, with the `kube::Client` speaking through it (the
+mechanism owns the TLS server-name handling a locally-terminated tunnel requires). The registered
+Kubernetes handle connects lazily at first use; module ordering (networking → cluster → consumers)
+means a deployment's very first apply completes its Kubernetes plane in the same operation.
+`External` mode provisions none of it and says so on connection failure. Sessions are
+agent-initiated and outbound-only, so Requirement 10's no-ingress posture is untouched.
+
+`Ops` recovers its coordinates (admitted namespace, derived cluster name) by reading the admitted
+revision from the deployment directory `DeploymentRef` carries — the sanctioned path for a
+definition-backed platform's operations.
+
 ### Day-2 operations
 
 `Ops` in provider terms over `KubePlatform`: scale patches replicas and awaits readiness in startup
@@ -151,6 +170,10 @@ actionably when the cluster or credentials are unreachable.
 - **Property 11 — Scale ordering with zero admissible.** *For any* scale target including zero,
   scale-up applies in startup order and scale-down in reverse; zero for `tokeira-controller` is
   refused while any `tokeirad` replica remains. **Validates: Requirements 9.1, 9.3.**
+- **Property 12 — Access mode is exact.** *For any* admitted config: `Ssm` yields exactly one relay
+  instance (keyless, ingress-free, SSM-core profile) and the three SSM interface endpoints;
+  `External` yields neither; in both modes no ingress rule or public surface is added.
+  **Validates: Requirements 13.1, 13.5.**
 
 ## Error Handling
 
@@ -164,6 +187,8 @@ actionably when the cluster or credentials are unreachable.
 | S3 state conflict | CAS re-read + re-plan, never force |
 | AWS clients unregistered at state-store creation | Loud failure (mirror ecs) |
 | Scale-to-zero requested for the controller with live runtimes | Refusal naming the constraint |
+| Session Manager plugin absent / relay not yet SSM-registered | Named condition + remedy; never a silent direct-connect timeout |
+| Connection failure under `External` access | States the operator-provided-route assumption |
 
 ## Testing Strategy
 

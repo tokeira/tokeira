@@ -736,3 +736,107 @@ impl Resource for CapacityProviderResource {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    // All four capacity-plane resources are fixed at create (update is a
+    // recorded no-op), so diff answers NoChange even when the recorded state
+    // diverges from the desired shape.
+
+    #[test]
+    fn cluster_diff_noops_regardless_of_recorded_state() {
+        let resource = EcsClusterResource::new("tok-cluster".into(), "tok.internal".into(), "ecs");
+        let stale = EcsClusterResource::new("tok-cluster".into(), "stale.internal".into(), "ecs");
+        let current = stale.state("arn:cluster".into());
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(
+            change,
+            InternalChange::NoChange { resource_id } if resource_id == resource.resource_id()
+        ));
+    }
+
+    #[test]
+    fn launch_template_diff_noops_regardless_of_recorded_state() {
+        let resource = LaunchTemplateResource {
+            name: "tok-lt".into(),
+            cluster_name: "tok-cluster".into(),
+            instance_type: "m7g.large".into(),
+            workload: "engine".into(),
+            instance_profile_name: "tok-profile".into(),
+            security_group_dependency: ResourceId("sg".into()),
+            module: "ecs".into(),
+        };
+        let stale = LaunchTemplateResource {
+            instance_type: "m7g.xlarge".into(),
+            workload: "stale".into(),
+            ..resource
+        };
+        let current = stale.state("lt-0abc".into(), "ami-stale".into());
+        let resource = LaunchTemplateResource {
+            instance_type: "m7g.large".into(),
+            workload: "engine".into(),
+            ..stale
+        };
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(
+            change,
+            InternalChange::NoChange { resource_id } if resource_id == resource.resource_id()
+        ));
+    }
+
+    #[test]
+    fn asg_diff_noops_regardless_of_recorded_state() {
+        let resource = AsgResource {
+            name: "tok-asg".into(),
+            min_size: 1,
+            desired_capacity: 2,
+            max_size: 3,
+            new_instances_protected_from_scale_in: false,
+            launch_template_dependency: ResourceId("lt".into()),
+            vpc_dependency: ResourceId("vpc".into()),
+            module: "ecs".into(),
+        };
+        let stale = AsgResource {
+            desired_capacity: 9,
+            ..resource
+        };
+        let current = stale.state("arn:asg".into());
+        let resource = AsgResource {
+            desired_capacity: 2,
+            ..stale
+        };
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(
+            change,
+            InternalChange::NoChange { resource_id } if resource_id == resource.resource_id()
+        ));
+    }
+
+    #[test]
+    fn capacity_provider_diff_noops_regardless_of_recorded_state() {
+        let resource = CapacityProviderResource {
+            name: "tok-cp".into(),
+            cluster_dependency: ResourceId("cluster".into()),
+            asg_dependency: ResourceId("asg".into()),
+            module: "ecs".into(),
+        };
+        let current = resource.state("arn:cp".into());
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(
+            change,
+            InternalChange::NoChange { resource_id } if resource_id == resource.resource_id()
+        ));
+    }
+}

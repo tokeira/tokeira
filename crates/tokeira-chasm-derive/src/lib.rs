@@ -48,6 +48,29 @@ use syn::{
 ///
 /// The `#[chasm(...)]` helper attribute carries the component's fully-qualified name
 /// (`#[chasm(fqn = "...")]`) and per-field markers (`#[chasm(data)]`, `#[chasm(transient)]`).
+///
+/// A component that derives `Component` but never implements `Lifecycle` does not compile —
+/// the requirement is a real supertrait bound, not a naming convention. (Proven here as a
+/// `compile_fail` doctest rather than a stderr snapshot: the E0277 rendering varies with
+/// source-path remapping across build environments, while the failure itself does not.)
+///
+/// ```compile_fail,E0277
+/// use tokeira_chasm::Field;
+/// use tokeira_chasm_derive::Component;
+///
+/// #[derive(Clone, PartialEq, prost::Message)]
+/// struct Payload {
+///     #[prost(uint64, tag = "1")]
+///     value: u64,
+/// }
+///
+/// #[derive(Component)]
+/// #[chasm(fqn = "test.no_lifecycle")]
+/// struct NoLifecycle {
+///     #[chasm(data)]
+///     state: Field<Payload>,
+/// }
+/// ```
 #[proc_macro_derive(Component, attributes(chasm))]
 pub fn derive_component(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

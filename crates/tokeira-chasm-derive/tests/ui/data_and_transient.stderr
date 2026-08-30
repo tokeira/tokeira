@@ -1,0 +1,6 @@
+error: a field cannot be both #[chasm(data)] and #[chasm(transient)]
+  --> tests/ui/data_and_transient.rs:13:5
+   |
+13 | /     #[chasm(data, transient)]
+14 | |     state: Field<Payload>,
+   | |_________________________^

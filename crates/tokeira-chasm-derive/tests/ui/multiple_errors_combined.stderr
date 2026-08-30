@@ -1,0 +1,11 @@
+error: unmanaged field: declare it as `Field`/`Map`/`ParentPtr`, or mark it `#[chasm(transient)]` if it must not be persisted (Requirement 3.3, 3.5)
+ --> tests/ui/multiple_errors_combined.rs:8:5
+  |
+8 |     plain: String,
+  |     ^^^^^^^^^^^^^
+
+error: unmanaged field: declare it as `Field`/`Map`/`ParentPtr`, or mark it `#[chasm(transient)]` if it must not be persisted (Requirement 3.3, 3.5)
+ --> tests/ui/multiple_errors_combined.rs:9:5
+  |
+9 |     also_plain: u64,
+  |     ^^^^^^^^^^^^^^^

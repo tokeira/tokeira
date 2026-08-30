@@ -21,5 +21,13 @@ syn = "2.0"
 quote = "1.0"
 proc-macro2 = "1.0"
 
+[dev-dependencies]
+# The macro's shape rules are compile-time contracts (Requirement 3.2-3.5); trybuild
+# pins each rejection's message and span, and tokeira-chasm supplies the real trait
+# surface so the accept fixtures prove the generated impl against the framework.
+trybuild = "1.0"
+tokeira-chasm = { path = "../tokeira-chasm", version = "0.1.1" }
+prost = "0.12"
+
 [lints]
 workspace = true

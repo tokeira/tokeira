@@ -1,0 +1,5 @@
+error: #[chasm(data)] must annotate a `Field<T>` whose `T` is the component's proto data type
+ --> tests/ui/data_not_field_type.rs:7:12
+  |
+7 |     state: u32,
+  |            ^^^

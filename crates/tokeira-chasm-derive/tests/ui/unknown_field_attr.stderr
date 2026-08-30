@@ -1,0 +1,5 @@
+error: unknown #[chasm(...)] field attribute; expected `data` or `transient`
+  --> tests/ui/unknown_field_attr.rs:15:13
+   |
+15 |     #[chasm(persisted)]
+   |             ^^^^^^^^^

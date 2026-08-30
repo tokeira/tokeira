@@ -874,3 +874,96 @@ impl Resource for AlbListenerResource {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn current_state(resource_type: &str, properties: serde_json::Value) -> ResourceState {
+        let now = chrono::Utc::now().to_rfc3339();
+        ResourceState {
+            resource_type: ResourceType::new(resource_type),
+            physical_id: "arn:phys".into(),
+            properties,
+            dependencies: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            module: "edge".into(),
+        }
+    }
+
+    // All three elbv2 resources are fixed at create (update is a recorded
+    // no-op), so diff answers NoChange even when recorded properties diverge
+    // from the desired shape.
+
+    #[test]
+    fn alb_diff_noops_regardless_of_recorded_properties() {
+        let resource = AlbResource::new(
+            "edge-alb".into(),
+            "edge".into(),
+            ResourceId("vpc".into()),
+            ResourceId("sg".into()),
+        );
+        let current = current_state(
+            "Alb",
+            serde_json::json!({ "dns_name": "stale.example", "subnet_ids": [] }),
+        );
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(
+            change,
+            InternalChange::NoChange { resource_id } if resource_id == resource.resource_id()
+        ));
+    }
+
+    #[test]
+    fn target_group_diff_noops_regardless_of_recorded_properties() {
+        let resource = AlbTargetGroupResource::new(
+            "edge-api-tg".into(),
+            7233,
+            "/grpc.health.v1.Health/Check".into(),
+            30,
+            "edge".into(),
+            ResourceId("vpc".into()),
+        );
+        let current = current_state(
+            "AlbTargetGroup",
+            serde_json::json!({ "port": 9999, "health_check_path": "/stale" }),
+        );
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(
+            change,
+            InternalChange::NoChange { resource_id } if resource_id == resource.resource_id()
+        ));
+    }
+
+    #[test]
+    fn listener_diff_noops_regardless_of_recorded_properties() {
+        let resource = AlbListenerResource::new(
+            "edge".into(),
+            AlbListenerMode::Http2,
+            None,
+            "internal.example".into(),
+            "edge".into(),
+            ResourceId("alb".into()),
+            ResourceId("tg-api".into()),
+            ResourceId("tg-poll".into()),
+        );
+        let current = current_state(
+            "AlbListener",
+            serde_json::json!({ "port": 443, "protocol": "HTTPS" }),
+        );
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(
+            change,
+            InternalChange::NoChange { resource_id } if resource_id == resource.resource_id()
+        ));
+    }
+}

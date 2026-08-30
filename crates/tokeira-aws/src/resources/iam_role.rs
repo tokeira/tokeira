@@ -642,3 +642,155 @@ impl Resource for IamRole {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn role(inline_policies: &[(&str, &str)], managed_policy_arns: &[&str]) -> IamRole {
+        IamRole {
+            role_name: "tok-role".into(),
+            config: IamRoleConfig {
+                trust_policy: "{}".into(),
+                inline_policies: inline_policies
+                    .iter()
+                    .map(|(name, document)| (name.to_string(), document.to_string()))
+                    .collect(),
+                managed_policy_arns: managed_policy_arns
+                    .iter()
+                    .map(|arn| arn.to_string())
+                    .collect(),
+                module: "iam".into(),
+            },
+            project: "tok".into(),
+            region: "us-east-1".into(),
+            tags: HashMap::new(),
+        }
+    }
+
+    // Mirrors the tag set diff() derives from role_name/project (create() and
+    // update() derive the same set via ctx.resource_tags).
+    fn matching_tags() -> serde_json::Value {
+        serde_json::json!({
+            "Name": "tok-role",
+            "Project": "tok",
+            "ManagedBy": "tokeira-cli",
+        })
+    }
+
+    fn role_state(
+        tags: serde_json::Value,
+        inline_policies: serde_json::Value,
+        managed_policy_arns: serde_json::Value,
+    ) -> ResourceState {
+        let now = chrono::Utc::now().to_rfc3339();
+        ResourceState {
+            resource_type: ResourceType::new("IamRole"),
+            physical_id: "arn:role".into(),
+            properties: serde_json::json!({
+                "role_name": "tok-role",
+                "role_arn": "arn:role",
+                "tags": tags,
+                "inline_policies": inline_policies,
+                "managed_policy_arns": managed_policy_arns,
+            }),
+            dependencies: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            module: "iam".into(),
+        }
+    }
+
+    const POLICY: &str = r#"{"Version":"2012-10-17","Statement":[]}"#;
+
+    #[test]
+    fn diff_noops_when_tags_policies_and_attachments_match() {
+        let resource = role(&[("inline", POLICY)], &["arn:policy:a"]);
+        let current = role_state(
+            matching_tags(),
+            serde_json::json!({ "inline": POLICY }),
+            serde_json::json!(["arn:policy:a"]),
+        );
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::NoChange { .. }));
+    }
+
+    #[test]
+    fn diff_updates_when_tags_differ() {
+        let resource = role(&[], &[]);
+        let current = role_state(
+            serde_json::json!({ "Name": "tok-role" }),
+            serde_json::json!({}),
+            serde_json::json!([]),
+        );
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+
+    #[test]
+    fn diff_updates_when_inline_policy_document_changes() {
+        let resource = role(
+            &[(
+                "inline",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow"}]}"#,
+            )],
+            &[],
+        );
+        let current = role_state(
+            matching_tags(),
+            serde_json::json!({ "inline": POLICY }),
+            serde_json::json!([]),
+        );
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+
+    #[test]
+    fn diff_noops_when_inline_policies_differ_only_in_formatting() {
+        let resource = role(&[("inline", POLICY)], &[]);
+        let reformatted = r#"{ "Version" : "2012-10-17" , "Statement" : [ ] }"#;
+        let current = role_state(
+            matching_tags(),
+            serde_json::json!({ "inline": reformatted }),
+            serde_json::json!([]),
+        );
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::NoChange { .. }));
+    }
+
+    #[test]
+    fn diff_updates_when_managed_policy_set_changes() {
+        let resource = role(&[], &["arn:policy:a", "arn:policy:b"]);
+        let current = role_state(
+            matching_tags(),
+            serde_json::json!({}),
+            serde_json::json!(["arn:policy:a"]),
+        );
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+
+    #[test]
+    fn diff_noops_when_managed_policies_merely_reordered() {
+        let resource = role(&[], &["arn:policy:a", "arn:policy:b"]);
+        let current = role_state(
+            matching_tags(),
+            serde_json::json!({}),
+            serde_json::json!(["arn:policy:b", "arn:policy:a", "arn:policy:a"]),
+        );
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::NoChange { .. }));
+    }
+}

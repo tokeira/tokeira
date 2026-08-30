@@ -777,3 +777,101 @@ impl Resource for VpcResource {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn vpc_resource(cidr: &str, availability_zones: &[&str]) -> VpcResource {
+        VpcResource::new(
+            &crate::ResourceContext {
+                project: "tok".into(),
+                region: "us-east-1".into(),
+                tags: HashMap::new(),
+            },
+            VpcConfig {
+                cidr: cidr.into(),
+                availability_zones: availability_zones.iter().map(|az| az.to_string()).collect(),
+            },
+            "network",
+        )
+    }
+
+    fn vpc_state(properties: serde_json::Value) -> ResourceState {
+        let now = chrono::Utc::now().to_rfc3339();
+        ResourceState {
+            resource_type: ResourceType::new("Vpc"),
+            physical_id: "vpc-0abc".into(),
+            properties,
+            dependencies: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            module: "network".into(),
+        }
+    }
+
+    #[test]
+    fn diff_noops_when_cidr_and_azs_match() {
+        let resource = vpc_resource("10.0.0.0/16", &["us-east-1a", "us-east-1b"]);
+        let current = vpc_state(serde_json::json!({
+            "cidr": "10.0.0.0/16",
+            "availability_zones": ["us-east-1a", "us-east-1b"],
+        }));
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::NoChange { .. }));
+    }
+
+    #[test]
+    fn diff_updates_when_cidr_changes() {
+        let resource = vpc_resource("10.1.0.0/16", &["us-east-1a"]);
+        let current = vpc_state(serde_json::json!({
+            "cidr": "10.0.0.0/16",
+            "availability_zones": ["us-east-1a"],
+        }));
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        match change {
+            InternalChange::Update { details, .. } => {
+                assert_eq!(details[0].field, "cidr");
+                assert_eq!(details[0].before.as_deref(), Some("10.0.0.0/16"));
+                assert_eq!(details[0].after.as_deref(), Some("10.1.0.0/16"));
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_updates_when_availability_zones_change() {
+        let resource = vpc_resource("10.0.0.0/16", &["us-east-1a", "us-east-1c"]);
+        let current = vpc_state(serde_json::json!({
+            "cidr": "10.0.0.0/16",
+            "availability_zones": ["us-east-1a", "us-east-1b"],
+        }));
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+
+    #[test]
+    fn diff_updates_when_cidr_missing_from_state() {
+        let resource = vpc_resource("10.0.0.0/16", &["us-east-1a"]);
+        let current = vpc_state(serde_json::json!({ "vpc_id": "vpc-0abc" }));
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+
+    #[test]
+    fn subnet_cidr_maps_az_index_into_third_octet() {
+        assert_eq!(subnet_cidr("10.0.0.0/16", 0), "10.0.0.0/24");
+        assert_eq!(subnet_cidr("10.0.0.0/16", 2), "10.0.2.0/24");
+        assert_eq!(subnet_cidr("172.31.0.0/16", 1), "172.31.1.0/24");
+    }
+}

@@ -1,0 +1,5 @@
+error: unmanaged field: declare it as `Field`/`Map`/`ParentPtr`, or mark it `#[chasm(transient)]` if it must not be persisted (Requirement 3.3, 3.5)
+  --> tests/ui/unmanaged_field.rs:15:5
+   |
+15 |     plain: String,
+   |     ^^^^^^^^^^^^^

@@ -493,3 +493,83 @@ fn struct_spelling_unit_and_unknown_variant_boundaries() {
     .expect("plain struct");
     assert_eq!(plain.region, "eu");
 }
+
+/// Property-5 probe config: `deny_unknown_fields` is the admission posture
+/// every platform config carries (standing workspace property).
+#[derive(Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionProbeConfig {
+    name: String,
+    replicas: u32,
+    durable: bool,
+}
+
+fn admission_value(name: &str, replicas: i128, durable: bool) -> LocatedValue {
+    let field = |offset: usize, value: ValueShape| {
+        LocatedValue::new(value)
+            .located(crate::error::SourceRange::new(offset, offset + 10).expect("valid range"))
+    };
+    LocatedValue::new(ValueShape::Struct {
+        name: "AdmissionProbeConfig".to_string(),
+        fields: vec![
+            (
+                "name".to_string(),
+                field(0, ValueShape::String(name.to_string())),
+            ),
+            (
+                "replicas".to_string(),
+                field(20, ValueShape::Integer(replicas)),
+            ),
+            ("durable".to_string(), field(40, ValueShape::Bool(durable))),
+        ],
+    })
+}
+
+proptest! {
+    // Feature: platform-builder-abstraction, Property 5: config admission is
+    // pure Serde admission.
+    #[test]
+    fn located_config_admission_is_serde_backed_and_pure(
+        name in "[a-z][a-z0-9-]{0,24}",
+        replicas in 0u32..10_000,
+        durable in proptest::bool::ANY,
+    ) {
+        // Admission is decode alone: a well-shaped value decodes to exactly
+        // the authored data, twice, with no environment consulted.
+        let decode = || -> Result<AdmissionProbeConfig, _> {
+            from_located_value(admission_value(&name, i128::from(replicas), durable))
+        };
+        let first = decode().expect("well-shaped config admits");
+        prop_assert_eq!(&first.name, &name);
+        prop_assert_eq!(first.replicas, replicas);
+        prop_assert_eq!(first.durable, durable);
+        prop_assert_eq!(first, decode().expect("admission is deterministic"));
+
+        // An invalid field value is rejected with that value's own range —
+        // the nearest range the frontend supplied.
+        let mut bad = admission_value(&name, i128::from(replicas), durable);
+        let ValueShape::Struct { fields, .. } = &mut bad.value else {
+            unreachable!("probe value is a struct");
+        };
+        fields[1].1.value = ValueShape::String("not-a-number".to_string());
+        let mismatch = from_located_value::<AdmissionProbeConfig>(bad)
+            .expect_err("a mistyped field is refused");
+        prop_assert_eq!(
+            mismatch.range(),
+            Some(crate::error::SourceRange::new(20, 30).expect("valid range"))
+        );
+
+        // An unknown field is rejected by serde's deny_unknown_fields, named.
+        let mut extra = admission_value(&name, i128::from(replicas), durable);
+        let ValueShape::Struct { fields, .. } = &mut extra.value else {
+            unreachable!("probe value is a struct");
+        };
+        fields.push((
+            "surprise".to_string(),
+            LocatedValue::new(ValueShape::Bool(true)),
+        ));
+        let unknown = from_located_value::<AdmissionProbeConfig>(extra)
+            .expect_err("an unknown field is refused");
+        prop_assert!(unknown.message().contains("surprise"), "{}", unknown.message());
+    }
+}

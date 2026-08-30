@@ -1,6 +1,6 @@
 # 045 Autoscaling on ECS on EC2 (private-only, no CloudWatch)
 
-**Status:** revised draft  
+**Status:** future direction — not yet implemented; spec authors should treat as intent, not decided architecture  
 **Decision direction:** preferred  
 **Related docs:** [035-placement-and-membership](035-placement-and-membership.md), [040-delivery-broker](040-delivery-broker.md), [050-dsql-storage](050-dsql-storage.md), [060-connection-management](060-connection-management.md), [090-failover-and-recovery](090-failover-and-recovery.md)
 

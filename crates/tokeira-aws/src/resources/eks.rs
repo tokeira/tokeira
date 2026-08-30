@@ -822,3 +822,79 @@ impl Resource for EksClusterResource {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn eks_resource(version: &str) -> EksClusterResource {
+        EksClusterResource::new(
+            &crate::ResourceContext {
+                project: "tok".into(),
+                region: "us-east-1".into(),
+                tags: HashMap::new(),
+            },
+            EksConfig {
+                version: version.into(),
+                namespace: "tokeira".into(),
+                kms_key_arn: None,
+                deletion_protection: false,
+                bootstrap_admin_permissions: false,
+                cluster_admin_principal_arn: None,
+            },
+            "eks",
+        )
+    }
+
+    fn cluster_state(properties: serde_json::Value) -> ResourceState {
+        let now = chrono::Utc::now().to_rfc3339();
+        ResourceState {
+            resource_type: ResourceType::new("EksCluster"),
+            physical_id: "tok-eks".into(),
+            properties,
+            dependencies: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            module: "eks".into(),
+        }
+    }
+
+    #[test]
+    fn diff_noops_when_version_matches() {
+        let resource = eks_resource("1.31");
+        let current = cluster_state(serde_json::json!({ "version": "1.31" }));
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::NoChange { .. }));
+    }
+
+    #[test]
+    fn diff_updates_when_version_changes() {
+        let resource = eks_resource("1.32");
+        let current = cluster_state(serde_json::json!({ "version": "1.31" }));
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        match change {
+            InternalChange::Update { details, .. } => {
+                assert_eq!(details[0].field, "version");
+                assert_eq!(details[0].before.as_deref(), Some("1.31"));
+                assert_eq!(details[0].after.as_deref(), Some("1.32"));
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_updates_when_version_missing_from_state() {
+        let resource = eks_resource("1.31");
+        let current = cluster_state(serde_json::json!({ "cluster_name": "tok-eks" }));
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+}

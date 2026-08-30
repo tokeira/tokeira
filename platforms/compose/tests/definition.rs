@@ -152,3 +152,67 @@ fn selecting_dsql_adds_the_module_and_writeback() {
     assert_eq!(modules, ["local_state", "dsql", "runtime", "observability"]);
     assert_eq!(output.graph.writeback().len(), 5);
 }
+
+// Feature: platform-builder-abstraction, Property 16: compose storage modes
+// preserve graph parity. In-memory omits DSQL and carries no writeback;
+// managed and preexisting DSQL add the dsql module and its five writebacks —
+// and all three modes realize the identical non-DSQL service resource set.
+#[test]
+fn storage_modes_preserve_the_reference_graph_shape() {
+    let shipped = shipped_root();
+    let use_line =
+        "use platform::{Aws, Backend, Compose, Grafana, Observability, Storage, Tokeirad};";
+    let dsql_use = shipped.replace(
+        use_line,
+        "use platform::{Aws, Backend, Compose, DsqlMode, DsqlStorage, Grafana, Observability, Storage, Tokeirad};",
+    );
+    let managed = dsql_use.replace(
+        "storage: Storage::InMemory,",
+        "storage: Storage::Dsql(DsqlStorage {\n            region: \"eu-west-2\".into(),\n            mode: DsqlMode::Managed,\n            endpoint: None,\n            arn: None,\n        }),",
+    );
+    let preexisting = dsql_use.replace(
+        "storage: Storage::InMemory,",
+        "storage: Storage::Dsql(DsqlStorage {\n            region: \"eu-west-2\".into(),\n            mode: DsqlMode::Preexisting,\n            endpoint: \"example-cluster.dsql.eu-west-2.on.aws\".into(),\n            arn: \"arn:aws:dsql:eu-west-2:000000000000:cluster/example\".into(),\n        }),",
+    );
+    assert_ne!(managed, shipped, "the managed literal was rewritten");
+    assert_ne!(
+        preexisting, shipped,
+        "the preexisting literal was rewritten"
+    );
+
+    let service_set = |root: &str, label: &str| {
+        let output = evaluate(root).unwrap_or_else(|err| panic!("{label} evaluates: {err}"));
+        let has_dsql = output
+            .graph
+            .modules()
+            .iter()
+            .any(|module| module.name() == "dsql");
+        let services: Vec<String> = output
+            .graph
+            .resources()
+            .iter()
+            .filter(|resource| resource.module() != "dsql")
+            .map(|resource| format!("{}:{}", resource.module(), resource.logical_id()))
+            .collect();
+        (has_dsql, output.graph.writeback().len(), services)
+    };
+
+    let (in_memory_dsql, in_memory_writebacks, in_memory_services) =
+        service_set(&shipped, "in-memory");
+    let (managed_dsql, managed_writebacks, managed_services) = service_set(&managed, "managed");
+    let (preexisting_dsql, preexisting_writebacks, preexisting_services) =
+        service_set(&preexisting, "preexisting");
+
+    assert!(!in_memory_dsql, "in-memory carries no dsql module");
+    assert_eq!(in_memory_writebacks, 0);
+    assert!(managed_dsql, "managed DSQL adds the dsql module");
+    assert_eq!(managed_writebacks, 5);
+    assert!(preexisting_dsql, "preexisting DSQL adds the dsql module");
+    assert_eq!(preexisting_writebacks, 5);
+
+    assert_eq!(
+        in_memory_services, managed_services,
+        "the service resource set is storage-mode independent"
+    );
+    assert_eq!(in_memory_services, preexisting_services);
+}

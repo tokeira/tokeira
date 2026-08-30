@@ -29,6 +29,23 @@ pub struct PortForwardConfig {
     pub(crate) local_port: u16,
 }
 
+impl PortForwardConfig {
+    /// Construct a loopback-only forward to one service pod port.
+    pub fn new(
+        namespace: impl Into<String>,
+        service_name: impl Into<String>,
+        remote_port: u16,
+        local_port: u16,
+    ) -> Self {
+        Self {
+            namespace: namespace.into(),
+            service_name: service_name.into(),
+            remote_port,
+            local_port,
+        }
+    }
+}
+
 /// A running port-forward session handle.
 ///
 /// Dropping [`abort_handle`](Self::abort_handle) (or aborting it) stops the
@@ -39,6 +56,15 @@ pub struct PortForwardSession {
     pub local_addr: SocketAddr,
     /// The background accept-loop task; abort it to stop forwarding.
     pub abort_handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PortForwardSession {
+    fn drop(&mut self) {
+        // The listener is a capability owned by this handle. Explicitly abort
+        // it so ending an operator session cannot leave a detached loopback
+        // listener alive inside a longer-running provisioner process.
+        self.abort_handle.abort();
+    }
 }
 
 /// Start a port-forward session to a pod backing the target service.

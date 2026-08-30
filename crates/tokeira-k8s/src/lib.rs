@@ -33,7 +33,7 @@ mod portforward;
 mod scale;
 mod watch;
 
-pub use logs::LogOptions;
+pub use logs::{KubeLogStream, LogOptions};
 pub use namespace::{NamespaceConfig, NamespaceResource};
 pub use platform::KubePlatform;
 pub use portforward::{PortForwardConfig, PortForwardSession};
@@ -59,8 +59,8 @@ pub(crate) const FIELD_MANAGER: &str = "tkp";
 pub enum K8sError {
     /// The API server could not be reached (no cluster, connectivity, or auth).
     ///
-    /// Read-only `plan` tolerates this by omitting the platform from the
-    /// context; `apply`/`destroy` require a reachable platform.
+    /// Read-only `plan` treats this as unsupported live state;
+    /// `apply`/`destroy` require a reachable platform.
     #[error("kubernetes API server is unreachable: {0}")]
     Unreachable(String),
     /// A manifest lacked a field required to route it to an API endpoint

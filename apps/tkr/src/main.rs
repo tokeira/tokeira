@@ -452,7 +452,7 @@ fn forwarded_scale_verb(action: &ScaleAction) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc};
 
     use super::*;
     use crate::{
@@ -463,6 +463,7 @@ mod tests {
         deployment_dir::{DEPLOYMENT_TOML, METADATA_JSON, TOKEIRAD_TOML},
     };
     use proptest::prelude::*;
+    use serde::Serialize;
     use serde_json::json;
     use tokeira_local_deployment::LocalConfig;
     use tokeira_orchestrator::{PlatformConfig, PlatformId, StorageKind};
@@ -1328,6 +1329,137 @@ mod tests {
             "no legacy deployment.toml"
         );
         assert!(dir.join("state").exists(), "state dir created");
+    }
+
+    #[derive(Serialize)]
+    struct DefinitionContext {
+        project_name: String,
+    }
+
+    fn assert_created_eks_plan_inputs(
+        dir: &std::path::Path,
+        definition: &tokeira_deployment::RecordedDefinition,
+    ) {
+        use tokeira_platform::definition::{
+            DefinitionSource, DefinitionSourceName, DirectoryPartSources, evaluate_definition,
+            verify_definition,
+        };
+
+        let definition_path = dir.join(definition.path.as_path());
+        let source = DefinitionSource {
+            format: definition.format.clone(),
+            source_name: DefinitionSourceName::DeploymentRelative(definition.path.clone()),
+            bytes: Arc::from(fs::read(&definition_path).expect("created root is readable")),
+        };
+        let parts = DirectoryPartSources::new(dir, definition.format.as_str());
+        let context = DefinitionContext {
+            project_name: "created-eks".to_string(),
+        };
+        let declaration = tokeira_eks_deployment::platform();
+        let evaluated = match definition.format.as_str() {
+            "tkd" => evaluate_definition(
+                &tokeira_platform_definition::tkd::frontend(),
+                source,
+                &context,
+                &declaration.namespaces,
+                &parts,
+            ),
+            "tkdp" => evaluate_definition(
+                &tokeira_platform_definition::tkdp::frontend(),
+                source,
+                &context,
+                &declaration.namespaces,
+                &parts,
+            ),
+            format => panic!("unexpected EKS definition format {format}"),
+        }
+        .expect("created definition evaluates from its staged companions");
+        let realized = verify_definition(&evaluated)
+            .realize("created-eks", dir, dir, &BTreeMap::new())
+            .expect("created definition realizes with staged companion content");
+        let resources = realized.iter().collect::<Vec<_>>();
+        assert!(
+            tokeira_iac::verify_resources(&resources).is_empty(),
+            "created definition produces valid provider-independent plan inputs"
+        );
+        assert_eq!(
+            realized.manifests().len(),
+            resources.len(),
+            "every realized infrastructure resource contributes its desired plan manifest"
+        );
+    }
+
+    #[test]
+    fn eks_create_stages_full_sets_and_plan_inputs_for_both_formats() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let discovery = platform_discovery::PlatformDiscovery::from_workspace(&workspace)
+            .expect("workspace discovery");
+        let descriptor = discovery
+            .platform(&platform("eks"))
+            .expect("EKS descriptor");
+
+        for format in ["tkd", "tkdp"] {
+            let format_id = tokeira_orchestrator::DefinitionFormatId::new(format)
+                .expect("built-in definition format");
+            let (frontend, definition_path, seed_path) = discovery
+                .workspace_frontend(descriptor, Some(&format_id))
+                .expect("EKS frontend seed");
+            let sources =
+                tokeira_platform_definition::read_source_set(&seed_path, Some(&frontend.format))
+                    .expect("complete EKS source set");
+            let expected_root = sources.root.clone();
+            let expected_parts = sources.parts.clone();
+            let expected_content = discovery
+                .workspace_content(descriptor)
+                .expect("EKS companion content");
+            let temp = tempfile::tempdir().expect("deployment root");
+            let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
+            let recorded = tokeira_deployment::RecordedDefinition {
+                format: frontend.format.clone(),
+                path: definition_path,
+            };
+            let pending = deployments
+                .begin_create(
+                    "created-eks",
+                    platform("eks"),
+                    StorageKind::InMemory,
+                    None,
+                    Some(deployment_dir::DefinitionSeed {
+                        definition: recorded.clone(),
+                        bytes: sources.root,
+                        parts: sources.parts,
+                        content: expected_content
+                            .iter()
+                            .map(|file| (file.relative_path.clone(), file.bytes.clone()))
+                            .collect(),
+                    }),
+                )
+                .expect("tkr create stages EKS");
+            assert_eq!(
+                fs::read(pending.path().join(recorded.path.as_path())).expect("staged root"),
+                expected_root
+            );
+            for (name, expected) in &expected_parts {
+                assert_eq!(
+                    fs::read(pending.path().join(name)).expect("staged definition part"),
+                    *expected,
+                    "{format} part {name} stages byte-for-byte"
+                );
+            }
+            for file in &expected_content {
+                assert_eq!(
+                    fs::read(pending.path().join(file.relative_path.as_path()))
+                        .expect("staged companion content"),
+                    file.bytes,
+                    "{format} content {} stages byte-for-byte",
+                    file.relative_path
+                );
+            }
+
+            let metadata = pending.publish().expect("created deployment publishes");
+            let dir = deployments.path(&metadata.name);
+            assert_created_eks_plan_inputs(&dir, &recorded);
+        }
     }
 
     #[tokio::test]

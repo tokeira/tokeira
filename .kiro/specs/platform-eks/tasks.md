@@ -15,7 +15,7 @@
   `kind::decode_resource`/`decode_service`, own TYPE consts pinned by test) and retire the
   bridge/builder machinery the retired frontend required. Kinds keep realizing to `tokeira-aws`
   resources unchanged (Req 4.1).
-- [ ] 1.2 Implement `EksExecution` (probe: AWS credential resolvability = `Ok(None)`; no
+- [x] 1.2 Implement `EksExecution` (probe: AWS credential resolvability = `Ok(None)`; no
   deployment-wide cluster probe — document why operation-local errors are authoritative) and
   `EksIntegration` (registers the live `KubePlatform` extension during applying verbs; never
   constructs a duplicate AWS client bundle) (Req 2.2).
@@ -29,12 +29,11 @@
 - [x] 1.5 [PBT] `// Feature: platform-eks, Property 9` — NodePool/pod-shape/version topology currency.
 - [x] 1.6 **Checkpoint** — crate green under the workspace bar; kinds decode/realize round-trips pass.
 
-  **DONE:** 1.1 and 1.3–1.5. The platform declares the current namespaces and catalog seeds, and
-  focused tests pin kind decoding, EKS 1.36, Auto Mode family selection, and the workload pod
-  shape. The integration seam in 1.2 remains open because the framework registers extensions only
-  before infrastructure apply: a cluster created by that apply cannot supply a refreshed
-  `KubePlatform` to later resources or deployment services in the same operation. The complete
-  workspace bar is green on the XL devbox.
+  **DONE:** 1.1–1.6. The platform declares the current namespaces and catalog seeds, and focused
+  tests pin kind decoding, EKS 1.36, Auto Mode family selection, and the workload pod shape.
+  `EksIntegration` registers one shared, lazy `KubePlatform`: registration performs no Kubernetes
+  access, and failed first-use initialization is retryable after the ordered cluster module. The
+  complete workspace bar is green on the XL devbox.
 
 ## 2. The definition sets
 
@@ -75,21 +74,24 @@
   fixtures.
 - [ ] 3.3 S3-native state store selection keyed by the deployment name alone; loud failure without AWS
   clients (Req 11.1).
-- [ ] 3.4 `tkr … create` stages the shipped set for the chosen format — root + all parts + content —
+- [x] 3.4 `tkr … create` stages the shipped set for the chosen format — root + all parts + content —
   verified by a create-then-plan test (Req 11.2; the companion-content staging lesson).
-- [ ] 3.5 **Checkpoint** — created deployment plans clean in both formats without further staging.
+- [x] 3.5 **Checkpoint** — created deployment plans clean in both formats without further staging.
 
-  **DONE:** 3.1–3.2. The standard writeback resolver produces exactly the five fields admitted by
-  `TokeiraConfig`; service assembly consumes the applied private DSQL endpoint and refuses an
-  unresolved output. S3 store selection remains a framework-owned gap: the provisioner currently
-  selects local CAS stores before platform execution and exposes no platform store-selection seam.
+  **DONE:** 3.1–3.2 and 3.4–3.5. The standard writeback resolver produces exactly the five fields
+  admitted by `TokeiraConfig`; service assembly consumes the applied private DSQL endpoint and
+  refuses an unresolved output. A framework-independent `tkr create` regression byte-checks every
+  shipped root, part, and content companion, then evaluates and realizes the created deployment into
+  verified plan inputs for both frontends. S3 store selection remains a framework-owned gap: the
+  provisioner currently selects local CAS stores before platform execution and exposes no platform
+  store-selection seam.
 
 ## 4. Operations and live apply
 
-- [ ] 4.1 `Ops` over `KubePlatform`: scale in startup order (reverse down; zero admissible for
+- [x] 4.1 `Ops` over `KubePlatform`: scale in startup order (reverse down; zero admissible for
   `tokeirad` + observability; controller-zero refused while runtimes remain), logs, port-forward; every
   verb loud and actionable when the cluster/credentials are unreachable (Req 9).
-- [ ] 4.2 [PBT] `// Feature: platform-eks, Property 11` — scale-order computation with zero targets.
+- [x] 4.2 [PBT] `// Feature: platform-eks, Property 11` — scale-order computation with zero targets.
 - [x] 4.3 [PBT] `// Feature: platform-eks, Property 8` — apply routes through the registered
   `KubePlatform`; plan-without-cluster yields Creates; missing-handle lifecycle error.
 - [x] 4.4 [PBT] `// Feature: platform-eks, Property 5` — manifest serde round-trip + acyclic service
@@ -105,10 +107,14 @@
 - [ ] 4.8 **Checkpoint** — full §10.4 bar green; provider-contract checklist satisfied item-by-item in
   the PR.
 
-  **DONE:** 4.3–4.4. Plans remain provider-pure, missing Kubernetes handles fail loudly, registered
-  handles own apply/delete, desired-field comparison checks live Kubernetes drift, and the
-  seven-service graph is acyclic in startup order. Live integration task 4.5 and the operator-access
-  slice in tasks 4.6–4.8 remain operator-gated follow-ups.
+  **DONE:** 4.1–4.4. `Ops` re-evaluates the admitted revision to recover its authored namespace and
+  derives the cluster name from deployment identity; logs, live pod port-forward, and readiness-
+  awaited scale all run through `KubePlatform`. Scale reductions run in reverse startup order,
+  increases run forward, zero is admitted, and controller-zero is refused while runtimes remain;
+  Property 11 covers generated mixed target sets. Registered handles connect lazily on first use
+  (Req 13.3), plans remain provider-pure, desired-field comparison checks live drift, and the
+  seven-service graph is acyclic. Live integration task 4.5 and the remaining operator-access slice
+  in tasks 4.6–4.8 remain operator-gated follow-ups.
 
 ## 5. Live acceptance (operator-driven)
 

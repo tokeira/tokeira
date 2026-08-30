@@ -218,22 +218,24 @@ impl iac::Resource for K8sManifestResource {
     }
 
     async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
-        // No platform → existence is unknowable, not absent: return `Unsupported`
-        // so the engine never prunes on a read-only `plan` with no reachable
-        // cluster (design → Property 11). Every desired manifest then diffs as a
-        // Create.
+        // A missing handle or a lazy handle whose first connection cannot
+        // reach the cluster makes existence unknowable, not absent. Returning
+        // `Unsupported` keeps read-only plan provider-pure and prevents state
+        // pruning; mutations still surface the same connection failure loudly.
         let Some(platform) = ctx.extension::<KubePlatform>() else {
             return Ok(DescribeResult::Unsupported);
         };
         let mut any_present = false;
         let mut live_manifests = Vec::with_capacity(self.manifests.len());
         for manifest in &self.manifests {
-            match platform.get(manifest).await.map_err(to_iac)? {
-                Some(live) => {
+            match platform.get(manifest).await {
+                Ok(Some(live)) => {
                     any_present = true;
                     live_manifests.push(live);
                 }
-                None => live_manifests.push(serde_json::Value::Null),
+                Ok(None) => live_manifests.push(serde_json::Value::Null),
+                Err(K8sError::Unreachable(_)) => return Ok(DescribeResult::Unsupported),
+                Err(error) => return Err(to_iac(error)),
             }
         }
         // Any live object of the bundle means it exists; re-apply reconciles the

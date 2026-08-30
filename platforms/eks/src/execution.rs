@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use tokeira_k8s::{K8sError, KubePlatform};
+use tokeira_k8s::KubePlatform;
 use tokeira_platform::declaration::{DeploymentRef, PlatformExecution, PlatformIntegration};
 
 use crate::service::EksServicePlatform;
@@ -35,19 +35,6 @@ pub struct EksIntegration {
 }
 
 impl EksIntegration {
-    async fn reachable_platform() -> Result<Option<KubePlatform>, K8sError> {
-        let platform = match KubePlatform::connect().await {
-            Ok(platform) => platform,
-            Err(K8sError::Unreachable(_)) => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        match platform.ensure_reachable().await {
-            Ok(()) => Ok(Some(platform)),
-            Err(K8sError::Unreachable(_)) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
     fn remember(&self, deployment: &str, platform: KubePlatform) -> anyhow::Result<()> {
         self.platforms
             .write()
@@ -64,10 +51,12 @@ impl PlatformIntegration for EksIntegration {
         deployment: &DeploymentRef,
         ctx: &mut tokeira_iac::ProvisionContext,
     ) -> anyhow::Result<()> {
-        if let Some(platform) = Self::reachable_platform().await? {
-            ctx.set_extension(platform.clone());
-            self.remember(&deployment.name, platform)?;
-        }
+        // Registration cannot require a pre-existing cluster: networking and
+        // the cluster are earlier modules in the same first apply. The shared
+        // handle resolves ambient connection details on its first K8s use.
+        let platform = KubePlatform::lazy();
+        ctx.set_extension(platform.clone());
+        self.remember(&deployment.name, platform)?;
         Ok(())
     }
 
@@ -76,10 +65,9 @@ impl PlatformIntegration for EksIntegration {
         deployment: &DeploymentRef,
         ctx: &mut tokeira_deploy_engine::ServiceContext,
     ) -> anyhow::Result<()> {
-        if let Some(platform) = Self::reachable_platform().await? {
-            ctx.set_extension(platform.clone());
-            self.remember(&deployment.name, platform)?;
-        }
+        let platform = KubePlatform::lazy();
+        ctx.set_extension(platform.clone());
+        self.remember(&deployment.name, platform)?;
         Ok(())
     }
 
@@ -138,5 +126,25 @@ mod tests {
             .expect_err("an unregistered deployment must fail closed");
 
         assert!(error.to_string().contains("deployment `demo`"));
+    }
+
+    #[tokio::test]
+    async fn registration_is_lazy_and_needs_no_reachable_cluster() {
+        let integration = EksIntegration::default();
+        let mut ctx = tokeira_iac::ProvisionContext::new("demo", std::collections::HashMap::new());
+
+        integration
+            .register_infra_extensions(&deployment(), &mut ctx)
+            .await
+            .expect("registration performs no provider access");
+
+        assert!(ctx.extension::<KubePlatform>().is_some());
+        assert!(
+            integration
+                .platforms
+                .read()
+                .expect("registry lock")
+                .contains_key("demo")
+        );
     }
 }

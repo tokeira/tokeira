@@ -13,23 +13,28 @@ mod k8s_resource;
 pub mod kinds;
 mod manifests;
 pub mod observability_content;
+mod ops;
 mod service;
+
+fn namespaces() -> Vec<Namespace> {
+    vec![
+        kinds::namespace(),
+        tokeira_deployment::server_config::namespace(),
+        observability_content::namespace(),
+        Namespace {
+            name: tokeira_aws::kinds::NAMESPACE,
+            kinds: tokeira_aws::kinds::KINDS,
+            defaults: None,
+            decode: tokeira_aws::kinds::decode,
+        },
+    ]
+}
 
 /// Pure EKS platform declaration.
 pub fn platform() -> PlatformDeclaration {
     PlatformDeclaration {
-        namespaces: vec![
-            kinds::namespace(),
-            tokeira_deployment::server_config::namespace(),
-            observability_content::namespace(),
-            Namespace {
-                name: tokeira_aws::kinds::NAMESPACE,
-                kinds: tokeira_aws::kinds::KINDS,
-                defaults: None,
-                decode: tokeira_aws::kinds::decode,
-            },
-        ],
-        ops: None,
+        namespaces: namespaces(),
+        ops: Some(Box::new(ops::EksOps::default())),
         execution: Box::new(execution::EksExecution),
         implementation: Arc::new(execution::EksIntegration::default()),
     }
@@ -55,7 +60,7 @@ mod tests {
                 "tokeira_aws"
             ]
         );
-        assert!(declaration.ops.is_none());
+        assert!(declaration.ops.is_some());
         let mut names = std::collections::BTreeSet::new();
         for namespace in declaration.namespaces {
             for kind in namespace.kinds {

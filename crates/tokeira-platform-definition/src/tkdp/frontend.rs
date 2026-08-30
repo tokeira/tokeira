@@ -249,6 +249,9 @@ fn values_equal(left: &LocatedValue, right: &LocatedValue) -> bool {
         (ValueShape::Unit, ValueShape::Unit) => true,
         (ValueShape::Bool(left), ValueShape::Bool(right)) => left == right,
         (ValueShape::Integer(left), ValueShape::Integer(right)) => left == right,
+        // Compare authored f64 values exactly, with no tolerance or NaN
+        // normalization. IEEE equality makes a NaN-valued create field refuse
+        // even against itself; authored configuration accepts that safe bias.
         (ValueShape::Float(left), ValueShape::Float(right)) => left == right,
         (ValueShape::String(left), ValueShape::String(right)) => left == right,
         (ValueShape::Sequence(left), ValueShape::Sequence(right)) => {
@@ -359,6 +362,9 @@ fn collect_retargets(
             }
         }
         (ValueShape::Sequence(prior), ValueShape::Sequence(current)) => {
+            // Sequence elements pair positionally. A prepend can therefore
+            // mis-pair later create fields and false-refuse the edit, which is
+            // the safe direction for create-time identity admission.
             for (prior, current) in prior.iter().zip(current) {
                 collect_retargets(creates, prior, current, messages);
             }

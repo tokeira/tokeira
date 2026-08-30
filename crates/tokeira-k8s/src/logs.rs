@@ -4,8 +4,10 @@
 //! [`crate::standard_labels`]); the platform resolves that to a backing pod and
 //! reads its logs. This is the operator `logs` day-2 op — no `kubectl` shell-out.
 
+use std::pin::Pin;
+
 use anyhow::{Context, Result};
-use futures::{AsyncBufReadExt, TryStreamExt};
+use futures::{AsyncBufReadExt, Stream, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     Client,
@@ -25,6 +27,15 @@ pub struct LogOptions {
 }
 
 impl LogOptions {
+    /// Construct options for a snapshot or following log read.
+    pub fn new(follow: bool, tail_lines: Option<i64>, container: Option<String>) -> Self {
+        Self {
+            follow,
+            tail_lines,
+            container,
+        }
+    }
+
     /// Translate into `kube`'s `LogParams`, applying `follow`/`tail`/`container`.
     fn to_params(&self) -> LogParams {
         LogParams {
@@ -35,6 +46,9 @@ impl LogOptions {
         }
     }
 }
+
+/// An owned line stream from one Kubernetes pod log response.
+pub type KubeLogStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
 
 /// Fetch a snapshot of a service pod's logs as a single string (non-following).
 pub(crate) async fn get_pod_logs(
@@ -49,6 +63,24 @@ pub(crate) async fn get_pod_logs(
         .with_context(|| format!("no running pod found for service {service_name}"))?;
     let logs = pods.logs(&pod_name, &options.to_params()).await?;
     Ok(logs)
+}
+
+/// Open an owned line stream for a service pod.
+pub(crate) async fn open_service_log_stream(
+    client: &Client,
+    namespace: &str,
+    service_name: &str,
+    options: &LogOptions,
+) -> Result<KubeLogStream> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pod_name = find_running_pod(&pods, service_name)
+        .await?
+        .with_context(|| format!("no running pod found for service {service_name}"))?;
+
+    info!(pod = pod_name, service = service_name, "streaming logs");
+
+    let stream = pods.log_stream(&pod_name, &options.to_params()).await?;
+    Ok(Box::pin(stream.lines().map_err(anyhow::Error::from)))
 }
 
 /// Stream a service pod's logs, invoking `on_line` for each line as it arrives.

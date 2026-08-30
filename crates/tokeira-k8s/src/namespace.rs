@@ -16,7 +16,7 @@ use tokeira_iac::{
     ResourceId, ResourceState, ResourceType, Reversibility, SemanticsContext,
 };
 
-use crate::KubePlatform;
+use crate::{K8sError, KubePlatform};
 
 /// Opaque resource-type tag recorded in state for a namespace.
 const RESOURCE_TYPE: &str = "Namespace";
@@ -247,10 +247,10 @@ impl Resource for NamespaceResource {
     }
 
     async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
-        // No platform means existence is unknowable, not absent. Returning
-        // `Unsupported` (rather than `Absent`) stops the engine from pruning
-        // persisted state, and is precisely the path a read-only `plan` takes
-        // when no cluster is reachable (design → Property 11).
+        // A missing handle or a lazy handle whose first connection cannot
+        // reach the cluster makes existence unknowable, not absent. Returning
+        // `Unsupported` keeps read-only plan provider-pure and prevents state
+        // pruning; mutations still surface the same connection failure loudly.
         let Some(platform) = ctx.extension::<KubePlatform>() else {
             return Ok(DescribeResult::Unsupported);
         };
@@ -258,6 +258,7 @@ impl Resource for NamespaceResource {
         match platform.get(&self.desired_manifest()).await {
             Ok(Some(live)) => Ok(DescribeResult::Present(self.state_with_manifest(live))),
             Ok(None) => Ok(DescribeResult::Absent),
+            Err(K8sError::Unreachable(_)) => Ok(DescribeResult::Unsupported),
             Err(error) => Err(IacError::Other(anyhow::Error::new(error))),
         }
     }

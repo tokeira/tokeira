@@ -25,6 +25,7 @@ tokeira-aws = { workspace = true }
 tokeira-iac = { workspace = true }
 tokeira-deploy-engine = { workspace = true }
 tokeira-platform = { workspace = true }
+tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
 tokeira-deployment = { workspace = true }
 tokeira-config = { workspace = true }
 # K8s object types for the manifest builders (Block 3). Pinned to the same
@@ -40,7 +41,6 @@ thiserror = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = { workspace = true }
-tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
 
 [lints]
 workspace = true

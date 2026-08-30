@@ -8805,6 +8805,7 @@ dependencies = [
  "tokeira-deploy-engine",
  "tokeira-deployment",
  "tokeira-ecs-deployment",
+ "tokeira-eks-deployment",
  "tokeira-iac",
  "tokeira-local-deployment",
  "tokeira-orchestrator",

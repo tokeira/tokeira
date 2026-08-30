@@ -100,7 +100,7 @@ affordance 1.36 unlocks, outside this spec.
 - **Module staging** — the ordered infra module set:
   `remote_state → images → networking → dsql → cluster → observability → services`, mirroring the ECS
   definition's modular decomposition. The bootstrap `remote_state` module creates the S3 state bucket.
-- **Writeback / hydration** — projecting discovered infra outputs (DSQL endpoint/ARN, region,
+- **Writeback / hydration** — projecting discovered infra outputs (the DSQL endpoint, region, and
   coordination table names) into the deployment's `TokeiraConfig` through the definition's declared
   writebacks, persisted platform-side after infra apply.
 - **tokeira topology** — tokeira's real process set: `tokeirad` (the monolithic edge+runtime+projection
@@ -194,13 +194,14 @@ node; the `max_idle_conns == max_conns` invariant is enforced by `TokeiraConfig`
 | `services` (per-service: image, replicas, cpu, memory) | tokeira's real topology only (Requirement 6) | Non-canonical gRPC/metrics ports rejected | ecs `services.tkd` |
 | `observability` ({mimir,loki,grafana,alloy} image + cpu/memory + retention) | Carried; images pinned to the workspace-current observability pins | — | model.rs `ObservabilitySection`; ecs `observability.tkd` |
 | `debug` (cloudwatch_logs, log_retention_days) | Carried; gates the optional `logs` VPC endpoint | — | model.rs `DebugSection` |
+| `operator_access` (shaped enum: `Ssm` default / `External`) | `Ssm` makes the nodes SSM-managed and provisions the SSM interface endpoints (Requirement 13); `External` provisions neither — the operator brings VPN/Direct Connect | — | source operator model (SSM/VPN); ecs-deployment SSM precedent |
 
 ## AWS Resource Kind Policy (all reused from `tokeira-aws`)
 
 | Kind | `tokeira-aws` resource | Module | Notes |
 |---|---|---|---|
 | `Vpc` | `vpc` | networking | private-only; emits `subnet_ids` |
-| `VpcEndpoint` (Gateway/Interface) | `vpc_endpoint` | networking | s3+dynamodb gateway; ecr/sts/eks-auth/dsql/secretsmanager interface; logs iff `debug.cloudwatch_logs` |
+| `VpcEndpoint` (Gateway/Interface) | `vpc_endpoint` | networking | s3+dynamodb gateway; ecr/sts/eks-auth/dsql/secretsmanager interface; logs iff `debug.cloudwatch_logs`; ssm/ssmmessages/ec2messages interface iff `operator_access = Ssm` (the ECS deployment's required-endpoint precedent) |
 | `SecurityGroup` | `security_group` | networking | eks-nodes-sg (membership+grpc+metrics self) and vpc-endpoints-sg (443, 5432) |
 | `IamRole` | `iam_role` | dsql / cluster | cluster-role, auto-node-role, and per-service Pod-Identity task roles (the tokeirad task role carries DSQL + DynamoDB access) |
 | `DsqlCluster` | `dsql_cluster` | dsql | Managed vs Preexisting per the shaped config enum |
@@ -231,7 +232,6 @@ node; the `max_idle_conns == max_conns` invariant is enforced by `TokeiraConfig`
 | `infrastructure.storage = "dsql"` | (const, under DSQL) | mirrors compose + ecs |
 | `infrastructure.dsql.endpoint` | connection-endpoint `private_hostname`, else cluster `cluster_endpoint` | endpoint-preferred |
 | `infrastructure.dsql.region` | config region | |
-| `infrastructure.dsql.arn` | cluster `cluster_arn` | |
 | `infrastructure.dsql.rate_limiter_table` / `conn_lease_table` | DynamoDb table `name` | coordination tables |
 
 ## Requirements
@@ -399,7 +399,10 @@ through the standard operations seam, so that a running deployment is fully oper
 1. THE declaration SHALL supply `Ops` implemented in provider terms: scale patches Deployment replicas
    and waits for readiness in tokeira's startup order (reverse order scaling down); logs return the
    service's recent logs from the live cluster; port-forward establishes a live forward via the `kube`
-   client.
+   client, reached through the operator-access path of Requirement 13. The coordinates `Ops` needs
+   beyond `DeploymentRef` (the admitted namespace, the derived cluster name) SHALL be recovered from
+   the deployment directory the `DeploymentRef` carries — reading the admitted revision is the
+   sanctioned path for a definition-backed platform's operations.
 2. WHERE a day-2 verb requires a reachable cluster, THE platform SHALL surface a clear, actionable
    error when the cluster or credentials are unavailable, and SHALL NOT silently succeed.
 3. THE scale verb SHALL admit zero as a target replica count for `tokeirad` and the observability
@@ -456,3 +459,35 @@ composition validated, so that the platform's desired state is trustworthy befor
    admission; non-`#[create]` changes SHALL reconcile.
 4. Generated Kubernetes manifests SHALL round-trip through `serde_json` without loss, and the service
    dependency graph SHALL be acyclic.
+
+### Requirement 13: Operator access to the private cluster (SSM-first)
+
+**User Story:** As an operator with no VPN or Direct Connect, I want to reach my private-only EKS
+deployment — for apply, kubectl, and every day-2 verb — through AWS SSM Session Manager alone, so
+that private-only never means inaccessible.
+
+_Ground truth: the ECS deployment already establishes this pattern — `AmazonSSMManagedInstanceCore`
+on the instance profiles "for SSM Session Manager — port-forward and exec", with `ssm`,
+`ssmmessages`, and `ec2messages` in its required interface-endpoint set
+(`.kiro/specs/ecs-deployment/tasks.md` 3.2, 5.1). EKS Auto Mode nodes run Bottlerocket, which ships
+the SSM agent; making the nodes SSM-managed makes them the tunnel anchors — no bastion or relay
+instance exists in this design._
+
+#### Acceptance Criteria
+
+1. WHERE `operator_access = Ssm` (the default), THE node IAM role SHALL carry the AWS-managed SSM
+   core policy and the networking module SHALL provision the `ssm`, `ssmmessages`, and
+   `ec2messages` interface endpoints, so every node registers as an SSM managed instance with no
+   public path (sessions are agent-initiated and outbound-only, preserving Requirement 10).
+2. WHEN a kube connection is needed from a seat with no VPC route (live apply and every day-2 verb
+   alike), THE platform SHALL establish it through an SSM port-forwarding session anchored on a
+   node, layered to the private EKS API endpoint — and the connection path SHALL be one shared
+   mechanism, not per-verb reimplementations.
+3. IF the local AWS Session Manager plugin is absent or no node is SSM-registered yet, THEN the
+   operation SHALL fail with an error naming exactly that condition and its remedy (install the
+   plugin; wait for node registration), and SHALL NOT silently fall back to a direct connection
+   attempt's timeout.
+4. WHERE `operator_access = External`, THE platform SHALL provision no SSM endpoints and attach no
+   SSM policy, and connection failures SHALL state that the deployment assumes an operator-provided
+   route (VPN/Direct Connect).
+5. THE deployment SHALL create no bastion, relay, or other standing access instance in either mode.

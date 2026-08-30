@@ -6,7 +6,7 @@
 
 use tokeira_platform_definition::tkdp::preflight::preflight;
 
-const FACADE: &[&str] = &["Context", "Deployment", "Probe", "Store"];
+const FACADE: &[&str] = &["Context", "Deployment", "create", "Probe", "Store"];
 
 /// Entrypoint scaffolding so snippet-level sources satisfy the entrypoint
 /// rules; the snippet lands inside `deployment`.

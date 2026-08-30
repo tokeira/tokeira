@@ -8,25 +8,28 @@
 //! here are the thin, typed surface (returning [`crate::K8sError`]); the
 //! `kube`-specific mechanics live in the sibling modules.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use kube::Client;
+use tokio::sync::OnceCell;
 
 use crate::{
     ApplyOptions, K8sError, PlannedManifest,
-    logs::LogOptions,
+    logs::{KubeLogStream, LogOptions},
     portforward::{PortForwardConfig, PortForwardSession},
     scale::DeploymentStatus,
 };
 
 /// A handle to a live Kubernetes API server.
 ///
-/// Cloneable (the inner `kube::Client` is a cheap `Arc`-backed handle) and
-/// `Send + Sync + 'static`, so it is safe to store in the provision context's
-/// typed extension map and share across concurrent resource operations.
+/// Cloneable and `Send + Sync + 'static`, so it is safe to store in the
+/// provision context's typed extension map and share across concurrent
+/// resource operations. Ambient client construction is lazy: registering the
+/// handle never requires the cluster to exist or be reachable, while the first
+/// operation still fails loudly if connection or authentication is unavailable.
 #[derive(Clone)]
 pub struct KubePlatform {
-    client: Client,
+    client: Arc<OnceCell<Client>>,
 }
 
 impl std::fmt::Debug for KubePlatform {
@@ -39,36 +42,72 @@ impl std::fmt::Debug for KubePlatform {
 }
 
 impl KubePlatform {
+    /// Construct an ambient-config handle without connecting to Kubernetes.
+    ///
+    /// The first operation initializes the shared client exactly once. Failed
+    /// initialization is not cached, so a later operation can succeed after an
+    /// operator repairs kubeconfig, credentials, or routing.
+    pub fn lazy() -> Self {
+        Self {
+            client: Arc::new(OnceCell::new()),
+        }
+    }
+
+    async fn client(&self) -> Result<Client, K8sError> {
+        self.client
+            .get_or_try_init(|| async {
+                let client = Client::try_default()
+                    .await
+                    .map_err(|error| K8sError::Unreachable(error.to_string()))?;
+                // Reachability is part of lazy initialization, not merely
+                // kubeconfig construction. That keeps an offline read-only
+                // plan on the typed `Unreachable` path while still letting a
+                // first apply connect after its cluster module completes.
+                client
+                    .apiserver_version()
+                    .await
+                    .map_err(|error| K8sError::Unreachable(error.to_string()))?;
+                Ok(client)
+            })
+            .await
+            .cloned()
+    }
+
+    /// Compare exactly the fields a desired manifest owns with one live object.
+    ///
+    /// Provider-defaulted and controller-owned live fields are ignored. This
+    /// pure comparator is shared by infrastructure and service drift checks so
+    /// both lifecycle planes use the same ownership rule.
+    pub fn desired_fields_match(desired: &serde_json::Value, live: &serde_json::Value) -> bool {
+        crate::apply::desired_fields_match(desired, live)
+    }
+
     /// Connect using the ambient kubeconfig or in-cluster service-account config.
     ///
-    /// A failure here is reported as [`K8sError::Unreachable`]: for `tkp` this is
-    /// the signal to omit the platform for read-only `plan` yet abort
-    /// `apply`/`destroy`.
+    /// A failure here is reported as [`K8sError::Unreachable`]: read-only
+    /// `plan` treats that as unsupported live state, while `apply`/`destroy`
+    /// surface it as a failure.
     pub async fn connect() -> Result<Self, K8sError> {
-        let client = Client::try_default()
-            .await
-            .map_err(|e| K8sError::Unreachable(e.to_string()))?;
-        Ok(Self { client })
+        let platform = Self::lazy();
+        platform.client().await?;
+        Ok(platform)
     }
 
     /// Wrap an already-constructed client (tests, or a custom-config client).
     pub fn from_client(client: Client) -> Self {
-        Self { client }
-    }
-
-    /// Borrow the underlying client for resource impls needing the raw `kube` API
-    /// (e.g. [`crate::NamespaceResource`], which uses the typed `Namespace` API).
-    pub(crate) fn client(&self) -> &Client {
-        &self.client
+        Self {
+            client: Arc::new(OnceCell::from(client)),
+        }
     }
 
     /// Confirm the API server is actually reachable.
     ///
-    /// `tkp` calls this before registering the platform for `apply`/`destroy`.
     /// A single lightweight version call is enough to distinguish "cluster
-    /// present" from "no reachable cluster" (design → Property 11).
+    /// present" from "no reachable cluster" when a caller needs an explicit
+    /// health check beyond the operation-local lazy initialization.
     pub async fn ensure_reachable(&self) -> Result<(), K8sError> {
-        self.client
+        self.client()
+            .await?
             .apiserver_version()
             .await
             .map(|_| ())
@@ -77,7 +116,8 @@ impl KubePlatform {
 
     /// Server-side-apply a batch of raw manifests; returns the count applied.
     pub async fn apply(&self, manifests: &[serde_json::Value]) -> Result<usize, K8sError> {
-        Ok(crate::apply::apply_manifests(&self.client, manifests).await?)
+        let client = self.client().await?;
+        Ok(crate::apply::apply_manifests(&client, manifests).await?)
     }
 
     /// Server-side-apply pre-planned manifests with explicit options (e.g. to
@@ -87,7 +127,8 @@ impl KubePlatform {
         manifests: &[PlannedManifest],
         options: ApplyOptions,
     ) -> Result<usize, K8sError> {
-        Ok(crate::apply::apply_planned_manifests(&self.client, manifests, options).await?)
+        let client = self.client().await?;
+        Ok(crate::apply::apply_planned_manifests(&client, manifests, options).await?)
     }
 
     /// Fetch a single object's live state as JSON, or `None` if it is absent.
@@ -95,12 +136,27 @@ impl KubePlatform {
         &self,
         manifest: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>, K8sError> {
-        Ok(crate::apply::get_manifest(&self.client, manifest).await?)
+        let client = self.client().await?;
+        Ok(crate::apply::get_manifest(&client, manifest).await?)
+    }
+
+    /// Report whether every field owned by the desired manifest set still
+    /// matches the live objects.
+    ///
+    /// Kubernetes adds defaults and controller state after apply, so this
+    /// compares the desired documents as recursive subsets of live state.
+    pub async fn manifests_current(
+        &self,
+        manifests: &[serde_json::Value],
+    ) -> Result<bool, K8sError> {
+        let client = self.client().await?;
+        Ok(crate::apply::manifests_current(&client, manifests).await?)
     }
 
     /// Delete a batch of manifests (reverse order, ignoring not-found).
     pub async fn delete(&self, manifests: &[serde_json::Value]) -> Result<usize, K8sError> {
-        Ok(crate::apply::delete_manifests(&self.client, manifests).await?)
+        let client = self.client().await?;
+        Ok(crate::apply::delete_manifests(&client, manifests).await?)
     }
 
     /// Wait until a Deployment reaches its desired ready replica count.
@@ -110,8 +166,9 @@ impl KubePlatform {
         deployment: &str,
         timeout: Option<Duration>,
     ) -> Result<(), K8sError> {
+        let client = self.client().await?;
         Ok(
-            crate::watch::wait_for_deployment_ready(&self.client, namespace, deployment, timeout)
+            crate::watch::wait_for_deployment_ready(&client, namespace, deployment, timeout)
                 .await?,
         )
     }
@@ -127,7 +184,8 @@ impl KubePlatform {
         deployment: &str,
         replicas: u32,
     ) -> Result<(), K8sError> {
-        Ok(crate::scale::patch_replicas(&self.client, namespace, deployment, replicas).await?)
+        let client = self.client().await?;
+        Ok(crate::scale::patch_replicas(&client, namespace, deployment, replicas).await?)
     }
 
     /// Read a Deployment's current replica/readiness counts, or `None` if absent.
@@ -136,7 +194,8 @@ impl KubePlatform {
         namespace: &str,
         deployment: &str,
     ) -> Result<Option<DeploymentStatus>, K8sError> {
-        Ok(crate::scale::deployment_status(&self.client, namespace, deployment).await?)
+        let client = self.client().await?;
+        Ok(crate::scale::deployment_status(&client, namespace, deployment).await?)
     }
 
     /// Fetch a snapshot of logs from a pod backing the named service.
@@ -146,7 +205,19 @@ impl KubePlatform {
         service: &str,
         options: &LogOptions,
     ) -> Result<String, K8sError> {
-        Ok(crate::logs::get_pod_logs(&self.client, namespace, service, options).await?)
+        let client = self.client().await?;
+        Ok(crate::logs::get_pod_logs(&client, namespace, service, options).await?)
+    }
+
+    /// Open an owned line stream from a pod backing the named service.
+    pub async fn log_stream(
+        &self,
+        namespace: &str,
+        service: &str,
+        options: &LogOptions,
+    ) -> Result<KubeLogStream, K8sError> {
+        let client = self.client().await?;
+        Ok(crate::logs::open_service_log_stream(&client, namespace, service, options).await?)
     }
 
     /// Stream logs from a pod backing the named service, one line per callback.
@@ -160,10 +231,8 @@ impl KubePlatform {
     where
         F: FnMut(&str),
     {
-        Ok(
-            crate::logs::stream_service_logs(&self.client, namespace, service, options, on_line)
-                .await?,
-        )
+        let client = self.client().await?;
+        Ok(crate::logs::stream_service_logs(&client, namespace, service, options, on_line).await?)
     }
 
     /// Establish a local (loopback) TCP port-forward to a pod backing the service.
@@ -171,6 +240,7 @@ impl KubePlatform {
         &self,
         config: &PortForwardConfig,
     ) -> Result<PortForwardSession, K8sError> {
-        Ok(crate::portforward::start_port_forward(&self.client, config).await?)
+        let client = self.client().await?;
+        Ok(crate::portforward::start_port_forward(&client, config).await?)
     }
 }

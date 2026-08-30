@@ -1,0 +1,592 @@
+// The EKS deployment root is the wiring diagram for this ten-document set.
+// It owns operator defaults, the seven module edges, shared resource handles,
+// and the canonical writebacks. Focused parts own module-local resources.
+// `definition.tkdp` is a peer projection; tests require identical admitted
+// config, graph, writebacks, and realized infrastructure from both roots.
+
+mod cluster;
+mod dsql;
+mod helpers;
+mod images;
+mod networking;
+mod observability;
+mod platform;
+mod remote_state;
+mod services;
+
+use platform::{
+    Aws, Debug, Dsql, DsqlClusterMode, Eks, EksPolicy, EndpointKind, GeneratedPassword,
+    Images, IngressRule, Networking, Observability, PreexistingDsql, SecretSource,
+    Services, Tag, Workload,
+};
+
+// This function is the operator-editable surface of a new deployment.
+// Platform identity, topology, and exact third-party image versions are data
+// here; provider kinds remain the final shape-validation boundary.
+fn config() -> Eks {
+    Eks {
+        aws: Aws {
+            region: "eu-west-2".into(),
+        },
+        tags: vec![Tag {
+            key: "ManagedBy".into(),
+            value: "tkp".into(),
+        }],
+        networking: Networking {
+            vpc_cidr: "10.42.0.0/16".into(),
+            availability_zones: vec![
+                "eu-west-2a".into(),
+                "eu-west-2b".into(),
+                "eu-west-2c".into(),
+            ],
+        },
+        eks: EksPolicy {
+            version: "1.36".into(),
+            namespace: "tokeira-system".into(),
+            node_families: vec!["m8g".into(), "c8g".into(), "r8g".into()],
+            kms_key_arn: None,
+            deletion_protection: true,
+            bootstrap_admin_permissions: false,
+            cluster_admin_principal_arn: None,
+        },
+        dsql: Dsql::Managed,
+        images: Images {
+            tokeirad: "tokeirad:latest".into(),
+            controller: "tokeira-controller:latest".into(),
+            autoscaler: "tokeira-autoscaler:latest".into(),
+            mimir: "grafana/mimir:3.2.0".into(),
+            loki: "grafana/loki:3.7.6".into(),
+            grafana: "grafana/grafana:12.4.9".into(),
+            alloy: "grafana/alloy:v1.19.0".into(),
+            pull_policy: "IfNotPresent".into(),
+        },
+        services: Services {
+            tokeirad: Workload {
+                replicas: 2,
+                cpu: "2".into(),
+                memory: "4Gi".into(),
+            },
+            controller: Workload {
+                replicas: 1,
+                cpu: "500m".into(),
+                memory: "1Gi".into(),
+            },
+            autoscaler: Workload {
+                replicas: 1,
+                cpu: "250m".into(),
+                memory: "512Mi".into(),
+            },
+        },
+        observability: Observability {
+            mimir: Workload {
+                replicas: 1,
+                cpu: "1".into(),
+                memory: "2Gi".into(),
+            },
+            loki: Workload {
+                replicas: 1,
+                cpu: "1".into(),
+                memory: "2Gi".into(),
+            },
+            grafana: Workload {
+                replicas: 1,
+                cpu: "500m".into(),
+                memory: "1Gi".into(),
+            },
+            retention_days: 30,
+        },
+        debug: Debug {
+            cloudwatch_logs: false,
+            log_retention_days: 7,
+        },
+    }
+}
+
+// Module dependencies express coarse staging. Resource dependencies below
+// carry the precise VPC, security-group, cluster, identity, and config edges.
+fn deployment(cfg: Eks, cx: Context) -> Deployment {
+    let d = Deployment::new(&["default"]);
+
+    // The S3 state bucket is the unique dependency-free bootstrap resource.
+    let remote_state_module = d.module("remote_state", vec![]);
+    remote_state::define(d, cfg, cx, remote_state_module);
+
+    // Repositories and networking can proceed independently after bootstrap.
+    let images_module = d.module("images", vec![remote_state_module]);
+    images::define(d, cfg, cx, images_module);
+
+    let networking_module = d.module("networking", vec![remote_state_module]);
+    let vpc = networking_module.resource(
+        "vpc",
+        Vpc {
+            region: cfg.aws.region.clone(),
+            cidr: cfg.networking.vpc_cidr.clone(),
+            availability_zones: cfg.networking.availability_zones.clone(),
+        },
+    );
+    let endpoint_sg = networking_module.resource(
+        "sg-vpc-endpoints",
+        SecurityGroup {
+            region: cfg.aws.region.clone(),
+            name: format!("{}-vpc-endpoints", cx.project_name),
+            description: "Private AWS service endpoints".into(),
+            ingress: vec![
+                IngressRule {
+                    description: "HTTPS from the private VPC".into(),
+                    protocol: "tcp".into(),
+                    from_port: 443,
+                    to_port: 443,
+                    source: cfg.networking.vpc_cidr.clone(),
+                },
+                IngressRule {
+                    description: "PostgreSQL from the private VPC".into(),
+                    protocol: "tcp".into(),
+                    from_port: 5432,
+                    to_port: 5432,
+                    source: cfg.networking.vpc_cidr.clone(),
+                },
+            ],
+        },
+        vec![vpc],
+    );
+    let node_sg = networking::define(d, cfg, cx, networking_module, vpc);
+
+    helpers::endpoint(
+        networking_module,
+        vpc,
+        endpoint_sg,
+        cfg.aws.region.clone(),
+        "s3".into(),
+        "s3".into(),
+        EndpointKind::Gateway,
+    );
+    helpers::endpoint(
+        networking_module,
+        vpc,
+        endpoint_sg,
+        cfg.aws.region.clone(),
+        "dynamodb".into(),
+        "dynamodb".into(),
+        EndpointKind::Gateway,
+    );
+    helpers::endpoint(
+        networking_module,
+        vpc,
+        endpoint_sg,
+        cfg.aws.region.clone(),
+        "ecr-api".into(),
+        "ecr.api".into(),
+        EndpointKind::Interface,
+    );
+    helpers::endpoint(
+        networking_module,
+        vpc,
+        endpoint_sg,
+        cfg.aws.region.clone(),
+        "ecr-dkr".into(),
+        "ecr.dkr".into(),
+        EndpointKind::Interface,
+    );
+    helpers::endpoint(
+        networking_module,
+        vpc,
+        endpoint_sg,
+        cfg.aws.region.clone(),
+        "sts".into(),
+        "sts".into(),
+        EndpointKind::Interface,
+    );
+    helpers::endpoint(
+        networking_module,
+        vpc,
+        endpoint_sg,
+        cfg.aws.region.clone(),
+        "eks-auth".into(),
+        "eks-auth".into(),
+        EndpointKind::Interface,
+    );
+    helpers::endpoint(
+        networking_module,
+        vpc,
+        endpoint_sg,
+        cfg.aws.region.clone(),
+        "dsql".into(),
+        "dsql".into(),
+        EndpointKind::Interface,
+    );
+    helpers::endpoint(
+        networking_module,
+        vpc,
+        endpoint_sg,
+        cfg.aws.region.clone(),
+        "secretsmanager".into(),
+        "secretsmanager".into(),
+        EndpointKind::Interface,
+    );
+    if cfg.debug.cloudwatch_logs {
+        helpers::endpoint(
+            networking_module,
+            vpc,
+            endpoint_sg,
+            cfg.aws.region.clone(),
+            "logs".into(),
+            "logs".into(),
+            EndpointKind::Interface,
+        );
+    }
+
+    // Managed and adopted storage publish one stable resource identity and
+    // one complete writeback surface to the deployment configuration.
+    let dsql_module = d.module("dsql", vec![networking_module]);
+    let dsql_cluster = match &cfg.dsql {
+        Dsql::Managed => dsql::define(
+            d,
+            cfg,
+            cx,
+            dsql_module,
+            DsqlClusterMode::Managed,
+            None,
+            None,
+        ),
+        Dsql::Preexisting(identity) => dsql::define(
+            d,
+            cfg,
+            cx,
+            dsql_module,
+            DsqlClusterMode::Preexisting,
+            Some(identity.endpoint.clone()),
+            Some(identity.arn.clone()),
+        ),
+    };
+    let connection_endpoint = dsql_module.resource(
+        "connection-endpoint",
+        DsqlConnectionEndpoint {
+            region: cfg.aws.region.clone(),
+            identity: cx.project_name.clone(),
+            id: Some("dsql:connection-endpoint".into()),
+        },
+        vec![vpc, endpoint_sg, dsql_cluster],
+    );
+    let rate_limiter = dsql_module.resource(
+        "rate-limiter",
+        DynamoDbTable {
+            table: format!("{}-dsql-rate-limiter", cx.project_name),
+            region: cfg.aws.region.clone(),
+            hash_key: "pk".into(),
+            ttl: Some("ttl_epoch".into()),
+        },
+    );
+    let conn_lease = dsql_module.resource(
+        "conn-lease",
+        DynamoDbTable {
+            table: format!("{}-dsql-conn-lease", cx.project_name),
+            region: cfg.aws.region.clone(),
+            hash_key: "pk".into(),
+            ttl: Some("ttl_epoch".into()),
+        },
+    );
+    d.writeback("infrastructure.storage", "dsql");
+    d.writeback(
+        "infrastructure.dsql.endpoint",
+        connection_endpoint.output("private_hostname"),
+    );
+    d.writeback("infrastructure.dsql.region", cfg.aws.region.clone());
+    d.writeback(
+        "infrastructure.dsql.rate_limiter_table",
+        rate_limiter.output("table_name"),
+    );
+    d.writeback(
+        "infrastructure.dsql.conn_lease_table",
+        conn_lease.output("table_name"),
+    );
+
+    // The control plane waits for its storage/network foundation; the
+    // namespace and NodePool are authored by the cluster part.
+    let cluster_module = d.module("cluster", vec![dsql_module]);
+    let eks_cluster = cluster::define(d, cfg, cx, cluster_module, vpc, node_sg);
+
+    // Observability owns durable buckets and its generated Grafana secret.
+    let observability_module = d.module("observability", vec![cluster_module, images_module]);
+    let mimir_bucket = observability::define(d, cfg, cx, observability_module);
+    let loki_bucket = observability_module.resource(
+        "loki-data",
+        S3Bucket {
+            region: cfg.aws.region.clone(),
+            bucket: format!("{}-loki-data", cx.project_name),
+            versioning: true,
+            key_prefix: None,
+        },
+    );
+    let grafana_secret = observability_module.resource(
+        "grafana-admin",
+        SecretsManagerSecret {
+            region: cfg.aws.region.clone(),
+            name: format!("{}/grafana/admin", cx.project_name),
+            source: SecretSource::GeneratedPasswordJson(GeneratedPassword {
+                username: "admin".into(),
+                password_length: 32,
+            }),
+            recovery_window_days: Some(7),
+        },
+    );
+    let content = observability_module.resource(
+        "content",
+        ObservabilityContent {
+            namespace: cfg.eks.namespace.clone(),
+            project: cx.project_name.clone(),
+            region: cfg.aws.region.clone(),
+            retention_days: cfg.observability.retention_days,
+        },
+    );
+
+    // Workloads are the terminal module. Their graph dependencies name both
+    // substrate prerequisites and service startup constraints.
+    let services_module = d.module("services", vec![observability_module]);
+    let server_config = services::define(d, cfg, cx, services_module);
+    // Pod Identity is one role/association per ServiceAccount. Policy ARNs
+    // resolve from the exact declared storage dependencies after AWS assigns
+    // them; no role widens provider resources to `*`.
+    let tokeirad_identity = helpers::pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region.clone(),
+        cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
+        "tokeirad".into(),
+        helpers::runtime_policies(cx.project_name.clone()),
+        vec![dsql_cluster, rate_limiter, conn_lease],
+    );
+    let controller_identity = helpers::pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region.clone(),
+        cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
+        "tokeira-controller".into(),
+        helpers::runtime_policies(cx.project_name.clone()),
+        vec![dsql_cluster, rate_limiter, conn_lease],
+    );
+    let autoscaler_identity = helpers::pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region.clone(),
+        cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
+        "tokeira-autoscaler".into(),
+        helpers::runtime_policies(cx.project_name.clone()),
+        vec![dsql_cluster, rate_limiter, conn_lease],
+    );
+    let mimir_identity = helpers::pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region.clone(),
+        cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
+        "mimir".into(),
+        helpers::storage_policy(
+            "mimir-storage".into(),
+            format!("s3-{}-mimir-data", cx.project_name),
+        ),
+        vec![mimir_bucket],
+    );
+    let loki_identity = helpers::pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region.clone(),
+        cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
+        "loki".into(),
+        helpers::storage_policy(
+            "loki-storage".into(),
+            format!("s3-{}-loki-data", cx.project_name),
+        ),
+        vec![loki_bucket],
+    );
+    let grafana_identity = helpers::pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region.clone(),
+        cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
+        "grafana".into(),
+        helpers::secret_policy(format!("secret-{}/grafana/admin", cx.project_name)),
+        vec![grafana_secret],
+    );
+
+    let controller = services_module.resource(
+        "tokeira-controller",
+        ServiceDeployment {
+            spec: helpers::service_manifest(
+                cx,
+                cfg.eks.namespace.clone(),
+                "tokeira-controller".into(),
+                cfg.images.controller.clone(),
+                cfg.images.pull_policy.clone(),
+                cfg.services.controller,
+                vec!["--config".into(), "/etc/tokeira/controller.toml".into()],
+                Some("TOKEIRA_CONFIG".into()),
+                "controller.toml".into(),
+                Some(9091),
+                9090,
+                false,
+                cfg.images.alloy.clone(),
+                false,
+            ),
+            config_content: format!("dsql_endpoint = \"__WRITEBACK_DSQL_ENDPOINT__\"\ndsql_region = \"{}\"\ncluster_name = \"tokeira\"\ngrpc_listen_addr = \"0.0.0.0:9091\"\nmetrics_addr = \"0.0.0.0:9090\"\n", cfg.aws.region),
+            alloy_config_content: "".into(),
+            depends_on: vec![],
+        },
+        vec![
+            eks_cluster,
+            controller_identity,
+            connection_endpoint,
+            content,
+        ],
+    );
+    let mimir = services_module.resource(
+        "mimir",
+        ServiceDeployment {
+            spec: helpers::service_manifest(
+                cx,
+                cfg.eks.namespace.clone(),
+                "mimir".into(),
+                cfg.images.mimir.clone(),
+                cfg.images.pull_policy.clone(),
+                cfg.observability.mimir,
+                vec!["-config.file=/etc/tokeira/mimir.yaml".into()],
+                None,
+                "mimir.yaml".into(),
+                None,
+                9009,
+                false,
+                cfg.images.alloy.clone(),
+                true,
+            ),
+            config_content: "".into(),
+            alloy_config_content: "".into(),
+            depends_on: vec![],
+        },
+        vec![eks_cluster, mimir_identity, mimir_bucket, content],
+    );
+    let loki = services_module.resource(
+        "loki",
+        ServiceDeployment {
+            spec: helpers::service_manifest(
+                cx,
+                cfg.eks.namespace.clone(),
+                "loki".into(),
+                cfg.images.loki.clone(),
+                cfg.images.pull_policy.clone(),
+                cfg.observability.loki,
+                vec!["-config.file=/etc/tokeira/loki.yaml".into()],
+                None,
+                "loki.yaml".into(),
+                None,
+                3100,
+                false,
+                cfg.images.alloy.clone(),
+                true,
+            ),
+            config_content: "".into(),
+            alloy_config_content: "".into(),
+            depends_on: vec![],
+        },
+        vec![eks_cluster, loki_identity, loki_bucket, content],
+    );
+    let tokeirad = services_module.resource(
+        "tokeirad",
+        ServiceDeployment {
+            spec: helpers::service_manifest(
+                cx,
+                cfg.eks.namespace.clone(),
+                "tokeirad".into(),
+                cfg.images.tokeirad.clone(),
+                cfg.images.pull_policy.clone(),
+                cfg.services.tokeirad,
+                vec!["--config".into(), "/etc/tokeira/tokeirad.toml".into()],
+                Some("TOKEIRA_CONFIG".into()),
+                "tokeirad.toml".into(),
+                Some(7233),
+                9090,
+                true,
+                cfg.images.alloy.clone(),
+                false,
+            ),
+            config_content: "".into(),
+            alloy_config_content: "".into(),
+            depends_on: vec!["tokeira-controller".into()],
+        },
+        vec![
+            eks_cluster,
+            tokeirad_identity,
+            content,
+            server_config,
+            controller,
+        ],
+    );
+    services_module.resource(
+        "tokeira-autoscaler",
+        ServiceDeployment {
+            spec: helpers::service_manifest(
+                cx,
+                cfg.eks.namespace.clone(),
+                "tokeira-autoscaler".into(),
+                cfg.images.autoscaler.clone(),
+                cfg.images.pull_policy.clone(),
+                cfg.services.autoscaler,
+                vec!["--config".into(), "/etc/tokeira/autoscaler.toml".into()],
+                Some("TOKEIRA_CONFIG".into()),
+                "autoscaler.toml".into(),
+                None,
+                9090,
+                false,
+                cfg.images.alloy.clone(),
+                false,
+            ),
+            config_content: format!("polling_interval = 15\nscale_out_consecutive_samples = 2\nscale_in_consecutive_samples = 6\ncooldown = 300\nmimir_endpoint = \"http://mimir:9009\"\nmetrics_addr = \"0.0.0.0:9090\"\nstaleness_threshold = 45\ndsql_connection_budget = 10000\ndsql_connection_rate_budget = 1000\nper_runtime_reserved_connections = 64\nper_runtime_startup_connection_rate = 10\ncluster_name = \"tokeira\"\ndsql_endpoint = \"__WRITEBACK_DSQL_ENDPOINT__\"\ndsql_region = \"{}\"\n\n[service_configs.tokeirad]\nmin = 0\nmax = 16\nstep = 1\n", cfg.aws.region),
+            alloy_config_content: "".into(),
+            depends_on: vec!["tokeira-controller".into(), "mimir".into()],
+        },
+        vec![
+            eks_cluster,
+            autoscaler_identity,
+            connection_endpoint,
+            content,
+            controller,
+            mimir,
+        ],
+    );
+    services_module.resource(
+        "grafana",
+        ServiceDeployment {
+            spec: helpers::service_manifest(
+                cx,
+                cfg.eks.namespace.clone(),
+                "grafana".into(),
+                cfg.images.grafana.clone(),
+                cfg.images.pull_policy.clone(),
+                cfg.observability.grafana,
+                vec![],
+                Some("GF_PATHS_CONFIG".into()),
+                "grafana.ini".into(),
+                None,
+                3000,
+                false,
+                cfg.images.alloy,
+                true,
+            ),
+            config_content: "".into(),
+            alloy_config_content: "".into(),
+            depends_on: vec!["mimir".into(), "loki".into()],
+        },
+        vec![
+            eks_cluster,
+            grafana_identity,
+            grafana_secret,
+            content,
+            mimir,
+            loki,
+        ],
+    );
+    d
+}

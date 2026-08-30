@@ -1,0 +1,145 @@
+# The Python projection of the EKS operator configuration. These dataclasses
+# are authoring data only; the provider kinds validate every resource value.
+
+from dataclasses import dataclass
+
+from tokeira import create
+
+
+@dataclass
+class Aws:
+    # Deployment-scoped AWS region.
+    region: str
+
+
+@dataclass
+class Tag:
+    # Named tag fields are portable across both definition frontends.
+    key: str
+    value: str
+
+
+@dataclass
+class DependentInlinePolicy:
+    # One least-privilege IAM statement resolved from applied dependency state.
+    name: str
+    actions: list[str]
+    dependency: str
+    property: str
+    resource_suffixes: list[str]
+
+
+@dataclass
+class Networking:
+    # Private address plan and availability-zone spread.
+    vpc_cidr: str
+    availability_zones: list[str]
+
+
+@dataclass
+class EksPolicy:
+    # EKS control plane and Auto Mode node policy.
+    version: str
+    namespace: str
+    node_families: list[str]
+    kms_key_arn: str | None
+    deletion_protection: bool
+    bootstrap_admin_permissions: bool
+    cluster_admin_principal_arn: str | None
+
+
+@dataclass
+class Managed:
+    # The deployment creates and owns Aurora DSQL.
+    pass
+
+
+@dataclass
+class Preexisting:
+    # Complete identity of an adopted Aurora DSQL cluster.
+    endpoint: str
+    arn: str
+
+
+@dataclass
+class Images:
+    # Tokeira images are deployment-owned build outputs. Third-party images
+    # are exact pins and move in both definition roots together.
+    tokeirad: str
+    controller: str
+    autoscaler: str
+    mimir: str
+    loki: str
+    grafana: str
+    alloy: str
+    pull_policy: str
+
+
+@dataclass
+class Workload:
+    # Desired replicas and Kubernetes Quantity resources.
+    replicas: int
+    cpu: str
+    memory: str
+
+
+@dataclass
+class Services:
+    tokeirad: Workload
+    controller: Workload
+    autoscaler: Workload
+
+
+@dataclass
+class Observability:
+    mimir: Workload
+    loki: Workload
+    grafana: Workload
+    retention_days: int
+
+
+@dataclass
+class Debug:
+    cloudwatch_logs: bool
+    log_retention_days: int
+
+
+@create("dsql")
+@dataclass
+class Eks:
+    # Complete operator surface. The DSQL provenance is deployment identity,
+    # so changing it is a refused retarget rather than reconciliation.
+    aws: Aws
+    tags: list[Tag]
+    networking: Networking
+    eks: EksPolicy
+    dsql: Managed | Preexisting
+    images: Images
+    services: Services
+    observability: Observability
+    debug: Debug
+
+
+@dataclass
+class ServiceManifest:
+    # Complete pod-shape input consumed by ServiceDeployment. Port numbers
+    # remain fixed by the root because they are process contracts, not knobs.
+    name: str
+    namespace: str
+    project: str
+    image: str
+    image_pull_policy: str
+    args: list[str]
+    config_env: str | None
+    replicas: int
+    cpu: str
+    memory: str
+    grpc_port: int | None
+    metrics_port: int
+    service_account: str
+    alloy_image: str
+    config_map: str
+    config_file: str
+    advertise_node_host: bool
+    config_from_content: bool
+    alloy_from_content: bool

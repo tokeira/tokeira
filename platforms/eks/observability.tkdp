@@ -1,0 +1,17 @@
+# Durable observability storage. This part owns the Mimir bucket returned to
+# the root; Loki storage, credentials, content, and pods are wired there
+# because later service dependencies consume their handles.
+
+from tokeira import S3Bucket
+
+
+def define(d, cfg, cx, module):
+    return module.resource(
+        "mimir-data",
+        S3Bucket(
+            region=cfg.aws.region,
+            bucket=cx.project_name + "-mimir-data",
+            versioning=True,
+            key_prefix=None,
+        ),
+    )

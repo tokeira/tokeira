@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use serde::Serialize;
 use tokeira_iac::{
     ChangeKind, ChangeSemantics, Citation, DescribeResult, InternalChange, ProvisionContext,
     Resource, ResourceId, ResourceState, ResourceType, SemanticsContext, error::IacError,
@@ -7,11 +8,34 @@ use tokeira_iac::{
 
 // ── Config and resource structs ──────────────────────────────────────────────
 
+/// One inline IAM policy whose resource ARN comes from a declared dependency.
+///
+/// Provider-assigned identities such as a DSQL cluster ARN are unavailable
+/// when a definition is realized. Keeping the source resource and property in
+/// the desired model lets the engine order the role after that resource and
+/// resolve the exact ARN at lifecycle time instead of widening to `*`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DependentInlinePolicy {
+    /// Inline policy name on the role.
+    pub name: String,
+    /// Exact IAM actions granted by the statement.
+    pub actions: Vec<String>,
+    /// Declared resource supplying the provider-assigned identity.
+    pub dependency: ResourceId,
+    /// Property read from the dependency's applied state.
+    pub property: String,
+    /// Suffixes appended to the resolved identity; an empty suffix means the
+    /// identity itself. Multiple suffixes support pairs such as bucket and
+    /// bucket objects without reconstructing the base ARN.
+    pub resource_suffixes: Vec<String>,
+}
+
 /// Configuration for a single IAM role provider resource.
 #[derive(Debug)]
 pub struct IamRoleConfig {
     pub trust_policy: String,
     pub inline_policies: HashMap<String, String>,
+    pub dependent_inline_policies: Vec<DependentInlinePolicy>,
     pub managed_policy_arns: Vec<String>,
     pub module: String,
 }
@@ -36,6 +60,57 @@ impl IamRole {
             tags: rctx.tags.clone(),
         }
     }
+
+    fn policy_dependencies(&self) -> Vec<ResourceId> {
+        let mut dependencies = self
+            .config
+            .dependent_inline_policies
+            .iter()
+            .map(|policy| policy.dependency.clone())
+            .collect::<Vec<_>>();
+        dependencies.sort();
+        dependencies.dedup();
+        dependencies
+    }
+
+    fn resolved_inline_policies(
+        &self,
+        ctx: &ProvisionContext,
+    ) -> Result<HashMap<String, String>, IacError> {
+        let mut policies = self.config.inline_policies.clone();
+        for policy in &self.config.dependent_inline_policies {
+            let state = ctx.get_resource_state(&policy.dependency)?;
+            let resource = state
+                .properties
+                .get(&policy.property)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    IacError::DependencyResolution(format!(
+                        "IAM role `{}` policy `{}` needs non-empty output `{}.{}`",
+                        self.role_name, policy.name, policy.dependency.0, policy.property
+                    ))
+                })?;
+            let resources = policy
+                .resource_suffixes
+                .iter()
+                .map(|suffix| format!("{resource}{suffix}"))
+                .collect::<Vec<_>>();
+            policies.insert(
+                policy.name.clone(),
+                serde_json::json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Action": policy.actions,
+                        "Resource": resources,
+                    }]
+                })
+                .to_string(),
+            );
+        }
+        Ok(policies)
+    }
 }
 
 fn normalize_string_map(mut map: HashMap<String, String>) -> HashMap<String, String> {
@@ -51,6 +126,44 @@ fn normalize_sorted_strings(mut values: Vec<String>) -> Vec<String> {
 
 #[async_trait::async_trait]
 impl Resource for IamRole {
+    fn validate_input(&self) -> Result<(), String> {
+        let mut policy_names = HashSet::new();
+        for policy in &self.config.dependent_inline_policies {
+            if policy.name.is_empty()
+                || policy.actions.is_empty()
+                || policy.actions.iter().any(String::is_empty)
+                || policy.property.is_empty()
+                || policy.resource_suffixes.is_empty()
+            {
+                return Err(format!(
+                    "IAM role `{}` has an incomplete dependency-backed policy",
+                    self.role_name
+                ));
+            }
+            if self.config.inline_policies.contains_key(&policy.name)
+                || !policy_names.insert(&policy.name)
+            {
+                return Err(format!(
+                    "IAM role `{}` declares inline policy `{}` twice",
+                    self.role_name, policy.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn desired_manifest(&self) -> serde_json::Value {
+        serde_json::json!({
+            "role_name": self.role_name,
+            "region": self.region,
+            "trust_policy": self.config.trust_policy,
+            "inline_policies": self.config.inline_policies,
+            "dependent_inline_policies": self.config.dependent_inline_policies,
+            "managed_policy_arns": self.config.managed_policy_arns,
+            "module": self.config.module,
+        })
+    }
+
     fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
         const CREATE: Citation = Citation::code(concat!(
             module_path!(),
@@ -86,7 +199,7 @@ impl Resource for IamRole {
     }
 
     fn dependencies(&self) -> Vec<ResourceId> {
-        vec![]
+        self.policy_dependencies()
     }
 
     fn module(&self) -> &str {
@@ -97,6 +210,7 @@ impl Resource for IamRole {
         let name = &self.role_name;
         let tags = ctx.resource_tags(name);
         let iam_tags = super::iam_tags(&tags);
+        let inline_policies = self.resolved_inline_policies(ctx)?;
 
         // iam:CreateRole with trust policy and tags
         let role_arn = match ctx
@@ -151,7 +265,7 @@ impl Resource for IamRole {
             .map_err(|e| IacError::AwsSdk(format!("iam:TagRole: {}", e.into_service_error())))?;
 
         // iam:PutRolePolicy per inline policy
-        for (policy_name, policy_document) in &self.config.inline_policies {
+        for (policy_name, policy_document) in &inline_policies {
             ctx.extension::<crate::AwsClients>()
                 .expect("AwsClients")
                 .iam
@@ -188,11 +302,11 @@ impl Resource for IamRole {
             properties: serde_json::json!({
                 "role_name": self.role_name,
                 "role_arn": role_arn,
-                "inline_policies": self.config.inline_policies,
+                "inline_policies": inline_policies,
                 "managed_policy_arns": normalize_sorted_strings(self.config.managed_policy_arns.clone()),
                 "tags": tags,
             }),
-            dependencies: vec![],
+            dependencies: self.policy_dependencies(),
             created_at: now.clone(),
             updated_at: now,
             module: self.module().to_owned(),
@@ -412,7 +526,7 @@ impl Resource for IamRole {
                         "managed_policy_arns": managed_policy_arns,
                         "tags": live_tags,
                     }),
-                    dependencies: vec![],
+                    dependencies: self.policy_dependencies(),
                     created_at: now.clone(),
                     updated_at: now,
                     module: self.module().to_owned(),
@@ -437,6 +551,7 @@ impl Resource for IamRole {
         let name = &self.role_name;
         let tags = ctx.resource_tags(name);
         let iam_tags = super::iam_tags(&tags);
+        let inline_policies = self.resolved_inline_policies(ctx)?;
 
         let current_tags: HashMap<String, String> = current
             .properties
@@ -486,7 +601,7 @@ impl Resource for IamRole {
 
         let stale_inline_policy_names: Vec<String> = current_inline_policies
             .keys()
-            .filter(|policy_name| !self.config.inline_policies.contains_key(*policy_name))
+            .filter(|policy_name| !inline_policies.contains_key(*policy_name))
             .cloned()
             .collect();
         for policy_name in stale_inline_policy_names {
@@ -504,7 +619,7 @@ impl Resource for IamRole {
         }
 
         // iam:PutRolePolicy per inline policy — ensures policies are up to date
-        for (policy_name, policy_document) in &self.config.inline_policies {
+        for (policy_name, policy_document) in &inline_policies {
             ctx.extension::<crate::AwsClients>()
                 .expect("AwsClients")
                 .iam
@@ -567,11 +682,11 @@ impl Resource for IamRole {
             properties: serde_json::json!({
                 "role_name": self.role_name,
                 "role_arn": role_arn,
-                "inline_policies": self.config.inline_policies,
+                "inline_policies": inline_policies,
                 "managed_policy_arns": desired_managed_policy_arns,
                 "tags": tags,
             }),
-            dependencies: vec![],
+            dependencies: self.policy_dependencies(),
             created_at: current.created_at.clone(),
             updated_at: chrono::Utc::now().to_rfc3339(),
             module: self.module().to_owned(),
@@ -600,7 +715,18 @@ impl Resource for IamRole {
         desired_tags.insert("Name".into(), self.role_name.clone());
         desired_tags.insert("Project".into(), self.project.clone());
         desired_tags.insert("ManagedBy".into(), "tokeira-cli".into());
-        let desired_inline_policies = self.config.inline_policies.clone();
+        let desired_inline_policies = match self.resolved_inline_policies(_ctx) {
+            Ok(policies) => policies,
+            Err(error) => {
+                return InternalChange::Update {
+                    resource_id: self.resource_id(),
+                    resource_type: self.resource_type(),
+                    details: vec![tokeira_iac::FieldDiff::observation(format!(
+                        "dependency-backed inline policy is unresolved: {error}"
+                    ))],
+                };
+            }
+        };
         let desired_managed_policy_arns =
             normalize_sorted_strings(self.config.managed_policy_arns.clone());
 
@@ -645,6 +771,8 @@ impl Resource for IamRole {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn role(inline_policies: &[(&str, &str)], managed_policy_arns: &[&str]) -> IamRole {
@@ -656,6 +784,7 @@ mod tests {
                     .iter()
                     .map(|(name, document)| (name.to_string(), document.to_string()))
                     .collect(),
+                dependent_inline_policies: Vec::new(),
                 managed_policy_arns: managed_policy_arns
                     .iter()
                     .map(|arn| arn.to_string())
@@ -792,5 +921,74 @@ mod tests {
         let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
 
         assert!(matches!(change, InternalChange::NoChange { .. }));
+    }
+
+    #[test]
+    fn dependency_backed_policy_refuses_a_missing_provider_output() {
+        let dependency = ResourceId("dsql:cluster".into());
+        let mut resource = role(&[], &[]);
+        resource.config.dependent_inline_policies = vec![DependentInlinePolicy {
+            name: "dsql-connect".into(),
+            actions: vec!["dsql:DbConnect".into()],
+            dependency: dependency.clone(),
+            property: "cluster_arn".into(),
+            resource_suffixes: vec![String::new()],
+        }];
+        let mut ctx = ProvisionContext::new("test", HashMap::new());
+        ctx.state.resources.insert(
+            dependency,
+            role_state(
+                serde_json::json!({}),
+                serde_json::json!({}),
+                serde_json::json!([]),
+            ),
+        );
+
+        let error = resource
+            .resolved_inline_policies(&ctx)
+            .expect_err("missing provider identity must fail closed");
+
+        assert!(error.to_string().contains("dsql:cluster.cluster_arn"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        // Exact provider outputs remain exact IAM resources; resolution must
+        // never replace an unknown-at-realization identity with a wildcard.
+        #[test]
+        fn dependency_backed_policy_preserves_exact_provider_arns(
+            account in "[0-9]{12}",
+            cluster in "[a-z0-9-]{1,24}",
+        ) {
+            let arn = format!("arn:aws:dsql:eu-west-2:{account}:cluster/{cluster}");
+            let dependency = ResourceId("dsql:cluster".into());
+            let mut resource = role(&[], &[]);
+            resource.config.dependent_inline_policies = vec![DependentInlinePolicy {
+                name: "dsql-connect".into(),
+                actions: vec!["dsql:DbConnect".into()],
+                dependency: dependency.clone(),
+                property: "cluster_arn".into(),
+                resource_suffixes: vec![String::new()],
+            }];
+            let mut ctx = ProvisionContext::new("test", HashMap::new());
+            let mut state = role_state(
+                serde_json::json!({}),
+                serde_json::json!({}),
+                serde_json::json!([]),
+            );
+            state.properties = serde_json::json!({ "cluster_arn": arn });
+            ctx.state.resources.insert(dependency, state);
+
+            let policies = resource
+                .resolved_inline_policies(&ctx)
+                .expect("declared output resolves");
+            let document: serde_json::Value = serde_json::from_str(&policies["dsql-connect"])
+                .expect("generated policy is JSON");
+
+            prop_assert_eq!(&document["Statement"][0]["Resource"], &serde_json::json!([arn]));
+            prop_assert_eq!(&document["Statement"][0]["Action"], &serde_json::json!(["dsql:DbConnect"]));
+            prop_assert!(!document.to_string().contains("\"*\""));
+        }
     }
 }

@@ -1,0 +1,49 @@
+// Private ECR repositories for the workload images. Operators author exact
+// image inputs in platform config; repository identities derive from project.
+
+use platform::Eks;
+
+pub fn define(d: Deployment, cfg: Eks, cx: Context, module: Module) {
+    module.resource(
+        "tokeirad",
+        EcrRepository {
+            repository: format!("{}/tokeirad", cx.project_name),
+        },
+    );
+    module.resource(
+        "tokeira-controller",
+        EcrRepository {
+            repository: format!("{}/tokeira-controller", cx.project_name),
+        },
+    );
+    module.resource(
+        "tokeira-autoscaler",
+        EcrRepository {
+            repository: format!("{}/tokeira-autoscaler", cx.project_name),
+        },
+    );
+    module.resource(
+        "mimir",
+        EcrRepository {
+            repository: format!("{}/mimir", cx.project_name),
+        },
+    );
+    module.resource(
+        "loki",
+        EcrRepository {
+            repository: format!("{}/loki", cx.project_name),
+        },
+    );
+    module.resource(
+        "grafana",
+        EcrRepository {
+            repository: format!("{}/grafana", cx.project_name),
+        },
+    );
+    module.resource(
+        "alloy",
+        EcrRepository {
+            repository: format!("{}/alloy", cx.project_name),
+        },
+    );
+}

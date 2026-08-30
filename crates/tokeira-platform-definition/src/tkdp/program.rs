@@ -15,6 +15,7 @@ use ruff_text_size::TextSize;
 use crate::tkdp::{
     facade::{FACADE_FILE_NAME, FACADE_MODULE_NAME},
     lower::Lowered,
+    preflight::CreateField,
     source_map::{Origin, Segment, SourceMap, SourceMapBuilder},
 };
 
@@ -43,6 +44,8 @@ pub struct PartUnit {
     pub(crate) original: String,
     /// The part's lowered form (match splice applied).
     pub(crate) lowered: Lowered,
+    /// Create-time admission metadata declared by this companion.
+    pub(crate) creates: Vec<CreateField>,
 }
 
 /// Per-part translation data: everything the runner needs to render a frame

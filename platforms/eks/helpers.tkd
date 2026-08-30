@@ -1,0 +1,160 @@
+// Repeated assemblies called only by the root. Companion parts never call
+// helpers: each part is independently legible and imports its own vocabulary.
+
+use platform::{DependentInlinePolicy, EndpointKind, IngressRule, ServiceManifest, Workload};
+
+pub fn endpoint(
+    module: Module,
+    vpc: Resource,
+    endpoint_sg: Resource,
+    region: String,
+    short: String,
+    service: String,
+    kind: EndpointKind,
+) {
+    let dependencies = match &kind {
+        EndpointKind::Interface => vec![vpc, endpoint_sg],
+        EndpointKind::Gateway => vec![vpc],
+    };
+    module.resource(
+        format!("vpce-{}", short),
+        VpcEndpoint {
+            region: region.clone(),
+            short_name: short,
+            service_name: format!("com.amazonaws.{}.{}", region, service),
+            endpoint_type: kind,
+            id: None,
+        },
+        dependencies,
+    );
+}
+
+pub fn service_manifest(
+    cx: Context,
+    namespace: String,
+    name: String,
+    image: String,
+    pull_policy: String,
+    policy: Workload,
+    args: Vec<String>,
+    config_env: Option<String>,
+    config_file: String,
+    grpc_port: Option<u16>,
+    metrics_port: u16,
+    advertise_node_host: bool,
+    alloy_image: String,
+    config_from_content: bool,
+) -> ServiceManifest {
+    ServiceManifest {
+        name: name.clone(),
+        namespace: namespace,
+        project: cx.project_name,
+        image: image,
+        image_pull_policy: pull_policy,
+        args: args,
+        config_env: config_env,
+        replicas: policy.replicas,
+        cpu: policy.cpu,
+        memory: policy.memory,
+        grpc_port: grpc_port,
+        metrics_port: metrics_port,
+        service_account: name.clone(),
+        alloy_image: alloy_image,
+        config_map: format!("{}-config", name),
+        config_file: config_file,
+        advertise_node_host: advertise_node_host,
+        config_from_content: config_from_content,
+        alloy_from_content: true,
+    }
+}
+
+pub fn pod_role(
+    module: Module,
+    cluster: Resource,
+    region: String,
+    namespace: String,
+    project: String,
+    service: String,
+    policies: Vec<DependentInlinePolicy>,
+    policy_dependencies: Vec<Resource>,
+) -> Resource {
+    let role = module.resource(
+        format!("role-{}", service),
+        IamRole {
+            region: region.clone(),
+            name: format!("{}-{}-task", project, service),
+            trust_policy: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"pods.eks.amazonaws.com\"},\"Action\":[\"sts:AssumeRole\",\"sts:TagSession\"]}]}".into(),
+            dependent_inline_policies: policies,
+            managed_policy_arns: vec![],
+        },
+        policy_dependencies,
+    );
+    module.resource(
+        format!("pod-id-{}", service),
+        PodIdentityAssociation {
+            region: region,
+            namespace: namespace,
+            service_account: service,
+        },
+        vec![cluster, role],
+    )
+}
+
+pub fn runtime_policies(project: String) -> Vec<DependentInlinePolicy> {
+    vec![
+        DependentInlinePolicy {
+            name: "dsql-connect".into(),
+            actions: vec!["dsql:DbConnect".into()],
+            dependency: "dsql:cluster".into(),
+            property: "cluster_arn".into(),
+            resource_suffixes: vec!["".into()],
+        },
+        DependentInlinePolicy {
+            name: "dsql-rate-limiter".into(),
+            actions: vec![
+                "dynamodb:GetItem".into(),
+                "dynamodb:PutItem".into(),
+                "dynamodb:UpdateItem".into(),
+            ],
+            dependency: format!("dynamodb-{}-dsql-rate-limiter", project),
+            property: "table_arn".into(),
+            resource_suffixes: vec!["".into()],
+        },
+        DependentInlinePolicy {
+            name: "dsql-connection-lease".into(),
+            actions: vec![
+                "dynamodb:GetItem".into(),
+                "dynamodb:PutItem".into(),
+                "dynamodb:UpdateItem".into(),
+            ],
+            dependency: format!("dynamodb-{}-dsql-conn-lease", project),
+            property: "table_arn".into(),
+            resource_suffixes: vec!["".into()],
+        },
+    ]
+}
+
+pub fn storage_policy(name: String, bucket_dependency: String) -> Vec<DependentInlinePolicy> {
+    vec![DependentInlinePolicy {
+        name: name,
+        actions: vec![
+            "s3:GetObject".into(),
+            "s3:PutObject".into(),
+            "s3:DeleteObject".into(),
+            "s3:ListBucket".into(),
+        ],
+        dependency: bucket_dependency,
+        property: "bucket_arn".into(),
+        resource_suffixes: vec!["".into(), "/*".into()],
+    }]
+}
+
+pub fn secret_policy(secret_dependency: String) -> Vec<DependentInlinePolicy> {
+    vec![DependentInlinePolicy {
+        name: "grafana-admin-secret".into(),
+        actions: vec!["secretsmanager:GetSecretValue".into()],
+        dependency: secret_dependency,
+        property: "secret_arn".into(),
+        resource_suffixes: vec!["".into()],
+    }]
+}

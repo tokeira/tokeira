@@ -11,6 +11,7 @@
 use serde::Serialize;
 use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_platform::{
+    author::{LocatedValue, ValueShape, VariantShape},
     definition::{DefinitionFrontend, FrontendOutput, FrontendSource, Namespace},
     error::{DiagnosticCategory, FrontendDiagnostic, SourceRange},
 };
@@ -22,7 +23,7 @@ use crate::tkdp::{
     diagnostics,
     facade::{self, FACADE_MODULE_NAME},
     lower::lower,
-    preflight::{PartImport, Preflight, preflight, preflight_part},
+    preflight::{CreateField, PartImport, Preflight, preflight, preflight_part},
     program::{PartUnit, Program, assemble},
     runner::execute,
 };
@@ -61,6 +62,7 @@ struct Prepared<'a> {
     text: &'a str,
     preflight: Preflight,
     program: Program,
+    creates: Vec<CreateField>,
 }
 
 fn to_range(range: ruff_text_size::TextRange) -> Option<SourceRange> {
@@ -132,6 +134,7 @@ impl TkdpFrontend {
                 file_name,
                 original: text,
                 lowered,
+                creates: part.creates,
             });
         }
         Ok(parts)
@@ -183,12 +186,19 @@ impl TkdpFrontend {
         let synthesized = facade::render(&kind_names, &context_value);
 
         let part_units = self.discover_parts(source, &pf.part_imports, parts, &names)?;
+        let mut creates = pf.creates.clone();
+        creates.extend(
+            part_units
+                .iter()
+                .flat_map(|part| part.creates.iter().cloned()),
+        );
         let lowered = lower(text, &pf.module, &label);
         let program = assemble(synthesized, lowered, part_units);
         Ok(Prepared {
             text,
             preflight: pf,
             program,
+            creates,
         })
     }
 
@@ -213,6 +223,181 @@ impl TkdpFrontend {
         self.prepare(&source, context, namespaces, parts)
             .map(|prepared| prepared.program)
     }
+
+    fn execute_prepared(
+        &self,
+        source: &FrontendSource<'_>,
+        namespaces: &[Namespace],
+        prepared: Prepared<'_>,
+    ) -> Result<FrontendOutput, FrontendDiagnostic> {
+        let result = execute(&prepared.program, prepared.text).map_err(|failure| {
+            self.diagnostic(source, failure.range.and_then(to_range), failure.message)
+        })?;
+
+        convert(
+            result,
+            namespaces,
+            &prepared.preflight.call_sites,
+            prepared.preflight.deployment_range,
+        )
+        .map_err(|error| self.diagnostic(source, to_range(error.range), error.message))
+    }
+}
+
+fn values_equal(left: &LocatedValue, right: &LocatedValue) -> bool {
+    match (&left.value, &right.value) {
+        (ValueShape::Unit, ValueShape::Unit) => true,
+        (ValueShape::Bool(left), ValueShape::Bool(right)) => left == right,
+        (ValueShape::Integer(left), ValueShape::Integer(right)) => left == right,
+        // Compare authored f64 values exactly, with no tolerance or NaN
+        // normalization. IEEE equality makes a NaN-valued create field refuse
+        // even against itself; authored configuration accepts that safe bias.
+        (ValueShape::Float(left), ValueShape::Float(right)) => left == right,
+        (ValueShape::String(left), ValueShape::String(right)) => left == right,
+        (ValueShape::Sequence(left), ValueShape::Sequence(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| values_equal(left, right))
+        }
+        (ValueShape::Option(left), ValueShape::Option(right)) => match (left, right) {
+            (Some(left), Some(right)) => values_equal(left, right),
+            (None, None) => true,
+            _ => false,
+        },
+        (ValueShape::Map(left), ValueShape::Map(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(left_key, left_value)| {
+                    right.iter().any(|(right_key, right_value)| {
+                        values_equal(left_key, right_key) && values_equal(left_value, right_value)
+                    })
+                })
+        }
+        (
+            ValueShape::Struct {
+                name: left_name,
+                fields: left_fields,
+            },
+            ValueShape::Struct {
+                name: right_name,
+                fields: right_fields,
+            },
+        ) => {
+            left_name == right_name
+                && left_fields.len() == right_fields.len()
+                && left_fields.iter().zip(right_fields).all(
+                    |((left_name, left_value), (right_name, right_value))| {
+                        left_name == right_name && values_equal(left_value, right_value)
+                    },
+                )
+        }
+        (
+            ValueShape::Enum {
+                name: left_name,
+                variant: left_variant,
+                body: left_body,
+            },
+            ValueShape::Enum {
+                name: right_name,
+                variant: right_variant,
+                body: right_body,
+            },
+        ) => {
+            left_name == right_name
+                && left_variant == right_variant
+                && match (left_body, right_body) {
+                    (VariantShape::Unit, VariantShape::Unit) => true,
+                    (VariantShape::Newtype(left), VariantShape::Newtype(right)) => {
+                        values_equal(left, right)
+                    }
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+fn collect_retargets(
+    creates: &[CreateField],
+    prior: &LocatedValue,
+    current: &LocatedValue,
+    messages: &mut Vec<String>,
+) {
+    match (&prior.value, &current.value) {
+        (
+            ValueShape::Struct {
+                name: prior_name,
+                fields: prior_fields,
+            },
+            ValueShape::Struct {
+                name: current_name,
+                fields: current_fields,
+            },
+        ) if prior_name == current_name => {
+            for create in creates.iter().filter(|create| create.ty == *current_name) {
+                let prior_value = prior_fields
+                    .iter()
+                    .find(|(name, _)| name == &create.field)
+                    .map(|(_, value)| value);
+                let current_value = current_fields
+                    .iter()
+                    .find(|(name, _)| name == &create.field)
+                    .map(|(_, value)| value);
+                if !matches!((prior_value, current_value), (Some(prior), Some(current)) if values_equal(prior, current))
+                {
+                    messages.push(format!(
+                        "`{}.{}` is create-time-immutable; changing it is a retarget, refused (not reconciled)",
+                        create.ty, create.field
+                    ));
+                }
+            }
+            for (current_field, current_value) in current_fields {
+                if let Some((_, prior_value)) = prior_fields
+                    .iter()
+                    .find(|(prior_field, _)| prior_field == current_field)
+                {
+                    collect_retargets(creates, prior_value, current_value, messages);
+                }
+            }
+        }
+        (ValueShape::Sequence(prior), ValueShape::Sequence(current)) => {
+            // Sequence elements pair positionally. A prepend can therefore
+            // mis-pair later create fields and false-refuse the edit, which is
+            // the safe direction for create-time identity admission.
+            for (prior, current) in prior.iter().zip(current) {
+                collect_retargets(creates, prior, current, messages);
+            }
+        }
+        (ValueShape::Option(Some(prior)), ValueShape::Option(Some(current))) => {
+            collect_retargets(creates, prior, current, messages);
+        }
+        (ValueShape::Map(prior), ValueShape::Map(current)) => {
+            for (current_key, current_value) in current {
+                if let Some((_, prior_value)) = prior
+                    .iter()
+                    .find(|(prior_key, _)| values_equal(prior_key, current_key))
+                {
+                    collect_retargets(creates, prior_value, current_value, messages);
+                }
+            }
+        }
+        (
+            ValueShape::Enum {
+                variant: prior_variant,
+                body: VariantShape::Newtype(prior),
+                ..
+            },
+            ValueShape::Enum {
+                variant: current_variant,
+                body: VariantShape::Newtype(current),
+                ..
+            },
+        ) if prior_variant == current_variant => {
+            collect_retargets(creates, prior, current, messages);
+        }
+        _ => {}
+    }
 }
 
 impl DefinitionFrontend for TkdpFrontend {
@@ -231,13 +416,44 @@ impl DefinitionFrontend for TkdpFrontend {
         C: Serialize,
     {
         let prepared = self.prepare(&source, context, namespaces, parts)?;
+        self.execute_prepared(&source, namespaces, prepared)
+    }
 
-        let result = execute(&prepared.program, prepared.text).map_err(|failure| {
-            self.diagnostic(&source, failure.range.and_then(to_range), failure.message)
-        })?;
-
-        let pf = prepared.preflight;
-        convert(result, namespaces, &pf.call_sites, pf.deployment_range)
-            .map_err(|error| self.diagnostic(&source, to_range(error.range), error.message))
+    fn retarget_check<C>(
+        &self,
+        prior: FrontendSource<'_>,
+        current: FrontendSource<'_>,
+        context: &C,
+        namespaces: &[Namespace],
+        prior_parts: &dyn tokeira_platform::definition::SourceResolver,
+        current_parts: &dyn tokeira_platform::definition::SourceResolver,
+    ) -> Result<(), Vec<String>>
+    where
+        C: Serialize,
+    {
+        let evaluate = |source: FrontendSource<'_>,
+                        parts: &dyn tokeira_platform::definition::SourceResolver,
+                        label: &str|
+         -> Result<(FrontendOutput, Vec<CreateField>), Vec<String>> {
+            let prepared = self
+                .prepare(&source, context, namespaces, parts)
+                .map_err(|error| vec![format!("{label} definition: {}", error.message)])?;
+            let creates = prepared.creates.clone();
+            let output = self
+                .execute_prepared(&source, namespaces, prepared)
+                .map_err(|error| vec![format!("{label} definition: {}", error.message)])?;
+            Ok((output, creates))
+        };
+        let (prior, _) = evaluate(prior, prior_parts, "prior")?;
+        // As with TKD, the current definition supplies the admission metadata:
+        // it is the contract the operator is proposing to apply.
+        let (current, creates) = evaluate(current, current_parts, "current")?;
+        let mut messages = Vec::new();
+        collect_retargets(&creates, &prior.config, &current.config, &mut messages);
+        if messages.is_empty() {
+            Ok(())
+        } else {
+            Err(messages)
+        }
     }
 }

@@ -1,0 +1,170 @@
+// The EKS operator configuration model. The definition is the configuration:
+// every other part consumes these values, while provider kinds remain the
+// final validation boundary. The Python peer in platform.tkdp carries the
+// same fields and defaults.
+
+pub struct Aws {
+    // Region used by every AWS resource and by the framework's standard
+    // deployment-scoped client bundle.
+    pub region: String,
+}
+
+pub struct Tag {
+    // Explicit key/value shape; tuple values do not cross either frontend's
+    // authoring boundary and named fields keep operator intent legible.
+    pub key: String,
+    pub value: String,
+}
+
+// One least-privilege IAM statement whose ARN is resolved from a declared
+// graph dependency after AWS assigns it.
+pub struct DependentInlinePolicy {
+    pub name: String,
+    pub actions: Vec<String>,
+    pub dependency: String,
+    pub property: String,
+    pub resource_suffixes: Vec<String>,
+}
+
+pub struct Networking {
+    // A private-only address plan: one private subnet in each listed AZ.
+    pub vpc_cidr: String,
+    pub availability_zones: Vec<String>,
+}
+
+pub struct EksPolicy {
+    // Control-plane version and the Auto Mode arm64 compute policy.
+    pub version: String,
+    pub namespace: String,
+    pub node_families: Vec<String>,
+    pub kms_key_arn: Option<String>,
+    pub deletion_protection: bool,
+    pub bootstrap_admin_permissions: bool,
+    pub cluster_admin_principal_arn: Option<String>,
+}
+
+pub struct PreexistingDsql {
+    // Complete immutable identity for an adopted cluster.
+    pub endpoint: String,
+    pub arn: String,
+}
+
+pub enum Dsql {
+    // Storage provenance is shaped, never inferred from absent fields.
+    Managed,
+    Preexisting(PreexistingDsql),
+}
+
+pub struct Images {
+    // Workload inputs. Tokeira application images are deployment-owned build
+    // outputs; third-party observability images are exact version pins.
+    pub tokeirad: String,
+    pub controller: String,
+    pub autoscaler: String,
+    pub mimir: String,
+    pub loki: String,
+    pub grafana: String,
+    pub alloy: String,
+    pub pull_policy: String,
+}
+
+pub struct Workload {
+    // Kubernetes requests equal limits; values use Quantity syntax.
+    pub replicas: u32,
+    pub cpu: String,
+    pub memory: String,
+}
+
+pub struct Services {
+    pub tokeirad: Workload,
+    pub controller: Workload,
+    pub autoscaler: Workload,
+}
+
+pub struct Observability {
+    // Backend capacity and retention are operator policy; images live in
+    // the common image section so every image input has one owner.
+    pub mimir: Workload,
+    pub loki: Workload,
+    pub grafana: Workload,
+    pub retention_days: u32,
+}
+
+pub struct Debug {
+    // CloudWatch Logs is opt-in; when false no logs endpoint is declared.
+    pub cloudwatch_logs: bool,
+    pub log_retention_days: u32,
+}
+
+pub enum DsqlClusterMode {
+    // Provider vocabulary passed to the generic AWS cluster kind.
+    Managed,
+    Preexisting,
+}
+
+pub enum EndpointKind {
+    // Provider vocabulary for private VPC endpoints.
+    Interface,
+    Gateway,
+}
+
+pub struct GeneratedPassword {
+    // Provider shape for a generated username/password JSON secret.
+    pub username: String,
+    pub password_length: i32,
+}
+
+pub enum SecretSource {
+    // Provider vocabulary is constructed only by the root document.
+    Static(String),
+    GeneratedPasswordJson(GeneratedPassword),
+}
+
+pub struct IngressRule {
+    // Provider security-group rule shape.
+    pub description: String,
+    pub protocol: String,
+    pub from_port: u16,
+    pub to_port: u16,
+    pub source: String,
+}
+
+pub struct ServiceManifest {
+    // Complete pod-shape input consumed by ServiceDeployment.
+    pub name: String,
+    pub namespace: String,
+    pub project: String,
+    pub image: String,
+    pub image_pull_policy: String,
+    pub args: Vec<String>,
+    pub config_env: Option<String>,
+    pub replicas: u32,
+    pub cpu: String,
+    pub memory: String,
+    pub grpc_port: Option<u16>,
+    pub metrics_port: u16,
+    pub service_account: String,
+    pub alloy_image: String,
+    pub config_map: String,
+    pub config_file: String,
+    pub advertise_node_host: bool,
+    // Observability configs and every Alloy config are supplied by the
+    // platform content service; binary configs remain workload-owned.
+    pub config_from_content: bool,
+    pub alloy_from_content: bool,
+}
+
+pub struct Eks {
+    // The complete operator surface. AWS/networking/DSQL are deployment
+    // identities; DSQL carries the frontend's create-time retarget guard.
+    pub aws: Aws,
+    pub tags: Vec<Tag>,
+    pub networking: Networking,
+    pub eks: EksPolicy,
+    #[create]
+    pub dsql: Dsql,
+    pub images: Images,
+    pub services: Services,
+    pub observability: Observability,
+    pub debug: Debug,
+}

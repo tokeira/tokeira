@@ -52,6 +52,7 @@ impl Module for ClusterModule {
                 IamRoleConfig {
                     trust_policy: ec2_assume_role_policy(),
                     inline_policies: std::collections::HashMap::new(),
+                    dependent_inline_policies: Vec::new(),
                     managed_policy_arns: vec![
                         "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
                             .to_owned(),

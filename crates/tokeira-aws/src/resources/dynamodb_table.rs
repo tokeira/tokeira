@@ -642,9 +642,10 @@ impl Resource for DynamoDbTable {
         let now = chrono::Utc::now().to_rfc3339();
         Ok(ResourceState {
             resource_type: ResourceType::new("DynamoDbTable"),
-            physical_id: table_arn,
+            physical_id: table_arn.clone(),
             properties: serde_json::json!({
                 "table_name": self.table_name,
+                "table_arn": table_arn,
                 "billing_mode": format!("{:?}", self.billing_mode),
                 "ttl_attribute": self.ttl_attribute,
                 "tags": tags,
@@ -729,6 +730,7 @@ impl Resource for DynamoDbTable {
             physical_id: current.physical_id.clone(),
             properties: serde_json::json!({
                 "table_name": self.table_name,
+                "table_arn": current.physical_id,
                 "billing_mode": format!("{:?}", self.billing_mode),
                 "ttl_attribute": self.ttl_attribute,
                 "tags": tags,
@@ -836,9 +838,10 @@ impl Resource for DynamoDbTable {
                 let now = chrono::Utc::now().to_rfc3339();
                 Ok(DescribeResult::Present(ResourceState {
                     resource_type: ResourceType::new("DynamoDbTable"),
-                    physical_id: arn,
+                    physical_id: arn.clone(),
                     properties: serde_json::json!({
                         "table_name": self.table_name,
+                        "table_arn": arn,
                         "billing_mode": billing_mode,
                         "ttl_attribute": ttl_attribute,
                         "tags": tags,

@@ -33,7 +33,7 @@ mod portforward;
 mod scale;
 mod watch;
 
-pub use logs::LogOptions;
+pub use logs::{KubeLogStream, LogOptions};
 pub use namespace::{NamespaceConfig, NamespaceResource};
 pub use platform::KubePlatform;
 pub use portforward::{PortForwardConfig, PortForwardSession};
@@ -59,8 +59,8 @@ pub(crate) const FIELD_MANAGER: &str = "tkp";
 pub enum K8sError {
     /// The API server could not be reached (no cluster, connectivity, or auth).
     ///
-    /// Read-only `plan` tolerates this by omitting the platform from the
-    /// context; `apply`/`destroy` require a reachable platform.
+    /// Read-only `plan` treats this as unsupported live state;
+    /// `apply`/`destroy` require a reachable platform.
     #[error("kubernetes API server is unreachable: {0}")]
     Unreachable(String),
     /// A manifest lacked a field required to route it to an API endpoint
@@ -221,7 +221,7 @@ pub fn build_node_pool(node_families: &[String]) -> serde_json::Value {
                     "requirements": [
                         { "key": "kubernetes.io/arch", "operator": "In", "values": ["arm64"] },
                         { "key": "karpenter.sh/capacity-type", "operator": "In", "values": ["on-demand"] },
-                        { "key": "node.kubernetes.io/instance-type", "operator": "In", "values": node_families }
+                        { "key": "eks.amazonaws.com/instance-family", "operator": "In", "values": node_families }
                     ],
                     "nodeClassRef": {
                         "group": "eks.amazonaws.com",
@@ -313,7 +313,7 @@ mod tests {
             serde_json::json!(["on-demand"])
         );
         assert_eq!(
-            value_for("node.kubernetes.io/instance-type"),
+            value_for("eks.amazonaws.com/instance-family"),
             serde_json::json!(["m8g", "c8g", "r8g"])
         );
     }

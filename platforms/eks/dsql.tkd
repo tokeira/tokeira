@@ -1,0 +1,26 @@
+// Aurora DSQL storage. The root selects the shaped provenance and passes
+// provider mode/identity directly; this part owns the cluster resource.
+
+use platform::{DsqlClusterMode, Eks};
+
+pub fn define(
+    d: Deployment,
+    cfg: Eks,
+    cx: Context,
+    module: Module,
+    mode: DsqlClusterMode,
+    endpoint: Option<String>,
+    arn: Option<String>,
+) -> Resource {
+    module.resource(
+        "cluster",
+        DsqlCluster {
+            identity: cx.project_name,
+            region: cfg.aws.region,
+            mode: mode,
+            endpoint: endpoint,
+            arn: arn,
+            id: "dsql:cluster".into(),
+        },
+    )
+}

@@ -1,0 +1,155 @@
+# Repeated assemblies called only by the root. Parts import and declare their
+# own resources directly so every companion remains independently legible.
+
+from platform import ServiceManifest
+from tokeira import IamRole, PodIdentityAssociation, VpcEndpoint
+
+
+def endpoint(module, vpc, endpoint_sg, region, short, service, kind):
+    dependencies = [vpc, endpoint_sg] if kind == "Interface" else [vpc]
+    module.resource(
+        "vpce-" + short,
+        VpcEndpoint(
+            region=region,
+            short_name=short,
+            service_name="com.amazonaws." + region + "." + service,
+            endpoint_type=kind,
+            id=None,
+        ),
+        dependencies,
+    )
+
+
+def service_manifest(
+    cx,
+    namespace,
+    name,
+    image,
+    pull_policy,
+    policy,
+    args,
+    config_env,
+    config_file,
+    grpc_port,
+    metrics_port,
+    advertise_node_host,
+    alloy_image,
+    config_from_content,
+):
+    return ServiceManifest(
+        name=name,
+        namespace=namespace,
+        project=cx.project_name,
+        image=image,
+        image_pull_policy=pull_policy,
+        args=args,
+        config_env=config_env,
+        replicas=policy.replicas,
+        cpu=policy.cpu,
+        memory=policy.memory,
+        grpc_port=grpc_port,
+        metrics_port=metrics_port,
+        service_account=name,
+        alloy_image=alloy_image,
+        config_map=name + "-config",
+        config_file=config_file,
+        advertise_node_host=advertise_node_host,
+        config_from_content=config_from_content,
+        alloy_from_content=True,
+    )
+
+
+def pod_role(
+    module,
+    cluster,
+    region,
+    namespace,
+    project,
+    service,
+    policies,
+    policy_dependencies,
+):
+    role = module.resource(
+        "role-" + service,
+        IamRole(
+            region=region,
+            name=project + "-" + service + "-task",
+            trust_policy='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]}]}',
+            inline_policies={},
+            dependent_inline_policies=policies,
+            managed_policy_arns=[],
+        ),
+        policy_dependencies,
+    )
+    return module.resource(
+        "pod-id-" + service,
+        PodIdentityAssociation(
+            region=region,
+            namespace=namespace,
+            service_account=service,
+        ),
+        [cluster, role],
+    )
+
+
+def runtime_policies(project):
+    return [
+        {
+            "name": "dsql-connect",
+            "actions": ["dsql:DbConnect"],
+            "dependency": "dsql:cluster",
+            "property": "cluster_arn",
+            "resource_suffixes": [""],
+        },
+        {
+            "name": "dsql-rate-limiter",
+            "actions": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+            ],
+            "dependency": "dynamodb-" + project + "-dsql-rate-limiter",
+            "property": "table_arn",
+            "resource_suffixes": [""],
+        },
+        {
+            "name": "dsql-connection-lease",
+            "actions": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+            ],
+            "dependency": "dynamodb-" + project + "-dsql-conn-lease",
+            "property": "table_arn",
+            "resource_suffixes": [""],
+        },
+    ]
+
+
+def storage_policy(name, bucket_dependency):
+    return [
+        {
+            "name": name,
+            "actions": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+            ],
+            "dependency": bucket_dependency,
+            "property": "bucket_arn",
+            "resource_suffixes": ["", "/*"],
+        }
+    ]
+
+
+def secret_policy(secret_dependency):
+    return [
+        {
+            "name": "grafana-admin-secret",
+            "actions": ["secretsmanager:GetSecretValue"],
+            "dependency": secret_dependency,
+            "property": "secret_arn",
+            "resource_suffixes": [""],
+        }
+    ]

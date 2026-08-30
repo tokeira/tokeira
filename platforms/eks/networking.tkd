@@ -1,0 +1,45 @@
+// Private EKS node networking. The root owns the VPC and endpoint group
+// because later parts consume them; this part returns the EKS-node group.
+
+use platform::{Eks, IngressRule};
+
+pub fn define(
+    d: Deployment,
+    cfg: Eks,
+    cx: Context,
+    module: Module,
+    vpc: Resource,
+) -> Resource {
+    module.resource(
+        "sg-eks-nodes",
+        SecurityGroup {
+            region: cfg.aws.region,
+            name: format!("{}-eks-nodes-sg", cx.project_name),
+            description: "Private EKS node traffic".into(),
+            ingress: vec![
+                IngressRule {
+                    description: "node membership".into(),
+                    protocol: "-1".into(),
+                    from_port: 0,
+                    to_port: 0,
+                    source: "self".into(),
+                },
+                IngressRule {
+                    description: "private gRPC".into(),
+                    protocol: "tcp".into(),
+                    from_port: 7233,
+                    to_port: 7242,
+                    source: cfg.networking.vpc_cidr,
+                },
+                IngressRule {
+                    description: "private metrics".into(),
+                    protocol: "tcp".into(),
+                    from_port: 3000,
+                    to_port: 3100,
+                    source: cfg.networking.vpc_cidr,
+                },
+            ],
+        },
+        vec![vpc],
+    )
+}

@@ -519,6 +519,7 @@ mod tests {
                 name: "task".into(),
                 trust_policy: "{}".into(),
                 inline_policies: Default::default(),
+                dependent_inline_policies: Vec::new(),
                 managed_policy_arns: Vec::new(),
             }
             .realize(&no_deps)

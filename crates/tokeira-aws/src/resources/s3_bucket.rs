@@ -186,6 +186,10 @@ impl Resource for S3Bucket {
         ResourceType::new("S3Bucket")
     }
 
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &["bucket_name", "bucket_arn"]
+    }
+
     fn resource_id(&self) -> ResourceId {
         ResourceId(format!("s3-{}", self.bucket_name))
     }
@@ -368,6 +372,7 @@ impl Resource for S3Bucket {
             physical_id: self.bucket_name.clone(),
             properties: serde_json::json!({
                 "bucket_name": self.bucket_name,
+                "bucket_arn": format!("arn:aws:s3:::{}", self.bucket_name),
                 "versioning": self.config.versioning,
                 "snapshot_delete_prevention_prefix": snapshot_delete_prevention_prefix,
                 "tags": tags,
@@ -448,6 +453,7 @@ impl Resource for S3Bucket {
             physical_id: current.physical_id.clone(),
             properties: serde_json::json!({
                 "bucket_name": self.bucket_name,
+                "bucket_arn": format!("arn:aws:s3:::{}", self.bucket_name),
                 "versioning": self.config.versioning,
                 "snapshot_delete_prevention_prefix": snapshot_delete_prevention_prefix,
                 "tags": tags,
@@ -568,6 +574,7 @@ impl Resource for S3Bucket {
                     physical_id: self.bucket_name.clone(),
                     properties: serde_json::json!({
                         "bucket_name": self.bucket_name,
+                        "bucket_arn": format!("arn:aws:s3:::{}", self.bucket_name),
                         "versioning": versioning.status()
                             == Some(&aws_sdk_s3::types::BucketVersioningStatus::Enabled),
                         "snapshot_delete_prevention_prefix": snapshot_delete_prevention_prefix,

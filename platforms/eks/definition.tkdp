@@ -1,0 +1,511 @@
+# The EKS Python root is the wiring diagram for this modular definition set.
+# It owns defaults, module edges, shared handles, and writebacks; the focused
+# companions own module-local resources. The TKD peer must project exactly the
+# same admitted configuration and provider intent.
+
+import cluster
+import dsql
+import helpers
+import images
+import networking
+import observability
+import remote_state
+import services
+
+from dataclasses import dataclass
+
+from platform import (
+    Aws,
+    Debug,
+    Eks,
+    EksPolicy,
+    Images,
+    Managed as ManagedDsql,
+    Networking,
+    Observability,
+    Preexisting as PreexistingDsql,
+    Services,
+    Tag,
+    Workload,
+)
+from tokeira import (
+    Context,
+    Deployment,
+    DsqlConnectionEndpoint,
+    DynamoDbTable,
+    ObservabilityContent,
+    S3Bucket,
+    SecretsManagerSecret,
+    SecurityGroup,
+    ServiceDeployment,
+    Vpc,
+)
+
+
+@dataclass
+class GeneratedPasswordJson:
+    # Provider enum projection; enum construction remains root-owned.
+    username: str
+    password_length: int
+
+
+def config() -> Eks:
+    # Operator-editable defaults. Third-party observability images are exact
+    # pins and must move in both roots together.
+    return Eks(
+        aws=Aws(region="eu-west-2"),
+        tags=[Tag(key="ManagedBy", value="tkp")],
+        networking=Networking(
+            vpc_cidr="10.42.0.0/16",
+            availability_zones=["eu-west-2a", "eu-west-2b", "eu-west-2c"],
+        ),
+        eks=EksPolicy(
+            version="1.36",
+            namespace="tokeira-system",
+            node_families=["m8g", "c8g", "r8g"],
+            kms_key_arn=None,
+            deletion_protection=True,
+            bootstrap_admin_permissions=False,
+            cluster_admin_principal_arn=None,
+        ),
+        dsql=ManagedDsql(),
+        images=Images(
+            tokeirad="tokeirad:latest",
+            controller="tokeira-controller:latest",
+            autoscaler="tokeira-autoscaler:latest",
+            mimir="grafana/mimir:3.2.0",
+            loki="grafana/loki:3.7.6",
+            grafana="grafana/grafana:12.4.9",
+            alloy="grafana/alloy:v1.19.0",
+            pull_policy="IfNotPresent",
+        ),
+        services=Services(
+            tokeirad=Workload(replicas=2, cpu="2", memory="4Gi"),
+            controller=Workload(replicas=1, cpu="500m", memory="1Gi"),
+            autoscaler=Workload(replicas=1, cpu="250m", memory="512Mi"),
+        ),
+        observability=Observability(
+            mimir=Workload(replicas=1, cpu="1", memory="2Gi"),
+            loki=Workload(replicas=1, cpu="1", memory="2Gi"),
+            grafana=Workload(replicas=1, cpu="500m", memory="1Gi"),
+            retention_days=30,
+        ),
+        debug=Debug(cloudwatch_logs=False, log_retention_days=7),
+    )
+
+
+def deployment(cfg: Eks, cx: Context) -> Deployment:
+    d = Deployment(["default"])
+
+    remote_state_module = d.module("remote_state")
+    remote_state.define(d, cfg, cx, remote_state_module)
+
+    images_module = d.module("images", [remote_state_module])
+    images.define(d, cfg, cx, images_module)
+
+    networking_module = d.module("networking", [remote_state_module])
+    vpc = networking_module.resource(
+        "vpc",
+        Vpc(
+            region=cfg.aws.region,
+            cidr=cfg.networking.vpc_cidr,
+            availability_zones=cfg.networking.availability_zones,
+        ),
+    )
+    endpoint_sg = networking_module.resource(
+        "sg-vpc-endpoints",
+        SecurityGroup(
+            region=cfg.aws.region,
+            name=cx.project_name + "-vpc-endpoints",
+            description="Private AWS service endpoints",
+            ingress=[
+                {
+                    "description": "HTTPS from the private VPC",
+                    "protocol": "tcp",
+                    "from_port": 443,
+                    "to_port": 443,
+                    "source": cfg.networking.vpc_cidr,
+                },
+                {
+                    "description": "PostgreSQL from the private VPC",
+                    "protocol": "tcp",
+                    "from_port": 5432,
+                    "to_port": 5432,
+                    "source": cfg.networking.vpc_cidr,
+                },
+            ],
+        ),
+        [vpc],
+    )
+    node_sg = networking.define(d, cfg, cx, networking_module, vpc)
+    helpers.endpoint(
+        networking_module, vpc, endpoint_sg, cfg.aws.region, "s3", "s3", "Gateway"
+    )
+    helpers.endpoint(
+        networking_module,
+        vpc,
+        endpoint_sg,
+        cfg.aws.region,
+        "dynamodb",
+        "dynamodb",
+        "Gateway",
+    )
+    for short, service in [
+        ("ecr-api", "ecr.api"),
+        ("ecr-dkr", "ecr.dkr"),
+        ("sts", "sts"),
+        ("eks-auth", "eks-auth"),
+        ("dsql", "dsql"),
+        ("secretsmanager", "secretsmanager"),
+    ]:
+        helpers.endpoint(
+            networking_module,
+            vpc,
+            endpoint_sg,
+            cfg.aws.region,
+            short,
+            service,
+            "Interface",
+        )
+    if cfg.debug.cloudwatch_logs:
+        helpers.endpoint(
+            networking_module,
+            vpc,
+            endpoint_sg,
+            cfg.aws.region,
+            "logs",
+            "logs",
+            "Interface",
+        )
+
+    dsql_module = d.module("dsql", [networking_module])
+    match cfg.dsql:
+        case ManagedDsql():
+            dsql_cluster = dsql.define(
+                d, cfg, cx, dsql_module, "Managed", None, None
+            )
+        case PreexistingDsql(endpoint=endpoint, arn=arn):
+            dsql_cluster = dsql.define(
+                d, cfg, cx, dsql_module, "Preexisting", endpoint, arn
+            )
+    connection_endpoint = dsql_module.resource(
+        "connection-endpoint",
+        DsqlConnectionEndpoint(
+            region=cfg.aws.region,
+            identity=cx.project_name,
+            id="dsql:connection-endpoint",
+        ),
+        [vpc, endpoint_sg, dsql_cluster],
+    )
+    rate_limiter = dsql_module.resource(
+        "rate-limiter",
+        DynamoDbTable(
+            table=cx.project_name + "-dsql-rate-limiter",
+            region=cfg.aws.region,
+            hash_key="pk",
+            ttl="ttl_epoch",
+        ),
+    )
+    conn_lease = dsql_module.resource(
+        "conn-lease",
+        DynamoDbTable(
+            table=cx.project_name + "-dsql-conn-lease",
+            region=cfg.aws.region,
+            hash_key="pk",
+            ttl="ttl_epoch",
+        ),
+    )
+    d.writeback("infrastructure.storage", "dsql")
+    d.writeback(
+        "infrastructure.dsql.endpoint",
+        connection_endpoint.output("private_hostname"),
+    )
+    d.writeback("infrastructure.dsql.region", cfg.aws.region)
+    d.writeback(
+        "infrastructure.dsql.rate_limiter_table",
+        rate_limiter.output("table_name"),
+    )
+    d.writeback(
+        "infrastructure.dsql.conn_lease_table",
+        conn_lease.output("table_name"),
+    )
+
+    cluster_module = d.module("cluster", [dsql_module])
+    eks_cluster = cluster.define(
+        d, cfg, cx, cluster_module, vpc, node_sg
+    )
+
+    observability_module = d.module(
+        "observability", [cluster_module, images_module]
+    )
+    mimir_bucket = observability.define(d, cfg, cx, observability_module)
+    loki_bucket = observability_module.resource(
+        "loki-data",
+        S3Bucket(
+            region=cfg.aws.region,
+            bucket=cx.project_name + "-loki-data",
+            versioning=True,
+            key_prefix=None,
+        ),
+    )
+    grafana_secret = observability_module.resource(
+        "grafana-admin",
+        SecretsManagerSecret(
+            region=cfg.aws.region,
+            name=cx.project_name + "/grafana/admin",
+            source=GeneratedPasswordJson(username="admin", password_length=32),
+            recovery_window_days=7,
+        ),
+    )
+    content = observability_module.resource(
+        "content",
+        ObservabilityContent(
+            namespace=cfg.eks.namespace,
+            project=cx.project_name,
+            region=cfg.aws.region,
+            retention_days=cfg.observability.retention_days,
+        ),
+    )
+
+    services_module = d.module("services", [observability_module])
+    server_config = services.define(d, cfg, cx, services_module)
+    tokeirad_identity = helpers.pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region,
+        cfg.eks.namespace,
+        cx.project_name,
+        "tokeirad",
+        helpers.runtime_policies(cx.project_name),
+        [dsql_cluster, rate_limiter, conn_lease],
+    )
+    controller_identity = helpers.pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region,
+        cfg.eks.namespace,
+        cx.project_name,
+        "tokeira-controller",
+        helpers.runtime_policies(cx.project_name),
+        [dsql_cluster, rate_limiter, conn_lease],
+    )
+    autoscaler_identity = helpers.pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region,
+        cfg.eks.namespace,
+        cx.project_name,
+        "tokeira-autoscaler",
+        helpers.runtime_policies(cx.project_name),
+        [dsql_cluster, rate_limiter, conn_lease],
+    )
+    mimir_identity = helpers.pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region,
+        cfg.eks.namespace,
+        cx.project_name,
+        "mimir",
+        helpers.storage_policy(
+            "mimir-storage", "s3-" + cx.project_name + "-mimir-data"
+        ),
+        [mimir_bucket],
+    )
+    loki_identity = helpers.pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region,
+        cfg.eks.namespace,
+        cx.project_name,
+        "loki",
+        helpers.storage_policy(
+            "loki-storage", "s3-" + cx.project_name + "-loki-data"
+        ),
+        [loki_bucket],
+    )
+    grafana_identity = helpers.pod_role(
+        services_module,
+        eks_cluster,
+        cfg.aws.region,
+        cfg.eks.namespace,
+        cx.project_name,
+        "grafana",
+        helpers.secret_policy("secret-" + cx.project_name + "/grafana/admin"),
+        [grafana_secret],
+    )
+
+    controller = services_module.resource(
+        "tokeira-controller",
+        ServiceDeployment(
+            spec=helpers.service_manifest(
+                cx,
+                cfg.eks.namespace,
+                "tokeira-controller",
+                cfg.images.controller,
+                cfg.images.pull_policy,
+                cfg.services.controller,
+                ["--config", "/etc/tokeira/controller.toml"],
+                "TOKEIRA_CONFIG",
+                "controller.toml",
+                9091,
+                9090,
+                False,
+                cfg.images.alloy,
+                False,
+            ),
+            config_content='dsql_endpoint = "__WRITEBACK_DSQL_ENDPOINT__"\ndsql_region = "'
+            + cfg.aws.region
+            + '"\ncluster_name = "tokeira"\ngrpc_listen_addr = "0.0.0.0:9091"\nmetrics_addr = "0.0.0.0:9090"\n',
+            alloy_config_content="",
+            depends_on=[],
+        ),
+        [eks_cluster, controller_identity, connection_endpoint, content],
+    )
+    mimir = services_module.resource(
+        "mimir",
+        ServiceDeployment(
+            spec=helpers.service_manifest(
+                cx,
+                cfg.eks.namespace,
+                "mimir",
+                cfg.images.mimir,
+                cfg.images.pull_policy,
+                cfg.observability.mimir,
+                ["-config.file=/etc/tokeira/mimir.yaml"],
+                None,
+                "mimir.yaml",
+                None,
+                9009,
+                False,
+                cfg.images.alloy,
+                True,
+            ),
+            config_content="",
+            alloy_config_content="",
+            depends_on=[],
+        ),
+        [eks_cluster, mimir_identity, mimir_bucket, content],
+    )
+    loki = services_module.resource(
+        "loki",
+        ServiceDeployment(
+            spec=helpers.service_manifest(
+                cx,
+                cfg.eks.namespace,
+                "loki",
+                cfg.images.loki,
+                cfg.images.pull_policy,
+                cfg.observability.loki,
+                ["-config.file=/etc/tokeira/loki.yaml"],
+                None,
+                "loki.yaml",
+                None,
+                3100,
+                False,
+                cfg.images.alloy,
+                True,
+            ),
+            config_content="",
+            alloy_config_content="",
+            depends_on=[],
+        ),
+        [eks_cluster, loki_identity, loki_bucket, content],
+    )
+    tokeirad = services_module.resource(
+        "tokeirad",
+        ServiceDeployment(
+            spec=helpers.service_manifest(
+                cx,
+                cfg.eks.namespace,
+                "tokeirad",
+                cfg.images.tokeirad,
+                cfg.images.pull_policy,
+                cfg.services.tokeirad,
+                ["--config", "/etc/tokeira/tokeirad.toml"],
+                "TOKEIRA_CONFIG",
+                "tokeirad.toml",
+                7233,
+                9090,
+                True,
+                cfg.images.alloy,
+                False,
+            ),
+            config_content="",
+            alloy_config_content="",
+            depends_on=["tokeira-controller"],
+        ),
+        [
+            eks_cluster,
+            tokeirad_identity,
+            content,
+            server_config,
+            controller,
+        ],
+    )
+    services_module.resource(
+        "tokeira-autoscaler",
+        ServiceDeployment(
+            spec=helpers.service_manifest(
+                cx,
+                cfg.eks.namespace,
+                "tokeira-autoscaler",
+                cfg.images.autoscaler,
+                cfg.images.pull_policy,
+                cfg.services.autoscaler,
+                ["--config", "/etc/tokeira/autoscaler.toml"],
+                "TOKEIRA_CONFIG",
+                "autoscaler.toml",
+                None,
+                9090,
+                False,
+                cfg.images.alloy,
+                False,
+            ),
+            config_content='polling_interval = 15\nscale_out_consecutive_samples = 2\nscale_in_consecutive_samples = 6\ncooldown = 300\nmimir_endpoint = "http://mimir:9009"\nmetrics_addr = "0.0.0.0:9090"\nstaleness_threshold = 45\ndsql_connection_budget = 10000\ndsql_connection_rate_budget = 1000\nper_runtime_reserved_connections = 64\nper_runtime_startup_connection_rate = 10\ncluster_name = "tokeira"\ndsql_endpoint = "__WRITEBACK_DSQL_ENDPOINT__"\ndsql_region = "'
+            + cfg.aws.region
+            + '"\n\n[service_configs.tokeirad]\nmin = 0\nmax = 16\nstep = 1\n',
+            alloy_config_content="",
+            depends_on=["tokeira-controller", "mimir"],
+        ),
+        [
+            eks_cluster,
+            autoscaler_identity,
+            connection_endpoint,
+            content,
+            controller,
+            mimir,
+        ],
+    )
+    services_module.resource(
+        "grafana",
+        ServiceDeployment(
+            spec=helpers.service_manifest(
+                cx,
+                cfg.eks.namespace,
+                "grafana",
+                cfg.images.grafana,
+                cfg.images.pull_policy,
+                cfg.observability.grafana,
+                [],
+                "GF_PATHS_CONFIG",
+                "grafana.ini",
+                None,
+                3000,
+                False,
+                cfg.images.alloy,
+                True,
+            ),
+            config_content="",
+            alloy_config_content="",
+            depends_on=["mimir", "loki"],
+        ),
+        [
+            eks_cluster,
+            grafana_identity,
+            grafana_secret,
+            content,
+            mimir,
+            loki,
+        ],
+    )
+    return d

@@ -57,6 +57,7 @@ which = "7"
 [dev-dependencies]
 proptest = "1"
 tempfile.workspace = true
+tokeira-eks-deployment = { path = "../../platforms/eks" }
 # The offline pipeline fakes (mock Dagger engine) for the repository
 # integration tests; test builds only.
 tokeira-build = { workspace = true, features = ["testing"] }

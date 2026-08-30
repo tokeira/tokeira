@@ -483,6 +483,7 @@ impl Resource for DsqlIamRoleResource {
             IamRoleConfig {
                 trust_policy: Self::assume_role_policy(),
                 inline_policies,
+                dependent_inline_policies: Vec::new(),
                 managed_policy_arns: vec![],
                 module: self.module.clone(),
             },
@@ -515,6 +516,7 @@ impl Resource for DsqlIamRoleResource {
             IamRoleConfig {
                 trust_policy: Self::assume_role_policy(),
                 inline_policies: HashMap::new(),
+                dependent_inline_policies: Vec::new(),
                 managed_policy_arns: vec![],
                 module: self.module.clone(),
             },

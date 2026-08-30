@@ -1,0 +1,16 @@
+// Bootstrap remote state. The bucket and key prefix derive from stable
+// deployment name, so every invocation resolves the same S3 layout. There is
+// deliberately no environment knob: distinct deployments have distinct names.
+
+use platform::Eks;
+
+pub fn define(d: Deployment, cfg: Eks, cx: Context, module: Module) {
+    module.resource(
+        "bucket",
+        RemoteStateBucket {
+            region: cfg.aws.region,
+            bucket: format!("{}-state-{}", cx.project_name, cfg.aws.region),
+            key_prefix: cx.project_name,
+        },
+    );
+}

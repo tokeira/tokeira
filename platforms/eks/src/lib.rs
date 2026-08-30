@@ -1,33 +1,71 @@
-//! `tokeira-eks-deployment` — the `syn`-authored EKS platform for tokeira.
+//! Definition-backed EKS platform package.
 //!
-//! This is the Kubernetes sibling of `platforms/ecs` and the AWS sibling of
-//! `platforms/compose`: it provisions tokeira on AWS EKS with Aurora DSQL,
-//! authored in the `syn` deployment DSL (Proposals 003/004) and driven by `tkp`.
-//! It sits in the platform plane — it owns *what* to provision (the config, the
-//! kinds, the builder vocabulary, the `definition.tkd`, the orchestrator
-//! adapter), while the interpreter (`tokeira-tkd`), the live Kubernetes apply
-//! (`tokeira-k8s`), and the AWS resource implementations (`tokeira-aws`) are
-//! shared crates it consumes unchanged.
-//!
-//! **The DSL is the config (Proposal 003 §3).** Unlike the classic
-//! `platforms/ecs`, there is no serde `EksConfig`/TOML config file: the config
-//! types, their `config()` defaults, and their `#[create]`/`#[require]`
-//! attributes are authored in `definition.tkd` and read by the interpreter's
-//! `TypeTable`. This crate therefore has no `config.rs`; validation is
-//! `#[require]` and unknown-field rejection is the interpreter subset. The only
-//! TOML in play is the *server* config (`tokeirad.toml`) that writeback fills.
-//!
-//! Module map (built incrementally per the platform-eks spec's task blocks):
-//! - [`context`] — the engine-injected [`context::Cx`] the `.tkd` reads.
-//! - [`builder`] — the author's builder vocabulary ([`builder::Deployment`] and
-//!   the [`builder::Kind`] trait) that a realized `.tkd` records into.
-//!
-//! Later blocks add `definition.tkd` and `adapter` (the
-//! `tokeira_orchestrator::Deployment`/`Ops` seam).
+//! The package declares the authoring namespaces and execution seams consumed
+//! by `tkp`; AWS resources remain in `tokeira-aws`, Kubernetes mechanics remain
+//! in `tokeira-k8s`, and this crate owns only EKS vocabulary and pod shape.
 
-pub mod bridge;
-pub mod builder;
-pub mod context;
-pub mod k8s_resource;
+use std::sync::Arc;
+
+use tokeira_platform::{declaration::PlatformDeclaration, definition::Namespace};
+
+pub mod execution;
+mod k8s_resource;
 pub mod kinds;
-pub mod manifests;
+mod manifests;
+pub mod observability_content;
+mod ops;
+mod service;
+
+fn namespaces() -> Vec<Namespace> {
+    vec![
+        kinds::namespace(),
+        tokeira_deployment::server_config::namespace(),
+        observability_content::namespace(),
+        Namespace {
+            name: tokeira_aws::kinds::NAMESPACE,
+            kinds: tokeira_aws::kinds::KINDS,
+            defaults: None,
+            decode: tokeira_aws::kinds::decode,
+        },
+    ]
+}
+
+/// Pure EKS platform declaration.
+pub fn platform() -> PlatformDeclaration {
+    PlatformDeclaration {
+        namespaces: namespaces(),
+        ops: Some(Box::new(ops::EksOps::default())),
+        execution: Box::new(execution::EksExecution),
+        implementation: Arc::new(execution::EksIntegration::default()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declaration_is_pure_and_kind_names_are_unique() {
+        let declaration = platform();
+        assert_eq!(
+            declaration
+                .namespaces
+                .iter()
+                .map(|namespace| namespace.name)
+                .collect::<Vec<_>>(),
+            [
+                "tokeira_eks_deployment",
+                "tokeira_deployment",
+                "tokeira_eks_content",
+                "tokeira_aws"
+            ]
+        );
+        assert!(declaration.ops.is_some());
+        let mut names = std::collections::BTreeSet::new();
+        for namespace in declaration.namespaces {
+            for kind in namespace.kinds {
+                assert!(names.insert(kind), "duplicate kind `{kind}`");
+            }
+        }
+    }
+}

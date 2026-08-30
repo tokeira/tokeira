@@ -1,0 +1,56 @@
+# EKS Auto Mode control plane, namespace, and arm64 NodePool. Role names are
+# provider dependency identities; namespace and compute wait on the cluster.
+
+from tokeira import EksCluster, IamRole, Namespace, NodePool
+
+
+def define(d, cfg, cx, module, vpc, node_sg):
+    cluster_role = module.resource(
+        "cluster-role",
+        IamRole(
+            region=cfg.aws.region,
+            name=cx.project_name + "-eks-cluster-role",
+            trust_policy='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"eks.amazonaws.com"},"Action":"sts:AssumeRole"}]}',
+            inline_policies={},
+            managed_policy_arns=[
+                "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy",
+                "arn:aws:iam::aws:policy/AmazonEKSComputePolicy",
+                "arn:aws:iam::aws:policy/AmazonEKSBlockStoragePolicy",
+                "arn:aws:iam::aws:policy/AmazonEKSLoadBalancingPolicy",
+                "arn:aws:iam::aws:policy/AmazonEKSNetworkingPolicy",
+            ],
+        ),
+    )
+    node_role = module.resource(
+        "node-role",
+        IamRole(
+            region=cfg.aws.region,
+            name=cx.project_name + "-eks-auto-node-role",
+            trust_policy='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}',
+            inline_policies={},
+            managed_policy_arns=[
+                "arn:aws:iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy",
+                "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly",
+            ],
+        ),
+    )
+    cluster = module.resource(
+        "cluster",
+        EksCluster(
+            region=cfg.aws.region,
+            version=cfg.eks.version,
+            namespace=cfg.eks.namespace,
+            kms_key_arn=cfg.eks.kms_key_arn,
+            deletion_protection=cfg.eks.deletion_protection,
+            bootstrap_admin_permissions=cfg.eks.bootstrap_admin_permissions,
+            cluster_admin_principal_arn=cfg.eks.cluster_admin_principal_arn,
+        ),
+        [vpc, node_sg, cluster_role, node_role],
+    )
+    namespace = module.resource(
+        "namespace", Namespace(name=cfg.eks.namespace), [cluster]
+    )
+    module.resource(
+        "node-pool", NodePool(node_families=cfg.eks.node_families), [cluster]
+    )
+    return cluster

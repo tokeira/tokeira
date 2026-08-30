@@ -1,0 +1,25 @@
+# Private repositories for the three first-party workload images. Repository
+# names derive from deployment identity; runtime image refs remain operator
+# inputs so build and infrastructure ownership stay separate.
+
+from tokeira import EcrRepository
+
+
+def define(d, cfg, cx, module):
+    module.resource(
+        "tokeirad", EcrRepository(repository=cx.project_name + "/tokeirad")
+    )
+    module.resource(
+        "tokeira-controller",
+        EcrRepository(repository=cx.project_name + "/tokeira-controller"),
+    )
+    module.resource(
+        "tokeira-autoscaler",
+        EcrRepository(repository=cx.project_name + "/tokeira-autoscaler"),
+    )
+    module.resource("mimir", EcrRepository(repository=cx.project_name + "/mimir"))
+    module.resource("loki", EcrRepository(repository=cx.project_name + "/loki"))
+    module.resource(
+        "grafana", EcrRepository(repository=cx.project_name + "/grafana")
+    )
+    module.resource("alloy", EcrRepository(repository=cx.project_name + "/alloy"))

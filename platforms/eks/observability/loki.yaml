@@ -1,0 +1,21 @@
+# Revision-bound Loki configuration for the private S3 backend.
+auth_enabled: false
+server:
+  http_listen_port: 3100
+common:
+  path_prefix: /tmp/loki
+  storage:
+    s3:
+      bucketnames: {{ project }}-loki-data
+      region: {{ region }}
+schema_config:
+  configs:
+    - from: "2024-01-01"
+      store: tsdb
+      object_store: s3
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+limits_config:
+  retention_period: {{ retention_days }}d

@@ -53,15 +53,7 @@ impl SecretsProvider for AwsSecretsProvider {
                     .send()
                     .await
                     .map_err(|err| unresolvable(reference, err))?;
-                match value.secret_string() {
-                    Some(secret) => Ok(Secret::new(secret.to_string())),
-                    // Binary secrets have no place in a config value; refusing
-                    // beats handing a schema field undecodable bytes.
-                    None => Err(SecretError::Unresolvable {
-                        locator: reference.to_string(),
-                        reason: "the secret holds binary data, not a string value".to_string(),
-                    }),
-                }
+                string_secret(reference, &value)
             }
             SecretRef::AwsSsmParameter(name) => {
                 let value = self
@@ -72,13 +64,7 @@ impl SecretsProvider for AwsSecretsProvider {
                     .send()
                     .await
                     .map_err(|err| unresolvable(reference, err))?;
-                match value.parameter().and_then(|parameter| parameter.value()) {
-                    Some(secret) => Ok(Secret::new(secret.to_string())),
-                    None => Err(SecretError::Unresolvable {
-                        locator: reference.to_string(),
-                        reason: "the parameter exists but has no value".to_string(),
-                    }),
-                }
+                parameter_value(reference, &value)
             }
             // `env:` never reaches a provider — SecretRef::resolve handles it
             // locally. Answering anyway would invite a second resolution path.
@@ -87,6 +73,42 @@ impl SecretsProvider for AwsSecretsProvider {
                 reason: "env references resolve without a provider".to_string(),
             }),
         }
+    }
+}
+
+// The response-interpretation decisions are separated from the wire calls so the
+// offline suite can exercise them against builder-constructed SDK outputs — a
+// live client cannot be driven without credentials, and the default suite runs
+// with none by contract.
+
+/// Interpret a Secrets Manager response: a string secret resolves; a binary
+/// secret is refused — binary has no place in a config value, and refusing
+/// beats handing a schema field undecodable bytes.
+fn string_secret(
+    reference: &SecretRef,
+    value: &aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueOutput,
+) -> Result<Secret<String>, SecretError> {
+    match value.secret_string() {
+        Some(secret) => Ok(Secret::new(secret.to_string())),
+        None => Err(SecretError::Unresolvable {
+            locator: reference.to_string(),
+            reason: "the secret holds binary data, not a string value".to_string(),
+        }),
+    }
+}
+
+/// Interpret an SSM response: a parameter with a value resolves; a parameter
+/// record without one is refused with the locator named.
+fn parameter_value(
+    reference: &SecretRef,
+    value: &aws_sdk_ssm::operation::get_parameter::GetParameterOutput,
+) -> Result<Secret<String>, SecretError> {
+    match value.parameter().and_then(|parameter| parameter.value()) {
+        Some(secret) => Ok(Secret::new(secret.to_string())),
+        None => Err(SecretError::Unresolvable {
+            locator: reference.to_string(),
+            reason: "the parameter exists but has no value".to_string(),
+        }),
     }
 }
 
@@ -132,6 +154,70 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("aws-sm:acme/grafana"), "{message}");
         assert!(message.contains("secrets provider"), "{message}");
+    }
+
+    #[test]
+    fn a_string_secret_resolves() {
+        let reference = SecretRef::parse("aws-sm:acme/grafana").unwrap();
+        let output =
+            aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueOutput::builder()
+                .secret_string("hunter2")
+                .build();
+        let secret = string_secret(&reference, &output).unwrap();
+        assert_eq!(secret.expose(), "hunter2");
+    }
+
+    #[test]
+    fn a_binary_secret_is_refused_with_the_locator_named() {
+        let reference = SecretRef::parse("aws-sm:acme/blob").unwrap();
+        let output =
+            aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueOutput::builder()
+                .secret_binary(aws_sdk_secretsmanager::primitives::Blob::new(vec![0u8, 1]))
+                .build();
+        let err = string_secret(&reference, &output).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("aws-sm:acme/blob"), "{message}");
+        assert!(message.contains("binary"), "{message}");
+    }
+
+    #[test]
+    fn a_parameter_with_a_value_resolves() {
+        let reference = SecretRef::parse("aws-ssm:/acme/db-password").unwrap();
+        let output = aws_sdk_ssm::operation::get_parameter::GetParameterOutput::builder()
+            .parameter(
+                aws_sdk_ssm::types::Parameter::builder()
+                    .name("/acme/db-password")
+                    .value("swordfish")
+                    .build(),
+            )
+            .build();
+        let secret = parameter_value(&reference, &output).unwrap();
+        assert_eq!(secret.expose(), "swordfish");
+    }
+
+    #[test]
+    fn a_parameter_without_a_value_is_refused_with_the_locator_named() {
+        let reference = SecretRef::parse("aws-ssm:/acme/empty").unwrap();
+        let output = aws_sdk_ssm::operation::get_parameter::GetParameterOutput::builder()
+            .parameter(
+                aws_sdk_ssm::types::Parameter::builder()
+                    .name("/acme/empty")
+                    .build(),
+            )
+            .build();
+        let err = parameter_value(&reference, &output).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("aws-ssm:/acme/empty"), "{message}");
+        assert!(message.contains("no value"), "{message}");
+    }
+
+    #[test]
+    fn sdk_errors_map_to_unresolvable_with_locator_and_reason() {
+        let reference = SecretRef::parse("aws-sm:acme/grafana").unwrap();
+        let err = unresolvable(&reference, "connection refused");
+        let message = err.to_string();
+        assert!(message.contains("aws-sm:acme/grafana"), "{message}");
+        assert!(message.contains("connection refused"), "{message}");
     }
 
     #[tokio::test]

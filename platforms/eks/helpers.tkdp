@@ -59,16 +59,27 @@ def service_manifest(
     )
 
 
-def pod_role(module, cluster, region, namespace, service):
+def pod_role(
+    module,
+    cluster,
+    region,
+    namespace,
+    project,
+    service,
+    policies,
+    policy_dependencies,
+):
     role = module.resource(
         "role-" + service,
         IamRole(
             region=region,
-            name=service + "-task",
+            name=project + "-" + service + "-task",
             trust_policy='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]}]}',
             inline_policies={},
+            dependent_inline_policies=policies,
             managed_policy_arns=[],
         ),
+        policy_dependencies,
     )
     return module.resource(
         "pod-id-" + service,
@@ -79,3 +90,66 @@ def pod_role(module, cluster, region, namespace, service):
         ),
         [cluster, role],
     )
+
+
+def runtime_policies(project):
+    return [
+        {
+            "name": "dsql-connect",
+            "actions": ["dsql:DbConnect"],
+            "dependency": "dsql:cluster",
+            "property": "cluster_arn",
+            "resource_suffixes": [""],
+        },
+        {
+            "name": "dsql-rate-limiter",
+            "actions": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+            ],
+            "dependency": "dynamodb-" + project + "-dsql-rate-limiter",
+            "property": "table_arn",
+            "resource_suffixes": [""],
+        },
+        {
+            "name": "dsql-connection-lease",
+            "actions": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+            ],
+            "dependency": "dynamodb-" + project + "-dsql-conn-lease",
+            "property": "table_arn",
+            "resource_suffixes": [""],
+        },
+    ]
+
+
+def storage_policy(name, bucket_dependency):
+    return [
+        {
+            "name": name,
+            "actions": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+            ],
+            "dependency": bucket_dependency,
+            "property": "bucket_arn",
+            "resource_suffixes": ["", "/*"],
+        }
+    ]
+
+
+def secret_policy(secret_dependency):
+    return [
+        {
+            "name": "grafana-admin-secret",
+            "actions": ["secretsmanager:GetSecretValue"],
+            "dependency": secret_dependency,
+            "property": "secret_arn",
+            "resource_suffixes": [""],
+        }
+    ]

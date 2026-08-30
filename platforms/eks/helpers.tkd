@@ -1,7 +1,7 @@
 // Repeated assemblies called only by the root. Companion parts never call
 // helpers: each part is independently legible and imports its own vocabulary.
 
-use platform::{EndpointKind, IngressRule, ServiceManifest, Workload};
+use platform::{DependentInlinePolicy, EndpointKind, IngressRule, ServiceManifest, Workload};
 
 pub fn endpoint(
     module: Module,
@@ -73,16 +73,21 @@ pub fn pod_role(
     cluster: Resource,
     region: String,
     namespace: String,
+    project: String,
     service: String,
+    policies: Vec<DependentInlinePolicy>,
+    policy_dependencies: Vec<Resource>,
 ) -> Resource {
     let role = module.resource(
         format!("role-{}", service),
         IamRole {
             region: region.clone(),
-            name: format!("{}-task", service),
+            name: format!("{}-{}-task", project, service),
             trust_policy: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"pods.eks.amazonaws.com\"},\"Action\":[\"sts:AssumeRole\",\"sts:TagSession\"]}]}".into(),
+            dependent_inline_policies: policies,
             managed_policy_arns: vec![],
         },
+        policy_dependencies,
     );
     module.resource(
         format!("pod-id-{}", service),
@@ -93,4 +98,63 @@ pub fn pod_role(
         },
         vec![cluster, role],
     )
+}
+
+pub fn runtime_policies(project: String) -> Vec<DependentInlinePolicy> {
+    vec![
+        DependentInlinePolicy {
+            name: "dsql-connect".into(),
+            actions: vec!["dsql:DbConnect".into()],
+            dependency: "dsql:cluster".into(),
+            property: "cluster_arn".into(),
+            resource_suffixes: vec!["".into()],
+        },
+        DependentInlinePolicy {
+            name: "dsql-rate-limiter".into(),
+            actions: vec![
+                "dynamodb:GetItem".into(),
+                "dynamodb:PutItem".into(),
+                "dynamodb:UpdateItem".into(),
+            ],
+            dependency: format!("dynamodb-{}-dsql-rate-limiter", project),
+            property: "table_arn".into(),
+            resource_suffixes: vec!["".into()],
+        },
+        DependentInlinePolicy {
+            name: "dsql-connection-lease".into(),
+            actions: vec![
+                "dynamodb:GetItem".into(),
+                "dynamodb:PutItem".into(),
+                "dynamodb:UpdateItem".into(),
+            ],
+            dependency: format!("dynamodb-{}-dsql-conn-lease", project),
+            property: "table_arn".into(),
+            resource_suffixes: vec!["".into()],
+        },
+    ]
+}
+
+pub fn storage_policy(name: String, bucket_dependency: String) -> Vec<DependentInlinePolicy> {
+    vec![DependentInlinePolicy {
+        name: name,
+        actions: vec![
+            "s3:GetObject".into(),
+            "s3:PutObject".into(),
+            "s3:DeleteObject".into(),
+            "s3:ListBucket".into(),
+        ],
+        dependency: bucket_dependency,
+        property: "bucket_arn".into(),
+        resource_suffixes: vec!["".into(), "/*".into()],
+    }]
+}
+
+pub fn secret_policy(secret_dependency: String) -> Vec<DependentInlinePolicy> {
+    vec![DependentInlinePolicy {
+        name: "grafana-admin-secret".into(),
+        actions: vec!["secretsmanager:GetSecretValue".into()],
+        dependency: secret_dependency,
+        property: "secret_arn".into(),
+        resource_suffixes: vec!["".into()],
+    }]
 }

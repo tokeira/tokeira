@@ -54,17 +54,18 @@
   backward dependencies.
 - [x] 2.6 [PBT] `// Feature: platform-eks, Property 10` — config round-trip identity + unknown-field
   refusal through each frontend's admission.
-- [ ] 2.7 [PBT] `// Feature: platform-eks, Property 4` — `#[create]` DSQL identity change refused as a
+- [x] 2.7 [PBT] `// Feature: platform-eks, Property 4` — `#[create]` DSQL identity change refused as a
   retarget; non-`#[create]` change reconciles.
-- [ ] 2.8 [PBT] `// Feature: platform-eks, Property 6` — private-only/least-privilege plan invariants.
+- [x] 2.8 [PBT] `// Feature: platform-eks, Property 6` — private-only/least-privilege plan invariants.
 - [x] 2.9 [PBT] `// Feature: platform-eks, Property 7` — single DSQL datastore.
 - [x] 2.10 **Checkpoint** — both sets evaluate green; parity holds; `cargo doc` clean.
 
-  **DONE:** 2.1–2.6 and 2.9. Both modular source sets evaluate to the same 51-node graph and
-  realized manifests for managed and adopted DSQL, with deployment identity derived only from
-  `cx.project_name`. Property 4 remains TKD-only because the TKDP frontend has no retarget-admission
-  contract. Property 6 remains open because a managed DSQL provider-assigned ARN cannot yet be
-  projected into an exact `dsql:DbConnect` Pod Identity policy by the shared AWS kind.
+  **DONE:** 2.1–2.10. Both modular source sets evaluate to the same 51-node graph and realized
+  manifests for managed and adopted DSQL, with deployment identity derived only from
+  `cx.project_name`. TKD and TKDP both refuse DSQL identity retargets while admitting reconcilable
+  changes across generated configurations. Every workload has Pod Identity; dependency-backed IAM
+  policies resolve provider-assigned DSQL, DynamoDB, S3, and Secrets Manager ARNs exactly, and
+  property tests reject public placement or wildcard resources.
 
 ## 3. Writeback, state, and creation
 
@@ -105,9 +106,9 @@
   the PR.
 
   **DONE:** 4.3–4.4. Plans remain provider-pure, missing Kubernetes handles fail loudly, registered
-  handles own apply/delete, and the seven-service graph is acyclic in startup order. Ops remains
-  open because `Ops` receives only `DeploymentRef`, while the EKS namespace is authored config; the
-  framework provides no evaluated-config coordinate to an operations implementation.
+  handles own apply/delete, desired-field comparison checks live Kubernetes drift, and the
+  seven-service graph is acyclic in startup order. Live integration task 4.5 and the operator-access
+  slice in tasks 4.6–4.8 remain operator-gated follow-ups.
 
 ## 5. Live acceptance (operator-driven)
 

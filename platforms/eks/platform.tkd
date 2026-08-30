@@ -16,6 +16,16 @@ pub struct Tag {
     pub value: String,
 }
 
+// One least-privilege IAM statement whose ARN is resolved from a declared
+// graph dependency after AWS assigns it.
+pub struct DependentInlinePolicy {
+    pub name: String,
+    pub actions: Vec<String>,
+    pub dependency: String,
+    pub property: String,
+    pub resource_suffixes: Vec<String>,
+}
+
 pub struct Networking {
     // A private-only address plan: one private subnet in each listed AZ.
     pub vpc_cidr: String,

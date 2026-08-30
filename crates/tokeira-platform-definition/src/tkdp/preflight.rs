@@ -6,9 +6,9 @@
 //! Everything else in PEP 634 is rejected here with a spanned finding, as are
 //! reserved `__tokeira_internal_` identifiers (the lowering's private
 //! namespace), tab indentation (the lowering re-indents with space
-//! arithmetic), entrypoint violations, and `tokeira` imports outside the
-//! facade contract. All findings of one pass are collected together
-//! (TKDP001–TKDP012), so an operator sees the full list, not one error per
+//! arithmetic), entrypoint violations, malformed create-time annotations, and
+//! `tokeira` imports outside the facade contract. All findings of one pass are
+//! collected together, so an operator sees the full list, not one error per
 //! attempt.
 
 use ruff_python_ast::{
@@ -72,6 +72,15 @@ pub struct CallSite {
     pub(crate) range: TextRange,
 }
 
+/// One dataclass field declared create-time immutable by `@create(...)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateField {
+    /// Dataclass that owns the field.
+    pub(crate) ty: String,
+    /// Field compared between evaluated configurations.
+    pub(crate) field: String,
+}
+
 /// A validated definition plus everything later stages need.
 #[derive(Debug)]
 pub struct Preflight {
@@ -86,6 +95,8 @@ pub struct Preflight {
     pub part_imports: Vec<PartImport>,
     /// Builder-verb call sites for range correlation.
     pub call_sites: Vec<CallSite>,
+    /// Create-time immutable dataclass fields declared in this document.
+    pub(crate) creates: Vec<CreateField>,
     /// Range of the `config` entrypoint's name.
     pub config_range: TextRange,
     /// Range of the `deployment` entrypoint's name.
@@ -101,6 +112,8 @@ pub struct PartPreflight {
     /// Non-facade module names this part imports (part-to-part edges and
     /// built-ins alike), in source order.
     pub(crate) part_imports: Vec<PartImport>,
+    /// Create-time immutable dataclass fields declared in this part.
+    pub(crate) creates: Vec<CreateField>,
 }
 
 /// One non-facade import: a candidate definition part.
@@ -155,6 +168,7 @@ fn preflight_with_facade(
         checker.visit_stmt(stmt);
     }
     check_import_shadowing(&module, &mut checker);
+    let creates = extract_create_fields(&module, &mut checker.findings);
     let entrypoints = check_entrypoints(&module, &mut checker.findings);
 
     match (entrypoints, checker.findings.is_empty()) {
@@ -163,6 +177,7 @@ fn preflight_with_facade(
             imports: checker.imports,
             part_imports: checker.part_imports,
             call_sites: checker.call_sites,
+            creates,
             config_range,
             deployment_range,
         }),
@@ -214,15 +229,90 @@ fn preflight_part_with_facade(
         checker.visit_stmt(stmt);
     }
     check_import_shadowing(&module, &mut checker);
+    let creates = extract_create_fields(&module, &mut checker.findings);
 
     if checker.findings.is_empty() {
         Ok(PartPreflight {
             module,
             part_imports: checker.part_imports,
+            creates,
         })
     } else {
         Err(checker.findings)
     }
+}
+
+/// Extract `@create("field", ...)` metadata and reject misspelled or dynamic
+/// declarations before the sandbox runs. Keeping the arguments literal makes
+/// admission reviewable from source and lets retarget checks collect metadata
+/// from companion parts without executing provider code.
+fn extract_create_fields(module: &ModModule, findings: &mut Vec<Finding>) -> Vec<CreateField> {
+    let mut creates = Vec::new();
+    for stmt in &module.body {
+        let Stmt::ClassDef(class) = stmt else {
+            continue;
+        };
+        let fields: Vec<&str> = class
+            .body
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::AnnAssign(assign) => match &*assign.target {
+                    Expr::Name(name) => Some(name.id.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        for decorator in &class.decorator_list {
+            let Expr::Call(call) = &decorator.expression else {
+                continue;
+            };
+            let Expr::Name(function) = &*call.func else {
+                continue;
+            };
+            if function.id.as_str() != "create" {
+                continue;
+            }
+            if !call.arguments.keywords.is_empty() || call.arguments.args.is_empty() {
+                findings.push(Finding::new(
+                    "TKDP015",
+                    "`@create` takes one or more literal field names and no keyword arguments",
+                    decorator.range,
+                ));
+                continue;
+            }
+            for argument in &call.arguments.args {
+                let Expr::StringLiteral(field) = argument else {
+                    findings.push(Finding::new(
+                        "TKDP015",
+                        "`@create` field names must be string literals",
+                        argument.range(),
+                    ));
+                    continue;
+                };
+                let field = field.value.to_string();
+                if !fields.contains(&field.as_str()) {
+                    findings.push(Finding::new(
+                        "TKDP015",
+                        format!(
+                            "`@create` names unknown field `{}.{field}`",
+                            class.name.as_str()
+                        ),
+                        argument.range(),
+                    ));
+                    continue;
+                }
+                let create = CreateField {
+                    ty: class.name.to_string(),
+                    field,
+                };
+                if !creates.contains(&create) {
+                    creates.push(create);
+                }
+            }
+        }
+    }
+    creates
 }
 
 /// Refuses a plain `import X` that this file's own module-level `X` would

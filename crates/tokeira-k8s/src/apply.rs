@@ -119,6 +119,52 @@ pub(crate) async fn get_manifest(
     }
 }
 
+/// Check every field the desired manifest owns against one live object.
+///
+/// Server-side apply deliberately leaves provider-defaulted and controller-owned
+/// fields outside the desired document. A whole-object equality check would
+/// therefore report permanent drift; recursive subset comparison checks exactly
+/// the surface attributed to `tkp` while ignoring live-only fields such as
+/// `status`, resource versions, and allocated Service addresses.
+pub(crate) fn desired_fields_match(desired: &serde_json::Value, live: &serde_json::Value) -> bool {
+    match (desired, live) {
+        (serde_json::Value::Object(desired), serde_json::Value::Object(live)) => {
+            desired.iter().all(|(key, value)| {
+                live.get(key)
+                    .is_some_and(|live| desired_fields_match(value, live))
+            })
+        }
+        (serde_json::Value::Array(desired), serde_json::Value::Array(live)) => {
+            desired.len() == live.len()
+                && desired
+                    .iter()
+                    .zip(live)
+                    .all(|(desired, live)| desired_fields_match(desired, live))
+        }
+        _ => desired == live,
+    }
+}
+
+/// Read and compare the complete desired manifest set.
+///
+/// Missing objects, changed owned fields, and objects whose live list shape no
+/// longer matches are drift. Provider errors remain errors so callers can choose
+/// the fail-closed behavior appropriate to their planning surface.
+pub(crate) async fn manifests_current(
+    client: &Client,
+    manifests: &[serde_json::Value],
+) -> Result<bool> {
+    for desired in manifests {
+        let Some(live) = get_manifest(client, desired).await? else {
+            return Ok(false);
+        };
+        if !desired_fields_match(desired, &live) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Delete a batch of manifests in reverse order, ignoring not-found.
 ///
 /// Reverse order (last applied deleted first) mirrors dependency-safe teardown;
@@ -229,5 +275,60 @@ mod tests {
         assert_eq!(pluralize("NodeClass"), "nodeclasses");
         assert_eq!(pluralize("Deployment"), "deployments");
         assert_eq!(pluralize("ConfigMap"), "configmaps");
+    }
+
+    #[test]
+    fn desired_field_comparison_ignores_server_owned_fields() {
+        let desired = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "tokeirad",
+                "labels": { "app": "tokeirad" }
+            },
+            "spec": {
+                "replicas": 2,
+                "template": { "spec": { "containers": [{ "name": "tokeirad" }] } }
+            }
+        });
+        let live = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "tokeirad",
+                "labels": { "app": "tokeirad", "controller": "deployment" },
+                "resourceVersion": "42"
+            },
+            "spec": {
+                "replicas": 2,
+                "strategy": { "type": "RollingUpdate" },
+                "template": { "spec": { "containers": [{ "name": "tokeirad", "imagePullPolicy": "IfNotPresent" }] } }
+            },
+            "status": { "readyReplicas": 2 }
+        });
+
+        assert!(desired_fields_match(&desired, &live));
+    }
+
+    #[test]
+    fn desired_field_comparison_detects_owned_scalar_and_list_drift() {
+        let desired = serde_json::json!({
+            "spec": {
+                "replicas": 2,
+                "containers": [{ "name": "server" }, { "name": "alloy" }]
+            }
+        });
+        let changed_replicas = serde_json::json!({
+            "spec": {
+                "replicas": 3,
+                "containers": [{ "name": "server" }, { "name": "alloy" }]
+            }
+        });
+        let missing_sidecar = serde_json::json!({
+            "spec": { "replicas": 2, "containers": [{ "name": "server" }] }
+        });
+
+        assert!(!desired_fields_match(&desired, &changed_replicas));
+        assert!(!desired_fields_match(&desired, &missing_sidecar));
     }
 }

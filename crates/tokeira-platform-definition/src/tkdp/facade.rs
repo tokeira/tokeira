@@ -29,7 +29,7 @@ pub(crate) const FACADE_MODULE_NAME: &str = "tokeira";
 pub(crate) const FACADE_FILE_NAME: &str = "<tokeira-facade>";
 
 /// Names the facade publishes besides the kind inventory.
-pub(crate) const BUILDER_NAMES: &[&str] = &["Context", "Deployment"];
+pub(crate) const BUILDER_NAMES: &[&str] = &["Context", "Deployment", "create"];
 
 /// The complete importable surface: builders plus the engine kind inventory.
 pub(crate) fn facade_names<'a>(kind_names: &'a [&'a str]) -> Vec<&'a str> {
@@ -78,6 +78,12 @@ def __tokeira_internal_match(subject, cls, fields):
             )
         values.append(getattr(subject, name))
     return values
+
+
+def __tokeira_internal_create(*fields):
+    def annotate(cls):
+        return cls
+    return annotate
 
 
 class __tokeira_internal_Output:
@@ -219,6 +225,7 @@ pub(crate) fn render(kind_names: &[&str], context: &serde_json::Value) -> String
     // business at the import site — nothing to render for them here.
     out.push_str("Deployment = __tokeira_internal_Deployment\n");
     out.push_str("Context = __tokeira_internal_Context\n");
+    out.push_str("create = __tokeira_internal_create\n");
     for name in kind_names {
         out.push_str(&format!("{name} = __tokeira_internal_kind_{name}\n"));
     }

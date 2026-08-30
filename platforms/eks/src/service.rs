@@ -220,6 +220,23 @@ impl Platform for EksServicePlatform {
             .map_err(|error| RuntimeError::Platform(error.to_string()))
     }
 
+    async fn is_service_current(
+        &self,
+        _service_name: &str,
+        manifests: &[serde_json::Value],
+    ) -> bool {
+        match self.platform() {
+            // The trait's boolean surface cannot preserve the provider error.
+            // Defaulting errors to false fails closed: an unreadable live object
+            // is never accepted as current because desired state persisted.
+            Ok(platform) => platform
+                .manifests_current(manifests)
+                .await
+                .unwrap_or_default(),
+            Err(_) => false,
+        }
+    }
+
     fn supports_delete(&self) -> bool {
         true
     }

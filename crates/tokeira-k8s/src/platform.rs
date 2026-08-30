@@ -39,6 +39,15 @@ impl std::fmt::Debug for KubePlatform {
 }
 
 impl KubePlatform {
+    /// Compare exactly the fields a desired manifest owns with one live object.
+    ///
+    /// Provider-defaulted and controller-owned live fields are ignored. This
+    /// pure comparator is shared by infrastructure and service drift checks so
+    /// both lifecycle planes use the same ownership rule.
+    pub fn desired_fields_match(desired: &serde_json::Value, live: &serde_json::Value) -> bool {
+        crate::apply::desired_fields_match(desired, live)
+    }
+
     /// Connect using the ambient kubeconfig or in-cluster service-account config.
     ///
     /// A failure here is reported as [`K8sError::Unreachable`]: for `tkp` this is
@@ -54,12 +63,6 @@ impl KubePlatform {
     /// Wrap an already-constructed client (tests, or a custom-config client).
     pub fn from_client(client: Client) -> Self {
         Self { client }
-    }
-
-    /// Borrow the underlying client for resource impls needing the raw `kube` API
-    /// (e.g. [`crate::NamespaceResource`], which uses the typed `Namespace` API).
-    pub(crate) fn client(&self) -> &Client {
-        &self.client
     }
 
     /// Confirm the API server is actually reachable.
@@ -96,6 +99,18 @@ impl KubePlatform {
         manifest: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>, K8sError> {
         Ok(crate::apply::get_manifest(&self.client, manifest).await?)
+    }
+
+    /// Report whether every field owned by the desired manifest set still
+    /// matches the live objects.
+    ///
+    /// Kubernetes adds defaults and controller state after apply, so this
+    /// compares the desired documents as recursive subsets of live state.
+    pub async fn manifests_current(
+        &self,
+        manifests: &[serde_json::Value],
+    ) -> Result<bool, K8sError> {
+        Ok(crate::apply::manifests_current(&self.client, manifests).await?)
     }
 
     /// Delete a batch of manifests (reverse order, ignoring not-found).

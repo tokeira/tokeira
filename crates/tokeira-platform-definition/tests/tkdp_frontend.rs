@@ -538,6 +538,89 @@ fn repeated_evaluation_is_identical() {
 }
 
 #[test]
+fn create_marker_refuses_identity_changes_and_admits_reconciliation() {
+    let source = |identity: &str, replicas: u32| {
+        format!(
+            r#"from dataclasses import dataclass
+
+from tokeira import Context, Deployment, create
+
+
+@create("identity")
+@dataclass
+class Config:
+    identity: str
+    replicas: int
+
+
+def config() -> Config:
+    return Config(identity="{identity}", replicas={replicas})
+
+
+def deployment(cfg: Config, cx: Context) -> Deployment:
+    return Deployment(["default"])
+"#
+        )
+    };
+    let prior = source("managed", 1);
+    let retargeted = source("preexisting", 1);
+    let reconciled = source("managed", 3);
+    let path = RelativeDefinitionPath::new("definition.tkdp").expect("path");
+    let source_name = DefinitionSourceName::DeploymentRelative(path);
+    let check = |current: &str| {
+        frontend().retarget_check(
+            FrontendSource {
+                source_name: &source_name,
+                bytes: prior.as_bytes(),
+            },
+            FrontendSource {
+                source_name: &source_name,
+                bytes: current.as_bytes(),
+            },
+            &ctx(),
+            &namespaces(),
+            &NoPartSources,
+            &NoPartSources,
+        )
+    };
+
+    let messages = check(&retargeted).expect_err("identity change retargets");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Config.identity")),
+        "{messages:?}"
+    );
+    check(&reconciled).expect("replicas reconcile");
+}
+
+#[test]
+fn create_marker_refuses_unknown_fields_at_preflight() {
+    let source = r#"from dataclasses import dataclass
+
+from tokeira import Context, Deployment, create
+
+
+@create("identitty")
+@dataclass
+class Config:
+    identity: str
+
+
+def config() -> Config:
+    return Config(identity="managed")
+
+
+def deployment(cfg: Config, cx: Context) -> Deployment:
+    return Deployment(["default"])
+"#;
+
+    let error = evaluate(source).expect_err("misspelled create field refuses");
+    assert!(error.contains("TKDP015"), "{error}");
+    assert!(error.contains("Config.identitty"), "{error}");
+}
+
+#[test]
 // The inspection seam (`transient_program`, carried from the spike CLI's
 // `lower --show-generated`) assembles exactly the program `evaluate`
 // executes, deterministically, with the source map covering every byte.

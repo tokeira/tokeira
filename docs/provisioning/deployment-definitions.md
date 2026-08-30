@@ -492,7 +492,8 @@ The authored shape mirrors the Rust form:
 
 - **Facade imports.** Builders and kinds arrive via
   `from tokeira import Context, Deployment, Service, …`. The importable set is
-  the complete engine kind inventory plus `Context` and `Deployment` — no
+  the complete engine kind inventory plus `Context`, `Deployment`, and the
+  `create` admission marker — no
   platform curates below what the engine ships. `import tokeira` and
   `from tokeira import *` are rejected; the frontend satisfies the import
   itself (Monty resolves no such module).
@@ -502,6 +503,13 @@ The authored shape mirrors the Rust form:
   zero-field dataclass is a unit variant (`Managed()`), a field-carrying one a
   payload variant (`Dsql(region=…)`), decoding exactly as the `.tkd` enum
   spelling does.
+- **Create-time identity is explicit.** Decorate a config dataclass with
+  `@create("field", …)` (imported from `tokeira`) to give those fields the same
+  retarget semantics as TKD's `#[create]`. Field names are literal and checked
+  against that dataclass during admission; metadata in companion parts is
+  collected with the root. The marker does not change the dataclass value or
+  call the provider—it only causes the host's prior/current retarget check to
+  refuse a changed identity field.
 - **The entrypoints are `config()` and `deployment(cfg, cx)`**, both required
   exactly once, with exact arities.
 - **Kinds construct with keyword fields.** Omitted fields fill from the

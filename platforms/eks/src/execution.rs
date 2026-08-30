@@ -101,3 +101,42 @@ impl PlatformIntegration for EksIntegration {
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn deployment() -> DeploymentRef {
+        DeploymentRef {
+            name: "demo".into(),
+            dir: PathBuf::from("demo"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_deployment_probe_defers_to_operation_local_provider_checks() {
+        let issue = EksExecution
+            .probe(&deployment())
+            .await
+            .expect("probe is provider-pure");
+
+        assert!(issue.is_none());
+    }
+
+    #[tokio::test]
+    async fn service_platform_is_deployment_scoped_and_fails_without_a_registered_handle() {
+        let integration = EksIntegration::default();
+        let platform = integration
+            .service_platform(&deployment())
+            .expect("standard integration supplies the service applier");
+
+        let error = platform
+            .apply_manifests(&[])
+            .await
+            .expect_err("an unregistered deployment must fail closed");
+
+        assert!(error.to_string().contains("deployment `demo`"));
+    }
+}

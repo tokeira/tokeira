@@ -72,16 +72,20 @@ impl K8sManifestResource {
 
     /// The persisted state. The desired manifests are recorded so `diff` can
     /// detect a changed manifest set and trigger a re-apply.
-    fn state(&self) -> ResourceState {
+    fn state_with_manifests(&self, manifests: &[serde_json::Value]) -> ResourceState {
         ResourceState {
             resource_type: ResourceType::new(self.resource_type),
             physical_id: self.id.0.clone(),
-            properties: serde_json::json!({ "manifests": self.manifests }),
+            properties: serde_json::json!({ "manifests": manifests }),
             dependencies: self.dependencies.clone(),
             created_at: String::new(),
             updated_at: String::new(),
             module: self.module.clone(),
         }
+    }
+
+    fn state(&self) -> ResourceState {
+        self.state_with_manifests(&self.manifests)
     }
 }
 
@@ -170,6 +174,10 @@ impl iac::Resource for K8sManifestResource {
         self.dependencies.clone()
     }
 
+    fn desired_manifest(&self) -> serde_json::Value {
+        serde_json::json!({ "manifests": self.manifests })
+    }
+
     fn module(&self) -> &str {
         &self.module
     }
@@ -218,26 +226,38 @@ impl iac::Resource for K8sManifestResource {
             return Ok(DescribeResult::Unsupported);
         };
         let mut any_present = false;
+        let mut live_manifests = Vec::with_capacity(self.manifests.len());
         for manifest in &self.manifests {
-            if platform.get(manifest).await.map_err(to_iac)?.is_some() {
-                any_present = true;
+            match platform.get(manifest).await.map_err(to_iac)? {
+                Some(live) => {
+                    any_present = true;
+                    live_manifests.push(live);
+                }
+                None => live_manifests.push(serde_json::Value::Null),
             }
         }
         // Any live object of the bundle means it exists; re-apply reconciles the
         // rest. Only a fully-absent bundle is a genuine `Absent`.
         Ok(if any_present {
-            DescribeResult::Present(self.state())
+            DescribeResult::Present(self.state_with_manifests(&live_manifests))
         } else {
             DescribeResult::Absent
         })
     }
 
     fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
-        // Re-apply whenever the desired manifest set differs from what was last
-        // recorded. Comparing the recorded manifests (not a checksum) keeps the
-        // diff exact and dependency-free.
-        let desired = serde_json::json!({ "manifests": self.manifests });
-        if current.properties == desired {
+        let live_matches =
+            current
+                .properties
+                .get("manifests")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|live| {
+                    live.len() == self.manifests.len()
+                        && self.manifests.iter().zip(live).all(|(desired, live)| {
+                            KubePlatform::desired_fields_match(desired, live)
+                        })
+                });
+        if live_matches {
             InternalChange::NoChange {
                 resource_id: self.resource_id(),
             }
@@ -293,5 +313,28 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("KubePlatform is not registered"));
         assert!(message.contains("reachable cluster is required"));
+    }
+
+    #[test]
+    fn diff_ignores_server_fields_but_detects_owned_drift_and_missing_objects() {
+        let resource = resource();
+        let mut live = resource.state();
+        live.properties["manifests"][0]["metadata"]["resourceVersion"] = serde_json::json!("42");
+        assert!(matches!(
+            resource.diff(&live, &ProvisionContext::default()),
+            InternalChange::NoChange { .. }
+        ));
+
+        live.properties["manifests"][0]["metadata"]["name"] = serde_json::json!("retargeted");
+        assert!(matches!(
+            resource.diff(&live, &ProvisionContext::default()),
+            InternalChange::Update { .. }
+        ));
+
+        live.properties["manifests"][0] = serde_json::Value::Null;
+        assert!(matches!(
+            resource.diff(&live, &ProvisionContext::default()),
+            InternalChange::Update { .. }
+        ));
     }
 }

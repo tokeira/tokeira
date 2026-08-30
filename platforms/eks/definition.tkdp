@@ -274,42 +274,64 @@ def deployment(cfg: Eks, cx: Context) -> Deployment:
         eks_cluster,
         cfg.aws.region,
         cfg.eks.namespace,
+        cx.project_name,
         "tokeirad",
+        helpers.runtime_policies(cx.project_name),
+        [dsql_cluster, rate_limiter, conn_lease],
     )
     controller_identity = helpers.pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region,
         cfg.eks.namespace,
+        cx.project_name,
         "tokeira-controller",
+        helpers.runtime_policies(cx.project_name),
+        [dsql_cluster, rate_limiter, conn_lease],
     )
     autoscaler_identity = helpers.pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region,
         cfg.eks.namespace,
+        cx.project_name,
         "tokeira-autoscaler",
+        helpers.runtime_policies(cx.project_name),
+        [dsql_cluster, rate_limiter, conn_lease],
     )
     mimir_identity = helpers.pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region,
         cfg.eks.namespace,
+        cx.project_name,
         "mimir",
+        helpers.storage_policy(
+            "mimir-storage", "s3-" + cx.project_name + "-mimir-data"
+        ),
+        [mimir_bucket],
     )
     loki_identity = helpers.pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region,
         cfg.eks.namespace,
+        cx.project_name,
         "loki",
+        helpers.storage_policy(
+            "loki-storage", "s3-" + cx.project_name + "-loki-data"
+        ),
+        [loki_bucket],
     )
     grafana_identity = helpers.pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region,
         cfg.eks.namespace,
+        cx.project_name,
         "grafana",
+        helpers.secret_policy("secret-" + cx.project_name + "/grafana/admin"),
+        [grafana_secret],
     )
 
     controller = services_module.resource(

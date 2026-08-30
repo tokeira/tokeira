@@ -458,11 +458,9 @@ fn state_and_dsql_identity_derive_only_from_the_deployment_name() {
     assert_eq!(dsql["identity"], "demo");
 }
 
-// Feature: platform-eks, Property 6
-#[test]
-fn realized_plan_is_private_and_every_pod_has_pod_identity() {
-    let output = evaluate_tkd(&shipped("deployment.tkd")).expect("TKD set evaluates");
-    let manifests = serde_json::to_string(realize(&output).manifests()).expect("manifests encode");
+fn assert_private_and_least_privilege_plan(output: &EvaluatedDefinition<DecodedKind>) {
+    let realized = realize(output);
+    let manifests = serde_json::to_string(realized.manifests()).expect("manifests encode");
     assert!(!manifests.contains("0.0.0.0/0"));
     for forbidden in ["InternetGateway", "Ingress", "LoadBalancer"] {
         assert!(!manifests.contains(forbidden), "{forbidden}");
@@ -489,6 +487,76 @@ fn realized_plan_is_private_and_every_pod_has_pod_identity() {
             })
         }));
     }
+
+    let declared_outputs = realized
+        .iter()
+        .map(|resource| (resource.resource_id().0, resource.declared_outputs()))
+        .collect::<BTreeMap<_, _>>();
+    let roles = realized
+        .iter()
+        .filter(|resource| resource.resource_type().0 == "IamRole")
+        .map(|resource| {
+            let manifest = resource.desired_manifest();
+            let name = manifest["role_name"]
+                .as_str()
+                .expect("role name is desired")
+                .to_string();
+            (name, resource, manifest)
+        })
+        .filter(|(name, _, _)| name.ends_with("-task"))
+        .collect::<Vec<_>>();
+    assert_eq!(roles.len(), 6);
+    for (name, role, manifest) in roles {
+        assert!(name.starts_with("demo-"), "{name}");
+        assert!(name.ends_with("-task"), "{name}");
+        assert_eq!(manifest["inline_policies"], serde_json::json!({}));
+        assert_eq!(manifest["managed_policy_arns"], serde_json::json!([]));
+        assert!(!manifest.to_string().contains("\"*\""), "{name}");
+
+        let policies = manifest["dependent_inline_policies"]
+            .as_array()
+            .expect("dependency-backed policies are desired");
+        let expected_policy_count = if [
+            "demo-tokeirad-task",
+            "demo-tokeira-controller-task",
+            "demo-tokeira-autoscaler-task",
+        ]
+        .contains(&name.as_str())
+        {
+            3
+        } else {
+            1
+        };
+        assert_eq!(policies.len(), expected_policy_count, "{name}");
+
+        let dependencies = role
+            .dependencies()
+            .into_iter()
+            .map(|dependency| dependency.0)
+            .collect::<Vec<_>>();
+        for policy in policies {
+            let dependency = policy["dependency"]
+                .as_str()
+                .expect("policy dependency is desired");
+            let property = policy["property"]
+                .as_str()
+                .expect("policy output is desired");
+            assert!(dependencies.iter().any(|candidate| candidate == dependency));
+            assert!(
+                declared_outputs
+                    .get(dependency)
+                    .is_some_and(|outputs| outputs.contains(&property)),
+                "{name} policy asks `{dependency}.{property}` but the provider does not declare it"
+            );
+        }
+    }
+}
+
+// Feature: platform-eks, Property 6
+#[test]
+fn realized_plan_is_private_and_every_pod_has_pod_identity() {
+    let output = evaluate_tkd(&shipped("deployment.tkd")).expect("TKD set evaluates");
+    assert_private_and_least_privilege_plan(&output);
 }
 
 // Feature: platform-eks, Property 7
@@ -638,35 +706,61 @@ fn unknown_config_fields_refuse_in_both_frontends() {
 
 // Feature: platform-eks, Property 4
 #[test]
-fn tkd_retarget_refuses_dsql_identity_but_admits_replica_changes() {
+fn both_frontends_refuse_dsql_retargets_and_admit_replica_changes() {
     let package = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source_name = DefinitionSourceName::AuthoringPath(package.join("deployment.tkd"));
-    let prior = shipped("deployment.tkd");
-    let adopted = preexisting_tkd();
     let declaration = tokeira_eks_deployment::platform();
-    let parts = DirectoryPartSources::new(package, "tkd");
-    let frontend = tokeira_platform_definition::tkd::frontend();
-    let check = |current: &str| {
-        frontend.retarget_check(
+    let tkd_source_name = DefinitionSourceName::AuthoringPath(package.join("deployment.tkd"));
+    let tkd_parts = DirectoryPartSources::new(package, "tkd");
+    let prior_tkd = shipped("deployment.tkd");
+    let check_tkd = |current: &str| {
+        tokeira_platform_definition::tkd::frontend().retarget_check(
             FrontendSource {
-                source_name: &source_name,
-                bytes: prior.as_bytes(),
+                source_name: &tkd_source_name,
+                bytes: prior_tkd.as_bytes(),
             },
             FrontendSource {
-                source_name: &source_name,
+                source_name: &tkd_source_name,
                 bytes: current.as_bytes(),
             },
             &Ctx {
                 project_name: "demo".into(),
             },
             &declaration.namespaces,
-            &parts,
-            &parts,
+            &tkd_parts,
+            &tkd_parts,
         )
     };
-    let messages = check(&adopted).expect_err("DSQL identity is create-time immutable");
-    assert!(messages.iter().any(|message| message.contains("dsql")));
-    check(&mutated_roots(3, 30, false).0).expect("replicas reconcile");
+    let tkdp_source_name = DefinitionSourceName::AuthoringPath(package.join("definition.tkdp"));
+    let tkdp_parts = DirectoryPartSources::new(package, "tkdp");
+    let prior_tkdp = shipped("definition.tkdp");
+    let check_tkdp = |current: &str| {
+        tokeira_platform_definition::tkdp::frontend().retarget_check(
+            FrontendSource {
+                source_name: &tkdp_source_name,
+                bytes: prior_tkdp.as_bytes(),
+            },
+            FrontendSource {
+                source_name: &tkdp_source_name,
+                bytes: current.as_bytes(),
+            },
+            &Ctx {
+                project_name: "demo".into(),
+            },
+            &declaration.namespaces,
+            &tkdp_parts,
+            &tkdp_parts,
+        )
+    };
+    let (reconciled_tkd, reconciled_tkdp) = mutated_roots(3, 30, false);
+    let tkd_messages =
+        check_tkd(&preexisting_tkd()).expect_err("TKD DSQL identity is create-time immutable");
+    assert!(tkd_messages.iter().any(|message| message.contains("dsql")));
+    check_tkd(&reconciled_tkd).expect("TKD replicas reconcile");
+
+    let tkdp_messages =
+        check_tkdp(&preexisting_tkdp()).expect_err("TKDP DSQL identity is create-time immutable");
+    assert!(tkdp_messages.iter().any(|message| message.contains("dsql")));
+    check_tkdp(&reconciled_tkdp).expect("TKDP replicas reconcile");
 }
 
 proptest! {
@@ -695,6 +789,66 @@ proptest! {
         let (root, _) = mutated_roots(replicas, retention, logs);
         let output = evaluate_tkd(&root).expect("generated TKD config evaluates");
         assert_module_dag(&output);
+    }
+
+    // Feature: platform-eks, Property 6
+    #[test]
+    fn private_and_least_privilege_plan_holds_across_admitted_config(
+        replicas in 0_u32..5,
+        retention in 1_u32..366,
+        logs in any::<bool>(),
+    ) {
+        let (root, _) = mutated_roots(replicas, retention, logs);
+        let output = evaluate_tkd(&root).expect("generated TKD config evaluates");
+        assert_private_and_least_privilege_plan(&output);
+    }
+
+    // Feature: platform-eks, Property 4
+    #[test]
+    fn both_frontends_admit_reconcilable_changes_across_config(
+        replicas in 0_u32..5,
+        retention in 1_u32..366,
+        logs in any::<bool>(),
+    ) {
+        let package = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let declaration = tokeira_eks_deployment::platform();
+        let (current_tkd, current_tkdp) = mutated_roots(replicas, retention, logs);
+        let tkd_source_name = DefinitionSourceName::AuthoringPath(package.join("deployment.tkd"));
+        let tkd_parts = DirectoryPartSources::new(package, "tkd");
+        let tkd_result = tokeira_platform_definition::tkd::frontend().retarget_check(
+            FrontendSource {
+                source_name: &tkd_source_name,
+                bytes: shipped("deployment.tkd").as_bytes(),
+            },
+            FrontendSource {
+                source_name: &tkd_source_name,
+                bytes: current_tkd.as_bytes(),
+            },
+            &Ctx { project_name: "demo".into() },
+            &declaration.namespaces,
+            &tkd_parts,
+            &tkd_parts,
+        );
+        prop_assert!(tkd_result.is_ok(), "{tkd_result:?}");
+
+        let tkdp_source_name = DefinitionSourceName::AuthoringPath(package.join("definition.tkdp"));
+        let tkdp_parts = DirectoryPartSources::new(package, "tkdp");
+        let prior_tkdp = shipped("definition.tkdp");
+        let tkdp_result = tokeira_platform_definition::tkdp::frontend().retarget_check(
+            FrontendSource {
+                source_name: &tkdp_source_name,
+                bytes: prior_tkdp.as_bytes(),
+            },
+            FrontendSource {
+                source_name: &tkdp_source_name,
+                bytes: current_tkdp.as_bytes(),
+            },
+            &Ctx { project_name: "demo".into() },
+            &declaration.namespaces,
+            &tkdp_parts,
+            &tkdp_parts,
+        );
+        prop_assert!(tkdp_result.is_ok(), "{tkdp_result:?}");
     }
 
     // Feature: platform-eks, Property 10

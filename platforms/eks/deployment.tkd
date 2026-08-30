@@ -343,50 +343,74 @@ fn deployment(cfg: Eks, cx: Context) -> Deployment {
     // substrate prerequisites and service startup constraints.
     let services_module = d.module("services", vec![observability_module]);
     let server_config = services::define(d, cfg, cx, services_module);
-    // Pod Identity is one role/association per ServiceAccount. The managed
-    // DSQL role's dynamic cluster-ARN policy is a named shared-provider
-    // follow-up; a broad Resource "*" policy is deliberately not authored.
+    // Pod Identity is one role/association per ServiceAccount. Policy ARNs
+    // resolve from the exact declared storage dependencies after AWS assigns
+    // them; no role widens provider resources to `*`.
     let tokeirad_identity = helpers::pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region.clone(),
         cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
         "tokeirad".into(),
+        helpers::runtime_policies(cx.project_name.clone()),
+        vec![dsql_cluster, rate_limiter, conn_lease],
     );
     let controller_identity = helpers::pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region.clone(),
         cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
         "tokeira-controller".into(),
+        helpers::runtime_policies(cx.project_name.clone()),
+        vec![dsql_cluster, rate_limiter, conn_lease],
     );
     let autoscaler_identity = helpers::pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region.clone(),
         cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
         "tokeira-autoscaler".into(),
+        helpers::runtime_policies(cx.project_name.clone()),
+        vec![dsql_cluster, rate_limiter, conn_lease],
     );
     let mimir_identity = helpers::pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region.clone(),
         cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
         "mimir".into(),
+        helpers::storage_policy(
+            "mimir-storage".into(),
+            format!("s3-{}-mimir-data", cx.project_name),
+        ),
+        vec![mimir_bucket],
     );
     let loki_identity = helpers::pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region.clone(),
         cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
         "loki".into(),
+        helpers::storage_policy(
+            "loki-storage".into(),
+            format!("s3-{}-loki-data", cx.project_name),
+        ),
+        vec![loki_bucket],
     );
     let grafana_identity = helpers::pod_role(
         services_module,
         eks_cluster,
         cfg.aws.region.clone(),
         cfg.eks.namespace.clone(),
+        cx.project_name.clone(),
         "grafana".into(),
+        helpers::secret_policy(format!("secret-{}/grafana/admin", cx.project_name)),
+        vec![grafana_secret],
     );
 
     let controller = services_module.resource(

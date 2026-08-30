@@ -247,6 +247,10 @@ impl Resource for SecretsManagerSecret {
         ResourceType::new("SecretsManagerSecret")
     }
 
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &["secret_name", "secret_arn", "version_id"]
+    }
+
     fn resource_id(&self) -> ResourceId {
         ResourceId(format!("secret-{}", self.secret_name))
     }
@@ -335,13 +339,14 @@ impl Resource for SecretsManagerSecret {
         let now = chrono::Utc::now().to_rfc3339();
         Ok(ResourceState {
             resource_type: ResourceType::new("SecretsManagerSecret"),
-            physical_id: secret_arn,
+            physical_id: secret_arn.clone(),
             // `version_id` is the committed secret version — the identity a
             // pinned consumer (an ECS task definition's `valueFrom`) names so
             // a content change is a visible, planned redeploy rather than a
             // silent drift between replicas.
             properties: serde_json::json!({
                 "secret_name": self.secret_name,
+                "secret_arn": secret_arn,
                 "tags": tags,
                 "version_id": version_id,
             }),
@@ -422,11 +427,13 @@ impl Resource for SecretsManagerSecret {
         {
             Ok(output) => {
                 let now = chrono::Utc::now().to_rfc3339();
+                let secret_arn = output.arn().unwrap_or_default().to_string();
                 Ok(DescribeResult::Present(ResourceState {
                     resource_type: ResourceType::new("SecretsManagerSecret"),
-                    physical_id: output.arn().unwrap_or_default().to_string(),
+                    physical_id: secret_arn.clone(),
                     properties: serde_json::json!({
                         "secret_name": self.secret_name,
+                        "secret_arn": secret_arn,
                     }),
                     dependencies: vec![],
                     created_at: now.clone(),

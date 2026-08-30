@@ -236,6 +236,7 @@ pub(crate) fn service_task_role(service_name: &str, config: &EcsConfig, module: 
         IamRoleConfig {
             trust_policy: ecs_tasks_assume_role_policy(),
             inline_policies,
+            dependent_inline_policies: Vec::new(),
             managed_policy_arns: Vec::new(),
             module: module.to_owned(),
         },
@@ -256,6 +257,7 @@ pub(crate) fn execution_role_for_workload(
             IamRoleConfig {
                 trust_policy: ecs_tasks_assume_role_policy(),
                 inline_policies,
+                dependent_inline_policies: Vec::new(),
                 managed_policy_arns: Vec::new(),
                 module: module.to_owned(),
             },
@@ -276,6 +278,7 @@ pub(crate) fn execution_role(service_name: &str, config: &EcsConfig, module: &st
         IamRoleConfig {
             trust_policy: ecs_tasks_assume_role_policy(),
             inline_policies,
+            dependent_inline_policies: Vec::new(),
             managed_policy_arns: Vec::new(),
             module: module.to_owned(),
         },

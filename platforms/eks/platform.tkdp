@@ -3,6 +3,8 @@
 
 from dataclasses import dataclass
 
+from tokeira import create
+
 
 @dataclass
 class Aws:
@@ -15,6 +17,16 @@ class Tag:
     # Named tag fields are portable across both definition frontends.
     key: str
     value: str
+
+
+@dataclass
+class DependentInlinePolicy:
+    # One least-privilege IAM statement resolved from applied dependency state.
+    name: str
+    actions: list[str]
+    dependency: str
+    property: str
+    resource_suffixes: list[str]
 
 
 @dataclass
@@ -92,10 +104,11 @@ class Debug:
     log_retention_days: int
 
 
+@create("dsql")
 @dataclass
 class Eks:
-    # Complete operator surface. TKDP does not yet express create-time
-    # annotations, so parity tests protect the same shaped DSQL identity.
+    # Complete operator surface. The DSQL provenance is deployment identity,
+    # so changing it is a refused retarget rather than reconciliation.
     aws: Aws
     tags: list[Tag]
     networking: Networking

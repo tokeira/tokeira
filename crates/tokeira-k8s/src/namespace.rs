@@ -10,8 +10,6 @@
 //! orphaning persisted state.
 
 use async_trait::async_trait;
-use k8s_openapi::api::core::v1::Namespace as K8sNamespace;
-use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 use tokeira_iac::{
     ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, DescribeResult, Disruption,
     IacError, InternalChange, LifecycleOperation, ProvisionContext, ReplacementPolicy, Resource,
@@ -72,11 +70,18 @@ impl NamespaceResource {
 
     /// The persisted state for this namespace at the current instant.
     fn current_state(&self) -> ResourceState {
+        self.state_with_manifest(self.desired_manifest())
+    }
+
+    fn state_with_manifest(&self, manifest: serde_json::Value) -> ResourceState {
         let now = chrono::Utc::now().to_rfc3339();
         ResourceState {
             resource_type: self.resource_type(),
             physical_id: self.name.clone(),
-            properties: serde_json::json!({ "namespace": self.name }),
+            properties: serde_json::json!({
+                "namespace": self.name,
+                "manifest": manifest,
+            }),
             dependencies: self.dependencies(),
             created_at: now.clone(),
             updated_at: now,
@@ -95,8 +100,8 @@ impl Resource for NamespaceResource {
         ));
         const UPDATE: Citation = Citation::code(concat!(
             module_path!(),
-            "::update — bookkeeping only: a namespace is name-only from the \
-             engine's view and `diff` never reports a change"
+            "::update — server-side apply reconciles the namespace labels \
+             owned by Tokeira without replacing the namespace"
         ));
         const DELETE: Citation = Citation::code(concat!(
             module_path!(),
@@ -187,33 +192,26 @@ impl Resource for NamespaceResource {
         vec![self.config.eks_cluster_dependency.clone()]
     }
 
+    fn desired_manifest(&self) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": self.name,
+                "labels": crate::standard_labels(&self.name, &self.project),
+            },
+        })
+    }
+
     fn module(&self) -> &str {
         &self.config.module
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        let client = self.platform(ctx)?.client().clone();
-        let ns_api: Api<K8sNamespace> = Api::all(client);
-
-        let ns = K8sNamespace {
-            metadata: ObjectMeta {
-                name: Some(self.name.clone()),
-                labels: Some(crate::standard_labels(&self.name, &self.project)),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        match ns_api.create(&PostParams::default(), &ns).await {
-            Ok(_) => {}
-            // Adopt a pre-existing namespace rather than fail: from the engine's
-            // perspective create must be idempotent, so a namespace that already
-            // exists (e.g. re-apply after a partial run) is a success, not drift.
-            Err(kube::Error::Api(ref e)) if e.code == 409 => {
-                tracing::warn!(namespace = %self.name, "namespace already exists, adopting");
-            }
-            Err(e) => return Err(IacError::Other(anyhow::anyhow!("k8s CreateNamespace: {e}"))),
-        }
+        self.platform(ctx)?
+            .apply(&[self.desired_manifest()])
+            .await
+            .map_err(|error| IacError::Other(anyhow::Error::new(error)))?;
 
         Ok(self.current_state())
     }
@@ -221,15 +219,17 @@ impl Resource for NamespaceResource {
     async fn update(
         &self,
         current: &ResourceState,
-        _ctx: &ProvisionContext,
+        ctx: &ProvisionContext,
     ) -> Result<ResourceState, IacError> {
-        // A namespace has no engine-tracked mutable fields (see `diff`), so
-        // `update` is only ever reached for bookkeeping; refresh the timestamp
-        // and re-derived fields, preserving the original creation time.
+        self.platform(ctx)?
+            .apply(&[self.desired_manifest()])
+            .await
+            .map_err(|error| IacError::Other(anyhow::Error::new(error)))?;
         Ok(ResourceState {
             updated_at: chrono::Utc::now().to_rfc3339(),
             dependencies: self.dependencies(),
             module: self.config.module.clone(),
+            properties: self.current_state().properties,
             ..current.clone()
         })
     }
@@ -239,18 +239,11 @@ impl Resource for NamespaceResource {
         _current: &ResourceState,
         ctx: &ProvisionContext,
     ) -> Result<(), IacError> {
-        let client = self.platform(ctx)?.client().clone();
-        let ns_api: Api<K8sNamespace> = Api::all(client);
-
-        match ns_api.delete(&self.name, &DeleteParams::default()).await {
-            Ok(_) => Ok(()),
-            // Already gone is success: delete is idempotent.
-            Err(kube::Error::Api(ref e)) if e.code == 404 => {
-                tracing::warn!(namespace = %self.name, "namespace already absent, skipping");
-                Ok(())
-            }
-            Err(e) => Err(IacError::Other(anyhow::anyhow!("k8s DeleteNamespace: {e}"))),
-        }
+        self.platform(ctx)?
+            .delete(&[self.desired_manifest()])
+            .await
+            .map(|_| ())
+            .map_err(|error| IacError::Other(anyhow::Error::new(error)))
     }
 
     async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
@@ -262,20 +255,64 @@ impl Resource for NamespaceResource {
             return Ok(DescribeResult::Unsupported);
         };
 
-        let ns_api: Api<K8sNamespace> = Api::all(platform.client().clone());
-        match ns_api.get_opt(&self.name).await {
-            Ok(Some(_)) => Ok(DescribeResult::Present(self.current_state())),
-            // A positive "not found" from the API server is a genuine `Absent`.
+        match platform.get(&self.desired_manifest()).await {
+            Ok(Some(live)) => Ok(DescribeResult::Present(self.state_with_manifest(live))),
             Ok(None) => Ok(DescribeResult::Absent),
-            Err(e) => Err(IacError::Other(anyhow::anyhow!("k8s GetNamespace: {e}"))),
+            Err(error) => Err(IacError::Other(anyhow::Error::new(error))),
         }
     }
 
-    fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
-        // A namespace is name-only from the engine's view — nothing it tracks can
-        // drift — so it never reports a change once created.
-        InternalChange::NoChange {
-            resource_id: self.resource_id(),
+    fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
+        let matches = current
+            .properties
+            .get("manifest")
+            .is_some_and(|live| KubePlatform::desired_fields_match(&self.desired_manifest(), live));
+        if matches {
+            InternalChange::NoChange {
+                resource_id: self.resource_id(),
+            }
+        } else {
+            InternalChange::Update {
+                resource_id: self.resource_id(),
+                resource_type: self.resource_type(),
+                details: vec![tokeira_iac::FieldDiff::observation(
+                    "namespace labels changed",
+                )],
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resource() -> NamespaceResource {
+        NamespaceResource::new(
+            "runtime",
+            NamespaceConfig {
+                eks_cluster_dependency: ResourceId("eks/demo".into()),
+                module: "cluster".into(),
+            },
+            "demo",
+        )
+    }
+
+    #[test]
+    fn diff_ignores_server_fields_and_detects_owned_label_drift() {
+        let resource = resource();
+        let mut live = resource.current_state();
+        live.properties["manifest"]["metadata"]["resourceVersion"] = serde_json::json!("42");
+        assert!(matches!(
+            resource.diff(&live, &ProvisionContext::default()),
+            InternalChange::NoChange { .. }
+        ));
+
+        live.properties["manifest"]["metadata"]["labels"]["app.kubernetes.io/managed-by"] =
+            serde_json::json!("someone-else");
+        assert!(matches!(
+            resource.diff(&live, &ProvisionContext::default()),
+            InternalChange::Update { .. }
+        ));
     }
 }

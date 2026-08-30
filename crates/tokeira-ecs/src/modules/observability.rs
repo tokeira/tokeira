@@ -292,6 +292,7 @@ pub(crate) fn storage_role(
         IamRoleConfig {
             trust_policy: ecs_tasks_assume_role_policy(),
             inline_policies,
+            dependent_inline_policies: Vec::new(),
             managed_policy_arns: Vec::new(),
             module: module.to_owned(),
         },

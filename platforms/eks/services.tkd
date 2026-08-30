@@ -1,0 +1,8 @@
+// Deploy-plane configuration identity. The root consumes this handle from
+// every `tokeirad` workload; EKS owns delivery as a mounted ConfigMap.
+
+use platform::Eks;
+
+pub fn define(d: Deployment, cfg: Eks, cx: Context, module: Module) -> Resource {
+    module.resource("server-config", ServerConfig {})
+}

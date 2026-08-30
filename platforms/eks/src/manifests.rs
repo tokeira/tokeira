@@ -4,20 +4,20 @@
 //! `serde_json::Value` via a small `to_manifest` helper, which is the form the K8s-object
 //! kinds hand to `KubePlatform` for server-side apply. Building typed structs
 //! (rather than hand-writing JSON) keeps the manifests schema-checked at compile
-//! time; the round-trip to `Value` is lossless (Property 9).
+//! time; the round-trip to `Value` is lossless (Property 5).
 //!
-//! The shape is the proven source pod shape (Alloy native sidecar, arm64
-//! affinity, pod anti-affinity, Pod-Identity ServiceAccount) adapted to tokeira:
+//! The shared shape combines an Alloy native sidecar, arm64 affinity, pod
+//! anti-affinity, and a Pod-Identity ServiceAccount:
 //!
 //! - **Config, not env.** `tokeirad`/`tokeira-controller`/`tokeira-autoscaler`
 //!   each read all configuration — including the entire DSQL contract — from a
 //!   TOML file located by `--config` (`apps/tokeirad/src/lib.rs`,
 //!   `apps/tokeira-controller`, `apps/tokeira-autoscaler`). So the pod mounts a
 //!   config ConfigMap and passes `--config <path>`; the DSQL endpoint arrives in
-//!   that file via writeback (Req 6.2/9), never as `TEMPORAL_SQL_*` env.
+//!   that file via writeback (Requirements 5.2 and 8), never as per-field env.
 //! - **Per-pod broadcast address.** Only `tokeirad` advertises a membership
 //!   endpoint; it gets `TOKEIRA_NODE_HOST` from the downward API (`status.podIP`),
-//!   consumed by the `tokeira-config` env override (Req 6.1). A shared ConfigMap
+//!   consumed by the `tokeira-config` env override (Requirement 5.2). A shared ConfigMap
 //!   cannot carry a per-pod host, which is exactly why that override exists.
 //! - **No headless Service.** Membership is controller-based (a node registers
 //!   with `tokeira-controller` over gRPC), not gossip, so no peer-discovery
@@ -43,6 +43,7 @@ use k8s_openapi::{
         util::intstr::IntOrString,
     },
 };
+use serde::Deserialize;
 use tokeira_k8s::standard_labels;
 
 /// Directory the config ConfigMap is mounted at; the config file sits directly
@@ -55,7 +56,8 @@ const ALLOY_MOUNT_DIR: &str = "/etc/alloy";
 /// the three tokeira binaries (`tokeirad`, `tokeira-controller`,
 /// `tokeira-autoscaler`) plus the observability services. The pod *shape* is
 /// identical; only these fields differ.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceManifest {
     /// Kubernetes object name and `app` selector value, e.g. `tokeirad`.
     pub(crate) name: String,
@@ -65,6 +67,12 @@ pub struct ServiceManifest {
     pub(crate) project: String,
     /// Container image reference.
     pub(crate) image: String,
+    /// Kubernetes image pull policy.
+    pub(crate) image_pull_policy: String,
+    /// Container arguments, including any platform-specific config locator.
+    pub(crate) args: Vec<String>,
+    /// Optional environment variable that receives the mounted config path.
+    pub(crate) config_env: Option<String>,
     /// Desired replica count.
     pub(crate) replicas: u32,
     /// CPU request/limit as a Kubernetes quantity (e.g. `500m`, `2`).
@@ -89,6 +97,10 @@ pub struct ServiceManifest {
     /// Only `tokeirad` (a runtime node) does; the controller is reached via its
     /// Service and the autoscaler has no inbound endpoint.
     pub(crate) advertise_node_host: bool,
+    /// The platform content service already owns the main config ConfigMap.
+    pub(crate) config_from_content: bool,
+    /// The platform content service already owns the Alloy config ConfigMap.
+    pub(crate) alloy_from_content: bool,
 }
 
 /// The `app` selector for a service — matched by its Deployment, Service, and
@@ -131,12 +143,13 @@ fn env_field_ref(name: &str, field_path: &str) -> EnvVar {
 
 /// The Alloy native sidecar: a Kubernetes 1.33 native sidecar, i.e. an init
 /// container with `restartPolicy: Always` so it starts before and runs for the
-/// lifetime of the main container (Req 6.1; Property 13). It reads its rendered
+/// lifetime of the main container (Requirement 5.1; Property 9). It reads its rendered
 /// config from the `alloy-config` ConfigMap mounted read-only.
 fn alloy_sidecar(spec: &ServiceManifest) -> Container {
     Container {
         name: "alloy".to_string(),
         image: Some(spec.alloy_image.clone()),
+        image_pull_policy: Some(spec.image_pull_policy.clone()),
         // The `Always` restart policy on an init container is precisely what makes
         // it a native sidecar rather than a run-once init step — do not drop it.
         restart_policy: Some("Always".to_string()),
@@ -204,11 +217,15 @@ fn affinity(name: &str) -> Affinity {
 /// mounted config file, so this list is deliberately tiny.
 fn main_env(spec: &ServiceManifest) -> Vec<EnvVar> {
     let config_path = format!("{CONFIG_MOUNT_DIR}/{}", spec.config_file);
-    let mut env_vars = vec![env("TOKEIRA_CONFIG", &config_path)];
+    let mut env_vars = spec
+        .config_env
+        .as_ref()
+        .map(|name| vec![env(name, &config_path)])
+        .unwrap_or_default();
     if spec.advertise_node_host {
         // `POD_IP` is informational; `TOKEIRA_NODE_HOST` is the value the
         // `tokeira-config` env override consumes so this pod advertises its own
-        // reachable membership address (Req 6.1 / the N1 hook). Without it every
+        // reachable membership address (Requirements 5.2 and 6.2). Without it every
         // pod sharing the ConfigMap would advertise the same static host.
         env_vars.push(env_field_ref("POD_IP", "status.podIP"));
         env_vars.push(env_field_ref("TOKEIRA_NODE_HOST", "status.podIP"));
@@ -238,15 +255,13 @@ fn container_ports(spec: &ServiceManifest) -> Vec<ContainerPort> {
 /// and the config + alloy-config ConfigMap volumes.
 pub(crate) fn deployment(spec: &ServiceManifest) -> serde_json::Value {
     let labels = standard_labels(&spec.name, &spec.project);
-    let config_path = format!("{CONFIG_MOUNT_DIR}/{}", spec.config_file);
-
     let main = Container {
         name: spec.name.clone(),
         image: Some(spec.image.clone()),
-        // The image entrypoint is the tokeira binary; every binary locates its
-        // config via `--config <path>` (`tokeirad` clap; controller/autoscaler
-        // `config_path_from_args`). This is the uniform, ground-truthed mechanism.
-        args: Some(vec!["--config".to_string(), config_path]),
+        image_pull_policy: Some(spec.image_pull_policy.clone()),
+        // Arguments remain authored per binary: the shared pod shape does not
+        // manufacture one CLI contract for unrelated observability images.
+        args: Some(spec.args.clone()),
         ports: Some(container_ports(spec)),
         env: Some(main_env(spec)),
         resources: Some(ResourceRequirements {
@@ -379,7 +394,7 @@ pub(crate) fn service_account(name: &str, namespace: &str, project: &str) -> ser
 ///
 /// This is the vehicle for the server config: the hydrated `tokeirad.toml` (DSQL
 /// endpoint filled by writeback) is the `content`, mounted at
-/// `/etc/tokeira/<file_name>` and passed via `--config` (Req 6.2/9).
+/// `/etc/tokeira/<file_name>` and passed via `--config` (Requirements 5.2 and 8).
 pub(crate) fn config_map(
     name: &str,
     namespace: &str,
@@ -405,7 +420,7 @@ pub(crate) fn config_map(
 
 /// Build the Karpenter `NodePool` (arm64/on-demand → EKS Auto Mode default
 /// NodeClass). Delegates to the shared `tokeira-k8s` helper so the shape is
-/// single-sourced (Property 13).
+/// single-sourced (Property 9).
 pub(crate) fn node_pool(node_families: &[String]) -> serde_json::Value {
     tokeira_k8s::build_node_pool(node_families)
 }
@@ -436,6 +451,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn tokeirad_spec() -> ServiceManifest {
@@ -444,16 +461,21 @@ mod tests {
             namespace: "tokeira-system".into(),
             project: "tokeira".into(),
             image: "tokeirad:latest".into(),
+            image_pull_policy: "IfNotPresent".into(),
+            args: vec!["--config".into(), "/etc/tokeira/tokeirad.toml".into()],
+            config_env: Some("TOKEIRA_CONFIG".into()),
             replicas: 3,
             cpu: "2".into(),
             memory: "4Gi".into(),
             grpc_port: Some(7233),
             metrics_port: 9090,
             service_account: "tokeirad".into(),
-            alloy_image: "grafana/alloy:v1.16.0".into(),
+            alloy_image: "grafana/alloy:v1.19.0".into(),
             config_map: "tokeirad-config".into(),
             config_file: "tokeirad.toml".into(),
             advertise_node_host: true,
+            config_from_content: false,
+            alloy_from_content: true,
         }
     }
 
@@ -484,6 +506,12 @@ mod tests {
         let env = d["spec"]["template"]["spec"]["containers"][0]["env"]
             .as_array()
             .expect("env array");
+        assert!(
+            env.iter().all(|entry| {
+                entry["name"] != "TOKEIRA_ENVIRONMENT" && entry["name"] != "ENVIRONMENT"
+            }),
+            "deployment identity is the project name; workloads receive no environment discriminator"
+        );
         let node_host = env
             .iter()
             .find(|e| e["name"] == "TOKEIRA_NODE_HOST")
@@ -553,9 +581,9 @@ mod tests {
         );
     }
 
-    // Property 9 (manifest round-trip): every generated manifest round-trips
+    // Property 5 (manifest round-trip): every generated manifest round-trips
     // through serde_json losslessly.
-    // Feature: platform-eks, Property 9
+    // Feature: platform-eks, Property 5
     #[test]
     fn manifests_round_trip_through_serde_json() {
         let spec = tokeirad_spec();
@@ -578,26 +606,62 @@ mod tests {
         }
     }
 
-    // Property 13 (topology currency): the NodePool is `karpenter.sh/v1` referencing
-    // the `eks.amazonaws.com` default NodeClass, with Graviton4 node families; the
-    // Alloy sidecar is a native sidecar (asserted in
-    // `deployment_carries_apiversion_kind_and_pod_shape`).
-    // Feature: platform-eks, Property 13
-    #[test]
-    fn node_pool_is_current_graviton_auto_mode() {
-        let np = node_pool(&["m8g".into(), "c8g".into(), "r8g".into()]);
-        assert_eq!(np["apiVersion"], "karpenter.sh/v1");
-        assert_eq!(np["kind"], "NodePool");
-        let node_class = &np["spec"]["template"]["spec"]["nodeClassRef"];
-        assert_eq!(node_class["group"], "eks.amazonaws.com");
-        assert_eq!(node_class["name"], "default");
-        let reqs = np["spec"]["template"]["spec"]["requirements"]
-            .as_array()
-            .expect("requirements array");
-        let families = reqs
-            .iter()
-            .find(|r| r["key"] == "node.kubernetes.io/instance-type")
-            .expect("instance-type requirement");
-        assert_eq!(families["values"], serde_json::json!(["m8g", "c8g", "r8g"]));
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        // Feature: platform-eks, Property 9
+        #[test]
+        fn topology_currency_holds_for_authored_node_families(
+            families in prop::collection::vec(
+                prop_oneof![Just("m8g"), Just("c8g"), Just("r8g")],
+                1..7,
+            ),
+            replicas in 0_u32..16,
+        ) {
+            let families = families.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let np = node_pool(&families);
+            prop_assert_eq!(&np["apiVersion"], "karpenter.sh/v1");
+            prop_assert_eq!(&np["kind"], "NodePool");
+            let node_class = &np["spec"]["template"]["spec"]["nodeClassRef"];
+            prop_assert_eq!(&node_class["group"], "eks.amazonaws.com");
+            prop_assert_eq!(&node_class["kind"], "NodeClass");
+            prop_assert_eq!(&node_class["name"], "default");
+            let reqs = np["spec"]["template"]["spec"]["requirements"]
+                .as_array()
+                .expect("requirements array");
+            let requirement = reqs
+                .iter()
+                .find(|requirement| requirement["key"] == "eks.amazonaws.com/instance-family")
+                .expect("Auto Mode instance-family requirement");
+            prop_assert_eq!(&requirement["values"], &serde_json::json!(families));
+
+            let mut spec = tokeirad_spec();
+            spec.replicas = replicas;
+            let pod = deployment(&spec);
+            prop_assert_eq!(&pod["spec"]["replicas"], replicas);
+            prop_assert_eq!(
+                &pod["spec"]["template"]["spec"]["initContainers"][0]["restartPolicy"],
+                "Always",
+            );
+        }
+
+        // Feature: platform-eks, Property 5
+        #[test]
+        fn generated_manifests_round_trip_losslessly(
+            replicas in 0_u32..32,
+            cpu_millis in 1_u16..4000,
+            memory_mib in 64_u16..8192,
+        ) {
+            let mut spec = tokeirad_spec();
+            spec.replicas = replicas;
+            spec.cpu = format!("{cpu_millis}m");
+            spec.memory = format!("{memory_mib}Mi");
+            for manifest in [deployment(&spec), service(&spec)] {
+                let encoded = serde_json::to_vec(&manifest).expect("manifest serializes");
+                let decoded: serde_json::Value =
+                    serde_json::from_slice(&encoded).expect("manifest deserializes");
+                prop_assert_eq!(manifest, decoded);
+            }
+        }
     }
 }

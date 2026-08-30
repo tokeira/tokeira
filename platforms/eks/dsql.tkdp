@@ -1,0 +1,18 @@
+# Aurora DSQL storage. The root supplies an explicit managed/preexisting mode
+# and complete adopted identity; this part owns the one stable cluster node.
+
+from tokeira import DsqlCluster
+
+
+def define(d, cfg, cx, module, mode, endpoint, arn):
+    return module.resource(
+        "cluster",
+        DsqlCluster(
+            identity=cx.project_name,
+            region=cfg.aws.region,
+            mode=mode,
+            endpoint=endpoint,
+            arn=arn,
+            id="dsql:cluster",
+        ),
+    )

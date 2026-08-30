@@ -7,12 +7,15 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[package.metadata.tokeira.platform]
+id = "eks"
+engine = "0.1.1"
+default = false
+default-format = "tkd"
+definitions = ["deployment.tkd", "definition.tkdp"]
+content = ["observability"]
+
 [dependencies]
-# The shared `syn` interpreter. The EKS platform supplies its own bridge/kinds/
-# builder/Cx and delegates parsing/eval to this crate, so there is no direct
-# `syn`/`proc-macro2` dependency here (Requirement 1.4; mirrors the refactored
-# `platforms/compose-syn`).
-tokeira-platform-definition = { workspace = true, features = ["tkd"] }
 # Live Kubernetes apply + shared manifest helpers (the `KubePlatform` handle,
 # `NamespaceResource`, `build_node_pool`, `standard_labels`).
 tokeira-k8s = { workspace = true }
@@ -21,24 +24,23 @@ tokeira-k8s = { workspace = true }
 tokeira-aws = { workspace = true }
 tokeira-iac = { workspace = true }
 tokeira-deploy-engine = { workspace = true }
-tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
-tokeira-state = { workspace = true }
+tokeira-platform = { workspace = true }
+tokeira-deployment = { workspace = true }
 tokeira-config = { workspace = true }
 # K8s object types for the manifest builders (Block 3). Pinned to the same
 # single API feature as `tokeira-k8s` so the two agree under feature unification.
 k8s-openapi = { version = "0.25", features = ["v1_33"] }
-aws-config = { version = "1", features = ["behavior-version-latest"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-chrono = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = { workspace = true }
+tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
 
 [lints]
 workspace = true

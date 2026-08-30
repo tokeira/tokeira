@@ -3,9 +3,8 @@
 //! This is the seam that keeps EKS on the single `InfraEngine` apply path: a
 //! Kubernetes object (or a small co-owned set — a service's Deployment, Service,
 //! ServiceAccount, and ConfigMap) is an ordinary `iac::Resource` whose lifecycle
-//! methods drive the context's [`KubePlatform`], exactly as a compose container
-//! is an infra resource applied via `ComposePlatform` (design → "single
-//! InfraEngine path"). There is no separate `DeployEngine`/manifest-only channel.
+//! methods drive the context's [`KubePlatform`]. There is no separate
+//! manifest-only infrastructure channel.
 //!
 //! `describe` distinguishes "no platform registered" ([`DescribeResult::Unsupported`],
 //! never prune — the read-only `plan`-without-cluster path) from a confirmed-absent
@@ -19,9 +18,6 @@ use tokeira_iac::{
 };
 use tokeira_k8s::{K8sError, KubePlatform};
 
-/// Opaque resource-type tag recorded in state for a manifest bundle.
-const RESOURCE_TYPE: &str = "K8sManifest";
-
 /// Convert a `tokeira-k8s` error into the engine's error type, preserving the
 /// context chain. `K8sError` is `Send + Sync + 'static`, so it wraps cleanly.
 fn to_iac(err: K8sError) -> IacError {
@@ -34,6 +30,7 @@ fn to_iac(err: K8sError) -> IacError {
 /// precedes the Deployment that references it) and deleted in reverse.
 #[derive(Debug)]
 pub struct K8sManifestResource {
+    resource_type: &'static str,
     id: ResourceId,
     module: String,
     dependencies: Vec<ResourceId>,
@@ -47,12 +44,14 @@ impl K8sManifestResource {
     /// EKS cluster and the target namespace, so a workload is never applied
     /// before its cluster/namespace exist.
     pub(crate) fn new(
+        resource_type: &'static str,
         id: impl Into<String>,
         module: impl Into<String>,
         dependencies: Vec<ResourceId>,
         manifests: Vec<serde_json::Value>,
     ) -> Self {
         Self {
+            resource_type,
             id: ResourceId(id.into()),
             module: module.into(),
             dependencies,
@@ -75,7 +74,7 @@ impl K8sManifestResource {
     /// detect a changed manifest set and trigger a re-apply.
     fn state(&self) -> ResourceState {
         ResourceState {
-            resource_type: ResourceType::new(RESOURCE_TYPE),
+            resource_type: ResourceType::new(self.resource_type),
             physical_id: self.id.0.clone(),
             properties: serde_json::json!({ "manifests": self.manifests }),
             dependencies: self.dependencies.clone(),
@@ -160,7 +159,7 @@ impl iac::Resource for K8sManifestResource {
     }
 
     fn resource_type(&self) -> ResourceType {
-        ResourceType::new(RESOURCE_TYPE)
+        ResourceType::new(self.resource_type)
     }
 
     fn resource_id(&self) -> ResourceId {
@@ -251,5 +250,48 @@ impl iac::Resource for K8sManifestResource {
                 )],
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokeira_iac::Resource as _;
+
+    use super::*;
+
+    fn resource() -> K8sManifestResource {
+        K8sManifestResource::new(
+            "Fixture",
+            "fixture/demo",
+            "cluster",
+            Vec::new(),
+            vec![serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": "demo", "namespace": "default" }
+            })],
+        )
+    }
+
+    // Feature: platform-eks, Property 8
+    #[tokio::test]
+    async fn plan_without_a_cluster_preserves_unknown_live_state() {
+        let described = resource()
+            .describe(&ProvisionContext::default())
+            .await
+            .expect("describe without a cluster is non-fatal");
+        assert!(matches!(described, DescribeResult::Unsupported));
+    }
+
+    // Feature: platform-eks, Property 8
+    #[tokio::test]
+    async fn apply_without_a_registered_cluster_refuses_loudly() {
+        let error = resource()
+            .create(&ProvisionContext::default())
+            .await
+            .expect_err("apply needs a live cluster handle");
+        let message = error.to_string();
+        assert!(message.contains("KubePlatform is not registered"));
+        assert!(message.contains("reachable cluster is required"));
     }
 }

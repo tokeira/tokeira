@@ -1,0 +1,9 @@
+# The deployment-owned server-config graph identity. The root makes every
+# tokeirad workload depend on this handle; the EKS service kind owns its
+# substrate-specific ConfigMap projection and mount.
+
+from tokeira import ServerConfig
+
+
+def define(d, cfg, cx, module):
+    return module.resource("server-config", ServerConfig())

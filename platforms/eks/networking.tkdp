@@ -1,0 +1,40 @@
+# Private EKS node networking. The root owns the VPC because the endpoint and
+# cluster stages both consume it; this part owns and returns only the node
+# security group that the cluster stage depends on.
+
+from tokeira import SecurityGroup
+
+
+def define(d, cfg, cx, module, vpc):
+    return module.resource(
+        "sg-eks-nodes",
+        SecurityGroup(
+            region=cfg.aws.region,
+            name=cx.project_name + "-eks-nodes-sg",
+            description="Private EKS node traffic",
+            ingress=[
+                {
+                    "description": "node membership",
+                    "protocol": "-1",
+                    "from_port": 0,
+                    "to_port": 0,
+                    "source": "self",
+                },
+                {
+                    "description": "private gRPC",
+                    "protocol": "tcp",
+                    "from_port": 7233,
+                    "to_port": 7242,
+                    "source": cfg.networking.vpc_cidr,
+                },
+                {
+                    "description": "private metrics",
+                    "protocol": "tcp",
+                    "from_port": 3000,
+                    "to_port": 3100,
+                    "source": cfg.networking.vpc_cidr,
+                },
+            ],
+        ),
+        [vpc],
+    )

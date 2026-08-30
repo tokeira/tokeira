@@ -1,0 +1,5 @@
+// Revision-bound baseline shared by every native Alloy sidecar. Backend
+// discovery is private ClusterIP DNS inside the deployment namespace.
+logging {
+  level = "info"
+}

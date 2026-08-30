@@ -1,0 +1,16 @@
+# The sole dependency-free bootstrap resource. Bucket and key identities
+# derive solely from the deployment name supplied by tkp, so repeated
+# invocations address the same state without another identity knob.
+
+from tokeira import RemoteStateBucket
+
+
+def define(d, cfg, cx, module):
+    module.resource(
+        "bucket",
+        RemoteStateBucket(
+            region=cfg.aws.region,
+            bucket=cx.project_name + "-state-" + cfg.aws.region,
+            key_prefix=cx.project_name,
+        ),
+    )

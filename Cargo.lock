@@ -9386,8 +9386,6 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "aws-config",
- "chrono",
  "k8s-openapi",
  "proptest",
  "serde",
@@ -9397,11 +9395,11 @@ dependencies = [
  "tokeira-aws",
  "tokeira-config",
  "tokeira-deploy-engine",
+ "tokeira-deployment",
  "tokeira-iac",
  "tokeira-k8s",
- "tokeira-orchestrator",
+ "tokeira-platform",
  "tokeira-platform-definition",
- "tokeira-state",
  "tokio",
 ]
 

@@ -1,0 +1,16 @@
+// Durable observability backends. Services consume these buckets through
+// their Pod-Identity roles; this part authors storage, not workload pods.
+
+use platform::Eks;
+
+pub fn define(d: Deployment, cfg: Eks, cx: Context, module: Module) -> Resource {
+    module.resource(
+        "mimir-data",
+        S3Bucket {
+            region: cfg.aws.region.clone(),
+            bucket: format!("{}-mimir-data", cx.project_name),
+            versioning: true,
+            key_prefix: None,
+        },
+    )
+}

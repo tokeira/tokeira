@@ -1,0 +1,14 @@
+# Revision-bound Mimir configuration. Project and region tokens are rendered
+# by the platform content kind before this document becomes a ConfigMap.
+multitenancy_enabled: false
+server:
+  http_listen_port: 9009
+blocks_storage:
+  backend: s3
+  s3:
+    bucket_name: {{ project }}-mimir-data
+    region: {{ region }}
+compactor:
+  data_dir: /tmp/mimir-compactor
+limits:
+  compactor_blocks_retention_period: {{ retention_days }}d

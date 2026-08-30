@@ -221,7 +221,7 @@ pub fn build_node_pool(node_families: &[String]) -> serde_json::Value {
                     "requirements": [
                         { "key": "kubernetes.io/arch", "operator": "In", "values": ["arm64"] },
                         { "key": "karpenter.sh/capacity-type", "operator": "In", "values": ["on-demand"] },
-                        { "key": "node.kubernetes.io/instance-type", "operator": "In", "values": node_families }
+                        { "key": "eks.amazonaws.com/instance-family", "operator": "In", "values": node_families }
                     ],
                     "nodeClassRef": {
                         "group": "eks.amazonaws.com",
@@ -313,7 +313,7 @@ mod tests {
             serde_json::json!(["on-demand"])
         );
         assert_eq!(
-            value_for("node.kubernetes.io/instance-type"),
+            value_for("eks.amazonaws.com/instance-family"),
             serde_json::json!(["m8g", "c8g", "r8g"])
         );
     }

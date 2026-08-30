@@ -1,0 +1,69 @@
+# DSQL storage in managed and adopted forms. Both branches publish the same
+# cluster and endpoint resource identities, so downstream dependencies and
+# canonical writebacks are provenance-independent.
+
+from platform import Managed as ManagedDsql
+from tokeira import DsqlCluster, DsqlConnectionEndpoint, DsqlEndpoint, VpcEndpoint
+
+
+def define(d, cfg, cx, dsql, vpc, endpoint_sg):
+    if isinstance(cfg.dsql, ManagedDsql):
+        cluster = dsql.resource(
+            "cluster",
+            DsqlCluster(
+                identity=cx.project_name + "-" + cfg.environment,
+                region=cfg.aws.region,
+                mode="Managed",
+                id="dsql:cluster",
+            ),
+        )
+        dsql.resource(
+            "management_endpoint",
+            VpcEndpoint(
+                region=cfg.aws.region,
+                short_name="dsql-management",
+                service_name="com.amazonaws."
+                + cfg.aws.region
+                + ".dsql-control",
+                endpoint_type="Interface",
+                id="dsql:management-endpoint",
+            ),
+            [vpc, endpoint_sg],
+        )
+        dsql.resource(
+            "connection_endpoint",
+            DsqlConnectionEndpoint(
+                region=cfg.aws.region,
+                identity=cx.project_name + "-connection",
+                id="dsql:connection-endpoint",
+            ),
+            [vpc, endpoint_sg, cluster],
+        )
+        return cluster
+
+    cluster = dsql.resource(
+        "cluster",
+        DsqlCluster(
+            identity=cx.project_name + "-" + cfg.environment,
+            region=cfg.aws.region,
+            mode="Preexisting",
+            endpoint=cfg.dsql.endpoint,
+            arn=cfg.dsql.arn,
+            id="dsql:cluster",
+        ),
+    )
+    dsql.resource(
+        "management_endpoint",
+        DsqlEndpoint(
+            id="dsql:management-endpoint",
+            endpoint_id=cfg.dsql.management_endpoint_id,
+        ),
+    )
+    dsql.resource(
+        "connection_endpoint",
+        DsqlEndpoint(
+            id="dsql:connection-endpoint",
+            endpoint_id=cfg.dsql.connection_endpoint_id,
+        ),
+    )
+    return cluster

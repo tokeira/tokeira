@@ -21,7 +21,7 @@ provenance chain, and command model, read [Provisioning](../provisioning/README.
 |---|---|---|---|---|
 | [`local`](local/README.md) | Bare host process | In-memory or Aurora DSQL | `deployment.toml`, in-process `tkr` handlers | Available |
 | [`compose`](compose/README.md) | Docker containers with Mimir, Loki, Grafana, and Alloy | In-memory or Aurora DSQL | `definition.tkd`, deployment-local Compose `tkp` | Available |
-| [`ecs`](ecs/README.md) | AWS ECS services in private subnets | Aurora DSQL | `deployment.tkd`, deployment-local ECS `tkp` | Available (M1; live-AWS acceptance pending) |
+| [`ecs`](ecs/README.md) | AWS ECS services in private subnets | Aurora DSQL | `deployment.tkd` / `definition.tkdp`, deployment-local ECS `tkp` | Available (live-AWS acceptance pending) |
 | [EKS components](eks/README.md) | Kubernetes-oriented platform vocabulary | Aurora DSQL model | TKD bridge and kinds only | No complete provisioner or operator route |
 
 Create one of the available operator platforms with:

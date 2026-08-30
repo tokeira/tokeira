@@ -5,7 +5,7 @@
 // live in the root beside the shared DynamoDB coordination tables.
 //
 // The role resources and their writebacks live in the root: their mode
-// carries a tuple-variant payload, and the frontend admits tuple-variant
+// carries a tuple-variant payload, and the TKD frontend admits tuple-variant
 // construction in the root document only. This part declares the cluster
 // and endpoint identities.
 //
@@ -14,7 +14,14 @@
 
 use platform::{Dsql, DsqlClusterMode, Ecs, EndpointKind};
 
-pub fn define(d: Deployment, cfg: Ecs, cx: Context, dsql: Module, vpc: Resource, endpoint_sg: Resource) -> Resource {
+pub fn define(
+    d: Deployment,
+    cfg: Ecs,
+    cx: Context,
+    dsql: Module,
+    vpc: Resource,
+    endpoint_sg: Resource,
+) -> Resource {
     match &cfg.dsql {
         Dsql::Managed => {
             let cluster = dsql.resource(

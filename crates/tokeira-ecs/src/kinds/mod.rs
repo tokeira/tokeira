@@ -192,9 +192,9 @@ mod tests {
             replicas: None,
             cpu: 1024,
             memory_mb: 2048,
-            alloy_image: "grafana/alloy:latest".into(),
-            aws_cli_image: "amazon/aws-cli:latest".into(),
-            busybox_image: "busybox:latest".into(),
+            alloy_image: "grafana/alloy:v1.19.0".into(),
+            aws_cli_image: "amazon/aws-cli:2.17.0".into(),
+            busybox_image: "busybox:1.36".into(),
         }
         .realize(&placement(vec![
             tokeira_iac::ResourceId("iam-role-demo-tokeira-runtime-task".into()),
@@ -297,9 +297,9 @@ mod tests {
             replicas: None,
             cpu: 1024,
             memory_mb: 2048,
-            alloy_image: "grafana/alloy:latest".into(),
-            aws_cli_image: "amazon/aws-cli:latest".into(),
-            busybox_image: "busybox:latest".into(),
+            alloy_image: "grafana/alloy:v1.19.0".into(),
+            aws_cli_image: "amazon/aws-cli:2.17.0".into(),
+            busybox_image: "busybox:1.36".into(),
         }
         .realize(&placement(Vec::new()))
         .expect_err("unknown workload");
@@ -319,9 +319,9 @@ mod tests {
             replicas: None,
             cpu: 1024,
             memory_mb: 2048,
-            alloy_image: "grafana/alloy:latest".into(),
-            aws_cli_image: "amazon/aws-cli:latest".into(),
-            busybox_image: "busybox:latest".into(),
+            alloy_image: "grafana/alloy:v1.19.0".into(),
+            aws_cli_image: "amazon/aws-cli:2.17.0".into(),
+            busybox_image: "busybox:1.36".into(),
         }
         .realize(&placement(Vec::new()))
         .expect_err("no task role declared");

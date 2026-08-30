@@ -8,30 +8,44 @@ use platform::Ecs;
 pub fn define(d: Deployment, cfg: Ecs, cx: Context, images: Module) {
     images.resource(
         "tokeirad",
-        EcrRepository { repository: format!("{}/tokeirad", cx.project_name) },
+        EcrRepository {
+            repository: format!("{}/tokeirad", cx.project_name),
+        },
     );
     images.resource(
         "mimir",
-        EcrRepository { repository: format!("{}/mimir", cx.project_name) },
+        EcrRepository {
+            repository: format!("{}/mimir", cx.project_name),
+        },
     );
     images.resource(
         "loki",
-        EcrRepository { repository: format!("{}/loki", cx.project_name) },
+        EcrRepository {
+            repository: format!("{}/loki", cx.project_name),
+        },
     );
     images.resource(
         "grafana",
-        EcrRepository { repository: format!("{}/grafana", cx.project_name) },
+        EcrRepository {
+            repository: format!("{}/grafana", cx.project_name),
+        },
     );
     images.resource(
         "alloy",
-        EcrRepository { repository: format!("{}/alloy", cx.project_name) },
+        EcrRepository {
+            repository: format!("{}/alloy", cx.project_name),
+        },
     );
     images.resource(
         "aws-cli",
-        EcrRepository { repository: format!("{}/aws-cli", cx.project_name) },
+        EcrRepository {
+            repository: format!("{}/aws-cli", cx.project_name),
+        },
     );
     images.resource(
         "busybox",
-        EcrRepository { repository: format!("{}/busybox", cx.project_name) },
+        EcrRepository {
+            repository: format!("{}/busybox", cx.project_name),
+        },
     );
 }

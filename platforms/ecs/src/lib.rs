@@ -2,10 +2,10 @@
 //! observability content.
 //!
 //! Realization lives in `tokeira-ecs` (`crates/tokeira-ecs`); this package
-//! assembles the definition-driven platform — the shipped `.tkd` documents,
-//! the platform-owned observability kinds, and the one entry point — and
-//! re-exports the implementation crate's legacy surface so existing callers
-//! keep their import paths.
+//! assembles the definition-driven platform — modular `.tkd` and `.tkdp`
+//! source sets describing the same graph, the platform-owned observability
+//! kinds, and the one entry point — and re-exports the implementation crate's
+//! legacy surface so existing callers keep their import paths.
 
 use std::sync::Arc;
 

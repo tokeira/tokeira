@@ -751,27 +751,27 @@ fn expect_port(
 }
 
 fn default_mimir_image() -> String {
-    "grafana/mimir:3.0.6".into()
+    "grafana/mimir:3.2.0".into()
 }
 
 fn default_grafana_image() -> String {
-    "grafana/grafana-oss:12.4.3".into()
+    "grafana/grafana:12.4.9".into()
 }
 
 fn default_loki_image() -> String {
-    "grafana/loki:3.7.1".into()
+    "grafana/loki:3.7.6".into()
 }
 
 fn default_alloy_image() -> String {
-    "grafana/alloy:v1.16.0".into()
+    "grafana/alloy:v1.19.0".into()
 }
 
 fn default_aws_cli_image() -> String {
-    "amazon/aws-cli:latest".into()
+    "amazon/aws-cli:2.17.0".into()
 }
 
 fn default_busybox_image() -> String {
-    "public.ecr.aws/docker/library/busybox:latest".into()
+    "busybox:1.36".into()
 }
 
 fn default_loki_query_url() -> String {
@@ -783,6 +783,18 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn default_observability_images_are_pinned_to_the_platform_contract() {
+        let observability = ObservabilityConfig::default();
+
+        assert_eq!(observability.mimir_image, "grafana/mimir:3.2.0");
+        assert_eq!(observability.loki_image, "grafana/loki:3.7.6");
+        assert_eq!(observability.grafana_image, "grafana/grafana:12.4.9");
+        assert_eq!(observability.alloy_image, "grafana/alloy:v1.19.0");
+        assert_eq!(observability.aws_cli_image, "amazon/aws-cli:2.17.0");
+        assert_eq!(observability.busybox_image, "busybox:1.36");
+    }
 
     #[test]
     fn insufficient_service_cpu_fails_validation() {

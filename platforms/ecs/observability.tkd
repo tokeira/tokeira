@@ -13,15 +13,24 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, observability: Module) {
 
     observability.resource(
         "mimir_data",
-        S3Bucket { region: cfg.aws.region.clone(), bucket: mimir_bucket.clone() },
+        S3Bucket {
+            region: cfg.aws.region.clone(),
+            bucket: mimir_bucket.clone(),
+        },
     );
     observability.resource(
         "loki_data",
-        S3Bucket { region: cfg.aws.region.clone(), bucket: loki_bucket.clone() },
+        S3Bucket {
+            region: cfg.aws.region.clone(),
+            bucket: loki_bucket.clone(),
+        },
     );
     let artifacts_bucket = observability.resource(
         "artifacts_bucket",
-        S3Bucket { region: cfg.aws.region.clone(), bucket: artifacts_bucket_name.clone() },
+        S3Bucket {
+            region: cfg.aws.region.clone(),
+            bucket: artifacts_bucket_name.clone(),
+        },
     );
 
     observability.resource(
@@ -40,7 +49,6 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, observability: Module) {
             bucket: loki_bucket,
         },
     );
-
 
     // The shipped dashboards and alert rules, uploaded as one fenced tree.
     observability.resource(

@@ -1,0 +1,143 @@
+# The ECS configuration vocabulary shared by the Python definition root and
+# every companion part. These dataclasses are authoring data only: provider
+# kinds validate the resource values at their declaration sites.
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Aws:
+    # Deployment-scoped AWS coordinates. Every resource is authored in this
+    # region, and the framework installs the matching AWS client bundle.
+    region: str
+
+
+@dataclass
+class Cluster:
+    # ECS and Service Connect identities.
+    name: str
+    service_connect_namespace: str
+
+
+@dataclass
+class Networking:
+    # Private address plan and the internal ALB DNS zone.
+    vpc_cidr: str
+    availability_zones: list[str]
+    private_dns_zone: str
+
+
+@dataclass
+class Managed:
+    # The platform creates and owns Aurora DSQL.
+    pass
+
+
+@dataclass
+class Preexisting:
+    # Complete coordinates for an adopted DSQL deployment. Keeping every
+    # identity required makes a partially described deployment impossible.
+    endpoint: str
+    arn: str
+    management_endpoint_id: str
+    connection_endpoint_id: str
+    runtime_role_arn: str
+    admin_role_arn: str
+
+
+@dataclass
+class ReplicaPolicy:
+    # Desired count and task resources for a replica-scheduled workload.
+    image: str
+    replicas: int
+    cpu: int
+    memory_mb: int
+
+
+@dataclass
+class DaemonPolicy:
+    # Task resources for a workload scheduled once per eligible host.
+    image: str
+    cpu: int
+    memory_mb: int
+
+
+@dataclass
+class Services:
+    # The seven application workload policies.
+    edge_api: ReplicaPolicy
+    edge_poll: ReplicaPolicy
+    runtime: DaemonPolicy
+    projection: ReplicaPolicy
+    controller: ReplicaPolicy
+    autoscaler: ReplicaPolicy
+    admin: ReplicaPolicy
+
+
+@dataclass
+class CapacityPlane:
+    # EC2 instance family and Auto Scaling bounds for one workload family.
+    instance_type: str
+    min: int
+    desired: int
+    max: int
+
+
+@dataclass
+class Capacity:
+    # The eight isolated ECS capacity planes.
+    edge_api: CapacityPlane
+    edge_poll: CapacityPlane
+    runtime: CapacityPlane
+    projection: CapacityPlane
+    control: CapacityPlane
+    mimir: CapacityPlane
+    loki: CapacityPlane
+    grafana: CapacityPlane
+
+
+@dataclass
+class Http2:
+    # Plain internal HTTP/2 listener.
+    pass
+
+
+@dataclass
+class Https:
+    # TLS listener and its ACM certificate.
+    certificate_arn: str
+
+
+@dataclass
+class Alb:
+    # Internal edge listener and health-check policy.
+    protocol: Http2 | Https
+    health_check_path: str
+    health_check_interval_secs: int
+
+
+@dataclass
+class Observability:
+    # Backend workloads and the collection/init image set.
+    mimir: ReplicaPolicy
+    loki: ReplicaPolicy
+    grafana: ReplicaPolicy
+    alloy_image: str
+    aws_cli_image: str
+    busybox_image: str
+
+
+@dataclass
+class Ecs:
+    # Complete operator-authored ECS configuration. AWS, networking, and
+    # DSQL are deployment identities; TKDP currently has no create-time
+    # retarget annotations, but the source preserves the same logical model.
+    environment: str
+    aws: Aws
+    cluster: Cluster
+    networking: Networking
+    dsql: Managed | Preexisting
+    services: Services
+    capacity: Capacity
+    alb: Alb
+    observability: Observability

@@ -9,7 +9,16 @@ use platform::{AlbProtocol, Ecs, EndpointKind, IngressRule, ListenerProtocol};
 
 // The VPC and the endpoint security group arrive from the root, which owns
 // the resources several parts stand on. This part declares the rest.
-pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module, vpc: Resource, endpoint_sg: Resource, edge_api_tg: Resource, edge_poll_tg: Resource) {
+pub fn define(
+    d: Deployment,
+    cfg: Ecs,
+    cx: Context,
+    networking: Module,
+    vpc: Resource,
+    endpoint_sg: Resource,
+    edge_api_tg: Resource,
+    edge_poll_tg: Resource,
+) {
     // The ALB group listens on the listener's own port; the others carry
     // their family's canonical gRPC port.
     let listener_port = match &cfg.alb.protocol {
@@ -34,7 +43,6 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module, vpc: Res
         vec![vpc],
     );
 
-
     // The private substrate's required AWS endpoints. Interface endpoints
     // attach the endpoint security group; the S3 gateway rides the route
     // tables. DSQL's own endpoints belong to the dsql module.
@@ -52,7 +60,9 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module, vpc: Res
     // The internal ALB and its two edge routes.
     let alb = networking.resource(
         "alb",
-        Alb { name: "tokeira".into() },
+        Alb {
+            name: "tokeira".into(),
+        },
         vec![vpc, alb_sg],
     );
     networking.resource(
@@ -64,7 +74,7 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, networking: Module, vpc: Res
                 AlbProtocol::Https(_) => ListenerProtocol::Https,
             },
             certificate_arn: match &cfg.alb.protocol {
-                AlbProtocol::Https(arn) => Some(arn.clone()),
+                AlbProtocol::Https(tls) => Some(tls.certificate_arn.clone()),
                 AlbProtocol::Http2 => None,
             },
             private_dns_zone: cfg.networking.private_dns_zone.clone(),

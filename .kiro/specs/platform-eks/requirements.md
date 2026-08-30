@@ -186,7 +186,7 @@ node; the `max_idle_conns == max_conns` invariant is enforced by `TokeiraConfig`
 
 | Config element | Target policy | Error if invalid | Source anchor |
 |---|---|---|---|
-| `environment`, `region`, tags model | Carried; seeds context + resource tags | Empty region rejected at admission | model.rs `ProjectSection`; ecs `platform.tkd` |
+| `region`, tags model | Carried; seeds resource tags. **No authored environment**: deployment identity derives solely from the deployment name (`cx.project_name`, delivered by `tkp` from the deployment dir) — a "dev" and a "prod" deployment are two named deployments | Empty region rejected at admission | model.rs `ProjectSection`; compose precedent |
 | `networking` (vpc cidr, availability_zones) | Carried; private-only, one subnet per AZ | Empty cidr/AZs rejected | model.rs `VpcSection`; ecs `networking.tkd` |
 | `eks` (version, namespace, node_families, kms_key_arn?, deletion_protection, bootstrap_admin_permissions, cluster_admin_principal_arn?) | Carried (Graviton4 families default `[m8g,c8g,r8g]`; version default `1.36`, operator-configurable) | — | model.rs `EksSection` |
 | `dsql` (mode as a shaped enum: Managed / Preexisting{endpoint, arn}) | Carried; `#[create]` (storage identity is create-time-immutable) | Retarget refused on `#[create]` change | model.rs `DsqlSection`; ecs `dsql.tkd` |
@@ -433,8 +433,8 @@ definition.
 
 #### Acceptance Criteria
 
-1. THE EKS platform SHALL select the S3-native state store for infra and deploy state, keyed by project
-   + environment, failing loudly when AWS clients are not registered.
+1. THE EKS platform SHALL select the S3-native state store for infra and deploy state, keyed by the
+   deployment name alone, failing loudly when AWS clients are not registered.
 2. WHEN `tkr … create` selects the eks platform, THEN it SHALL stage the shipped definition set for the
    chosen format — the root document and **all** companion parts and content — so the created
    deployment plans without further staging.

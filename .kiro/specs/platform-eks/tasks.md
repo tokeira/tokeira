@@ -77,9 +77,11 @@
   graph in startup order.
 - [ ] 4.5 Gated (non-default) live integration tests for the `KubePlatform` paths.
 - [ ] 4.6 Operator access (Req 13): the `operator_access` config enum in both definition sets; under
-  `Ssm`, the SSM core policy on the node role + the three SSM interface endpoints in the networking
-  module; the shared SSM-anchored connection mechanism used by live apply and every day-2 verb; the
-  named-condition errors (plugin absent, no registered node, External-mode route assumption).
+  `Ssm`, the relay (keyless arm64 nano, SSM-parameter AMI resolution, ingress-free SG, SSM-core
+  profile) + the three SSM interface endpoints in the networking module; the shared relay-anchored
+  connection mechanism (lazy first-use connect, TLS server-name handling) used by live apply and
+  every day-2 verb; the named-condition errors (plugin absent, relay unregistered, External-mode
+  route assumption).
 - [ ] 4.7 [PBT] `// Feature: platform-eks, Property 12` — access-mode exactness across both modes.
 - [ ] 4.8 **Checkpoint** — full §10.4 bar green; provider-contract checklist satisfied item-by-item in
   the PR.

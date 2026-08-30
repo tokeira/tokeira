@@ -1,0 +1,6 @@
+error: a component may declare only one #[chasm(data)] field (Requirement 3.2)
+  --> tests/ui/two_data_fields.rs:15:5
+   |
+15 | /     #[chasm(data)]
+16 | |     second: Field<Payload>,
+   | |__________________________^

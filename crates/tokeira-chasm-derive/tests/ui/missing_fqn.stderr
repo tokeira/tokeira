@@ -1,0 +1,8 @@
+error: #[derive(Component)] requires #[chasm(fqn = "...")] (the component's fully-qualified name)
+  --> tests/ui/missing_fqn.rs:11:1
+   |
+11 | / struct NoFqn {
+12 | |     #[chasm(data)]
+13 | |     state: Field<Payload>,
+14 | | }
+   | |_^

@@ -1,0 +1,5 @@
+error: #[chasm(data)] `Field<T>` must name its payload type `T`
+ --> tests/ui/data_field_no_generics.rs:9:12
+  |
+9 |     state: Field,
+  |            ^^^^^

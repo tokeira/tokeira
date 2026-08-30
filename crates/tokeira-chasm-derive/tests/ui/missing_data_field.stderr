@@ -1,0 +1,5 @@
+error: a component must declare exactly one #[chasm(data)] field (Requirement 3.2)
+  --> tests/ui/missing_data_field.rs:12:8
+   |
+12 | struct NoData {
+   |        ^^^^^^

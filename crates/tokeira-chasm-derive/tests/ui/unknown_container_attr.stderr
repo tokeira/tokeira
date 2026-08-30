@@ -1,0 +1,5 @@
+error: unknown #[chasm(...)] container attribute; expected `fqn = "..."`
+  --> tests/ui/unknown_container_attr.rs:11:9
+   |
+11 | #[chasm(name = "wrong")]
+   |         ^^^^

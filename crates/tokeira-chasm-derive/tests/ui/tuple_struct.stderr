@@ -1,0 +1,6 @@
+error: #[derive(Component)] requires a struct with named fields
+  --> tests/ui/tuple_struct.rs:11:1
+   |
+11 | / #[chasm(fqn = "test.tuple")]
+12 | | struct Tuple(#[chasm(data)] Field<Payload>);
+   | |____________________________________________^

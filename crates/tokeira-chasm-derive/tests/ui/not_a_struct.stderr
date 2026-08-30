@@ -1,0 +1,8 @@
+error: #[derive(Component)] can only be applied to a struct
+ --> tests/ui/not_a_struct.rs:4:1
+  |
+4 | / #[chasm(fqn = "test.enum")]
+5 | | enum NotAStruct {
+6 | |     Variant,
+7 | | }
+  | |_^

@@ -39,7 +39,8 @@ and a peer `.tkdp` projection:
 - `deployment.tkd` — the root: module wiring
   (`remote_state → images → networking → dsql → cluster → observability → services`), cross-part
   resource handles (VPC, security groups), `config()` defaults, writeback declarations.
-- `platform.tkd` — the config model: environment/region/tags, `Networking`, `Eks` (version 1.36
+- `platform.tkd` — the config model: region/tags (no authored environment — deployment identity is
+  `cx.project_name` alone), `Networking`, `Eks` (version 1.36
   default, Graviton4 families), `Dsql` as a shaped enum (`Managed` / `Preexisting { endpoint, arn }`,
   `#[create]`), `Services`, `Observability`, `Debug`.
 - `helpers.tkd` — shared assemblies callable from the root.
@@ -107,7 +108,7 @@ actionably when the cluster or credentials are unreachable.
 - **Writebacks** — the five-key DSQL set (requirements policy table), resolved from applied
   `InfraState` outputs and persisted into `TokeiraConfig` by the standard platform-side machinery.
 - **Manifests** — `k8s-openapi` values built by pure functions; serde_json round-trip lossless.
-- **State** — S3-native store keyed by project + environment; loud failure when AWS clients are
+- **State** — S3-native store keyed by the deployment name alone; loud failure when AWS clients are
   unregistered.
 
 ## Correctness Properties

@@ -59,7 +59,7 @@
   DSQL identity from applied state before assembly (Req 8).
 - [ ] 3.2 [PBT] `// Feature: platform-eks, Property 3` — writeback exactness over `InfraState`
   fixtures.
-- [ ] 3.3 S3-native state store selection keyed by project + environment; loud failure without AWS
+- [ ] 3.3 S3-native state store selection keyed by the deployment name alone; loud failure without AWS
   clients (Req 11.1).
 - [ ] 3.4 `tkr … create` stages the shipped set for the chosen format — root + all parts + content —
   verified by a create-then-plan test (Req 11.2; the companion-content staging lesson).

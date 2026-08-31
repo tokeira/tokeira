@@ -1,0 +1,213 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1560" viewBox="0 0 2400 1560">
+<defs>
+  <linearGradient id="ctrl" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ecfeff"/><stop offset="1" stop-color="#EDF1F3"/></linearGradient>
+  <linearGradient id="auto" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff7ed"/><stop offset="1" stop-color="#F7F0DC"/></linearGradient>
+  <linearGradient id="infra" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#FBF9F5"/></linearGradient>
+  <marker id="arr_cyan" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#0B7285"/></marker>
+  <marker id="arr_rust" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#B85C38"/></marker>
+  <marker id="arr_gold" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#B08D2E"/></marker>
+  <marker id="arr_green" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#2F7D4F"/></marker>
+  <style>
+    .subtitle { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 18px; font-weight: 520; fill:#5C564E; }
+    .section { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 14px; font-weight: 900; fill:#6E6860; letter-spacing:2.2px; }
+    .subhead { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 15px; font-weight: 850; fill:#1B1714; }
+    .micro { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 12px; font-weight: 620; fill:#6E6860; }
+    .num { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 14px; font-weight: 900; fill:#FFFFFF; }
+    .code { font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 12px; font-weight: 650; fill:#4A443C; }
+    .chip { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 11px; font-weight: 750; fill:#8A6A14; }
+    .flowlabel { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 11px; font-weight: 700; fill:#6E6860; }
+  </style>
+</defs>
+<rect x="0" y="0" width="2400" height="1560" fill="#F6F3EE"/>
+
+<text x="70" y="24" font-family="'SF Mono',Menlo,monospace" font-size="14" letter-spacing="3" fill="#9A4A2C">TOKEIRA &#183; PROVISIONING</text>
+<text x="70" y="60" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif" font-size="34" font-weight="700" fill="#1B1714">How a deployment is born</text>
+<text x="70" y="94" class="subtitle">One command &#8212; catalog resolution, a content-addressed engine, staged verification, an atomic commit, and a birth publication.</text>
+
+<rect x="1560" y="26" width="770" height="100" rx="18" fill="#FFFFFF" stroke="#D8D2C8" stroke-width="1.2"/>
+<text x="1586" y="52" class="subhead">Flow key</text>
+<path d="M1590,74 L1650,74" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<text x="1662" y="78" class="flowlabel">command / process flow</text>
+<path d="M1900,74 L1960,74" fill="none" stroke="#B08D2E" stroke-width="3" marker-end="url(#arr_gold)"/>
+<text x="1972" y="78" class="flowlabel">refusal gate / dev path</text>
+<path d="M1590,102 L1650,102" fill="none" stroke="#2F7D4F" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_green)"/>
+<text x="1662" y="106" class="flowlabel">persisted artifact</text>
+<path d="M1900,102 L1960,102" fill="none" stroke="#B85C38" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arr_rust)"/>
+<text x="1972" y="106" class="flowlabel">derived without building</text>
+
+<!-- BAND 1: TKR -->
+<text x="70" y="168" class="section">TKR &#8212; CONSTRUCTION AUTHORITY</text>
+<rect x="70" y="186" width="2260" height="304" rx="26" fill="url(#ctrl)" stroke="#BCD6DB" stroke-width="2"/>
+
+<rect x="110" y="226" width="600" height="228" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<circle cx="140" cy="256" r="13" fill="#0B7285"/><text x="140" y="261" class="num" text-anchor="middle">1</text>
+<text x="162" y="261" class="subhead">The command</text>
+<text x="136" y="290" class="code">
+<tspan x="136" dy="0">tkr deployment create --name dev</tspan>
+<tspan x="136" dy="19">  --platform compose</tspan>
+<tspan x="136" dy="19">  --build-image &lt;image&gt;@sha256:&lt;digest&gt;</tspan>
+</text>
+<text x="136" y="366" class="micro">the hermetic bundle is the default; the digest pin is required</text>
+<rect x="136" y="382" width="264" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
+<text x="150" y="399" class="chip">ecs / eks &#8594; refused as experimental</text>
+<rect x="136" y="416" width="310" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
+<text x="150" y="433" class="chip">storage / region come from the definition</text>
+
+<rect x="770" y="226" width="640" height="228" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<circle cx="800" cy="256" r="13" fill="#0B7285"/><text x="800" y="261" class="num" text-anchor="middle">2</text>
+<text x="822" y="261" class="subhead">Catalog resolution</text>
+<text x="796" y="290" class="micro">
+<tspan x="796" dy="0">platforms are discovered, never hard-coded: tkr walks up from the working</tspan>
+<tspan x="796" dy="20">directory to the workspace root (Cargo.lock + rust-toolchain.toml mark it),</tspan>
+<tspan x="796" dy="20">then reads each member package declaring:</tspan>
+</text>
+<text x="796" y="360" class="code">[package.metadata.tokeira.platform]</text>
+<text x="796" y="390" class="micro">
+<tspan x="796" dy="0">&#8594; platform descriptor + engine version</tspan>
+<tspan x="796" dy="20">&#8594; definition frontend (tkd | tkdp) + the platform's definition</tspan>
+<tspan x="796" dy="20">&#8594; platform content roots (e.g. observability/)</tspan>
+</text>
+
+<rect x="1470" y="226" width="820" height="228" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<circle cx="1500" cy="256" r="13" fill="#0B7285"/><text x="1500" y="261" class="num" text-anchor="middle">3</text>
+<text x="1522" y="261" class="subhead">Staging &#8212; invisible until the commit</text>
+<text x="1496" y="290" class="code">&lt;deployments-root&gt;/.&lt;name&gt;.create-&lt;uuid&gt;/</text>
+<text x="1496" y="320" class="micro">
+<tspan x="1496" dy="0">the definition root at its recorded name, companion parts beside it,</tspan>
+<tspan x="1496" dy="20">platform content roots, a default tokeirad.toml, metadata.json</tspan>
+<tspan x="1496" dy="20">recording the definition and (later) the repository binding.</tspan>
+<tspan x="1496" dy="20">A half-created deployment never becomes visible &#8212; failure deletes it.</tspan>
+</text>
+
+<path d="M710,340 L770,340" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M1410,340 L1470,340" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+
+<!-- BAND 2 LEFT: OBTAIN -->
+<text x="70" y="544" class="section">OBTAIN &#8212; THE ENGINE, CONTENT-ADDRESSED</text>
+<rect x="70" y="562" width="1380" height="560" rx="26" fill="url(#auto)" stroke="#E3D5B7" stroke-width="2"/>
+
+<rect x="110" y="602" width="560" height="212" rx="14" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.25"/>
+<circle cx="140" cy="632" r="13" fill="#B08D2E"/><text x="140" y="637" class="num" text-anchor="middle">4</text>
+<text x="162" y="637" class="subhead">EngineIdentity &#8212; derived without building</text>
+<text x="136" y="666" class="micro">
+<tspan x="136" dy="0">frozen source closure: generic shell &#8746; selected platform &#8746;</tspan>
+<tspan x="136" dy="20">selected frontend, via the generated composition root</tspan>
+<tspan x="136" dy="20">canonical lock digest &#183; exact Rust toolchain</tspan>
+<tspan x="136" dy="20">digest-pinned build container &#183; features &#183; build profile</tspan>
+<tspan x="136" dy="20">a floating image tag is refused here</tspan>
+</text>
+
+<rect x="110" y="854" width="560" height="250" rx="14" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.25"/>
+<circle cx="140" cy="884" r="13" fill="#B08D2E"/><text x="140" y="889" class="num" text-anchor="middle">5</text>
+<text x="162" y="889" class="subhead">The engine store &#8212; .bundle-cas</text>
+<text x="136" y="918" class="micro">
+<tspan x="136" dy="0">a store of already-built engines, addressed by what they are:</tspan>
+<tspan x="136" dy="20">the same identity and target always name the same bytes.</tspan>
+<tspan x="136" dy="20">Developer-built and CI-built engines live in separate tiers, so</tspan>
+<tspan x="136" dy="20">a deployment that requires CI builds can never get a local one</tspan>
+<tspan x="136" dy="26">a match is not trust &#8212; every hit is checked again: authority</tspan>
+<tspan x="136" dy="20">high enough, not revoked, bytes still matching the manifest.</tspan>
+<tspan x="136" dy="20">A bad entry fails loudly instead of being quietly rebuilt</tspan>
+</text>
+
+<rect x="730" y="602" width="680" height="330" rx="14" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.25"/>
+<text x="766" y="637" class="subhead">Hermetic Dagger build &#8212; on a miss</text>
+<text x="756" y="668" class="micro">
+<tspan x="756" dy="0">materialize the frozen snapshot &#8212; never the live worktree</tspan>
+</text>
+<text x="756" y="696" class="code">cargo test --locked</text>
+<text x="920" y="696" class="micro">over the closure crates</text>
+<text x="756" y="724" class="code">cargo build --locked --profile dist</text>
+<text x="756" y="754" class="micro">
+<tspan x="756" dy="0">strip &#183; export &#183; SHA-256 computed host-side, so the manifest</tspan>
+<tspan x="756" dy="20">attests the bytes that actually left the engine</tspan>
+<tspan x="756" dy="26">bundle publish &#8594; CAS: refuses failed test evidence and</tspan>
+<tspan x="756" dy="20">mismatched bytes; the manifest is written last</tspan>
+</text>
+
+<rect x="730" y="962" width="680" height="120" rx="14" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1.25"/>
+<text x="766" y="994" class="subhead" fill="#8A6A14">--dev-engine &#8212; the stated development path</text>
+<text x="756" y="1022" class="micro">
+<tspan x="756" dy="0">native workspace build of the same generated root; a synthesized dev-tier</tspan>
+<tspan x="756" dy="20">sidecar records tests.passed: false and no container pin; never enters the CAS</tspan>
+</text>
+
+<path d="M390,814 L390,854" fill="none" stroke="#B85C38" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arr_rust)"/>
+<path d="M670,930 L730,900" fill="none" stroke="#B08D2E" stroke-width="3" marker-end="url(#arr_gold)"/>
+<text x="676" y="892" class="flowlabel">miss</text>
+<path d="M730,952 L670,982" fill="none" stroke="#2F7D4F" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_green)"/>
+<text x="686" y="1002" class="flowlabel">publish</text>
+
+<!-- BAND 2 RIGHT: BIND + VERIFY -->
+<text x="1500" y="544" class="section">BIND + VERIFY &#8212; STILL STAGED</text>
+<rect x="1490" y="562" width="840" height="560" rx="26" fill="#EDF5EF" stroke="#CBE3D2" stroke-width="2"/>
+
+<rect x="1530" y="602" width="760" height="160" rx="14" fill="#FFFFFF" stroke="#DDEEE2" stroke-width="1.25"/>
+<circle cx="1560" cy="632" r="13" fill="#2F7D4F"/><text x="1560" y="637" class="num" text-anchor="middle">6</text>
+<text x="1582" y="637" class="subhead">Bind the engine to the deployment</text>
+<text x="1556" y="666" class="micro">
+<tspan x="1556" dy="0">obtained bytes &#8594; &lt;staging&gt;/tkp &#183; the full bundle &#8594; tkp.manifest.json</tspan>
+<tspan x="1556" dy="20">the artifact is retained under state/binaries/&lt;identity&gt;/&lt;triple&gt;,</tspan>
+<tspan x="1556" dy="20">so rollback can later restore the exact prior engine</tspan>
+</text>
+
+<rect x="1530" y="792" width="760" height="290" rx="14" fill="#FFFFFF" stroke="#DDEEE2" stroke-width="1.25"/>
+<circle cx="1560" cy="822" r="13" fill="#2F7D4F"/><text x="1560" y="827" class="num" text-anchor="middle">7</text>
+<text x="1582" y="827" class="subhead">Verify &#8212; through the placed engine</text>
+<text x="1556" y="856" class="micro">
+<tspan x="1556" dy="0">tkr drives every step here itself &#8212; none of this is an operator command:</tspan>
+<tspan x="1556" dy="26">it runs the placed engine's read-only definition check &#8212; admission,</tspan>
+<tspan x="1556" dy="20">then the definition's ConfigurationIdentity &#8212; and its config seed,</tspan>
+<tspan x="1556" dy="20">which renders tokeirad.toml with provider-derived fields blank</tspan>
+<tspan x="1556" dy="26">tkr then independently re-hashes &lt;staging&gt;/tkp against the</tspan>
+<tspan x="1556" dy="20">manifest descriptor for this host target &#8212; a sidecar that does</tspan>
+<tspan x="1556" dy="20">not describe the placed bytes is a creation refusal</tspan>
+<tspan x="1556" dy="26">the envelope records binding + integrity + config revision 0</tspan>
+</text>
+
+<path d="M1450,720 L1530,690" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<text x="1458" y="746" class="flowlabel">obtained, verified bytes</text>
+<path d="M760,490 L760,562" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M1910,1122 L1910,1194" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+
+<!-- BAND 3: COMMIT + PUBLICATION -->
+<text x="70" y="1178" class="section">COMMIT + BIRTH PUBLICATION</text>
+<rect x="70" y="1194" width="2260" height="304" rx="26" fill="url(#infra)" stroke="#D8D2C8" stroke-width="2"/>
+
+<rect x="110" y="1234" width="700" height="224" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<circle cx="140" cy="1264" r="13" fill="#33586E"/><text x="140" y="1269" class="num" text-anchor="middle">8</text>
+<text x="162" y="1269" class="subhead">The deployment repository (TUF)</text>
+<text x="136" y="1298" class="micro">
+<tspan x="136" dy="0">provisioned while still staged: a signed root.json pinned under</tspan>
+<tspan x="136" dy="20">state/repository/, publisher.json, the datastore &#8212; and role keys</tspan>
+<tspan x="136" dy="20">kept outside the deployment directory (.repository-keys/&lt;name&gt;)</tspan>
+<tspan x="136" dy="26">residency at create is local (repositories/&lt;name&gt;);</tspan>
+<tspan x="136" dy="20">S3 residency is reached through fetch / publish remotes</tspan>
+</text>
+
+<rect x="870" y="1234" width="560" height="224" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<circle cx="900" cy="1264" r="13" fill="#33586E"/><text x="900" y="1269" class="num" text-anchor="middle">9</text>
+<text x="922" y="1269" class="subhead">Atomic commit</text>
+<text x="896" y="1298" class="micro">
+<tspan x="896" dy="0">one rename: staging &#8594; &lt;deployments-root&gt;/&lt;name&gt;,</tspan>
+<tspan x="896" dy="20">then the .latest pointer &#8212; a failed pointer write</tspan>
+<tspan x="896" dy="20">rolls the directory back</tspan>
+<tspan x="896" dy="26">from here the deployment exists: engine and</tspan>
+<tspan x="896" dy="20">revision 0 bound in the envelope</tspan>
+</text>
+
+<rect x="1490" y="1234" width="800" height="224" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<circle cx="1520" cy="1264" r="13" fill="#33586E"/><text x="1520" y="1269" class="num" text-anchor="middle">10</text>
+<text x="1542" y="1269" class="subhead">Birth publication</text>
+<text x="1516" y="1298" class="micro">
+<tspan x="1516" dy="0">published targets: the definition root carrying the deployment claim,</tspan>
+<tspan x="1516" dy="20">companion parts, the whole config tree (content roots, tokeirad.toml),</tspan>
+<tspan x="1516" dy="20">tkp.manifest.json, and one engine binary per target triple &#8212;</tspan>
+<tspan x="1516" dy="20">create-only objects first, mutable heads last</tspan>
+</text>
+<rect x="1516" y="1398" width="614" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
+<text x="1530" y="1415" class="chip">failure is non-fatal: &#8220;created, publication pending&#8221; &#8594; tkr deployment publish</text>
+
+<path d="M810,1346 L870,1346" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M1430,1346 L1490,1346" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+</svg>

@@ -1,5 +1,14 @@
+# Workspace registration is the author's move — `module init` records only the
+# SDK bookkeeping entry below (rust.4 rerun observation, ../README.md).
+# NOTE: registration must trail regeneration — a registered-but-stale module
+# fails every workspace command, and `dagger generate` only reaches a stale
+# module while it is unregistered (as-sdk-listed only).
+# [modules.ci]
+# source = "module"
+
 [modules.dagger-rust-sdk]
 source = "rust"
 
 [modules.dagger-rust-sdk.as-sdk]
 name = "rust"
+

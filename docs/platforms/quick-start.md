@@ -4,7 +4,7 @@ From a clean checkout to a running Temporal-compatible server:
 
 ```bash
 # Install the operator CLI (building requires protoc — see the development guide)
-cargo install --path apps/tkr
+cargo install --locked --path apps/tkr
 
 # Create and start a local deployment
 tkr deployment create --name dev --platform local --storage in-memory

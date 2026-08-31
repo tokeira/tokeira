@@ -18,6 +18,105 @@ Rust application when a separate service is unnecessary.
 
 **Keep the workflow. Choose the engine.**
 
+## Quickstart
+
+Prerequisites: Rust ≥ 1.97 and `protoc` (`brew install protobuf` /
+`apt install protobuf-compiler`); Docker for the service path.
+
+### A durable workflow in one file
+
+The embedded engine, a worker, and one workflow execution — a single process,
+no server, no containers:
+
+```console
+git clone https://github.com/tokeira/tokeira
+cargo run --manifest-path tokeira/examples/hello-workflow/Cargo.toml
+```
+
+```text
+Hello, Tokeira! This greeting is durable.
+```
+
+The complete program is
+[`examples/hello-workflow`](examples/hello-workflow/src/main.rs). Its heart:
+
+```rust
+// A Temporal-compatible engine, in-process. No listener, no daemon.
+let engine = Engine::embedded().await?;
+
+// The Temporal Rust SDK reaches it over an in-memory duplex.
+let options = ConnectionOptions::new("http://tokeira-engine.invalid:7233".parse::<url::Url>()?)
+    .service_override(engine.service_override())
+    .dns_load_balancing(None)
+    .build();
+let connection = Connection::connect(options).await?;
+let client = Client::new(connection, ClientOptions::new("default").build())?;
+
+// One worker on this process's runtime, serving a #[workflow] type…
+let worker_options = WorkerOptions::new("hello")
+    .register_workflow::<HelloWorkflow>()?
+    .register_activities(Greetings)
+    .build();
+
+// …and one durable execution, idempotent on its workflow ID.
+let handle = client
+    .start_workflow(
+        HelloWorkflow::run,
+        "Tokeira".to_string(),
+        WorkflowStartOptions::new("hello", "hello-1").build(),
+    )
+    .await?;
+let result: String = handle.get_result(WorkflowGetResultOptions::default()).await?;
+```
+
+To use it in your own project: `cargo add tokeira-engine` alongside the
+Temporal SDK crates the example's
+[manifest](examples/hello-workflow/Cargo.toml) lists — including its
+`[patch.crates-io]` section, which pins the SDK to v0.7.0 plus one
+worker-shutdown fix that is merged upstream but not yet in a released SDK
+version. That section disappears once the next SDK release lands.
+
+### The service, with Compose
+
+The same engine as a service: `tokeirad` and its observability stack
+(Mimir · Loki · Grafana · Alloy) in Docker containers. From the clone —
+the install and the dev engine each build from source, so expect a few
+minutes each on first run:
+
+```console
+cd tokeira
+cargo install --locked --path apps/tkr
+tkr deployment create --name dev --platform compose --dev-engine
+tkr infra apply --yes
+tkr deploy apply --yes
+```
+
+`tokeirad` is now serving the Temporal gRPC surface on `localhost:7233`, and
+Grafana is on `localhost:3000` (`admin` / `admin`) with the provisioned
+Tokeira dashboards.
+
+Browse it with Temporal's own Web UI:
+
+```console
+docker run --rm -it \
+  --name tokeira-ui \
+  -p 8080:8080 \
+  -e TEMPORAL_ADDRESS=host.docker.internal:7233 \
+  -e TEMPORAL_UI_PORT=8080 \
+  -e TEMPORAL_DEFAULT_NAMESPACE=default \
+  temporalio/ui:latest
+```
+
+And give it something to show:
+
+```console
+cargo run -p tokeira-bench --bin bench-worker &
+cargo run -p tokeira-bench --bin bench-starter -- --count 100
+```
+
+One hundred durable workflow executions — in the Web UI at `localhost:8080`,
+and on the Grafana dashboards.
+
 ## Mission
 
 Tokeira exists to preserve the public

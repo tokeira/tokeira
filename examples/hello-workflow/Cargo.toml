@@ -1,0 +1,30 @@
+[package]
+name = "hello-workflow"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+futures = "0.3"
+tokeira-engine = "0.1.1"
+temporalio-client = "0.7"
+temporalio-common = "0.7"
+temporalio-macros = "0.7"
+temporalio-sdk = "0.7"
+temporalio-workflow = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+url = "2"
+
+[patch.crates-io]
+temporalio-client = { git = "https://github.com/tokeira/sdk-rust.git", rev = "0602a7d647f2842747b52b17f3533f7c1086795f" }
+temporalio-common = { git = "https://github.com/tokeira/sdk-rust.git", rev = "0602a7d647f2842747b52b17f3533f7c1086795f" }
+temporalio-common-wasm = { git = "https://github.com/tokeira/sdk-rust.git", rev = "0602a7d647f2842747b52b17f3533f7c1086795f" }
+temporalio-macros = { git = "https://github.com/tokeira/sdk-rust.git", rev = "0602a7d647f2842747b52b17f3533f7c1086795f" }
+temporalio-protos = { git = "https://github.com/tokeira/sdk-rust.git", rev = "0602a7d647f2842747b52b17f3533f7c1086795f" }
+temporalio-sdk = { git = "https://github.com/tokeira/sdk-rust.git", rev = "0602a7d647f2842747b52b17f3533f7c1086795f" }
+temporalio-sdk-core = { git = "https://github.com/tokeira/sdk-rust.git", rev = "0602a7d647f2842747b52b17f3533f7c1086795f" }
+temporalio-workflow = { git = "https://github.com/tokeira/sdk-rust.git", rev = "0602a7d647f2842747b52b17f3533f7c1086795f" }

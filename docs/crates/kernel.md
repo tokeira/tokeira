@@ -1,50 +1,57 @@
 # tokeira-kernel
 
-Pure deterministic state machine that owns workflow semantic correctness. The kernel derives the authoritative next state for a workflow run given its current state and a command. It produces history events and explicit transition effects, but never executes I/O; storage derives visibility snapshots from the committed next state.
+Pure deterministic workflow transition engine. Given a loaded run and a command,
+the kernel derives the authoritative next state, history events, and explicit
+post-transition effects.
 
-## Dependencies
+## Where it sits
 
-- `tokeira-types` — identity types, payloads, search attributes, retry policy
-- External: `smallvec`, `thiserror`, `time`, `tracing`
+The kernel is the semantic core of the authoritative runtime and storage plane.
+`tokeira-runtime` decides when and under which shard fence to invoke it;
+`tokeira-storage` commits the resulting transition.
 
-## Module Structure
+CHASM is a peer substrate in `tokeira-chasm`, not an extension of this crate.
+Standalone activities therefore do not add I/O or component machinery to the
+workflow kernel.
 
-| File | Contents |
+## Surface map
+
+| Module | Contract |
 |---|---|
-| `state.rs` | `WorkflowState`, `LoadedRun`, `PendingWorkflowTask`, `ActivityState` (with `started_event_id`), `TimerState`, `ChildWorkflowState`, `PendingExternalSignal`, `PendingExternalCancel`, `PendingUpdate`, `PendingNexusOperation`, `VersioningOverride`, `CompletionCallback`, `ParentClosePolicy`, `PauseInfo`, `ActivityPauseInfo` |
-| `command.rs` | `Command` enum (~27 top-level variants), `WorkflowCommand` enum (~16 worker-issued variants), all request structs, conflict/reuse policies, retry state, timeout types |
-| `event.rs` | `HistoryEvent`, `HistoryEventKind` (40+ variants including `ActivityTaskStarted`), `ActivityResolution`, `CloseInfo` |
-| `kernel.rs` | `Kernel` trait, `BasicKernel` implementation, `TransitionBuilder`, `Reject` error enum, `ReplayContext` |
-| `transition.rs` | `Transition`, `DispatchOp`, `ActivityOp`, `TimerOp`, `RequestDedupeOp` |
+| `state` | `WorkflowState`, `LoadedRun`, pending workflow/activity/timer/child/Nexus/update state |
+| `command` | External and worker-authored inputs such as start, signal, workflow-task completion, timeouts, reset, and Nexus resolution |
+| `event` | Durable `HistoryEvent` and `HistoryEventKind` values |
+| `kernel` | `Kernel`, `BasicKernel`, rejection types, and history-prefix replay |
+| `transition` | `Transition` plus derived dispatch, activity, timer, and request-deduplication operations |
 
-## Command Variants
+The main entry point is `BasicKernel::apply`: it consumes a loaded state and one
+command and returns either a complete transition or a typed rejection. Reset
+materialization uses deterministic history-prefix replay to derive the successor
+state.
 
-Top-level `Command`: Start, SignalWithStart, Signal, Update, Cancel, Terminate, PauseWorkflow, UnpauseWorkflow, UpdateActivityOptions, PauseActivity, UnpauseActivity, ResetActivity, Reset, UpdateExecutionOptions, WorkflowExecutionTimedOut, WorkflowTaskStarted, WorkflowTaskCompleted, ActivityStarted, ActivityResolved, ChildStartConfirmed, ChildResolved, ExternalSignalResolved, ExternalCancelResolved, NexusOperationResolved, WorkflowTaskFailed, WorkflowTaskTimedOut, TimerDue.
+## Invariants
 
-Worker `WorkflowCommand`: ScheduleActivity, StartTimer, CancelTimer, RequestCancelActivity, CompleteWorkflow, FailWorkflow, ContinueAsNew, CancelWorkflow, StartChildWorkflow, SignalExternalWorkflow, RequestCancelExternalWorkflow, ScheduleNexusOperation, RequestCancelNexusOperation, RecordMarker, ProtocolMessage, UpdateExecutionOptions.
+- No I/O, async work, storage, networking, metrics, clocks, or nondeterministic
+  inputs enter the kernel.
+- A transition advances the run's sequence and appends ordered history without
+  reusing event identifiers.
+- Terminal workflow states reject further semantic mutation.
+- Workflow-task, activity, timer, child-workflow, external-operation, update, and
+  Nexus decisions are reflected in state and history together.
+- Dispatch and timer operations are descriptions of derived work, not side
+  effects executed by the kernel.
 
-## Kernel Entry Point
+## It does not own
 
-`BasicKernel::apply(loaded, command) -> Result<Transition, Reject>` dispatches to ~27 internal apply methods. `replay_history_prefix` replays a history up to a fork point for reset materialisation.
+The crate does not load or persist runs, acquire shard leases, poll workers,
+deliver tasks, evaluate wall-clock deadlines, expose RPCs, or materialize
+visibility. Runtime and storage must preserve the transition's ordering and
+fences.
 
-## Activity Support
+## Pointers
 
-- `ActivityTaskStarted` event in the event model
-- `apply_activity_started` kernel operation
-- `scheduled_event_id` and `started_event_id` on activity resolution events
-- `activity_type`, `header`, `retry_policy` threaded through `ScheduleActivity` command and `ActivityTaskScheduled` event
-- `started_event_id` field on `ActivityState`
-
-## Tests
-
-- `tests/golden_tests.rs` — deterministic golden-file tests for command→event sequences
-- `tests/property_tests.rs` — proptest-based property tests for correctness invariants
-
-## Key Invariants
-
-- Pure: no I/O, no async, no side effects
-- At most one pending WFT per run at any time
-- History event IDs are contiguous and never reused within a run
-- `TransitionSeq` increments by exactly one per transition
-- Close events are terminal — no further mutations after close
-- Parent close policy is applied atomically with the parent's close
+- [Crate root](../../crates/tokeira-kernel/src/lib.rs)
+- [Kernel-specific contract](../../crates/tokeira-kernel/AGENTS.md)
+- [CHASM substrate](chasm.md)
+- [Runtime](runtime.md)
+- [Storage](storage.md)

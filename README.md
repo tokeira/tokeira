@@ -192,7 +192,8 @@ And one command's whole journey through them:
 
 The architecture is documented in
 [docs/architecture/](docs/architecture/000-overview.md). A navigable reference
-for the seven engine crates lives in [docs/crates/](docs/crates/README.md).
+for every published engine and supporting crate lives in
+[docs/crates/](docs/crates/README.md).
 
 ## Run Tokeira
 

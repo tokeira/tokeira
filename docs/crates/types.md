@@ -1,42 +1,51 @@
 # tokeira-types
 
-Shared durable-domain value types and identity newtypes used by every other crate in the workspace.
+Shared durable-domain value types. The crate keeps identity, routing, task,
+visibility, and worker contracts consistent across the compatibility edge and
+the lower engine planes.
 
-## Purpose
+## Where it sits
 
-`tokeira-types` keeps cross-crate contracts honest. Every crate that needs to talk about a run, a namespace, a payload, or a task token imports these types rather than inventing its own. The crate carries no behaviour, no I/O, and no dependencies on storage or transport.
+The architecture places `tokeira-types` in the compatibility-edge group
+because it defines the transport-neutral vocabulary used at that boundary. It
+is also intentionally usable by the kernel, runtime, storage, and projection
+crates without depending on any of them.
 
-## Dependencies
+## Surface map
 
-External only: `serde`, `time`, `uuid`. No other tokeira crates.
-
-## Module Structure
-
-| File | Contents |
+| Area | Modules and representative types |
 |---|---|
-| `ids.rs` | `NamespaceId`, `RunId`, `RunKey`, `ShardId`, `ShardEpoch`, `TransitionSeq`, `LogicalTaskSeq` |
-| `execution.rs` | `NamespaceName`, `WorkflowId`, `WorkflowType`, `ExecutionStatus` (8 variants), `ExecutionRef`, `ExecutionSummary` |
-| `payload.rs` | Codec-neutral `Payload`, `Payloads`, `Headers`, `Memo` |
-| `search_attributes.rs` | `SearchAttrValue` (7 typed variants), `SearchAttributes` map |
-| `task_queue.rs` | `TaskKind`, `TaskQueueName`, `WorkerIdentity`, `BuildId`, `DeploymentId`, `QueueKey`, `StickyAffinity` |
-| `tokens.rs` | `WorkflowTaskToken`, `ActivityTaskToken`, `TaskToken` enum |
-| `request.rs` | `RequestId`, `RequestContext` (idempotency + caller identity) |
-| `retry.rs` | `RetryPolicy` (exponential backoff config with non-retryable error types) |
-| `visibility.rs` | `ProjectionCursor` (partition-aware cursor for projection log consumption) |
+| Execution identity | `execution`, `ids`: `ExecutionRef`, `ExecutionStatus`, `NamespaceId`, `RunId`, `RunKey`, `ShardEpoch`, `TransitionSeq` |
+| Payloads and requests | `payload`, `request`, `retry`: `Payload`, `Headers`, `Memo`, `RequestContext`, `RetryPolicy` |
+| Task queues | `task_queue`, `tokens`: `QueueKey`, `StickyAffinity`, `WorkflowTaskToken`, `ActivityTaskToken` |
+| Placement | `routing`, `spread`: `RoutingSnapshot`, `RoutingDelta`, `BundleOwner`, deterministic spread-key helpers |
+| Visibility | `search_attributes`, `visibility`: `SearchAttrValue`, `SearchAttributes`, `ProjectionCursor`, `ArchetypeId` |
+| Workers | `worker_authorization`, `worker_compute`, `worker_heartbeat`: task origins, compute-controller values, heartbeat observations |
+| Other shared records | `observability`, `workflow_rules`: metric naming and transport-neutral Workflow Rule records |
 
-## Key Types
+## Contracts
 
-- `RunKey` — internal durable row key (UUID); storage addresses runs by this, not by `RunId`
-- `TransitionSeq` — monotonic OCC fence; storage rejects writes with stale sequence
-- `ShardEpoch` — monotonic fence for shard lease ownership
-- `QueueKey` — composite key (namespace + queue name + task kind + optional deployment/build_id)
-- `ExecutionStatus` — 8-variant enum: Running, Paused, Completed, Failed, Cancelled, Terminated, ContinuedAsNew, TimedOut
-- `TaskToken` — unified enum wrapping `WorkflowTaskToken` and `ActivityTaskToken`, serialised as opaque bytes on the wire
+- Identity newtypes prevent accidental interchange of workflow, run, namespace,
+  shard, and queue identifiers.
+- Serialised collections use deterministic shapes where ordering is part of the
+  durable or hashed representation.
+- Tokens carry enough identity to reject stale workflow-task and activity-task
+  completions.
+- Routing snapshots and deltas are data contracts; ownership enforcement belongs
+  to the runtime and storage layers.
+- Visibility values are typed without importing a SQL or protobuf model.
 
-## Design Principles
+## It does not own
 
-1. No behaviour — types are data, not services
-2. No storage details — types don't know about DSQL columns
-3. No transport details — types don't know about protobuf
-4. Strong typing — newtypes prevent mixing up `RunId` with `WorkflowId`
-5. Deterministic serialisation — `BTreeMap` used throughout for stable ordering
+The crate performs no I/O and has no storage-driver or wire-protocol knowledge.
+It does not decide workflow transitions, authorize requests, route network
+calls, persist heartbeats, or execute worker-compute actions. Traits carried
+here, such as `HeartbeatStore`, define shared value-level contracts whose
+implementations live elsewhere.
+
+## Pointers
+
+- [Crate root and module map](../../crates/tokeira-types/src/lib.rs)
+- [Architecture overview](../architecture/000-overview.md)
+- [Storage](storage.md)
+- [Proto bindings](proto.md)

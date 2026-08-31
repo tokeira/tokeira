@@ -1,186 +1,438 @@
 # State and convergence
 
-Tokeira's IaC engines are stateless algorithms. A platform supplies desired objects,
-the orchestrator loads recorded state, and provider implementations supply live
-evidence. Convergence reconciles those three inputs without treating a configuration
-file as proof of current provider state.
+Tokeira converges desired objects against recorded documents and live provider evidence.
+The engines do not own a database or state backend: orchestration loads a document,
+passes it into an operation context, and supplies a version-threaded callback for each
+durable step.
 
-This page describes infrastructure and runtime deployment state. It does not describe
-workflow histories or the Aurora DSQL storage used by the Tokeira runtime.
+This page covers infrastructure and service convergence state. It does not cover
+workflow history or the Aurora DSQL storage used by the workflow runtime. The
+deployment envelope and repository are introduced only where they meet engine state;
+their complete lifecycle belongs in
+[the provisioning guide](../provisioning/README.md).
 
-## Inputs to an infrastructure operation
+## State domains
 
-An infrastructure operation combines:
+The convergence layer uses two document types from `tokeira-iac`:
+
+```rust
+pub struct InfraState {
+    pub version: u32,
+    pub resources: BTreeMap<ResourceId, ResourceState>,
+    pub outputs: BTreeMap<String, String>,
+    pub last_applied: String,
+}
+
+pub struct RuntimeState {
+    pub version: u32,
+    pub images: BTreeMap<String, ImageState>,
+    pub services: BTreeMap<String, ServiceState>,
+    pub last_applied: String,
+}
+```
+
+`InfraState` records logical resources, provider identities and comparison properties,
+dependency edges, module ownership, outputs, and apply metadata. `RuntimeState` records
+desired image references and service manifest hashes. Neither document is desired
+source, and neither is proof of current provider state.
+
+Definition-backed deployments also have `DeploymentStateEnvelope` in
+`tokeira-deployment`. It records engine binding and integrity, configuration revision,
+rollback checkpoint, in-flight marker, infra/runtime heads, and the effective config
+reference. The envelope coordinates the deployment lifecycle; it does not replace
+`InfraState` or `RuntimeState`.
+
+On the bound path these documents have separate deployment-local stores:
+
+| Document | Store root | Publication cadence |
+|---|---|---|
+| Infrastructure state | `state/infra` | After every infra state transition and confirmed pruning during mutation |
+| Runtime state | `state/deploy` | After every changed or deleted service; once for image-only recording when all services are unchanged |
+| Deployment envelope | `state/envelope` | At lifecycle commit points owned by the shell |
+| Operation lease | `state/lock` | Acquire, renew, adopt, and release around a complete mutating command |
+
+All four currently use framework-selected local persistence on the definition-bound
+path. A `PlatformDeclaration` does not choose these stores. The legacy local adapter
+also uses local stores; the legacy ECS adapter selects `S3StateStore` for infra and
+runtime state when its AWS clients are available.
+
+## Inputs to infrastructure convergence
+
+An infra operation combines:
 
 1. **Desired resources** — objects that should exist after apply.
-2. **Known resources** — all objects the deployment can manage, including definitions
-   retained solely to remove an object that is no longer desired.
-3. **Recorded state** — the last successfully persisted view of provider identities,
-   comparison properties, dependencies, and outputs.
-4. **Live evidence** — observations returned by each provider resource's `describe`
-   implementation.
-5. **Operation scope** — active module or resource selection.
+2. **Known resources** — all objects this execution can manage, including resources
+   retained only for refresh or deletion.
+3. **Recorded state** — the last successfully published identities, properties,
+   dependencies, outputs, and module ownership.
+4. **Live evidence** — each known resource's `DescribeResult`.
+5. **Operation scope** — all modules, or an expanded active module set.
 
-`Engine` in `tokeira-iac` does not own a state store. The orchestrator loads state and
-passes it into the engine together with an optional `StateSaver` callback. This keeps
-resource lifecycle semantics provider- and backend-neutral.
+`InfraComposition` preserves desired, known, and active module sets separately. The
+known set must contain every desired module. A named `ModuleSelection::Only` adds
+transitive prerequisites for plan/apply or transitive dependants for destroy; unknown
+names are refused.
 
-## Refresh is evidence, not desired state
+The engine itself holds state only in `ProvisionContext`. `InfraEngine<D>` reloads the
+store at each verb, installs the document in that context, and passes a `StateSaver`
+only to mutating operations.
 
-Before computing a normal plan or apply, the infrastructure engine refreshes every
-known resource that it can realize. `Resource::describe` returns one of three outcomes:
+## Refresh is evidence
 
-- `Present(ResourceState)` positively reports the live object and replaces the
-  recorded entry for planning.
-- `Absent` positively confirms nonexistence and permits the recorded entry to be
-  removed.
-- `Unsupported` means the provider implementation cannot establish presence or
-  absence. Recorded state is preserved and refresh coverage records the uncertainty.
+Before an ordinary infra plan or mutation, the engine calls `describe` on each known
+resource in dependency order:
+
+```rust
+pub enum DescribeResult {
+    Present(ResourceState),
+    Absent,
+    Unsupported,
+}
+```
+
+The outcomes mean:
+
+- **Present** — a provider query found the object. The normalized live state replaces
+  the recorded entry in the operation's refreshed view.
+- **Absent** — a provider query confirmed nonexistence. The entry is removed from the
+  refreshed view; a mutating refresh can publish that pruning.
+- **Unsupported** — the resource cannot establish presence or absence. Recorded state
+  remains authoritative for this operation and cannot be pruned.
 
 ```mermaid
 flowchart TD
-    Known["Engine realizes a known resource"] --> Describe["Resource::describe"]
-    Describe --> Evidence{"Provider evidence"}
-    Evidence -->|Present| Live["Replace the planning view with normalized live ResourceState"]
-    Live --> Coverage["Record live coverage and flag live_departed when properties differ"]
-    Evidence -->|Absent| Remove["Remove the recorded entry from the refreshed view"]
-    Remove --> Desired{"Resource still desired?"}
-    Desired -->|Yes| DesiredMissing["DesiredMissing: the delta becomes Create"]
-    Desired -->|No| ManagedMissing["ManagedMissing: persist pruning during a mutating operation"]
-    Evidence -->|Unsupported| Preserve["Preserve recorded state"]
-    Preserve --> Unknown["Record Unknown coverage; never infer absence"]
+    Describe["Resource::describe"] --> Result{"Provider evidence"}
+    Result -->|Present| Replace["Use normalized live state"]
+    Result -->|Absent| Prune["Remove from refreshed view"]
+    Result -->|Unsupported| Preserve["Preserve recorded state"]
+    Replace --> Coverage["Record refresh status and departure"]
+    Prune --> Coverage
+    Preserve --> Coverage
+    Coverage --> Delta["Compute desired delta"]
 ```
 
-A missing client, incomplete implementation, or failed prerequisite must not be
-reported as `Absent`. Confirmed absence is deletion evidence; uncertainty is not.
+The distinction is a deletion invariant. A stub method, missing client, missing
+dependency, or ambiguous permission error is not evidence that the object is gone. Such
+a path returns `Unsupported`.
 
-Refresh can change the in-memory state used by a plan and can perform provider reads.
-“Plan does not mutate” means that it performs no provider create, update, or delete;
-it does not mean the operation is pure or offline.
+During plan the saver is absent, so pruning affects only the returned planning view.
+During apply or destroy, confirmed absence for a known-but-not-desired resource is saved
+immediately. If a provider issue interrupts plan refresh, the engine restores the
+recorded view and returns a blocked `PlanOutcome` with no changes. The same issue is a
+hard error during apply or destroy.
 
-The resulting refresh coverage allows an operator to distinguish a plan based on live
-observations from one that includes unknown provider state.
+## Refresh coverage and plan evidence
+
+`RefreshCoverage` distinguishes five per-resource states:
+
+```rust
+pub enum RefreshStatus {
+    DesiredLive,
+    DesiredMissing,
+    ManagedLive,
+    ManagedMissing,
+    Unknown,
+}
+```
+
+It also records:
+
+- `examined`, so a consumer can distinguish no refresh from complete confirmation;
+- `status_by_id`, stored in deterministic key order; and
+- `live_departed`, the resources whose confirmed provider properties differ from the
+  prior record or whose recorded object is confirmed absent.
+
+`PlanOutcome` carries that refresh evidence with changes, semantics, display nouns,
+known-set dependency edges, and platform issues. Semantics and edges remain unfiltered
+for module-scoped plans: an unchanged dependant can still be relevant to the effect of a
+selected change.
+
+A platform issue is not an uncertain refresh entry. It blocks the entire plan, so the
+outcome contains the issue and no planned changes. `Unknown` is narrower: refresh ran
+for that resource but its `describe` could not prove presence or absence.
 
 ## Delta calculation
 
-After refresh, each resource's pure `diff` classifies the desired change and the engine
-reports:
+After refresh, the logical `ResourceId` joins desired objects to the recorded view:
 
-- **Create** when a desired logical ID has no recorded live object;
-- **Update** when `diff` selects an in-place change;
-- **Replace** when `diff` selects delete followed by create;
-- **Delete** when a known recorded object is no longer desired;
-- **No change** when desired and refreshed properties agree.
+- **Create** — desired ID has no current state.
+- **Update** — `diff` selects an in-place change.
+- **Replace** — `diff` selects delete followed by create.
+- **Delete** — state contains an ID absent from desired.
+- **NoChange** — desired and current state agree.
 
-`change_semantics()` annotates an already classified update or replacement with
-operator-facing evidence; it does not choose the execution path. Returning update from
-`diff` and replacement only from `change_semantics()` still executes an update.
+`change_semantics` describes the already selected path. It cannot convert an update into
+a replacement. `Delete` and `Replace` are destructive; the shell uses the engine's
+classification for review and explicit confirmation.
 
-The logical `ResourceId` is the join key. It must remain stable across runs. Provider
-physical IDs belong inside `ResourceState` and can change during replacement without
-changing the desired logical identity.
+The engine validates composition before the delta: module IDs and resource IDs are
+unique, desired modules are known, and the supplied module graph is acyclic. The bound
+definition path also runs `verify_resources` before planning, refusing resources with
+stub discovery and resource edges that point outside the realized definition.
 
-The engine validates module and desired-resource graphs before mutation. Duplicate
-module IDs, duplicate resource IDs, missing desired modules, and cycles block
-convergence.
+## Ordering and interruption
 
-## Ordering
+Creates and updates execute in forward resource order: dependencies first. Deletes
+execute in reverse persisted-dependency order: dependants first. Module ordering and
+resource ordering are separate graphs.
 
-Creates and updates execute in forward topological order: dependencies before their
-dependents. Removed resources execute in reverse dependency order: dependents before
-the objects they use.
+Desired graphs are strict because an author can correct them before mutation. Historical
+delete graphs may be incomplete after definitions change. Missing historical edges are
+tolerated; cyclic or unresolved remnants are appended in stable order so cleanup can
+continue.
 
-Desired graphs are strict because the current configuration can be corrected before
-mutation. Deletion ordering can depend on historical resource state after definitions
-have disappeared. Missing historical edges are tolerated, and cyclic or unresolved
-remnants fall back to deterministic ordering so cleanup can continue.
+### Infrastructure persistence
 
-Replacement has two durable halves:
+`StateSaver` runs after each successful create, update, or delete. It also runs when a
+mutating refresh prunes a confirmed missing managed resource.
 
-1. delete the old physical object, remove its state entry, and save;
-2. create the replacement, insert its new state, and save again.
+Replacement deliberately publishes twice:
 
-If execution stops between those halves, the next operation observes no current object
-for that logical ID and resumes as a create rather than attempting an update against a
-deleted provider object.
+1. delete the old provider object, remove its state, and save;
+2. create the new provider object, insert its state, and save.
 
-The runtime service graph has a separate contract. Service names must be unique, every
-dependency must exist, and cycles are rejected. Destroy processes services in reverse
-service dependency order.
+An interruption between those publications leaves an honest absence. The next operation
+computes create instead of trying to update an object already deleted.
 
-## Persistence and interruption
-
-Infrastructure apply invokes `StateSaver` after every successful create, update, or
-delete and after both state transitions of a replacement. A save failure aborts the
-operation. This bounds replay after interruption and prevents a later step from
-assuming that an earlier provider mutation was durably recorded when it was not.
-
-The orchestrator reloads state for each verb and threads the version returned by one
-successful save into the next save. `DeploymentStore<T>` treats versions as opaque: a
-caller passes the version associated with the document it modified rather than
-inventing a token or forcing an overwrite. Both store implementations validate after
-load and before save, and a stale expected version returns `StateError::Conflict`.
+The saver closes over the latest store version. A successful save replaces that token
+with the returned version; the next save must use it. A conflict or other save error
+stops the operation before later resources can assume the prior state transition was
+durable.
 
 ```mermaid
 sequenceDiagram
-    participant Infra as InfraEngine
-    participant Store as DeploymentStore
     participant Engine as IaC Engine
-    participant Resource
+    participant Provider
+    participant State as InfraState
     participant Saver as StateSaver
+    participant Store as DeploymentStore
 
-    Infra->>Store: load()
-    Store-->>Infra: state and v0
-    Infra->>Engine: apply(state, StateSaver(v0))
-
-    loop Each successful resource mutation
-        Engine->>Resource: create, update, or delete
-        Resource-->>Engine: updated state or completion
-        Engine->>Saver: save(current state)
-        Saver->>Store: save(state, vN)
+    loop Each successful state transition
+        Engine->>Provider: create, update, or delete
+        Provider-->>Engine: provider mutation succeeds
+        Engine->>State: record the exact new state
+        Engine->>Saver: save current document
+        Saver->>Store: save(document, vN)
         alt vN is current
-            Store-->>Saver: vN+1
-            Saver->>Saver: retain vN+1 for the next save
-        else vN is stale
-            Store--xSaver: StateError::Conflict
-            Saver--xEngine: abort the operation
+            Store-->>Saver: committed vN+1
+            Saver->>Saver: retain vN+1 for the next transition
+        else vN is stale or publication fails
+            Store--xSaver: Conflict or state error
+            Saver--xEngine: abort before the next resource
         end
     end
 ```
 
-### Local state publication
+### Service persistence
 
-`CasStore<T>` serializes the complete document and passes the expected version to its
-`StateBackend`. `LocalBackend` uses a SHA-256 content hash as the version and serializes
-writers with an exclusive lock on a stable sidecar file.
+The service engine orders services by declared service dependencies. The bound plan
+generates manifests, lets the platform prepare each service, compares its SHA-256 hash
+with `RuntimeState`, and checks live currency when the hash matches.
 
-The sidecar lock covers the version check, temporary-file write, and atomic rename. It
-is deliberately separate from the manifest inode, which rename replaces. Concurrent
-same-version writers on one host therefore admit one successful publication; later
-writers acquire the lock, observe the changed hash, and return a conflict. Readers
-observe either the complete previous manifest or the complete replacement.
+Apply handles one service at a time: prepare, classify, apply if changed or drifted,
+update runtime state, then save. Destroy processes the graph in reverse and saves after
+each successful deletion. A failure therefore retains the durable progress of earlier
+services while leaving the failed and later services recorded for retry.
 
-`LocalBackend` is a single-host store. The sidecar lock does not provide distributed
-coordination.
+If apply changes no service, `DeployEngine` still saves once after image recording. This
+preserves new desired image records even when every service manifest is unchanged.
 
-### S3 state publication
+`Platform::apply_manifests` and `delete_service` must remain idempotent. A provider call
+can succeed while the following state save fails, so retry can repeat the call.
 
-`S3StateStore<T>` stores a single mutable manifest and immutable full-document
-snapshots. The manifest contains the committed head and a short save lease; its ETag is
-the opaque version returned to callers.
+## Safe deletion when definitions change
 
-A save validates and serializes the document, verifies the caller's expected manifest
-ETag, and acquires the save lease in the same conditional manifest write. That write
-both rejects stale versions and acquires the lease, so no writer can intervene between
-those decisions. An empty expected version succeeds only when the manifest does not
-exist. A current unexpired lease returns `StateError::Locked`.
+Infra state can outlive the definition node that created it. The engine has two ways to
+retain delete behavior:
 
-After acquiring the lease, the store reloads the manifest and verifies the lease token
-and expiry before uploading a new immutable snapshot. It then commits the new head plus
-lease release in one `If-Match` manifest update. The ETag returned by that exact commit
-becomes the caller's next expected version. A failed commit can leave an unreferenced
-immutable snapshot, but the snapshot cannot overwrite committed data and the manifest
-head remains unchanged.
+1. the resource remains in the known graph even though it is not desired; or
+2. a `ResourceRecovery` registered in `ProvisionContext` reconstructs a deletable
+   resource from its `ResourceState`.
+
+If neither path claims the state entry, deletion returns `UnknownResourceDelete`. The
+engine never removes state merely because current desired source cannot construct the
+provider object.
+
+Destroy refreshes the known graph, orders recorded deletes in reverse, and describes
+each resource again immediately before deletion. `Present` uses fresh live state,
+`Absent` prunes, and `Unsupported` deletes from recorded physical identity.
+
+Runtime state has no manifest bodies, only hashes. A recorded service missing from the
+current service definition therefore cannot be safely reconstructed for deletion.
+Service destroy refuses the whole pass and directs the operator to restore the service
+definition. It also checks platform deletion support before touching any workload.
+
+## Store contract
+
+The common seam is `DeploymentStore<T>`:
+
+```rust
+#[async_trait]
+pub trait DeploymentStore<T>: Send + Sync {
+    async fn load(&self) -> Result<(T, String), StateError>;
+    async fn save(&self, doc: &T, expected_version: &str) -> Result<String, StateError>;
+}
+```
+
+`load` returns a validated document and an opaque version. `save` validates the document,
+compares against the version of the document it was derived from, and returns the exact
+version of the committed result.
+
+A genuinely missing document loads as `T::default()` plus an empty version. The empty
+version means create-only on save. A malformed document, inaccessible provider, or
+unexpected backend error is not a missing store and remains an error.
+
+Both built-in document stores validate after load and before save. A stale version
+returns `StateError::Conflict`; callers reload and recompute rather than forcing an
+overwrite.
+
+## Store and backend families
+
+`tokeira-state` has two layers because direct-document CAS and snapshot storage have
+different protocols.
+
+### `CasStore<T>` and `StateBackend`
+
+`CasStore<T>` serializes the complete validated document as pretty JSON and uses a
+`StateBackend` for I/O:
+
+```rust
+#[async_trait]
+pub trait StateBackend: Send + Sync {
+    async fn read_manifest(&self, key: &str)
+        -> Result<Option<(Vec<u8>, String)>, StateError>;
+    async fn write_manifest(
+        &self,
+        key: &str,
+        data: &[u8],
+        expected_version: &str,
+    ) -> Result<(), StateError>;
+    async fn read_snapshot(&self, key: &str) -> Result<Vec<u8>, StateError>;
+    async fn write_snapshot(&self, key: &str, data: &[u8]) -> Result<(), StateError>;
+    async fn list_snapshots(&self, prefix: &str) -> Result<Vec<String>, StateError>;
+}
+```
+
+The manifest methods are the direct-document CAS surface. Snapshot methods support
+other content-addressed users, including binary and bundle stores; `CasStore` itself
+writes only the manifest document. `CasStore::save` re-reads after a successful write to
+obtain the backend's new version.
+
+Two backends implement this trait:
+
+- `LocalBackend` maps keys to filesystem paths and uses content-hash versions.
+- `S3Backend` maps keys to S3 objects and uses conditional requests with ETag versions.
+
+`S3Backend` is not `S3StateStore`. The backend can place a single complete `CasStore`
+document directly in S3; the store implements a separate manifest-head and snapshot
+protocol.
+
+### `S3StateStore<T>`
+
+`S3StateStore<T>` implements `DeploymentStore<T>` directly. It stores a mutable
+`manifest.json` plus immutable full-document snapshots. The manifest is the writer
+serialization point and its ETag is the opaque document version.
+
+The `manifest` module defines the protocol records:
+
+- `StateManifest` — schema version, monotonic revision, optional snapshot head, and
+  optional save lease;
+- `SnapshotRef` — key, version ID, ETag, SHA-256, size, commit identity, time, and owner;
+- `StateLeaseLock` — owner, token, acquisition time, and expiry;
+- `ManifestState` — decoded manifest plus the ETag needed for its next CAS; and
+- `LockGuard` — the in-memory owner/token/expiry proof used while saving.
+
+The direct store and backend families share `StateError`, including `Conflict`,
+`Locked`, `LockLost`, `Corrupted`, `NotFound`, provider-specific backend errors, and
+other contextual failures.
+
+## Local publication protocol
+
+`LocalBackend` stores each direct document at `{root}/{key}/manifest.json`. The opaque
+version is SHA-256 over the document bytes.
+
+A writer:
+
+1. creates the key directory;
+2. acquires an exclusive advisory lock on the stable sibling `manifest.lock`;
+3. re-reads the manifest and verifies the expected content hash, or verifies absence
+   for an empty expected version;
+4. writes a uniquely named temporary manifest; and
+5. atomically renames it over `manifest.json` before releasing the lock.
+
+The lock file must be a separate inode. Locking the manifest itself would not protect a
+waiter after rename replaced that inode. With the stable sidecar, two writers derived
+from the same version admit at most one success on one host.
+
+Readers do not take the writer lock. Atomic rename exposes either the complete previous
+document or the complete replacement. This is single-host coordination, not a
+distributed lease.
+
+```mermaid
+sequenceDiagram
+    participant Writer
+    participant Lock as manifest.lock
+    participant Manifest as manifest.json
+    participant Temp as unique temporary file
+    participant Reader
+
+    Writer->>Lock: acquire exclusive sidecar lock
+    Writer->>Manifest: read bytes and calculate current hash
+    alt Expected version is stale
+        Writer--xWriter: StateError::Conflict
+        Writer->>Lock: release
+    else Expected version is current
+        Writer->>Temp: write complete new document
+        Writer->>Manifest: atomic rename over manifest
+        Writer->>Lock: release after publication
+        Reader->>Manifest: read without writer lock
+        Manifest-->>Reader: complete old or complete new document
+    end
+```
+
+## S3 direct-document backend
+
+`S3Backend` stores each direct document at `{prefix}/{key}/manifest.json`.
+`write_manifest` uses `If-None-Match: *` for an empty expected version and
+`If-Match: <etag>` otherwise. A precondition failure becomes `StateError::Conflict`.
+
+`read_manifest` treats `NoSuchKey`, `NotFound`, and `NoSuchBucket` as no state so a
+remote-state resource can bootstrap in the same apply. Other S3 errors remain errors.
+
+Snapshot writes use `If-None-Match: *`. A repeated write is idempotent only when the
+existing bytes match; different bytes at the same immutable key are a conflict.
+
+## S3 snapshot publication protocol
+
+`S3StateStore<T>` uses:
+
+```text
+{key_prefix}/manifest.json
+{key_prefix}/snapshots/<timestamp>-<uuid>.json
+```
+
+A save is one version-threaded protocol:
+
+1. validate and serialize the document;
+2. load the manifest and compare its ETag with `expected_version`, requiring true
+   absence for an empty version;
+3. reject an unexpired save lease;
+4. publish a new lease through the same conditional manifest write that establishes
+   version currency;
+5. reload and verify the lease owner, token, and expiry;
+6. upload a create-only immutable snapshot; and
+7. publish the new head, incremented revision, and lease release in one `If-Match`
+   manifest update.
+
+The ETag returned by step 7 is the exact committed document version. A follow-up read
+could observe another writer, so it cannot safely supply this token.
+
+A failed final CAS can leave an unreferenced immutable snapshot. It cannot move or
+corrupt the committed head. Loads follow the head, optionally pin the S3 object version,
+verify the snapshot SHA-256, deserialize, and validate the document.
+
+The store's save lease lasts only for one snapshot publication. It is not the lock for a
+complete lifecycle operation.
 
 ```mermaid
 sequenceDiagram
@@ -191,35 +443,32 @@ sequenceDiagram
 
     Caller->>Store: save(document, expected ETag)
     Store->>Store: validate and serialize
-    Store->>Manifest: GET current manifest
-    Manifest-->>Store: head, lease, and current ETag
-
+    Store->>Manifest: load head, lease, and current ETag
     alt Expected ETag is stale
         Store--xCaller: StateError::Conflict
-    else An active lease exists
+    else An unexpired lease exists
         Store--xCaller: StateError::Locked
     else Publication is eligible
-        Store->>Manifest: PUT lease with If-Match or create-only condition
-        alt Conditional lease write loses a race
+        Store->>Manifest: conditionally publish save lease
+        alt Conditional write loses a race
             Manifest--xStore: precondition failed
             Store--xCaller: StateError::Conflict
         else Lease acquired
-            Manifest-->>Store: lease manifest committed
-            Store->>Manifest: GET locked manifest
-            Manifest-->>Store: lease token, expiry, and ETag
-            alt Lease token changed or expired
+            Manifest-->>Store: lease-manifest ETag
+            Store->>Manifest: reload and verify owner, token, and expiry
+            alt Lease changed or expired
                 Store--xCaller: StateError::LockLost
             else Lease is valid
-                Store->>Store: calculate snapshot checksum and identity
-                Store->>Snapshots: PUT immutable snapshot with create-only condition
-                Snapshots-->>Store: snapshot stored
-                Store->>Manifest: PUT new head and clear lease with If-Match
-                alt Commit wins
-                    Manifest-->>Store: commit ETag
-                    Store-->>Caller: commit ETag as next version
-                else Commit loses a race
+                Store->>Store: calculate snapshot identity and SHA-256
+                Store->>Snapshots: create immutable snapshot
+                Snapshots-->>Store: snapshot version and ETag
+                Store->>Manifest: commit new head and clear lease with If-Match
+                alt Head commit wins
+                    Manifest-->>Store: committed manifest ETag
+                    Store-->>Caller: committed ETag as next version
+                else Head commit loses a race
                     Manifest--xStore: precondition failed
-                    Note right of Snapshots: Snapshot remains unreferenced
+                    Note right of Snapshots: Unreferenced snapshot is harmless
                     Store--xCaller: StateError::Conflict
                 end
             end
@@ -227,145 +476,94 @@ sequenceDiagram
     end
 ```
 
-Loads follow the manifest head, fetch the referenced snapshot, verify its SHA-256
-checksum, deserialize it, and validate the resulting document. A missing manifest
-returns the document default and an empty version.
+## Operation locking
 
-### Coordination scopes
+`tokeira_state::OperationLock` is a renewable lease over any `StateBackend`. Its record
+lives under a dedicated key and uses backend CAS for acquire, renew, adoption, and
+release.
 
-State publication and operation locking solve different problems:
+- `acquire(holder, ttl)` accepts an absent, released, or expired lease. Concurrent
+  acquirers race through CAS and at most one wins. An active lease returns
+  `StateError::Locked`.
+- `renew(guard, ttl)` verifies the token and publishes a later expiry. A missing,
+  released, or replaced lease returns `StateError::LockLost`.
+- `adopt(holder, token, ttl)` joins a live lease acquired by an orchestrating parent.
+  This keeps one lock continuous across a two-binary lifecycle sequence.
+- `release(guard)` marks the matching lease released. A missing lease or a different
+  token is already no longer owned by the caller and is a no-op.
 
-- the expected version rejects a document derived from stale recorded state;
-- the local sidecar lock serializes one host's check-and-rename publication;
-- the S3 save lease protects one snapshot and manifest update; and
-- `OperationLock` is a separate renewable lease over `StateBackend` for serializing a
-  complete multi-save deployment operation.
+The bound shell acquires this lock around every mutating command and renews it while the
+command runs. Upgrade and rollback orchestration can acquire in `tkr`, pass the holder
+and token to `tkp`, and have the child adopt without opening a concurrency window.
 
-Operation locking does not replace per-save CAS. Each save still carries the version of
-the document from which it was derived.
+This concrete lease is distinct from three nearby concepts:
 
-Contributor invariants for state implementations are binding in
-[`crates/tokeira-state/AGENTS.md`](../../crates/tokeira-state/AGENTS.md). Exact store
-behavior is defined by [`DeploymentStore`](../../crates/tokeira-state/src/store.rs).
+- document-version CAS rejects a save derived from stale state;
+- the S3 save lease protects one manifest-head publication; and
+- `tokeira_deployment::OperationLock` is a serializable envelope field, not the
+  `tokeira_state` lease primitive that performs backend coordination.
 
-## Missing state and remote-state bootstrap
+Operation locking does not replace per-save CAS. Each save still proves that its source
+document version is current.
 
-A missing backing store is a valid first-deployment condition. Loading returns the
-default validated document plus an initial version instead of failing merely because
-the state object does not exist yet.
+## Missing state and bootstrap
 
-The remote-state module participates in infrastructure composition so the first apply
-can create the resources that hold later state. This creates a deliberate bootstrap
-sequence:
+Missing state is a valid first-apply condition. `DeploymentStore::load` returns the
+default document and an empty version when the backing document is genuinely absent.
 
-1. load an empty deployment state;
-2. include the remote-state resources in desired and known composition;
-3. create those resources through the same reviewed lifecycle; and
-4. publish the first state document through the selected store.
+The bound execution nominates exactly one dependency-free definition module as the
+bootstrap module. `DescribedDeployment::remote_state_module` presents it to
+`InfraEngine`, which includes it in desired and known composition for every operation.
+On the deployment-local path this module commonly creates the state directory; on a
+remote legacy path it can create the remote backing resource.
 
-Missing-store tolerance must not be generalized to malformed or inaccessible state.
-Validation failures and provider errors remain errors.
+Bootstrap does not weaken validation. Corrupt JSON, invalid document fields,
+authentication failures, or unexpected provider errors stop the operation.
 
-## Safe deletion after definitions change
+## Outputs and writeback
 
-Recorded state can outlive the source definition that created a resource. The engine
-therefore separates “desired” from “known.” A platform should keep removed definitions
-in the known set long enough to realize the resource needed for deletion.
+Infrastructure outputs are recorded data. Definition writebacks declare which values
+should project into the deployment's server configuration:
 
-When current modules cannot realize that resource, the platform can register a
-`ResourceRecovery` implementation in `ProvisionContext`. Recovery reconstructs a
-resource from its persisted type and state so normal provider deletion can run.
+- a literal passes through unchanged;
+- an output reference resolves through `RealizedResourceIndex` to one applied
+  `ResourceState`, then reads the declared property name.
 
-If neither a known resource nor a recovery implementation claims the recorded type,
-the engine fails closed. It does not erase the state entry and pretend that the live
-provider object was deleted.
+The bound `DescribedDeployment::hydrate_config` is an identity function. After infra
+apply, `collect_writeback` resolves the declared entries, and the lifecycle shell writes
+those key/value pairs to `tokeirad.toml` before committing the new configuration
+revision.
 
-Destroy refreshes known resources and then deletes in reverse order. Immediately
-before deletion, confirmed `Absent` permits state pruning, while `Unsupported` drives
-deletion from recorded state. A provider that cannot describe an object can still
-support safe deletion if persisted state contains the required physical identity.
-
-## Infrastructure state and runtime state
-
-Infrastructure and runtime convergence use separate documents and stores.
-
-| Document | Contains | Save cadence |
-|---|---|---|
-| `InfraState` | Resource identities, provider properties, dependencies, module ownership, and outputs. | Incrementally after infrastructure mutations. |
-| `RuntimeState` | Recorded image references, service manifest hashes, and workload deployment records. | Once after the runtime operation completes. |
-
-`ServiceEngine` generates provider manifests and hashes their serialized form. Runtime
-plan compares absent, equal, or different recorded hashes without checking live
-provider drift. During apply, `Platform::is_service_current` can promote a recorded
-“no change” service to update before manifest application.
-
-Manifest generation must be stable: semantically identical desired input must not
-produce nondeterministic serialized manifests and perpetual updates.
-
-Runtime apply mutates services sequentially and saves `RuntimeState` only after the
-full service loop. If execution stops after one service succeeds but before the final
-save, the next apply can replay that successful mutation. `Platform::apply_manifests`
-must therefore be idempotent.
-
-Current image recording stores a desired `repository:tag`, no resolved digest, and a
-recorded timestamp. Image build, push, and mirror are separate command flows; runtime
-state must not be described as proof that an artifact was built or published.
-
-A platform can choose not to use the separate runtime engine. Some platforms model
-workloads as infrastructure resources and route deployment operations through
-`InfraEngine`. That is a platform realization choice; it does not merge `InfraState`
-and `RuntimeState` into one framework concept.
-
-## Provisioner and configuration state
-
-A deployment-bound provisioner can keep an envelope and configuration history alongside
-engine state. Those records govern which provisioner may operate, retain configuration
-revisions, and make interrupted lifecycle transitions resumable. They do not replace
-`InfraState` or `RuntimeState`.
-
-Desired deployment source and server runtime configuration are separate domains as well.
-A `.tkd` definition or platform config describes desired deployment state;
-`tokeirad.toml` configures the running server; Aurora DSQL contains workflow-runtime
-authority. Keeping them distinct prevents a source edit or config write from being
-mistaken for proof that provider convergence succeeded.
-
-The complete envelope, binding, and revision contracts are documented in
-[the provisioner guide](../provisioning/provisioner.md).
-
-## Outputs, hydration, and writeback
-
-A resource can publish outputs into infrastructure state. After successful convergence,
-the orchestrator can hydrate its in-memory platform configuration from those outputs. A
-`Deployment` can also calculate deferred writeback as key/value updates.
-
-Writeback calculation does not imply persistence. The invoking host owns any persistence
-channel and target; the IaC framework only exposes derived values. Provisioning command
-routing and host ownership are described in the
-[provisioning guide](../provisioning/README.md).
-
-Writeback remains derived from applied state. It is not the authority for whether the
-provider object exists.
+Writeback is derived from applied state. It does not establish that a provider object
+still exists, and undeclared outputs are not silently projected.
 
 ## Operation summary
 
-| Operation | Live provider reads | Provider mutations | State behavior |
-|---|---:|---:|---|
-| Infrastructure plan | Yes | No | Loads and refreshes the in-memory planning view. |
-| Infrastructure apply | Yes | Yes | Saves incrementally after resource mutations. |
-| Infrastructure destroy | Yes | Yes | Removes entries as provider objects are confirmed absent or deleted. |
-| Runtime plan | No | No | Generates manifests and compares them with recorded runtime state. |
-| Runtime apply | Yes | Yes | Checks live currency and saves once after the service loop. |
+| Operation | Provider interaction | Mutation | State publication |
+|---|---|---|---|
+| Infrastructure plan | Platform probe and resource `describe` reads | None | None; refresh is an in-memory planning view |
+| Infrastructure apply | Probe, refresh, then provider create/update/delete | Yes | Incremental after every infra transition and confirmed managed pruning |
+| Infrastructure destroy | Probe, refresh, and pre-delete `describe` | Yes | Incremental after every removal or confirmed absence |
+| Service plan on the bound path | Manifest generation, platform preparation, and live currency check for matching hashes | No running-workload mutation; preparation may populate provider-owned prerequisites | None |
+| Service apply | Preparation, live currency check, and manifest apply | Yes | After every changed service; one final save when only image records changed |
+| Service destroy | Manifest regeneration and provider delete | Yes | After every deleted service |
 
-All destructive CLI paths remain subject to review and confirmation policy; engine
-capability does not bypass the operator contract.
+The engine's ability to mutate does not bypass shell policy. Destructive apply and every
+destroy remain subject to review and explicit confirmation.
 
 ## Further reading
 
-- [IaC framework](README.md) — crates, boundaries, and entry paths.
-- [Extending the IaC framework](extending.md) — provider contracts and integration.
-- [Provisioning](../provisioning/README.md) — deployment definitions, provisioner
-  envelope, revisions, and command routing.
-- [`tokeira-iac` engine](../../crates/tokeira-iac/src/engine.rs) — exact refresh,
-  delta, ordering, and mutation algorithms.
-- [`tokeira-state`](../../crates/tokeira-state/src/lib.rs) — state documents and
-  persistence implementations.
+- [Infrastructure as code engines](README.md) — resource, service, orchestration, and
+  lifecycle contracts.
+- [Extending the IaC framework](extending.md) — provider kinds, namespaces, platform
+  declarations, and state extension rules.
+- [Provisioning](../provisioning/README.md) — envelope, revisions, repository, and
+  command routing.
+- [`tokeira-iac` engine](../../crates/tokeira-iac/src/engine.rs) — refresh, delta,
+  ordering, and save callbacks.
+- [`DeploymentStore`](../../crates/tokeira-state/src/store.rs),
+  [`S3StateStore`](../../crates/tokeira-state/src/s3_store.rs), and
+  [`OperationLock`](../../crates/tokeira-state/src/operation_lock.rs) — exact
+  persistence and coordination protocols.
+- [`DescribedDeployment`](../../crates/tokeira-tkp/src/described.rs) — bound-path store,
+  module, service, and writeback selection.

@@ -1,358 +1,380 @@
 # Extending the IaC framework
 
-Extend Tokeira's IaC framework by adding provider behavior at an existing seam, not by
-adding provider knowledge to the framework crates. `tokeira-iac` and
-`tokeira-deploy-engine` remain provider-agnostic; concrete API clients, resource
-models, manifests, credentials, and recovery logic belong in platform crates.
+Add provider behavior through kinds and namespaces, then assemble those capabilities in
+a pure `PlatformDeclaration`. Add deployment shape through definition documents. The
+framework generates the bound composition root and supplies orchestration, stores,
+planning, ordering, confirmation, and persistence.
 
-The binding package-boundary rules and short recipes are in the
-[engineering reference](../agents/engineering-reference.md). This guide explains how
-to choose and implement the seams those recipes name.
+This is the extension recipe for definition-backed platforms. The architecture and
+operator boundaries are established in
+[the IaC architecture overview](../architecture/120-iac-framework.md) and
+[the provisioning guide](../provisioning/README.md); this page covers the engine-facing
+implementation work.
 
-## Choose the smallest extension seam
+## Choose the owning seam
 
-| Need | Extension seam | Typical owner |
+Start with the smallest contract that owns the behavior.
+
+| Need | Current extension seam | Typical owner |
 |---|---|---|
-| Manage one logical provider lifecycle | `tokeira_iac::Resource` | Platform crate |
-| Group related infrastructure resources | `tokeira_iac::Module` | Platform crate |
-| Connect platform config, modules, workloads, stores, and writeback | `tokeira_orchestrator::Deployment` | Platform crate |
-| Describe an image reference for runtime state | `tokeira_deploy_engine::Image` | Platform crate |
-| Generate a workload manifest | `tokeira_deploy_engine::Service` | Platform crate |
-| Apply and inspect service manifests | `tokeira_deploy_engine::Platform` | Platform crate |
-| Add deployment-definition vocabulary | `tokeira_tkd::HostBridge` plus platform kinds and adapter | Platform crate |
-| Expose lifecycle operations through `tkp` | `tokeira_provisioner_cli::ProvisionerPlatform` | Platform provisioner |
-| Add a deployment-state backend | `tokeira_state::DeploymentStore<T>` or `StateBackend` | State/platform crate |
+| Manage an infrastructure object or coordinated bundle | `tokeira_iac::Resource` | Provider or platform resource crate |
+| Expose an authored infra object | `tokeira_platform::Kind<R>` plus `decode_resource` | Crate that owns the kind |
+| Generate and converge workload manifests | `tokeira_deploy_engine::Service` | Provider or platform resource crate |
+| Expose an authored service | `Kind<R>` plus `decode_service` | Crate that owns the kind |
+| Group author-visible kinds | `tokeira_platform::definition::Namespace` | Same crate as the kinds |
+| Connect reachability, context registration, service application, and live operations | `PlatformDeclaration` | `platforms/{name}` package |
+| Describe modules, resources, dependencies, and writeback | `.tkd` and/or `.tkdp` definition set | `platforms/{name}` package |
+| Add a state publication medium | `StateBackend` for direct-document CAS, or `DeploymentStore<T>` for a different store model | `tokeira-state` or an explicitly approved state integration |
+
+Do not implement `tokeira_orchestrator::Deployment` for a new platform. The bound path
+uses the framework's `DescribedDeployment`, which adapts every realized definition to
+the orchestrator. `LocalDeployment` and `EcsDeployment` are legacy in-process adapters,
+not templates for new work.
 
 ```mermaid
 flowchart TD
-    Start(["Identify the smallest behavior boundary"]) --> Concern{"Which concern changes?"}
-    Concern -->|One provider lifecycle| Resource["Resource"]
-    Concern -->|Infrastructure grouping| Module["Module"]
-    Concern -->|Platform assembly and stores| Deployment["Deployment"]
-    Concern -->|Runtime workload| Runtime{"What does the seam own?"}
-    Runtime -->|Image reference| Image["Image"]
-    Runtime -->|Manifest generation| Service["Service"]
-    Runtime -->|Manifest apply and inspection| Platform["Platform"]
-    Concern -->|State publication| Store["DeploymentStore or StateBackend"]
-    Concern -->|Authoring or shell integration| Entry{"Where is it exposed?"}
-    Entry -->|Definition vocabulary| Bridge["HostBridge plus adapter"]
-    Entry -->|Provisioner lifecycle| Provisioner["ProvisionerPlatform"]
+    Metadata["Cargo platform metadata"] --> Catalog["Workspace platform catalog"]
+    Resource["Resource implementation"] --> Kind["Typed Kind"]
+    Service["Service implementation"] --> Kind
+    Kind --> Namespace["Namespace inventory and decoder"]
+    Namespace --> Declaration["Selected platform package<br/>with pure PlatformDeclaration"]
+    Definition[".tkd / .tkdp definition set"] --> Frontend["Selected definition frontend"]
+    Catalog --> Generator["Composition-root generator"]
+    Frontend --> Generator
+    Generator --> Root["Generated three-dependency root"]
+    Declaration --> Root
+    Root --> Realization["Verified infra and service realization"]
+    Realization --> Adapter["Framework DescribedDeployment"]
+    Adapter --> Engines["InfraEngine and DeployEngine"]
 ```
 
-Avoid a new abstraction when one resource, module, or adapter is sufficient. A new
-framework dependency or context type is an architectural change.
-
-## Implementing a resource
-
-A `Resource` owns one logical lifecycle and state entry. It can manage one provider
-object or a coordinated bundle whose members must converge as a unit. Its implementation
-must make the following decisions explicit.
-
-### Stable identity
-
-`resource_id()` returns the logical state key. Build it from stable deployment input,
-not from a provider ID assigned during creation. Persist the provider identity needed
-for later operations in `ResourceState` so update, replacement, deletion, and recovery
-can address the live object or bundle.
-
-Two desired resources must never produce the same logical ID. Duplicate IDs block the
-operation before mutation.
-
-### Dependency metadata and engine ordering
-
-`Resource::dependencies()` is the trait-level metadata surface through which a realized
-resource exposes logical `ResourceId` edges assembled by its platform. It does not make
-the resource implementation responsible for dependency management: `create`, `update`,
-and `delete` must not schedule, traverse, or wait for other resources.
-
-The engine collects the declared edges, builds the graph over the supplied resources,
-rejects cycles, and computes deterministic execution order. Creates and updates run in
-forward topological order; deletion uses persisted `ResourceState.dependencies` in
-reverse order. The provider lifecycle remains responsible only for its own mutation.
-
-Resource dependency values are logical resource IDs, not module names or physical
-provider IDs. Module ordering is a separate engine-managed graph used before resource
-ordering.
-
-### Live discovery
-
-`describe()` must distinguish:
-
-- `Present` — a provider query found the object and returned comparison state;
-- `Absent` — a provider query positively established that the object does not exist;
-- `Unsupported` — the implementation cannot establish either result.
-
-Never convert a stub, missing client, permission ambiguity, or unimplemented provider
-query into `Absent`. False absence can prune state and turn a managed object into an
-orphan.
-
-The live `ResourceState` returned by `Present` should contain stable, normalized
-properties. Provider response order, timestamps unrelated to desired state, and other
-volatile fields can otherwise create perpetual diffs.
-
-### Diff and change semantics
-
-`diff()` compares desired input with recorded or refreshed state without making provider
-calls. It is the seam that selects no change, in-place update, or replacement, and it
-must be deterministic for the same inputs.
-
-`change_semantics()` runs after that classification and adds operator-facing evidence
-about the already selected change. It does not switch an update to replacement. A
-resource that requires delete/create must return replacement from `diff()` so the engine
-uses the durable replacement path.
-
-Explanations should include provider-relevant field changes without leaking credentials
-or opaque client data.
-
-### Mutation
-
-`create`, `update`, and `delete` own provider side effects. On success, create and
-update return a complete `ResourceState` suitable for the next diff and for deletion
-after process restart.
-
-Operations should be idempotent where the provider permits it. An interrupted apply can
-restart from the last successfully saved state, and live refresh can discover that a
-provider mutation completed before its state save did.
-
-Delete must use persisted provider identity rather than assuming the current desired
-definition still contains every creation-time value.
-
-## Implementing modules and composition
-
-A `Module` realizes resources and declares module dependencies. Module IDs must be
-stable and unique. The engine topologically realizes modules before validating and
-ordering resources.
-
-A platform's `Deployment` supplies both the selected desired modules and the complete
-known module set. Keep these concepts separate:
-
-- selection narrows what the operator wants to converge;
-- known modules preserve the ability to refresh and delete previously managed objects;
-- active module names communicate the current operation scope to module logic.
-
-External module dependencies are allowed when the supplied composition intentionally
-omits the external module. Cycles among supplied modules are not.
-
-Include the remote-state module consistently. Missing state is a supported bootstrap
-condition, and the remote-state resources must be converged through the same lifecycle
-as other infrastructure.
-
-## Registering provider capabilities
-
-Use the existing typed extension bags instead of globals or framework dependencies:
-
-- `ProvisionContext` for infrastructure modules and resources;
-- `ServiceContext` for workload services; and
-- `ImageContext` for image references.
-
-Register extensions in the corresponding `Deployment` hook before realizing objects
-that consume them. Typical values are authenticated clients, provider configuration,
-platform handles, or `ResourceRecovery` implementations.
-
-Each context has an independent map. If both a resource and a service need a client,
-register it in both relevant contexts. Do not assume registrations flow between them.
-
-The typed bags are the sanctioned provider-decoupling mechanism. Do not introduce a
-new `Box<dyn Any>` context for a convenience path.
-
-## Selecting and implementing state storage
-
-A `Deployment` selects separate stores for infrastructure and runtime state. New and
-changed stores must preserve these binding contracts:
-
-- loading a missing store returns a valid default document for bootstrap;
-- malformed documents and provider access failures remain errors;
-- documents are validated after load and before save;
-- versions are opaque and tied to the loaded document;
-- callers pass the expected version when publishing a modified document; and
-- a stale publication reports a conflict rather than forcing an overwrite.
-
-`CasStore<T>` validates before save and delegates expected-version publication to its
-`StateBackend`. `LocalBackend` uses a content hash as the version and holds a stable
-sidecar lock across version verification, temporary-file write, and atomic rename. It
-provides single-host CAS: concurrent same-version writers admit exactly one success.
-
-Use `CasStore<T>` when a `StateBackend` supplies complete-document bytes and versioned
-publication. Use `S3StateStore<T>` when the platform needs immutable snapshots,
-checksum verification, manifest ETag CAS, and a short save lease. The S3 store validates
-before serialization, acquires its lease only if the caller's expected version is
-current, and returns the ETag from the exact manifest update that commits the new head.
-
-An operation lock and a per-save version serve different scopes. `OperationLock` can
-serialize a complete multi-save deployment operation, while each state publication
-still carries the expected version of its source document. The S3 save lease is narrower
-than either: it protects one snapshot and manifest publication.
-
-Read the binding state rules in
-[`crates/tokeira-state/AGENTS.md`](../../crates/tokeira-state/AGENTS.md) before changing
-a store or state document.
-
-## Supporting removed resources
-
-A platform must plan for the case where state contains an object that current desired
-configuration no longer constructs.
-
-Prefer to retain a known module/resource implementation capable of deleting the object.
-When that is impossible, register `ResourceRecovery` in `ProvisionContext`. Recovery
-claims provider-defined resource types and reconstructs a deletable `Resource` from
-`ResourceState`.
-
-Recovery must be unambiguous. If no implementation claims a state entry, deletion
-fails closed. Do not “clean up” by removing state without performing or positively
-confirming provider deletion.
-
-## Implementing runtime services and images
-
-Use the runtime deployment engine when a platform has a distinct workload lifecycle.
-
-An `Image` contributes a desired image reference. The current engine records
-`repository:tag`, leaves the digest unset, and records a timestamp; image build, push,
-mirror, and publication remain separate commands. Do not treat `ImageState` as proof
-that an artifact was resolved or published.
-
-A `Service` converts desired configuration and recorded image references into a
-provider manifest. A service `Platform` checks live currency, applies manifests, and
-optionally deletes workloads.
-
-Manifest generation must be deterministic because the engine hashes serialized
-manifests. Sort map-derived collections and exclude volatile values unless a change in
-that value should trigger an update.
-
-Runtime plan compares generated manifests with recorded hashes and performs no live
-drift check. Apply checks `Platform::is_service_current` before applying changed or
-drifted services.
-
-Declare service dependencies by service name. The runtime engine rejects missing
-dependencies, duplicates, and cycles. If the platform cannot safely delete services,
-report that capability before a destructive pass; the engine rejects the pass before
-partially deleting workloads.
-
-Runtime state is saved once after the service loop, not after each service. An
-interrupted apply can replay services that already succeeded, so
-`Platform::apply_manifests` must be idempotent.
-
-A platform does not have to use this lifecycle. If workloads are naturally provider
-resources, they can be modeled under `tokeira-iac`. Make that choice explicit in the
-platform adapter and operator documentation.
-
-## Connecting a platform with `Deployment`
-
-A complete `tokeira_orchestrator::Deployment` implementation normally performs these
-jobs:
-
-1. define the platform configuration type;
-2. register infrastructure, service, and image extensions;
-3. construct the remote-state module;
-4. return selected desired modules and the full known module set;
-5. return services and images if the runtime lifecycle applies;
-6. create infrastructure and runtime state stores;
-7. hydrate configuration from applied infrastructure outputs;
-8. calculate host-owned writeback; and
-9. report required configuration namespaces.
-
-A typical infrastructure apply crosses those seams in this order. Platform code
-constructs objects and performs provider-specific lifecycle calls; the orchestrator and
-IaC engine retain control of state, graph management, and sequencing.
-
-```mermaid
-sequenceDiagram
-    participant Host
-    participant Infra as InfraEngine
-    participant Deployment as Platform Deployment
-    participant Store as DeploymentStore
-    participant Engine as IaC Engine
-    participant Module
-    participant Resource
-    participant Provider as Provider API
-
-    Host->>Infra: new(deployment, config, directory)
-    Infra->>Deployment: register_infra_extensions(config, context)
-    Infra->>Deployment: create_infra_store(config, directory)
-    Deployment-->>Infra: store
-    Infra->>Store: load()
-    Store-->>Infra: bootstrap state
-
-    Host->>Infra: compose(selection)
-    Infra->>Deployment: remote_state_module() and infra_modules(selected/all)
-    Deployment-->>Infra: desired and known modules
-
-    Host->>Infra: apply(composition, selection)
-    Infra->>Store: load()
-    Store-->>Infra: state and version
-    Infra->>Engine: apply(composition, context, StateSaver)
-    Engine->>Engine: validate and order the module graph
-    Engine->>Module: resources(ModuleContext)
-    Module-->>Engine: realized Resources with dependency metadata
-
-    loop Refresh each known resource
-        Engine->>Resource: describe(context)
-        opt Provider-backed discovery is available
-            Resource->>Provider: read live object
-            Provider-->>Resource: provider evidence
-        end
-        Resource-->>Engine: Present, Absent, or Unsupported
-    end
-
-    loop Classify each desired resource
-        Engine->>Resource: diff(recorded or refreshed state)
-        Resource-->>Engine: pure change classification
-    end
-
-    Engine->>Engine: validate the resource graph and compute mutation order
-    loop Engine-ordered mutations
-        Engine->>Resource: create, update, or delete
-        Resource->>Provider: provider mutation
-        Provider-->>Resource: result
-        Resource-->>Engine: ResourceState or completion
-        Engine->>Store: StateSaver publishes state with expected version
-        Store-->>Engine: next version
-    end
-
-    Engine-->>Infra: applied changes
-    Infra->>Deployment: hydrate_config(config, applied state)
+## 1. Declare package discovery metadata
+
+Platform discovery comes from the platform package's Cargo metadata. A descriptor names
+the platform, its engine version, default definition format, definition roots, and any
+companion content trees:
+
+```toml
+[package.metadata.tokeira.platform]
+id = "example"
+engine = "0.1.1"
+default = false
+default-format = "tkd"
+definitions = ["deployment.tkd", "definition.tkdp"]
+content = ["configuration"]
 ```
 
-Keep realization free of hidden global state. The same deployment configuration and
-registered context should produce the same logical IDs, module graph, and manifests.
-Provider reads belong in lifecycle methods, not in local diff or graph construction.
+`definitions` lists root documents, one per supported format. Companion parts are
+resolved through the root document. `content` lists platform-owned trees that kinds may
+read from the definition source's directory; retained revisions therefore realize their
+own companion bytes.
 
-Writeback calculation returns derived values to the invoking host. It does not imply
-persistence: how and where those values are stored is outside the IaC framework and
-belongs to the host command.
+The workspace catalog discovers this descriptor. Adding a platform does not require a
+new `tkr` enum variant or command dispatch branch.
+
+## 2. Implement the lifecycle object
+
+An infrastructure `Resource` owns one logical state entry. A service `Service` owns one
+stable manifest-producing workload. Both are provider-facing contracts and belong beside
+the clients and provider models they use.
+
+### Infrastructure resource checklist
+
+Implement every resource decision explicitly:
+
+- Return a stable `resource_id` derived from deployment input and placement, not a
+  provider-assigned ID.
+- Return logical `ResourceId` dependencies. Do not schedule them inside lifecycle
+  methods; the engine owns ordering.
+- Validate the fully realized input in `validate_input`.
+- List every author-referenceable output in `declared_outputs`.
+- Return a canonical, deterministic `desired_manifest` for retained definition
+  evidence.
+- Keep `describes() == true` only when `describe` performs a real provider query once
+  its prerequisites are present. Override it to `false` for a stub; definition
+  verification will refuse the kind.
+- Make `describe` distinguish `Present`, confirmed `Absent`, and `Unsupported`.
+- Keep `diff` pure and return `Replace` when an immutable field needs delete/create.
+- Return complete `ResourceState` from create and update, including provider identity,
+  normalized comparison properties, dependencies, and module ownership.
+- Delete using persisted provider identity so removal still works after desired input
+  has changed.
+- Implement required, pure, total `change_semantics` with citations for every
+  non-unknown claim.
+- Supply a short lowercase `display_kind` when operator output benefits from a noun.
+
+Normalize provider observations before putting them in `ResourceState::properties`.
+Unordered API results, response timestamps, and volatile fields otherwise produce a
+perpetual update.
+
+Treat provider not-found as success in an idempotent delete. This is particularly
+important when `describe` returns `Unsupported`: destroy must call delete from persisted
+state because it cannot safely infer absence.
+
+### Service checklist
+
+A service validates authored input, declares outputs, names its module and dependencies,
+and generates provider manifests. Keep the following properties:
+
+- `name` is stable and unique across the realized service set.
+- `dependencies` names other services, not modules or infrastructure resource IDs.
+- `manifests` is deterministic because serialized JSON is hashed as desired state.
+- `validate_input` refuses an invalid complete service before the deploy engine sees it.
+- `declared_outputs` lists every output the authoring layer may reference.
+
+The runtime `Platform` owns provider-side preparation, live currency checks, manifest
+application, and deletion. `prepare_service` may satisfy a manifest prerequisite such
+as an image cache but must not alter the running workload. `apply_manifests` and
+`delete_service` should be idempotent: a provider operation can succeed before state
+publication does.
+
+If deletion is supported, return `true` from `supports_delete` and make an already
+absent service a successful delete. Otherwise the default fails closed before a
+non-empty delete pass.
+
+### Images
+
+Implement `Image` only when desired image references need their own runtime-state record.
+`desired_ref` returns repository, tag, and any upstream reference. `writeback_targets`
+names host-owned configuration fields populated by image publication flows.
+
+`record_images` does not build or publish an artifact. It records a desired
+`repository:tag`, source metadata, and a timestamp with no digest. Keep artifact
+evidence in the image build and publication subsystem that actually produced it.
+
+## 3. Wrap authored input in a kind
+
+Definitions never construct provider resources by reflection. A typed kind deserializes
+the authored fields and realizes the exact engine object:
+
+```rust
+pub trait Kind<R>: fmt::Debug + Send + Sync {
+    fn realize(&self, placement: &PlacementContext) -> Result<R, KindError>;
+}
+```
+
+`PlacementContext` supplies the stable deployment ID, deployment root, definition-source
+directory, owning module, logical ID, realized infra dependencies, dependency content
+identities, and tags. Use those values instead of reading global state.
+
+For example, a service kind can take its service name from `placement.logical_id`, its
+module from `placement.module`, and couple rendered configuration through a declared
+dependency's content identity.
+
+The namespace decoder chooses the lifecycle plane:
+
+```rust
+kind::decode_resource::<AuthoredBucket, BucketResource>(BUCKET_TYPE, value)
+kind::decode_service::<AuthoredService, ProviderService>(SERVICE_TYPE, value)
+```
+
+The decoder applies `serde` to the source-located value. Realization then checks that
+the concrete object's `resource_type` matches the authored kind name and calls
+`validate_input`. Return `KindError` with source range where possible; do not postpone a
+deterministic input error until provider mutation.
+
+## 4. Publish a namespace
+
+A namespace is the runtime shadow of one crate dependency:
+
+```rust
+pub struct Namespace {
+    pub name: &'static str,
+    pub kinds: &'static [&'static str],
+    pub defaults: Option<fn(&str) -> Option<LocatedValue>>,
+    pub decode: fn(&str, LocatedValue) -> Option<Result<DecodedKind, KindError>>,
+}
+```
+
+Keep the namespace facts beside the kinds:
+
+- `name` is the normalized crate name imported by definitions;
+- `kinds` is the complete author-visible inventory;
+- `defaults` returns authoring-only empty shapes when the frontend supports explicit
+  struct-update defaults; and
+- `decode` returns `None` for a name this namespace does not own.
+
+Every advertised kind must decode, and kind names must be unique across all namespaces
+in one platform declaration. A collision refuses the bound binary rather than letting
+import order select behavior.
+
+Provider crates should export reusable namespaces for provider objects. A platform
+package can add its own namespace for deployment-specific kinds, such as a rendered
+configuration bundle that consumes platform companion content.
+
+## 5. Export a pure platform declaration
+
+The platform package exports one entry point:
+
+```rust
+pub fn platform() -> PlatformDeclaration
+```
+
+Construct all four fields without filesystem, network, credentials, or provider clients:
+
+```rust
+pub struct PlatformDeclaration {
+    pub namespaces: Vec<Namespace>,
+    pub ops: Option<Box<dyn Ops>>,
+    pub execution: Box<dyn PlatformExecution>,
+    pub implementation: Arc<dyn PlatformIntegration>,
+}
+```
+
+`PlatformExecution::probe` answers whether the substrate is reachable for a
+`DeploymentRef`. Return `Ok(None)` when reachable or `Ok(Some(PlatformIssue))` when a
+provider problem should block plan and refuse mutation. Keep the provider's fact,
+evidence, and any grounded direction separate in the issue.
+
+`PlatformIntegration` registers provider handles into infra, service, and image
+contexts and constructs the runtime service `Platform`. Registration happens per
+operation and receives only `DeploymentRef { name, dir }`, not a state document.
+
+The declaration's `Ops` is `tokeira_platform::declaration::Ops`. It implements live
+`log_stream`, `port_mappings`, and `scale` over `DeploymentRef`. Do not confuse it with
+the legacy `tokeira_orchestrator::Ops`, whose methods operate on an associated config
+type.
+
+Test declaration purity by constructing it without a provider and by checking namespace
+and kind-name uniqueness.
+
+## 6. Author the definition set
+
+Definitions own deployment shape. Put the configuration model, modules, resource and
+service nodes, dependency edges, create-time annotations, and writebacks in `.tkd` or
+`.tkdp`, not in a hand-written `Deployment` implementation.
+
+The graph must have exactly one dependency-free module. The framework nominates it as
+the bootstrap module and presents it through `remote_state_module`; it does not rely on
+a reserved module name. Every other module should state its prerequisites explicitly.
+
+Resource references create graph edges. Output references are checked against the
+realized object's `declared_outputs`. An infrastructure resource cannot depend on a
+service resource, and service outputs cannot feed infrastructure-backed writeback.
+
+Writeback must be declared. A literal passes through; an output reference resolves
+through the realization index and applied `ResourceState::properties`. On the bound
+path `hydrate_config` is the identity function—the framework does not invent projection
+from arbitrary state.
+
+Definition-backed services are active engine objects. Realization separates them from
+infra resources, `DescribedDeployment::services` exposes them to `DeployEngine`, and
+deploy apply/destroy persists per-service progress.
+
+Use [the deployment definition guide](../provisioning/deployment-definitions.md) for
+language syntax and admission rules rather than duplicating the frontend contract here.
+
+## 7. Let the framework generate the composition root
+
+Do not add a hand-written `tkp` binary or a runtime platform dispatch table. The build
+pipeline discovers the selected platform and definition frontend, creates an ordinary
+generated workspace member, and links exactly three dependencies: the platform package,
+the selected frontend package, and `tokeira-tkp`.
+
+The generated `main` has this shape:
+
+```rust
+tokeira_tkp::bound_provisioner_main!(
+    expected_platform: "example",
+    platform: selected_platform::platform,
+    expected_format: "tkd",
+    content_roots: ["configuration"],
+    frontend: selected_frontend::tkd::frontend,
+);
+```
+
+Cargo remains the dependency resolver. The generated root joins the frozen,
+closure-scoped workspace and lockfile; the generated source and selected identity are
+part of engine identity. Definition bytes remain deployment data and are not compiled
+into the binary.
+
+## Provider capabilities and recovery
+
+Register clients in the context that consumes them:
+
+- infra clients and `ResourceRecovery` in `ProvisionContext`;
+- runtime-platform helpers in `ServiceContext`; and
+- image resolver or registry helpers in `ImageContext`.
+
+The maps do not inherit from one another. If both an infra resource and a service need a
+client, register an appropriate handle in both paths.
+
+`ResourceRecovery` covers recorded infra state whose current definition no longer
+realizes a resource. It takes `ResourceState` and may reconstruct a resource capable of
+deleting that type. Return `None` for types the recovery implementation does not own.
+The engine widens what can be deleted; it never widens what may be forgotten.
+
+The service engine uses a stricter source requirement because `ServiceState` retains a
+hash but not the manifest bodies needed for deletion. Restore any missing service
+definitions before destroy; the engine refuses a recorded service that the current
+definition cannot reproduce.
+
+## State-store extensions
+
+Adding a platform does not normally require a store implementation. The bound framework
+selects `CasStore` over deployment-local `LocalBackend` instances for infra and runtime
+state.
+
+When an explicitly scoped change adds storage behavior, choose the right level:
+
+- Implement `StateBackend` when `CasStore<T>` can serialize the complete document and
+  the medium can provide conditional manifest writes plus immutable snapshot helpers.
+  `LocalBackend` and `S3Backend` are the existing examples.
+- Implement `DeploymentStore<T>` when the store has its own document protocol.
+  `S3StateStore<T>` is the existing manifest-pointer plus immutable-snapshot model.
+
+Preserve these contracts:
+
+- a genuinely missing store loads `T::default()` with an empty version;
+- malformed or inaccessible state is an error, not bootstrap;
+- documents validate after load and before save;
+- versions are opaque and tied to the exact loaded or committed document;
+- an empty expected version is create-only; and
+- a stale publication returns `StateError::Conflict`.
+
+Read [`crates/tokeira-state/AGENTS.md`](../../crates/tokeira-state/AGENTS.md) before a
+state implementation change. State dependencies and format changes are architectural
+work, not incidental platform setup.
 
 ## Verification checklist
 
-Before considering a platform extension complete, verify the behavior its seam owns:
+Before calling a platform extension complete, verify:
 
-- logical resource and module IDs are stable and unique;
-- module and resource graphs reject cycles and produce deterministic order;
-- `describe` distinguishes confirmed absence from unsupported discovery;
-- `diff` selects the correct update or replacement execution path;
-- normalized live state and pure diffing converge to no change after apply;
-- replacement and deletion can resume from incrementally persisted state;
-- removed resources remain deletable through known composition or recovery;
-- state loading tolerates only a genuinely missing bootstrap store;
-- new or changed state backends validate on save and reject stale publication;
-- manifest generation is stable and service dependencies are complete;
-- runtime manifest application is idempotent under replay;
-- typed provider handles are registered in every context that consumes them; and
-- destructive operations remain behind plan, review, and confirmation.
+- the package descriptor is discoverable and names every definition/content root;
+- `platform()` is pure and its kind names are unique;
+- each kind decodes located input and realizes the advertised resource type;
+- complete input validation runs before lifecycle methods;
+- logical IDs, module names, and service names are stable and unique;
+- module, resource, and service graphs reject invalid edges and cycles;
+- every infra kind performs a real `describe`, or verification refuses it;
+- `Absent` is returned only after a provider confirms nonexistence;
+- normalized live state and pure diffing converge to `NoChange` after apply;
+- immutable-field changes select `Replace` from `diff`;
+- semantics are total and every non-unknown claim has a citation;
+- replacement and deletion resume from incrementally published state;
+- removed infra resources remain deletable through the known graph or recovery;
+- service manifests are deterministic and application/deletion are idempotent;
+- runtime deletion is supported or fails before touching a service;
+- provider handles are registered in every context that consumes them;
+- create-time definition changes are refused by the retarget gate; and
+- destructive infra and service operations remain behind plan/review/confirmation.
 
-Use focused crate tests during development and the workspace validation bar before a
-push or pull request.
+Use focused crate tests while implementing. Finish with the workspace validation bar in
+the root `AGENTS.md` before pushing.
 
 ## Further reading
 
-- [IaC framework](README.md) — subsystem map and lifecycle overview.
-- [State and convergence](state-and-convergence.md) — refresh, ordering, persistence,
-  and deletion behavior.
-- [Provisioning](../provisioning/README.md) — deployment definitions, platform
-  provisioners, and the `tkr`/`tkp`/`tkd` boundary.
-- [Engineering reference](../agents/engineering-reference.md) — binding boundaries and
-  repository recipes.
-- [`Resource` and `Module`](../../crates/tokeira-iac/src/lib.rs) — exact infrastructure
-  contracts.
-- [`Deployment`](../../crates/tokeira-orchestrator/src/lib.rs) — exact platform
-  integration contract.
-- [`ServiceEngine`](../../crates/tokeira-deploy-engine/src/engine.rs) — runtime
-  convergence behavior.
+- [Infrastructure as code engines](README.md) — exact engine traits and lifecycle
+  algorithms.
+- [State and convergence](state-and-convergence.md) — refresh, CAS publication,
+  snapshots, and leases.
+- [IaC architecture overview](../architecture/120-iac-framework.md) — platform
+  declarations, definition realization, bound provisioners, and the legacy boundary.
+- [Deployment definitions](../provisioning/deployment-definitions.md) — definition
+  language and admission.
+- [`tokeira-platform` declaration](../../crates/tokeira-platform/src/declaration.rs) and
+  [kind](../../crates/tokeira-platform/src/kind.rs) — current extension types.
+- [`tokeira-build` composition](../../crates/tokeira-build/src/composition.rs) — generated
+  root and frozen workspace assembly.
+- [`tokeira-tkp` described adapter](../../crates/tokeira-tkp/src/described.rs) — the
+  framework's bound-path `Deployment` implementation.

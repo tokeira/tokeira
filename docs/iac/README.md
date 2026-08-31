@@ -1,658 +1,741 @@
-# Infrastructure as code framework
+# Infrastructure as code engines
 
-Tokeira's infrastructure as code (IaC) framework reconciles platform-specific desired
-state with live provider state. It computes a reviewable plan, applies changes in
-dependency order, and records enough state to identify and manage the same resources
-on the next operation.
+Tokeira has two provider-neutral convergence engines. `tokeira-iac` manages
+infrastructure resources, while `tokeira-deploy-engine` manages service manifests and
+image records. Both compare desired objects with recorded state, delegate provider work
+through explicit traits, and leave persistence to their caller.
 
-The framework is assembled from four provider-neutral crates:
-
-- `tokeira-iac` defines infrastructure resources, modules, plans, and convergence;
-- `tokeira-state` persists versioned deployment-state documents;
-- `tokeira-orchestrator` connects a platform implementation to the engines and stores;
-  and
-- `tokeira-deploy-engine` converges runtime images and service manifests when a
-  platform uses a separate workload lifecycle.
-
-Platform crates complete the framework by supplying concrete resources, modules,
-services, images, provider clients, and store selection. No single crate owns the
-whole lifecycle.
+This guide is the engine-layer reference. Read
+[the IaC architecture overview](../architecture/120-iac-framework.md) first for the
+whole system shape, and use [the provisioning guide](../provisioning/README.md) for
+deployment creation, `tkr`, the bound `tkp`, revisions, and the deployment repository.
+Here the focus is narrower and deeper: resource and service contracts, planning,
+mutation order, change semantics, orchestration, and state publication.
 
 ## Mental model
 
-An operation combines three views of a deployment:
+Every convergence operation combines three views:
 
-1. **Desired state** comes from a platform implementation as typed modules, resources,
-   images, and services.
+1. **Desired state** is the graph realized from the admitted definition. On the legacy
+   path it comes from Rust modules owned by the deployment adapter.
 2. **Recorded state** preserves logical identities, provider identities, comparison
-   properties, dependency edges, and previous runtime manifests.
-3. **Live state** is read from providers during infrastructure refresh and, for runtime
-   services, during apply-time currency checks.
+   properties, dependency edges, outputs, image references, and service manifest
+   hashes.
+3. **Live state** is provider evidence. Infrastructure resources return it from
+   `describe`; the service engine asks its runtime platform whether an unchanged
+   manifest is still current.
 
-The engines are stateless algorithms. The orchestrator loads recorded state, builds the
-operation context, calls the appropriate engine, and persists the resulting state.
-Concrete platform objects perform provider lifecycle operations.
+Desired state says what should exist. Recorded state says what the last successful
+publication knew. Live state says what the provider can prove now. None substitutes for
+another.
 
-```mermaid
-flowchart TB
-    Caller["Caller<br/>plan, apply, or destroy"]
-    Platform["Platform implementation<br/>config, resources, modules,<br/>images, services, clients"]
-
-    subgraph Orchestration["tokeira-orchestrator"]
-        Deployment["Deployment trait"]
-        InfraFacade["InfraEngine facade"]
-        RuntimeFacade["DeployEngine facade"]
-    end
-
-    subgraph Lifecycle["Provider-neutral lifecycle engines"]
-        IacEngine["tokeira-iac<br/>Engine"]
-        ServiceEngine["tokeira-deploy-engine<br/>ServiceEngine"]
-    end
-
-    subgraph Persistence["tokeira-state"]
-        InfraStore["DeploymentStore<br/>InfraState"]
-        RuntimeStore["DeploymentStore<br/>RuntimeState"]
-        Backends["Local or S3 persistence"]
-    end
-
-    InfraObjects["Modules and Resources"]
-    RuntimeObjects["Images, Services,<br/>runtime Platform"]
-    Provider["Provider APIs"]
-
-    Platform -->|implements| Deployment
-    Platform --> InfraObjects
-    Platform --> RuntimeObjects
-    Caller --> InfraFacade
-    Caller --> RuntimeFacade
-    Deployment --> InfraFacade
-    Deployment --> RuntimeFacade
-    Deployment -. selects .-> InfraStore
-    Deployment -. selects .-> RuntimeStore
-    InfraFacade --> IacEngine
-    RuntimeFacade --> ServiceEngine
-    IacEngine -->|calls| InfraObjects
-    ServiceEngine -->|calls| RuntimeObjects
-    InfraFacade <--> InfraStore
-    RuntimeFacade <--> RuntimeStore
-    InfraStore --> Backends
-    RuntimeStore --> Backends
-    InfraObjects --> Provider
-    RuntimeObjects --> Provider
-```
-
-The arrows are ownership boundaries as well as call paths. `tokeira-iac` does not know
-which provider a `Resource` uses. `tokeira-state` does not interpret a resource graph.
-`tokeira-orchestrator` does not implement provider behavior. Platform crates do not
-reimplement generic planning or persistence coordination.
-
-## Crate responsibilities
-
-### `tokeira-iac`: infrastructure model and convergence
-
-`tokeira-iac` owns the infrastructure vocabulary and stateless lifecycle algorithm:
-
-- `ResourceId`, `ResourceType`, and `ResourceState`;
-- `Resource` and `Module` traits;
-- `ProvisionContext` and `ModuleContext`;
-- `InfraComposition` and module selection;
-- change kinds, field-level differences, and change semantics;
-- refresh evidence in `PlanOutcome`;
-- dependency ordering; and
-- infrastructure `plan`, `apply`, `plan_destroy`, `destroy`, and
-  `destroy_selected`.
-
-It also defines the `InfraState` and `RuntimeState` document shapes. Defining those
-shapes does not make the crate responsible for storing them: persistence is supplied by
-the caller through `StateSaver` and `DeploymentStore`.
-
-### `tokeira-state`: document persistence
-
-`tokeira-state` owns generic persistence mechanics:
-
-- the `Validate` boundary for state documents;
-- `DeploymentStore<T>`, which loads a document with an opaque version and saves against
-  an expected version;
-- `CasStore<T>` over a generic `StateBackend`;
-- `LocalBackend` for filesystem state;
-- `S3StateStore<T>` for manifest-addressed immutable snapshots; and
-- operation-lock primitives.
-
-The crate stores bytes and validated documents. It does not decide which resources are
-desired, calculate changes, or call resource lifecycle methods.
-
-### `tokeira-orchestrator`: platform integration
-
-`tokeira-orchestrator` defines the `Deployment` contract implemented by a platform and
-provides two facades:
-
-- `InfraEngine<D>` connects `Deployment`, `tokeira-iac`, `InfraState`, and an
-  infrastructure store.
-- `DeployEngine<D>` connects `Deployment`, `tokeira-deploy-engine`, `RuntimeState`, and
-  a runtime store.
-
-The orchestrator owns the integration sequence: register typed extensions, create the
-platform-selected stores, load state for each operation, compose modules, delegate to a
-stateless engine, and persist the result. After infrastructure apply it can hydrate
-in-memory platform configuration and expose calculated writeback values to the caller.
-
-### `tokeira-deploy-engine`: runtime manifest convergence
-
-`tokeira-deploy-engine` owns the optional workload lifecycle:
-
-- `Image` and `ImageContext`;
-- `Service` and `ServiceContext`;
-- the runtime `Platform` interface;
-- service dependency ordering;
-- manifest hashing and recorded image references; and
-- `ServiceEngine` plan, apply, and delete-only behavior.
-
-It does not own `RuntimeState` persistence. `DeployEngine<D>` loads the document before
-the operation and saves it after the service loop completes.
-
-### Platform crates: concrete behavior
-
-A platform crate implements the provider-facing side of these contracts. It owns:
-
-- validated platform configuration;
-- concrete `Module` and `Resource` implementations;
-- concrete `Image`, `Service`, and runtime `Platform` implementations where needed;
-- provider clients and credentials;
-- infrastructure and runtime store selection;
-- output hydration and writeback calculation; and
-- the `Deployment` implementation that assembles those parts.
-
-Provider lifecycle calls belong in `Resource::{create, update, delete, describe}` and
-runtime `Platform` methods, not in the generic engines.
-
-## Infrastructure model
-
-### Logical resource identity
-
-A `Resource` represents one logical lifecycle and state entry. The entry can correspond
-to one provider object or a coordinated bundle that must be reconciled as a unit.
-
-`ResourceId` is the stable key shared by desired configuration, dependency edges, plans,
-and `InfraState`. It must not depend on a provider-assigned physical identifier that is
-unknown before creation. The physical identifier and provider-specific comparison
-properties belong in `ResourceState`.
-
-A persisted `ResourceState` contains:
-
-- the resource type;
-- the provider physical identifier;
-- provider-specific properties used by later diff and delete operations;
-- logical resource dependencies;
-- creation and update timestamps; and
-- the owning module.
-
-### Resource lifecycle contract
-
-A provider resource implements:
-
-| Method | Responsibility |
-|---|---|
-| `resource_id` | Return the stable logical identity. |
-| `dependencies` | Return logical IDs that must exist first. |
-| `module` | Name the owning module. |
-| `describe` | Read the provider and distinguish present, confirmed absent, and unknown. |
-| `diff` | Purely classify the desired change against current state. |
-| `create` | Create or adopt the provider object and return complete state. |
-| `update` | Reconcile an existing object in place and return new state. |
-| `delete` | Delete the live object identified by persisted state. |
-| `change_semantics` | Describe the effects of an already classified change for explanation. |
-
-`describe` returns `DescribeResult`:
-
-- `Present(ResourceState)` means a provider read found the live object;
-- `Absent` means a provider read positively confirmed nonexistence; and
-- `Unsupported` means existence could not be determined.
-
-Only confirmed absence permits the engine to prune recorded state. A stub, unavailable
-client, missing prerequisite, or unsupported provider query must return `Unsupported`,
-not `Absent`.
-
-`diff` selects `Update`, `Replace`, or `NoChange` for a desired resource that already
-has state. `change_semantics` annotates that decision; it cannot switch an update onto
-the replacement execution path.
-
-### Modules and composition
-
-A `Module` is a named resource factory with explicit dependencies on other modules.
-The engine expands modules in topological order, then validates and orders the resulting
-resource graph independently.
-
-`InfraComposition` carries three module sets:
-
-- **desired modules** describe what should exist after apply;
-- **known modules** are everything the platform can manage, including objects that are
-  no longer desired but may still require deletion; and
-- **active modules** identify the scope of a selected operation.
-
-`InfraEngine::compose` always includes the remote-state module. Selected platform
-modules form the desired set; all platform modules form the known set.
+The engines are stateless algorithms. They mutate an operation-local context and call a
+save callback; the orchestration layer owns the actual stores and version tokens.
 
 ```mermaid
 flowchart LR
-    Remote["Remote-state module"]
-    Selected["Selected platform modules"]
-    All["All manageable platform modules"]
-
-    Desired["desired_modules<br/>target state"]
-    Known["known_modules<br/>management superset"]
-    Active["active_modules<br/>operation scope"]
-
-    Remote --> Desired
-    Selected --> Desired
-    Remote --> Known
-    All --> Known
-    Desired -->|module names| Active
-
-    Desired --> Validation["Composition validation"]
-    Known --> Validation
-    Validation --> Resources["Realized resource graph"]
+    Definition["Verified definition graph"] --> Realize["Kinds realize resources and services"]
+    Recorded["Recorded InfraState and RuntimeState"] --> Orchestration["Orchestrator facades"]
+    Realize --> Orchestration
+    Orchestration --> Infra["tokeira-iac Engine"]
+    Orchestration --> Deploy["tokeira-deploy-engine ServiceEngine"]
+    Infra --> Provider["Provider APIs"]
+    Deploy --> Provider
+    Infra --> Save["StateSaver"]
+    Deploy --> Save
+    Save --> Stores["DeploymentStore documents"]
 ```
 
-Before calculating a delta, the engine rejects duplicate module IDs, desired modules
-missing from the known set, module cycles, and duplicate resource IDs. Resource cycles
-are rejected when the graph is ordered for refresh or mutation.
+## Ownership map
 
-Dependencies outside the supplied module or resource set do not participate in that
-operation's topological sort. Within the set, ordering is deterministic: ready nodes
-are selected alphabetically.
+| Crate | Owns | Does not own |
+|---|---|---|
+| `tokeira-iac` | Infrastructure resource and module traits, composition, refresh, delta calculation, ordering, change semantics, `InfraState`, and `RuntimeState` document types | Provider clients, state backends, CLI confirmation, or deployment definitions |
+| `tokeira-deploy-engine` | Image, service, and runtime-platform traits; manifest hashing; service ordering; service plan/apply/destroy | State-store selection, deployment admission, or platform discovery |
+| `tokeira-orchestrator` | The `Deployment` adapter contract and the `InfraEngine<D>` / `DeployEngine<D>` facades that connect engines to contexts and stores | Definition parsing or provider behavior |
+| `tokeira-state` | Validated document persistence, compare-and-swap publication, local and S3 backends, S3 snapshot storage, and operation leases | Resource semantics or desired-state calculation |
+| `tokeira-platform` | Platform declarations, definition graphs, namespaces, kinds, and the infra/service realization split | Planning, apply order, state publication, or operator confirmation |
+| `tokeira-tkp` | The definition-bound composition path: verification, `DescribedDeployment`, lifecycle gates, and the generated provisioner shell | Provider-specific resource implementations |
 
-### Typed execution contexts
+Platform packages are descriptions, not orchestrator deployments. A package exports a
+pure `platform() -> PlatformDeclaration`; definition nodes realize through its
+namespaces. On the bound path the framework supplies the single generic
+`DescribedDeployment` implementation and chooses the infra and runtime stores.
 
-Provider-neutral crates cannot depend on every provider SDK. The framework therefore
-passes provider capabilities through typed extension bags:
+The complete production implementor set of `tokeira_orchestrator::Deployment` is:
 
-- `ProvisionContext` carries `InfraState`, project metadata, progress reporters, and
-  infrastructure extensions.
-- `ModuleContext` borrows the current infrastructure state and the same infrastructure
-  extension map while modules realize resources.
-- `ServiceContext` carries service state, infrastructure state, and a separate runtime
-  extension map.
-- `ImageContext` carries image state and its own extension map.
+- `DescribedDeployment`, used by every definition-backed platform;
+- `LocalDeployment`, the legacy local in-process adapter; and
+- `EcsDeployment`, the legacy ECS in-process adapter.
 
-A platform registers clients, platform handles, validated configuration fragments, or
-recovery helpers through `Deployment::register_*_extensions`. Resources and services
-retrieve them by concrete type. Registrations are context-local: adding a value to
-`ProvisionContext` does not make it available to `ServiceContext` or `ImageContext`.
+Compose does not implement `Deployment`. Its package is a `PlatformDeclaration`, its
+shape lives in definition documents, and its resource behavior lives in provider kinds.
+
+## From a definition to engine objects
+
+A platform declaration contributes `Namespace` values. Each namespace names its
+author-visible kinds and decodes an authored value into `DecodedKind`. The kind realizes
+once with invocation placement:
+
+```rust
+pub trait Kind<R>: fmt::Debug + Send + Sync {
+    fn realize(&self, placement: &PlacementContext) -> Result<R, KindError>;
+}
+```
+
+The heterogeneous result is either an infrastructure resource or a service:
+
+```rust
+pub enum RealizedResource {
+    Infra(Box<dyn tokeira_iac::Resource>),
+    Service(Box<dyn tokeira_deploy_engine::Service>),
+}
+```
+
+Realization validates each object through its owning trait, verifies referenced output
+names, rejects an infrastructure resource that depends on a service, and separates the
+result into infra and service planes. `tokeira-tkp::ExecutionState` then retains:
+
+- module identities and dependency edges;
+- the unique dependency-free bootstrap module;
+- infra resources grouped by module;
+- realized services in declaration order;
+- namespaces and writeback declarations;
+- the logical-reference-to-`ResourceId` index; and
+- canonical desired manifests and configuration identity.
+
+`DescribedDeployment` converts that execution state into the older orchestrator seam.
+It is an adapter, not a second desired-state model.
+
+```mermaid
+flowchart LR
+    Source[".tkd or .tkdp definition"] --> Frontend["DefinitionFrontend"]
+    Frontend --> Definition["Modules, objects, edges, and writeback"]
+    Declaration["PlatformDeclaration"] --> Namespaces["Namespaces and kinds"]
+    Definition --> Realize["Decode and realize each kind once"]
+    Namespaces --> Realize
+    Realize --> Verify["Validate inputs, outputs, and cross-plane edges"]
+    Verify --> Infra["InfraComposition<br/>desired / known / active"]
+    Verify --> Services["Realized service set"]
+    Infra --> InfraEngine["InfraEngine&lt;DescribedDeployment&gt;"]
+    Services --> DeployEngine["DeployEngine&lt;DescribedDeployment&gt;"]
+```
+
+## Infrastructure resource contract
+
+`ResourceId` is the stable join key shared by desired configuration, dependency edges,
+plans, and `InfraState`. It must be known before provider creation. A cloud-assigned ID
+belongs in `ResourceState::physical_id`, not in the logical ID.
+
+The complete trait is:
+
+```rust
+#[async_trait::async_trait]
+pub trait Resource: Send + Sync {
+    fn resource_type(&self) -> ResourceType;
+
+    fn validate_input(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn desired_manifest(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+
+    fn resource_id(&self) -> ResourceId;
+    fn dependencies(&self) -> Vec<ResourceId>;
+
+    fn describes(&self) -> bool {
+        true
+    }
+
+    fn module(&self) -> &str;
+
+    async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, error::IacError>;
+    async fn update(
+        &self,
+        current: &ResourceState,
+        ctx: &ProvisionContext,
+    ) -> Result<ResourceState, error::IacError>;
+    async fn delete(
+        &self,
+        current: &ResourceState,
+        ctx: &ProvisionContext,
+    ) -> Result<(), error::IacError>;
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, error::IacError>;
+    fn diff(&self, current: &ResourceState, ctx: &ProvisionContext) -> InternalChange;
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics;
+
+    fn display_kind(&self) -> Option<&'static str> {
+        None
+    }
+}
+```
+
+The methods divide into five responsibilities:
+
+| Responsibility | Methods |
+|---|---|
+| Identity and graph | `resource_type`, `resource_id`, `dependencies`, `module` |
+| Definition admission | `validate_input`, `declared_outputs`, `desired_manifest`, `describes` |
+| Provider mutation and observation | `create`, `update`, `delete`, `describe` |
+| Reconciliation and explanation | `diff`, `change_semantics` |
+| Presentation | `display_kind` |
+
+`validate_input` refuses an invalid realized object before a lifecycle method can run.
+`declared_outputs` is the allow-list for output references. `desired_manifest` is the
+canonical desired evidence retained for definition-backed resources. `describes` says
+whether the implementation can perform a real provider query; definition verification
+refuses a stub kind before planning.
+
+A persisted `ResourceState` contains the resource type, provider physical ID,
+provider-specific comparison properties, logical dependencies, creation and update
+timestamps, and owning module. Create and update must return a complete state value
+that supports later diff, refresh, recovery, and deletion.
+
+### Three-valued live discovery
+
+`describe` does not return an option:
+
+```rust
+pub enum DescribeResult {
+    Present(ResourceState),
+    Absent,
+    Unsupported,
+}
+```
+
+- `Present(state)` means a provider read found the live object. That state replaces the
+  recorded planning view.
+- `Absent` means a provider read positively confirmed nonexistence. Only this result
+  permits state pruning.
+- `Unsupported` means the implementation could not establish presence or absence. The
+  engine preserves recorded state; a delete proceeds from the persisted physical
+  identity rather than assuming the object is gone.
+
+A missing client, missing prerequisite, permission ambiguity, or stub query is
+`Unsupported`, never `Absent`. Deletion is deliberately fail-closed: uncertainty cannot
+turn a live provider object into an untracked orphan.
+
+### Diff and replacement
+
+For a desired resource with current state, `diff` returns an `InternalChange` that
+flattens to one of:
+
+```rust
+pub enum ChangeKind {
+    Create,
+    Update,
+    Replace,
+    Delete,
+    NoChange,
+}
+```
+
+`Replace` is delete-then-create for an immutable-field change. It is not a more severe
+label on an update; it selects a different execution path. Both `Delete` and `Replace`
+are destructive, and `destructive_changes` / `plan_is_destructive` expose that class to
+the shell's confirmation gate.
+
+`diff` must be pure. Provider reads belong in `describe`, and provider writes belong in
+the lifecycle methods.
+
+## Change semantics
+
+`ChangeKind` tells the engine what reconciliation path to execute. `ChangeSemantics`
+tells the operator what that path means for the running resource. A resource cannot
+turn `Update` into `Replace` through semantics; it must return `Replace` from `diff`.
+
+The shared vocabulary is:
+
+```rust
+pub enum LifecycleOperation {
+    Created,
+    UpdatedInPlace,
+    Replaced,
+    Deleted,
+}
+
+pub enum ReplacementPolicy {
+    NotRequired,
+    CreateBeforeDestroy,
+    DestroyBeforeCreate,
+}
+
+pub enum Disruption {
+    None,
+    Rolling,
+    BriefInterruption,
+    UnavailableDuringChange,
+}
+
+pub enum DataEffect {
+    NoDataHeld,
+    Preserved,
+    Migrated,
+    Destroyed,
+    Policy,
+}
+
+pub enum Reversibility {
+    Reversible,
+    ReversibleWithDataLoss,
+    Irreversible,
+}
+```
+
+Each field carries an explicit confidence grade:
+
+```rust
+pub enum Confidence<T> {
+    Unknown,
+    Inference { value: T, citation: Citation },
+    EngineFact { value: T, citation: Citation },
+    ProviderGuarantee { value: T, citation: Citation },
+}
+
+pub struct ChangeSemantics {
+    pub operation: Confidence<LifecycleOperation>,
+    pub replacement: Confidence<ReplacementPolicy>,
+    pub disruption: Confidence<Disruption>,
+    pub data_effect: Confidence<DataEffect>,
+    pub reversibility: Confidence<Reversibility>,
+    pub statement: Option<Cow<'static, str>>,
+    pub provider_assigned: Vec<Cow<'static, str>>,
+}
+```
+
+Every confidence field defaults to `Unknown`. Every non-unknown grade carries a
+`Citation`: `EngineFact` cites code, `ProviderGuarantee` cites provider documentation,
+and `Inference` cites the facts from which the engine derived it. The type therefore
+prevents an uncited confident claim. `provider_assigned` names creation values that
+cannot be known until apply, such as a provider-generated endpoint.
+
+`change_semantics` is required, pure, and total. It receives the computed `ChangeKind`,
+the current state when one exists, and the field-level differences. `NoChange` has no
+semantics entry because there is no operation to explain.
+
+## Modules, contexts, and composition
+
+A module groups resources and gives the operator a stable selection unit. Its exact
+trait is async-annotated even though its current methods are synchronous:
+
+```rust
+#[async_trait::async_trait]
+pub trait Module: Debug + Send + Sync {
+    fn name(&self) -> &str;
+    fn dependencies(&self) -> Vec<&str>;
+    fn resources(&self, ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError>;
+}
+```
+
+Module dependencies are module names, not resource IDs. The engine sorts modules before
+calling `resources`; it then sorts the realized resource graph independently. Cycles in
+either supplied graph are errors, and ready nodes are selected in stable lexical order.
+
+Provider-neutral crates cannot depend on every provider SDK, so contexts carry typed
+extension bags:
+
+- `ProvisionContext` carries `InfraState`, deployment identity, tags, progress hooks,
+  and infrastructure extensions.
+- `ModuleContext` borrows the current infra state and the same infrastructure
+  extensions while modules enumerate resources.
+- `ServiceContext` carries `RuntimeState`, the preceding `InfraState`, and deploy
+  extensions.
+- `ImageContext` carries runtime state and image extensions.
+
+The bags are separate. Registering a Docker or AWS handle in `ProvisionContext` does
+not make it available to a service or image.
+
+`InfraComposition` keeps three sets:
+
+```rust
+pub struct InfraComposition {
+    pub desired_modules: Vec<Box<dyn Module>>,
+    pub known_modules: Vec<Box<dyn Module>>,
+    pub active_modules: Vec<String>,
+}
+```
+
+- **Desired** is what should remain after apply.
+- **Known** is everything this execution can manage, including objects that are no
+  longer desired but still need refresh or deletion. It must contain every desired
+  module.
+- **Active** is the current operation scope used for module filtering.
+
+The framework always includes the definition's unique dependency-free bootstrap module.
+A named `ModuleSelection::Only` expands before composition: plan and apply include all
+transitive prerequisites; destroy includes all transitive dependants. An empty or
+unknown named selection is refused with the supported module names.
 
 ## Infrastructure plan
 
-Planning reloads recorded state, validates composition, refreshes all known resources,
-and calculates a delta for desired resources. It performs provider reads but no provider
-create, update, or delete.
+The bound plan path performs these steps:
+
+1. Evaluate the admitted definition, verify the structural graph, realize its kinds,
+   and run `verify_resources`. A kind with `describes() == false` or a dangling resource
+   edge is refused before a provider operation.
+2. Probe the platform. A reported `PlatformIssue` blocks the plan and produces no
+   changes.
+3. Open `InfraEngine<DescribedDeployment>`, load `(InfraState, version)` from the
+   `DeploymentStore`, and expand any module selection toward prerequisites.
+4. Validate composition: unique module IDs, every desired module present in known,
+   an acyclic module graph, and unique resource IDs.
+5. Realize desired and known resources, order the known graph, and call `describe` on
+   every known resource.
+6. Compute `Create`, `Update`, `Replace`, `Delete`, or `NoChange` from the refreshed
+   in-memory view.
+7. Return the plan and evidence. Plan supplies no `StateSaver`, so confirmed absence
+   changes only the planning view.
 
 ```mermaid
 sequenceDiagram
-    actor Caller
-    participant Facade as InfraEngine
+    participant Shell as Bound shell
+    participant Definition
+    participant Platform
     participant Store as DeploymentStore
     participant Engine as IaC Engine
-    participant Module
-    participant Resource
-    participant Provider
+    participant Resources
 
-    Caller->>Facade: plan(composition, selection)
-    Facade->>Store: load()
-    Store-->>Facade: InfraState and version
-    Facade->>Engine: plan or plan_for_modules
-    Engine->>Engine: validate composition
-    Engine->>Module: resources(ModuleContext)
-    Module-->>Engine: known and desired Resources
-
-    loop Known resources in dependency order
-        Engine->>Resource: describe(ProvisionContext)
-        Resource->>Provider: read live object
-        Provider-->>Resource: provider observation
-        Resource-->>Engine: Present, Absent, or Unsupported
-        Engine->>Engine: update in-memory refresh view
+    Shell->>Definition: admit, realize, and verify resources
+    Definition-->>Shell: ExecutionState
+    Shell->>Platform: probe deployment substrate
+    alt Platform issue
+        Platform-->>Shell: PlatformIssue
+        Shell-->>Shell: return blocked PlanOutcome
+    else Platform reachable
+        Platform-->>Shell: reachable
+        Shell->>Store: load infrastructure state
+        Store-->>Shell: document and opaque version
+        Shell->>Engine: plan composition without StateSaver
+        Engine->>Engine: validate module and resource graphs
+        Engine->>Resources: describe known resources in dependency order
+        Resources-->>Engine: Present, Absent, or Unsupported
+        Engine->>Engine: refresh view and compute deltas
+        Engine-->>Shell: PlanOutcome with evidence
+        Note over Engine,Store: Plan never publishes the refreshed document
     end
-
-    loop Desired resources
-        Engine->>Resource: diff(current state)
-        Resource-->>Engine: Update, Replace, or NoChange
-    end
-
-    Engine->>Engine: add Creates and removed-resource Deletes
-    Engine-->>Facade: PlanOutcome
-    Facade-->>Caller: changes and refresh evidence
 ```
 
-`PlanOutcome` contains more than a flat change list:
+A provider issue raised during resource refresh also blocks the plan. The engine
+restores the pre-refresh recorded view and returns the issue rather than manufacturing
+changes from stale state.
 
-- per-resource refresh status records whether the provider confirmed live or missing
-  state or could not determine it;
-- `live_departed` identifies confirmed provider observations that differ from recorded
-  properties;
-- change semantics and display nouns support operator explanations; and
-- known-resource dependency edges preserve the context needed to explain impact.
+`PlanOutcome` is an evidence bundle, not a change vector:
 
-Plan refresh mutates the in-memory `ProvisionContext`, but the plan path supplies no
-state saver. “Read-only plan” therefore means no provider mutation and no state
-publication, not no provider I/O.
+```rust
+pub struct PlanOutcome {
+    pub changes: Vec<Change>,
+    pub refresh: RefreshCoverage,
+    pub semantics_by_id: BTreeMap<ResourceId, ChangeSemantics>,
+    pub display_by_id: BTreeMap<ResourceId, String>,
+    pub edges_by_id: BTreeMap<ResourceId, Vec<ResourceId>>,
+    pub platform_issues: Vec<PlatformIssue>,
+}
+```
+
+`RefreshCoverage` records whether refresh ran, each resource's status, and
+`live_departed`: confirmed live properties or absence that differ from the recorded
+view. Semantics and display nouns explain what each change means. Known-set dependency
+edges remain unfiltered so an explanation can include unchanged dependants. A non-empty
+`platform_issues` list means `changes` is empty.
+
+Planning is read-only with respect to workload and state publication, but it is not
+offline. Infrastructure plan performs provider reads; service plan can resolve
+platform-owned prerequisites such as image-cache population.
 
 ## Infrastructure apply
 
-Apply begins with the same validation, realization, refresh, and delta calculation as
-plan. Mutation then has two ordered phases.
+The bound shell runs the operation-marker, binding, and create-time retarget gates
+before provider mutation. Without `--yes`, it also plans and refuses if any `Delete` or
+`Replace` is present. With `--yes`, the operator has already confirmed the destructive
+class and the shell does not pay for a separate confirmation plan.
 
 ```mermaid
 flowchart TD
-    Load["Reload InfraState and version"]
-    Validate["Validate composition"]
-    Realize["Realize desired and known resources"]
-    Refresh["Refresh known resources"]
-    Delta["Compute Create, Update, Replace,<br/>Delete, and NoChange"]
-    Forward["Forward topological phase"]
-    CreateUpdate["Create or update resource"]
-    ReplaceDelete["Replace: delete old object<br/>remove state"]
-    ReplaceCreate["Replace: create new object<br/>insert state"]
-    Save["StateSaver publishes state<br/>and advances expected version"]
-    Reverse["Reverse persisted-dependency phase"]
-    Delete["Delete removed resource<br/>remove state"]
-    Hydrate["Hydrate in-memory config<br/>from final InfraState"]
-
-    Load --> Validate --> Realize --> Refresh --> Delta --> Forward
-    Forward --> CreateUpdate --> Save
-    Forward --> ReplaceDelete --> Save
-    Save --> ReplaceCreate
-    ReplaceCreate --> Save
-    Forward --> Reverse
-    Save --> Reverse
-    Reverse --> Delete --> Save
-    Reverse --> Hydrate
-    Save --> Hydrate
+    Apply["Bound infra apply"] --> Gates["Operation marker, binding, and retarget gates"]
+    Gates --> Confirmed{"--yes?"}
+    Confirmed -->|No| Review["Run plan for confirmation"]
+    Review --> Destructive{"Delete or Replace?"}
+    Destructive -->|Yes| Refuse["Refuse before provider mutation"]
+    Destructive -->|No| Converge["Reload, refresh, and compute delta"]
+    Confirmed -->|Yes| Converge
+    Converge --> Forward["Create, update, and replace<br/>in forward dependency order"]
+    Forward --> Reverse["Delete removed resources<br/>in reverse persisted order"]
+    Forward -. "after each durable transition" .-> Save["StateSaver publishes with current version"]
+    Reverse -. "after each deletion" .-> Save
+    Save --> Conflict{"Save succeeds?"}
+    Conflict -->|Yes| Next["Retain returned version and continue"]
+    Conflict -->|No| Abort["Abort; caller reloads and re-plans"]
 ```
 
-Creates and updates run in forward resource order. A replacement is deliberately split
-into two durable transitions: delete and save the absence, then create and save the new
-state. If execution stops between them, the next refresh sees a missing desired resource
-and resumes with creation instead of trying to update a deleted object.
+The engine then:
 
-Deletes run after the forward phase, in reverse order reconstructed from persisted
-`ResourceState.dependencies`. Historical dependency information can be incomplete after
-configuration changes. Missing edges are tolerated; cyclic or unresolved remnants are
-appended in stable sorted order rather than blocking cleanup.
+1. Reloads `InfraState` and its opaque store version.
+2. Repeats composition validation, resource realization, and live refresh. A
+   `PlatformIssue` is a hard error on a mutating verb.
+3. Persists a confirmed missing known-but-not-desired resource during refresh.
+4. Computes the delta.
+5. Runs creates, updates, and replacements in forward resource order.
+6. Runs deletes in reverse order reconstructed from persisted dependency edges.
+7. Calls `StateSaver` after every successful state transition.
 
-`StateSaver` runs after each successful create, update, or delete and after both state
-transitions of replacement. A save failure aborts the operation. The orchestrator's
-saver keeps the latest opaque store version and passes it as the expected version of the
-next save.
+A replacement has two durable transitions. The engine deletes the old object, removes
+its state, and saves; it then creates the replacement, inserts the new state, and saves
+again. If execution stops between the saves, the next refresh sees a missing desired
+object and resumes with creation.
 
-The engine returns all calculated changes, including `NoChange`. Confirmation policy
-and rendering belong to the caller; they are not hidden side effects of `Engine::apply`.
+Deletion ordering uses persisted edges because the current definition may no longer
+contain the removed resource. Missing historical edges are tolerated. Cyclic or
+unresolved remnants fall back to stable order so cleanup can continue, but the actual
+delete remains fail-closed: the engine needs a known resource or a `ResourceRecovery`
+that claims the persisted type.
+
+The orchestrator's saver retains the latest version returned by `DeploymentStore::save`
+and uses it for the next publication. A conflict or any save failure aborts the
+operation; callers reload and re-plan rather than overwriting.
 
 ## Infrastructure destroy
 
-Destroy treats the desired set as empty, but it still uses the known set to locate
-provider behavior. It refreshes known resources, computes deletions for recorded state,
-and deletes in reverse persisted-dependency order.
+Destroy is not apply with a convenient flag. The shell requires `--yes`, applies its
+marker and binding gates, probes the platform, and expands a selected module toward its
+dependants so nothing remains standing on a removed module.
 
-```mermaid
-sequenceDiagram
-    actor Caller
-    participant Facade as InfraEngine
-    participant Store as DeploymentStore
-    participant Engine as IaC Engine
-    participant Recovery as ResourceRecovery
-    participant Resource
-    participant Provider
+The engine treats desired as empty, refreshes known resources, and calculates deletes
+from recorded state. Immediately before each delete it calls `describe` again:
 
-    Caller->>Facade: destroy(composition, selection)
-    Facade->>Store: load()
-    Store-->>Facade: InfraState and version
-    Facade->>Facade: register DestroyMode
-    Facade->>Engine: destroy with empty desired set
-    Engine->>Engine: refresh known resources
-    Engine->>Engine: order Deletes in reverse
+- `Present(live)` deletes using the fresh live state;
+- `Absent` prunes the recorded entry; and
+- `Unsupported` calls `delete` with the persisted state.
 
-    loop Recorded resource selected for deletion
-        alt Resource exists in known set
-            Engine->>Resource: use known Resource
-        else Definition no longer realizes the resource
-            Engine->>Recovery: recover(ResourceState)
-            Recovery-->>Engine: Resource or unclaimed
-        end
+Deletes run in reverse dependency order and save after each removal. If a recorded
+resource is absent from the known graph, `ResourceRecovery` may reconstruct a deletable
+object from its `ResourceState`. If neither path can claim it, the engine returns
+`UnknownResourceDelete` instead of dropping the state entry.
 
-        alt No known or recovered Resource
-            Engine-->>Facade: fail with UnknownResourceDelete
-        else Resource is available
-            Engine->>Resource: describe(context)
-            Resource->>Provider: read live object
-            Provider-->>Resource: observation
-            alt Present
-                Engine->>Resource: delete(live state)
-                Resource->>Provider: delete live object
-            else Confirmed Absent
-                Engine->>Engine: prune recorded entry
-            else Unsupported
-                Engine->>Resource: delete(recorded state)
-                Resource->>Provider: delete by persisted identity
-            end
-            Engine->>Store: save(updated InfraState, expected version)
-            Store-->>Engine: next version
-        end
-    end
+`destroy_selected_in` is the narrower rollback primitive. It touches only exact logical
+IDs, treats an ID absent from state as already complete, and uses the same recovery,
+reverse-order, and incremental-save path without refreshing the full known set.
 
-    Facade->>Facade: remove DestroyMode
-    Facade-->>Caller: deletion changes
+## Orchestrator adapter contract
+
+The orchestrator retains one adapter trait so both the definition-backed and legacy
+paths can use the same facades:
+
+```rust
+#[async_trait]
+pub trait Deployment: Send + Sync {
+    type Config: Send + Sync + Clone + 'static;
+
+    fn remote_state_module(
+        &self,
+        config: &Self::Config,
+        deployment_dir: &Path,
+    ) -> Box<dyn iac::Module>;
+    fn infra_modules(
+        &self,
+        config: &Self::Config,
+        selection: &iac::ModuleSelection,
+    ) -> Vec<Box<dyn iac::Module>>;
+    fn services(&self, config: &Self::Config) -> Vec<Box<dyn deploy_engine::Service>>;
+    fn images(&self, config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>>;
+    fn required_namespaces(&self, config: &Self::Config) -> Vec<String>;
+    async fn register_infra_extensions(
+        &self,
+        config: &Self::Config,
+        ctx: &mut iac::ProvisionContext,
+    ) -> Result<()>;
+    async fn register_deploy_extensions(
+        &self,
+        config: &Self::Config,
+        ctx: &mut deploy_engine::ServiceContext,
+    ) -> Result<()>;
+    async fn register_image_extensions(
+        &self,
+        _config: &Self::Config,
+        _ctx: &mut deploy_engine::ImageContext,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn create_infra_store(
+        &self,
+        config: &Self::Config,
+        deployment_dir: &Path,
+    ) -> Box<dyn DeploymentStore<iac::InfraState>>;
+    fn create_deploy_store(
+        &self,
+        config: &Self::Config,
+        deployment_dir: &Path,
+    ) -> Box<dyn DeploymentStore<iac::RuntimeState>>;
+    fn hydrate_config(&self, config: &Self::Config, state: &iac::InfraState) -> Self::Config;
+    fn collect_writeback(
+        &self,
+        config: &Self::Config,
+        state: &iac::InfraState,
+    ) -> Vec<(String, String)>;
+}
 ```
 
-`ResourceRecovery` is the fail-closed seam for state that outlives the configuration
-that created it. A platform can reconstruct a deletable resource from `ResourceState`.
-If neither the known set nor recovery claims the resource type, the engine refuses to
-drop the state entry and orphan the provider object.
+On the bound path, `DescribedDeployment` derives modules and services from
+`ExecutionState`, delegates extension registration to `PlatformIntegration`, selects
+framework-standard local stores under the deployment directory, keeps hydration as the
+identity function, and resolves only definition-declared writebacks. A platform package
+does not implement this trait or select these stores.
 
-`destroy_selected` is a narrower delete-only primitive. It acts only on exact logical
-IDs, leaves every other resource untouched, treats IDs absent from state as already
-done, and uses the same recovery and reverse-order deletion path. It does not refresh
-the full known set first.
+The legacy `LocalDeployment` and `EcsDeployment` adapters still construct their own
+modules, stores, and writeback through this trait. That is compatibility surface, not the
+extension recipe for a new platform.
 
-## State persistence
+## Service and image convergence
 
-The state document types live in `tokeira-iac`; their storage mechanisms live in
-`tokeira-state`.
+The definition realization boundary sends service kinds to the deploy plane. A service
+has its own admission methods as well as manifest behavior:
 
-| Document | Records | Persistence cadence |
-|---|---|---|
-| `InfraState` | Resources, provider identities and properties, dependency edges, outputs, and apply metadata. | Incrementally after infrastructure state transitions. |
-| `RuntimeState` | Desired image references, service manifest hashes, and service apply metadata. | Once after a runtime operation completes. |
+```rust
+pub trait Service: Debug + Send + Sync {
+    fn resource_type(&self) -> &'static str;
+    fn validate_input(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &[]
+    }
+    fn name(&self) -> &str;
+    fn module(&self) -> &str;
+    fn dependencies(&self) -> Vec<&str>;
+    fn manifests(&self, ctx: &ServiceContext) -> Result<Vec<serde_json::Value>, RuntimeError>;
+}
+```
 
-### Store contract
+Manifest serialization is the desired comparison key, so generation must be stable.
+Service names must be unique, every dependency must exist, and cycles are errors.
 
-`DeploymentStore<T>::load` returns a validated document and an opaque version.
-`save` validates the document, accepts the version from the load or successful save
-that produced it, and returns the next version. A stale expected version returns
-`StateError::Conflict`; callers must reload and re-plan rather than force an overwrite.
+The bound service plan uses `plan_services_with_platform`. For each service in dependency
+order it generates manifests, calls `Platform::prepare_service`, hashes the manifests,
+compares the hash with `RuntimeState`, and calls `is_service_current` when the hash
+matches. Preparation may populate an image cache but must not mutate the running
+workload.
 
-Missing backing state loads as `T::default()` with an initial empty version so the
-remote-state module can bootstrap the backing resource during first apply. An empty
-expected version is create-only: it succeeds only while no current document exists.
+Apply repeats that per-service sequence. A create, changed hash, or detected live drift
+calls `apply_manifests`, updates `RuntimeState`, and saves immediately before moving to
+the next service. If every service is unchanged, the orchestrator still saves once so
+newly recorded image references are persisted. Service replay must be safe because a
+provider mutation can succeed before its save fails.
 
-### Local CAS publication
-
-`CasStore<T>` serializes the complete validated document and delegates versioned
-publication to a `StateBackend`. `LocalBackend` uses a SHA-256 hash of the manifest
-bytes as its version.
-
-Writers acquire an exclusive lock on a stable sidecar file before checking the expected
-version. The lock remains held while a uniquely named temporary manifest is written and
-atomically renamed over the published manifest. The sidecar is separate from the
-manifest inode so rename cannot allow another writer to bypass the lock. On one host,
-concurrent writers using the same expected version therefore admit exactly one success;
-the others observe the new hash and return `StateError::Conflict`.
-
-Readers do not take the writer lock. Atomic rename means they observe either the
-complete previous manifest or the complete replacement. `LocalBackend` is a
-single-host mechanism; it does not provide distributed locking.
-
-### S3 CAS publication
-
-`S3StateStore<T>` keeps immutable full-document snapshots under
-`snapshots/<timestamp>-<uuid>.json` and a single mutable `manifest.json` containing the
-head pointer and short save lease.
-
-A save proceeds as one version-threaded protocol:
-
-1. validate and serialize the document;
-2. load the manifest and verify the caller's expected ETag, using an empty version only
-   when no manifest exists;
-3. acquire the save lease in the same conditional manifest write that rejects a stale
-   expected version;
-4. upload a new immutable snapshot;
-5. verify the lease token and expiry; and
-6. publish the new head and release the lease in one `If-Match` manifest update.
-
-The ETag returned by the final conditional update is the version for the committed
-document and is threaded into the caller's next save. A failed final manifest update
-can leave an unreferenced immutable snapshot, but it cannot move or corrupt the
-committed head. Loads follow the manifest head, verify the snapshot SHA-256 checksum,
-deserialize the document, and validate it before returning.
-
-### Operation-level coordination
-
-Per-save CAS protects one state publication. `OperationLock` is a separate renewable
-lease over `StateBackend` that can serialize a complete multi-save deployment
-operation. The S3 save lease is narrower still: it protects only one snapshot and
-manifest publication. These mechanisms complement rather than replace one another.
-
-See [State and convergence](state-and-convergence.md) for state ownership and
-interruption behavior.
-
-## Runtime deployment lifecycle
-
-The runtime engine is separate from infrastructure convergence. A platform can use it
-when workloads are best represented as images and service manifests rather than as
-infrastructure resources.
-
-`Image::desired_ref` contributes a desired repository and tag. The current
-`record_images` path records `repository:tag`, source metadata, and a timestamp; it does
-not resolve or persist an artifact digest. Artifact build and publication are outside
-this engine operation.
-
-`Service::manifests` produces the provider manifests for one service. Manifest
-serialization must be stable because its SHA-256 hash is the desired-state comparison
-key. Service dependencies are strict: duplicate names, missing dependencies, and cycles
-are errors.
+Destroy first refuses if any recorded service is absent from the current definition;
+the manifest bodies required for deletion must be reproducible. It then checks
+`Platform::supports_delete` for the complete pass, deletes in reverse service dependency
+order, and saves after each successful removal.
 
 ```mermaid
 sequenceDiagram
-    actor Caller
-    participant Facade as DeployEngine
-    participant Store as DeploymentStore
-    participant Deployment
-    participant Engine as ServiceEngine
+    participant Deploy as DeployEngine
+    participant Image
     participant Service
-    participant Platform as Runtime Platform
+    participant Platform
+    participant Store as Runtime DeploymentStore
 
-    Caller->>Facade: plan()
-    Facade->>Store: load RuntimeState
-    Facade->>Deployment: services(config)
-    Deployment-->>Facade: desired Services
-    Facade->>Engine: plan_services
+    Deploy->>Image: record desired image references
     loop Services in dependency order
-        Engine->>Service: manifests(context)
-        Service-->>Engine: desired manifests
-        Engine->>Engine: hash and compare with recorded state
-    end
-    Engine-->>Facade: Create, Update, or NoChange
-    Facade-->>Caller: service changes
-
-    Caller->>Facade: apply(runtime Platform)
-    Facade->>Store: load RuntimeState and version
-    Facade->>Deployment: images(config)
-    Facade->>Engine: record desired image references
-    Facade->>Deployment: services(config)
-    Facade->>Engine: apply_services
-    loop Services in dependency order
-        Engine->>Service: manifests(context)
-        Service-->>Engine: desired manifests
-        alt Recorded hash matches
-            Engine->>Platform: is_service_current
-            Platform-->>Engine: current or drifted
+        Deploy->>Service: generate deterministic manifests
+        Service-->>Deploy: manifest values
+        Deploy->>Platform: prepare service
+        Deploy->>Deploy: hash manifests and compare RuntimeState
+        opt Desired hash already recorded
+            Deploy->>Platform: is service current?
+            Platform-->>Deploy: current or drifted
         end
-        opt New, changed, or drifted
-            Engine->>Platform: apply_manifests
-            Engine->>Engine: update in-memory RuntimeState
+        alt Create, changed hash, or live drift
+            Deploy->>Platform: apply manifests
+            Platform-->>Deploy: applied
+            Deploy->>Store: save updated RuntimeState with current version
+            Store-->>Deploy: next version
+        else No service change
+            Deploy->>Deploy: retain recorded service state
         end
     end
-    Facade->>Store: save RuntimeState once
-    Store-->>Facade: next version
-    Facade-->>Caller: service changes
+    opt No service save occurred
+        Deploy->>Store: save image recording once
+        Store-->>Deploy: next version
+    end
+    Note over Deploy,Platform: Destroy preflights the whole set, then deletes in reverse order
 ```
 
-Runtime plan performs no live provider check; it compares generated manifest hashes with
-recorded state. Apply performs the live `is_service_current` check even when a hash
-matches and can promote `NoChange` to `Update`.
+`Image::desired_ref` contributes a repository, tag, and optional upstream reference.
+`record_images` currently stores `repository:tag`, source metadata, and a timestamp; its
+digest field remains `None`. Runtime state is therefore not proof that an image was
+built, mirrored, or published.
 
-Unlike infrastructure apply, runtime apply saves once after the complete service loop.
-An interruption can therefore replay services that already succeeded.
-`Platform::apply_manifests` must be idempotent.
+## Two `Ops` traits
 
-`ServiceEngine::destroy_services` first verifies that the runtime platform supports
-deletion, then deletes in reverse service dependency order and removes service state.
-It refuses an unsupported non-empty delete pass before touching any workload.
+Two unrelated traits are named `Ops`:
 
-A platform is not required to use this separate lifecycle. It can model workloads as
-infrastructure `Resource`s when that representation better matches its provider. The
-framework does not impose a universal infrastructure-then-runtime sequence.
+- `tokeira_platform::declaration::Ops` is the definition-backed platform surface. It
+  implements `log_stream`, `port_mappings`, and `scale` over `DeploymentRef { name,
+  dir }`.
+- `tokeira_orchestrator::Ops` is the legacy in-process surface. It owns a `Config`
+  associated type and implements valid-service enumeration, desired replicas,
+  `scale_up`, `scale_down`, `logs`, and `port_mappings` over that config.
 
-## Extension seams
+New platform packages implement the declaration trait when they expose live operations.
+Naming the module with the trait avoids confusing the current and legacy contracts.
 
-The framework exposes a small set of explicit extension points:
+## State seam
 
-| Extension | Implement when | Consumed by |
-|---|---|---|
-| `Resource` | A provider object or bundle needs infrastructure convergence. | `tokeira-iac::Engine` |
-| `Module` | Resources need grouping and module-level ordering. | Infrastructure composition |
-| `Deployment` | A platform must assemble config, objects, contexts, stores, and outputs. | `tokeira-orchestrator` |
-| `Image` | Runtime state needs a desired image reference. | `ServiceEngine::record_images` |
-| `Service` | A workload can be expressed as stable manifests. | `ServiceEngine` |
-| Runtime `Platform` | Manifests need live inspection, apply, or deletion. | `ServiceEngine` |
-| `DeploymentStore<T>` | A platform requires a new state publication mechanism. | Orchestrator facades |
-| `ResourceRecovery` | Removed configuration can leave a state-only resource requiring deletion. | Infrastructure delete paths |
+Both orchestrator facades hold the same generic store contract:
 
-`Deployment` is the central assembly seam. It supplies remote-state and infrastructure
-modules, runtime services and images, extension-registration hooks, both state stores,
-configuration hydration, calculated writeback, and required namespaces.
+```rust
+#[async_trait]
+pub trait DeploymentStore<T>: Send + Sync {
+    async fn load(&self) -> Result<(T, String), StateError>;
+    async fn save(&self, doc: &T, expected_version: &str) -> Result<String, StateError>;
+}
+```
 
-Typed extensions keep provider clients out of framework dependencies. This is deliberate
-inversion of control, not a plugin registry: extension types are compiled platform
-contracts, and a missing required extension is a platform integration error.
+The string is an opaque version. A missing store loads a valid default document and an
+empty version; an empty expected version is create-only. A stale version returns
+`StateError::Conflict`.
+
+Infrastructure saves after every mutation and after confirmed pruning during a
+mutating refresh. Service apply and destroy save after every changed service. The
+framework-standard bound path uses `CasStore` over `LocalBackend` for both documents;
+legacy ECS selects `S3StateStore`. The complete persistence and locking protocols are
+in [State and convergence](state-and-convergence.md).
 
 ## Correctness invariants
 
-The mechanics above rely on several invariants:
-
-- Logical resource IDs and module IDs are stable and unique.
-- The known module set is a superset of desired modules.
-- `describe` reports `Absent` only after a provider confirms nonexistence.
-- `diff` and change-semantics calculation are pure and deterministic.
-- Provider properties and generated manifests are normalized enough to converge to
-  `NoChange` after a successful apply.
-- Creates and updates run dependencies first; deletes run dependents first.
-- A provider mutation is not considered durably recorded until its state save succeeds.
-- Unknown state-only resource types fail closed during deletion.
-- Store implementations reject stale publication and validate at persistence boundaries.
-- Runtime manifest application is idempotent because runtime state is saved after the
-  service loop rather than after each service.
-- Platform-specific clients and behavior remain outside provider-neutral crates.
+- Logical resource IDs, module names, and service names are stable and unique.
+- Known modules contain every desired module.
+- A kind with no real `describe` does not reach a definition-backed plan.
+- `Absent` is returned only after a provider confirms nonexistence.
+- `diff`, `change_semantics`, desired manifests, and service manifests are deterministic.
+- `Replace` is selected by `diff` and executes as two durable transitions.
+- Creates and updates run dependencies first; deletes run dependants first.
+- A state-only resource or service is never forgotten merely because its current
+  definition is missing.
+- Store versions are threaded from the exact document read or save that produced them.
+- Platform clients and behavior remain outside provider-neutral engine crates.
 
 ## Further reading
 
-- [State and convergence](state-and-convergence.md) — state domains, refresh evidence,
-  ordering, persistence, and interruption behavior.
-- [Extending the IaC framework](extending.md) — implementation guidance for resources,
-  modules, platforms, stores, and runtime workloads.
-- [Engineering reference](../agents/engineering-reference.md#iac-engine-contracts) —
-  binding package boundaries and repository recipes.
-- [`tokeira-iac` source](../../crates/tokeira-iac/src/lib.rs) — exact infrastructure
-  contracts and state document types.
-- [`tokeira-state` source](../../crates/tokeira-state/src/lib.rs) — exact persistence
-  interfaces and implementations.
-- [`tokeira-orchestrator` source](../../crates/tokeira-orchestrator/src/lib.rs) — exact
-  platform assembly and facade behavior.
-- [`tokeira-deploy-engine` source](../../crates/tokeira-deploy-engine/src/lib.rs) — exact
-  runtime image and service contracts.
+- [State and convergence](state-and-convergence.md) — refresh evidence, document
+  ownership, CAS publication, snapshots, and operation locks.
+- [Extending the IaC framework](extending.md) — kinds, namespaces, platform
+  declarations, definitions, and provider implementation guidance.
+- [IaC architecture overview](../architecture/120-iac-framework.md) — the full
+  platform-as-description and bound-provisioner shape.
+- [Provisioning](../provisioning/README.md) — deployment creation, revisions,
+  repositories, and the `tkr`/`tkp` boundary.
+- [`tokeira-iac` source](../../crates/tokeira-iac/src/lib.rs) and
+  [engine](../../crates/tokeira-iac/src/engine.rs) — exact infra contracts and
+  algorithms.
+- [`tokeira-deploy-engine` source](../../crates/tokeira-deploy-engine/src/lib.rs) —
+  exact service and image contracts.
+- [`tokeira-orchestrator` source](../../crates/tokeira-orchestrator/src/lib.rs) —
+  adapter and facade contracts.
+- [`tokeira-state` source](../../crates/tokeira-state/src/lib.rs) — persistence
+  implementations.

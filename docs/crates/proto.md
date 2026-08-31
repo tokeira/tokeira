@@ -1,57 +1,55 @@
 # tokeira-proto
 
-Generated protobuf and gRPC bindings for Tokeira, covering both the public Temporal-compatible API surface and internal control-plane packages.
+Ahead-of-time generated protobuf and RPC bindings for the public
+Temporal-compatible API and Tokeira-owned control-plane contracts.
 
-## Dependencies
+## Where it sits
 
-- `tokeira-types` — domain types for conversions
-- External: `prost`, `prost-types`, `tonic`, `serde`, `serde_json`, `thiserror`, `time`, `uuid`
-- No build script: the bindings are generated ahead of time and checked in
-  under `src/generated/` (`upstream/` for the Temporal surface, `tokeira/` for
-  Tokeira's own packages). Regenerate with `cargo run -p proto-sync --
-  generate` after changing the vendored protos or the codegen stack
-  (`tonic-build`, `connectrpc-build`, pinned in `tools/proto-sync`).
+The crate is part of the compatibility edge. It owns wire shapes and service
+metadata, while `tokeira-edge` owns request handling and `tokeira-types` owns
+transport-neutral values.
 
-## Module Structure
+## Surface map
 
-| File | Contents |
+| Module | Contract |
 |---|---|
-| `public.rs` | All 28 `temporal.api.*` packages, service constants, file descriptor set, convenience re-exports |
-| `internal.rs` | `tokeira.internal.runtime.v1` and `tokeira.internal.admin.v1` (currently empty shells), internal file descriptor set |
-| `conversions/mod.rs` | `ProtoConversionError` enum (InvalidUuid, InvalidTaskToken, InvalidTimestamp, MissingField) |
-| `conversions/common.rs` | Wire ↔ domain helpers for payloads, headers, memo, search attributes, task queues, task tokens, timestamps, durations |
+| `public` | Generated `temporal.api.*` packages, public service names, the descriptor set, and embedded OpenAPI documents |
+| `conversions` | Explicit conversions for shared payloads, headers, memo, search attributes, task queues, tokens, timestamps, and durations |
+| `connect` | Preferred Connect, gRPC, and gRPC-Web controller surface using buffa and connect-rust |
+| `internal` | Legacy tonic/prost Tokeira runtime, admin, and controller packages |
+| `compute::v1` | Provider-neutral Worker Compute request and response messages |
+| `compute` constants | Fixed Nexus service, operation, and message-type identifiers for Worker Compute |
 
-## Public API Packages
+## Generation contract
 
-Uses upstream Temporal API protos (v1.62.11) vendored via `tools/proto-sync`. The compatibility smoke target is `temporalio-sdk` v0.4. The `public.rs` module exports all 28 packages under `temporal::api::*::v1`:
+Bindings are checked in under `src/generated/`. A normal crate build does not
+run `protoc` or require the vendored proto tree. `tools/proto-sync` regenerates
+the checked-in output after an intentional proto or code-generator change.
 
-`activity`, `batch`, `callback`, `command`, `common`, `compute`, `deployment`, `enums`, `errordetails`, `export`, `failure`, `filter`, `history`, `namespace`, `nexus`, `operatorservice`, `protocol`, `protometa`, `query`, `replication`, `rules`, `schedule`, `sdk`, `taskqueue`, `update`, `version`, `worker`, `workflow`, `workflowservice`
+The vendored files under `proto/upstream/`, not generated build output, are the
+authority for Temporal wire shape. The compatibility target for observable
+server behaviour is tracked separately by `tokeira-build-info`.
 
-Convenience re-exports: `common`, `enums`, `failure`, `history`, `operatorservice`, `taskqueue`, `workflow`, `workflowservice`.
+## Key invariants
 
-Service constants: `WORKFLOW_SERVICE_NAME` and `OPERATOR_SERVICE_NAME`. The complete public file
-descriptor set drives the HTTP/JSON gateway, and `OPENAPI_V2_JSON` / `OPENAPI_V3_YAML` expose the
-official immutable API v1.62.11 documents without runtime filesystem I/O.
+- Upstream Temporal messages are not extended with Tokeira-owned fields.
+- Wire/domain conversion is explicit; domain crates do not depend on protobuf
+  messages.
+- The public descriptor set drives descriptor-derived HTTP/JSON routing.
+- Controller callers should prefer `connect`; `internal` remains for code that
+  still uses the tonic/prost surface.
+- Worker Compute messages remain provider-neutral; provider execution belongs
+  outside this crate.
 
-## Conversions
+## It does not own
 
-`conversions/common.rs` provides explicit helpers:
+This crate does not validate Temporal behaviour, dispatch RPCs, authorize
+callers, run workflows, or persist state. Generated bindings describe the wire;
+the edge and compatibility crates decide how supported calls are admitted.
 
-- `payload_from_domain` / `payload_to_domain` — `Payload` ↔ proto
-- `payloads_from_domain` / `payloads_to_domain` — `Payloads` ↔ proto
-- `headers_from_domain` / `headers_to_domain` — `Headers` ↔ proto `Header`
-- `memo_from_domain` / `memo_to_domain` — `Memo` ↔ proto
-- `search_attributes_from_domain` / `search_attributes_to_domain` — `SearchAttributes` ↔ proto
-- `task_queue_from_domain` / `task_queue_to_domain` — `TaskQueueName` ↔ proto `TaskQueue`
-- `encode_task_token` / `decode_task_token` — `TaskToken` ↔ opaque bytes (JSON)
-- `workflow_execution_from_ids` — build proto `WorkflowExecution` from IDs
-- `to_proto_timestamp` / `to_opt_proto_timestamp` — `OffsetDateTime` → `prost_types::Timestamp`
-- `to_proto_duration` / `to_opt_proto_duration` — `time::Duration` → `prost_types::Duration`
+## Pointers
 
-## Internal Protos
-
-`tokeira.internal.runtime.v1` and `tokeira.internal.admin.v1` are declared but currently empty. The file descriptor set is available for future reflection use.
-
-## Status
-
-Stable. All 28 upstream Temporal API packages are generated. Conversion helpers cover the types needed by the edge and runtime layers. Dead conversion files (workflow.rs, operator.rs) have been removed.
+- [Crate root](../../crates/tokeira-proto/src/lib.rs)
+- [Vendored upstream protos](../../proto/upstream/)
+- [Compatibility metadata](compatibility.md)
+- [Compatibility edge](edge.md)

@@ -1,79 +1,64 @@
 # tokeira-storage
 
-Storage interfaces and an in-memory development store. Defines the durable persistence contract that the runtime depends on, and provides `InMemoryStore` for tests, examples, and development. No real DSQL implementation yet — the goal is to make contracts explicit first.
+Semantic persistence contracts plus in-memory and feature-gated Aurora DSQL
+implementations. Runtime code depends on repository traits rather than physical
+tables or SQL statements.
 
-## Dependencies
+## Where it sits
 
-- `tokeira-kernel` — `WorkflowState`, `HistoryEvent`, `Transition`, `LoadedRun`, `ActivityState`, `TimerState`
-- `tokeira-types` — identity types, queue keys, tokens
-- External: `anyhow`, `async-trait`, `time`, `tokio`, `tracing`
+The crate is the persistence boundary of the authoritative runtime and storage
+plane. It stores committed workflow history and CHASM node state, enforces
+optimistic and ownership fences, and exposes ordered projection records.
 
-## Module Structure
+## Core contracts
 
-| File | Contents |
+| Area | Representative contracts |
 |---|---|
-| `api.rs` | `RunRepository` trait, `ProjectionLog` trait, `LeaseRepository` trait, `ConnectionDirector` trait, plus all supporting types |
-| `memory.rs` | `InMemoryStore` — full implementation of all repository traits |
+| Workflow authority | `RunRepository`, `CommitResult`, request deduplication, transition audit, reset successor materialization |
+| Ownership | `LeaseRepository`, `ControlRepository`, `BundleLease`, `LeaseOutcome` |
+| Derived work | Dispatchable workflow/activity tasks, durable backlog, timer and timeout sweep records |
+| Projection feed | `ProjectionLog`, `ProjectionRecord`, partitioned `ProjectionCursor` batches |
+| CHASM | `ChasmNodeRepository`, atomic dirty-node batches, `ExpectedVersion`, current-run pointers |
+| Worker control | Deployment, task-queue configuration, provenance, and Worker Compute repository contracts |
+| Connections | `ConnectionDirector`, operation-class `DbClass`, admitted `DbPermit` values |
 
-## RunRepository Trait
+## Implementations
 
-Core storage contract. Key methods:
+`InMemoryStore` implements the workflow repository, projection log, and bundle
+leases for embedded use, examples, and tests. `InMemoryChasmNodeStore` and
+`InMemoryWorkerComputeRepository` cover their corresponding contracts. These
+stores are process-local implementations, not the concurrency reference for a
+cluster.
 
-| Method | Purpose |
-|---|---|
-| `resolve_execution` | Map `ExecutionRef` → `RunKey` (current open run lookup) |
-| `find_latest_run` | Resolve closed workflows by namespace + workflow_id |
-| `load_run` | Load `LoadedRun` (Absent or Existing with full `WorkflowState`) |
-| `read_history` | Paginated history read (after_event_id, limit) |
-| `lookup_request_dedupe` | Check if a request ID was already applied |
-| `read_transition_audit` | Read transition audit log for a run |
-| `commit_transition` | Fenced commit: OCC check on `TransitionSeq`, epoch validation on `ShardEpoch` |
-| `materialize_reset_successor` | Create a new run by replaying a history prefix up to a fork point |
-| `list_dispatchable_workflow_tasks` | Queue-scoped query for pending WFTs |
-| `list_dispatchable_activity_tasks` | Queue-scoped query for pending activity tasks |
-| `persist_to_backlog` / `drain_backlog` | Durable backlog for overflow dispatch |
-| `list_due_timers` | Global timer scan |
-| `list_*_for_shard` | Six shard-filtered sweep queries: workflow tasks, activity tasks, timers, workflow timeouts, open activities, pending Nexus operations |
+With the `dsql` feature, the crate provides the production Aurora DSQL
+foundation: migration and schema checks, IAM-authenticated connection
+management, operation-class admission, `DsqlRunRepository`,
+`DsqlProjectionLog`, `DsqlChasmNodeRepository`, and Worker Compute
+persistence.
 
-## Supporting Types
+## Invariants
 
-- `CommitResult` — `Applied { transition_seq, last_event_id, execution_status, new_run_id }` or `Conflict`
-- `DispatchableWorkflowTask` / `DispatchableActivityTask` — task descriptors for broker dispatch
-- `BacklogEntry` / `BacklogPayload` — durable overflow entries
-- `DueTimer`, `WorkflowTimeoutSweepEntry`, `ActivitySweepEntry`, `NexusSweepEntry` — sweep query results
-- `CurrentExecutionConflictPolicy` — `Reject` (default) or `AllowAfterClose`
-- `ProjectionRecord`, `ProjectionContext`, `ProjectionBatch` — projection log types
-- `RequestRecord`, `TransitionAuditRecord` — dedup and audit types
+- Workflow commits are fenced by the expected transition sequence and shard
+  ownership epoch.
+- History, state, deduplication, audit, and the versioned projection record for a
+  transition commit atomically.
+- CHASM dirty-node batches apply all-or-nothing after every node precondition is
+  checked; conflicts never force-overwrite newer state.
+- Projection records are ordered inputs to a rebuildable read model, not
+  authoritative workflow state.
+- Storage implements persistence mechanics; transition correctness remains in
+  the kernel or CHASM substrate.
 
-## ProjectionLog Trait
+## It does not own
 
-- `read_from(cursor, limit)` → `ProjectionBatch` — ordered log consumption for the projection worker
+The crate does not choose when to run transitions, execute broker delivery,
+shape public API errors, or interpret visibility filters. The DSQL visibility
+store lives in `tokeira-projection`, which owns projection semantics.
 
-## LeaseRepository Trait
+## Pointers
 
-- `try_acquire_bundle(shard_id, owner)` → `LeaseOutcome` — shard lease acquisition with epoch bumping
-- `renew_bundle(shard_id, owner, epoch)` → `LeaseOutcome` — lease renewal with epoch fencing
-
-## ConnectionDirector Trait
-
-- `acquire(DbClass)` → `DbPermit` — connection admission control (placeholder for DSQL reservoir)
-
-## InMemoryStore
-
-Full implementation of `RunRepository`, `ProjectionLog`, `LeaseRepository`, and `ConnectionDirector`. Features:
-
-- OCC fencing with `inject_conflict()` for test scenarios
-- Configurable `CurrentExecutionConflictPolicy` (Reject or AllowAfterClose)
-- Deterministic shard assignment via `run_key % shard_count`
-- Epoch validation on `commit_transition`
-- History append with pagination support
-- Independent activity state (with `started_event_id`) and timer bucket tables
-- Activity task dispatch tracking
-- Projection log with partition/fanout
-- Lease management with epoch fencing
-- Request dedup persistence
-- Transition audit log
-
-## Tests
-
-21 property and unit tests in `memory.rs` covering OCC conflicts, backlog ordering, reset materialisation, conflict policies, timer bucketing, and sweep queries.
+- [Crate root](../../crates/tokeira-storage/src/lib.rs)
+- [Storage-specific contract](../../crates/tokeira-storage/AGENTS.md)
+- [DSQL module](../../crates/tokeira-storage/src/dsql/mod.rs)
+- [Runtime](runtime.md)
+- [Projection](projection.md)

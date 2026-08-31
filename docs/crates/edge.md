@@ -1,84 +1,58 @@
 # tokeira-edge
 
-Public API compatibility shell for Tokeira. This crate admits and translates requests but does not implement durable workflow semantics. If a change would alter workflow history ordering, retry semantics, timer behavior, or task durability, it belongs in kernel, runtime, or storage instead.
+Temporal-compatible public API boundary. The crate admits, authenticates,
+validates, routes, and translates requests, then shapes lower-layer results back
+onto the wire.
 
-## Dependencies
+## Where it sits
 
-- `tokeira-kernel` — command types, history events
-- `tokeira-proto` — generated protobuf bindings
-- `tokeira-runtime` — runtime API types (`StartedWorkflowTask`, `StartedActivityTask`, `UpdateOutcome`, etc.)
-- `tokeira-storage` — `RunRepository` for history reads
-- `tokeira-types` — identity types, tokens, queue keys
-- External: `anyhow`, `async-trait`, `http`, `prost`, `prost-reflect`, `prost-types`, `serde`, `serde_json`, `thiserror`, `time`, `tokio`, `tonic`, `tracing`, `uuid`
+This is the outer compatibility-edge crate. Observable API behaviour is pinned
+to the targeted Temporal server release. Durable workflow and activity meaning
+belongs to the authoritative runtime and storage plane.
 
-## Module Structure
+## Request path
 
-| File | Contents |
+`grpc` and `http_api` decode transport requests and call domain services in
+`workflow_service` and `operator_service`. `interceptors` applies
+authentication, authorization, and request metadata. `namespace_cache` resolves
+names, `routing` and `routing_cache` forward non-local work, and `translate`
+converts between wire and domain types. `EdgeError` is the shared boundary for
+consistent status mapping.
+
+## Key surfaces
+
+| Area | Representative contracts |
 |---|---|
-| `workflow_service.rs` | `WorkflowService` struct, `WorkflowRuntimeApi` trait, `ExecutionResolver` trait, `VisibilityApi` trait, all RPC handler methods |
-| `operator_service.rs` | `OperatorService` struct, `OperatorApi` trait, `InMemoryOperatorApi`, `ClusterInfo`, `SearchAttributeDefinition` |
-| `health_service.rs` | gRPC health check endpoints |
-| `interceptors.rs` | Authn/authz middleware, `Action` enum for all RPC types |
-| `namespace_cache.rs` | Namespace name → ID resolution, `NamespaceCache` trait, `ResolvedNamespace` |
-| `poller_registry.rs` | `PollerRegistry` for tracking active pollers per queue, RAII `PollerGuard` |
-| `history_wait.rs` | `HistoryWaitRegistry` for long-poll notifications via watch channels, `HistoryNotifyingRepository` wrapper |
-| `long_poll.rs` | `LongPollGate` — semaphore-based admission control (default 10k concurrent) |
-| `http_api/` | Descriptor-derived Temporal HTTP routes, ProtoJSON/payload shorthand, Host/header policy, request transcoding, and response/status rendering |
-| `request_id.rs` | Request ID assignment and propagation |
-| `routing.rs` | `EdgeRouter` trait, execution-home and queue-home routing |
-| `errors.rs` | `EdgeError` enum with status codes and action names |
-| `translate/mod.rs` | All edge-facing DTO types (30+ request/response structs) |
-| `translate/to_internal.rs` | Proto/edge → kernel command translation |
-| `translate/from_internal.rs` | Kernel/runtime → proto/edge response translation |
-| `translate/history_serializer.rs` | History event serialization with `ActivityTaskStarted` support |
-| `grpc/` | gRPC server setup: `workflow_service.rs`, `operator_service.rs`, `runtime_adapter.rs`, `translate.rs`, `errors.rs`, `metadata.rs` |
+| Public services | `WorkflowService`, `OperatorService`, tonic adapters, in-process gRPC service |
+| Admission | `EdgeInterceptors`, `Action`, scoped Worker sessions, request IDs |
+| Routing | `EdgeRouter`, `CacheBackedRouter`, `RoutingCache`, namespace resolution |
+| Long polls | `LongPollGate`, `HistoryWaitRegistry`, `HistoryNotifyingRepository`, `PollerRegistry` |
+| Translation | Request/response DTOs, command conversion, history serialization, status conversion |
+| Additional surfaces | Schedule APIs, batch driver, Nexus endpoints and callbacks, standalone-activity bridge, Workflow Rules |
+| Conformance | Wire-coverage and functional-conformance reporting types |
 
-## Implemented RPC Handlers
+## Contracts
 
-### WorkflowService
+- Every public call passes through the admission and authorization seam.
+- Blocking calls return before the caller's deadline; the edge supplies wait
+  primitives rather than making the runtime block.
+- Routing chooses where to send a request but never grants shard ownership.
+- The standalone-activity bridge translates Activity Execution RPCs into CHASM
+  calls; `tokeira-chasm-activity` owns the activity state machine.
+- Visibility list, count, and describe results come from the projection plane.
+- HTTP/JSON, gRPC, gRPC-Web, and in-process calls converge on the same service
+  handlers.
 
-| RPC | Status |
-|---|---|
-| `StartWorkflowExecution` | ✅ |
-| `SignalWorkflowExecution` | ✅ |
-| `SignalWithStartWorkflowExecution` | ✅ |
-| `PollWorkflowTaskQueue` | ✅ |
-| `RespondWorkflowTaskCompleted` | ✅ |
-| `PollActivityTaskQueue` | ✅ |
-| `RespondActivityTaskCompleted` | ✅ |
-| `RespondActivityTaskFailed` | ✅ |
-| `RecordActivityTaskHeartbeat` | ✅ |
-| `TerminateWorkflowExecution` | ✅ |
-| `RequestCancelWorkflowExecution` | ✅ |
-| `QueryWorkflow` | ✅ |
-| `UpdateWorkflowExecution` | ✅ |
-| `DescribeWorkflowExecution` | ✅ |
-| `GetWorkflowExecutionHistory` | ✅ (with long-poll via watch channels, close-event filter) |
-| `GetWorkflowExecutionHistoryReverse` | ✅ |
-| `ListWorkflowExecutions` | ✅ (delegates to VisibilityApi) |
-| `CountWorkflowExecutions` | ✅ (delegates to VisibilityApi) |
-| `DeleteWorkflowExecution` | ✅ |
-| `ResetWorkflowExecution` | ✅ |
-| `GetSystemInfo` | ✅ |
-| `GetClusterInfo` | ✅ |
-| `ListNamespaces` | ✅ |
-| `DescribeNamespace` | ✅ |
-| `RegisterNamespace` | ✅ |
-| `DescribeTaskQueue` | ✅ (returns active pollers from registry) |
+## It does not own
 
-### OperatorService
+The edge does not decide history ordering, retries, timers, workflow task
+durability, CHASM transitions, schedules, or visibility materialization. It also
+does not define protobuf messages or compatibility policy.
 
-- `ClusterInfo` — cluster name, version, notes
-- `ListSearchAttributes` / `UpsertSearchAttribute` / `RemoveSearchAttribute` — namespace-scoped SA registry
+## Pointers
 
-## Key Features
-
-- **Long-poll for GetWorkflowExecutionHistory** — `HistoryWaitRegistry` uses `tokio::sync::watch` channels to notify waiters when new events are committed
-- **HistoryNotifyingRepository** — wraps `RunRepository` to automatically notify history waiters on `commit_transition` and `materialize_reset_successor`
-- **PollerRegistry** — tracks active pollers per queue with RAII guards for automatic cleanup
-- **Close-event filter** — `history_event_filter_type` support for `get_result()` style calls
-- **Temporal HTTP/JSON API** — `google.api.http` bindings discovered from the pinned descriptor set and dispatched through the existing Tonic service stack
-
-## Tests
-
-15 unit tests + 1 integration test.
+- [Crate rustdoc source](../../crates/tokeira-edge/src/lib.rs)
+- [Authentication and authorization](auth.md)
+- [Compatibility metadata](compatibility.md)
+- [Runtime](runtime.md)
+- [Projection](projection.md)

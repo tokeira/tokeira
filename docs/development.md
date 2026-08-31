@@ -75,7 +75,8 @@ docs/         architecture · adr · platforms · conformance · readiness · te
 ```
 
 The workspace `Cargo.toml` member list is authoritative; this is orientation.
-The engine's seven core crates are documented in [docs/crates/](crates/README.md).
+Every published engine and supporting crate is documented in
+[docs/crates/](crates/README.md).
 
 ## See also
 

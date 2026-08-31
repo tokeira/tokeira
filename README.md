@@ -87,9 +87,14 @@ minutes each on first run:
 cd tokeira
 cargo install --locked --path apps/tkr
 tkr deployment create --name dev --platform compose --dev-engine
+tkr image build
 tkr infra apply --yes
 tkr deploy apply --yes
 ```
+
+`tkr image build` builds the `tokeirad` container image from source in a
+hermetic, checksum-pinned build engine that it provisions itself — the one
+step here that downloads a sizeable artifact on first run.
 
 `tokeirad` is now serving the Temporal gRPC surface on `localhost:7233`, and
 Grafana is on `localhost:3000` (`admin` / `admin`) with the provisioned

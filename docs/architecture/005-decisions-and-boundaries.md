@@ -11,25 +11,39 @@ This document is the **ground-truth record** of resolved architectural decisions
 
 ## Temporal Compatibility Boundary
 
+The measured evidence behind this boundary is the v0.1.0 release gate:
+[corpus-evidence](../readiness/corpus-evidence.md) records the full v1.31.0
+functional-conformance run — 64 test-bearing entrypoints, 1,261 pass outcomes,
+0 failures — with every exclusion cited by name. This section states the
+boundary; that report is the measurement behind it.
+
 ### Preserved
 
 Tokeira preserves the following Temporal semantics and wire-level behaviors:
 
-- Temporal SDK wire protocol (gRPC `WorkflowService`)
+- Temporal SDK wire protocol (gRPC `WorkflowService` and `OperatorService`, plus the HTTP API)
 - Workflow determinism semantics
 - History event ordering
 - Task token semantics
-- Signal / query / update delivery
+- Signal / query / update delivery (including workflow update and update-with-start)
 - Activity heartbeat
 - Retry policies
 - Continue-as-new chains
 - Child workflows
 - Timers
-- Cancellation
-- Termination
-- Search attributes
-- Memo
-- Visibility queries
+- Cancellation and termination
+- Workflow reset
+- Eager workflow start
+- Search attributes, memo, and user metadata
+- Visibility queries (SQL-native advanced visibility)
+- Schedules
+- Batch operations
+- Standalone activities and the activity-control APIs
+- Worker deployments and versioning v3
+- Task priority and fairness
+- Nexus endpoints, API, and workflow-driven operations
+- Workflow completion callbacks
+- Links
 
 ### Changed
 
@@ -41,21 +55,35 @@ Tokeira changes the following internal implementation details:
 - **No partitioned task queues** — single logical queue per name
 - **Connection management** — reservoir pattern for DSQL with distributed rate limiting
 
+### Deliberate deviations
+
+Chosen divergences from Temporal's internal representations, stated so they are
+not mistaken for oversights. The externally observable contract is preserved in
+each case:
+
+- **Nexus callback tokens** — an opaque versioned token plus operation fencing instead of Temporal's internal callback-token wire format; the observable async-completion contract is unchanged
+- **Schedules** — a native schedule engine rather than an internal scheduler workflow; there is no `temporal-sys-scheduler` execution to signal or inspect
+- **Task matching** — one runtime-owned delivery broker; no classic / priority / fairness matcher modes and no migration topology between them
+
 ### Not supported (documented)
 
-The following are explicitly out of scope or deferred:
+The following are explicitly out of scope:
 
-- Multi-cluster replication
-- Archival (deferred)
+- **Dynamic configuration injection** — operational limits are pinned-release constants; there is no dynamic-config surface to override them at runtime
+- **`AdminService` and internal service RPCs** — `DescribeMutableState`, `CloseShard`, Matching internals, and similar in-process surfaces are beyond the public claim
+- **Worker versioning v1/v2** — version sets, rules, reachability, and Build-ID scavenging; the stock-default `PERMISSION_DENIED` responses are preserved, and v3 is the supported path
+- **CHASM components other than standalone activities** — the scheduler and callback CHASM modes are non-default at v1.31.0 and excluded
+- **Raw history mode** (`SendRawWorkflowHistory`)
+- **Multi-cluster replication**
+- **Archival** (deferred)
 
-### In progress
+### Tracked gaps
 
-The following are actively being implemented:
+Deferred and tracked, distinct from out-of-scope:
 
-- Schedules (execution engine and 7 gRPC handlers)
-- Batch operations (4 gRPC handlers)
-- Nexus (task transport — 3 gRPC handlers; full routing parity with Temporal is the goal)
-- Advanced visibility (SQL-native on DSQL — no Elasticsearch dependency)
+- Inbound async Nexus completion callbacks (callback URL delivery and invocation on handler-workflow close)
+- The `__temporal_system` internal Nexus endpoint
+- Callback lifecycle state in `DescribeWorkflowExecution` (the fields are currently empty)
 
 ---
 

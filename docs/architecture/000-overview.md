@@ -5,7 +5,7 @@
 
 ## Intent
 
-**Tokeira** is a Temporal-compatible durable execution engine implemented in Rust and specialized for **Aurora DSQL**. The design goal is to preserve the public Temporal contract that SDKs, operators, and tooling care about, while changing the internal architecture enough to make ordering, delivery, and persistence materially simpler and more efficient.
+**Tokeira** is a Temporal-compatible durable execution engine implemented in Rust and specialized for **Aurora DSQL**. The design goal is to preserve the public Temporal contract that SDKs, operators, and tooling care about, while changing the internal architecture enough to make ordering, delivery, and persistence materially simpler and more efficient, whether Tokeira runs as a standalone service or embedded inside a host process.
 
 This repo is **not** aiming for a service-by-service port of Temporal’s current Frontend / History / Matching / Worker layout. Temporal documents that server layout today, but it also documents a more important truth for this redesign: a single Task Queue can contain work for many Workflow Executions, task ordering on partitioned queues is not the same thing as workflow event ordering, and the Worker Service exists to run internal background Workflows rather than user code.[^temporal-server][^matching][^task-queue][^event-history] Workflow durability comes from event history, while queue delivery is an implementation detail with weaker ordering guarantees.
 
@@ -45,6 +45,8 @@ Aurora DSQL makes this redesign even more attractive. AWS documents a fixed Post
 ## Proposed system shape
 
 Tokeira is organized into **three core planes**, **five primary crates**, and a small set of **operational services**.
+
+These planes describe the engine, not a process topology. Tokeira ships in two shapes built from the same planes: **`tokeirad`**, a standalone Temporal-compatible service fronted by gRPC, and **embedded Tokeira**, where the engine lives inside a host Rust process and the Temporal SDK reaches the compatibility edge over an in-memory duplex instead of a TCP listener. Embedded deployments can begin with in-memory storage and snapshots and move to Aurora DSQL without changing the execution model. Everything below applies to both shapes.
 
 ### Plane 1: Compatibility edge
 

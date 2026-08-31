@@ -1,0 +1,239 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1620" viewBox="0 0 2400 1620">
+<defs>
+  <linearGradient id="ctrl" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ecfeff"/><stop offset="1" stop-color="#EDF1F3"/></linearGradient>
+  <linearGradient id="auto" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff7ed"/><stop offset="1" stop-color="#F7F0DC"/></linearGradient>
+  <linearGradient id="infra" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#FBF9F5"/></linearGradient>
+  <marker id="arr_cyan" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#0B7285"/></marker>
+  <marker id="arr_gray" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#8A8378"/></marker>
+  <style>
+    .subtitle { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 18px; font-weight: 520; fill:#5C564E; }
+    .section { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 14px; font-weight: 900; fill:#6E6860; letter-spacing:2.2px; }
+    .subhead { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 15px; font-weight: 850; fill:#1B1714; }
+    .micro { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 12px; font-weight: 620; fill:#6E6860; }
+    .num { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 13px; font-weight: 900; fill:#FFFFFF; }
+    .code { font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 12px; font-weight: 650; fill:#4A443C; }
+    .chip { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 11px; font-weight: 750; fill:#8A6A14; }
+    .flowlabel { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 11px; font-weight: 700; fill:#6E6860; }
+  </style>
+</defs>
+<rect x="0" y="0" width="2400" height="1620" fill="#F6F3EE"/>
+
+<text x="70" y="24" font-family="'SF Mono',Menlo,monospace" font-size="14" letter-spacing="3" fill="#9A4A2C">TOKEIRA &#183; PROVISIONING</text>
+<text x="70" y="60" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif" font-size="34" font-weight="700" fill="#1B1714">One deployment, two processes</text>
+<text x="70" y="94" class="subtitle">tkr forwards every bound lifecycle verb to the deployment&#8217;s own tkp. The definition set in the deployment directory is the desired source,</text>
+<text x="70" y="120" class="subtitle">and every mutation walks one gate spine.</text>
+
+<rect x="1720" y="26" width="610" height="100" rx="18" fill="#FFFFFF" stroke="#D8D2C8" stroke-width="1.2"/>
+<text x="1746" y="52" class="subhead">Flow key</text>
+<path d="M1750,74 L1810,74" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<text x="1822" y="78" class="flowlabel">forwarded command</text>
+<path d="M1750,102 L1810,102" fill="none" stroke="#8A8378" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_gray)"/>
+<text x="1822" y="106" class="flowlabel">report / exit status (inherited stdio)</text>
+<circle cx="2010" cy="70" r="9" fill="#B08D2E"/>
+<text x="2028" y="75" class="flowlabel">a numbered gate can refuse</text>
+
+<!-- COL 1: OPERATOR -->
+<text x="70" y="188" class="section">OPERATOR &#8212; TWO KINDS OF EDIT</text>
+<rect x="70" y="206" width="600" height="850" rx="26" fill="url(#ctrl)" stroke="#BCD6DB" stroke-width="2"/>
+
+<rect x="100" y="246" width="540" height="250" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<rect x="100" y="246" width="6" height="250" rx="3" fill="#0B7285"/>
+<text x="130" y="280" class="subhead">Definition edit</text>
+<text x="130" y="308" class="micro">
+<tspan x="130" dy="0">edit deployment.tkd, a companion part, or platform</tspan>
+<tspan x="130" dy="20">content &#8212; in place, in the deployment directory</tspan>
+</text>
+<text x="130" y="366" class="code">
+<tspan x="130" dy="0">tkr definition check</tspan>
+<tspan x="130" dy="24">tkr infra plan</tspan>
+<tspan x="130" dy="24">tkr infra apply</tspan>
+</text>
+<text x="130" y="466" class="micro">the edit becomes config revision N+1 on apply</text>
+
+<rect x="100" y="526" width="540" height="210" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<rect x="100" y="526" width="6" height="210" rx="3" fill="#B85C38"/>
+<text x="130" y="560" class="subhead">Service manifest edit</text>
+<text x="130" y="588" class="micro">
+<tspan x="130" dy="0">the workload plane, over the same definition&#8217;s</tspan>
+<tspan x="130" dy="20">service nodes</tspan>
+</text>
+<text x="130" y="648" class="code">
+<tspan x="130" dy="0">tkr deploy plan</tspan>
+<tspan x="130" dy="24">tkr deploy apply</tspan>
+</text>
+<text x="130" y="716" class="micro">a workload apply advances the revision too</text>
+
+<rect x="100" y="766" width="540" height="250" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<rect x="100" y="766" width="6" height="250" rx="3" fill="#2F7D4F"/>
+<text x="130" y="800" class="subhead">Operate</text>
+<text x="130" y="832" class="code">
+<tspan x="130" dy="0">tkr scale up tokeirad 2</tspan>
+<tspan x="130" dy="24">tkr logs tokeirad --follow</tspan>
+<tspan x="130" dy="24">tkr port-forward grafana</tspan>
+<tspan x="130" dy="24">tkr deployment describe</tspan>
+</text>
+<text x="130" y="960" class="micro">
+<tspan x="130" dy="0">scale takes &lt;dimension&gt;=&lt;count&gt; specs the</tspan>
+<tspan x="130" dy="20">platform interprets</tspan>
+</text>
+
+<rect x="70" y="1096" width="600" height="130" rx="18" fill="#FFFFFF" stroke="#D8D2C8" stroke-width="1.2"/>
+<text x="100" y="1130" class="subhead">Authoring aside</text>
+<text x="100" y="1158" class="micro">
+<tspan x="100" dy="0">tkr definition check --definition &lt;path&gt; is a platform-free</tspan>
+<tspan x="100" dy="20">syntax tier that never launches tkp; the full check runs</tspan>
+<tspan x="100" dy="20">against the deployment</tspan>
+</text>
+
+<!-- COL 2: TKR -->
+<text x="740" y="188" class="section">TKR &#8212; LAUNCH AUTHORITY</text>
+<rect x="740" y="206" width="640" height="850" rx="26" fill="url(#infra)" stroke="#D8D2C8" stroke-width="2"/>
+
+<rect x="770" y="246" width="580" height="180" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<text x="800" y="280" class="subhead">Route by record, not file presence</text>
+<text x="800" y="308" class="micro">
+<tspan x="800" dy="0">metadata.json&#8217;s definition record decides:</tspan>
+<tspan x="800" dy="20">bound &#8658; forward to the deployment&#8217;s own tkp;</tspan>
+<tspan x="800" dy="20">legacy local &#8658; in-process handlers</tspan>
+<tspan x="800" dy="26">a bound deployment can never silently fall</tspan>
+<tspan x="800" dy="20">through to a legacy handler</tspan>
+</text>
+
+<rect x="770" y="456" width="580" height="310" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<text x="800" y="490" class="subhead">The launcher gate</text>
+<text x="800" y="518" class="micro">
+<tspan x="800" dy="0">resolve &lt;dir&gt;/tkp &#8212; the engine bound at creation,</tspan>
+<tspan x="800" dy="20">never PATH and never a workspace build</tspan>
+<tspan x="800" dy="26">classify the verb: read-only &#183; bound mutation &#183;</tspan>
+<tspan x="800" dy="20">dev candidate &#183; rollback</tspan>
+<tspan x="800" dy="26">a bound mutation re-hashes the binary against the</tspan>
+<tspan x="800" dy="20">envelope&#8217;s integrity manifest for this host target</tspan>
+<tspan x="800" dy="26">spawn with inherited stdio; the tkp exit status</tspan>
+<tspan x="800" dy="20">propagates verbatim</tspan>
+</text>
+
+<rect x="770" y="796" width="580" height="220" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<text x="800" y="830" class="subhead">One argv shape</text>
+<text x="800" y="860" class="code">
+<tspan x="800" dy="0">&lt;dir&gt;/tkp &lt;verb&#8230;&gt;</tspan>
+<tspan x="800" dy="24">  --deployment-dir &lt;dir&gt; [--yes]</tspan>
+<tspan x="800" dy="24">  [--module M] [--explanation P]</tspan>
+</text>
+<text x="800" y="960" class="micro">
+<tspan x="800" dy="0">--yes must cross the boundary: the destructive</tspan>
+<tspan x="800" dy="20">gate lives in tkp, not in tkr</tspan>
+</text>
+
+<!-- BYPASSES under col 2 -->
+<rect x="740" y="1096" width="640" height="452" rx="18" fill="#FFFFFF" stroke="#D8D2C8" stroke-width="1.2"/>
+<text x="770" y="1130" class="subhead">Around the spine</text>
+<rect x="770" y="1150" width="580" height="110" rx="12" fill="#F4F8F5" stroke="#DDEEE2" stroke-width="1"/>
+<text x="796" y="1180" class="subhead" fill="#2F7D4F">Read-only bypass</text>
+<text x="796" y="1206" class="micro">
+<tspan x="796" dy="0">plan &#183; describe &#183; logs &#183; port-mappings &#183; definition check</tspan>
+<tspan x="796" dy="20">run with no lock and no gates</tspan>
+</text>
+<rect x="770" y="1276" width="580" height="130" rx="12" fill="#FBF4EF" stroke="#EBD9CC" stroke-width="1"/>
+<text x="796" y="1306" class="subhead" fill="#B85C38">The deploy plane differs</text>
+<text x="796" y="1332" class="micro">
+<tspan x="796" dy="0">its destructive gate counts service deletes; there is</tspan>
+<tspan x="796" dy="20">no writeback, no publication, and no explanation</tspan>
+<tspan x="796" dy="20">model on the workload verbs</tspan>
+</text>
+<rect x="770" y="1422" width="580" height="106" rx="12" fill="#F2F5F8" stroke="#D9E3EB" stroke-width="1"/>
+<text x="796" y="1452" class="subhead" fill="#33586E">revert --to N</text>
+<text x="796" y="1478" class="micro">
+<tspan x="796" dy="0">restores revision N and commits it as a new forward</tspan>
+<tspan x="796" dy="20">revision &#8212; history only moves forward</tspan>
+</text>
+
+<!-- COL 3: TKP SPINE -->
+<text x="1450" y="188" class="section">TKP &#8212; THE GATE SPINE OF A MUTATION</text>
+<rect x="1450" y="206" width="880" height="1342" rx="26" fill="url(#auto)" stroke="#E3D5B7" stroke-width="2"/>
+
+<rect x="1490" y="242" width="800" height="102" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="270" r="12" fill="#B08D2E"/><text x="1518" y="275" class="num" text-anchor="middle">1</text>
+<text x="1540" y="275" class="subhead">Admission &#8212; before the lock</text>
+<text x="1516" y="300" class="micro">
+<tspan x="1516" dy="0">the deployment&#8217;s recorded platform and format must equal the pair this</tspan>
+<tspan x="1516" dy="18">binary was built as; a foreign deployment is refused before any state read</tspan>
+</text>
+
+<rect x="1490" y="356" width="800" height="84" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="384" r="12" fill="#B08D2E"/><text x="1518" y="389" class="num" text-anchor="middle">2</text>
+<text x="1540" y="389" class="subhead">Operation lease &#8212; state/lock/</text>
+<text x="1516" y="414" class="micro">one renewable lease per complete transition</text>
+
+<rect x="1490" y="452" width="800" height="84" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="480" r="12" fill="#B08D2E"/><text x="1518" y="485" class="num" text-anchor="middle">3</text>
+<text x="1540" y="485" class="subhead">Marker gate</text>
+<text x="1516" y="510" class="micro">an open upgrade or rollback marker refuses every other verb until resolved</text>
+
+<rect x="1490" y="548" width="800" height="84" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="576" r="12" fill="#B08D2E"/><text x="1518" y="581" class="num" text-anchor="middle">4</text>
+<text x="1540" y="581" class="subhead">Binding gate</text>
+<text x="1516" y="606" class="micro">the running engine vs the recorded binding &#8212; source-tree hash, never semver</text>
+
+<rect x="1490" y="644" width="800" height="102" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="672" r="12" fill="#B08D2E"/><text x="1518" y="677" class="num" text-anchor="middle">5</text>
+<text x="1540" y="677" class="subhead">Retarget gate</text>
+<text x="1516" y="702" class="micro">
+<tspan x="1516" dy="0">the retained prior revision vs the live source: a changed create-time field</tspan>
+<tspan x="1516" dy="18">(#[create] / @create) refuses absolutely, naming each field</tspan>
+</text>
+
+<rect x="1490" y="758" width="800" height="84" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="786" r="12" fill="#B08D2E"/><text x="1518" y="791" class="num" text-anchor="middle">6</text>
+<text x="1540" y="791" class="subhead">Destructive gate</text>
+<text x="1516" y="816" class="micro">deletes and replacements need --yes, each named with its remedy</text>
+
+<rect x="1490" y="854" width="800" height="102" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="882" r="12" fill="#2F7D4F"/><text x="1518" y="887" class="num" text-anchor="middle">7</text>
+<text x="1540" y="887" class="subhead">Probe, then mutate</text>
+<text x="1516" y="912" class="micro">
+<tspan x="1516" dy="0">the platform probe refuses on issue; then the engine reconciles &#8212;</tspan>
+<tspan x="1516" dy="18">infra resources, or service manifests on the deploy plane</tspan>
+</text>
+
+<rect x="1490" y="968" width="800" height="84" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="996" r="12" fill="#2F7D4F"/><text x="1518" y="1001" class="num" text-anchor="middle">8</text>
+<text x="1540" y="1001" class="subhead">Writeback</text>
+<text x="1516" y="1026" class="micro">resolved provisioning outputs merge into tokeirad.toml (infra apply)</text>
+
+<rect x="1490" y="1064" width="800" height="102" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="1092" r="12" fill="#2F7D4F"/><text x="1518" y="1097" class="num" text-anchor="middle">9</text>
+<text x="1540" y="1097" class="subhead">Envelope CAS commit</text>
+<text x="1516" y="1122" class="micro">
+<tspan x="1516" dy="0">config revision N+1; the post-writeback source set is retained at</tspan>
+<tspan x="1516" dy="18">state/config-revisions/N+1/ &#8212; this save is the authoritative commit</tspan>
+</text>
+
+<rect x="1490" y="1178" width="800" height="102" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="1206" r="12" fill="#33586E"/><text x="1518" y="1211" class="num" text-anchor="middle">10</text>
+<text x="1540" y="1211" class="subhead">Post-commit publication</text>
+<text x="1516" y="1236" class="micro">
+<tspan x="1516" dy="0">apply &#183; revert &#183; upgrade publish their transition to the deployment repository;</tspan>
+<tspan x="1516" dy="18">a failure is pending, never an unwind &#8212; completed by tkr deployment publish</tspan>
+</text>
+
+<rect x="1490" y="1292" width="800" height="84" rx="12" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.2"/>
+<circle cx="1518" cy="1320" r="12" fill="#33586E"/><text x="1518" y="1325" class="num" text-anchor="middle">11</text>
+<text x="1540" y="1325" class="subhead">Explanation retained</text>
+<text x="1516" y="1350" class="micro">explanation.json beside the retained revision (infra apply)</text>
+
+<rect x="1490" y="1394" width="800" height="120" rx="12" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1.2"/>
+<text x="1516" y="1428" class="subhead" fill="#8A6A14">The revision ledger</text>
+<text x="1516" y="1454" class="micro">
+<tspan x="1516" dy="0">state/config-revisions/&lt;N&gt;/ holds every committed source set; the retarget</tspan>
+<tspan x="1516" dy="20">gate&#8217;s &#8220;prior&#8221; and rollback&#8217;s baseline both read from here, never before-images</tspan>
+</text>
+
+<!-- Arrows -->
+<path d="M640,370 L740,340" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M640,630 L740,600" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M640,890 L740,890" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M1380,620 L1450,620" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<text x="1352" y="600" class="flowlabel">spawn</text>
+<path d="M1450,940 L1380,940" fill="none" stroke="#8A8378" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_gray)"/>
+<path d="M740,980 L670,980" fill="none" stroke="#8A8378" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_gray)"/>
+</svg>

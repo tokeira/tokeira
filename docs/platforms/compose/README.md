@@ -127,6 +127,35 @@ tkr --deployment dev-compose infra destroy --yes
 infrastructure second, and local records only after both live-plane operations succeed.
 A failure retains the deployment directory and state so teardown can be retried.
 
+## Browsing the running deployment
+
+The applied stack publishes its ports on the host: `tokeirad` serves the
+Temporal gRPC surface on `localhost:7233` and its metrics on `localhost:9090`;
+Grafana is on `localhost:3000` with the provisioned Tokeira dashboard folder
+(`admin` / `admin` by the shipped definition's default — override
+`admin_password` in the deployment configuration). `tkr port-forward SERVICE`
+reports the live mappings.
+
+Temporal's own Web UI can browse the running engine directly:
+
+```bash
+docker run --rm -it \
+  --name tokeira-ui \
+  -p 8080:8080 \
+  -e TEMPORAL_ADDRESS=host.docker.internal:7233 \
+  -e TEMPORAL_UI_PORT=8080 \
+  -e TEMPORAL_DEFAULT_NAMESPACE=default \
+  temporalio/ui:latest
+```
+
+To put traffic on both, the workspace bench pair fires durable executions at
+the running engine:
+
+```bash
+cargo run -p tokeira-bench --bin bench-worker &
+cargo run -p tokeira-bench --bin bench-starter -- --count 100
+```
+
 ## Definition and modules
 
 The `config()` function in `deployment.tkd` is the operator-visible desired

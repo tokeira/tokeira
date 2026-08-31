@@ -235,8 +235,9 @@ let engine = tokeira_engine::Engine::embedded().await?;
 // and every SDK worker and client in the process speaks to it directly.
 ```
 
-Embedded deployments can begin with in-memory storage and snapshots and move
-to managed Aurora DSQL without changing the execution model.
+Embedded deployments can begin in memory — optionally with snapshots — and
+move to Aurora DSQL without changing the execution model: either a managed
+cluster the engine creates and recovers, or an existing cluster you supply.
 
 This makes durable execution practical for applications that want Temporal's
 programming model without operating a separate workflow service — while

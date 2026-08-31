@@ -55,6 +55,7 @@ members = [
     "crates/tokeira-build",
 ]
 exclude = [
+    "examples/hello-workflow",
     "scenarios/worker-versioning",
     "scenarios/standalone-activities",
     "spikes/dagger-module-ci/shape",

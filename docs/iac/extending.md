@@ -31,6 +31,23 @@ uses the framework's `DescribedDeployment`, which adapts every realized definiti
 the orchestrator. `LocalDeployment` and `EcsDeployment` are legacy in-process adapters,
 not templates for new work.
 
+```mermaid
+flowchart TD
+    Metadata["Cargo platform metadata"] --> Catalog["Workspace platform catalog"]
+    Resource["Resource implementation"] --> Kind["Typed Kind"]
+    Service["Service implementation"] --> Kind
+    Kind --> Namespace["Namespace inventory and decoder"]
+    Namespace --> Declaration["Selected platform package<br/>with pure PlatformDeclaration"]
+    Definition[".tkd / .tkdp definition set"] --> Frontend["Selected definition frontend"]
+    Catalog --> Generator["Composition-root generator"]
+    Frontend --> Generator
+    Generator --> Root["Generated three-dependency root"]
+    Declaration --> Root
+    Root --> Realization["Verified infra and service realization"]
+    Realization --> Adapter["Framework DescribedDeployment"]
+    Adapter --> Engines["InfraEngine and DeployEngine"]
+```
+
 ## 1. Declare package discovery metadata
 
 Platform discovery comes from the platform package's Cargo metadata. A descriptor names

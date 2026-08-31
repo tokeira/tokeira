@@ -199,6 +199,30 @@ with the returned version; the next save must use it. A conflict or other save e
 stops the operation before later resources can assume the prior state transition was
 durable.
 
+```mermaid
+sequenceDiagram
+    participant Engine as IaC Engine
+    participant Provider
+    participant State as InfraState
+    participant Saver as StateSaver
+    participant Store as DeploymentStore
+
+    loop Each successful state transition
+        Engine->>Provider: create, update, or delete
+        Provider-->>Engine: provider mutation succeeds
+        Engine->>State: record the exact new state
+        Engine->>Saver: save current document
+        Saver->>Store: save(document, vN)
+        alt vN is current
+            Store-->>Saver: committed vN+1
+            Saver->>Saver: retain vN+1 for the next transition
+        else vN is stale or publication fails
+            Store--xSaver: Conflict or state error
+            Saver--xEngine: abort before the next resource
+        end
+    end
+```
+
 ### Service persistence
 
 The service engine orders services by declared service dependencies. The bound plan
@@ -344,6 +368,28 @@ Readers do not take the writer lock. Atomic rename exposes either the complete p
 document or the complete replacement. This is single-host coordination, not a
 distributed lease.
 
+```mermaid
+sequenceDiagram
+    participant Writer
+    participant Lock as manifest.lock
+    participant Manifest as manifest.json
+    participant Temp as unique temporary file
+    participant Reader
+
+    Writer->>Lock: acquire exclusive sidecar lock
+    Writer->>Manifest: read bytes and calculate current hash
+    alt Expected version is stale
+        Writer--xWriter: StateError::Conflict
+        Writer->>Lock: release
+    else Expected version is current
+        Writer->>Temp: write complete new document
+        Writer->>Manifest: atomic rename over manifest
+        Writer->>Lock: release after publication
+        Reader->>Manifest: read without writer lock
+        Manifest-->>Reader: complete old or complete new document
+    end
+```
+
 ## S3 direct-document backend
 
 `S3Backend` stores each direct document at `{prefix}/{key}/manifest.json`.
@@ -387,6 +433,48 @@ verify the snapshot SHA-256, deserialize, and validate the document.
 
 The store's save lease lasts only for one snapshot publication. It is not the lock for a
 complete lifecycle operation.
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Store as S3StateStore
+    participant Manifest as Mutable manifest
+    participant Snapshots as Immutable snapshots
+
+    Caller->>Store: save(document, expected ETag)
+    Store->>Store: validate and serialize
+    Store->>Manifest: load head, lease, and current ETag
+    alt Expected ETag is stale
+        Store--xCaller: StateError::Conflict
+    else An unexpired lease exists
+        Store--xCaller: StateError::Locked
+    else Publication is eligible
+        Store->>Manifest: conditionally publish save lease
+        alt Conditional write loses a race
+            Manifest--xStore: precondition failed
+            Store--xCaller: StateError::Conflict
+        else Lease acquired
+            Manifest-->>Store: lease-manifest ETag
+            Store->>Manifest: reload and verify owner, token, and expiry
+            alt Lease changed or expired
+                Store--xCaller: StateError::LockLost
+            else Lease is valid
+                Store->>Store: calculate snapshot identity and SHA-256
+                Store->>Snapshots: create immutable snapshot
+                Snapshots-->>Store: snapshot version and ETag
+                Store->>Manifest: commit new head and clear lease with If-Match
+                alt Head commit wins
+                    Manifest-->>Store: committed manifest ETag
+                    Store-->>Caller: committed ETag as next version
+                else Head commit loses a race
+                    Manifest--xStore: precondition failed
+                    Note right of Snapshots: Unreferenced snapshot is harmless
+                    Store--xCaller: StateError::Conflict
+                end
+            end
+        end
+    end
+```
 
 ## Operation locking
 

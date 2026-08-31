@@ -107,6 +107,20 @@ result into infra and service planes. `tokeira-tkp::ExecutionState` then retains
 `DescribedDeployment` converts that execution state into the older orchestrator seam.
 It is an adapter, not a second desired-state model.
 
+```mermaid
+flowchart LR
+    Source[".tkd or .tkdp definition"] --> Frontend["DefinitionFrontend"]
+    Frontend --> Definition["Modules, objects, edges, and writeback"]
+    Declaration["PlatformDeclaration"] --> Namespaces["Namespaces and kinds"]
+    Definition --> Realize["Decode and realize each kind once"]
+    Namespaces --> Realize
+    Realize --> Verify["Validate inputs, outputs, and cross-plane edges"]
+    Verify --> Infra["InfraComposition<br/>desired / known / active"]
+    Verify --> Services["Realized service set"]
+    Infra --> InfraEngine["InfraEngine&lt;DescribedDeployment&gt;"]
+    Services --> DeployEngine["DeployEngine&lt;DescribedDeployment&gt;"]
+```
+
 ## Infrastructure resource contract
 
 `ResourceId` is the stable join key shared by desired configuration, dependency edges,
@@ -378,6 +392,35 @@ The bound plan path performs these steps:
 7. Return the plan and evidence. Plan supplies no `StateSaver`, so confirmed absence
    changes only the planning view.
 
+```mermaid
+sequenceDiagram
+    participant Shell as Bound shell
+    participant Definition
+    participant Platform
+    participant Store as DeploymentStore
+    participant Engine as IaC Engine
+    participant Resources
+
+    Shell->>Definition: admit, realize, and verify resources
+    Definition-->>Shell: ExecutionState
+    Shell->>Platform: probe deployment substrate
+    alt Platform issue
+        Platform-->>Shell: PlatformIssue
+        Shell-->>Shell: return blocked PlanOutcome
+    else Platform reachable
+        Platform-->>Shell: reachable
+        Shell->>Store: load infrastructure state
+        Store-->>Shell: document and opaque version
+        Shell->>Engine: plan composition without StateSaver
+        Engine->>Engine: validate module and resource graphs
+        Engine->>Resources: describe known resources in dependency order
+        Resources-->>Engine: Present, Absent, or Unsupported
+        Engine->>Engine: refresh view and compute deltas
+        Engine-->>Shell: PlanOutcome with evidence
+        Note over Engine,Store: Plan never publishes the refreshed document
+    end
+```
+
 A provider issue raised during resource refresh also blocks the plan. The engine
 restores the pre-refresh recorded view and returns the issue rather than manufacturing
 changes from stale state.
@@ -411,6 +454,24 @@ The bound shell runs the operation-marker, binding, and create-time retarget gat
 before provider mutation. Without `--yes`, it also plans and refuses if any `Delete` or
 `Replace` is present. With `--yes`, the operator has already confirmed the destructive
 class and the shell does not pay for a separate confirmation plan.
+
+```mermaid
+flowchart TD
+    Apply["Bound infra apply"] --> Gates["Operation marker, binding, and retarget gates"]
+    Gates --> Confirmed{"--yes?"}
+    Confirmed -->|No| Review["Run plan for confirmation"]
+    Review --> Destructive{"Delete or Replace?"}
+    Destructive -->|Yes| Refuse["Refuse before provider mutation"]
+    Destructive -->|No| Converge["Reload, refresh, and compute delta"]
+    Confirmed -->|Yes| Converge
+    Converge --> Forward["Create, update, and replace<br/>in forward dependency order"]
+    Forward --> Reverse["Delete removed resources<br/>in reverse persisted order"]
+    Forward -. "after each durable transition" .-> Save["StateSaver publishes with current version"]
+    Reverse -. "after each deletion" .-> Save
+    Save --> Conflict{"Save succeeds?"}
+    Conflict -->|Yes| Next["Retain returned version and continue"]
+    Conflict -->|No| Abort["Abort; caller reloads and re-plans"]
+```
 
 The engine then:
 
@@ -569,6 +630,40 @@ Destroy first refuses if any recorded service is absent from the current definit
 the manifest bodies required for deletion must be reproducible. It then checks
 `Platform::supports_delete` for the complete pass, deletes in reverse service dependency
 order, and saves after each successful removal.
+
+```mermaid
+sequenceDiagram
+    participant Deploy as DeployEngine
+    participant Image
+    participant Service
+    participant Platform
+    participant Store as Runtime DeploymentStore
+
+    Deploy->>Image: record desired image references
+    loop Services in dependency order
+        Deploy->>Service: generate deterministic manifests
+        Service-->>Deploy: manifest values
+        Deploy->>Platform: prepare service
+        Deploy->>Deploy: hash manifests and compare RuntimeState
+        opt Desired hash already recorded
+            Deploy->>Platform: is service current?
+            Platform-->>Deploy: current or drifted
+        end
+        alt Create, changed hash, or live drift
+            Deploy->>Platform: apply manifests
+            Platform-->>Deploy: applied
+            Deploy->>Store: save updated RuntimeState with current version
+            Store-->>Deploy: next version
+        else No service change
+            Deploy->>Deploy: retain recorded service state
+        end
+    end
+    opt No service save occurred
+        Deploy->>Store: save image recording once
+        Store-->>Deploy: next version
+    end
+    Note over Deploy,Platform: Destroy preflights the whole set, then deletes in reverse order
+```
 
 `Image::desired_ref` contributes a repository, tag, and optional upstream reference.
 `record_images` currently stores `repository:tag`, source metadata, and a timestamp; its

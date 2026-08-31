@@ -1,0 +1,355 @@
+# Implementation Plan
+
+- [ ] 1. Establish the shared release contract and changie files
+  - [ ] 1.1 Add byte-equivalent changie configuration to both repositories
+    - Add `.changie.yaml`, `.changes/header.tpl.md`, `.changes/unreleased/`, and root
+      `CHANGELOG.md` with the exact design configuration and an initial valid fragment.
+    - Add a config-digest fixture proving the two repository copies are byte-equivalent
+      and that distinct UUID Slice values produce distinct fragment paths.
+    - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.9, 4.11_
+  - [ ] 1.2 Add repository release configuration and Odori's external `tkr` pin file
+    - Declare only workspace-specific version replacements, release branch metadata,
+      and the full Tokeira Git revision Odori consumes.
+    - Keep the tool pin outside both `Cargo.toml` and `Cargo.lock`.
+    - _Requirements: 3.3, 12.2, 12.6_
+  - [ ] 1.3 Add the release Plan and Report schema types
+    - Implement the complete policy-table fields, portable relative paths, closed enums,
+      canonical JSON, and secret-free `Debug`/serialization behavior in
+      `crates/tokeira-build/src/pipelines/release/model.rs`.
+    - _Requirements: 2.1, 2.12, 8.10, 9.1, 11.1_
+  - [ ] 1.4 Land the owner-authored repository constitution line
+    - The operator, not an implementation agent, adds the exact one-line fragment rule
+      proposed by Requirement 4.10 to both repository `AGENTS.md` files.
+    - _Requirements: 4.10_
+
+- [ ] 2. Pin and resolve changie `v1.25.2`
+  - [ ] 2.1 Add the single changie release pin
+    - Implement `ChangieRelease`, the four supported assets, source revision, exact
+      upstream archive names, and SHA-256 values in
+      `crates/tokeira-build/src/changie_release.rs`.
+    - Re-export only the immutable pin and typed asset selector.
+    - _Requirements: 5.1, 5.2, 5.3_
+  - [ ] 2.2 Add the verified local changie resolver
+    - Reuse the existing cache-lock, temporary download, checksum verification, atomic
+      rename, and version-probe pattern under `apps/tkr/src/commands/release/changie.rs`.
+    - Refuse unsupported platforms and ignore ambient changie binaries.
+    - _Requirements: 5.4, 5.5, 5.6, 5.7_
+  - [ ] 2.3 Add Dagger-side changie acquisition
+    - Select only the matching pinned Linux asset, verify it inside the Dagger graph,
+      and expose the binary to release and CI steps without a hosted action.
+    - _Requirements: 5.3, 5.5, 5.8_
+
+- [ ] 3. Checkpoint: shared contract and tool resolver are green
+  - Run formatting, `cargo lint --locked -p tokeira-build -p tkr`, focused unit tests,
+    and repository config-digest validation.
+  - Confirm neither repository lockfile changed.
+
+- [ ] 4. Implement workspace discovery, graph planning, and canonical Plans
+  - [ ] 4.1 Build the Publishable Package graph from Cargo metadata
+    - Admit exactly one workspace, select crates.io-publishable members, derive internal
+      publishable edges, reject cycles, and use a lexical topological tie break.
+    - _Requirements: 1.2, 1.3, 1.4, 2.3, 2.5, 6.2, 8.1, 8.2_
+  - [ ] 4.2 Implement source and fragment admission
+    - Check clean/up-to-date Git state, stable increasing target version, Unified
+      Version, configured base ref, fragment inventory, and canonical config digest.
+    - _Requirements: 2.2, 2.3, 2.4, 4.8, 4.9_
+  - [ ] 4.3 Implement read-only external observations
+    - Observe tag, package/version checksum, dependency availability, and existing
+      release state through Dagger-backed seams without resolving a registry token.
+    - _Requirements: 2.6, 7.7, 11.1, 12.8_
+  - [ ] 4.4 Implement deterministic notes preview and Plan digesting
+    - Canonicalize portable fields, exclude local roots and advancing observations from
+      Train Identity, and emit every outward effect plus release-notes digest.
+    - _Requirements: 2.1, 2.7, 2.8, 2.9, 2.12, 10.1, 10.2, 10.3_
+
+- [ ] 5. Add the standing changelog and packaging CI checks
+  - [ ] 5.1 Extend `CiCheck` and CLI selection
+    - Add `ChangelogFragments` and `PackageDryRun` to the existing report, serde shape,
+      `CliCiCheck` mapping, and all-check registry.
+    - _Requirements: 1.8, 6.1, 6.8_
+  - [ ] 5.2 Implement the changelog-fragment gate
+    - Compare with the admitted base ref, validate added fragments with pinned changie,
+      model the exact release batch transition, validate the Slice filename identity,
+      and report the failing fragment path.
+    - _Requirements: 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.11_
+  - [ ] 5.3 Implement per-package locked publish dry-runs
+    - Run each Publishable Package in graph order under the pinned toolchain, inspect
+      normalized packaged manifests and required consumer metadata, and prove source
+      bytes and lockfiles remain unchanged.
+    - _Requirements: 6.2, 6.3, 6.4, 6.5, 6.6, 6.7_
+
+- [ ] 6. Checkpoint: planning and standing CI checks are green
+  - Run `cargo lint --locked -p tokeira-build -p tkr`, focused nextest suites, doctests
+    for changed crates, and `tkr ci check --check changelog-fragments --check
+    package-dry-run` against both fixture workspace shapes.
+
+- [ ] 7. Implement transactional release source preparation
+  - [ ] 7.1 Add the structured Unified Version rewriter
+    - Update package versions, internal publishable dependency requirements, and the
+      exact configured non-Cargo version fields without changing dependency membership,
+      sources, features, or ordering.
+    - Do not invoke `cargo add` or `cargo remove`.
+    - _Requirements: 3.1, 3.2, 3.3, 3.4, 12.6, 12.7_
+  - [ ] 7.2 Add changie batch and merge execution
+    - Run the explicit target version with `--allow-no-changes=false`, merge the version
+      file, and validate the output diff against the admitted fragments and preview.
+    - _Requirements: 3.5, 3.6, 4.7, 10.1_
+  - [ ] 7.3 Add atomic preparation export
+    - Prepare in an isolated Dagger source, export only a completely validated diff,
+      and restore only executor-authored host mutations on pre-push failure.
+    - _Requirements: 2.11, 3.10_
+
+- [ ] 8. Implement release commit, tag, and hermetic packaging
+  - [ ] 8.1 Create and validate Train Identity in Git objects
+    - Add the Plan digest trailer to the Release Commit, create the annotated
+      `v<version>` tag, and verify matching local/remote objects without moving refs.
+    - _Requirements: 3.7, 3.8, 3.12_
+  - [ ] 8.2 Build all `.crate` artifacts from tagged source
+    - Package in the Dagger toolchain from the exact Release Tag, retain deterministic
+      artifact bytes and SHA-256 values, and reject host-source or host-target leakage.
+    - _Requirements: 3.9, 9.1_
+  - [ ] 8.3 Push only after the complete Hermetic Tag Build succeeds
+    - Push the exact Release Commit and annotated tag before publication and leave no
+      remote mutation on preparation/build failure.
+    - _Requirements: 3.10, 3.11, 3.12_
+
+- [ ] 9. Implement token admission and the publish state machine
+  - [ ] 9.1 Add last-responsible-moment token resolution
+    - Accept only an environment-variable name, resolve it after Plan validation and
+      confirmation, pass an opaque Dagger secret handle, and omit token values from all
+      serializable/debuggable types. Resolve fixed `GH_TOKEN` only after parity when a
+      release still needs creation.
+    - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 10.9, 10.10_
+  - [ ] 9.2 Add registry observation and Skip Existing
+    - Observe before upload, download/verify Existing Packages, inspect after Cargo
+      polling timeouts, and retain pending state after bounded ambiguity.
+    - _Requirements: 8.3, 8.4, 8.8, 8.9, 8.10, 11.3_
+  - [ ] 9.3 Add serial pacing with a virtual-clock seam
+    - Allow one upload in flight, enforce the 600-second success cooldown, and honor a
+      longer registry retry deadline without delaying verification-only work.
+    - _Requirements: 8.5, 8.6, 8.7_
+
+- [ ] 10. Implement parity, release notes, and resume classification
+  - [ ] 10.1 Add three-way Artifact Parity
+    - Hash hermetic and downloaded bytes, compare registry metadata, classify mismatches
+      as terminal, and block all release-note mutation until every package passes.
+    - _Requirements: 8.4, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7_
+  - [ ] 10.2 Add deterministic release-note generation
+    - Preserve the tagged changie version body, append the Rust 1.97 minimum statement,
+      and append the complete lexical package/checksum/page/README table.
+    - _Requirements: 10.1, 10.2, 10.3, 10.7_
+  - [ ] 10.3 Add idempotent `gh release create`
+    - Run inside Dagger with `--verify-tag` and `--notes-file`, skip an exact existing
+      release, refuse conflicts, use the fixed secret-injected credential, and use no
+      generated-note or hosted-action mode.
+    - _Requirements: 10.4, 10.5, 10.6, 10.7, 10.8, 10.9, 10.10_
+  - [ ] 10.4 Add the complete train state model
+    - Classify pre-publication failure, partial publication, terminal mismatch, and
+      completion; admit only the specified resume transitions.
+    - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.9_
+
+- [ ] 11. Wire the four `tkr release` sub-verbs
+  - [ ] 11.1 Add clap types and dispatcher wiring
+    - Expose exactly `fragment`, `plan`, `apply`, and `verify`; add no release mutation
+      to `tkr ci`.
+    - _Requirements: 1.1, 1.8_
+  - [ ] 11.2 Implement fragment authoring
+    - Resolve the selected workspace, invoke pinned changie interactively or with the
+      admitted kind/body and a generated lowercase UUID version 4 Slice value, and
+      report the one created relative path.
+    - _Requirements: 1.2, 1.3, 1.4, 1.5, 4.3, 4.4, 4.5, 4.11_
+  - [ ] 11.3 Implement Plan and Verify rendering
+    - Support stdout/atomic output, human and JSON modes, typed exit codes, and the
+      read-only boundaries.
+    - _Requirements: 1.6, 1.7, 2.1, 9.6, 11.1_
+  - [ ] 11.4 Implement Apply revalidation and confirmation
+    - Recompute the Plan, render every required outward effect, enforce interactive and
+      non-interactive confirmation, then invoke the executor.
+    - _Requirements: 2.7, 2.8, 2.9, 2.10, 2.11_
+
+- [ ] 12. Add the Odori bootstrap and cross-repository wiring
+  - [ ] 12.1 Implement the pinned Git-source `tkr` bootstrap
+    - Install with the exact locked Cargo command into the operator cache and verify the
+      full source revision before forwarding a release command.
+    - _Requirements: 12.2, 12.3, 12.4_
+  - [ ] 12.2 Add identical Tokeira and Odori invocation adapters
+    - Tokeira runs the in-tree binary; Odori runs the verified installed binary; both
+      pass an explicit workspace root and identical remaining release arguments.
+    - _Requirements: 12.1, 12.5_
+  - [ ] 12.3 Add external dependency preflight for Odori
+    - Refuse a train before confirmation when a required external registry version is
+      absent.
+    - _Requirements: 12.8_
+
+- [ ] 13. Checkpoint: end-to-end command compiles and focused tests are green
+  - Run formatting, lint, check, focused nextest suites, and doctests for `tokeira-build`
+    and `tkr`.
+  - Run Odori's focused bootstrap/config tests without changing either lockfile.
+
+- [ ] 14. Property test: Property 1 — workspace-generic deterministic package plan
+  - Generate acyclic workspace graphs, absolute root variants, and isomorphic Tokeira /
+    Odori fixtures; compare against a reference stable topological sort for at least 256
+    cases.
+  - Tag: `// Feature: release-engineering, Property 1: workspace-generic deterministic package plan`
+  - _Requirements: 1.2, 1.3, 1.4, 2.3, 2.5, 8.1, 8.2, 12.5_
+
+- [ ] 15. Property test: Property 2 — canonical Plan determinism and secret independence
+  - Generate source/external observations, root paths, and token values; assert
+    canonical Plan bytes, digest, and confirmation noninterference for at least 256
+    cases.
+  - Tag: `// Feature: release-engineering, Property 2: canonical Plan determinism and secret independence`
+  - _Requirements: 2.1, 2.6, 2.7, 2.8, 2.12, 7.2, 7.6_
+
+- [ ] 16. Property test: Property 3 — confirmation is a mutation fence
+  - Model generated source/Git/registry/release states and refusal causes; assert
+    byte-identical state after each refusal for at least 256 cases.
+  - Tag: `// Feature: release-engineering, Property 3: confirmation is a mutation fence`
+  - _Requirements: 2.7, 2.8, 2.9, 2.10, 2.11, 3.10_
+
+- [ ] 17. Property test: Property 4 — Unified Version rewrite preserves dependency membership
+  - Generate manifests with workspace/path/registry dependencies, features, and
+    unrelated entries; compare structured rewrite output to a reference model for at
+    least 256 cases.
+  - Tag: `// Feature: release-engineering, Property 4: Unified Version rewrite preserves dependency membership`
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 12.6, 12.7_
+
+- [ ] 18. Property test: Property 5 — fragment gate is complete and explicit
+  - Generate non-release and batch-shaped diffs, every fragment kind, and pairs of
+    distinct UUID Slice values; compare gate results, rendered notes, and fragment paths
+    to pinned reference fixtures for at least 256 cases.
+  - Tag: `// Feature: release-engineering, Property 5: fragment gate is complete and explicit`
+  - _Requirements: 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.11_
+
+- [ ] 19. Property test: Property 6 — tool acquisition fails closed
+  - Generate platform selection, archive corruption, version substitution, cache state,
+    and ambient binaries with a fake command executor for at least 256 cases.
+  - Tag: `// Feature: release-engineering, Property 6: tool acquisition fails closed`
+  - _Requirements: 5.2, 5.3, 5.4, 5.5, 5.6, 5.7_
+
+- [ ] 20. Property test: Property 7 — packaging gate covers the publishable closure
+  - Generate workspace metadata and normalized package manifests with path-only edges,
+    missing fields, and source snapshots; compare to a reference admission model for at
+    least 256 cases.
+  - Tag: `// Feature: release-engineering, Property 7: packaging gate covers the publishable closure`
+  - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8_
+
+- [ ] 21. Property test: Property 8 — publish execution is idempotent
+  - Drive generated package DAGs and registry outcome sequences through a fake Dagger
+    registry; assert at-most-once observable publication and correct resume for at least
+    256 cases.
+  - Tag: `// Feature: release-engineering, Property 8: publish execution is idempotent`
+  - _Requirements: 8.3, 8.4, 8.5, 8.8, 8.9, 8.10, 11.1, 11.2, 11.3_
+
+- [ ] 22. Property test: Property 9 — publish pacing respects both clocks
+  - Generate success timestamps, retry deadlines, and verification events under a
+    virtual clock; compare next-upload decisions to `max(success + 600s, retry_at)` for
+    at least 256 cases.
+  - Tag: `// Feature: release-engineering, Property 9: publish pacing respects both clocks`
+  - _Requirements: 8.5, 8.6, 8.7_
+
+- [ ] 23. Property test: Property 10 — credential noninterference
+  - Generate arbitrary non-empty registry and release API credential bytes plus every
+    report/error path; scan all output and compare non-secret results across credentials
+    for at least 256 cases.
+  - Tag: `// Feature: release-engineering, Property 10: credential noninterference`
+  - _Requirements: 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 10.9, 10.10_
+
+- [ ] 24. Property test: Property 11 — Artifact Parity is three-way equality
+  - Generate local/download bytes and registry checksum values; assert admission exactly
+    matches three-way SHA-256 equality and notes stay immutable otherwise for at least
+    256 cases.
+  - Tag: `// Feature: release-engineering, Property 11: Artifact Parity is three-way equality`
+  - _Requirements: 8.4, 9.1, 9.2, 9.3, 9.4, 9.5, 9.7_
+
+- [ ] 25. Property test: Property 12 — release notes are deterministic and changelog-authored
+  - Generate version bodies and verified package inventories; compare exact bytes,
+    ordering, minimum-Rust annotation, and README URLs for at least 256 cases.
+  - Tag: `// Feature: release-engineering, Property 12: release notes are deterministic and changelog-authored`
+  - _Requirements: 10.1, 10.2, 10.3, 10.7_
+
+- [ ] 26. Property test: Property 13 — partial-train state classification and resume
+  - Generate phase outcome sequences and compare state/resume decisions with the design
+    state machine for at least 256 cases.
+  - Tag: `// Feature: release-engineering, Property 13: partial-train state classification and resume`
+  - _Requirements: 10.4, 10.5, 10.6, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.9_
+
+- [ ] 27. Property test: Property 14 — cross-repository tool bootstrap isolation
+  - Generate Odori manifest/lockfile bytes, tool revisions, bootstrap outcomes, and
+    modeled version rewrites; assert isolation and revision fencing for at least 256
+    cases.
+  - Tag: `// Feature: release-engineering, Property 14: cross-repository tool bootstrap isolation`
+  - _Requirements: 12.2, 12.3, 12.4, 12.6, 12.7, 12.8_
+
+- [ ] 28. Add end-to-end offline release-train integration tests
+  - [ ] 28.1 Exercise a fresh train and complete verify pass
+    - Use fake Dagger, Git, registry, and release gateways while executing the real CLI,
+      planner, preparer, executor, report, and note-generation layers.
+    - _Requirements: 1.1, 2.1, 3.1, 3.5, 3.8, 3.9, 3.11, 8.3, 9.3, 10.4, 11.9_
+  - [ ] 28.2 Exercise every resumable partial state
+    - Cover timeout-after-upload, all-existing rerun, subset-published resume,
+      note-only resume, and missing-token all-existing verification.
+    - _Requirements: 7.7, 8.4, 8.8, 8.9, 11.1, 11.2, 11.3, 11.4, 11.7_
+  - [ ] 28.3 Exercise every terminal conflict
+    - Cover dirty source, Plan drift, tag conflict, artifact mismatch, release conflict,
+      invalid tool asset, and unsupported tool platform.
+    - _Requirements: 2.4, 2.8, 3.12, 5.5, 5.7, 9.4, 10.6, 11.5, 11.8_
+  - [ ] 28.4 Exercise both repository workspace shapes
+    - Prove byte-equivalent changie config, identical command arguments, preserved Odori
+      dependency membership, and external dependency preflight.
+    - _Requirements: 4.1, 4.9, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, 12.8_
+
+- [ ] 29. Final checkpoint: both repositories satisfy their full bars
+  - In Tokeira, run the root `AGENTS.md` §10.4 bar plus the offline Markdown link check.
+  - In Odori, run its complete documented bar.
+  - Confirm all release tests are offline, use virtual clocks, and contain no token
+    value or hosted-workflow fixture.
+  - Confirm `git diff --exit-code` after checks and confirm no unexpected dependency or
+    lockfile movement.
+
+## Task Dependency Graph
+
+```json
+{
+  "1": [],
+  "2": ["1"],
+  "3": ["1", "2"],
+  "4": ["1", "2"],
+  "5": ["1", "2", "4"],
+  "6": ["4", "5"],
+  "7": ["1", "2", "4"],
+  "8": ["7"],
+  "9": ["4", "8"],
+  "10": ["8", "9"],
+  "11": ["2", "4", "5", "7", "8", "9", "10"],
+  "12": ["1", "11"],
+  "13": ["11", "12"],
+  "14": ["4"],
+  "15": ["4"],
+  "16": ["11"],
+  "17": ["7"],
+  "18": ["5"],
+  "19": ["2"],
+  "20": ["5"],
+  "21": ["9"],
+  "22": ["9"],
+  "23": ["9", "11"],
+  "24": ["10"],
+  "25": ["10"],
+  "26": ["10"],
+  "27": ["12"],
+  "28": ["13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27"],
+  "29": ["28"]
+}
+```
+
+## Notes
+
+- Implementation begins only after this spec PR is approved.
+- Tasks spanning both repositories must land as separately reviewable repository PRs;
+  the Tokeira tool/config slice lands before the Odori pin/bootstrap slice.
+- The operator owns the constitution edits in Task 1.4. Agents propose and test the
+  exact line but do not land policy text without that owner action.
+- No implementation task adds a GitHub Actions file, reads a real registry token, or
+  performs a live publish.
+- Live apply validation is a separately authorized operator action after offline and
+  read-only verification are green.

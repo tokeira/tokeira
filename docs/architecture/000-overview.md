@@ -1,7 +1,7 @@
 # 000 Overview
 
 **Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
-**Related docs:** [010-history-as-authority](010-history-as-authority.md), [015-configuration](015-configuration.md), [020-kernel](020-kernel.md), [025-system-services](025-system-services.md), [030-runtime-lanes](030-runtime-lanes.md), [035-placement-and-membership](035-placement-and-membership.md), [037-dynamic-placement](037-dynamic-placement.md), [040-delivery-broker](040-delivery-broker.md), [045-autoscaling-on-ecs-ec2](045-autoscaling-on-ecs-ec2.md), [050-dsql-storage](050-dsql-storage.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md), [065-runtime-auto-tune](065-runtime-auto-tune.md), [070-projection-plane](070-projection-plane.md), [075-archival-to-s3](075-archival-to-s3.md), [080-sql-visibility](080-sql-visibility.md), [090-failover-and-recovery](090-failover-and-recovery.md)
+**Related docs:** [010-history-as-authority](010-history-as-authority.md), [015-configuration](015-configuration.md), [020-kernel](020-kernel.md), [025-system-services](025-system-services.md), [030-runtime-lanes](030-runtime-lanes.md), [035-placement-and-membership](035-placement-and-membership.md), [037-dynamic-placement](037-dynamic-placement.md), [040-delivery-broker](040-delivery-broker.md), [045-autoscaling-on-ecs-ec2](045-autoscaling-on-ecs-ec2.md), [050-dsql-storage](050-dsql-storage.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md), [065-runtime-auto-tune](065-runtime-auto-tune.md), [070-projection-plane](070-projection-plane.md), [075-archival-to-s3](075-archival-to-s3.md), [080-sql-visibility](080-sql-visibility.md), [090-failover-and-recovery](090-failover-and-recovery.md), [120-iac-framework](120-iac-framework.md)
 
 ## Intent
 
@@ -46,7 +46,7 @@ Aurora DSQL makes this redesign even more attractive. AWS documents a fixed Post
 
 Tokeira is organized into **three core planes**, **five primary crates**, and a small set of **operational services**.
 
-These planes describe the engine, not a process topology. Tokeira ships in two shapes built from the same planes: **`tokeirad`**, a standalone Temporal-compatible service fronted by gRPC, and **embedded Tokeira**, where the engine lives inside a host Rust process and the Temporal SDK reaches the compatibility edge over an in-memory duplex instead of a TCP listener. Embedded deployments can begin with in-memory storage and snapshots and move to Aurora DSQL without changing the execution model. Everything below applies to both shapes.
+These planes describe the engine, not a process topology. Tokeira ships in two shapes built from the same planes: **`tokeirad`**, a standalone Temporal-compatible service fronted by gRPC, and **embedded Tokeira**, where the engine lives inside a host Rust process and the Temporal SDK reaches the compatibility edge over an in-memory duplex instead of a TCP listener. Embedded deployments can begin in memory — optionally with snapshots — and move to Aurora DSQL without changing the execution model: either a managed cluster the engine creates and recovers, or an existing cluster the operator supplies. Everything below applies to both shapes.
 
 ### Plane 1: Compatibility edge
 

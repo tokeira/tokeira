@@ -1,5 +1,7 @@
 # IaC Framework
 
+**Status:** current — describes the framework as implemented
+
 Tokeira ships a custom infrastructure-as-code engine that manages resource
 lifecycles through a declarative convergence model. The engine core is
 provider-agnostic — it knows nothing about AWS, Docker, or Kubernetes. Two

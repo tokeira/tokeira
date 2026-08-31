@@ -163,6 +163,7 @@ fn declaration(probe: FixedProbe) -> PlatformDeclaration {
     PlatformDeclaration {
         namespaces: Vec::new(),
         ops: None,
+        observability: None,
         execution: Box::new(probe),
         implementation: Arc::new(TestIntegration),
     }

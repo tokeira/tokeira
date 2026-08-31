@@ -826,6 +826,7 @@ mod tests {
         let declaration = tokeira_platform::declaration::PlatformDeclaration {
             namespaces: Vec::new(),
             ops: None,
+            observability: None,
             execution: Box::new(NoProbe),
             implementation: std::sync::Arc::new(crate::testkit::TestIntegration),
         };

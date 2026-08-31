@@ -103,12 +103,22 @@ Use:
 tkr observability check
 ```
 
-The command validates generated observability configuration for the selected
-deployment. It checks scrape configuration, dashboard rendering, alert rule
-rendering, and ECS observability artifact inclusion where applicable. Live
-backend checks require the relevant deployment endpoints to be reachable, for
-example through `tkr port-forward grafana`, `tkr port-forward mimir`, or private
-network access.
+For a definition-backed deployment, `tkr` forwards this read-only command to
+the deployment's bound `tkp`. The provisioner admits the recorded definition,
+realizes its observability content in memory, and validates the post-substitution
+tree: the expected Alloy scrape jobs, Grafana dashboard style (including the
+`$datasource` variable, panel descriptions, units, and line presentation), and
+Mimir alert-rule metadata. It does not acquire the operation lock, invoke
+provisioner gates, contact providers, or write the generated files.
+
+The command reports static configuration checks as `PASS`. Live Mimir, Loki,
+and Grafana reachability remains `WARN` because it requires a reachable
+deployment endpoint. Legacy `deployment.toml` deployments continue to run the
+in-process local/ECS checks, including ECS observability artifact inclusion.
+
+The per-deployment command complements the platform unit tests: those validate
+the shipped dashboard and alert sources, while this command validates the
+deployment's rendered result after its own parameter substitution.
 
 ## Dashboards
 

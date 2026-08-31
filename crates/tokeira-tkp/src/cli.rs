@@ -17,8 +17,8 @@ use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_platform::definition::DefinitionFrontend;
 
 use crate::{
-    apply, definition, deploy, describe, destroy, engine::Engine, lock, plan, platform::Admitted,
-    revert, rollback, scale, upgrade,
+    apply, definition, deploy, describe, destroy, engine::Engine, lock, observability, plan,
+    platform::Admitted, revert, rollback, scale, upgrade,
 };
 
 #[derive(Parser)]
@@ -71,6 +71,9 @@ enum Command {
     Logs(LogsArgs),
     /// Print live published port mappings for one logical service.
     PortMappings(ServiceArgs),
+    /// Validate the deployment's realized observability configuration.
+    #[command(subcommand)]
+    Observability(ObservabilityCommand),
     /// Revert to a prior config revision — a same-engine apply, gated on the binding.
     Revert(RevertArgs),
     /// Upgrade to a new engine identity.
@@ -103,6 +106,7 @@ impl Command {
             Self::Scale(args) => Some(&args.deployment_dir),
             Self::Logs(args) => Some(&args.deployment_dir),
             Self::PortMappings(args) => Some(&args.deployment_dir),
+            Self::Observability(ObservabilityCommand::Check(args)) => Some(&args.deployment_dir),
             Self::Revert(args) => Some(&args.deployment_dir),
             Self::Rollback(args) => Some(&args.deployment_dir),
         }
@@ -117,6 +121,24 @@ enum ConfigCommand {
     /// is published, so it is hidden from help.
     #[command(hide = true)]
     Seed(LifecycleArgs),
+}
+
+#[derive(Subcommand)]
+enum ObservabilityCommand {
+    /// Validate rendered scrape, dashboard, and alert configuration. Read-only;
+    /// never gates or acquires the operation lock.
+    Check(ObservabilityCheckArgs),
+}
+
+#[derive(Args)]
+struct ObservabilityCheckArgs {
+    /// Deployment directory holding the definition and its companion content.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Reserved live-backend reachability window; static validation remains
+    /// deterministic and reports backend reachability as a warning.
+    #[arg(long, default_value = "30")]
+    timeout_seconds: u64,
 }
 
 #[derive(Args)]
@@ -380,6 +402,9 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             }
             Ok(())
         }
+        Command::Observability(ObservabilityCommand::Check(args)) => {
+            observability::check(&engine, require(admitted), args.timeout_seconds)
+        }
         Command::Infra(InfraCommand::Plan(args)) => {
             plan::plan(
                 &engine,
@@ -548,6 +573,27 @@ mod tests {
         assert!(matches!(
             complete.command,
             Command::Destroy(DeploymentDestroyArgs { yes: true, .. })
+        ));
+    }
+
+    #[test]
+    fn parses_read_only_observability_check() {
+        let parsed = Cli::try_parse_from([
+            "tkp",
+            "observability",
+            "check",
+            "--deployment-dir",
+            "/tmp/d",
+            "--timeout-seconds",
+            "15",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Observability(ObservabilityCommand::Check(ObservabilityCheckArgs {
+                timeout_seconds: 15,
+                ..
+            }))
         ));
     }
 }

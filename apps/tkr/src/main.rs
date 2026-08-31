@@ -60,7 +60,7 @@ mod tui;
 
 use cli::{
     Cli, Command, ConfigAction, DeployAction, DeploymentAction, ImageCommand, InfraAction,
-    ScaleAction, SchemaAction,
+    ObservabilityAction, ScaleAction, SchemaAction,
 };
 use deployment_dir::{DeploymentResolver, load_context};
 
@@ -269,8 +269,14 @@ async fn run() -> Result<()> {
         Command::Compat(args) => commands::compat::run(args.command, cli.json),
         Command::Ci(args) => commands::ci::run(args.command, cli.json).await,
         Command::Observability { action } => {
-            let ctx = load_context(&deployments, selected)?;
-            commands::observability::run(action, ctx)
+            if deployments.uses_bound_provisioner(selected)? {
+                let dir = deployments.resolve_dir(selected)?;
+                let (verb, extra) = forwarded_observability_verb(&action);
+                launcher::launch(&dir, verb, &extra).await
+            } else {
+                let ctx = load_context(&deployments, selected)?;
+                commands::observability::run(action, ctx)
+            }
         }
         Command::Diagnostics { action } => {
             let ctx = load_context(&deployments, selected)?;
@@ -358,6 +364,20 @@ fn forwarded_infra_verb(action: &InfraAction) -> (&'static [&'static str], Vec<S
         }
         InfraAction::Status => (&["describe"], Vec::new()),
     }
+}
+
+/// Forward the read-only observability verb to the provisioner bound to the
+/// admitted deployment. The timeout remains explicit at the boundary so both
+/// shells preserve the same operator request even while live reachability is
+/// reported as a warning.
+fn forwarded_observability_verb(
+    action: &ObservabilityAction,
+) -> (&'static [&'static str], Vec<String>) {
+    let ObservabilityAction::Check { timeout_seconds } = action;
+    (
+        &["observability", "check"],
+        vec!["--timeout-seconds".to_string(), timeout_seconds.to_string()],
+    )
 }
 
 /// `--module` crosses to the bound `tkp` verbatim — the platform owns its
@@ -699,6 +719,7 @@ mod tests {
             vec!["tkr", "schema", "status"],
             vec!["tkr", "image", "list"],
             vec!["tkr", "image", "build"],
+            vec!["tkr", "observability", "check"],
             vec!["tkr", "deployment", "describe"],
             vec!["tkr", "deployment", "list"],
             vec!["tkr", "deployment", "lock"],
@@ -740,6 +761,19 @@ mod tests {
         };
         let (_, extra) = forwarded_infra_verb(&bare);
         assert!(extra.is_empty(), "no flag without a request");
+    }
+
+    #[test]
+    fn forwarding_preserves_the_observability_check_timeout() {
+        let action = ObservabilityAction::Check {
+            timeout_seconds: 15,
+        };
+        let (verb, extra) = forwarded_observability_verb(&action);
+        assert_eq!(verb, &["observability", "check"]);
+        assert_eq!(
+            extra,
+            vec!["--timeout-seconds".to_string(), "15".to_string()]
+        );
     }
 
     // The operator's confirmation crosses to the binary that gates on it:

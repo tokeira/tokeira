@@ -41,6 +41,7 @@ pub fn platform() -> PlatformDeclaration {
         // preserved legacy implementation until that contract is addressed
         // in its own slice.
         ops: None,
+        observability: None,
         execution: Box::new(tokeira_ecs::execution::EcsExecution),
         implementation: Arc::new(tokeira_ecs::execution::EcsIntegration),
     }

@@ -35,6 +35,7 @@ pub fn platform() -> PlatformDeclaration {
     PlatformDeclaration {
         namespaces: namespaces(),
         ops: Some(Box::new(ops::EksOps::default())),
+        observability: None,
         execution: Box::new(execution::EksExecution),
         implementation: Arc::new(execution::EksIntegration::default()),
     }

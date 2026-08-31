@@ -43,6 +43,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokeira_iac as iac;
+use tokeira_observability::testing::{AlertRuleValidator, DashboardValidator};
+use tokeira_platform::declaration::{
+    DeploymentRef, ObservabilityCheck, ObservabilityCheckOutcome, ObservabilityCheckReport,
+    ObservabilityCheckStatus,
+};
 
 mod kind;
 
@@ -59,6 +64,7 @@ const GRAFANA_DATASOURCES: &str = "config/grafana/provisioning/datasources/datas
 const GRAFANA_DASHBOARDS: &str = "config/grafana/provisioning/dashboards/dashboards.yaml";
 const ALERT_RULES: &str = "config/mimir/rules/observability-alerts.yaml";
 const GRAFANA_DASHBOARD_DIR: &str = "config/grafana/dashboards";
+const EXPECTED_SCRAPE_JOBS: &[&str] = &["tokeirad", "alloy", "mimir", "loki", "grafana"];
 
 /// Companion-content locations, relative to the definition source directory.
 const CONTENT_DIR: &str = "observability";
@@ -406,6 +412,40 @@ impl ObservabilityConfigFilesResource {
         desired_files(&self.definition_dir, &self.params)
     }
 
+    fn validate_rendered(&self) -> anyhow::Result<()> {
+        let files = self.desired_files()?;
+        let alloy = rendered_file(&files, ALLOY_CONFIG)?;
+        for job in EXPECTED_SCRAPE_JOBS {
+            let declaration = format!("prometheus.scrape \"{job}\"");
+            if !alloy.contents.contains(&declaration) {
+                anyhow::bail!("rendered Alloy config is missing expected scrape job `{job}`");
+            }
+        }
+
+        let mut dashboard_count = 0;
+        for file in files.iter().filter(|file| {
+            file.relative_path.starts_with(GRAFANA_DASHBOARD_DIR)
+                && file
+                    .relative_path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+        }) {
+            DashboardValidator::validate_str(&file.relative_path, &file.contents)?;
+            dashboard_count += 1;
+        }
+        if dashboard_count == 0 {
+            anyhow::bail!("rendered observability tree contains no Grafana dashboards");
+        }
+
+        let alerts = rendered_file(&files, ALERT_RULES)?;
+        AlertRuleValidator::validate_str(
+            &alerts.relative_path,
+            &alerts.contents,
+            &self.definition_dir,
+        )?;
+        Ok(())
+    }
+
     fn write_all(&self) -> Result<iac::ResourceState, iac::IacError> {
         let files = self.desired_files()?;
         for file in &files {
@@ -531,7 +571,7 @@ impl iac::Resource for ObservabilityConfigFilesResource {
     }
 
     fn validate_input(&self) -> Result<(), String> {
-        validate_params(&self.params).map_err(|error| error.to_string())
+        self.validate_rendered().map_err(|error| error.to_string())
     }
 
     fn desired_manifest(&self) -> serde_json::Value {
@@ -829,6 +869,88 @@ impl iac::Resource for ObservabilityConfigFilesResource {
     }
 }
 
+/// Compose's read-only check over the desired observability resource realized
+/// from one admitted deployment definition.
+#[derive(Debug, Default)]
+pub(crate) struct RenderedObservabilityCheck;
+
+impl ObservabilityCheck for RenderedObservabilityCheck {
+    fn check(
+        &self,
+        _deployment: &DeploymentRef,
+        resources: &[std::sync::Arc<dyn iac::Resource>],
+    ) -> anyhow::Result<ObservabilityCheckReport> {
+        let resource = resources
+            .iter()
+            .find(|resource| resource.resource_type().0 == ObservabilityConfigFilesResource::TYPE)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the realized definition contains no `{}` resource",
+                    ObservabilityConfigFilesResource::TYPE
+                )
+            })?;
+        // Realization validates kind inputs, but the verb deliberately invokes
+        // the rendered-content contract itself so the operator gets a direct
+        // check of this deployment rather than trusting construction alone.
+        resource.validate_input().map_err(anyhow::Error::msg)?;
+
+        let manifest = resource.desired_manifest();
+        let files = manifest
+            .get("files")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("rendered observability manifest has no file set"))?;
+        let dashboard_count = files
+            .keys()
+            .filter(|path| path.starts_with(GRAFANA_DASHBOARD_DIR) && path.ends_with(".json"))
+            .count();
+        let alert_count = usize::from(files.contains_key(ALERT_RULES));
+
+        Ok(ObservabilityCheckReport {
+            checks: vec![
+                ObservabilityCheckOutcome {
+                    name: "compose-scrapes",
+                    status: ObservabilityCheckStatus::Pass,
+                    detail: format!(
+                        "{} expected Alloy scrape jobs rendered",
+                        EXPECTED_SCRAPE_JOBS.len()
+                    ),
+                },
+                ObservabilityCheckOutcome {
+                    name: "compose-dashboards",
+                    status: ObservabilityCheckStatus::Pass,
+                    detail: format!(
+                        "{dashboard_count} rendered Grafana dashboards satisfy the style contract"
+                    ),
+                },
+                ObservabilityCheckOutcome {
+                    name: "compose-alerts",
+                    status: ObservabilityCheckStatus::Pass,
+                    detail: format!(
+                        "{alert_count} rendered Mimir alert bundle satisfies the style contract"
+                    ),
+                },
+                ObservabilityCheckOutcome {
+                    name: "live-backend-query",
+                    status: ObservabilityCheckStatus::Warn,
+                    detail:
+                        "live Mimir/Loki/Grafana queries require a reachable deployment endpoint"
+                            .to_string(),
+                },
+            ],
+        })
+    }
+}
+
+fn rendered_file<'a>(
+    files: &'a [RenderedConfigFile],
+    relative_path: &str,
+) -> anyhow::Result<&'a RenderedConfigFile> {
+    files
+        .iter()
+        .find(|file| file.relative_path == Path::new(relative_path))
+        .ok_or_else(|| anyhow::anyhow!("rendered observability file is missing: {relative_path}"))
+}
+
 /// Join a JSON string array for the one-line missing-files observation.
 fn tokeira_report_free_join(values: &[serde_json::Value]) -> String {
     values
@@ -980,6 +1102,96 @@ mod content_tests {
             "{\"title\":\"edge\"}",
         )
         .expect("dashboard");
+    }
+
+    /// Upgrade the generic rendering fixture into a style-valid tree carrying
+    /// every Alloy declaration that the operator check promises to verify.
+    fn check_fixture(root: &Path) {
+        content_fixture(root);
+        let obs = root.join(CONTENT_DIR);
+        let scrapes = EXPECTED_SCRAPE_JOBS
+            .iter()
+            .map(|job| format!("prometheus.scrape \"{job}\" {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            obs.join(CONTENT_TEMPLATES).join("alloy.alloy"),
+            format!(
+                "target {{{{ metrics_target_host }}}}:{{{{ metrics_target_port }}}}\n{scrapes}\n"
+            ),
+        )
+        .expect("Alloy fixture");
+        fs::write(
+            obs.join(CONTENT_DASHBOARDS).join("edge.json"),
+            r#"{"templating":{"list":[{"name":"datasource","type":"datasource"}]},"panels":[]}"#,
+        )
+        .expect("dashboard fixture");
+    }
+
+    fn check_resource(root: &Path) -> ObservabilityConfigFilesResource {
+        ObservabilityConfigFilesResource::new(
+            root.join("deployment"),
+            root.to_path_buf(),
+            ObservabilityParams::reference(),
+        )
+    }
+
+    #[test]
+    fn rendered_deployment_tree_passes_the_operator_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        check_fixture(dir.path());
+        let resources: Vec<std::sync::Arc<dyn iac::Resource>> =
+            vec![std::sync::Arc::new(check_resource(dir.path()))];
+
+        let report = RenderedObservabilityCheck
+            .check(
+                &DeploymentRef {
+                    name: "fixture".to_string(),
+                    dir: dir.path().join("deployment"),
+                },
+                &resources,
+            )
+            .expect("valid rendered tree");
+
+        assert_eq!(report.checks.len(), 4);
+        assert_eq!(
+            report.checks.last().map(|check| check.status),
+            Some(ObservabilityCheckStatus::Warn)
+        );
+    }
+
+    // The command validates the rendered deployment tree, not merely the
+    // platform's shipped source. A post-render style defect must therefore
+    // make this deployment-specific check fail.
+    #[test]
+    fn rendered_deployment_style_violation_fails_the_operator_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        check_fixture(dir.path());
+        fs::write(
+            dir.path()
+                .join(CONTENT_DIR)
+                .join(CONTENT_DASHBOARDS)
+                .join("edge.json"),
+            r#"{"panels":[]}"#,
+        )
+        .expect("invalid rendered dashboard fixture");
+        let resources: Vec<std::sync::Arc<dyn iac::Resource>> =
+            vec![std::sync::Arc::new(check_resource(dir.path()))];
+
+        let error = RenderedObservabilityCheck
+            .check(
+                &DeploymentRef {
+                    name: "fixture".to_string(),
+                    dir: dir.path().join("deployment"),
+                },
+                &resources,
+            )
+            .expect_err("style violation must fail the operator check");
+
+        assert!(
+            error.to_string().contains("missing $datasource variable"),
+            "validator refusal is preserved: {error}"
+        );
     }
 
     // Content is an input: rendering substitutes the authored parameters

@@ -35,6 +35,7 @@ mod described;
 mod destroy;
 pub mod engine;
 mod gate;
+mod observability;
 
 mod plan;
 pub mod platform;

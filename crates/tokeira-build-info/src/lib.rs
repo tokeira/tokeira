@@ -49,7 +49,9 @@ pub const SCHEMA_MIGRATION_SET_DIGEST: &str =
 pub struct BuildInfo {
     pub tokeira_version: &'static str,
     pub tokeira_git_sha: &'static str,
-    /// Full source revision, or the same degraded sentinel as local provenance.
+    /// Full 40-hex source revision when the build can determine one (the build
+    /// manifest, an injected environment value, or live Git, in that order); the
+    /// same degraded sentinel as `tokeira_git_sha` for a local release build.
     pub tokeira_source_revision: &'static str,
     pub temporal_proto_version: &'static str,
     pub temporal_server_compat: &'static str,

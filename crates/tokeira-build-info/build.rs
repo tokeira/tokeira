@@ -71,6 +71,11 @@ fn main() {
     );
     println!("cargo:rerun-if-changed=src/pinned.rs");
     println!("cargo:rerun-if-changed=src/provenance.rs");
+    // Live Git provenance changes with the checked-out commit; without this the
+    // embedded revision would survive a checkout until something else rebuilt.
+    if let Some(head) = git_head_path(&root) {
+        println!("cargo:rerun-if-changed={}", head.display());
+    }
     let schema_contract_path = root.join("crates/tokeira-storage/schema-contract.toml");
     println!("cargo:rerun-if-changed={}", schema_contract_path.display());
 
@@ -108,31 +113,29 @@ fn main() {
             "cargo::warning=release build outside CI carries degraded TOKEIRA_GIT_SHA=dev provenance"
         );
     }
-    let resolved_source_revision = non_empty_env("TOKEIRA_SOURCE_REVISION")
-        .filter(|revision| {
-            revision.len() == 40
-                && revision
-                    .chars()
-                    .all(|character| character.is_ascii_hexdigit())
-        })
-        .or_else(|| full_git_sha(&root))
-        .or_else(|| {
-            supplied_git_sha
-                .filter(|revision| {
-                    revision.len() == 40
-                        && revision
-                            .chars()
-                            .all(|character| character.is_ascii_hexdigit())
-                })
-                .map(str::to_owned)
-        });
+    // A degraded local release build carries the sentinel in both fields; otherwise the
+    // full revision follows the same supplied-over-live order as the short provenance.
+    let injected_source_revision = non_empty_env("TOKEIRA_SOURCE_REVISION");
+    let resolved_source_revision = if provenance.warn_local_release {
+        provenance.value.clone()
+    } else {
+        provenance::resolve_source_revision(
+            parsed_manifest
+                .as_ref()
+                .map(|manifest| manifest.source_revision.as_str()),
+            injected_source_revision.as_deref(),
+            supplied_git_sha,
+            || full_git_sha(&root),
+            &provenance.value,
+        )
+    };
 
     let mut manifest = parsed_manifest.unwrap_or_else(|| {
         dev_fallback_manifest(&root)
             .unwrap_or_else(|error| panic!("failed to derive development build metadata: {error}"))
     });
     manifest.git_sha = provenance.value;
-    manifest.source_revision = resolved_source_revision.unwrap_or_else(|| manifest.git_sha.clone());
+    manifest.source_revision = resolved_source_revision;
     if manifest_path.is_none() {
         if let Some(source_tree_hash) = non_empty_env("TOKEIRA_SOURCE_TREE_HASH") {
             manifest.source_tree_hash = source_tree_hash;
@@ -415,6 +418,20 @@ fn short_git_sha(root: &Path) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn git_head_path(root: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!git_dir.is_empty()).then(|| PathBuf::from(git_dir).join("HEAD"))
 }
 
 fn full_git_sha(root: &Path) -> Option<String> {

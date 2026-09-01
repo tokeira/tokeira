@@ -1,6 +1,6 @@
 //! Artifact parity and deterministic changelog-authored release notes.
 
-use super::{PackageOutcome, PackageResult, ReleaseError, digest::sha256_hex};
+use super::{PackageOutcome, PackageResult, ReleaseError, sha256_hex};
 
 /// Prove equality of hermetic bytes, downloaded bytes, and registry metadata.
 pub fn verify_artifact_parity(
@@ -52,6 +52,8 @@ pub fn generate_release_notes(
     if !notes.is_empty() {
         notes.push_str("\n\n");
     }
+    // The requirements pin this sentence while 1.97 remains the workspace contract; the
+    // package gate separately refuses any crate without a `rust-version` field.
     notes.push_str("Requires Rust 1.97 or newer.\n\n");
     notes.push_str("| Package | Version | SHA-256 | crates.io | README |\n");
     notes.push_str("|---|---:|---|---|---|\n");

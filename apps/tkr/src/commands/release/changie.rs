@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, IsTerminal as _},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -75,9 +75,7 @@ pub(crate) async fn create_fragment(
     kind: Option<&str>,
     body: Option<&str>,
 ) -> Result<PathBuf> {
-    use std::io::IsTerminal as _;
-
-    let interactive = std::io::stdin().is_terminal();
+    let interactive = io::stdin().is_terminal();
     if !interactive && kind.is_none() {
         return Err(changelog_error(
             workspace_root,
@@ -119,7 +117,16 @@ pub(crate) async fn create_fragment(
         ));
     }
     let after = fragment_paths(workspace_root)?;
-    let created = after.difference(&before).cloned().collect::<Vec<_>>();
+    // Only paths carrying this invocation's Slice are ours to judge or remove; a
+    // fragment another author lands concurrently must survive an error here.
+    let created = after
+        .difference(&before)
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(&slice))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let [relative] = created.as_slice() else {
         remove_created(workspace_root, &created)?;
         return Err(changelog_error(

@@ -9,9 +9,13 @@ use super::{
     ReleaseReport, RepositoryIdentity, TagResult, TrainState,
 };
 
+// The 0.1.1 train measured registry index liveness of 6–98 seconds per crate; the
+// schedule starts below that band and the window caps well above it.
 const INITIAL_OBSERVATION_DELAY: Duration = Duration::from_secs(5);
 const OBSERVATION_WINDOW: Duration = Duration::from_secs(10 * 60);
-const SUCCESS_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+/// Pause after a successful upload before the next one, so a train of seventeen
+/// crates never trips the registry's publish rate limit.
+pub(crate) const SUCCESS_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// Opaque registry credential admitted only by the publish-and-parity request.
 pub struct RegistryCredential(String);
@@ -195,12 +199,15 @@ fn validate_parity_report(
     plan: &ReleasePlan,
 ) -> Result<(), ReleaseError> {
     let expected_train = super::TrainIdentity::from(plan);
+    // The note digest is deliberately not compared with the Plan: the Plan holds a
+    // dated preview, while the report holds the digest derived from the tagged
+    // version file, which is what the release object must later carry.
     if report.schema_version != RELEASE_SCHEMA_VERSION
         || report.train != expected_train
         || report.tag.tag != plan.tag
         || report.tag.commit.is_empty()
         || !report.tag.published
-        || report.release_notes_sha256 != plan.release_notes_sha256
+        || report.release_notes_sha256.len() != 64
         || report.packages.len() != plan.packages.len()
     {
         return Err(ReleaseError::Plan {
@@ -208,13 +215,18 @@ fn validate_parity_report(
         });
     }
     for (result, package) in report.packages.iter().zip(&plan.packages) {
+        // Parity is four-way here: the bytes the Plan was confirmed for, the bytes
+        // the tag build produced, the bytes the registry serves, and the registry's
+        // own checksum must all agree.
         let checksums_match = result
             .hermetic_sha256
             .as_ref()
             .zip(result.downloaded_sha256.as_ref())
             .zip(result.registry_sha256.as_ref())
             .is_some_and(|((hermetic, downloaded), registry)| {
-                hermetic == downloaded && downloaded == registry
+                *hermetic == package.hermetic_sha256
+                    && hermetic == downloaded
+                    && downloaded == registry
             });
         if result.name != package.name
             || result.version != package.target_version
@@ -309,7 +321,98 @@ pub fn verify_resume_refs(
     })
 }
 
+/// How the pre-mutation observation classifies a train.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReleaseAdmission {
+    /// No release tag exists and the branch still sits at the admitted base.
+    Fresh,
+    /// Both refs already identify this train's Release Commit; nothing is pushed.
+    Resume {
+        /// The published Release Commit.
+        commit: String,
+    },
+}
+
+/// Decide fresh publication versus resume from one branch-and-tag observation.
+///
+/// The decision is taken here, from observed facts, so it is provable offline and
+/// cannot be reordered by the executor: a branch that moved without a tag, or a tag
+/// that is not this train's, is a conflict before any mutation.
+pub fn admit_release_refs(
+    base_commit: &str,
+    tag_name: &str,
+    plan_digest: &str,
+    observation: &RemoteGitObservation,
+) -> Result<ReleaseAdmission, ReleaseError> {
+    match (&observation.tag, &observation.branch) {
+        (None, Some(branch)) if branch.commit == base_commit => Ok(ReleaseAdmission::Fresh),
+        (None, branch) => Err(ReleaseError::GitRefConflict {
+            branch_observed: branch
+                .as_ref()
+                .map_or_else(|| "absent".to_owned(), |value| value.object_id.clone()),
+            tag_observed: "absent".to_owned(),
+        }),
+        // The tag exists but the branch never moved: another train, or a stray tag,
+        // owns the name, and this Plan can never become the published one.
+        (Some(tag), Some(branch)) if branch.commit == base_commit => {
+            Err(ReleaseError::TagConflict {
+                tag: tag_name.to_owned(),
+                expected: format!("sha256:{plan_digest}"),
+                observed: tag.commit.clone(),
+            })
+        }
+        (Some(tag), _) => {
+            verify_resume_refs(tag_name, &tag.commit, plan_digest, observation).map(|result| {
+                ReleaseAdmission::Resume {
+                    commit: result.commit,
+                }
+            })
+        }
+    }
+}
+
+/// Verify a published train without the resume rule's exact-tip requirement.
+///
+/// Verification reads a release that may be days old: the branch has legitimately
+/// moved on, so it must *contain* the tagged commit rather than equal it. The tag is
+/// the identity: its annotation and its commit must carry the same Plan digest, and
+/// the expected digest when the caller supplies one.
+pub fn verify_published_refs(
+    tag_name: &str,
+    observation: &RemoteGitObservation,
+    tag_commit_digest: Option<&str>,
+    branch_contains_tag: bool,
+    expected_plan_digest: Option<&str>,
+) -> Result<TagResult, ReleaseError> {
+    let Some(tag) = &observation.tag else {
+        return Err(ReleaseError::ReleaseNotFound {
+            tag: tag_name.to_owned(),
+        });
+    };
+    let branch_observed = observation
+        .branch
+        .as_ref()
+        .map_or_else(|| "absent".to_owned(), |value| value.object_id.clone());
+    let digest_consistent = tag_commit_digest.is_some_and(|digest| digest == tag.plan_digest)
+        && expected_plan_digest.is_none_or(|expected| expected == tag.plan_digest);
+    if !digest_consistent || !branch_contains_tag || observation.branch.is_none() {
+        return Err(ReleaseError::GitRefConflict {
+            branch_observed,
+            tag_observed: tag.object_id.clone(),
+        });
+    }
+    Ok(TagResult {
+        tag: tag_name.to_owned(),
+        commit: tag.commit.clone(),
+        published: true,
+    })
+}
+
 /// Generate polling intervals: 5 seconds, exponential backoff, hard 10-minute window.
+///
+/// The executor hands this schedule to the registry script verbatim, so the bounds
+/// the spec measured (registry liveness of 6–98 s per crate on the 0.1.1 train) live
+/// in exactly one place.
 pub fn registry_observation_delays() -> Vec<Duration> {
     let mut elapsed = Duration::ZERO;
     let mut delay = INITIAL_OBSERVATION_DELAY;
@@ -364,7 +467,11 @@ pub fn classify_train_state(facts: TrainPhaseFacts) -> TrainState {
     }
 }
 
-/// Refuse decline or Plan drift before a caller crosses any mutation gateway.
+/// The mutation fence: refuse Plan drift or a declined confirmation before any gateway.
+///
+/// `confirmed` is the operator's actual answer, resolved by the caller from `--yes`
+/// or the interactive prompt; a `false` here is an explicit decline, which is why it
+/// maps to `ConfirmationDeclined` rather than to the non-interactive refusal.
 pub fn require_apply_admission(
     stored: &ReleasePlan,
     recomputed: &ReleasePlan,
@@ -379,20 +486,30 @@ pub fn require_apply_admission(
         });
     }
     if !confirmed {
-        return Err(ReleaseError::Confirmation {
-            reason: "the exact recomputed Plan was not confirmed".to_owned(),
-        });
+        return Err(ReleaseError::ConfirmationDeclined);
     }
     Ok(())
 }
 
-/// Exact immutable GitHub release creation arguments.
-pub fn gh_release_create_arguments(tag: &str, notes_file: &str) -> Vec<String> {
+/// Exact immutable GitHub release creation arguments, as the executor runs them.
+///
+/// `--verify-tag` refuses to invent a tag, and `--target` pins the release object to
+/// the Release Commit so a later force of the tag cannot silently move it.
+pub fn gh_release_create_arguments(
+    repository: &str,
+    tag: &str,
+    target: &str,
+    notes_file: &str,
+) -> Vec<String> {
     vec![
         "release".to_owned(),
         "create".to_owned(),
         tag.to_owned(),
+        "--repo".to_owned(),
+        repository.to_owned(),
         "--verify-tag".to_owned(),
+        "--target".to_owned(),
+        target.to_owned(),
         "--title".to_owned(),
         tag.to_owned(),
         "--notes-file".to_owned(),
@@ -401,7 +518,7 @@ pub fn gh_release_create_arguments(tag: &str, notes_file: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{path::PathBuf, sync::Mutex};
 
     use proptest::prelude::*;
@@ -431,19 +548,55 @@ mod tests {
         }
 
         // Feature: release-engineering, Property 8: publish execution is idempotent
+        // (the skip-existing half runs the real registry script in `scripts.rs`)
         #[test]
-        fn observation_schedule_is_bounded_and_rerun_skips_visible_packages(
-            initially_visible in proptest::collection::vec(any::<bool>(), 1..30),
+        fn observation_schedule_starts_small_doubles_and_stays_inside_the_window(
+            _case in 0_u8..8,
         ) {
-            let first_uploads = initially_visible.iter().filter(|visible| !**visible).count();
-            let visible_after_first = vec![true; initially_visible.len()];
-            let rerun_uploads = visible_after_first.iter().filter(|visible| !**visible).count();
             let delays = registry_observation_delays();
-            prop_assert_eq!(first_uploads + rerun_uploads, first_uploads);
             prop_assert_eq!(delays.first().copied(), Some(Duration::from_secs(5)));
             prop_assert_eq!(delays.iter().sum::<Duration>(), Duration::from_secs(600));
             for pair in delays[..delays.len() - 1].windows(2) {
                 prop_assert_eq!(pair[1], pair[0].saturating_mul(2));
+            }
+        }
+
+        // Feature: release-engineering, Property 13: partial-train state classification and resume
+        #[test]
+        fn admission_is_fresh_only_at_the_untouched_base(
+            branch_at_base in any::<bool>(),
+            tag_present in any::<bool>(),
+            tag_is_this_train in any::<bool>(),
+        ) {
+            let base = "b".repeat(40);
+            let moved = "c".repeat(40);
+            let digest = "d".repeat(64);
+            let branch_commit = if branch_at_base { base.clone() } else { moved.clone() };
+            let tag_digest = if tag_is_this_train { digest.clone() } else { "e".repeat(64) };
+            let observation = RemoteGitObservation {
+                branch: Some(ObservedGitRef {
+                    object_id: branch_commit.clone(),
+                    commit: branch_commit.clone(),
+                    plan_digest: if branch_at_base { "absent".to_owned() } else { tag_digest.clone() },
+                }),
+                tag: tag_present.then(|| ObservedGitRef {
+                    object_id: "t".repeat(40),
+                    commit: moved.clone(),
+                    plan_digest: tag_digest.clone(),
+                }),
+            };
+            let admission = admit_release_refs(&base, "v1.0.0", &digest, &observation);
+            let ref_conflict = matches!(admission, Err(ReleaseError::GitRefConflict { .. }));
+            let tag_conflict = matches!(admission, Err(ReleaseError::TagConflict { .. }));
+            match (tag_present, branch_at_base, tag_is_this_train) {
+                (false, true, _) => prop_assert_eq!(admission.ok(), Some(ReleaseAdmission::Fresh)),
+                (false, false, _) => prop_assert!(ref_conflict),
+                (true, true, _) => prop_assert!(tag_conflict),
+                (true, false, true) => prop_assert_eq!(
+                    admission.ok(),
+                    Some(ReleaseAdmission::Resume { commit: moved.clone() })
+                ),
+                (true, false, false) => prop_assert!(ref_conflict),
             }
         }
 
@@ -618,7 +771,7 @@ mod tests {
         }
     }
 
-    fn sample_plan(base: &str) -> ReleasePlan {
+    pub(crate) fn sample_plan(base: &str) -> ReleasePlan {
         let mut plan = ReleasePlan {
             schema_version: RELEASE_SCHEMA_VERSION,
             repository: RepositoryIdentity {
@@ -635,6 +788,7 @@ mod tests {
                 from_version: "0.1.0".to_owned(),
                 target_version: "1.0.0".to_owned(),
                 publishable_dependencies: Vec::new(),
+                hermetic_sha256: "f".repeat(64),
                 registry: PlannedRegistryState::Absent,
             }],
             fragments: Vec::new(),
@@ -665,17 +819,58 @@ mod tests {
             [5, 10, 20, 40, 80, 160, 285].map(Duration::from_secs)
         );
         assert_eq!(
-            gh_release_create_arguments("v1.2.3", "/tmp/notes.md"),
+            gh_release_create_arguments("tokeira/tokeira", "v1.2.3", "commit", "/tmp/notes.md"),
             [
                 "release",
                 "create",
                 "v1.2.3",
+                "--repo",
+                "tokeira/tokeira",
                 "--verify-tag",
+                "--target",
+                "commit",
                 "--title",
                 "v1.2.3",
                 "--notes-file",
                 "/tmp/notes.md",
             ]
+        );
+    }
+
+    #[test]
+    fn verification_needs_a_tag_and_a_branch_that_contains_it() {
+        let digest = "d".repeat(64);
+        let tag = ObservedGitRef {
+            object_id: "t".repeat(40),
+            commit: "c".repeat(40),
+            plan_digest: digest.clone(),
+        };
+        let branch = ObservedGitRef {
+            object_id: "b".repeat(40),
+            commit: "b".repeat(40),
+            plan_digest: "absent".to_owned(),
+        };
+        let absent = RemoteGitObservation {
+            branch: Some(branch.clone()),
+            tag: None,
+        };
+        assert!(matches!(
+            verify_published_refs("v1.0.0", &absent, None, true, None),
+            Err(ReleaseError::ReleaseNotFound { .. })
+        ));
+        let published = RemoteGitObservation {
+            branch: Some(branch),
+            tag: Some(tag),
+        };
+        assert!(verify_published_refs("v1.0.0", &published, Some(&digest), true, None).is_ok());
+        assert!(
+            verify_published_refs("v1.0.0", &published, Some(&digest), true, Some(&digest)).is_ok()
+        );
+        assert!(verify_published_refs("v1.0.0", &published, Some(&digest), false, None).is_err());
+        assert!(verify_published_refs("v1.0.0", &published, Some("other"), true, None).is_err());
+        assert!(
+            verify_published_refs("v1.0.0", &published, Some(&digest), true, Some("other"))
+                .is_err()
         );
     }
 

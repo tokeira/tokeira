@@ -264,10 +264,38 @@ release_branch=$(sed -n 's/^release_branch[[:space:]]*=[[:space:]]*"\([^"]*\)"[[
 if [ -z "$release_branch" ]; then echo 'release config has no release_branch' >&2; exit 1; fi
 base=$(git merge-base HEAD "origin/$release_branch")
 changed=$(git diff --name-only "$base" --)
-non_release=$(printf '%s\n' "$changed" | grep -Ev '^(\.changes/|CHANGELOG.md$|(.*/)?Cargo.toml$|Cargo.lock$|\.tokeira-release.toml$)' || true)
+if [ -z "$changed" ]; then
+  echo 'no changes against the release branch base'
+  exit 0
+fi
+# Three shapes of diff reach this gate. A release preparation consumes fragments into
+# a new version file and is checked by re-running the pinned batch. A coherent slice
+# touches source and must add a fragment that batches on its own. Manifest, lockfile,
+# and release-config bookkeeping carries no user-facing sentence and passes as is.
 added=$(git diff --name-status "$base" -- .changes/unreleased | awk '$1 == "A" && $2 ~ /\.yaml$/ {{ print $2 }}')
 deleted=$(git diff --name-status "$base" -- .changes/unreleased | awk '$1 == "D" && $2 ~ /\.yaml$/ {{ print $2 }}')
-if [ -n "$non_release" ] || {{ [ -n "$added" ] && [ -z "$deleted" ]; }}; then
+version_file=$(git diff --name-status "$base" -- .changes | awk '$1 == "A" && $2 ~ /^\.changes\/[0-9]+\.[0-9]+\.[0-9]+\.md$/ {{ print $2 }}')
+non_release=$(printf '%s\n' "$changed" | grep -Ev '^(\.changes/|CHANGELOG.md$|(.*/)?Cargo.toml$|Cargo.lock$|\.tokeira-release.toml$)' || true)
+if [ -n "$deleted" ] && [ -n "$version_file" ]; then
+  target=${{version_file#.changes/}}
+  target=${{target%.md}}
+  rm -rf /tmp/reference-release /tmp/reference-changes /tmp/actual-changes
+  mkdir -p /tmp/reference-release
+  git archive "$base" | tar -x -C /tmp/reference-release
+  (cd /tmp/reference-release && /tmp/changie batch "$target" --allow-no-changes=false && /tmp/changie merge)
+  # The version heading carries the batch date; the reference batch runs on the day
+  # the gate runs, so headings are compared without their date.
+  undate() {{ sed -E 's/^(## [0-9]+\.[0-9]+\.[0-9]+) on [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$/\1/' "$1"; }}
+  cp -R /tmp/reference-release/.changes /tmp/reference-changes
+  cp -R .changes /tmp/actual-changes
+  for file in "/tmp/reference-changes/$target.md" "/tmp/actual-changes/$target.md"; do
+    undate "$file" >"$file.undated" && mv "$file.undated" "$file"
+  done
+  diff -ruN /tmp/reference-changes /tmp/actual-changes
+  undate /tmp/reference-release/CHANGELOG.md >/tmp/reference-changelog
+  undate CHANGELOG.md >/tmp/actual-changelog
+  cmp /tmp/reference-changelog /tmp/actual-changelog
+elif [ -n "$non_release" ] || [ -n "$added" ]; then
   if [ -z "$added" ]; then
     echo 'non-release change has no newly added .changes/unreleased fragment' >&2
     exit 1
@@ -284,23 +312,8 @@ if [ -n "$non_release" ] || {{ [ -n "$added" ] && [ -z "$deleted" ]; }}; then
       exit 1
     fi
   done
-  /tmp/changie batch 999.999.999 --dry-run --allow-no-changes=false >/tmp/changie-preview
 else
-  target=$(awk '
-    /^\[workspace\.package\]$/ {{ in_workspace=1; next }}
-    /^\[/ {{ in_workspace=0 }}
-    in_workspace && /^version[[:space:]]*=/ {{ value=$0; sub(/^[^\"]*\"/, "", value); sub(/\".*$/, "", value); print value; exit }}
-  ' Cargo.toml)
-  if [ -z "$target" ]; then
-    echo 'release-preparation diff has no workspace.package version' >&2
-    exit 1
-  fi
-  rm -rf /tmp/reference-release
-  mkdir -p /tmp/reference-release
-  git archive "$base" | tar -x -C /tmp/reference-release
-  (cd /tmp/reference-release && /tmp/changie batch "$target" --allow-no-changes=false && /tmp/changie merge)
-  diff -ruN /tmp/reference-release/.changes .changes
-  cmp /tmp/reference-release/CHANGELOG.md CHANGELOG.md
+  echo 'manifest-only change needs no fragment'
 fi
 "#,
         x86_url = linux_x86.url,
@@ -310,12 +323,13 @@ fi
         version = CHANGIE_RELEASE.version,
     );
     let query = client.query();
+    // The SDK takes contents first, then the path.
     let canonical = query
         .directory()
-        .with_new_file(".changie.yaml", include_str!("../../../../.changie.yaml"))
+        .with_new_file(include_str!("../../../../.changie.yaml"), ".changie.yaml")
         .with_new_file(
-            ".changes/header.tpl.md",
             include_str!("../../../../.changes/header.tpl.md"),
+            ".changes/header.tpl.md",
         );
     let base = attach_workspace(
         query
@@ -392,10 +406,12 @@ async fn execute_package_gate(
         arguments.push(package.name);
     }
     let source_digest = "find . -type f -not -path './target/*' -not -path './.git' -print0 | sort -z | xargs -0 sha256sum";
+    // The target cache volume persists between runs; stale archives from an earlier
+    // closure must not be re-validated as if this invocation produced them.
     let base = ci_builder(client, root, layout)?.with_exec(vec![
         "sh",
         "-c",
-        &format!("{source_digest} >/tmp/package-source-before"),
+        &format!("rm -rf target/package && {source_digest} >/tmp/package-source-before"),
     ]);
     let execution = base
         .with_exec(arguments)
@@ -815,14 +831,21 @@ fn attach_workspace(
         .with_workdir("/workspace")
 }
 
+/// Where a workspace's Git state lives, expressed for the engine-side mount.
+///
+/// Linked worktrees keep their `.git` as a pointer into the common directory; the
+/// container receives the common directory at `/repo.git` and a rewritten pointer,
+/// so every Git command inside it sees the same objects and refs the host does.
 #[derive(Debug)]
-struct GitLayout {
-    common_dir: PathBuf,
-    worktree_pointer: String,
+pub(crate) struct GitLayout {
+    /// The shared Git common directory on the host.
+    pub(crate) common_dir: PathBuf,
+    /// Contents of the `.git` pointer file to write into the mounted workspace.
+    pub(crate) worktree_pointer: String,
 }
 
 impl GitLayout {
-    fn resolve(root: &Path) -> Result<Self, BuildError> {
+    pub(crate) fn resolve(root: &Path) -> Result<Self, BuildError> {
         let common_dir = git_path(root, "--git-common-dir")?;
         let git_dir = git_path(root, "--absolute-git-dir")?;
         let relative = git_dir

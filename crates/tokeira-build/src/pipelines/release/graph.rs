@@ -49,6 +49,11 @@ pub fn publishable_packages(metadata: &Metadata) -> Result<Vec<PublishableNode>,
             .ok_or_else(|| ReleaseError::Workspace {
                 reason: format!("Cargo metadata omitted the resolve node for {name}"),
             })?;
+        // Only normal and build edges order publication: they are what the registry
+        // index records and what packaging must resolve. Dev-dependencies never reach
+        // the index, and counting them would turn `tokeira-chasm-derive`'s dev-dependency
+        // on `tokeira-chasm` into a cycle that does not exist for consumers. Cargo's
+        // resolve already carries target-specific and enabled-optional edges here.
         let mut dependencies = resolved
             .deps
             .iter()

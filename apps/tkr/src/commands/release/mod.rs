@@ -1,10 +1,16 @@
 //! `tkr release` — generic Plan, confirmed apply, fragment, and verify commands.
+//!
+//! Stdout carries only the verb's answer (a Plan, a Report, or a fragment path), so
+//! `--json` consumers can parse it. The Plan rendering that precedes a confirmation
+//! prompt, and the prompt itself, go to stderr in JSON mode. A train that stops after
+//! a public boundary still renders its Release Report before the refusal, so the
+//! operator sees what is durable without reading logs.
 
 mod changie;
 
 use std::{
     fs,
-    io::{self, IsTerminal as _, Write as _},
+    io::{self, BufRead, IsTerminal as _, Write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -128,8 +134,17 @@ async fn run_apply(
     )
     .await
     .context("recompute the release Plan")?;
-    require_apply_admission(&stored, &recomputed, true).map_err(|error| anyhow::anyhow!(error))?;
-    require_release_confirmation(&recomputed, yes, io::stdin().is_terminal())
+    // The operator's answer is resolved first and handed to the fence as a fact, so
+    // the fence, not this handler, is what stands between a decline and a mutation.
+    let confirmed = require_release_confirmation(
+        &recomputed,
+        yes,
+        io::stdin().is_terminal(),
+        json,
+        &mut io::stdin().lock(),
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    require_apply_admission(&stored, &recomputed, confirmed)
         .map_err(|error| anyhow::anyhow!(error))?;
 
     let upload_required = recomputed
@@ -155,9 +170,13 @@ async fn run_apply(
         plan: recomputed,
         registry_credential,
     };
-    let parity = publish_and_verify_release(&publish_request, &client)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let parity = match publish_and_verify_release(&publish_request, &client).await {
+        Ok(parity) => parity,
+        Err(error) => {
+            render_stopped_train(&error, json)?;
+            return Err(anyhow::anyhow!(error));
+        }
+    };
     drop(publish_request);
     client
         .close()
@@ -201,7 +220,7 @@ async fn run_apply(
                 outcome: ReleaseNotesOutcome::ExistingVerified,
                 sha256: existing.notes_sha256,
             },
-            diagnostics: Vec::new(),
+            diagnostics: parity.diagnostics,
         };
         render_report(&report, json)?;
         return Ok(());
@@ -242,10 +261,15 @@ async fn run_verify(root: PathBuf, version: &str, output: Option<&Path>, json: b
         .close()
         .await
         .context("close the release verification Dagger invocation")?;
-    let report = outcome.map_err(|error| anyhow::anyhow!(error))?;
-    let bytes = serde_json::to_vec_pretty(&report)?;
+    let report = match outcome {
+        Ok(report) => report,
+        Err(error) => {
+            render_stopped_train(&error, json)?;
+            return Err(anyhow::anyhow!(error));
+        }
+    };
     if let Some(path) = output {
-        let mut terminated = bytes.clone();
+        let mut terminated = serde_json::to_vec_pretty(&report)?;
         terminated.push(b'\n');
         write_atomic(path, &terminated).map_err(|source| {
             anyhow::anyhow!(ReleaseError::ReportOutput {
@@ -254,24 +278,38 @@ async fn run_verify(root: PathBuf, version: &str, output: Option<&Path>, json: b
             })
         })?;
     }
-    render_report(&report, json || output.is_none())
+    render_report(&report, json)
+}
+
+/// Render the Release Report a stopped train carries, if it carries one.
+fn render_stopped_train(error: &ReleaseError, json: bool) -> Result<()> {
+    match error.report() {
+        Some(report) => render_report(report, json),
+        None => Ok(()),
+    }
 }
 
 fn render_report(report: &ReleaseReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(report)?);
-    } else {
-        println!("Release {}: {:?}", report.tag.tag, report.state);
-        for package in &report.packages {
-            let marker = match package.outcome {
-                PackageOutcome::Published => "published",
-                PackageOutcome::ExistingVerified => "verified",
-                PackageOutcome::Pending => "pending",
-                PackageOutcome::Failed => "failed",
-            };
-            println!("  {} {}: {marker}", package.name, package.version);
-        }
-        println!("  release notes: {:?}", report.release_notes.outcome);
+        return Ok(());
+    }
+    println!("Release {}: {:?}", report.tag.tag, report.state);
+    if !report.tag.published {
+        println!("  git: branch and tag not published");
+    }
+    for package in &report.packages {
+        let marker = match package.outcome {
+            PackageOutcome::Published => "published",
+            PackageOutcome::ExistingVerified => "verified",
+            PackageOutcome::Pending => "pending",
+            PackageOutcome::Failed => "failed",
+        };
+        println!("  {} {}: {marker}", package.name, package.version);
+    }
+    println!("  release notes: {:?}", report.release_notes.outcome);
+    for diagnostic in &report.diagnostics {
+        println!("  {}: {}", diagnostic.code, diagnostic.summary);
     }
     Ok(())
 }
@@ -291,14 +329,11 @@ async fn run_plan(
         .await
         .context("close the Dagger release planning session")?;
     let plan = outcome.context("release planning failed")?;
+    let canonical = plan
+        .canonical_json()
+        .map_err(|error| anyhow::anyhow!(error))?;
     if let Some(path) = output {
-        write_atomic(
-            path,
-            &plan
-                .canonical_json()
-                .map_err(|error| anyhow::anyhow!(error))?,
-        )
-        .map_err(|source| {
+        write_atomic(path, &canonical).map_err(|source| {
             anyhow::anyhow!(ReleaseError::PlanOutput {
                 path: path.to_path_buf(),
                 reason: source.to_string(),
@@ -306,80 +341,75 @@ async fn run_plan(
         })?;
     }
     if json {
-        print!(
-            "{}",
-            String::from_utf8(
-                plan.canonical_json()
-                    .map_err(|error| anyhow::anyhow!(error))?
-            )?
-        );
+        print!("{}", String::from_utf8(canonical)?);
     } else if let Some(output) = output {
-        render_plan(&plan);
-        println!("Plan written to {}", output.display());
+        let mut stdout = io::stdout().lock();
+        render_plan(&plan, &mut stdout)?;
+        writeln!(stdout, "Plan written to {}", output.display())?;
     } else {
-        print!(
-            "{}",
-            String::from_utf8(
-                plan.canonical_json()
-                    .map_err(|error| anyhow::anyhow!(error))?
-            )?
-        );
+        print!("{}", String::from_utf8(canonical)?);
     }
     Ok(())
 }
 
-fn render_plan(plan: &ReleasePlan) {
+fn render_plan(plan: &ReleasePlan, out: &mut dyn Write) -> io::Result<()> {
     let existing = plan
         .packages
         .iter()
         .filter(|package| matches!(package.registry, PlannedRegistryState::Existing { .. }))
         .count();
-    println!("Release Plan {}", plan.tag);
-    println!("  repository: {}", plan.repository.slug);
-    println!("  base commit: {}", plan.base_commit);
-    println!("  plan digest: sha256:{}", plan.digest);
-    println!(
+    writeln!(out, "Release Plan {}", plan.tag)?;
+    writeln!(out, "  repository: {}", plan.repository.slug)?;
+    writeln!(out, "  base commit: {}", plan.base_commit)?;
+    writeln!(out, "  plan digest: sha256:{}", plan.digest)?;
+    writeln!(
+        out,
         "  packages: {} ({} already observed)",
         plan.packages.len(),
         existing
-    );
-    println!("  outward effects:");
+    )?;
+    writeln!(out, "  outward effects:")?;
     for effect in &plan.effects {
-        println!("    - {:?}: {}", effect.kind, effect.summary);
+        writeln!(out, "    - {:?}: {}", effect.kind, effect.summary)?;
     }
+    Ok(())
 }
 
+/// Resolve the operator's answer to the exact recomputed Plan.
+///
+/// `Ok(true)` is an affirmative answer or `--yes`; `Ok(false)` is an explicit decline
+/// that the fence turns into `ConfirmationDeclined`; a non-interactive session without
+/// `--yes` cannot answer at all and is refused here. In JSON mode the rendering and
+/// the prompt go to stderr so stdout stays parseable.
 fn require_release_confirmation(
     plan: &ReleasePlan,
     yes: bool,
     interactive: bool,
-) -> Result<(), ReleaseError> {
-    render_plan(plan);
+    json: bool,
+    input: &mut dyn BufRead,
+) -> Result<bool, ReleaseError> {
+    let mut prompt: Box<dyn Write> = if json {
+        Box::new(io::stderr())
+    } else {
+        Box::new(io::stdout())
+    };
+    let io_error = |source: io::Error| ReleaseError::Executor {
+        reason: format!("could not present the release confirmation: {source}"),
+    };
+    render_plan(plan, &mut *prompt).map_err(io_error)?;
     if yes {
-        return Ok(());
+        return Ok(true);
     }
     if !interactive {
         return Err(ReleaseError::Confirmation {
             reason: "--yes is required in a non-interactive session".to_owned(),
         });
     }
-    print!("Apply this exact release Plan? [y/N] ");
-    io::stdout()
-        .flush()
-        .map_err(|source| ReleaseError::Executor {
-            reason: format!("could not flush confirmation prompt: {source}"),
-        })?;
+    write!(prompt, "Apply this exact release Plan? [y/N] ").map_err(io_error)?;
+    prompt.flush().map_err(io_error)?;
     let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .map_err(|source| ReleaseError::Executor {
-            reason: format!("could not read release confirmation: {source}"),
-        })?;
-    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
-        Ok(())
-    } else {
-        Err(ReleaseError::ConfirmationDeclined)
-    }
+    input.read_line(&mut answer).map_err(io_error)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
 fn repository_identity(root: &Path) -> Result<RepositoryIdentity> {
@@ -401,41 +431,12 @@ fn repository_identity(root: &Path) -> Result<RepositoryIdentity> {
             ),
         }));
     }
-    let raw = String::from_utf8(output.stdout)
-        .map_err(|source| {
-            anyhow::anyhow!(ReleaseError::Workspace {
-                reason: format!("origin remote is not UTF-8: {source}"),
-            })
-        })?
-        .trim()
-        .to_owned();
-    let normalized = normalize_remote(&raw)?;
-    let path = normalized
-        .strip_prefix("https://github.com/")
-        .ok_or_else(|| {
-            anyhow::anyhow!(ReleaseError::Workspace {
-                reason: "origin is not a canonical GitHub repository".to_owned(),
-            })
-        })?
-        .trim_end_matches('/');
-    let slug = path.strip_suffix(".git").unwrap_or(path).to_owned();
-    Ok(RepositoryIdentity {
-        remote: format!("https://github.com/{slug}"),
-        slug,
-    })
-}
-
-fn normalize_remote(remote: &str) -> Result<String> {
-    if let Some(path) = remote.strip_prefix("git@github.com:") {
-        return Ok(format!("https://github.com/{path}"));
-    }
-    if let Some(rest) = remote.strip_prefix("https://") {
-        let without_user = rest.rsplit_once('@').map_or(rest, |(_, value)| value);
-        return Ok(format!("https://{without_user}"));
-    }
-    Err(anyhow::anyhow!(ReleaseError::Workspace {
-        reason: "origin remote must use GitHub HTTPS or SSH syntax".to_owned(),
-    }))
+    let raw = String::from_utf8(output.stdout).map_err(|source| {
+        anyhow::anyhow!(ReleaseError::Workspace {
+            reason: format!("origin remote is not UTF-8: {source}"),
+        })
+    })?;
+    RepositoryIdentity::from_remote(&raw).map_err(|error| anyhow::anyhow!(error))
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -513,7 +514,10 @@ fn is_workspace_root(candidate: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use clap::Parser as _;
+    use tokeira_build::{ChangieIdentity, PackagePlan, RELEASE_SCHEMA_VERSION, ToolchainIdentity};
 
     use super::*;
     use crate::cli::{Cli, Command};
@@ -539,16 +543,73 @@ mod tests {
         assert!(Cli::try_parse_from(["tkr", "release", "publish"]).is_err());
     }
 
+    fn sample_plan() -> ReleasePlan {
+        let mut plan = ReleasePlan {
+            schema_version: RELEASE_SCHEMA_VERSION,
+            repository: RepositoryIdentity {
+                slug: "tokeira/tokeira".to_owned(),
+                remote: "https://github.com/tokeira/tokeira".to_owned(),
+            },
+            workspace_root: PathBuf::from("/workspace"),
+            base_commit: "a".repeat(40),
+            target_version: "1.0.0".to_owned(),
+            tag: "v1.0.0".to_owned(),
+            packages: vec![PackagePlan {
+                name: "crate-a".to_owned(),
+                manifest_path: PathBuf::from("crate-a/Cargo.toml"),
+                from_version: "0.1.0".to_owned(),
+                target_version: "1.0.0".to_owned(),
+                publishable_dependencies: Vec::new(),
+                hermetic_sha256: "f".repeat(64),
+                registry: PlannedRegistryState::Absent,
+            }],
+            fragments: Vec::new(),
+            changelog_config_sha256: "b".repeat(64),
+            changie_release: ChangieIdentity {
+                version: "1.25.2".to_owned(),
+                source_revision: "c".repeat(40),
+                platform: "linux-x86_64".to_owned(),
+                asset: "changie.tar.gz".to_owned(),
+                asset_sha256: "d".repeat(64),
+            },
+            toolchain: ToolchainIdentity {
+                rust: "1.97.1".to_owned(),
+                dagger: "0.19.8".to_owned(),
+            },
+            release_notes_sha256: "e".repeat(64),
+            effects: Vec::new(),
+            digest: String::new(),
+        };
+        plan.seal().expect("sample Plan seals");
+        plan
+    }
+
     #[test]
-    fn remote_identity_removes_transport_details() {
-        assert_eq!(
-            normalize_remote("git@github.com:tokeira/tokeira.git").expect("SSH remote"),
-            "https://github.com/tokeira/tokeira.git"
+    fn confirmation_is_answered_by_the_operator_not_the_handler() {
+        let plan = sample_plan();
+        let mut nothing = Cursor::new("");
+        assert!(
+            require_release_confirmation(&plan, true, false, true, &mut nothing).expect("--yes"),
+            "--yes confirms without a prompt"
         );
-        assert_eq!(
-            normalize_remote("https://operator@github.com/tokeira/tokeira.git")
-                .expect("credential-bearing HTTPS remote"),
-            "https://github.com/tokeira/tokeira.git"
+        assert!(matches!(
+            require_release_confirmation(&plan, false, false, true, &mut nothing),
+            Err(ReleaseError::Confirmation { .. })
+        ));
+        let mut affirmative = Cursor::new("y\n");
+        assert!(
+            require_release_confirmation(&plan, false, true, true, &mut affirmative)
+                .expect("interactive answer")
         );
+        let mut decline = Cursor::new("n\n");
+        assert!(
+            !require_release_confirmation(&plan, false, true, true, &mut decline)
+                .expect("interactive answer")
+        );
+        assert!(matches!(
+            require_apply_admission(&plan, &plan, false),
+            Err(ReleaseError::ConfirmationDeclined)
+        ));
+        assert!(require_apply_admission(&plan, &plan, true).is_ok());
     }
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ReleaseError, digest::sha256_hex};
+use super::{ReleaseError, sha256_hex};
 
 /// Current JSON schema used by release Plans and Reports.
 pub const RELEASE_SCHEMA_VERSION: u32 = 1;
@@ -15,8 +15,47 @@ pub const RELEASE_SCHEMA_VERSION: u32 = 1;
 pub struct RepositoryIdentity {
     /// Repository slug, normally `owner/name`.
     pub slug: String,
-    /// Normalized HTTPS or SSH remote with any user-info removed.
+    /// Canonical HTTPS remote with transport and user-info removed.
     pub remote: String,
+}
+
+impl RepositoryIdentity {
+    /// Derive the canonical identity from a Git remote URL.
+    ///
+    /// SSH and HTTPS spellings of the same GitHub repository collapse to one identity,
+    /// and any user-info (a token embedded in an HTTPS remote) is dropped before the
+    /// value can reach a Plan, a trailer, or a diagnostic.
+    pub fn from_remote(raw: &str) -> Result<Self, ReleaseError> {
+        let raw = raw.trim();
+        let https = if let Some(path) = raw.strip_prefix("git@github.com:") {
+            format!("https://github.com/{path}")
+        } else if let Some(path) = raw.strip_prefix("ssh://git@github.com/") {
+            format!("https://github.com/{path}")
+        } else if let Some(rest) = raw.strip_prefix("https://") {
+            let without_user = rest.rsplit_once('@').map_or(rest, |(_, value)| value);
+            format!("https://{without_user}")
+        } else {
+            return Err(ReleaseError::Workspace {
+                reason: "origin remote must use GitHub HTTPS or SSH syntax".to_owned(),
+            });
+        };
+        let path = https
+            .strip_prefix("https://github.com/")
+            .ok_or_else(|| ReleaseError::Workspace {
+                reason: "origin is not a canonical GitHub repository".to_owned(),
+            })?
+            .trim_end_matches('/');
+        let slug = path.strip_suffix(".git").unwrap_or(path).to_owned();
+        if slug.split('/').filter(|part| !part.is_empty()).count() != 2 {
+            return Err(ReleaseError::Workspace {
+                reason: format!("origin does not name one owner/repository: {slug}"),
+            });
+        }
+        Ok(Self {
+            remote: format!("https://github.com/{slug}"),
+            slug,
+        })
+    }
 }
 
 /// One admitted changelog fragment.
@@ -79,6 +118,12 @@ pub struct PackagePlan {
     pub target_version: String,
     /// Internal publishable prerequisites in lexical order.
     pub publishable_dependencies: Vec<String>,
+    /// SHA-256 of the hermetic target-version `.crate` bytes built while planning.
+    ///
+    /// The Hermetic Tag Build must reproduce exactly these bytes before anything is
+    /// pushed, and every registry checksum must equal them; a train whose bytes cannot
+    /// match is refused before its first irreversible step.
+    pub hermetic_sha256: String,
     /// Read-only crates.io state observed during planning.
     pub registry: PlannedRegistryState,
 }
@@ -133,7 +178,11 @@ pub struct ReleasePlan {
     pub changie_release: ChangieIdentity,
     /// Pinned build identities.
     pub toolchain: ToolchainIdentity,
-    /// Digest of the deterministic note preview.
+    /// Digest of the planning-time note preview.
+    ///
+    /// Informational only: the version heading carries the changie batch date, so the
+    /// preview advances with the calendar. The notes that count are derived from the
+    /// tagged version file at apply and verify time and carried by the Release Report.
     pub release_notes_sha256: String,
     /// Ordered effects that require operator confirmation.
     pub effects: Vec<ReleaseEffect>,
@@ -148,8 +197,16 @@ struct DigestPackage<'a> {
     from_version: &'a str,
     target_version: &'a str,
     publishable_dependencies: &'a [String],
+    hermetic_sha256: &'a str,
 }
 
+/// The Train Identity input: everything that fixes *what* the train publishes.
+///
+/// Excluded on purpose: `workspace_root` (host detail), registry observations (they
+/// advance as the train progresses), and `release_notes_sha256` (its version heading
+/// is dated by the batch, so including it would make a Plan expire at midnight and a
+/// pending train unresumable the next day). Included on purpose: the hermetic crate
+/// checksums, which bind the identity to the exact bytes the train may publish.
 #[derive(Serialize)]
 struct PlanDigestInput<'a> {
     schema_version: u32,
@@ -162,7 +219,6 @@ struct PlanDigestInput<'a> {
     changelog_config_sha256: &'a str,
     changie_release: &'a ChangieIdentity,
     toolchain: &'a ToolchainIdentity,
-    release_notes_sha256: &'a str,
     effects: &'a [ReleaseEffect],
 }
 
@@ -187,6 +243,7 @@ impl ReleasePlan {
                 from_version: &package.from_version,
                 target_version: &package.target_version,
                 publishable_dependencies: &package.publishable_dependencies,
+                hermetic_sha256: &package.hermetic_sha256,
             })
             .collect();
         let input = PlanDigestInput {
@@ -200,7 +257,6 @@ impl ReleasePlan {
             changelog_config_sha256: &self.changelog_config_sha256,
             changie_release: &self.changie_release,
             toolchain: &self.toolchain,
-            release_notes_sha256: &self.release_notes_sha256,
             effects: &self.effects,
         };
         let bytes = serde_json::to_vec(&input).map_err(|source| ReleaseError::Plan {
@@ -218,8 +274,8 @@ impl ReleasePlan {
     /// Reject unsupported schema or tampered Plan bytes before any mutation.
     pub fn validate_digest(&self) -> Result<(), ReleaseError> {
         if self.schema_version != RELEASE_SCHEMA_VERSION {
-            return Err(ReleaseError::Plan {
-                reason: format!("unsupported schema version {}", self.schema_version),
+            return Err(ReleaseError::UnsupportedPlanSchema {
+                observed: self.schema_version,
             });
         }
         let computed = self.computed_digest()?;
@@ -400,7 +456,28 @@ mod tests {
 
     use super::*;
 
-    fn plan(root: PathBuf, registry: PlannedRegistryState) -> ReleasePlan {
+    #[test]
+    fn remote_identity_removes_transport_details() {
+        for remote in [
+            "git@github.com:tokeira/tokeira.git",
+            "ssh://git@github.com/tokeira/tokeira.git",
+            "https://operator:token@github.com/tokeira/tokeira.git",
+            "https://github.com/tokeira/tokeira/",
+        ] {
+            let identity = RepositoryIdentity::from_remote(remote).expect("GitHub remote");
+            assert_eq!(identity.slug, "tokeira/tokeira");
+            assert_eq!(identity.remote, "https://github.com/tokeira/tokeira");
+        }
+        assert!(RepositoryIdentity::from_remote("https://gitlab.com/tokeira/tokeira").is_err());
+        assert!(RepositoryIdentity::from_remote("git@github.com:tokeira").is_err());
+    }
+
+    fn plan(
+        root: PathBuf,
+        registry: PlannedRegistryState,
+        hermetic_sha256: &str,
+        release_notes_sha256: &str,
+    ) -> ReleasePlan {
         let mut plan = ReleasePlan {
             schema_version: RELEASE_SCHEMA_VERSION,
             repository: RepositoryIdentity {
@@ -417,6 +494,7 @@ mod tests {
                 from_version: "0.1.0".to_owned(),
                 target_version: "0.2.0".to_owned(),
                 publishable_dependencies: Vec::new(),
+                hermetic_sha256: hermetic_sha256.to_owned(),
                 registry,
             }],
             fragments: Vec::new(),
@@ -432,7 +510,7 @@ mod tests {
                 rust: "1.97.1".to_owned(),
                 dagger: "0.19.8".to_owned(),
             },
-            release_notes_sha256: "e".repeat(64),
+            release_notes_sha256: release_notes_sha256.to_owned(),
             effects: Vec::new(),
             digest: String::new(),
         };
@@ -449,17 +527,43 @@ mod tests {
             root_a in "/[a-z]{1,8}",
             root_b in "/[a-z]{1,8}",
             checksum in "[0-9a-f]{64}",
-            _registry_token in proptest::collection::vec(any::<u8>(), 1..64),
+            hermetic in "[0-9a-f]{64}",
+            other_hermetic in "[0-9a-f]{64}",
+            notes_today in "[0-9a-f]{64}",
+            notes_tomorrow in "[0-9a-f]{64}",
+            registry_token in proptest::collection::vec(any::<u8>(), 1..64),
         ) {
-            let absent = plan(PathBuf::from(root_a), PlannedRegistryState::Absent);
+            // Host path, registry state, and the dated note preview may all differ
+            // between planning and apply without changing what the train publishes.
+            let absent = plan(
+                PathBuf::from(root_a),
+                PlannedRegistryState::Absent,
+                &hermetic,
+                &notes_today,
+            );
             let existing = plan(
                 PathBuf::from(root_b),
                 PlannedRegistryState::Existing { checksum },
+                &hermetic,
+                &notes_tomorrow,
             );
-
             prop_assert_eq!(&absent.digest, &existing.digest);
             prop_assert!(absent.validate_digest().is_ok());
             prop_assert!(existing.validate_digest().is_ok());
+
+            // Different crate bytes are a different train.
+            let rebuilt = plan(
+                PathBuf::from("/same"),
+                PlannedRegistryState::Absent,
+                &other_hermetic,
+                &notes_today,
+            );
+            prop_assert_eq!(rebuilt.digest == absent.digest, other_hermetic == hermetic);
+
+            // No credential byte can reach the Plan's canonical form.
+            let canonical = absent.canonical_json().expect("canonical Plan JSON");
+            let token = String::from_utf8_lossy(&registry_token).into_owned();
+            prop_assert!(token.is_empty() || token.len() < 8 || !String::from_utf8_lossy(&canonical).contains(&token));
         }
     }
 }

@@ -1,141 +1,78 @@
-//! Transactional Unified Version rewriting and release command construction.
+//! Unified Version rewriting and the exact command shapes the executor runs.
+//!
+//! The rewrite is textual on purpose: a TOML round-trip would reorder tables and
+//! normalize formatting, and the Release Commit must touch only the version scalars
+//! it owns. Every rewrite is re-parsed afterwards and its dependency membership is
+//! compared with the input, so a slipped edit can never reach the tag.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
-use super::{ReleaseConfig, ReleaseError, ReleasePlan};
+use super::{ExtraVersionField, ReleaseError, ReleasePlan};
 
-/// Fully validated source mutation set, ready for one atomic export.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreparedRelease {
-    /// Complete replacement contents keyed by workspace-relative path.
-    pub files: BTreeMap<PathBuf, String>,
-    /// Exact pinned changie batch arguments.
-    pub changie_batch_arguments: Vec<String>,
-    /// Exact pinned changie merge arguments.
-    pub changie_merge_arguments: Vec<String>,
-    /// Release commit message including the Train Identity trailer.
-    pub commit_message: String,
-    /// Annotated tag message carrying the same Train Identity.
-    pub tag_message: String,
-}
-
-/// Isolated source seam; a production implementation is backed by one Dagger directory.
-pub trait ReleaseSource {
-    /// Read exact UTF-8 bytes from an isolated source snapshot.
-    fn read_text(&self, path: &Path) -> Result<String, ReleaseError>;
-    /// Run pinned changie batch and merge in isolation, returning all resulting replacements.
-    fn batch_changelog(
-        &self,
-        target_version: &str,
-    ) -> Result<BTreeMap<PathBuf, String>, ReleaseError>;
-    /// Atomically export a completely validated replacement set.
-    fn export(&self, files: &BTreeMap<PathBuf, String>) -> Result<(), ReleaseError>;
-}
-
-/// Prepare all release-owned source bytes, exporting only after every check succeeds.
-pub fn prepare_release_source(
-    plan: &ReleasePlan,
-    source: &dyn ReleaseSource,
-) -> Result<PreparedRelease, ReleaseError> {
-    plan.validate_digest()?;
-    let current_version = plan
-        .packages
-        .first()
-        .map(|package| package.from_version.as_str())
-        .ok_or_else(|| ReleaseError::Plan {
-            reason: "release Plan has no publishable packages".to_owned(),
-        })?;
-    let internal = plan
-        .packages
-        .iter()
-        .map(|package| package.name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut files = BTreeMap::new();
-    let root_manifest = PathBuf::from("Cargo.toml");
-    let root_text = source.read_text(&root_manifest)?;
-    let rewritten_root = rewrite_manifest(
-        &root_text,
-        current_version,
-        &plan.target_version,
-        &internal,
-        true,
-    )?;
-    files.insert(root_manifest, rewritten_root);
-    for package in &plan.packages {
-        if files.contains_key(&package.manifest_path) {
+/// Rewrite every release-owned manifest and extra version field of a workspace.
+///
+/// `manifests` lists each publishable package with its workspace-relative manifest
+/// path; the root manifest is always rewritten as well. One function serves both the
+/// read-only planning build and the apply-time preparation, so the bytes the operator
+/// confirmed are the bytes that get tagged.
+pub fn rewrite_workspace_manifests(
+    workspace_root: &Path,
+    manifests: &[(String, PathBuf)],
+    internal_packages: &BTreeSet<String>,
+    current_version: &str,
+    target_version: &str,
+    extra_version_fields: &[ExtraVersionField],
+) -> Result<BTreeMap<PathBuf, String>, ReleaseError> {
+    let read = |relative: &Path| -> Result<String, ReleaseError> {
+        let path = workspace_root.join(relative);
+        std::fs::read_to_string(&path).map_err(|source| ReleaseError::Workspace {
+            reason: format!("could not read {}: {source}", path.display()),
+        })
+    };
+    let root = PathBuf::from("Cargo.toml");
+    let mut rewritten = BTreeMap::new();
+    rewritten.insert(
+        root.clone(),
+        rewrite_manifest(
+            &read(&root)?,
+            current_version,
+            target_version,
+            internal_packages,
+            true,
+        )?,
+    );
+    for (name, manifest_path) in manifests {
+        if rewritten.contains_key(manifest_path) {
             continue;
         }
-        let text = source.read_text(&package.manifest_path)?;
-        let rewritten = rewrite_manifest(
-            &text,
-            &package.from_version,
-            &plan.target_version,
-            &internal,
-            true,
-        )?;
-        files.insert(package.manifest_path.clone(), rewritten);
+        let text = read(manifest_path).map_err(|source| ReleaseError::Workspace {
+            reason: format!("manifest for {name}: {source}"),
+        })?;
+        rewritten.insert(
+            manifest_path.clone(),
+            rewrite_manifest(
+                &text,
+                current_version,
+                target_version,
+                internal_packages,
+                true,
+            )?,
+        );
     }
-    let config = ReleaseConfig::load(&plan.workspace_root, &plan.repository)?;
-    for field in &config.extra_version_fields {
-        let input = match files.get(&field.path) {
-            Some(rewritten) => rewritten.clone(),
-            None => source.read_text(&field.path)?,
+    for field in extra_version_fields {
+        let input = match rewritten.get(&field.path) {
+            Some(text) => text.clone(),
+            None => read(&field.path)?,
         };
-        let rewritten =
-            rewrite_extra_version_field(&input, &field.key, current_version, &plan.target_version)?;
-        files.insert(field.path.clone(), rewritten);
+        rewritten.insert(
+            field.path.clone(),
+            rewrite_extra_version_field(&input, &field.key, current_version, target_version)?,
+        );
     }
-
-    let changelog_files = source.batch_changelog(&plan.target_version)?;
-    for fragment in &plan.fragments {
-        if changelog_files.contains_key(&fragment.path) {
-            return Err(ReleaseError::Changelog {
-                path: fragment.path.clone(),
-                reason: "batched fragments must be consumed, not replaced".to_owned(),
-            });
-        }
-    }
-    let version_file = PathBuf::from(format!(".changes/{}.md", plan.target_version));
-    for required in [Path::new("CHANGELOG.md"), version_file.as_path()] {
-        if !changelog_files.contains_key(required) {
-            return Err(ReleaseError::Changelog {
-                path: required.to_path_buf(),
-                reason: "pinned changie preparation omitted a required output".to_owned(),
-            });
-        }
-    }
-    if let Some(path) = changelog_files
-        .keys()
-        .find(|path| path.as_path() != Path::new("CHANGELOG.md") && **path != version_file)
-    {
-        return Err(ReleaseError::Changelog {
-            path: path.clone(),
-            reason: "pinned changie preparation changed an unowned path".to_owned(),
-        });
-    }
-    files.extend(changelog_files);
-    let prepared = PreparedRelease {
-        files,
-        changie_batch_arguments: vec![
-            "batch".to_owned(),
-            plan.target_version.clone(),
-            "--allow-no-changes=false".to_owned(),
-        ],
-        changie_merge_arguments: vec!["merge".to_owned()],
-        commit_message: format!(
-            "release: prepare {}\n\nRelease-Plan-Digest: sha256:{}\n",
-            plan.tag, plan.digest
-        ),
-        tag_message: format!(
-            "{}\n\nRelease-Plan-Digest: sha256:{}\n",
-            plan.tag, plan.digest
-        ),
-    };
-    source.export(&prepared.files)?;
-    Ok(prepared)
+    Ok(rewritten)
 }
 
 /// Rewrite release-owned TOML scalar values without reordering or changing membership.
@@ -146,10 +83,15 @@ pub fn rewrite_manifest(
     internal_packages: &BTreeSet<String>,
     rewrite_package_version: bool,
 ) -> Result<String, ReleaseError> {
-    let _: toml::Value = toml::from_str(input).map_err(|source| ReleaseError::Plan {
+    let parsed: toml::Value = toml::from_str(input).map_err(|source| ReleaseError::Plan {
         reason: format!("manifest is not valid TOML before rewrite: {source}"),
     })?;
     let before_membership = dependency_membership(input)?;
+    // A dependency written as its own table (`[dependencies.tokeira-kernel]`) carries
+    // `version` on a line of its own, and an alias (`package = "..."`) may follow it.
+    // The internal-package decision is therefore taken from the parsed tree before
+    // the line walk; the walk only needs to know which section it is standing in.
+    let internal_subtables = internal_dependency_subtables(&parsed, internal_packages);
     let mut section = String::new();
     let mut output = String::with_capacity(input.len());
     let mut replacements = 0_usize;
@@ -158,7 +100,7 @@ pub fn rewrite_manifest(
         let newline = if raw_line.ends_with('\n') { "\n" } else { "" };
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            section = trimmed.trim_matches(&['[', ']'][..]).to_owned();
+            section = normalize_section(trimmed.trim_matches(&['[', ']'][..]));
             output.push_str(line);
             output.push_str(newline);
             continue;
@@ -169,6 +111,10 @@ pub fn rewrite_manifest(
             && matches!(section.as_str(), "package" | "workspace.package")
             && key == Some("version")
         {
+            replace_quoted_assignment(line, current_version, target_version).inspect(|_| {
+                replacements += 1;
+            })?
+        } else if internal_subtables.contains(&section) && key == Some("version") {
             replace_quoted_assignment(line, current_version, target_version).inspect(|_| {
                 replacements += 1;
             })?
@@ -224,6 +170,64 @@ fn dependency_targets_internal(
         .and_then(|dependency| dependency.get("package"))
         .and_then(toml::Value::as_str)
         .is_some_and(|package| internal_packages.contains(package))
+}
+
+/// Section paths of dependency sub-tables that resolve to an internal package.
+///
+/// Every publish-relevant dependency table (`dependency_section`) is walked; a child
+/// that is itself a table is a sub-table dependency whose package is the `package`
+/// alias when present and the key otherwise. Dev-dependency tables are excluded by
+/// `dependency_section`, so their sub-tables keep their pins.
+fn internal_dependency_subtables(
+    value: &toml::Value,
+    internal_packages: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut sections = BTreeSet::new();
+    collect_internal_subtables(String::new(), value, internal_packages, &mut sections);
+    sections
+}
+
+fn collect_internal_subtables(
+    path: String,
+    value: &toml::Value,
+    internal_packages: &BTreeSet<String>,
+    sections: &mut BTreeSet<String>,
+) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for (key, child) in table {
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        if dependency_section(&path) && child.is_table() {
+            let resolved = child
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(key);
+            if internal_packages.contains(resolved) {
+                sections.insert(normalize_section(&child_path));
+            }
+        }
+        collect_internal_subtables(child_path, child, internal_packages, sections);
+    }
+}
+
+/// Reduce a raw table header to the dotted key path the parsed tree reports.
+///
+/// Headers may quote components (`[target.'cfg(unix)'.dependencies]`), while the
+/// parsed tree stores the unquoted key; dropping the quote characters on both sides
+/// makes the two comparable without a second TOML parse per line.
+fn normalize_section(raw: &str) -> String {
+    raw.chars()
+        .filter(|character| !matches!(character, '"' | '\''))
+        .collect::<String>()
+        .split('.')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Rewrite one repository-owned TOML string scalar selected by an exact key path.
@@ -444,12 +448,19 @@ fn collect_dependency_tables(
     }
 }
 
-/// Exact one-invocation Cargo package arguments for a publishable closure.
+/// Exact one-invocation Cargo package arguments for a Plan's publishable closure.
 pub fn cargo_package_arguments(plan: &ReleasePlan) -> Vec<String> {
-    package_arguments_for_names(plan.packages.iter().map(|package| package.name.as_str()))
+    cargo_package_arguments_for_names(plan.packages.iter().map(|package| package.name.as_str()))
 }
 
-fn package_arguments_for_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+/// Exact one-invocation Cargo package arguments for an ordered set of package names.
+///
+/// One invocation matters: per-crate packaging resolves sibling versions against the
+/// registry and fails until they are published, while a single multi-package call
+/// resolves them against the workspace.
+pub fn cargo_package_arguments_for_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
     let mut arguments = vec![
         "package".to_owned(),
         "--locked".to_owned(),
@@ -475,90 +486,9 @@ pub fn atomic_git_push_arguments(remote: &str, branch: &str, tag: &str) -> Vec<S
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use proptest::prelude::*;
 
     use super::*;
-    use crate::pipelines::release::{
-        ChangieIdentity, PackagePlan, PlannedRegistryState, RELEASE_SCHEMA_VERSION, ReleaseEffect,
-        ReleaseEffectKind, RepositoryIdentity, ToolchainIdentity,
-    };
-
-    struct RecordingSource {
-        files: BTreeMap<PathBuf, String>,
-        changelog: BTreeMap<PathBuf, String>,
-        exports: Mutex<Vec<BTreeMap<PathBuf, String>>>,
-    }
-
-    impl ReleaseSource for RecordingSource {
-        fn read_text(&self, path: &Path) -> Result<String, ReleaseError> {
-            self.files
-                .get(path)
-                .cloned()
-                .ok_or_else(|| ReleaseError::Plan {
-                    reason: format!("fixture omitted {}", path.display()),
-                })
-        }
-
-        fn batch_changelog(
-            &self,
-            _target_version: &str,
-        ) -> Result<BTreeMap<PathBuf, String>, ReleaseError> {
-            Ok(self.changelog.clone())
-        }
-
-        fn export(&self, files: &BTreeMap<PathBuf, String>) -> Result<(), ReleaseError> {
-            self.exports
-                .lock()
-                .expect("export recorder lock")
-                .push(files.clone());
-            Ok(())
-        }
-    }
-
-    fn preparation_plan(root: &Path) -> ReleasePlan {
-        let mut plan = ReleasePlan {
-            schema_version: RELEASE_SCHEMA_VERSION,
-            repository: RepositoryIdentity {
-                slug: "tokeira/tokeira".to_owned(),
-                remote: "https://github.com/tokeira/tokeira".to_owned(),
-            },
-            workspace_root: root.to_path_buf(),
-            base_commit: "a".repeat(40),
-            target_version: "0.2.0".to_owned(),
-            tag: "v0.2.0".to_owned(),
-            packages: vec![PackagePlan {
-                name: "fixture".to_owned(),
-                manifest_path: PathBuf::from("Cargo.toml"),
-                from_version: "0.1.1".to_owned(),
-                target_version: "0.2.0".to_owned(),
-                publishable_dependencies: Vec::new(),
-                registry: PlannedRegistryState::Absent,
-            }],
-            fragments: Vec::new(),
-            changelog_config_sha256: "b".repeat(64),
-            changie_release: ChangieIdentity {
-                version: "1.25.2".to_owned(),
-                source_revision: "c".repeat(40),
-                platform: "linux-x86_64".to_owned(),
-                asset: "changie.tar.gz".to_owned(),
-                asset_sha256: "d".repeat(64),
-            },
-            toolchain: ToolchainIdentity {
-                rust: "1.97.1".to_owned(),
-                dagger: "v1".to_owned(),
-            },
-            release_notes_sha256: "e".repeat(64),
-            effects: vec![ReleaseEffect {
-                kind: ReleaseEffectKind::Source,
-                summary: "prepare source".to_owned(),
-            }],
-            digest: String::new(),
-        };
-        plan.seal().expect("fixture Plan seals");
-        plan
-    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
@@ -568,10 +498,22 @@ mod tests {
         fn rewrite_changes_only_owned_versions(
             target_minor in 2_u16..500,
             feature in "[a-z]{1,12}",
-            unrelated in "[a-z]{1,12}",
+            unrelated in "x[a-z]{1,11}",
+            subtable in any::<bool>(),
         ) {
+            // The internal dependency is declared either inline or as its own table;
+            // both forms are release-owned and must move with the train.
+            let dependencies = if subtable {
+                format!(
+                    "[dependencies]\n{unrelated} = \"1\"\n\n[dependencies.internal]\npath = \"../internal\"\nversion = \"0.1.1\"\nfeatures = [\"{feature}\"]\n"
+                )
+            } else {
+                format!(
+                    "[dependencies]\n{unrelated} = \"1\"\ninternal = {{ path = \"../internal\", version = \"0.1.1\", features = [\"{feature}\"] }}\n"
+                )
+            };
             let input = format!(
-                "[package]\nname = \"example\"\nversion = \"0.1.1\"\n\n[dependencies]\ninternal = {{ path = \"../internal\", version = \"0.1.1\", features = [\"{feature}\"] }}\n{unrelated} = \"1\"\n\n[dev-dependencies]\ninternal = {{ path = \"../internal\", version = \"0.1.1\" }}\n"
+                "[package]\nname = \"example\"\nversion = \"0.1.1\"\n\n{dependencies}\n[dev-dependencies]\ninternal = {{ path = \"../internal\", version = \"0.1.1\" }}\n"
             );
             let target = format!("0.{target_minor}.0");
             let rewritten = rewrite_manifest(
@@ -583,12 +525,19 @@ mod tests {
             )
             .expect("valid rewrite");
 
-            let target_present = rewritten.contains(&format!("version = \"{}\"", target));
+            let stale_internal_pins = rewritten
+                .split("[dev-dependencies]")
+                .next()
+                .expect("manifest keeps its dev-dependency table")
+                .matches("version = \"0.1.1\"")
+                .count();
             let feature_present = rewritten.contains(&format!("features = [\"{}\"]", feature));
             let unrelated_present = rewritten.contains(&format!("{} = \"1\"", unrelated));
             let dev_unchanged = rewritten.contains(
                 "[dev-dependencies]\ninternal = { path = \"../internal\", version = \"0.1.1\" }"
             );
+            let target_present = rewritten.contains(&format!("version = \"{target}\""));
+            prop_assert_eq!(stale_internal_pins, 0);
             prop_assert!(target_present);
             prop_assert!(feature_present);
             prop_assert!(unrelated_present);
@@ -626,7 +575,7 @@ mod tests {
             path_only in any::<bool>(),
         ) {
             let ordered = names.iter().map(String::as_str).collect::<Vec<_>>();
-            let arguments = package_arguments_for_names(ordered.iter().copied());
+            let arguments = cargo_package_arguments_for_names(ordered.iter().copied());
             let selected = arguments
                 .windows(2)
                 .filter(|pair| pair[0] == "--package")
@@ -671,6 +620,33 @@ mod tests {
     }
 
     #[test]
+    fn subtable_internal_dependencies_move_with_the_train() {
+        // The shape `crates/tokeira-edge/Cargo.toml` uses for every internal edge, plus
+        // an aliased sub-table, a target-specific sub-table, and a dev sub-table that
+        // must keep its pin.
+        let input = "[package]\nname = \"consumer\"\nversion = \"0.1.1\"\n\n[dependencies]\nserde = \"1\"\n\n[dependencies.internal]\npath = \"../internal\"\nversion = \"0.1.1\"\n\n[dependencies.alias]\nversion = \"0.1.1\"\npath = \"../internal\"\npackage = \"internal\"\n\n[target.'cfg(unix)'.dependencies.internal]\npath = \"../internal\"\nversion = \"0.1.1\"\n\n[dev-dependencies.internal]\npath = \"../internal\"\nversion = \"0.1.1\"\n";
+        let rewritten = rewrite_manifest(
+            input,
+            "0.1.1",
+            "0.2.0",
+            &BTreeSet::from(["internal".to_owned()]),
+            true,
+        )
+        .expect("sub-table internal dependencies are release-owned");
+        let (release_owned, dev) = rewritten
+            .split_once("[dev-dependencies.internal]")
+            .expect("dev sub-table survives");
+        assert_eq!(release_owned.matches("version = \"0.2.0\"").count(), 4);
+        assert_eq!(release_owned.matches("version = \"0.1.1\"").count(), 0);
+        assert!(dev.contains("version = \"0.1.1\""));
+        assert!(rewritten.contains("serde = \"1\""));
+        assert_eq!(
+            dependency_membership(input).expect("input membership"),
+            dependency_membership(&rewritten).expect("rewritten membership")
+        );
+    }
+
+    #[test]
     fn aliased_internal_dependency_moves_with_the_train() {
         let input = "[package]\nname = \"consumer\"\nversion = \"0.1.1\"\n\n[dependencies]\nalias = { package = \"internal\", path = \"../internal\", version = \"0.1.1\" }\n";
         let rewritten = rewrite_manifest(
@@ -689,36 +665,49 @@ mod tests {
     }
 
     #[test]
-    fn preparation_exports_only_after_the_complete_changie_diff_is_admitted() {
+    fn workspace_rewrite_covers_root_members_and_extra_fields() {
         let workspace = tempfile::tempdir().expect("fixture workspace");
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("crates/member")).expect("member dir");
         std::fs::write(
-            workspace.path().join(".tokeira-release.toml"),
-            "schema_version = 1\nrelease_branch = \"main\"\n",
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\n\n[workspace.package]\nversion = \"0.1.1\"\n\n[workspace.dependencies]\nmember = { path = \"crates/member\", version = \"0.1.1\" }\n",
         )
-        .expect("release config");
-        let manifest = "[package]\nname = \"fixture\"\nversion = \"0.1.1\"\n";
-        let required = BTreeMap::from([
-            (PathBuf::from("CHANGELOG.md"), "# Changelog\n".to_owned()),
-            (PathBuf::from(".changes/0.2.0.md"), "## 0.2.0\n".to_owned()),
-        ]);
-        let source = RecordingSource {
-            files: BTreeMap::from([(PathBuf::from("Cargo.toml"), manifest.to_owned())]),
-            changelog: required.clone(),
-            exports: Mutex::new(Vec::new()),
-        };
-        let plan = preparation_plan(workspace.path());
-        let prepared = prepare_release_source(&plan, &source).expect("complete preparation");
-        assert_eq!(source.exports.lock().expect("exports").len(), 1);
-        assert_eq!(prepared.files[Path::new("CHANGELOG.md")], "# Changelog\n");
-
-        let mut unexpected = required;
-        unexpected.insert(PathBuf::from("README.md"), "changed\n".to_owned());
-        let refused = RecordingSource {
-            files: BTreeMap::from([(PathBuf::from("Cargo.toml"), manifest.to_owned())]),
-            changelog: unexpected,
-            exports: Mutex::new(Vec::new()),
-        };
-        assert!(prepare_release_source(&plan, &refused).is_err());
-        assert!(refused.exports.lock().expect("exports").is_empty());
+        .expect("root manifest");
+        std::fs::write(
+            root.join("crates/member/Cargo.toml"),
+            "[package]\nname = \"member\"\nversion.workspace = true\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .expect("member manifest");
+        std::fs::write(
+            root.join("release.toml"),
+            "[release]\nversion = \"0.1.1\"\n",
+        )
+        .expect("extra field file");
+        let rewritten = rewrite_workspace_manifests(
+            root,
+            &[(
+                "member".to_owned(),
+                PathBuf::from("crates/member/Cargo.toml"),
+            )],
+            &BTreeSet::from(["member".to_owned()]),
+            "0.1.1",
+            "0.2.0",
+            &[ExtraVersionField {
+                path: PathBuf::from("release.toml"),
+                key: vec!["release".to_owned(), "version".to_owned()],
+            }],
+        )
+        .expect("complete rewrite");
+        assert_eq!(rewritten.len(), 3);
+        assert!(
+            rewritten[Path::new("Cargo.toml")]
+                .contains("version = \"0.2.0\"\n\n[workspace.dependencies]")
+        );
+        assert!(rewritten[Path::new("Cargo.toml")].contains("version = \"0.2.0\" }"));
+        assert!(
+            rewritten[Path::new("crates/member/Cargo.toml")].contains("version.workspace = true")
+        );
+        assert!(rewritten[Path::new("release.toml")].contains("version = \"0.2.0\""));
     }
 }

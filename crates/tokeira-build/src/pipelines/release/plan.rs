@@ -59,23 +59,23 @@ impl ReleaseConfig {
         repository: &RepositoryIdentity,
     ) -> Result<Self, ReleaseError> {
         let path = workspace_root.join(".tokeira-release.toml");
-        let text = std::fs::read_to_string(&path).map_err(|source| ReleaseError::Workspace {
-            reason: format!("could not read {}: {source}", path.display()),
+        let text = std::fs::read_to_string(&path).map_err(|source| {
+            ReleaseError::UnsupportedReleaseConfig {
+                reason: format!("could not read {}: {source}", path.display()),
+            }
         })?;
-        let config: Self = toml::from_str(&text).map_err(|source| ReleaseError::Workspace {
-            reason: format!("invalid {}: {source}", path.display()),
-        })?;
+        let config: Self =
+            toml::from_str(&text).map_err(|source| ReleaseError::UnsupportedReleaseConfig {
+                reason: format!("invalid {}: {source}", path.display()),
+            })?;
         if config.schema_version != RELEASE_SCHEMA_VERSION {
-            return Err(ReleaseError::Workspace {
-                reason: format!(
-                    "unsupported release config schema {}",
-                    config.schema_version
-                ),
+            return Err(ReleaseError::UnsupportedReleaseConfig {
+                reason: format!("schema_version {} is not supported", config.schema_version),
             });
         }
         if !valid_release_branch(&config.release_branch) {
-            return Err(ReleaseError::Workspace {
-                reason: "release_branch is not a valid explicit branch name".to_owned(),
+            return Err(ReleaseError::InvalidReleaseBranch {
+                branch: config.release_branch.clone(),
             });
         }
         let mut version_fields = BTreeSet::new();
@@ -87,39 +87,39 @@ impl ReleaseConfig {
                     .components()
                     .all(|component| matches!(component, Component::Normal(_)));
             if !portable_path || field.key.is_empty() || field.key.iter().any(String::is_empty) {
-                return Err(ReleaseError::Workspace {
+                return Err(ReleaseError::InvalidVersionField {
                     reason: format!(
-                        "extra version field must name a workspace-relative path and non-empty key: {} {:?}",
+                        "must name a workspace-relative path and non-empty key: {} {:?}",
                         field.path.display(),
                         field.key
                     ),
                 });
             }
             if !version_fields.insert((field.path.clone(), field.key.clone())) {
-                return Err(ReleaseError::Workspace {
-                    reason: format!(
-                        "duplicate extra version field: {} {:?}",
-                        field.path.display(),
-                        field.key
-                    ),
+                return Err(ReleaseError::InvalidVersionField {
+                    reason: format!("duplicate entry: {} {:?}", field.path.display(), field.key),
                 });
             }
         }
         if repository.slug == "tokeira/tokeira" && config.tkr.is_some() {
-            return Err(ReleaseError::Workspace {
+            return Err(ReleaseError::InvalidToolSource {
                 reason: "the in-tree Tokeira release config forbids a `tkr` table".to_owned(),
             });
         }
         if let Some(pin) = &config.tkr {
+            if !pin.repository.starts_with("https://") {
+                return Err(ReleaseError::InvalidToolSource {
+                    reason: format!("`{}` is not an HTTPS Git source", pin.repository),
+                });
+            }
             let revision_is_valid = pin.revision.len() == 40
                 && pin
                     .revision
                     .chars()
                     .all(|character| character.is_ascii_hexdigit());
-            if !pin.repository.starts_with("https://") || !revision_is_valid {
-                return Err(ReleaseError::Workspace {
-                    reason: "external tkr pin requires an HTTPS source and full 40-hex revision"
-                        .to_owned(),
+            if !revision_is_valid {
+                return Err(ReleaseError::InvalidToolRevision {
+                    reason: format!("`{}` is not a full 40-hex commit", pin.revision),
                 });
             }
         }
@@ -216,6 +216,8 @@ pub trait ReleaseObservations: Send + Sync {
     fn git(&self, request: &ReleasePlanRequest<'_>) -> Result<GitObservation, ReleaseError>;
     /// Observe public package/version state without a registry credential.
     fn registry(&self, package: &PackageIdentity) -> Result<RegistryObservation, ReleaseError>;
+    /// Observe whether the remote already carries the release tag, peeled to its commit.
+    fn release_tag(&self, tag: &str) -> Result<Option<String>, ReleaseError>;
 }
 
 /// Build and seal one deterministic, secret-free release Plan.
@@ -344,12 +346,27 @@ pub fn plan_release(
                 reason: format!("missing hermetic planning artifact for {}", node.name),
             }
         })?;
+        // A version that is already public with different bytes can never reach
+        // parity: refuse here, before the operator confirms, rather than after the
+        // branch and tag are out.
+        if let PlannedRegistryState::Existing { checksum } = &registry
+            && *checksum != artifact.sha256
+        {
+            return Err(ReleaseError::ArtifactMismatch {
+                package: node.name.clone(),
+                version: target.to_string(),
+                hermetic: artifact.sha256.clone(),
+                downloaded: "absent".to_owned(),
+                registry: checksum.clone(),
+            });
+        }
         packages.push(PackagePlan {
             name: node.name.clone(),
             manifest_path: relative_manifest,
             from_version: current.to_string(),
             target_version: target.to_string(),
             publishable_dependencies: node.dependencies,
+            hermetic_sha256: artifact.sha256.clone(),
             registry,
         });
         note_packages.push(PackageResult {
@@ -376,6 +393,20 @@ pub fn plan_release(
         .filter(|package| matches!(package.registry, PlannedRegistryState::Existing { .. }))
         .count();
     let tag = format!("v{target}");
+    // The tag is the durable marker of a train that already crossed the Git
+    // boundary; a Plan that sees it describes a resume, and says so before the
+    // operator confirms.
+    let published_tag = observations.release_tag(&tag)?;
+    let git_effect = match &published_tag {
+        Some(commit) => format!(
+            "resume: annotated tag {tag} is already published at {commit}; branch {} and tag are verified, nothing is pushed",
+            config.release_branch
+        ),
+        None => format!(
+            "atomically publish branch {} and annotated tag {tag}",
+            config.release_branch
+        ),
+    };
     let mut effects = vec![
         ReleaseEffect {
             kind: ReleaseEffectKind::Source,
@@ -387,10 +418,7 @@ pub fn plan_release(
         },
         ReleaseEffect {
             kind: ReleaseEffectKind::Git,
-            summary: format!(
-                "atomically publish branch {} and annotated tag {tag}",
-                config.release_branch
-            ),
+            summary: git_effect,
         },
     ];
     effects.extend(packages.iter().map(|package| ReleaseEffect {

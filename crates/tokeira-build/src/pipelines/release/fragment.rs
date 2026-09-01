@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{FragmentIdentity, ReleaseError, digest::sha256_hex};
+use super::{FragmentIdentity, ReleaseError, sha256_hex};
 
 const CONFIG_PATH: &str = ".changie.yaml";
 const HEADER_PATH: &str = ".changes/header.tpl.md";
@@ -185,12 +185,13 @@ fn parse_fragment(workspace_root: &Path, path: &Path) -> Result<AdmittedFragment
     })
 }
 
+/// One user-facing sentence: 8 to 180 characters, a single line, ending in a stop.
+///
+/// Interior stops are allowed on purpose: release prose names versions (`1.31.0`),
+/// hosts (`crates.io`), and abbreviations, and a sentence is judged by how it ends,
+/// not by how many periods it contains.
 fn bounded_sentence(body: &str) -> bool {
     let length = body.chars().count();
-    let terminators = body
-        .chars()
-        .filter(|character| matches!(character, '.' | '!' | '?'))
-        .count();
     (8..=180).contains(&length)
         && !body
             .chars()
@@ -199,7 +200,6 @@ fn bounded_sentence(body: &str) -> bool {
             .chars()
             .last()
             .is_some_and(|character| matches!(character, '.' | '!' | '?'))
-        && terminators == 1
 }
 
 fn invalid_fragment(path: &Path, reason: &str) -> ReleaseError {
@@ -346,6 +346,22 @@ mod tests {
             prop_assert!(!rendered.contains(&internal_marker));
             prop_assert!(!rendered.contains("Internal"));
         }
+    }
+
+    #[test]
+    fn sentences_may_contain_versions_hosts_and_abbreviations() {
+        assert!(bounded_sentence("Bump the minimum Rust version to 1.97."));
+        assert!(bounded_sentence(
+            "Publish every crate to crates.io in one train."
+        ));
+        assert!(bounded_sentence(
+            "Support GitLab.com as an issuer, e.g. for mirrors!"
+        ));
+        assert!(!bounded_sentence("Short."));
+        assert!(!bounded_sentence(
+            "No terminal stop at the end of this sentence"
+        ));
+        assert!(!bounded_sentence("Two lines.\nAre not one sentence."));
     }
 
     #[test]

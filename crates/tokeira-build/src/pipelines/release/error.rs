@@ -1,8 +1,16 @@
 //! Typed release failures with stable operator-facing classifications.
+//!
+//! Every refusal the train can produce is one variant here, so the CLI boundary maps
+//! the enum onto the documented machine code and exit class in one place. One variant
+//! carries evidence: `Incomplete` wraps the condition that stopped a train together
+//! with the Release Report that classifies what is already durable in public, so an
+//! operator never has to reconstruct a partial train from log lines.
 
 use std::path::PathBuf;
 
 use thiserror::Error;
+
+use super::{ReleaseReport, TrainState};
 
 /// A release refusal or executor failure.
 #[derive(Debug, Error)]
@@ -19,6 +27,9 @@ pub enum ReleaseError {
         expected: PathBuf,
         observed: PathBuf,
     },
+    /// The remote the executor would push to is not the Plan's repository.
+    #[error("release repository mismatch: expected {expected}, observed {observed}")]
+    RepositoryMismatch { expected: String, observed: String },
     /// The selected source contains tracked or untracked mutations.
     #[error("release source is dirty at {commit}")]
     DirtyWorkspace { commit: String },
@@ -34,6 +45,21 @@ pub enum ReleaseError {
     /// Internal publishable dependencies contain a cycle.
     #[error("publishable package dependency graph contains a cycle: {packages:?}")]
     PublishGraphCycle { packages: Vec<String> },
+    /// `.tokeira-release.toml` is unreadable or declares an unsupported schema.
+    #[error("unsupported release config: {reason}")]
+    UnsupportedReleaseConfig { reason: String },
+    /// `release_branch` is not an explicit, valid branch name.
+    #[error("invalid release branch `{branch}`")]
+    InvalidReleaseBranch { branch: String },
+    /// An `extra_version_fields` entry cannot name exactly one workspace scalar.
+    #[error("invalid extra version field: {reason}")]
+    InvalidVersionField { reason: String },
+    /// `tkr.repository` is non-HTTPS, or present where it is forbidden.
+    #[error("invalid tkr tool source: {reason}")]
+    InvalidToolSource { reason: String },
+    /// `tkr.revision` is not a full 40-hex commit.
+    #[error("invalid tkr tool revision: {reason}")]
+    InvalidToolRevision { reason: String },
     /// Changelog configuration or a fragment is invalid.
     #[error("changelog admission failed for {path}: {reason}")]
     Changelog { path: PathBuf, reason: String },
@@ -52,7 +78,18 @@ pub enum ReleaseError {
     /// Cargo packaging did not prove the publishable closure.
     #[error("package dry-run failed: {reason}")]
     PackageDryRun { reason: String },
-    /// A serialized plan is unsupported, invalid, or has drifted.
+    /// The Hermetic Tag Build produced bytes the confirmed Plan did not describe.
+    #[error("hermetic build drift for {package} {version}: planned {planned}, observed {observed}")]
+    HermeticBuildDrift {
+        package: String,
+        version: String,
+        planned: String,
+        observed: String,
+    },
+    /// The Plan file declares a schema this `tkr` does not implement.
+    #[error("unsupported release Plan schema {observed}")]
+    UnsupportedPlanSchema { observed: u32 },
+    /// A serialized plan is invalid or has drifted.
     #[error("release plan admission failed: {reason}")]
     Plan { reason: String },
     /// Stored and recomputed canonical Plan identities differ.
@@ -94,6 +131,9 @@ pub enum ReleaseError {
         branch_observed: String,
         tag_observed: String,
     },
+    /// The requested version has no release tag to verify.
+    #[error("release {tag} is not published")]
+    ReleaseNotFound { tag: String },
     /// An ambiguous upload did not become observable inside the bounded window.
     #[error("registry state remains pending for {package} {version}")]
     RegistryPending { package: String, version: String },
@@ -118,6 +158,13 @@ pub enum ReleaseError {
     /// A release object exists with different immutable fields.
     #[error("release object conflict for {tag}: {reason}")]
     ReleaseConflict { tag: String, reason: String },
+    /// The train stopped; the report classifies what is durable in public.
+    #[error("release train {state:?}: {condition}")]
+    Incomplete {
+        state: TrainState,
+        condition: Box<ReleaseError>,
+        report: Box<ReleaseReport>,
+    },
     /// Dagger or another owned execution boundary failed.
     #[error("release executor failed: {reason}")]
     Executor { reason: String },
@@ -125,21 +172,29 @@ pub enum ReleaseError {
 
 impl ReleaseError {
     /// Stable machine code used by CLI JSON error output.
-    pub const fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::Workspace { .. } => "workspace_not_found",
             Self::AmbiguousWorkspace { .. } => "ambiguous_workspace",
             Self::WorkspaceMismatch { .. } => "workspace_mismatch",
+            Self::RepositoryMismatch { .. } => "repository_mismatch",
             Self::DirtyWorkspace { .. } => "dirty_workspace",
             Self::StaleWorkspace { .. } => "stale_workspace",
             Self::TargetVersion { .. } => "invalid_target_version",
             Self::NonUnifiedVersion { .. } => "non_unified_workspace_version",
             Self::PublishGraphCycle { .. } => "invalid_publish_graph",
+            Self::UnsupportedReleaseConfig { .. } => "unsupported_release_config",
+            Self::InvalidReleaseBranch { .. } => "invalid_release_branch",
+            Self::InvalidVersionField { .. } => "invalid_version_field",
+            Self::InvalidToolSource { .. } => "invalid_tool_source",
+            Self::InvalidToolRevision { .. } => "invalid_tool_revision",
             Self::Changelog { .. } => "invalid_fragment",
             Self::ChangelogConfigDrift { .. } => "changelog_config_drift",
             Self::UnsupportedToolPlatform { .. } => "unsupported_tool_platform",
             Self::Tool { .. } => "tool_pin_drift",
             Self::PackageDryRun { .. } => "package_dry_run_failed",
+            Self::HermeticBuildDrift { .. } => "hermetic_build_drift",
+            Self::UnsupportedPlanSchema { .. } => "unsupported_plan_schema",
             Self::Plan { .. } => "invalid_plan",
             Self::PlanDrift { .. } => "plan_drift",
             Self::PlanOutput { .. } => "plan_output_failed",
@@ -151,27 +206,36 @@ impl ReleaseError {
             Self::ExternalDependency { .. } => "external_dependency_unavailable",
             Self::TagConflict { .. } => "tag_conflict",
             Self::GitRefConflict { .. } => "git_ref_conflict",
+            Self::ReleaseNotFound { .. } => "release_not_found",
             Self::RegistryPending { .. } => "registry_state_pending",
             Self::RegistryPublish { .. } => "registry_publish_failed",
             Self::ArtifactMismatch { .. } => "artifact_mismatch",
             Self::ReleaseConflict { .. } => "release_conflict",
+            Self::Incomplete { condition, .. } => condition.code(),
             Self::Executor { .. } => "executor_failed",
         }
     }
 
     /// Stable process status class for the CLI boundary.
-    pub const fn exit_code(&self) -> u8 {
+    pub fn exit_code(&self) -> u8 {
         match self {
             Self::Workspace { .. }
             | Self::AmbiguousWorkspace { .. }
             | Self::WorkspaceMismatch { .. }
+            | Self::RepositoryMismatch { .. }
             | Self::DirtyWorkspace { .. }
             | Self::StaleWorkspace { .. }
             | Self::TargetVersion { .. }
             | Self::NonUnifiedVersion { .. }
             | Self::PublishGraphCycle { .. }
+            | Self::UnsupportedReleaseConfig { .. }
+            | Self::InvalidReleaseBranch { .. }
+            | Self::InvalidVersionField { .. }
+            | Self::InvalidToolSource { .. }
+            | Self::InvalidToolRevision { .. }
             | Self::Changelog { .. }
             | Self::ChangelogConfigDrift { .. }
+            | Self::UnsupportedPlanSchema { .. }
             | Self::Plan { .. }
             | Self::PlanDrift { .. }
             | Self::PlanOutput { .. }
@@ -182,13 +246,25 @@ impl ReleaseError {
             | Self::Tool { .. }
             | Self::CredentialMissing { .. }
             | Self::ReleaseCredentialMissing => 3,
-            Self::PackageDryRun { .. } | Self::ExternalDependency { .. } => 4,
+            Self::PackageDryRun { .. }
+            | Self::HermeticBuildDrift { .. }
+            | Self::ExternalDependency { .. } => 4,
             Self::TagConflict { .. }
             | Self::GitRefConflict { .. }
+            | Self::ReleaseNotFound { .. }
             | Self::ReleaseConflict { .. } => 5,
             Self::RegistryPending { .. } | Self::RegistryPublish { .. } => 6,
             Self::ArtifactMismatch { .. } => 7,
+            Self::Incomplete { condition, .. } => condition.exit_code(),
             Self::Executor { .. } => 8,
+        }
+    }
+
+    /// The Release Report attached to a train that stopped part-way.
+    pub fn report(&self) -> Option<&ReleaseReport> {
+        match self {
+            Self::Incomplete { report, .. } => Some(report),
+            _ => None,
         }
     }
 }

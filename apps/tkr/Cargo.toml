@@ -40,6 +40,7 @@ tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
 tokeira-local-deployment = { path = "../../platforms/local" }
 tokeira-ecs-deployment = { path = "../../platforms/ecs" }
+tokeira-observability.workspace = true
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
 tokeira-platform.workspace = true
 # The linked frontends for the standalone `definition check` syntax tier: the

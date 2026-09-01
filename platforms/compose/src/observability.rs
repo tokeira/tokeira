@@ -43,7 +43,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokeira_iac as iac;
-use tokeira_observability::testing::{AlertRuleValidator, DashboardValidator};
+use tokeira_observability::validation::{
+    AlertRuleValidator, AlloyConfigValidator, DashboardValidator,
+};
 use tokeira_platform::declaration::{
     DeploymentRef, ObservabilityCheck, ObservabilityCheckOutcome, ObservabilityCheckReport,
     ObservabilityCheckStatus,
@@ -415,12 +417,11 @@ impl ObservabilityConfigFilesResource {
     fn validate_rendered(&self) -> anyhow::Result<()> {
         let files = self.desired_files()?;
         let alloy = rendered_file(&files, ALLOY_CONFIG)?;
-        for job in EXPECTED_SCRAPE_JOBS {
-            let declaration = format!("prometheus.scrape \"{job}\"");
-            if !alloy.contents.contains(&declaration) {
-                anyhow::bail!("rendered Alloy config is missing expected scrape job `{job}`");
-            }
-        }
+        AlloyConfigValidator::validate_scrape_jobs(
+            &alloy.relative_path,
+            &alloy.contents,
+            EXPECTED_SCRAPE_JOBS,
+        )?;
 
         let mut dashboard_count = 0;
         for file in files.iter().filter(|file| {
@@ -1041,7 +1042,7 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), iac::IacError> {
 
 #[cfg(test)]
 mod content_tests {
-    use tokeira_observability::testing::{AlertRuleValidator, DashboardValidator};
+    use tokeira_observability::validation::{AlertRuleValidator, DashboardValidator};
 
     fn shipped_content() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("observability")

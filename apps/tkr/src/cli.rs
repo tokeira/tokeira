@@ -495,6 +495,10 @@ pub(crate) enum ConfigAction {
 #[derive(Subcommand)]
 pub(crate) enum ObservabilityAction {
     Check {
+        /// Validate an already-rendered config root directly. The directory
+        /// contains `alloy.alloy`, `grafana/dashboards/`, and `mimir/rules/`.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
         #[arg(long, default_value = "30")]
         timeout_seconds: u64,
     },

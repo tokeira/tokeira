@@ -269,13 +269,22 @@ async fn run() -> Result<()> {
         Command::Compat(args) => commands::compat::run(args.command, cli.json),
         Command::Ci(args) => commands::ci::run(args.command, cli.json).await,
         Command::Observability { action } => {
-            if deployments.uses_bound_provisioner(selected)? {
+            let ObservabilityAction::Check {
+                path,
+                timeout_seconds,
+            } = action;
+            if let Some(path) = path {
+                if selected.is_some() {
+                    anyhow::bail!("pass either `--path` or `--deployment`, not both");
+                }
+                commands::observability::run_path(&path, timeout_seconds)
+            } else if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
-                let (verb, extra) = forwarded_observability_verb(&action);
+                let (verb, extra) = forwarded_observability_verb(timeout_seconds);
                 launcher::launch(&dir, verb, &extra).await
             } else {
                 let ctx = load_context(&deployments, selected)?;
-                commands::observability::run(action, ctx)
+                commands::observability::run_selected(timeout_seconds, ctx)
             }
         }
         Command::Diagnostics { action } => {
@@ -370,10 +379,7 @@ fn forwarded_infra_verb(action: &InfraAction) -> (&'static [&'static str], Vec<S
 /// admitted deployment. The timeout remains explicit at the boundary so both
 /// shells preserve the same operator request even while live reachability is
 /// reported as a warning.
-fn forwarded_observability_verb(
-    action: &ObservabilityAction,
-) -> (&'static [&'static str], Vec<String>) {
-    let ObservabilityAction::Check { timeout_seconds } = action;
+fn forwarded_observability_verb(timeout_seconds: u64) -> (&'static [&'static str], Vec<String>) {
     (
         &["observability", "check"],
         vec!["--timeout-seconds".to_string(), timeout_seconds.to_string()],
@@ -765,10 +771,7 @@ mod tests {
 
     #[test]
     fn forwarding_preserves_the_observability_check_timeout() {
-        let action = ObservabilityAction::Check {
-            timeout_seconds: 15,
-        };
-        let (verb, extra) = forwarded_observability_verb(&action);
+        let (verb, extra) = forwarded_observability_verb(15);
         assert_eq!(verb, &["observability", "check"]);
         assert_eq!(
             extra,
@@ -990,9 +993,27 @@ mod tests {
                 .command,
             Command::Observability {
                 action: ObservabilityAction::Check {
+                    path: None,
                     timeout_seconds: 15
                 }
             }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "tkr",
+                "observability",
+                "check",
+                "--path",
+                "/tmp/rendered/config"
+            ])
+            .unwrap()
+            .command,
+            Command::Observability {
+                action: ObservabilityAction::Check {
+                    path: Some(path),
+                    timeout_seconds: 30
+                }
+            } if path == std::path::Path::new("/tmp/rendered/config")
         ));
         assert!(matches!(
             Cli::try_parse_from(["tkr", "version"]).unwrap().command,

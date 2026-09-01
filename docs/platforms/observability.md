@@ -111,14 +111,26 @@ tree: the expected Alloy scrape jobs, Grafana dashboard style (including the
 Mimir alert-rule metadata. It does not acquire the operation lock, invoke
 provisioner gates, contact providers, or write the generated files.
 
+To validate an already-rendered tree without selecting or admitting a
+deployment, pass its config root directly:
+
+```bash
+tkr observability check --path /path/to/rendered/config
+```
+
+The path must contain `alloy.alloy`, `grafana/dashboards/`, and
+`mimir/rules/`. This route runs the same production dashboard, alert-rule, and
+Alloy scrape-job validators directly in `tkr`; it does not require a bound
+provisioner. Pass either `--path` or `--deployment`, not both.
+
 The command reports static configuration checks as `PASS`. Live Mimir, Loki,
 and Grafana reachability remains `WARN` because it requires a reachable
 deployment endpoint. Legacy `deployment.toml` deployments continue to run the
 in-process local/ECS checks, including ECS observability artifact inclusion.
 
-The per-deployment command complements the platform unit tests: those validate
-the shipped dashboard and alert sources, while this command validates the
-deployment's rendered result after its own parameter substitution.
+The per-deployment and direct-path commands complement the platform unit tests:
+those validate the shipped dashboard and alert sources, while these commands
+validate rendered results.
 
 ## Dashboards
 

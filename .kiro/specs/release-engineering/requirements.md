@@ -34,6 +34,11 @@ The authoritative external contracts are:
 - GitHub CLI's
   [`gh release create`](https://cli.github.com/manual/gh_release_create) contract,
   including `--verify-tag` and `--notes-file`.
+- Git's [`push --atomic`](https://git-scm.com/docs/git-push#Documentation/git-push.txt---atomic)
+  contract: either every named remote ref updates or none does.
+- crates.io's January 2026
+  [Trusted Publishing update](https://blog.rust-lang.org/2026/01/21/crates-io-development-update/),
+  which names GitHub Actions and GitLab.com as the supported issuers.
 
 ## Glossary
 
@@ -45,8 +50,12 @@ The authoritative external contracts are:
   publication.
 - **Batched Changelog** — the version file produced from unreleased fragments by
   `changie batch`, merged into root `CHANGELOG.md` by `changie merge`.
+- **Bounded Observation Window** — registry polling that starts after 5 seconds,
+  doubles the interval after each absent observation, and stops no later than 10
+  minutes per crate after the ambiguous publish response.
 - **Dagger Executor** — the only environment in which release preparation, package
-  building, publication, parity verification, and release-note creation execute.
+  building, publication, parity verification, and release-note creation execute; apply
+  uses separate publish-and-parity and release-note invocations.
 - **Existing Package** — a package/version already present on crates.io when a plan or
   apply pass observes it.
 - **Fragment** — one changie YAML document under `.changes/unreleased/` declaring the
@@ -60,6 +69,9 @@ The authoritative external contracts are:
   package order, observed external state, intended effects, and content digest.
 - **Publishable Package** — a Cargo workspace member whose manifest permits
   publication to crates.io.
+- **Publish Dependency Edge** — a normal or build dependency between Publishable
+  Packages, including target-specific and enabled-optional dependencies;
+  dev-dependencies are excluded from release ordering.
 - **Release Commit** — the commit containing the unified version update, batched
   changelog, generated version file, and deleted consumed fragments.
 - **Release Config** — root `.tokeira-release.toml`, the small checked repository-local
@@ -94,15 +106,19 @@ The following becomes supported:
   verified and skipped, incomplete work resumes, and conflicting external state is
   refused.
 - The crates.io token remains in operator-side custody, crosses into the executor only
-  as a Dagger secret, and is absent from all persisted state and output.
+  as a Dagger secret for the publish-and-parity invocation, and is absent from all
+  persisted state and output. `GH_TOKEN` crosses only in the later release-note
+  invocation after parity succeeds.
 - Tokeira Odori obtains `tkr` from a full pinned Tokeira Git revision outside its Cargo
   dependency graph, then invokes the same command against the Odori workspace root.
 
 The following stays out of scope:
 
-- Trusted Publishing or any OIDC exchange. crates.io's current Trusted Publishing
-  support is limited to a CI issuer this project does not use; token mode is the
-  current contract. The dormant policy watch remains outside these repositories.
+- Trusted Publishing or any OIDC exchange. crates.io currently supports GitHub Actions
+  and GitLab.com as Trusted Publishing issuers; the local Dagger executor presents
+  neither, so token mode is the current contract. The dormant policy watch remains
+  outside these repositories and changes this contract only when crates.io supports an
+  issuer this executor can actually present.
 - Token minting, scope selection, rotation, revocation, or expiry procedure. Those are
   operator responsibilities; this spec owns only the invocation boundary.
 - Registry targets other than crates.io.
@@ -125,6 +141,11 @@ The following stays out of scope:
   surfaces.
 - `Cargo.toml` declares workspace Rust `1.97`, while the 17 currently Publishable
   Packages inherit one workspace version and fence non-publishable members explicitly.
+- `crates/tokeira-chasm-derive/Cargo.toml` dev-depends on `tokeira-chasm`; this
+  cycle-shaped test-only link is harmless to publication only because development
+  dependencies do not form Publish Dependency Edges. Cargo's `package` contract also
+  explicitly exempts development dependencies from the path-plus-version restriction
+  applied to normal and build dependencies.
 - `tokeira/tokeira-odori:Cargo.toml @ 03a46d3` declares five Publishable Packages with
   one workspace version and centralizes their internal dependency requirements under
   `[workspace.dependencies]`.
@@ -135,6 +156,15 @@ The following stays out of scope:
   checksums, `rust_version = 1.97`, and registry README endpoints. Their publication
   timestamps also provide the evidence for the conservative ten-minute upload
   cooldown used by this contract.
+- The public
+  [v0.1.1 packaging campaign](https://github.com/tokeira/tokeira/pull/139) established
+  that all 17 sibling crates must be packaged in one multi-package invocation: a
+  single-crate invocation resolves unpublished sibling versions against crates.io,
+  while the multi-package invocation overlays the sibling archives during verification.
+- Operator measurements from the public
+  [v0.1.1 train](https://github.com/tokeira/tokeira/releases/tag/v0.1.1) observed
+  registry-index liveness between 6 and 98 seconds per crate. The Bounded Observation
+  Window starts at 5 seconds and caps at 10 minutes per crate from that evidence.
 - Cargo documents that publication is permanent, a version cannot be overwritten, and
   a publish timeout can occur after a successful upload. Those facts require Skip
   Existing and verification-before-retry rather than blind retry.
@@ -145,6 +175,8 @@ The following stays out of scope:
   no-change refusal; an empty per-kind override falls back to the root format.
 - GitHub CLI documents that `gh release create --verify-tag` refuses an absent remote
   tag and `--notes-file` supplies deterministic caller-authored notes.
+- Git documents that `git push --atomic` updates every named remote ref or none and
+  fails when the remote does not support atomic pushes.
 
 ## Contract Policy
 
@@ -172,8 +204,8 @@ The following stays out of scope:
 |---|---|---|---|
 | `--workspace-root <path>` | Required when the Plan path does not resolve it unambiguously | `WorkspaceMismatch` | Selects the only workspace allowed to mutate |
 | `--plan <path>` | Required secret-free JSON produced by `plan` | `InvalidPlan` or `PlanDrift` | Read-only input; digest enters Release Commit and Release Tag |
-| `--token-env <name>` | Required only while at least one package still needs upload; names an environment variable and never accepts the token value | `RegistryCredentialMissing` | Value crosses only as an executor secret; name may appear in diagnostics |
-| `GH_TOKEN` environment | Required only while the matching release object is absent; fixed environment name used by `gh` | `ReleaseCredentialMissing` | Value crosses only as an executor secret and is never serialized |
+| `--token-env <name>` | Required only while at least one package still needs upload; names an environment variable and never accepts the token value | `RegistryCredentialMissing` | Value crosses only as a publish-and-parity executor secret; name may appear in diagnostics |
+| `GH_TOKEN` environment | Required only while the matching release object is absent and parity has succeeded; fixed environment name used by `gh` | `ReleaseCredentialMissing` | Value crosses only as the later release-note executor invocation's secret and is never serialized |
 | `--yes` | Optional in an interactive terminal; required in non-interactive mode | `ConfirmationRequired` | Authorizes the exact recomputed Plan effects |
 
 ### `tkr release verify`
@@ -299,10 +331,13 @@ cannot disagree.
    the Release Tag rather than the host working tree.
 10. IF source preparation or the hermetic build fails before the tag is pushed, THEN
     THE apply command SHALL leave no remote Git, registry, or release mutation.
-11. WHEN the hermetic build succeeds, THE apply command SHALL push the exact Release
-    Commit and annotated Release Tag before the first registry upload.
+11. WHEN the hermetic build succeeds, THE apply command SHALL use `git push --atomic`
+    to publish the exact Release Commit to the configured release branch and the
+    annotated Release Tag before the first registry upload.
 12. IF the remote Release Tag exists at a different object, THEN THE apply command
     SHALL return `TagConflict` before any registry upload.
+13. WHEN the Hermetic Tag Build packages the workspace, THE Dagger Executor SHALL
+    create every Publishable Package in one multi-package Cargo invocation.
 
 ### Requirement 4: Conflict-resistant changelog declarations
 
@@ -375,8 +410,9 @@ publishable.
    first-class report-producing checks.
 2. WHEN `PackageDryRun` runs, THE Dagger Executor SHALL discover every Publishable
    Package through Cargo metadata.
-3. WHEN `PackageDryRun` runs, THE Dagger Executor SHALL execute Cargo's locked publish
-   dry-run for each Publishable Package in dependency order.
+3. WHEN `PackageDryRun` runs, THE Dagger Executor SHALL execute one locked
+   multi-package Cargo publish dry-run selecting every Publishable Package in dependency
+   order.
 4. IF a package archive contains an unresolved path-only normal or build dependency,
    THEN THE package dry-run SHALL fail with the package and dependency names.
 5. IF a Publishable Package lacks a packaged README, license, repository metadata, or
@@ -404,8 +440,9 @@ registry authority.
    environment variable only after Plan validation and confirmation succeed.
 4. IF a package needs upload and the named environment variable is absent, THEN THE
    apply command SHALL return `RegistryCredentialMissing` before remote mutation.
-5. WHEN the token crosses into Dagger, THE release executor SHALL inject it as a secret
-   environment value only into the publish process.
+5. WHEN the registry token crosses into Dagger, THE release executor SHALL inject it as
+   a secret environment value only into the publish-and-parity invocation's registry
+   publish process.
 6. THE release executor SHALL never write the token to a file, credential store, Plan,
    report, command argument, log field, error chain, or release note.
 7. WHEN every package is Existing, THE apply and verify commands SHALL complete without
@@ -423,8 +460,9 @@ force an unsafe manual script.
 
 #### Acceptance Criteria
 
-1. THE planner SHALL topologically order Publishable Packages by publishable workspace
-   dependency edges with a lexical package-name tie break.
+1. THE planner SHALL topologically order Publishable Packages using normal and build
+   Publish Dependency Edges, including target-specific and enabled-optional edges but
+   excluding dev-dependencies, with a lexical package-name tie break.
 2. IF the publishable dependency graph is cyclic, THEN THE planner SHALL return
    `InvalidPublishGraph`.
 3. WHEN a package/version is absent from crates.io, THE apply executor SHALL publish
@@ -438,9 +476,9 @@ force an unsafe manual script.
    that interval before another request.
 8. WHEN Cargo times out while polling for a published package, THE apply executor SHALL
    inspect registry state before deciding whether an upload retry is necessary.
-9. IF a registry response is ambiguous and the package remains absent after the bounded
-   observation window, THEN THE apply executor SHALL stop the train with a resumable
-   package state.
+9. IF a registry response is ambiguous, THEN THE apply executor SHALL poll after 5
+   seconds, double the interval after each absent observation, and stop with a resumable
+   package state no later than 10 minutes per crate after the ambiguous response.
 10. THE Release Report SHALL record each package as `published`, `existing-verified`,
     `pending`, or `failed` without carrying credential material.
 
@@ -490,10 +528,15 @@ both readable and mechanically attributable.
    executor SHALL return `ReleaseConflict` without editing it.
 7. THE release executor SHALL use no auto-generated release-note mode.
 8. THE release executor SHALL use no GitHub Actions workflow or action.
-9. WHEN release-note creation needs authentication, THE apply command SHALL inject the
-   fixed `GH_TOKEN` environment value into Dagger as a secret only after parity succeeds.
+9. WHEN release-note creation needs authentication and parity has succeeded, THE apply
+   command SHALL start a distinct release-note executor invocation with the fixed
+   `GH_TOKEN` environment value as its only secret.
 10. THE release executor SHALL omit the release API credential from every file, Plan,
     report, command argument, log field, error chain, and release note.
+11. THE publish-and-parity executor invocation SHALL receive no release API credential
+    handle or value.
+12. THE release-note executor invocation SHALL receive no registry credential handle or
+    value.
 
 ### Requirement 11: Explicit partial-train recovery
 
@@ -521,6 +564,10 @@ is never silently repaired.
    `terminal-mismatch` and require a new corrective version.
 9. WHEN every package has parity and the release notes match, THE executor SHALL
    classify the train as `complete`.
+10. WHEN apply resumes a Train Identity, THE executor SHALL require the remote release
+    branch and Release Tag to be present, point to the same Release Commit, and carry
+    mutually consistent Train Identity; otherwise it returns terminal
+    `GitRefConflict` naming both observed ref values.
 
 ### Requirement 12: Tokeira Odori consumes `tkr` without dependency mutation
 

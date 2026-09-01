@@ -7,7 +7,9 @@ release executor to `tokeira-build`. The control plane resolves one workspace, p
 a canonical secret-free Plan, renders confirmation, and exports reports. The executor
 owns all command execution: changie, Cargo package verification, Git release-object
 creation, registry publication, registry download, checksum comparison, and GitHub
-release creation.
+release creation. Apply crosses the Dagger boundary twice: a publish-and-parity
+invocation carries only the registry token, then a structurally separate release-note
+invocation carries only `GH_TOKEN` after parity succeeds.
 
 The design uses current tool contracts rather than release-script conventions:
 
@@ -48,7 +50,9 @@ host tool path and cannot publish, tag, or create a release.
 ### Non-goals
 
 - Token issuance or account procedure.
-- Trusted Publishing or an OIDC issuer.
+- Trusted Publishing or an OIDC exchange. crates.io supports GitHub Actions and
+  GitLab.com, but the local Dagger executor presents neither issuer; the policy changes
+  only when crates.io supports an issuer this executor can actually present.
 - Hosted workflows, scheduled releases, or release-on-tag automation.
 - Alternate registries, pre-release channels, or package-specific versions.
 - Automatic changelog prose generation from commit messages or pull requests.
@@ -74,26 +78,32 @@ flowchart TD
     Operator --> Apply[tkr release apply]
     Plan --> Apply
     Apply --> Confirm[Plan revalidation and confirmation]
-    Confirm --> Dagger[Dagger release executor]
-    Dagger --> Prepare[Version rewrite and changie batch plus merge]
+    Confirm --> PublishDagger[Dagger publish-and-parity invocation]
+    PublishDagger --> Prepare[Version rewrite and changie batch plus merge]
     Prepare --> Tag[Release commit and annotated tag]
     Tag --> Package[Hermetic tag packaging]
     Package --> Push[Push exact commit and tag]
     Push --> Publish[DAG publish with skip-existing and pacing]
     Publish --> Parity[Download and SHA-256 parity]
-    Parity --> Notes[gh release create from batched changelog]
+    Parity --> NotesGate[Resolve GH_TOKEN after parity]
+    NotesGate --> NotesDagger[Dagger release-note invocation]
+    NotesDagger --> Notes[gh release create from batched changelog]
 
     Operator --> Verify[tkr release verify]
-    Verify --> Dagger
-    Dagger --> Report[Secret-free Release Report]
+    Verify --> VerifyDagger[Dagger verification invocation]
+    VerifyDagger --> Report[Secret-free Release Report]
 
     Ci[tkr ci check] --> FragmentGate[Fragment declaration gate]
     Ci --> PackageGate[Package dry-run gate]
 ```
 
-`tkr` is the control plane. It may inspect inputs, resolve the operator's secret at the
-last responsible moment, attach that value to Dagger as a secret, and render sanitized
-results. It does not run a host `cargo publish`, host changie, or host `gh release`.
+`tkr` is the control plane. It may inspect inputs, resolve each operator secret at the
+last responsible moment, attach that value only to its dedicated Dagger invocation, and
+render sanitized results. The publish-and-parity invocation can receive the registry
+token but has no release API credential field. Only after its parity result succeeds
+does `tkr` resolve `GH_TOKEN` and construct a release-note invocation, which has no
+registry credential field. `tkr` does not run a host `cargo publish`, host changie, or
+host `gh release`.
 
 The release state has three authorities:
 
@@ -305,10 +315,14 @@ fn require_release_confirmation(
 
 The handler resolves the workspace, renders the Plan, applies the existing
 confirmation convention, resolves the named environment variable after confirmation,
-wraps it directly as a Dagger secret, and drops the host string after the session is
-created. After parity, it resolves the fixed `GH_TOKEN` environment value only if a
-release object still needs creation and supplies that value as a second Dagger secret.
-Neither value enters an error context or `Debug` implementation.
+wraps it directly as a Dagger secret, constructs `ReleasePublishRequest`, and drops the
+host string after the publish-and-parity session is created. That request type has no
+release API credential field. After `publish_and_verify_release` returns successful
+parity, the handler resolves the fixed `GH_TOKEN` environment value only if a release
+object still needs creation, constructs a separate `ReleaseNotesRequest`, and starts a
+second Dagger invocation. That request type has no registry credential field. Neither
+value enters an error context or `Debug` implementation, and neither invocation can be
+presented the other phase's secret.
 
 ### Tool resolver (`apps/tkr/src/commands/release/changie.rs`)
 
@@ -369,6 +383,13 @@ inventory, version rewrite planning, notes preview, and canonical digesting are 
 functions. Git and registry reads cross the trait seam. The real implementation obtains
 those reads through the Dagger session; tests use generated observations.
 
+The Publishable Package graph contains normal and build dependencies, including
+target-specific and enabled-optional dependencies; dev-dependencies are excluded. In
+the current workspace,
+`tokeira-chasm-derive` dev-depends on `tokeira-chasm`; treating that cycle-shaped
+test-only link as a publish edge would make release ordering stricter than Cargo's
+registry contract.
+
 Plan digesting uses canonical JSON: object fields are in schema order, maps are
 `BTreeMap`, package and fragment arrays have defined order, and paths are workspace
 relative. `workspace_root` and advancing external observations are excluded. The digest
@@ -404,8 +425,13 @@ diff can be exported to the operator checkout and committed.
 ### Release executor (`crates/tokeira-build/src/pipelines/release/apply.rs`)
 
 ```rust
-pub async fn apply_release(
-    request: &ReleaseApplyRequest,
+pub async fn publish_and_verify_release(
+    request: &ReleasePublishRequest,
+    dagger: &dyn ReleaseDaggerClient,
+) -> Result<PublishParityReport, ReleaseError>;
+
+pub async fn create_release_notes(
+    request: &ReleaseNotesRequest,
     dagger: &dyn ReleaseDaggerClient,
 ) -> Result<ReleaseReport, ReleaseError>;
 
@@ -416,8 +442,13 @@ pub async fn verify_release(
 ```
 
 `ReleaseDaggerClient` is the test seam around Dagger operations. The production
-implementation constructs one graph from the tagged source. A secret is an opaque
-handle in `ReleaseApplyRequest`, never a serializable string.
+implementation constructs one graph from the tagged source for preparation through
+parity, returns a secret-free `PublishParityReport`, and constructs a second graph for
+release notes only after the first report proves parity. The registry secret is an
+opaque handle held only by `ReleasePublishRequest`; the release API secret is a distinct
+opaque handle held only by `ReleaseNotesRequest`. Neither request can represent the
+other phase's credential, and neither handle is serializable or value-bearing under
+`Debug`.
 
 ### CI extensions (`crates/tokeira-build/src/pipelines/ci.rs`)
 
@@ -427,18 +458,30 @@ one newly added valid fragment. A release diff is admitted only when a reference
 batch of the base fragments produces exactly the observed fragment deletion, version
 file, and `CHANGELOG.md` transition.
 
-The package check calls Cargo's locked publish dry-run independently for every
-Publishable Package in topological order. It additionally inspects normalized packaged
-manifests so path-only normal/build dependencies cannot hide behind a host workspace.
-The existing `CiCheckReport` surface remains unchanged.
+The package check calls one locked Cargo publish dry-run with repeated package selectors
+for every Publishable Package in topological order. The single multi-package invocation
+lets Cargo overlay sibling archives during verification; a per-crate invocation would
+try to resolve the target sibling versions from crates.io before the train publishes
+them. The check additionally inspects normalized packaged manifests so path-only
+normal/build dependencies cannot hide behind a host workspace. The existing
+`CiCheckReport` surface remains unchanged.
 
 ### Git gateway
 
 The Git phase creates the Release Commit and annotated Release Tag in isolation, then
-performs the Hermetic Tag Build before any remote push. If packaging succeeds, it
-pushes the exact commit and tag. A matching remote tag is a resume observation; a tag
-pointing elsewhere is a conflict. The implementation never moves or deletes a remote
-tag.
+performs the Hermetic Tag Build before any remote push. That build runs one locked Cargo
+package command with repeated selectors for the complete Publishable Package set, so
+Cargo overlays sibling archives during verification. If packaging succeeds, the Git
+phase runs one `git push --atomic` with explicit refspecs for the configured release
+branch and Release Tag. Git's atomic contract makes the two ref updates all-or-nothing
+and fails closed when the remote lacks atomic-push support.
+
+Resume still observes both refs rather than trusting the prior command outcome. The
+remote release branch and Release Tag must both exist, peel to the same Release Commit,
+and carry the expected Train Identity. Any absent or divergent pair returns
+terminal `GitRefConflict` before registry work and names both observed ref values
+(`absent` or object ID). A matching pair is a resume observation; the implementation
+never moves or deletes a remote tag.
 
 ### Registry gateway
 
@@ -447,7 +490,10 @@ For each package in order:
 1. Observe package/version metadata.
 2. If present, download and verify it; mark `existing-verified`.
 3. If absent, run locked Cargo publish from the tag source with the Dagger secret.
-4. Observe until metadata and download bytes are available.
+4. Observe until metadata and download bytes are available. After an ambiguous publish
+   response, wait 5 seconds before the first observation, double each subsequent
+   interval while the package remains absent, and truncate the final interval so the
+   window stops no later than 10 minutes per crate after the ambiguous response.
 5. Verify the three-way checksum equality; mark `published`.
 6. Start the 600-second minimum cooldown before another upload request.
 
@@ -458,11 +504,12 @@ in flight.
 
 ### Release-note gateway
 
-After all packages have parity, the executor reads the changie version file from the
-tag, appends the minimum-Rust statement, and appends the package inventory sorted by
-package name. Package names link to their crates.io pages; a separate README column
-uses each version's registry README URL. The generated notes file exists only in the
-Dagger graph.
+After the publish-and-parity invocation returns successful parity, `tkr` resolves
+`GH_TOKEN` and starts the structurally separate release-note invocation. That invocation
+reads the changie version file from the tag, appends the minimum-Rust statement, and
+appends the package inventory sorted by package name. Package names link to their
+crates.io pages; a separate README column uses each version's registry README URL. The
+generated notes file exists only in the release-note Dagger graph.
 
 Creation uses the equivalent of:
 
@@ -472,8 +519,10 @@ gh release create <tag> --verify-tag --title <tag> --notes-file <generated-notes
 
 An existing release is fetched first. Matching tag, target, and notes digest mean
 success; any difference is `ReleaseConflict`. The gateway does not edit releases.
-Authentication is the fixed `GH_TOKEN` environment value injected as a Dagger secret
-after parity; no credential file or host `gh` session is mounted.
+Authentication is the fixed `GH_TOKEN` environment value injected as the only secret in
+the release-note Dagger invocation. The publish-and-parity invocation has already ended
+and never receives that handle; the release-note invocation has no registry-token field.
+No credential file or host `gh` session is mounted.
 
 ## Train State Machine
 
@@ -503,6 +552,10 @@ stateDiagram-v2
 Once any package exists, source identity and target version are immutable. There is no
 rollback path because registry versions cannot be overwritten. A checksum mismatch is
 terminal for that version. Any corrective change uses a new version and a new Plan.
+Every resume transition is additionally gated by observing both remote Git refs: the
+release branch and tag must both exist, resolve to the same Release Commit, and carry
+the same Train Identity. Ref absence or divergence returns terminal `GitRefConflict`
+naming both observed ref values; it does not introduce another train state.
 
 ## Data Models
 
@@ -542,6 +595,16 @@ pub enum PlannedRegistryState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublishParityReport {
+    pub schema_version: u32,
+    pub train: TrainIdentity,
+    pub packages: Vec<PackageResult>,
+    pub tag: TagResult,
+    pub release_notes_sha256: String,
+    pub diagnostics: Vec<ReleaseDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseReport {
     pub schema_version: u32,
     pub train: TrainIdentity,
@@ -571,18 +634,21 @@ pub enum TrainState {
 ```
 
 Every path serialized in a portable identity is workspace-relative. External URLs are
-normalized and stripped of user-info. `ReleaseReport` has no secret field. The opaque
-Dagger secret handle is held only by the live apply request and lacks `Serialize` and a
-value-bearing `Debug` representation.
+normalized and stripped of user-info. `PublishParityReport` and `ReleaseReport` have no
+secret field. The registry-secret handle exists only in the live
+`ReleasePublishRequest`; the release API handle exists only in the live
+`ReleaseNotesRequest`. Both lack `Serialize` and a value-bearing `Debug`
+representation.
 
 ## Correctness Properties
 
 ### Property 1: Workspace-generic deterministic package plan
 
-*For any* admitted Cargo workspace graph with an acyclic publishable subgraph, planning
-SHALL return every Publishable Package exactly once in a valid topological order, use a
-lexical tie break, and return the same portable Plan for isomorphic Tokeira and Odori
-workspace shapes regardless of absolute root path.
+*For any* admitted Cargo workspace graph with an acyclic normal/build publishable
+subgraph, planning SHALL return every Publishable Package exactly once in a valid
+topological order, include target-specific and enabled-optional edges, exclude
+dev-dependencies, use a lexical tie break, and return the same portable Plan
+for isomorphic Tokeira and Odori workspace shapes regardless of absolute root path.
 
 **Validates: Requirements 1.2, 1.3, 1.4, 2.3, 2.5, 8.1, 8.2, 12.5**
 
@@ -633,18 +699,20 @@ select the ambient executable.
 ### Property 7: Packaging gate covers the publishable closure
 
 *For any* generated workspace metadata and normalized package manifests, the package
-gate SHALL run once per Publishable Package in dependency order, reject every path-only
+gate and Hermetic Tag Build SHALL each select the complete publishable closure in one
+multi-package Cargo invocation, preserve dependency order, reject every path-only
 normal/build dependency or missing required consumer field, and leave source bytes
 unchanged.
 
-**Validates: Requirements 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8**
+**Validates: Requirements 3.13, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8**
 
 ### Property 8: Publish execution is idempotent
 
 *For any* acyclic package graph and any sequence of success, timeout, absence,
 existence, and transient registry observations, repeated apply with the same Train
 Identity SHALL upload each package/version at most once after it becomes observable,
-verify every Existing Package, and resume from the first pending DAG node.
+verify every Existing Package, poll ambiguous results from 5 seconds with exponential
+backoff capped at 10 minutes per crate, and resume from the first pending DAG node.
 
 **Validates: Requirements 8.3, 8.4, 8.5, 8.8, 8.9, 8.10, 11.1, 11.2, 11.3**
 
@@ -661,10 +729,12 @@ from the upload clock.
 
 *For any* registry-token and release-API-token byte strings, success/failure schedule,
 report format, and diagnostic chain, changing only either credential SHALL not change
-serialized Plan/Report fields or sanitized log/error text, and no output byte sequence
-SHALL contain either credential.
+serialized Plan/Report fields or sanitized log/error text, no output byte sequence
+shall contain either credential, the publish-and-parity invocation shall receive only
+the registry-token handle, and the release-note invocation shall receive only the
+release-API-token handle after parity succeeds.
 
-**Validates: Requirements 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 10.9, 10.10**
+**Validates: Requirements 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 10.9, 10.10, 10.11, 10.12**
 
 ### Property 11: Artifact parity is three-way equality
 
@@ -688,10 +758,12 @@ generation.
 
 *For any* sequence of phase outcomes, the train model SHALL classify the state as
 `pre-publication-failed`, `partially-published`, `terminal-mismatch`, or `complete`
-according to the first durable public effect and SHALL permit only the resume
-transitions shown in the state machine.
+according to the first durable public effect, publish the release branch and tag in one
+atomic ref transaction, require both observed refs to resolve to the same Release Commit
+and Train Identity on resume, and permit only the resume transitions shown in the state
+machine.
 
-**Validates: Requirements 10.4, 10.5, 10.6, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.9**
+**Validates: Requirements 3.11, 10.4, 10.5, 10.6, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.9, 11.10**
 
 ### Property 14: Cross-repository tool bootstrap isolation
 
@@ -720,6 +792,7 @@ revision SHALL prevent release planning.
 | Release API credential absent | `ReleaseError::ReleaseCredentialMissing` | exit 3, `release_credential_missing` |
 | External dependency unavailable | `ReleaseError::ExternalDependency` | exit 4, `external_dependency_unavailable` |
 | Existing remote tag differs | `ReleaseError::TagConflict` | exit 5, `tag_conflict` |
+| Remote release branch/tag absent or divergent on resume | `ReleaseError::GitRefConflict` | exit 5, `git_ref_conflict` |
 | Registry absent after ambiguous result | `ReleaseError::RegistryPending` | exit 6, `registry_state_pending` |
 | Registry rejects publish | `ReleaseError::RegistryPublish` | exit 6, `registry_publish_failed` |
 | Artifact checksum differs | `ReleaseError::ArtifactMismatch` | exit 7, `artifact_mismatch` |
@@ -737,19 +810,25 @@ inputs are never sources for `Debug`, `Display`, `source()`, or JSON details.
   `crates/tokeira-build/src/pipelines/release/`. Host resolver and bootstrap isolation
   properties live beside `apps/tkr/src/commands/release/`.
 - **Example-based unit tests:** exact sub-verb spelling; exact changie version, revision,
-  asset names, and checksums; exact proposed config digest; exact `gh release create`
-  arguments; exact `--allow-no-changes=false`; non-TTY confirmation; unsupported host
+  asset names, and checksums; exact proposed config digest; exact multi-package Cargo
+  selectors; exact `git push --atomic` branch/tag refspecs; exact `gh release create`
+  arguments; the 5-second initial registry poll, exponential schedule, and 10-minute
+  bound; exact `--allow-no-changes=false`; non-TTY confirmation; unsupported host
   diagnostics; minimum-Rust and README URL annotations.
 - **Offline pipeline tests:** use the existing fake Dagger facility, deterministic
   `.crate` bytes, fake Git refs, fake registry observations, a virtual clock, and a fake
-  release API. No test sleeps and no test uses a live token or network.
+  release API. Fake gateways prove the publish-and-parity invocation is never presented
+  `GH_TOKEN`, the release-note invocation is never presented a registry token, atomic
+  branch/tag publication is all-or-nothing, and divergent observed refs fail with both
+  object IDs. No test sleeps and no test uses a live token or network.
 - **Integration tests:** exercise `fragment -> ci checks -> plan -> confirmed apply ->
   verify` against fixture workspaces shaped like both repositories. Scenarios cover a
   fresh train, all-existing rerun, timeout-after-upload, partial DAG resume, parity
-  mismatch, note-only resume, tag conflict, release conflict, and Odori bootstrap
-  revision mismatch.
+  mismatch, note-only resume, atomic-push refusal, divergent remote refs, tag conflict,
+  release conflict, and Odori bootstrap revision mismatch.
 - **Packaging fixtures:** include path-only dependency failure, missing packaged README,
-  an internal-only fragment train, concurrent fragment filenames, and the Odori
+  the excluded `tokeira-chasm-derive` dev-dependency on `tokeira-chasm`, an
+  internal-only fragment train, concurrent fragment filenames, and the Odori
   workspace-dependency preservation case.
 - **Manual live validation:** is outside automated tests but required before enabling
   real publication. The operator runs Plan and Verify against public read-only state;

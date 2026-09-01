@@ -47,16 +47,21 @@
 - [ ] 4. Implement workspace discovery, graph planning, and canonical Plans
   - [ ] 4.1 Build the Publishable Package graph from Cargo metadata
     - Admit exactly one workspace, select crates.io-publishable members, derive internal
-      publishable edges, reject cycles, and use a lexical topological tie break.
+      publishable edges from normal and build dependencies, including target-specific
+      and enabled-optional dependencies; exclude dev-dependencies, reject cycles, and
+      use a lexical topological tie break. Cover the harmless
+      `tokeira-chasm-derive` dev-dependency on `tokeira-chasm` explicitly.
     - _Requirements: 1.2, 1.3, 1.4, 2.3, 2.5, 6.2, 8.1, 8.2_
   - [ ] 4.2 Implement source and fragment admission
     - Check clean/up-to-date Git state, stable increasing target version, Unified
       Version, configured base ref, fragment inventory, and canonical config digest.
     - _Requirements: 2.2, 2.3, 2.4, 4.8, 4.9_
   - [ ] 4.3 Implement read-only external observations
-    - Observe tag, package/version checksum, dependency availability, and existing
-      release state through Dagger-backed seams without resolving a registry token.
-    - _Requirements: 2.6, 7.7, 11.1, 12.8_
+    - Observe the release branch and tag together, package/version checksum, dependency
+      availability, and existing release state through Dagger-backed seams without
+      resolving a registry token. Refuse divergent branch/tag observations while
+      naming both object IDs.
+    - _Requirements: 2.6, 7.7, 11.1, 11.10, 12.8_
   - [ ] 4.4 Implement deterministic notes preview and Plan digesting
     - Canonicalize portable fields, exclude local roots and advancing observations from
       Train Identity, and emit every outward effect plus release-notes digest.
@@ -72,10 +77,12 @@
       model the exact release batch transition, validate the Slice filename identity,
       and report the failing fragment path.
     - _Requirements: 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.11_
-  - [ ] 5.3 Implement per-package locked publish dry-runs
-    - Run each Publishable Package in graph order under the pinned toolchain, inspect
-      normalized packaged manifests and required consumer metadata, and prove source
-      bytes and lockfiles remain unchanged.
+  - [ ] 5.3 Implement the locked multi-package publish dry-run
+    - Select every Publishable Package in graph order in one Cargo invocation under the
+      pinned toolchain, inspect normalized packaged manifests and required consumer
+      metadata, and prove source bytes and lockfiles remain unchanged. Keep the sibling
+      archives in one packaging overlay so unpublished sibling versions never resolve
+      against the registry.
     - _Requirements: 6.2, 6.3, 6.4, 6.5, 6.6, 6.7_
 
 - [ ] 6. Checkpoint: planning and standing CI checks are green
@@ -102,27 +109,34 @@
 - [ ] 8. Implement release commit, tag, and hermetic packaging
   - [ ] 8.1 Create and validate Train Identity in Git objects
     - Add the Plan digest trailer to the Release Commit, create the annotated
-      `v<version>` tag, and verify matching local/remote objects without moving refs.
-    - _Requirements: 3.7, 3.8, 3.12_
+      `v<version>` tag, and verify matching local/remote branch and tag objects without
+      moving refs. Require both remote refs to exist and identify the same Release
+      Commit and Train Identity on resume.
+    - _Requirements: 3.7, 3.8, 3.12, 11.10_
   - [ ] 8.2 Build all `.crate` artifacts from tagged source
-    - Package in the Dagger toolchain from the exact Release Tag, retain deterministic
-      artifact bytes and SHA-256 values, and reject host-source or host-target leakage.
-    - _Requirements: 3.9, 9.1_
+    - Package every Publishable Package in one multi-package Cargo invocation in the
+      Dagger toolchain from the exact Release Tag, retain deterministic artifact bytes
+      and SHA-256 values, and reject host-source or host-target leakage.
+    - _Requirements: 3.9, 3.13, 9.1_
   - [ ] 8.3 Push only after the complete Hermetic Tag Build succeeds
-    - Push the exact Release Commit and annotated tag before publication and leave no
-      remote mutation on preparation/build failure.
+    - Push the exact Release Commit to the configured release branch and the annotated
+      tag together with `git push --atomic` before publication; leave no remote
+      mutation on preparation/build or atomic-push failure.
     - _Requirements: 3.10, 3.11, 3.12_
 
 - [ ] 9. Implement token admission and the publish state machine
   - [ ] 9.1 Add last-responsible-moment token resolution
     - Accept only an environment-variable name, resolve it after Plan validation and
-      confirmation, pass an opaque Dagger secret handle, and omit token values from all
-      serializable/debuggable types. Resolve fixed `GH_TOKEN` only after parity when a
-      release still needs creation.
-    - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 10.9, 10.10_
+      confirmation, and omit token values from all serializable/debuggable types. Define
+      structurally separate publish-and-parity and release-note request types and
+      executor invocations: the first carries only an opaque registry-token handle;
+      only after parity succeeds may the handler resolve fixed `GH_TOKEN` and create a
+      second request carrying only that release API credential.
+    - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 10.9, 10.10, 10.11, 10.12_
   - [ ] 9.2 Add registry observation and Skip Existing
     - Observe before upload, download/verify Existing Packages, inspect after Cargo
-      polling timeouts, and retain pending state after bounded ambiguity.
+      polling timeouts, then poll after 5 seconds with exponential backoff for no more
+      than 10 minutes per crate; retain pending state after bounded ambiguity.
     - _Requirements: 8.3, 8.4, 8.8, 8.9, 8.10, 11.3_
   - [ ] 9.3 Add serial pacing with a virtual-clock seam
     - Allow one upload in flight, enforce the 600-second success cooldown, and honor a
@@ -139,14 +153,18 @@
       and append the complete lexical package/checksum/page/README table.
     - _Requirements: 10.1, 10.2, 10.3, 10.7_
   - [ ] 10.3 Add idempotent `gh release create`
-    - Run inside Dagger with `--verify-tag` and `--notes-file`, skip an exact existing
-      release, refuse conflicts, use the fixed secret-injected credential, and use no
-      generated-note or hosted-action mode.
-    - _Requirements: 10.4, 10.5, 10.6, 10.7, 10.8, 10.9, 10.10_
+    - Run in the separate release-note Dagger invocation with `--verify-tag` and
+      `--notes-file`, skip an exact existing release, refuse conflicts, use fixed
+      `GH_TOKEN` as that invocation's only secret, and use no generated-note or
+      hosted-action mode.
+    - _Requirements: 10.4, 10.5, 10.6, 10.7, 10.8, 10.9, 10.10, 10.11, 10.12_
   - [ ] 10.4 Add the complete train state model
     - Classify pre-publication failure, partial publication, terminal mismatch, and
-      completion; admit only the specified resume transitions.
-    - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.9_
+      completion; admit only the specified resume transitions. Gate every resume on
+      observing both remote refs at the same Release Commit and return
+      terminal `GitRefConflict` with both observed ref values for any absence or
+      divergence.
+    - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.9, 11.10_
 
 - [ ] 11. Wire the four `tkr release` sub-verbs
   - [ ] 11.1 Add clap types and dispatcher wiring
@@ -164,8 +182,10 @@
     - _Requirements: 1.6, 1.7, 2.1, 9.6, 11.1_
   - [ ] 11.4 Implement Apply revalidation and confirmation
     - Recompute the Plan, render every required outward effect, enforce interactive and
-      non-interactive confirmation, then invoke the executor.
-    - _Requirements: 2.7, 2.8, 2.9, 2.10, 2.11_
+      non-interactive confirmation, invoke publish-and-parity with only the registry
+      credential, and only after parity succeeds resolve `GH_TOKEN` and invoke release
+      notes with no registry credential.
+    - _Requirements: 2.7, 2.8, 2.9, 2.10, 2.11, 10.9, 10.11, 10.12_
 
 - [ ] 12. Add the Odori bootstrap and cross-repository wiring
   - [ ] 12.1 Implement the pinned Git-source `tkr` bootstrap
@@ -187,9 +207,10 @@
   - Run Odori's focused bootstrap/config tests without changing either lockfile.
 
 - [ ] 14. Property test: Property 1 — workspace-generic deterministic package plan
-  - Generate acyclic workspace graphs, absolute root variants, and isomorphic Tokeira /
-    Odori fixtures; compare against a reference stable topological sort for at least 256
-    cases.
+  - Generate acyclic workspace graphs containing normal, build, target-specific,
+    enabled-optional, and dev-dependency links plus absolute root variants and
+    isomorphic Tokeira / Odori fixtures; compare against a reference stable topological
+    sort that excludes dev-dependencies for at least 256 cases.
   - Tag: `// Feature: release-engineering, Property 1: workspace-generic deterministic package plan`
   - _Requirements: 1.2, 1.3, 1.4, 2.3, 2.5, 8.1, 8.2, 12.5_
 
@@ -228,15 +249,17 @@
 
 - [ ] 20. Property test: Property 7 — packaging gate covers the publishable closure
   - Generate workspace metadata and normalized package manifests with path-only edges,
-    missing fields, and source snapshots; compare to a reference admission model for at
+    missing fields, source snapshots, and recorded Cargo invocations; require exactly
+    one multi-package invocation and compare to a reference admission model for at
     least 256 cases.
   - Tag: `// Feature: release-engineering, Property 7: packaging gate covers the publishable closure`
-  - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8_
+  - _Requirements: 3.13, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8_
 
 - [ ] 21. Property test: Property 8 — publish execution is idempotent
   - Drive generated package DAGs and registry outcome sequences through a fake Dagger
-    registry; assert at-most-once observable publication and correct resume for at least
-    256 cases.
+    registry and virtual clock; assert at-most-once observable publication, a first poll
+    after 5 seconds, exponential backoff, a hard 10-minute per-crate bound, and correct
+    resume for at least 256 cases.
   - Tag: `// Feature: release-engineering, Property 8: publish execution is idempotent`
   - _Requirements: 8.3, 8.4, 8.5, 8.8, 8.9, 8.10, 11.1, 11.2, 11.3_
 
@@ -249,10 +272,12 @@
 
 - [ ] 23. Property test: Property 10 — credential noninterference
   - Generate arbitrary non-empty registry and release API credential bytes plus every
-    report/error path; scan all output and compare non-secret results across credentials
-    for at least 256 cases.
+    report/error path; prove fake gateways never receive `GH_TOKEN` during the
+    publish-and-parity invocation or a registry token during the release-note
+    invocation, scan all output, and compare non-secret results across credentials for
+    at least 256 cases.
   - Tag: `// Feature: release-engineering, Property 10: credential noninterference`
-  - _Requirements: 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 10.9, 10.10_
+  - _Requirements: 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 10.9, 10.10, 10.11, 10.12_
 
 - [ ] 24. Property test: Property 11 — Artifact Parity is three-way equality
   - Generate local/download bytes and registry checksum values; assert admission exactly
@@ -268,10 +293,12 @@
   - _Requirements: 10.1, 10.2, 10.3, 10.7_
 
 - [ ] 26. Property test: Property 13 — partial-train state classification and resume
-  - Generate phase outcome sequences and compare state/resume decisions with the design
-    state machine for at least 256 cases.
+  - Generate phase outcome sequences, atomic branch/tag update outcomes, and observed
+    remote branch/tag object pairs; compare state/resume decisions and terminal
+    `GitRefConflict` diagnostics naming both ref values with the design state machine
+    for at least 256 cases.
   - Tag: `// Feature: release-engineering, Property 13: partial-train state classification and resume`
-  - _Requirements: 10.4, 10.5, 10.6, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.9_
+  - _Requirements: 3.11, 10.4, 10.5, 10.6, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.9, 11.10_
 
 - [ ] 27. Property test: Property 14 — cross-repository tool bootstrap isolation
   - Generate Odori manifest/lockfile bytes, tool revisions, bootstrap outcomes, and
@@ -283,16 +310,19 @@
 - [ ] 28. Add end-to-end offline release-train integration tests
   - [ ] 28.1 Exercise a fresh train and complete verify pass
     - Use fake Dagger, Git, registry, and release gateways while executing the real CLI,
-      planner, preparer, executor, report, and note-generation layers.
-    - _Requirements: 1.1, 2.1, 3.1, 3.5, 3.8, 3.9, 3.11, 8.3, 9.3, 10.4, 11.9_
+      planner, preparer, both executor invocations, report, and note-generation layers;
+      assert atomic ref publication, one multi-package packaging invocation, and the
+      structural credential boundary.
+    - _Requirements: 1.1, 2.1, 3.1, 3.5, 3.8, 3.9, 3.11, 3.13, 8.3, 9.3, 10.4, 10.9, 10.11, 10.12, 11.9_
   - [ ] 28.2 Exercise every resumable partial state
     - Cover timeout-after-upload, all-existing rerun, subset-published resume,
       note-only resume, and missing-token all-existing verification.
     - _Requirements: 7.7, 8.4, 8.8, 8.9, 11.1, 11.2, 11.3, 11.4, 11.7_
   - [ ] 28.3 Exercise every terminal conflict
-    - Cover dirty source, Plan drift, tag conflict, artifact mismatch, release conflict,
-      invalid tool asset, and unsupported tool platform.
-    - _Requirements: 2.4, 2.8, 3.12, 5.5, 5.7, 9.4, 10.6, 11.5, 11.8_
+    - Cover dirty source, Plan drift, tag conflict, atomic-push refusal, divergent
+      remote branch/tag object IDs, artifact mismatch, release conflict, invalid tool
+      asset, and unsupported tool platform.
+    - _Requirements: 2.4, 2.8, 3.11, 3.12, 5.5, 5.7, 9.4, 10.6, 11.5, 11.8, 11.10_
   - [ ] 28.4 Exercise both repository workspace shapes
     - Prove byte-equivalent changie config, identical command arguments, preserved Odori
       dependency membership, and external dependency preflight.

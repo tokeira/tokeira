@@ -495,9 +495,8 @@ pub(crate) enum ConfigAction {
 #[derive(Subcommand)]
 pub(crate) enum ObservabilityAction {
     Check {
-        /// Validate an already-rendered config root directly, or the dashboard
-        /// JSON file selected by `--grafana`.
-        #[arg(long, value_name = "PATH")]
+        /// Dashboard JSON file validated by `--grafana`.
+        #[arg(long, value_name = "DASHBOARD_JSON", requires = "grafana")]
         path: Option<PathBuf>,
         /// Validate only the Grafana dashboard supplied by `--path`.
         #[arg(long, requires = "path")]

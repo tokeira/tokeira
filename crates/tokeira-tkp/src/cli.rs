@@ -125,8 +125,8 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum ObservabilityCommand {
-    /// Validate rendered scrape, dashboard, and alert configuration. Read-only;
-    /// never gates or acquires the operation lock.
+    /// Run the platform-declared observability checks. Read-only; never gates
+    /// or acquires the operation lock.
     Check(ObservabilityCheckArgs),
 }
 
@@ -135,8 +135,8 @@ struct ObservabilityCheckArgs {
     /// Deployment directory holding the definition and its companion content.
     #[arg(long)]
     deployment_dir: PathBuf,
-    /// Reserved live-backend reachability window; static validation remains
-    /// deterministic and reports backend reachability as a warning.
+    /// Maximum duration available to platform-defined read-only reachability
+    /// checks. A platform with only static checks may ignore it.
     #[arg(long, default_value = "30")]
     timeout_seconds: u64,
 }

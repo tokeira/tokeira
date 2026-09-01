@@ -74,7 +74,7 @@ pub fn platform() -> PlatformDeclaration {
             },
         ],
         ops: Some(Box::new(tokeira_compose::ops::DockerOps)),
-        observability: Some(Box::new(observability::RenderedObservabilityCheck)),
+        observability: Some(Box::new(observability::ComposeObservabilityCheck)),
         execution: Box::new(tokeira_compose::execution::ComposeExecution),
         implementation: Arc::new(tokeira_compose::execution::ComposeIntegration),
     }

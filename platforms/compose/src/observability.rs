@@ -873,13 +873,14 @@ impl iac::Resource for ObservabilityConfigFilesResource {
 /// Compose's read-only check over the desired observability resource realized
 /// from one admitted deployment definition.
 #[derive(Debug, Default)]
-pub(crate) struct RenderedObservabilityCheck;
+pub(crate) struct ComposeObservabilityCheck;
 
-impl ObservabilityCheck for RenderedObservabilityCheck {
+impl ObservabilityCheck for ComposeObservabilityCheck {
     fn check(
         &self,
         _deployment: &DeploymentRef,
         resources: &[std::sync::Arc<dyn iac::Resource>],
+        _timeout: std::time::Duration,
     ) -> anyhow::Result<ObservabilityCheckReport> {
         let resource = resources
             .iter()
@@ -931,7 +932,7 @@ impl ObservabilityCheck for RenderedObservabilityCheck {
                     ),
                 },
                 ObservabilityCheckOutcome {
-                    name: "live-backend-query",
+                    name: "compose-live-backends",
                     status: ObservabilityCheckStatus::Warn,
                     detail:
                         "live Mimir/Loki/Grafana queries require a reachable deployment endpoint"
@@ -1144,13 +1145,14 @@ mod content_tests {
         let resources: Vec<std::sync::Arc<dyn iac::Resource>> =
             vec![std::sync::Arc::new(check_resource(dir.path()))];
 
-        let report = RenderedObservabilityCheck
+        let report = ComposeObservabilityCheck
             .check(
                 &DeploymentRef {
                     name: "fixture".to_string(),
                     dir: dir.path().join("deployment"),
                 },
                 &resources,
+                std::time::Duration::from_secs(30),
             )
             .expect("valid rendered tree");
 
@@ -1179,13 +1181,14 @@ mod content_tests {
         let resources: Vec<std::sync::Arc<dyn iac::Resource>> =
             vec![std::sync::Arc::new(check_resource(dir.path()))];
 
-        let error = RenderedObservabilityCheck
+        let error = ComposeObservabilityCheck
             .check(
                 &DeploymentRef {
                     name: "fixture".to_string(),
                     dir: dir.path().join("deployment"),
                 },
                 &resources,
+                std::time::Duration::from_secs(30),
             )
             .expect_err("style violation must fail the operator check");
 

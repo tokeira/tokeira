@@ -1,10 +1,15 @@
 # Production Observability
 
-Tokeira's production observability model is process-local telemetry plus
-platform-level collection. Each production process exposes its own HTTP
-observability endpoints; Alloy scrapes or collects from those endpoints and
-forwards the data to Mimir and Loki. Tokeira does not aggregate telemetry inside
-the application process. Aggregation belongs to the observability stack.
+Tokeira defines the telemetry exposed by its processes; each deployment
+platform owns how that telemetry is collected, stored, queried, and presented.
+There is no platform-independent requirement to deploy Alloy, Mimir, Loki,
+Grafana, or any other observability stack. A platform may declare those
+components, choose different ones, or expose only the process endpoints.
+
+The same boundary governs operator checks. A platform may declare an
+observability-check capability alongside its other operational capabilities.
+The platform owns the check's categories and evidence because only it knows
+which observability resources belong to the deployment.
 
 ## Process Endpoints
 
@@ -67,30 +72,31 @@ boundaries. Avoid broad `#[instrument]` on storage commit paths, lane execution,
 and other high-throughput async futures unless the span lifecycle has been
 audited.
 
-OTLP trace export is configurable. OTLP metrics push is Phase 2; Phase 1 relies
-on Prometheus scrape coverage and Alloy/Mimir ingestion.
+OTLP trace export is configurable. Metrics are exposed in Prometheus format;
+the selected platform decides whether and how to collect them.
 
 ## Compose Deployment
 
-Compose provisions Mimir, Loki, Grafana, and Alloy. Generated configuration
-includes:
+The Compose platform chooses Mimir, Loki, Grafana, and Alloy. Its generated
+configuration includes:
 
 - Alloy scrape jobs for Tokeira processes and infrastructure services.
 - Loki forwarding for logs.
 - Grafana dashboard provisioning.
 - Mimir alert rule provisioning.
 
-Dashboard JSON lives under `platforms/compose/dashboards/`. Alert rules live
-under `platforms/compose/alerts/`. The Compose generator discovers these
+Dashboard JSON lives under `platforms/compose/observability/dashboards/`. Alert
+rules live under `platforms/compose/observability/alerts/`. The Compose
+generator discovers these
 artifacts and renders them into the managed observability config tree.
 
 ## ECS Deployment
 
-ECS services expose process observability endpoints inside the private network.
-Each task gets observability environment values for service, cluster,
-deployment, metrics bind address, and JSON logging. Alloy uses task-scoped
-Docker discovery for log collection and local metrics scrape configuration for
-each service.
+The legacy ECS platform services expose process observability endpoints inside
+the private network. Each task gets observability environment values for
+service, cluster, deployment, metrics bind address, and JSON logging. Alloy uses
+task-scoped Docker discovery for log collection and local metrics scrape
+configuration for each service.
 
 Dashboard and alert artifacts are included in the ECS observability provisioning
 resources so Grafana and Mimir can be hydrated without public endpoints.
@@ -105,48 +111,45 @@ tkr observability check
 
 For a definition-backed deployment, `tkr` forwards this read-only command to
 the deployment's bound `tkp`. The provisioner admits the recorded definition,
-realizes its observability content in memory, and validates the post-substitution
-tree: the expected Alloy scrape jobs, Grafana dashboard style (including the
-`$datasource` variable, panel descriptions, units, and line presentation), and
-Mimir alert-rule metadata. It does not acquire the operation lock, invoke
-provisioner gates, contact providers, or write the generated files.
+realizes its desired resources in memory, and delegates the entire check to the
+capability in that platform's `PlatformDeclaration`. The framework prescribes
+neither an observability stack nor common check categories. A platform that
+does not declare the capability reports the command as not applicable.
 
-To validate an already-rendered tree without selecting or admitting a
-deployment, pass its config root directly:
+The framework does not acquire the operation lock, invoke provisioner gates,
+contact providers, or write deployment files while dispatching the check. Each
+platform implementation must likewise remain read-only.
 
-```bash
-tkr observability check --path /path/to/rendered/config
-```
+The current Compose capability validates Compose's own rendered Alloy scrape
+jobs, Grafana dashboards, and Mimir alert rules. Those checks describe Compose,
+not a requirement on other platforms. Legacy `deployment.toml` deployments
+continue to use their existing in-process local/ECS behavior.
 
-The path must contain `alloy.alloy`, `grafana/dashboards/`, and
-`mimir/rules/`. This route runs the same production dashboard, alert-rule, and
-Alloy scrape-job validators directly in `tkr`; it does not require a bound
-provisioner. Pass either `--path` or `--deployment`, not both.
-
-To validate one Grafana dashboard without requiring the rest of the rendered
-tree, select Grafana-only mode and pass the dashboard JSON file itself:
+To validate one Grafana dashboard without selecting a deployment or assuming
+a platform stack, select Grafana-only mode and pass the dashboard JSON file
+itself:
 
 ```bash
 tkr observability check --grafana --path /path/to/dashboard.json
 ```
 
-This mode runs `DashboardValidator` over that file and reports a single
+This explicit mode is independent of any selected platform. It runs
+`DashboardValidator` over that file and reports a single
 `grafana-dashboard` `PASS` result. It does not run the Alloy or alert-rule
 checks, report live-backend reachability, or admit a deployment. `--grafana`
-requires `--path`.
+and `--path` require each other; `--path` is not a generic rendered-stack input.
 
-The command reports static configuration checks as `PASS`. Live Mimir, Loki,
-and Grafana reachability remains `WARN` because it requires a reachable
-deployment endpoint. Legacy `deployment.toml` deployments continue to run the
-in-process local/ECS checks, including ECS observability artifact inclusion.
+Per-deployment checks complement platform-owned unit tests. A platform can use
+unit tests to validate its shipped sources and its declared capability to
+validate the deployment-specific realized result.
 
-The per-deployment and direct-path commands complement the platform unit tests:
-those validate the shipped dashboard and alert sources, while these commands
-validate rendered results.
+## Grafana Dashboards
 
-## Dashboards
+These conventions apply only when a platform chooses Grafana or when an
+operator explicitly uses `--grafana`. They are not a requirement to deploy
+Grafana.
 
-Provisioned dashboard families include:
+The dashboards currently shipped by Compose cover:
 
 - Broker/runtime health.
 - gRPC edge health.
@@ -162,12 +165,13 @@ Dashboards must use declared metric names, smooth line interpolation, explicit
 units, descriptions, meaningful legends, and the `$datasource` template
 variable. Do not put high-cardinality labels in legends.
 
-## Alerts
+## Compose Alerts
 
-Alert rules are stored in `platforms/compose/alerts/observability-alerts.yaml`.
-Each alert includes bounded severity and service labels plus a summary and
-description. Runbook URLs are intentionally not emitted until the
-production-observability surface defines a stable public documentation home.
+Alert rules are stored in
+`platforms/compose/observability/alerts/observability-alerts.yaml`. Each alert
+includes bounded severity and service labels plus a summary and description.
+Runbook URLs are intentionally not emitted until the production-observability
+surface defines a stable public documentation home.
 
 ## Implementer Notes
 
@@ -176,6 +180,8 @@ production-observability surface defines a stable public documentation home.
   metric labels.
 - Use typed label enums instead of ad-hoc strings on hot paths.
 - Use manual spans on hot or cancellable async paths.
-- Update dashboard and alert validation tests when adding telemetry artifacts.
-- Keep production defaults private-network friendly. Public observability
-  endpoints are not required for Compose or ECS operation.
+- When a platform ships dashboards or alerts, keep its validation tests beside
+  that platform's content and declare any deployment-specific check through
+  `PlatformDeclaration`.
+- Keep platform defaults private-network friendly. Public observability
+  endpoints are not required by the process telemetry contract.

@@ -274,15 +274,12 @@ async fn run() -> Result<()> {
                 grafana,
                 timeout_seconds,
             } = action;
-            if let Some(path) = path {
+            if grafana {
                 if selected.is_some() {
                     anyhow::bail!("pass either `--path` or `--deployment`, not both");
                 }
-                if grafana {
-                    commands::observability::run_grafana(&path)
-                } else {
-                    commands::observability::run_path(&path, timeout_seconds)
-                }
+                let path = path.ok_or_else(|| anyhow::anyhow!("`--grafana` requires `--path`"))?;
+                commands::observability::run_grafana(&path)
             } else if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
                 let (verb, extra) = forwarded_observability_verb(timeout_seconds);
@@ -1009,24 +1006,6 @@ mod tests {
                 "tkr",
                 "observability",
                 "check",
-                "--path",
-                "/tmp/rendered/config"
-            ])
-            .unwrap()
-            .command,
-            Command::Observability {
-                action: ObservabilityAction::Check {
-                    path: Some(path),
-                    grafana: false,
-                    timeout_seconds: 30
-                }
-            } if path == std::path::Path::new("/tmp/rendered/config")
-        ));
-        assert!(matches!(
-            Cli::try_parse_from([
-                "tkr",
-                "observability",
-                "check",
                 "--grafana",
                 "--path",
                 "/tmp/dashboard.json"
@@ -1042,6 +1021,16 @@ mod tests {
             } if path == std::path::Path::new("/tmp/dashboard.json")
         ));
         assert!(Cli::try_parse_from(["tkr", "observability", "check", "--grafana"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "tkr",
+                "observability",
+                "check",
+                "--path",
+                "/tmp/rendered/config"
+            ])
+            .is_err()
+        );
         assert!(matches!(
             Cli::try_parse_from(["tkr", "version"]).unwrap().command,
             Command::Version {

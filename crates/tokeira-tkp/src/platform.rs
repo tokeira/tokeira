@@ -243,7 +243,7 @@ impl BoundPlatform {
         self.declaration.ops.as_deref()
     }
 
-    /// The platform's rendered-observability validator, when declared.
+    /// The platform's own observability checks, when declared.
     pub(crate) fn observability(&self) -> Option<&dyn ObservabilityCheck> {
         self.declaration.observability.as_deref()
     }

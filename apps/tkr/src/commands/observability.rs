@@ -1,13 +1,11 @@
 //! Observability smoke checks for generated deployment telemetry paths.
 //!
-//! The command deliberately validates generated configuration before trying to
-//! query live backends. That gives operators fast feedback for broken scrape,
-//! dashboard, and alert provisioning even in private deployments where Mimir or
-//! Loki may only be reachable through port forwarding. A selected deployment
-//! uses its platform-owned generation path; `--path` validates an already
-//! rendered config root without deployment admission.
+//! Definition-backed deployments are forwarded to their platform declaration;
+//! only that platform knows which observability stack and checks apply. This
+//! module retains the legacy in-process deployment checks and the explicit
+//! `--grafana --path <dashboard.json>` validator.
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use tokeira_ecs_deployment::{
@@ -15,16 +13,9 @@ use tokeira_ecs_deployment::{
     services::EcsWorkload,
 };
 use tokeira_iac::{Module, ModuleContext};
-use tokeira_observability::validation::{
-    AlertRuleValidator, AlloyConfigValidator, DashboardValidator,
-};
+use tokeira_observability::validation::DashboardValidator;
 
 use crate::deployment_dir::{DeploymentContext, PlatformDeploymentConfig};
-
-const ALLOY_CONFIG: &str = "alloy.alloy";
-const DASHBOARD_DIR: &str = "grafana/dashboards";
-const ALERT_RULE_DIR: &str = "mimir/rules";
-const EXPECTED_SCRAPE_JOBS: &[&str] = &["tokeirad", "alloy", "mimir", "loki", "grafana"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckReport {
@@ -46,12 +37,6 @@ pub(crate) enum CheckStatus {
 
 pub(crate) fn run_selected(timeout_seconds: u64, ctx: DeploymentContext) -> Result<()> {
     let report = check_generated_observability(&ctx, timeout_seconds)?;
-    emit_report(&report);
-    Ok(())
-}
-
-pub(crate) fn run_path(path: &Path, timeout_seconds: u64) -> Result<()> {
-    let report = check_rendered_observability(path, timeout_seconds)?;
     emit_report(&report);
     Ok(())
 }
@@ -92,74 +77,6 @@ pub(crate) fn check_generated_observability(
     Ok(CheckReport { checks })
 }
 
-pub(crate) fn check_rendered_observability(
-    path: &Path,
-    timeout_seconds: u64,
-) -> Result<CheckReport> {
-    if timeout_seconds == 0 {
-        bail!("observability check timeout must be positive");
-    }
-    if !path.is_dir() {
-        bail!(
-            "rendered observability path is not a directory: {}",
-            path.display()
-        );
-    }
-
-    let alloy_path = path.join(ALLOY_CONFIG);
-    let alloy = fs::read_to_string(&alloy_path).with_context(|| {
-        format!(
-            "failed to read rendered Alloy config {}",
-            alloy_path.display()
-        )
-    })?;
-    AlloyConfigValidator::validate_scrape_jobs(&alloy_path, &alloy, EXPECTED_SCRAPE_JOBS)?;
-
-    let dashboards = path.join(DASHBOARD_DIR);
-    DashboardValidator::validate_directory(&dashboards)?;
-    let dashboard_count = count_files(&dashboards, &["json"])?;
-    if dashboard_count == 0 {
-        bail!(
-            "rendered observability path contains no Grafana dashboards under {}",
-            dashboards.display()
-        );
-    }
-
-    let alerts = path.join(ALERT_RULE_DIR);
-    AlertRuleValidator::validate_directory(&alerts, path)?;
-    let alert_count = count_files(&alerts, &["yaml", "yml"])?;
-    if alert_count == 0 {
-        bail!(
-            "rendered observability path contains no Mimir alert rules under {}",
-            alerts.display()
-        );
-    }
-
-    Ok(CheckReport {
-        checks: vec![
-            pass(
-                "rendered-scrapes",
-                format!(
-                    "{} expected Alloy scrape jobs present",
-                    EXPECTED_SCRAPE_JOBS.len()
-                ),
-            ),
-            pass(
-                "rendered-dashboards",
-                format!("{dashboard_count} Grafana dashboards satisfy the style contract"),
-            ),
-            pass(
-                "rendered-alerts",
-                format!("{alert_count} Mimir alert files satisfy the style contract"),
-            ),
-            warn(
-                "live-backend-query",
-                "live Mimir/Loki/Grafana queries require a reachable deployment endpoint",
-            ),
-        ],
-    })
-}
-
 pub(crate) fn check_grafana_dashboard(path: &Path) -> Result<CheckReport> {
     DashboardValidator::validate_file(path)?;
     Ok(CheckReport {
@@ -171,25 +88,6 @@ pub(crate) fn check_grafana_dashboard(path: &Path) -> Result<CheckReport> {
             ),
         )],
     })
-}
-
-fn count_files(path: &Path, extensions: &[&str]) -> Result<usize> {
-    let entries = fs::read_dir(path)
-        .with_context(|| format!("failed to read rendered directory {}", path.display()))?;
-    let mut count = 0;
-    for entry in entries {
-        let entry = entry
-            .with_context(|| format!("failed to read rendered entry under {}", path.display()))?;
-        if entry
-            .path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extensions.contains(&extension))
-        {
-            count += 1;
-        }
-    }
-    Ok(count)
 }
 
 fn ecs_checks(
@@ -289,7 +187,7 @@ fn warn(name: &'static str, detail: impl Into<String>) -> CheckOutcome {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use super::*;
     use crate::{
@@ -316,37 +214,6 @@ mod tests {
             },
             platform_config,
         }
-    }
-
-    fn rendered_fixture(root: &Path) {
-        std::fs::create_dir_all(root.join(DASHBOARD_DIR)).unwrap();
-        std::fs::create_dir_all(root.join(ALERT_RULE_DIR)).unwrap();
-        let scrapes = EXPECTED_SCRAPE_JOBS
-            .iter()
-            .map(|job| format!("prometheus.scrape \"{job}\" {{}}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(root.join(ALLOY_CONFIG), scrapes).unwrap();
-        std::fs::write(
-            root.join(DASHBOARD_DIR).join("health.json"),
-            r#"{"templating":{"list":[{"name":"datasource","type":"datasource"}]},"panels":[]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join(ALERT_RULE_DIR).join("health.yaml"),
-            r#"groups:
-  - name: health
-    rules:
-      - alert: HealthFailure
-        expr: vector(1)
-        labels:
-          severity: page
-          service: tokeirad
-        annotations:
-          summary: Health check failed
-"#,
-        )
-        .unwrap();
     }
 
     #[test]
@@ -391,33 +258,6 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("timeout must be positive"));
-    }
-
-    #[test]
-    fn standalone_rendered_path_passes_without_a_deployment() {
-        let rendered = tempfile::tempdir().unwrap();
-        rendered_fixture(rendered.path());
-
-        let report = check_rendered_observability(rendered.path(), 30).unwrap();
-
-        assert_eq!(report.checks.len(), 4);
-        assert_eq!(report.checks[0].name, "rendered-scrapes");
-        assert_eq!(report.checks[3].status, CheckStatus::Warn);
-    }
-
-    #[test]
-    fn standalone_rendered_path_rejects_dashboard_style_violations() {
-        let rendered = tempfile::tempdir().unwrap();
-        rendered_fixture(rendered.path());
-        std::fs::write(
-            rendered.path().join(DASHBOARD_DIR).join("health.json"),
-            r#"{"panels":[]}"#,
-        )
-        .unwrap();
-
-        let error = check_rendered_observability(rendered.path(), 30).unwrap_err();
-
-        assert!(error.to_string().contains("missing $datasource variable"));
     }
 
     #[test]

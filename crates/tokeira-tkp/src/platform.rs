@@ -20,7 +20,8 @@ use tokeira_deployment::DeploymentBindingMetadata;
 use tokeira_orchestrator::{DefinitionFormatId, PlatformId, RelativeDefinitionPath};
 use tokeira_platform::{
     declaration::{
-        DeploymentRef, Ops, PlatformDeclaration, PlatformExecution, PlatformIntegration,
+        DeploymentRef, ObservabilityCheck, Ops, PlatformDeclaration, PlatformExecution,
+        PlatformIntegration,
     },
     definition::Namespace,
 };
@@ -242,6 +243,11 @@ impl BoundPlatform {
         self.declaration.ops.as_deref()
     }
 
+    /// The platform's own observability checks, when declared.
+    pub(crate) fn observability(&self) -> Option<&dyn ObservabilityCheck> {
+        self.declaration.observability.as_deref()
+    }
+
     /// The platform implementation delegated to by the described deployment.
     pub(crate) fn implementation(&self) -> Arc<dyn PlatformIntegration> {
         Arc::clone(&self.declaration.implementation)
@@ -362,6 +368,7 @@ mod tests {
         PlatformDeclaration {
             namespaces,
             ops: None,
+            observability: None,
             execution: Box::new(NoProbe),
             implementation: Arc::new(NoIntegration),
         }

@@ -495,6 +495,12 @@ pub(crate) enum ConfigAction {
 #[derive(Subcommand)]
 pub(crate) enum ObservabilityAction {
     Check {
+        /// Dashboard JSON file validated by `--grafana`.
+        #[arg(long, value_name = "DASHBOARD_JSON", requires = "grafana")]
+        path: Option<PathBuf>,
+        /// Validate only the Grafana dashboard supplied by `--path`.
+        #[arg(long, requires = "path")]
+        grafana: bool,
         #[arg(long, default_value = "30")]
         timeout_seconds: u64,
     },

@@ -40,9 +40,9 @@ pub(crate) enum LaunchClass {
     CandidateUpgrade,
     DevCandidate,
     Rollback,
-    /// A read-only verb (`describe`/`plan`/`status`). Never verified and never
-    /// refused: `tkp describe` itself deliberately never gates, precisely so it
-    /// can diagnose the mismatches that block the mutating classes.
+    /// A read-only verb (`describe`, checks, plans, or operational reads).
+    /// Never verified and never refused: these verbs deliberately remain
+    /// available when a binding mismatch blocks mutation.
     ReadOnly,
 }
 
@@ -59,9 +59,12 @@ pub(crate) enum LaunchClass {
 /// provisioner's mutation gate will refuse it.
 pub(crate) fn resolve_class(verb: &[&str], envelope: &DeploymentStateEnvelope) -> LaunchClass {
     match verb {
-        ["describe"] | ["definition", "check"] | ["logs"] | ["port-mappings"] | [_, "plan"] => {
-            LaunchClass::ReadOnly
-        }
+        ["describe"]
+        | ["definition", "check"]
+        | ["observability", "check"]
+        | ["logs"]
+        | ["port-mappings"]
+        | [_, "plan"] => LaunchClass::ReadOnly,
         ["upgrade"] => LaunchClass::CandidateUpgrade,
         ["rollback"] => LaunchClass::Rollback,
         _ => match envelope.binding.as_ref().map(|b| b.build_mode) {
@@ -628,6 +631,10 @@ mod tests {
             );
             assert_eq!(
                 resolve_class(&["deploy", "plan"], envelope),
+                LaunchClass::ReadOnly
+            );
+            assert_eq!(
+                resolve_class(&["observability", "check"], envelope),
                 LaunchClass::ReadOnly
             );
         }

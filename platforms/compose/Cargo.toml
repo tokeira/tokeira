@@ -49,9 +49,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokeira-observability = { workspace = true }
 
 [dev-dependencies]
-tokeira-observability = { workspace = true }
 tokeira-platform-definition = { workspace = true, features = ["tkd"] }
 tempfile = { workspace = true }
 

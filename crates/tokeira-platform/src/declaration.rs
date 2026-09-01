@@ -6,7 +6,7 @@
 //! namespaces it exposes, its live operational capabilities, and the
 //! platform implementation that realizes those capabilities.
 
-use std::{fmt, path::PathBuf, pin::Pin, sync::Arc};
+use std::{fmt, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 use futures_util::Stream;
 
@@ -27,6 +27,8 @@ pub struct PlatformDeclaration {
     pub namespaces: Vec<Namespace>,
     /// Live operational queries exposed by this platform, when supported.
     pub ops: Option<Box<dyn Ops>>,
+    /// Platform-owned read-only observability checks, when supported.
+    pub observability: Option<Box<dyn ObservabilityCheck>>,
     /// Reachability of the platform's execution substrate.
     pub execution: Box<dyn PlatformExecution>,
     /// The platform-owned execution implementation.
@@ -45,6 +47,7 @@ impl fmt::Debug for PlatformDeclaration {
                     .collect::<Vec<_>>(),
             )
             .field("ops", &self.ops.is_some())
+            .field("observability", &self.observability.is_some())
             .field("execution", &self.execution)
             .field("implementation", &self.implementation)
             .finish_non_exhaustive()
@@ -96,6 +99,54 @@ pub trait Ops: Send + Sync + fmt::Debug {
     /// every one of its verbs in its own words — a provider without a scale
     /// dimension states its own refusal as the error.
     async fn scale(&self, deployment: &DeploymentRef, specs: &[String]) -> anyhow::Result<usize>;
+}
+
+/// Result of running one platform's observability checks for a deployment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservabilityCheckReport {
+    /// Ordered checks rendered by the operator shell.
+    pub checks: Vec<ObservabilityCheckOutcome>,
+}
+
+/// One operator-facing observability validation result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservabilityCheckOutcome {
+    /// Stable short name for the checked surface.
+    pub name: &'static str,
+    /// Whether the checked surface passed or needs operator follow-up.
+    pub status: ObservabilityCheckStatus,
+    /// Concise evidence or direction for the operator.
+    pub detail: String,
+}
+
+/// Non-failing statuses in a platform-owned observability check report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservabilityCheckStatus {
+    /// The platform's check succeeded.
+    Pass,
+    /// The platform found a condition that needs operator follow-up but does
+    /// not make the check fail.
+    Warn,
+}
+
+/// Platform-owned observability validation for an admitted deployment.
+///
+/// The framework deliberately defines no common observability stack or check
+/// categories. It realizes the admitted definition before calling this
+/// capability, and the platform decides which of its desired resources and
+/// artifacts are relevant. Implementations must remain read-only and must not
+/// mutate deployment state.
+pub trait ObservabilityCheck: Send + Sync + fmt::Debug {
+    /// Run the platform-defined checks over its realized resource set.
+    ///
+    /// `timeout` bounds any read-only reachability work the platform elects to
+    /// perform; a purely static check may ignore it.
+    fn check(
+        &self,
+        deployment: &DeploymentRef,
+        resources: &[Arc<dyn tokeira_iac::Resource>],
+        timeout: Duration,
+    ) -> anyhow::Result<ObservabilityCheckReport>;
 }
 
 /// The platform's execution seam, invoked by the framework: reachability

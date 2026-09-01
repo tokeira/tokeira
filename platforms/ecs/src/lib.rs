@@ -41,6 +41,7 @@ pub fn platform() -> PlatformDeclaration {
         // preserved legacy implementation until that contract is addressed
         // in its own slice.
         ops: None,
+        observability: None,
         execution: Box::new(tokeira_ecs::execution::EcsExecution),
         implementation: Arc::new(tokeira_ecs::execution::EcsIntegration),
     }
@@ -199,7 +200,7 @@ mod content_tests {
     // contract over it: every shipped dashboard and alert rule validates.
     #[test]
     fn dashboards_follow_the_style_contract() {
-        tokeira_observability::testing::DashboardValidator::validate_directory(
+        tokeira_observability::validation::DashboardValidator::validate_directory(
             &content_dir().join("dashboards"),
         )
         .unwrap();
@@ -212,7 +213,7 @@ mod content_tests {
             .nth(2)
             .expect("platforms/ecs sits two levels below the workspace root")
             .to_path_buf();
-        tokeira_observability::testing::AlertRuleValidator::validate_directory(
+        tokeira_observability::validation::AlertRuleValidator::validate_directory(
             &content_dir().join("alerts"),
             &repo_root,
         )

@@ -1,9 +1,11 @@
 //! Observability smoke checks for generated deployment telemetry paths.
 //!
-//! The command deliberately validates generated configuration before trying to
-//! query live backends. That gives operators fast feedback for broken scrape,
-//! dashboard, and alert provisioning even in private deployments where Mimir or
-//! Loki may only be reachable through port forwarding.
+//! Definition-backed deployments are forwarded to their platform declaration;
+//! only that platform knows which observability stack and checks apply. This
+//! module retains the legacy in-process deployment checks and the explicit
+//! `--grafana --path <dashboard.json>` validator.
+
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use tokeira_ecs_deployment::{
@@ -11,11 +13,9 @@ use tokeira_ecs_deployment::{
     services::EcsWorkload,
 };
 use tokeira_iac::{Module, ModuleContext};
+use tokeira_observability::validation::DashboardValidator;
 
-use crate::{
-    cli::ObservabilityAction,
-    deployment_dir::{DeploymentContext, PlatformDeploymentConfig},
-};
+use crate::deployment_dir::{DeploymentContext, PlatformDeploymentConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckReport {
@@ -35,10 +35,19 @@ pub(crate) enum CheckStatus {
     Warn,
 }
 
-pub(crate) fn run(action: ObservabilityAction, ctx: DeploymentContext) -> Result<()> {
-    let ObservabilityAction::Check { timeout_seconds } = action;
+pub(crate) fn run_selected(timeout_seconds: u64, ctx: DeploymentContext) -> Result<()> {
     let report = check_generated_observability(&ctx, timeout_seconds)?;
+    emit_report(&report);
+    Ok(())
+}
 
+pub(crate) fn run_grafana(path: &Path) -> Result<()> {
+    let report = check_grafana_dashboard(path)?;
+    emit_report(&report);
+    Ok(())
+}
+
+fn emit_report(report: &CheckReport) {
     for outcome in &report.checks {
         let status = match outcome.status {
             CheckStatus::Pass => "PASS",
@@ -46,7 +55,6 @@ pub(crate) fn run(action: ObservabilityAction, ctx: DeploymentContext) -> Result
         };
         println!("{status} {} - {}", outcome.name, outcome.detail);
     }
-    Ok(())
 }
 
 pub(crate) fn check_generated_observability(
@@ -67,6 +75,19 @@ pub(crate) fn check_generated_observability(
     };
 
     Ok(CheckReport { checks })
+}
+
+pub(crate) fn check_grafana_dashboard(path: &Path) -> Result<CheckReport> {
+    DashboardValidator::validate_file(path)?;
+    Ok(CheckReport {
+        checks: vec![pass(
+            "grafana-dashboard",
+            format!(
+                "{} satisfies the Grafana dashboard style contract",
+                path.display()
+            ),
+        )],
+    })
 }
 
 fn ecs_checks(
@@ -237,5 +258,33 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("timeout must be positive"));
+    }
+
+    #[test]
+    fn focused_grafana_path_validates_one_dashboard() {
+        let rendered = tempfile::tempdir().unwrap();
+        let dashboard = rendered.path().join("health.json");
+        std::fs::write(
+            &dashboard,
+            r#"{"templating":{"list":[{"name":"datasource","type":"datasource"}]},"panels":[]}"#,
+        )
+        .unwrap();
+
+        let report = check_grafana_dashboard(&dashboard).unwrap();
+
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].name, "grafana-dashboard");
+        assert_eq!(report.checks[0].status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn focused_grafana_path_rejects_a_style_violation() {
+        let rendered = tempfile::tempdir().unwrap();
+        let dashboard = rendered.path().join("health.json");
+        std::fs::write(&dashboard, r#"{"panels":[]}"#).unwrap();
+
+        let error = check_grafana_dashboard(&dashboard).unwrap_err();
+
+        assert!(error.to_string().contains("missing $datasource variable"));
     }
 }

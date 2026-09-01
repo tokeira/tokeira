@@ -60,7 +60,7 @@ mod tui;
 
 use cli::{
     Cli, Command, ConfigAction, DeployAction, DeploymentAction, ImageCommand, InfraAction,
-    ScaleAction, SchemaAction,
+    ObservabilityAction, ScaleAction, SchemaAction,
 };
 use deployment_dir::{DeploymentResolver, load_context};
 
@@ -269,8 +269,25 @@ async fn run() -> Result<()> {
         Command::Compat(args) => commands::compat::run(args.command, cli.json),
         Command::Ci(args) => commands::ci::run(args.command, cli.json).await,
         Command::Observability { action } => {
-            let ctx = load_context(&deployments, selected)?;
-            commands::observability::run(action, ctx)
+            let ObservabilityAction::Check {
+                path,
+                grafana,
+                timeout_seconds,
+            } = action;
+            if grafana {
+                if selected.is_some() {
+                    anyhow::bail!("pass either `--path` or `--deployment`, not both");
+                }
+                let path = path.ok_or_else(|| anyhow::anyhow!("`--grafana` requires `--path`"))?;
+                commands::observability::run_grafana(&path)
+            } else if deployments.uses_bound_provisioner(selected)? {
+                let dir = deployments.resolve_dir(selected)?;
+                let (verb, extra) = forwarded_observability_verb(timeout_seconds);
+                launcher::launch(&dir, verb, &extra).await
+            } else {
+                let ctx = load_context(&deployments, selected)?;
+                commands::observability::run_selected(timeout_seconds, ctx)
+            }
         }
         Command::Diagnostics { action } => {
             let ctx = load_context(&deployments, selected)?;
@@ -358,6 +375,17 @@ fn forwarded_infra_verb(action: &InfraAction) -> (&'static [&'static str], Vec<S
         }
         InfraAction::Status => (&["describe"], Vec::new()),
     }
+}
+
+/// Forward the read-only observability verb to the provisioner bound to the
+/// admitted deployment. The timeout remains explicit at the boundary so both
+/// shells preserve the same operator request even while live reachability is
+/// reported as a warning.
+fn forwarded_observability_verb(timeout_seconds: u64) -> (&'static [&'static str], Vec<String>) {
+    (
+        &["observability", "check"],
+        vec!["--timeout-seconds".to_string(), timeout_seconds.to_string()],
+    )
 }
 
 /// `--module` crosses to the bound `tkp` verbatim — the platform owns its
@@ -699,6 +727,7 @@ mod tests {
             vec!["tkr", "schema", "status"],
             vec!["tkr", "image", "list"],
             vec!["tkr", "image", "build"],
+            vec!["tkr", "observability", "check"],
             vec!["tkr", "deployment", "describe"],
             vec!["tkr", "deployment", "list"],
             vec!["tkr", "deployment", "lock"],
@@ -740,6 +769,16 @@ mod tests {
         };
         let (_, extra) = forwarded_infra_verb(&bare);
         assert!(extra.is_empty(), "no flag without a request");
+    }
+
+    #[test]
+    fn forwarding_preserves_the_observability_check_timeout() {
+        let (verb, extra) = forwarded_observability_verb(15);
+        assert_eq!(verb, &["observability", "check"]);
+        assert_eq!(
+            extra,
+            vec!["--timeout-seconds".to_string(), "15".to_string()]
+        );
     }
 
     // The operator's confirmation crosses to the binary that gates on it:
@@ -956,10 +995,42 @@ mod tests {
                 .command,
             Command::Observability {
                 action: ObservabilityAction::Check {
+                    path: None,
+                    grafana: false,
                     timeout_seconds: 15
                 }
             }
         ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "tkr",
+                "observability",
+                "check",
+                "--grafana",
+                "--path",
+                "/tmp/dashboard.json"
+            ])
+            .unwrap()
+            .command,
+            Command::Observability {
+                action: ObservabilityAction::Check {
+                    path: Some(path),
+                    grafana: true,
+                    timeout_seconds: 30
+                }
+            } if path == std::path::Path::new("/tmp/dashboard.json")
+        ));
+        assert!(Cli::try_parse_from(["tkr", "observability", "check", "--grafana"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "tkr",
+                "observability",
+                "check",
+                "--path",
+                "/tmp/rendered/config"
+            ])
+            .is_err()
+        );
         assert!(matches!(
             Cli::try_parse_from(["tkr", "version"]).unwrap().command,
             Command::Version {

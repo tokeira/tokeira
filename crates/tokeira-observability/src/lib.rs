@@ -29,6 +29,7 @@ pub mod redaction;
 pub mod shutdown;
 pub mod testing;
 pub mod tracing;
+pub mod validation;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

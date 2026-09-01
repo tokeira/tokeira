@@ -14,6 +14,8 @@ mod provenance;
 pub const TOKEIRA_VERSION: &str = env!("TOKEIRA_BUILD_INFO_VERSION");
 /// Short source revision, or a dev-mode fallback when git is unavailable.
 pub const TOKEIRA_GIT_SHA: &str = env!("TOKEIRA_BUILD_INFO_GIT_SHA");
+/// Full source revision used to fence external tool bootstraps.
+pub const TOKEIRA_SOURCE_REVISION: &str = env!("TOKEIRA_BUILD_INFO_SOURCE_REVISION");
 /// SDK-visible server version with source identity in SemVer build metadata.
 pub const SERVER_VERSION: &str = env!("TOKEIRA_BUILD_INFO_SERVER_VERSION");
 /// Vendored upstream Temporal proto version.
@@ -47,6 +49,10 @@ pub const SCHEMA_MIGRATION_SET_DIGEST: &str =
 pub struct BuildInfo {
     pub tokeira_version: &'static str,
     pub tokeira_git_sha: &'static str,
+    /// Full 40-hex source revision when the build can determine one (the build
+    /// manifest, an injected environment value, or live Git, in that order); the
+    /// same degraded sentinel as `tokeira_git_sha` for a local release build.
+    pub tokeira_source_revision: &'static str,
     pub temporal_proto_version: &'static str,
     pub temporal_server_compat: &'static str,
     pub rust_toolchain: &'static str,
@@ -68,6 +74,7 @@ pub const fn summary() -> BuildInfo {
     BuildInfo {
         tokeira_version: TOKEIRA_VERSION,
         tokeira_git_sha: TOKEIRA_GIT_SHA,
+        tokeira_source_revision: TOKEIRA_SOURCE_REVISION,
         temporal_proto_version: TEMPORAL_PROTO_VERSION,
         temporal_server_compat: TEMPORAL_SERVER_COMPAT,
         rust_toolchain: RUST_TOOLCHAIN,

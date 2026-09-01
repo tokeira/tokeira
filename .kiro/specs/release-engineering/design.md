@@ -392,25 +392,37 @@ registry contract.
 
 Plan digesting uses canonical JSON: object fields are in schema order, maps are
 `BTreeMap`, package and fragment arrays have defined order, and paths are workspace
-relative. `workspace_root` and advancing external observations are excluded. The digest
-therefore identifies intent, not one machine or one instant.
+relative. `workspace_root`, advancing external observations, and `release_notes_sha256`
+are excluded: the note preview's version heading carries the changie batch date, so
+including it would fence the Plan to one calendar day and leave a pending train
+unresumable after midnight. Each package's hermetic `.crate` checksum from the planning
+build is included, so the identity binds the train to the exact bytes it may publish.
+The digest therefore identifies intent, not one machine or one instant.
 
 ### Source preparer (`crates/tokeira-build/src/pipelines/release/prepare.rs`)
 
 ```rust
-pub fn prepare_release_source(
-    plan: &ReleasePlan,
-    source: &dyn ReleaseSource,
-) -> Result<PreparedRelease, ReleaseError>;
+pub fn rewrite_workspace_manifests(
+    workspace_root: &Path,
+    manifests: &[(String, PathBuf)],
+    internal_packages: &BTreeSet<String>,
+    current_version: &str,
+    target_version: &str,
+    extra_version_fields: &[ExtraVersionField],
+) -> Result<BTreeMap<PathBuf, String>, ReleaseError>;
 ```
 
-The preparer operates in an isolated Dagger source directory. It uses structured TOML
-editing to update the workspace version and every version requirement on an internal
-publishable edge. It does not call Cargo's dependency-editing commands. Repository-owned
-non-Cargo version fields are declared through a small checked replacement list in
-release configuration; every replacement must match exactly once or preparation fails.
+The preparer rewrites manifests textually so the Release Commit touches only the
+version scalars it owns: the workspace version, every version requirement on an
+internal publishable edge whether it is written inline or as its own
+`[dependencies.<name>]` table (the form `tokeira-edge` uses for every internal edge),
+and the exact configured non-Cargo version fields. It does not call Cargo's
+dependency-editing commands. Every rewrite is re-parsed and its dependency membership
+compared with the input; every configured replacement must match exactly once. One
+rewrite serves both the read-only planning build and the apply-time preparation, so the
+bytes the operator confirmed are the bytes that get tagged.
 
-The preparer then runs:
+The rewritten source enters an isolated Dagger directory, where the executor runs:
 
 ```text
 changie batch <target-version> --allow-no-changes=false
@@ -419,8 +431,10 @@ changie merge
 
 It verifies that the resulting diff is limited to admitted version fields, configured
 replacement fields, consumed fragments, the generated version file, `CHANGELOG.md`, and
-the lockfile changes produced by the pinned Cargo version. Only a complete validated
-diff can be exported to the operator checkout and committed.
+the lockfile changes produced by the pinned Cargo version. The operator checkout is
+never written: the Release Commit and Release Tag are created on the engine-side
+snapshot and reach the operator only through the remote, which is why a failed
+preparation leaves nothing on the host to restore.
 
 ### Release executor (`crates/tokeira-build/src/pipelines/release/apply.rs`)
 
@@ -468,13 +482,31 @@ normal/build dependencies cannot hide behind a host workspace. The existing
 
 ### Git gateway
 
-The Git phase creates the Release Commit and annotated Release Tag in isolation, then
-performs the Hermetic Tag Build before any remote push. That build runs one locked Cargo
-package command with repeated selectors for the complete Publishable Package set, so
-Cargo overlays sibling archives during verification. If packaging succeeds, the Git
-phase runs one `git push --atomic` with explicit refspecs for the configured release
-branch and Release Tag. Git's atomic contract makes the two ref updates all-or-nothing
-and fails closed when the remote lacks atomic-push support.
+The Git phase observes the remote release branch and Release Tag together, once, and
+decides in Rust whether the train is fresh or a resume: a branch at the admitted base
+with no tag is fresh; a tag whose branch never moved is `TagConflict`; anything else
+must satisfy the resume rule below. The same observation reports the push URL `origin`
+resolves to inside the container, which must normalize to the Plan's repository
+identity, so a repository-local `pushurl` or `insteadOf` cannot redirect the release
+(`RepositoryMismatch`).
+
+The phase then creates the Release Commit and annotated Release Tag in isolation and
+performs the Hermetic Tag Build before any remote push. That build runs one locked
+Cargo package command with repeated selectors for the complete Publishable Package set,
+so Cargo overlays sibling archives during verification. Every packaged archive's
+SHA-256 is compared with the Plan's hermetic checksum; a build that does not reproduce
+the confirmed bytes stops before the first irreversible step (`HermeticBuildDrift`).
+If packaging succeeds, the Git phase runs one `git push --atomic` with explicit
+refspecs for the configured release branch and Release Tag. Git's atomic contract makes
+the two ref updates all-or-nothing and fails closed when the remote lacks atomic-push
+support. The push's own status is not the evidence: the remote is observed again and
+both refs must identify the Release Commit and Train Identity.
+
+The operator's SSH agent is forwarded only to the Git steps that need it and is removed
+before the Hermetic Tag Build and publication, so dependency build scripts never see
+it. Every step that observes or mutates the remote, the registry, or the release API
+carries a per-invocation nonce, so the engine never serves a recorded observation or
+mutation result to a later run.
 
 Resume still observes both refs rather than trusting the prior command outcome. The
 remote release branch and Release Tag must both exist, peel to the same Release Commit,
@@ -482,6 +514,11 @@ and carry the expected Train Identity. Any absent or divergent pair returns
 terminal `GitRefConflict` before registry work and names both observed ref values
 (`absent` or object ID). A matching pair is a resume observation; the implementation
 never moves or deletes a remote tag.
+
+Verification follows a weaker rule on purpose: `tkr release verify` reads a release
+that may be days old, so the release branch must *contain* the tagged commit rather
+than equal it. The tag remains the identity: its annotation and its commit must carry
+the same Plan digest. An absent tag is `ReleaseNotFound`.
 
 ### Registry gateway
 
@@ -500,21 +537,33 @@ For each package in order:
 Existing-package verification is not paced because it sends no upload. A Cargo polling
 timeout is ambiguous, not failure proof: the gateway observes first. A registry
 `Retry-After` greater than the remaining cooldown wins. Only one upload request can be
-in flight.
+in flight. A Cargo failure that is not a conclusive refusal (`403`, ownership, an
+already-uploaded version, a failed package verification) is also treated as ambiguous
+and observed; its last stderr lines are retained as a diagnostic with token-shaped
+strings redacted. The observation schedule is generated once in Rust and handed to the
+container script verbatim, so the measured bounds live in one place.
+
+When a package stops the train, the invocation returns the typed condition wrapped in
+`Incomplete` together with a Release Report: every package that reached parity, the
+stopping package's `pending` or `failed` outcome, the diagnostics, and the classified
+train state. The report is rendered before the refusal so the operator sees what is
+durable without reading logs.
 
 ### Release-note gateway
 
 After the publish-and-parity invocation returns successful parity, `tkr` resolves
 `GH_TOKEN` and starts the structurally separate release-note invocation. That invocation
-reads the changie version file from the tag, appends the minimum-Rust statement, and
-appends the package inventory sorted by package name. Package names link to their
-crates.io pages; a separate README column uses each version's registry README URL. The
+reads the changie version file from the tag and generates the notes with the same Rust
+function the property tests exercise: the version body, the minimum-Rust statement, and
+the package inventory sorted by package name. Package names link to their crates.io
+pages; a separate README column uses each version's registry README URL. The notes
+digest must equal the one the parity report derived from the tagged version file. The
 generated notes file exists only in the release-note Dagger graph.
 
-Creation uses the equivalent of:
+Creation uses exactly:
 
 ```text
-gh release create <tag> --verify-tag --title <tag> --notes-file <generated-notes>
+gh release create <tag> --repo <owner/name> --verify-tag --target <release-commit> --title <tag> --notes-file <generated-notes>
 ```
 
 An existing release is fetched first. Matching tag, target, and notes digest mean
@@ -778,25 +827,30 @@ revision SHALL prevent release planning.
 
 | Condition | Internal error | External status / code |
 |---|---|---|
-| Workspace absent or ambiguous | `ReleaseError::Workspace` | exit 2, `workspace_not_found` / `ambiguous_workspace` |
-| Dirty or stale source | `ReleaseError::SourceAdmission` | exit 2, `dirty_workspace` / `stale_workspace` |
+| Workspace absent or ambiguous | `ReleaseError::Workspace` / `AmbiguousWorkspace` | exit 2, `workspace_not_found` / `ambiguous_workspace` |
+| Plan workspace or push target differs | `ReleaseError::WorkspaceMismatch` / `RepositoryMismatch` | exit 2, `workspace_mismatch` / `repository_mismatch` |
+| Dirty or stale source | `ReleaseError::DirtyWorkspace` / `StaleWorkspace` | exit 2, `dirty_workspace` / `stale_workspace` |
 | Invalid or non-increasing version | `ReleaseError::TargetVersion` | exit 2, `invalid_target_version` |
 | Publishable versions differ | `ReleaseError::NonUnifiedVersion` | exit 2, `non_unified_workspace_version` |
 | Cyclic publish graph | `ReleaseError::PublishGraphCycle` | exit 2, `invalid_publish_graph` |
-| Invalid fragment or config drift | `ReleaseError::Changelog` | exit 2, `invalid_fragment` / `changelog_config_drift` |
-| Unsupported/corrupt tool asset | `ReleaseError::Tool` | exit 3, `unsupported_tool_platform` / `tool_pin_drift` |
+| Release config unreadable, unsupported, or invalid | `ReleaseError::UnsupportedReleaseConfig` / `InvalidReleaseBranch` / `InvalidVersionField` / `InvalidToolSource` / `InvalidToolRevision` | exit 2, `unsupported_release_config` / `invalid_release_branch` / `invalid_version_field` / `invalid_tool_source` / `invalid_tool_revision` |
+| Invalid fragment or config drift | `ReleaseError::Changelog` / `ChangelogConfigDrift` | exit 2, `invalid_fragment` / `changelog_config_drift` |
+| Unsupported/corrupt tool asset | `ReleaseError::UnsupportedToolPlatform` / `Tool` | exit 3, `unsupported_tool_platform` / `tool_pin_drift` |
 | Package dry-run failure | `ReleaseError::PackageDryRun` | exit 4, `package_dry_run_failed` |
-| Plan schema/digest/source mismatch | `ReleaseError::Plan` | exit 2, `invalid_plan` / `plan_drift` |
-| Confirmation missing/declined | `ReleaseError::Confirmation` | exit 2, `confirmation_required` / `declined` |
+| Tag build does not reproduce the confirmed bytes | `ReleaseError::HermeticBuildDrift` | exit 4, `hermetic_build_drift` |
+| Plan schema unsupported, invalid, or drifted | `ReleaseError::UnsupportedPlanSchema` / `Plan` / `PlanDrift` | exit 2, `unsupported_plan_schema` / `invalid_plan` / `plan_drift` |
+| Confirmation missing/declined | `ReleaseError::Confirmation` / `ConfirmationDeclined` | exit 2, `confirmation_required` / `declined` |
 | Token environment absent | `ReleaseError::CredentialMissing` | exit 3, `registry_credential_missing` |
 | Release API credential absent | `ReleaseError::ReleaseCredentialMissing` | exit 3, `release_credential_missing` |
 | External dependency unavailable | `ReleaseError::ExternalDependency` | exit 4, `external_dependency_unavailable` |
 | Existing remote tag differs | `ReleaseError::TagConflict` | exit 5, `tag_conflict` |
 | Remote release branch/tag absent or divergent on resume | `ReleaseError::GitRefConflict` | exit 5, `git_ref_conflict` |
+| Verified version has no release tag | `ReleaseError::ReleaseNotFound` | exit 5, `release_not_found` |
 | Registry absent after ambiguous result | `ReleaseError::RegistryPending` | exit 6, `registry_state_pending` |
 | Registry rejects publish | `ReleaseError::RegistryPublish` | exit 6, `registry_publish_failed` |
 | Artifact checksum differs | `ReleaseError::ArtifactMismatch` | exit 7, `artifact_mismatch` |
 | Existing release differs | `ReleaseError::ReleaseConflict` | exit 5, `release_conflict` |
+| Train stopped after a public boundary | `ReleaseError::Incomplete` wrapping the condition above and carrying the Release Report | the wrapped condition's exit and code |
 | Executor/session failure | `ReleaseError::Executor` | exit 8, `executor_failed` |
 
 Errors serialize as the established code/summary/details report shape. Secret-bearing
@@ -815,12 +869,16 @@ inputs are never sources for `Debug`, `Display`, `source()`, or JSON details.
   arguments; the 5-second initial registry poll, exponential schedule, and 10-minute
   bound; exact `--allow-no-changes=false`; non-TTY confirmation; unsupported host
   diagnostics; minimum-Rust and README URL annotations.
-- **Offline pipeline tests:** use the existing fake Dagger facility, deterministic
-  `.crate` bytes, fake Git refs, fake registry observations, a virtual clock, and a fake
-  release API. Fake gateways prove the publish-and-parity invocation is never presented
-  `GH_TOKEN`, the release-note invocation is never presented a registry token, atomic
-  branch/tag publication is all-or-nothing, and divergent observed refs fail with both
-  object IDs. No test sleeps and no test uses a live token or network.
+- **Offline pipeline tests:** the real container scripts run outside Dagger with stub
+  `curl`/`cargo`/`jq` binaries on `PATH` and a local bare Git remote, in
+  `crates/tokeira-build/src/pipelines/release/scripts.rs`. They prove the publish state
+  machine (skip-existing, pending after the bounded window, conclusive refusal with
+  redacted evidence, inconclusive-then-visible, parity mismatch), fresh preparation,
+  the all-or-nothing push against a taken tag, resume admission, and verify's
+  containment rule. A recording fake client proves the publish-and-parity request has
+  no release-API field and the release-note request no registry field, and that neither
+  token reaches `Debug` or JSON output. Stubbed `sleep` and `date` stand in for the
+  clock; no test sleeps and no test uses a live token or network.
 - **Integration tests:** exercise `fragment -> ci checks -> plan -> confirmed apply ->
   verify` against fixture workspaces shaped like both repositories. Scenarios cover a
   fresh train, all-existing rerun, timeout-after-upload, partial DAG resume, parity

@@ -16,15 +16,18 @@ use dagger_sdk::{Client, Container, ContainerWithExecOpts, HostDirectoryOpts, Re
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::build::{builder_definition, builder_toolchain};
+use super::{
+    build::{builder_definition, builder_toolchain},
+    release::{admit_changelog_config, admit_fragments, publishable_packages},
+};
 use crate::{
-    BuildError,
+    BuildError, CHANGIE_RELEASE,
     compat_bump::{BumpTrailer, CompatibilityVersion},
     rust_toolchain_version,
 };
 
 const GOVERNANCE_IMAGE: &str = "debian:bookworm-slim";
-const GOVERNANCE_APT: &str = "apt-get update && apt-get install -y --no-install-recommends git ripgrep ca-certificates && rm -rf /var/lib/apt/lists/*";
+const GOVERNANCE_APT: &str = "apt-get update && apt-get install -y --no-install-recommends git ripgrep curl ca-certificates && rm -rf /var/lib/apt/lists/*";
 const NEXTTEST_VERSION: &str = "0.9.143";
 const DENY_VERSION: &str = "0.19.9";
 const LYCHEE_VERSION: &str = "0.24.2";
@@ -67,11 +70,15 @@ pub enum CiCheck {
     Deny,
     /// Offline Markdown link integrity.
     Links,
+    /// Every coherent non-release slice supplies a valid changie fragment.
+    ChangelogFragments,
+    /// The complete publishable closure packages in one locked invocation.
+    PackageDryRun,
 }
 
 impl CiCheck {
     /// Registry order used by local and future remote CI.
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::ProtoMonotonicity,
         Self::ServerCompatMonotonicity,
         Self::BumpTrailer,
@@ -83,6 +90,8 @@ impl CiCheck {
         Self::Rustdoc,
         Self::Deny,
         Self::Links,
+        Self::ChangelogFragments,
+        Self::PackageDryRun,
     ];
 
     /// Stable CLI/report name.
@@ -99,6 +108,8 @@ impl CiCheck {
             Self::Rustdoc => "rustdoc",
             Self::Deny => "deny",
             Self::Links => "links",
+            Self::ChangelogFragments => "changelog-fragments",
+            Self::PackageDryRun => "package-dry-run",
         }
     }
 
@@ -107,6 +118,10 @@ impl CiCheck {
             self,
             Self::ProtoMonotonicity | Self::ServerCompatMonotonicity | Self::BumpTrailer
         )
+    }
+
+    const fn is_release_gate(self) -> bool {
+        matches!(self, Self::ChangelogFragments | Self::PackageDryRun)
     }
 }
 
@@ -185,6 +200,8 @@ impl DaggerClient for Client {
         let layout = GitLayout::resolve(&request.workspace_root)?;
         let result: Result<CiCheckResult, BuildError> = if check.is_governance() {
             execute_governance(self, &request.workspace_root, &layout, check).await
+        } else if check.is_release_gate() {
+            execute_release_gate(self, &request.workspace_root, &layout, check).await
         } else {
             execute_bar(self, &request.workspace_root, &layout, check).await
         };
@@ -198,6 +215,273 @@ impl DaggerClient for Client {
             },
         })
     }
+}
+
+async fn execute_release_gate(
+    client: &Client,
+    root: &Path,
+    layout: &GitLayout,
+    check: CiCheck,
+) -> Result<CiCheckResult, BuildError> {
+    match check {
+        CiCheck::ChangelogFragments => execute_changelog_gate(client, root, layout).await,
+        CiCheck::PackageDryRun => execute_package_gate(client, root, layout).await,
+        _ => unreachable!("release-gate dispatch only receives release checks"),
+    }
+}
+
+async fn execute_changelog_gate(
+    client: &Client,
+    root: &Path,
+    layout: &GitLayout,
+) -> Result<CiCheckResult, BuildError> {
+    admit_changelog_config(root).map_err(|source| BuildError::Validation {
+        reason: source.to_string(),
+    })?;
+    admit_fragments(root).map_err(|source| BuildError::Validation {
+        reason: source.to_string(),
+    })?;
+    let linux_x86 = CHANGIE_RELEASE
+        .asset("linux-x86_64")
+        .expect("the immutable pin includes linux-x86_64");
+    let linux_arm = CHANGIE_RELEASE
+        .asset("linux-aarch64")
+        .expect("the immutable pin includes linux-aarch64");
+    let script = format!(
+        r#"set -eu
+case "$(uname -m)" in
+  x86_64) url='{x86_url}'; sha='{x86_sha}' ;;
+  aarch64|arm64) url='{arm_url}'; sha='{arm_sha}' ;;
+  *) echo 'unsupported changie executor architecture' >&2; exit 3 ;;
+esac
+curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --output /tmp/changie.tar.gz "$url"
+printf '%s  %s\n' "$sha" /tmp/changie.tar.gz | sha256sum --check --strict
+tar -xzf /tmp/changie.tar.gz -C /tmp changie
+/tmp/changie --version | grep -F '{version}' >/dev/null
+cmp .changie.yaml /canonical/.changie.yaml
+cmp .changes/header.tpl.md /canonical/.changes/header.tpl.md
+release_branch=$(sed -n 's/^release_branch[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' .tokeira-release.toml)
+if [ -z "$release_branch" ]; then echo 'release config has no release_branch' >&2; exit 1; fi
+base=$(git merge-base HEAD "origin/$release_branch")
+changed=$(git diff --name-only "$base" --)
+if [ -z "$changed" ]; then
+  echo 'no changes against the release branch base'
+  exit 0
+fi
+# Three shapes of diff reach this gate. A release preparation consumes fragments into
+# a new version file and is checked by re-running the pinned batch. A coherent slice
+# touches source and must add a fragment that batches on its own. Manifest, lockfile,
+# and release-config bookkeeping carries no user-facing sentence and passes as is.
+added=$(git diff --name-status "$base" -- .changes/unreleased | awk '$1 == "A" && $2 ~ /\.yaml$/ {{ print $2 }}')
+deleted=$(git diff --name-status "$base" -- .changes/unreleased | awk '$1 == "D" && $2 ~ /\.yaml$/ {{ print $2 }}')
+version_file=$(git diff --name-status "$base" -- .changes | awk '$1 == "A" && $2 ~ /^\.changes\/[0-9]+\.[0-9]+\.[0-9]+\.md$/ {{ print $2 }}')
+non_release=$(printf '%s\n' "$changed" | grep -Ev '^(\.changes/|CHANGELOG.md$|(.*/)?Cargo.toml$|Cargo.lock$|\.tokeira-release.toml$)' || true)
+if [ -n "$deleted" ] && [ -n "$version_file" ]; then
+  target=${{version_file#.changes/}}
+  target=${{target%.md}}
+  rm -rf /tmp/reference-release /tmp/reference-changes /tmp/actual-changes
+  mkdir -p /tmp/reference-release
+  git archive "$base" | tar -x -C /tmp/reference-release
+  (cd /tmp/reference-release && /tmp/changie batch "$target" --allow-no-changes=false && /tmp/changie merge)
+  # The version heading carries the batch date; the reference batch runs on the day
+  # the gate runs, so headings are compared without their date.
+  undate() {{ sed -E 's/^(## [0-9]+\.[0-9]+\.[0-9]+) on [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$/\1/' "$1"; }}
+  cp -R /tmp/reference-release/.changes /tmp/reference-changes
+  cp -R .changes /tmp/actual-changes
+  for file in "/tmp/reference-changes/$target.md" "/tmp/actual-changes/$target.md"; do
+    undate "$file" >"$file.undated" && mv "$file.undated" "$file"
+  done
+  diff -ruN /tmp/reference-changes /tmp/actual-changes
+  undate /tmp/reference-release/CHANGELOG.md >/tmp/reference-changelog
+  undate CHANGELOG.md >/tmp/actual-changelog
+  cmp /tmp/reference-changelog /tmp/actual-changelog
+elif [ -n "$non_release" ] || [ -n "$added" ]; then
+  if [ -z "$added" ]; then
+    echo 'non-release change has no newly added .changes/unreleased fragment' >&2
+    exit 1
+  fi
+  for fragment in $added; do
+    echo "validating $fragment"
+    rm -rf /tmp/fragment-case
+    mkdir -p /tmp/fragment-case/.changes/unreleased
+    cp .changie.yaml /tmp/fragment-case/
+    cp .changes/header.tpl.md /tmp/fragment-case/.changes/
+    cp "$fragment" /tmp/fragment-case/.changes/unreleased/
+    if ! (cd /tmp/fragment-case && /tmp/changie batch 999.999.999 --dry-run --allow-no-changes=false >/dev/null); then
+      echo "invalid changie fragment: $fragment" >&2
+      exit 1
+    fi
+  done
+else
+  echo 'manifest-only change needs no fragment'
+fi
+"#,
+        x86_url = linux_x86.url,
+        x86_sha = linux_x86.sha256,
+        arm_url = linux_arm.url,
+        arm_sha = linux_arm.sha256,
+        version = CHANGIE_RELEASE.version,
+    );
+    let query = client.query();
+    // The SDK takes contents first, then the path.
+    let canonical = query
+        .directory()
+        .with_new_file(include_str!("../../../../.changie.yaml"), ".changie.yaml")
+        .with_new_file(
+            include_str!("../../../../.changes/header.tpl.md"),
+            ".changes/header.tpl.md",
+        );
+    let base = attach_workspace(
+        query
+            .container()
+            .from(GOVERNANCE_IMAGE)
+            .with_exec(vec!["sh", "-c", GOVERNANCE_APT])
+            .with_directory("/canonical", canonical),
+        client,
+        root,
+        layout,
+    );
+    evaluate_release_execution(
+        CiCheck::ChangelogFragments,
+        "pinned changie fragment gate",
+        base.with_exec_opts(
+            vec!["sh", "-c", &script],
+            &ContainerWithExecOpts::default().with_expect(ReturnType::Any),
+        ),
+    )
+    .await
+}
+
+async fn execute_package_gate(
+    client: &Client,
+    root: &Path,
+    layout: &GitLayout,
+) -> Result<CiCheckResult, BuildError> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(root.join("Cargo.toml"))
+        .other_options(["--locked".to_owned()])
+        .exec()
+        .map_err(|source| BuildError::Validation {
+            reason: format!("could not read locked Cargo metadata for package gate: {source}"),
+        })?;
+    let packages = publishable_packages(&metadata).map_err(|source| BuildError::Validation {
+        reason: source.to_string(),
+    })?;
+    for node in &packages {
+        let package = metadata
+            .packages
+            .iter()
+            .find(|package| package.id.repr == node.package_id)
+            .expect("publish graph nodes originate in this metadata");
+        let missing = [
+            (package.readme.is_none(), "readme"),
+            (
+                package.license.is_none() && package.license_file.is_none(),
+                "license or license-file",
+            ),
+            (package.repository.is_none(), "repository"),
+            (package.rust_version.is_none(), "rust-version"),
+        ]
+        .into_iter()
+        .filter(|(missing, _)| *missing)
+        .map(|(_, field)| field)
+        .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Ok(failing(
+                CiCheck::PackageDryRun,
+                format!("{} lacks required consumer metadata", node.name),
+                missing.join(", "),
+            ));
+        }
+    }
+    let mut arguments = vec![
+        "cargo".to_owned(),
+        "publish".to_owned(),
+        "--dry-run".to_owned(),
+        "--locked".to_owned(),
+        "--allow-dirty".to_owned(),
+    ];
+    for package in packages {
+        arguments.push("--package".to_owned());
+        arguments.push(package.name);
+    }
+    let source_digest = "find . -type f -not -path './target/*' -not -path './.git' -print0 | sort -z | xargs -0 sha256sum";
+    // The target cache volume persists between runs; stale archives from an earlier
+    // closure must not be re-validated as if this invocation produced them.
+    let base = ci_builder(client, root, layout)?.with_exec(vec![
+        "sh",
+        "-c",
+        &format!("rm -rf target/package && {source_digest} >/tmp/package-source-before"),
+    ]);
+    let execution = base
+        .with_exec(arguments)
+        .with_exec_opts(
+            vec![
+                "sh",
+                "-c",
+                &format!(
+                    r#"set -eu
+{source_digest} >/tmp/package-source-after
+cmp /tmp/package-source-before /tmp/package-source-after
+found=0
+for manifest in target/package/*/Cargo.toml; do
+  [ -f "$manifest" ] || continue
+  found=1
+  package=$(basename "$(dirname "$manifest")")
+  for field in readme repository rust-version; do
+    if ! grep -Eq "^$field[[:space:]]*=" "$manifest"; then
+      echo "$package packaged manifest lacks $field" >&2
+      exit 1
+    fi
+  done
+  if ! grep -Eq '^(license|license-file)[[:space:]]*=' "$manifest"; then
+    echo "$package packaged manifest lacks license or license-file" >&2
+    exit 1
+  fi
+  if ! find "$(dirname "$manifest")" -type f -iname 'readme*' -print -quit | grep -q .; then
+    echo "$package archive lacks its README" >&2
+    exit 1
+  fi
+  if awk '
+    /^\[(target\..*\.)?(build-)?dependencies(\.|\])|^\[workspace\.dependencies/ {{ dependency=1; next }}
+    /^\[/ {{ dependency=0 }}
+    dependency && /path[[:space:]]*=/ && !/version[[:space:]]*=/ {{ exit 1 }}
+  ' "$manifest"; then :; else
+    echo "$package contains an unresolved path-only normal/build dependency" >&2
+    exit 1
+  fi
+done
+if [ "$found" -ne 1 ]; then echo 'Cargo produced no normalized package manifests' >&2; exit 1; fi"#
+                ),
+            ],
+            &ContainerWithExecOpts::default().with_expect(ReturnType::Any),
+        );
+    evaluate_release_execution(
+        CiCheck::PackageDryRun,
+        "locked one-invocation publishable closure package gate",
+        execution,
+    )
+    .await
+}
+
+async fn evaluate_release_execution(
+    check: CiCheck,
+    rendered: &str,
+    execution: Container,
+) -> Result<CiCheckResult, BuildError> {
+    let exit_code = execution.exit_code().await?;
+    let stdout = execution.stdout().await?;
+    let stderr = execution.stderr().await?;
+    Ok(if exit_code == 0 {
+        passing(check, format!("{rendered} passed"))
+    } else {
+        CiCheckResult {
+            check,
+            passed: false,
+            summary: format!("{rendered} failed with exit code {exit_code}"),
+            details: command_details(&stdout, &stderr),
+        }
+    })
 }
 
 async fn execute_governance(
@@ -547,14 +831,21 @@ fn attach_workspace(
         .with_workdir("/workspace")
 }
 
+/// Where a workspace's Git state lives, expressed for the engine-side mount.
+///
+/// Linked worktrees keep their `.git` as a pointer into the common directory; the
+/// container receives the common directory at `/repo.git` and a rewritten pointer,
+/// so every Git command inside it sees the same objects and refs the host does.
 #[derive(Debug)]
-struct GitLayout {
-    common_dir: PathBuf,
-    worktree_pointer: String,
+pub(crate) struct GitLayout {
+    /// The shared Git common directory on the host.
+    pub(crate) common_dir: PathBuf,
+    /// Contents of the `.git` pointer file to write into the mounted workspace.
+    pub(crate) worktree_pointer: String,
 }
 
 impl GitLayout {
-    fn resolve(root: &Path) -> Result<Self, BuildError> {
+    pub(crate) fn resolve(root: &Path) -> Result<Self, BuildError> {
         let common_dir = git_path(root, "--git-common-dir")?;
         let git_dir = git_path(root, "--absolute-git-dir")?;
         let relative = git_dir
@@ -715,13 +1006,14 @@ derive_manifest() {
   cargo run --locked --quiet -p tkr -- compat show --json > /tmp/compat.json
   version=$(cargo metadata --locked --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "tokeirad") | .version')
   git_sha=$(git rev-parse --short=8 HEAD)
+  source_revision=$(git rev-parse HEAD)
   proto=$(sed -n 's/^pub const TEMPORAL_PROTO_VERSION: &str = "\([^"]*\)";.*/\1/p' crates/tokeira-build-info/src/pinned.rs)
   server=$(sed -n 's/^pub const TEMPORAL_SERVER_COMPAT: &str = "\([^"]*\)";.*/\1/p' crates/tokeira-build-info/src/pinned.rs)
   rust=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
   source_hash=$(git archive --format=tar HEAD | sha256sum | cut -d' ' -f1)
   feature=$(jq -r '.feature_matrix_digest' /tmp/compat.json)
   sdk=$(jq -r '.sdk_matrix_digest' /tmp/compat.json)
-  printf 'TOKEIRA_VERSION=%s\nTOKEIRA_GIT_SHA=%s\nTEMPORAL_PROTO_VERSION=%s\nTEMPORAL_SERVER_COMPAT=%s\nRUST_TOOLCHAIN=%s\nSOURCE_TREE_HASH=%s\nFEATURE_MATRIX_DIGEST=%s\nSDK_MATRIX_DIGEST=%s\nBUILD_MODE=versioned\n' "$version" "$git_sha" "$proto" "$server" "$rust" "$source_hash" "$feature" "$sdk" > "$output"
+  printf 'TOKEIRA_VERSION=%s\nTOKEIRA_GIT_SHA=%s\nTOKEIRA_SOURCE_REVISION=%s\nTEMPORAL_PROTO_VERSION=%s\nTEMPORAL_SERVER_COMPAT=%s\nRUST_TOOLCHAIN=%s\nSOURCE_TREE_HASH=%s\nFEATURE_MATRIX_DIGEST=%s\nSDK_MATRIX_DIGEST=%s\nBUILD_MODE=versioned\n' "$version" "$git_sha" "$source_revision" "$proto" "$server" "$rust" "$source_hash" "$feature" "$sdk" > "$output"
 }
 derive_manifest /tmp/build-manifest-1
 derive_manifest /tmp/build-manifest-2
@@ -731,6 +1023,7 @@ target/release/tokeirad --version --json > /tmp/tokeirad-build-info.json
 value() { sed -n "s/^$1=//p" /tmp/build-manifest-1; }
 test "$(jq -r '.tokeira_version' /tmp/tokeirad-build-info.json)" = "$(value TOKEIRA_VERSION)"
 test "$(jq -r '.tokeira_git_sha' /tmp/tokeirad-build-info.json)" = "$(value TOKEIRA_GIT_SHA)"
+test "$(jq -r '.source_revision' /tmp/tokeirad-build-info.json)" = "$(value TOKEIRA_SOURCE_REVISION)"
 test "$(jq -r '.temporal_proto_version' /tmp/tokeirad-build-info.json)" = "$(value TEMPORAL_PROTO_VERSION)"
 test "$(jq -r '.temporal_server_compat' /tmp/tokeirad-build-info.json)" = "$(value TEMPORAL_SERVER_COMPAT)"
 test "$(jq -r '.rust_toolchain' /tmp/tokeirad-build-info.json)" = "$(value RUST_TOOLCHAIN)"

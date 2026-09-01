@@ -12,6 +12,7 @@
 //! | Workspace dev     | `tkr dev ...`    | Thin shims over `cargo build/test/clippy/fmt`. |
 //! | Deployment CRUD   | `tkr deployment` | Create/list/use/destroy named deployments.     |
 //! | Container images  | `tkr image`      | Build, push, and mirror runtime images.        |
+//! | Release train     | `tkr release`    | Plan, apply, resume, and verify crate releases.|
 //! | Cloud infra       | `tkr infra`      | Plan / apply / destroy declared resources.     |
 //! | Service deploy    | `tkr deploy`     | Plan / apply / destroy service manifests.      |
 //! | DSQL schema       | `tkr schema`     | Schema setup for DSQL-backed deployments.      |
@@ -66,17 +67,21 @@ use deployment_dir::{DeploymentResolver, load_context};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    match run().await {
+    let cli = Cli::parse();
+    let json = cli.json;
+    match run(cli).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            output::render_refusal(&error);
-            std::process::ExitCode::FAILURE
+            let exit_code = error
+                .downcast_ref::<tokeira_build::ReleaseError>()
+                .map_or(1, tokeira_build::ReleaseError::exit_code);
+            output::render_refusal(&error, json);
+            std::process::ExitCode::from(exit_code)
         }
     }
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> Result<()> {
     let deployments = DeploymentResolver::default()?;
 
     // Deployment lock (mis-apply guard, task 10.2): before dispatching, a mutating
@@ -268,6 +273,7 @@ async fn run() -> Result<()> {
         } => commands::config::run_show(&deployments, selected),
         Command::Compat(args) => commands::compat::run(args.command, cli.json),
         Command::Ci(args) => commands::ci::run(args.command, cli.json).await,
+        Command::Release(args) => commands::release::run(args.command, cli.json).await,
         Command::Observability { action } => {
             let ObservabilityAction::Check {
                 path,

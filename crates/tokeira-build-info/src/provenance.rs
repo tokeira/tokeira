@@ -50,6 +50,37 @@ pub(crate) fn resolve_git_sha(
     })
 }
 
+/// Choose the full source revision that accompanies the short provenance.
+///
+/// Supplied values outrank live Git for the same reason `resolve_git_sha` prefers
+/// them: a release build must carry the revision its manifest names, not whatever
+/// the builder's checkout happens to be. Live Git only fills a gap for development
+/// builds, and the short provenance is the last resort so the two values never
+/// disagree about a degraded build.
+pub(crate) fn resolve_source_revision(
+    manifest: Option<&str>,
+    injected: Option<&str>,
+    supplied_git_sha: Option<&str>,
+    live_git: impl FnOnce() -> Option<String>,
+    short_provenance: &str,
+) -> String {
+    let full = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| is_full_revision(value))
+            .map(str::to_owned)
+    };
+    full(manifest)
+        .or_else(|| full(injected))
+        .or_else(|| full(supplied_git_sha))
+        .or_else(live_git)
+        .unwrap_or_else(|| short_provenance.to_owned())
+}
+
+fn is_full_revision(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +114,47 @@ mod tests {
         assert_eq!(injected.value, "abcdef12");
         assert_eq!(git.value, "12345678");
         assert_eq!(degraded.value, "dev");
+    }
+
+    #[test]
+    fn source_revision_prefers_manifest_then_injected_then_supplied_then_live_git() {
+        let manifest = "a".repeat(40);
+        let injected = "b".repeat(40);
+        let supplied = "c".repeat(40);
+        let live = "d".repeat(40);
+        assert_eq!(
+            resolve_source_revision(
+                Some(&manifest),
+                Some(&injected),
+                Some(&supplied),
+                || Some(live.clone()),
+                "short"
+            ),
+            manifest
+        );
+        assert_eq!(
+            resolve_source_revision(
+                Some("abcdef12"),
+                Some(&injected),
+                Some(&supplied),
+                || None,
+                "short"
+            ),
+            injected,
+            "a short manifest value is not a full revision"
+        );
+        assert_eq!(
+            resolve_source_revision(None, None, Some(&supplied), || Some(live.clone()), "short"),
+            supplied
+        );
+        assert_eq!(
+            resolve_source_revision(None, None, Some("abcdef12"), || Some(live.clone()), "short"),
+            live
+        );
+        assert_eq!(
+            resolve_source_revision(None, None, None, || None, "dev"),
+            "dev",
+            "without any revision the short provenance stands in"
+        );
     }
 }

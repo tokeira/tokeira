@@ -25,6 +25,7 @@ pub(crate) mod infra;
 pub(crate) mod logs;
 pub(crate) mod observability;
 pub(crate) mod port_forward;
+pub(crate) mod release;
 pub(crate) mod scale;
 pub(crate) mod schema;
 pub(crate) mod version;

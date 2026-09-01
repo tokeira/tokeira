@@ -225,14 +225,14 @@ The following stays out of scope:
 | `workspace_root` | Canonical path used only for local admission | `WorkspaceMismatch` | Serialized locally; omitted from committed trailers and release notes |
 | `base_commit` | Full Git object ID of the clean source base | `StaleWorkspace` | Serialized and carried by Train Identity |
 | `target_version` / `tag` | Stable SemVer plus exact `v`-prefixed tag | `InvalidTargetVersion` | Serialized and externally visible |
-| `packages` | Every Publishable Package, target version, manifest path relative to root, publishable dependencies, current registry state, and deterministic order | `InvalidPublishGraph` | Serialized; drives packaging and publication |
+| `packages` | Every Publishable Package, target version, manifest path relative to root, publishable dependencies, the hermetic `.crate` SHA-256 from the planning build, current registry state, and deterministic order | `InvalidPublishGraph` | Serialized; drives packaging and publication; the checksum enters `digest` |
 | `fragments` | Relative path and SHA-256 of every admitted unreleased fragment | `InvalidFragment` | Serialized; no fragment body duplication outside its file |
 | `changelog_config_sha256` | Digest of the canonical changie config set | `ChangelogConfigDrift` | Serialized |
 | `changie_release` | Exact version, source revision, platform asset, and asset SHA-256 | `ToolPinDrift` | Serialized |
 | `toolchain` | Pinned Rust and Dagger identities used by checks and build | `ToolchainDrift` | Serialized |
-| `release_notes_sha256` | Digest of the deterministic preview notes | `ReleaseNotesDrift` | Serialized |
+| `release_notes_sha256` | Digest of the planning-time note preview; informational, because the version heading carries the changie batch date | — | Serialized; excluded from `digest`; the Release Report carries the digest derived from the tagged version file |
 | `effects` | Ordered human-readable outward effects, including Git, registry, and release API mutations | `InvalidPlan` | Rendered before confirmation |
-| `digest` | SHA-256 of canonical Plan content excluding `workspace_root`, observations that may advance monotonically, and the digest field itself | `PlanDrift` | Carried by commit trailer, tag annotation, and Release Report |
+| `digest` | SHA-256 of canonical Plan content excluding `workspace_root`, observations that may advance monotonically, the dated note preview, and the digest field itself; including each package's hermetic checksum | `PlanDrift` | Carried by commit trailer, tag annotation, and Release Report |
 
 ### Root `.tokeira-release.toml`
 
@@ -313,8 +313,9 @@ cannot disagree.
 
 1. WHEN source preparation begins, THE release executor SHALL update every Publishable
    Package to the target Unified Version.
-2. WHEN a publishable workspace dependency names another Publishable Package, THE
-   release executor SHALL update its registry version requirement to the target Unified
+2. WHEN a publishable workspace dependency names another Publishable Package, whether
+   it is declared inline or as its own `[dependencies.<name>]` table, THE release
+   executor SHALL update its registry version requirement to the target Unified
    Version.
 3. THE release executor SHALL preserve every existing workspace dependency entry that
    is not a version field owned by the train.
@@ -338,6 +339,15 @@ cannot disagree.
     SHALL return `TagConflict` before any registry upload.
 13. WHEN the Hermetic Tag Build packages the workspace, THE Dagger Executor SHALL
     create every Publishable Package in one multi-package Cargo invocation.
+14. WHEN the Hermetic Tag Build completes, THE apply command SHALL compare every
+    archive's SHA-256 with the Plan's hermetic checksum for that package and return
+    `HermeticBuildDrift` before any push when they differ.
+15. WHEN the executor resolves the remote it would push to, THE apply command SHALL
+    require that remote to normalize to the Plan's repository identity and return
+    `RepositoryMismatch` otherwise.
+16. WHEN the atomic push returns, THE apply command SHALL observe both remote refs
+    again and require them to identify the Release Commit and Train Identity rather
+    than trusting the push's own status.
 
 ### Requirement 4: Conflict-resistant changelog declarations
 
@@ -481,6 +491,10 @@ force an unsafe manual script.
    package state no later than 10 minutes per crate after the ambiguous response.
 10. THE Release Report SHALL record each package as `published`, `existing-verified`,
     `pending`, or `failed` without carrying credential material.
+11. IF Cargo fails without a conclusive refusal, THEN THE apply executor SHALL treat
+    the upload as ambiguous, observe the registry, and retain the last lines of
+    Cargo's diagnostic output in the Release Report with token-shaped strings
+    redacted.
 
 ### Requirement 9: Checksum parity is the integrity claim
 
@@ -501,7 +515,10 @@ the reviewed source identity.
 5. IF any package lacks verified parity, THEN THE apply command SHALL refuse to create
    or update release notes.
 6. WHEN `tkr release verify` runs, THE command SHALL rebuild from the Release Tag and
-   re-evaluate parity for every Publishable Package without a registry token.
+   re-evaluate parity for every Publishable Package without a registry token. The
+   release branch SHALL contain the Release Commit rather than equal it, the tag's
+   annotation and commit SHALL carry the same Train Identity, and an absent Release
+   Tag SHALL return `ReleaseNotFound`.
 7. THE parity verifier SHALL never treat matching package name and version as evidence
    of matching content.
 
@@ -568,6 +585,13 @@ is never silently repaired.
     branch and Release Tag to be present, point to the same Release Commit, and carry
     mutually consistent Train Identity; otherwise it returns terminal
     `GitRefConflict` naming both observed ref values.
+11. WHEN a train stops after the Git boundary, THE apply command SHALL return the
+    typed condition together with a Release Report that lists every package that
+    reached parity, the stopping package's `pending` or `failed` outcome, and the
+    classified train state, and SHALL render that report before the refusal.
+12. WHEN a Plan is applied or resumed on a later calendar day than it was produced,
+    THE apply command SHALL admit it: the Train Identity excludes the dated note
+    preview, and the notes that count are derived from the tagged version file.
 
 ### Requirement 12: Tokeira Odori consumes `tkr` without dependency mutation
 

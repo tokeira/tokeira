@@ -94,6 +94,7 @@ const TOKEIRAD_WORKSPACE_EXCLUDES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImageBuildProvenance {
     git_sha: String,
+    source_revision: String,
     source_tree_hash: String,
 }
 
@@ -147,6 +148,7 @@ pub async fn build_tokeirad_image(
         // shipped binary identifies the exact host worktree that supplied its bytes.
         .with_env_variable("CI", "true")
         .with_env_variable("TOKEIRA_GIT_SHA", &provenance.git_sha)
+        .with_env_variable("TOKEIRA_SOURCE_REVISION", &provenance.source_revision)
         .with_env_variable("TOKEIRA_SOURCE_TREE_HASH", &provenance.source_tree_hash)
         .with_exec(vec!["rustup", "target", "add", rust_target])
         .with_mounted_cache(registry_cache, "/usr/local/cargo/registry")
@@ -200,6 +202,7 @@ fn image_build_provenance(
     workspace_root: &std::path::Path,
 ) -> Result<ImageBuildProvenance, BuildError> {
     let revision = git_text(workspace_root, &["rev-parse", "--short=8", "HEAD"])?;
+    let source_revision = git_text(workspace_root, &["rev-parse", "HEAD"])?;
     if revision.len() != 8
         || !revision
             .bytes()
@@ -207,6 +210,17 @@ fn image_build_provenance(
     {
         return Err(BuildError::Validation {
             reason: format!("git rev-parse returned non-canonical short revision `{revision}`"),
+        });
+    }
+    if source_revision.len() != 40
+        || !source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(BuildError::Validation {
+            reason: format!(
+                "git rev-parse returned non-canonical full revision `{source_revision}`"
+            ),
         });
     }
     let dirty = !git_bytes(
@@ -222,6 +236,7 @@ fn image_build_provenance(
 
     Ok(ImageBuildProvenance {
         git_sha,
+        source_revision,
         source_tree_hash: image_source_tree_hash(workspace_root)?,
     })
 }
@@ -500,6 +515,7 @@ mod tests {
         let workspace = workspace_with_toolchain("1.95");
         let clean = image_build_provenance(workspace.path()).expect("clean provenance");
         assert_eq!(clean.git_sha.len(), 8);
+        assert_eq!(clean.source_revision.len(), 40);
         assert_eq!(clean.source_tree_hash.len(), 64);
 
         std::fs::write(

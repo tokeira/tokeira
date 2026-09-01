@@ -109,6 +109,7 @@ pub(crate) enum Command {
     },
     Compat(CompatArgs),
     Ci(CiArgs),
+    Release(ReleaseArgs),
     Observability {
         #[command(subcommand)]
         action: ObservabilityAction,
@@ -307,6 +308,56 @@ pub(crate) struct CiArgs {
     pub command: CiCommand,
 }
 
+#[derive(Args)]
+pub(crate) struct ReleaseArgs {
+    #[command(subcommand)]
+    pub command: ReleaseCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ReleaseCommand {
+    /// Add one collision-resistant changie fragment.
+    Fragment {
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Produce a deterministic, secret-free release Plan.
+    Plan {
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        base_ref: Option<String>,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Revalidate and apply an exact release Plan.
+    Apply {
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        token_env: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Observe a released or partially released train without credentials.
+    Verify {
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum CompatCommand {
     Show {
@@ -363,6 +414,8 @@ pub(crate) enum CliCiCheck {
     Rustdoc,
     Deny,
     Links,
+    ChangelogFragments,
+    PackageDryRun,
 }
 
 #[derive(Subcommand)]

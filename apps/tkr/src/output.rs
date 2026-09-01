@@ -16,8 +16,33 @@ pub(crate) mod build_info;
 /// `tkp`'s report emission. Refusals are authored in Markdown from here on;
 /// existing plain-text messages render unchanged. Always stderr: stdout
 /// stays parseable for `--json` consumers.
-pub(crate) fn render_refusal(error: &anyhow::Error) {
+pub(crate) fn render_refusal(error: &anyhow::Error, json: bool) {
     use std::io::IsTerminal;
+    if json {
+        let rendered = error
+            .downcast_ref::<tokeira_build::ReleaseError>()
+            .map_or_else(
+                || {
+                    serde_json::json!({
+                        "code": "refused",
+                        "summary": error.to_string(),
+                        "details": serde_json::Value::Null,
+                    })
+                },
+                |release| {
+                    serde_json::json!({
+                        "code": release.code(),
+                        "summary": release.to_string(),
+                        "details": serde_json::Value::Null,
+                    })
+                },
+            );
+        eprintln!(
+            "{}",
+            serde_json::to_string(&rendered).expect("refusal report is serializable")
+        );
+        return;
+    }
     let mut text = format!("**refused:** {error}\n");
     let mut causes = error.chain().skip(1).peekable();
     if causes.peek().is_some() {

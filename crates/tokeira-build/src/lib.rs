@@ -4,6 +4,7 @@
 //! which images exist and what remote references they should use.
 
 mod arch;
+mod changie_release;
 mod closure;
 pub mod compat_bump;
 mod composition;
@@ -23,6 +24,7 @@ pub mod pipelines;
 pub mod testing;
 
 pub use arch::Arch;
+pub use changie_release::{CHANGIE_RELEASE, ChangieAsset, ChangieRelease};
 pub use closure::{
     ClosureError, LockedDependency, ProvisionerClosure, resolve_source_closure,
     resolve_source_closure_for_packages,
@@ -50,6 +52,28 @@ pub use pipelines::{
     obtain::{ObtainedProvisioner, obtain_provisioner},
     provisioner::{ProvisionerBuildRequest, build_provisioner, engine_identity_for},
     publish::{PublishRequest, PublishResult, PublishedReference, RegistryPassword, publish_image},
+    release::{
+        AdmittedFragment, CANONICAL_CHANGELOG_CONFIG_SHA256, ChangieIdentity, ExternalTkrPin,
+        ExtraVersionField, FragmentIdentity, GitObservation, ObservedGitRef, ObservedReleaseInputs,
+        PackageIdentity, PackageOutcome, PackagePlan, PackageResult, PlannedArtifact,
+        PlannedRegistryState, PlannedReleaseArtifacts, PreparedRelease, PublishParityReport,
+        PublishableNode, RELEASE_SCHEMA_VERSION, RegistryCredential, RegistryObservation,
+        ReleaseApiCredential, ReleaseConfig, ReleaseDaggerClient, ReleaseDiagnostic, ReleaseEffect,
+        ReleaseEffectKind, ReleaseError, ReleaseNotesOutcome, ReleaseNotesRequest,
+        ReleaseNotesResult, ReleaseObjectObservation, ReleaseObservations, ReleasePlan,
+        ReleasePlanRequest, ReleasePublishRequest, ReleaseReport, ReleaseSource,
+        ReleaseVerifyRequest, RemoteGitObservation, RepositoryIdentity, TagResult,
+        ToolchainIdentity, TrainIdentity, TrainPhaseFacts, TrainState, admit_changelog_config,
+        admit_fragments, atomic_git_push_arguments, canonical_changelog_config_sha256,
+        cargo_package_arguments, classify_train_state, create_release_notes,
+        external_publish_dependencies, fragment_filename, generate_release_notes,
+        gh_release_create_arguments, next_upload_at, observe_planned_artifacts,
+        observe_release_inputs, observe_release_object, plan_release, plan_release_with_dagger,
+        prepare_release_source, publish_and_verify_release, publishable_packages,
+        registry_observation_delays, render_version_body, require_apply_admission,
+        rewrite_extra_version_field, rewrite_manifest, stable_topological_order,
+        verify_artifact_parity, verify_release, verify_resume_refs,
+    },
 };
 pub use snapshot::{
     SnapshotError, SnapshotRequest, SourceSnapshot, materialize_snapshot, snapshot_source_closure,

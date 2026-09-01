@@ -73,6 +73,8 @@ impl From<CliCiCheck> for tokeira_build::CiCheck {
             CliCiCheck::Rustdoc => Self::Rustdoc,
             CliCiCheck::Deny => Self::Deny,
             CliCiCheck::Links => Self::Links,
+            CliCiCheck::ChangelogFragments => Self::ChangelogFragments,
+            CliCiCheck::PackageDryRun => Self::PackageDryRun,
         }
     }
 }

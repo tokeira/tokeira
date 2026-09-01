@@ -17,6 +17,7 @@ pub(crate) fn format_version_verbose(info: &BuildInfo) -> String {
     [
         format!("tokeira_version: {}", info.tokeira_version),
         format!("tokeira_git_sha: {}", info.tokeira_git_sha),
+        format!("tokeira_source_revision: {}", info.tokeira_source_revision),
         format!("temporal_proto_version: {}", info.temporal_proto_version),
         format!("temporal_server_compat: {}", info.temporal_server_compat),
         format!("rust_toolchain: {}", info.rust_toolchain),
@@ -32,6 +33,7 @@ pub(crate) fn format_version_json(info: &BuildInfo) -> String {
     let value = serde_json::json!({
         "tokeira_version": info.tokeira_version,
         "tokeira_git_sha": info.tokeira_git_sha,
+        "source_revision": info.tokeira_source_revision,
         "temporal_proto_version": info.temporal_proto_version,
         "temporal_server_compat": info.temporal_server_compat,
         "rust_toolchain": info.rust_toolchain,
@@ -54,6 +56,7 @@ mod tests {
     const INFO: BuildInfo = BuildInfo {
         tokeira_version: "0.1.0",
         tokeira_git_sha: "12345678",
+        tokeira_source_revision: "1234567890123456789012345678901234567890",
         temporal_proto_version: "v1.47.0",
         temporal_server_compat: "1.27.0",
         rust_toolchain: "1.95",
@@ -80,5 +83,6 @@ mod tests {
         let rendered = format_version_json(&INFO);
         assert!(rendered.contains("\"temporal_proto_version\""));
         assert!(rendered.contains("\"feature_matrix_digest\""));
+        assert!(rendered.contains("\"source_revision\""));
     }
 }

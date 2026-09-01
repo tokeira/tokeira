@@ -56,6 +56,12 @@ pub(crate) fn run_path(path: &Path, timeout_seconds: u64) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn run_grafana(path: &Path) -> Result<()> {
+    let report = check_grafana_dashboard(path)?;
+    emit_report(&report);
+    Ok(())
+}
+
 fn emit_report(report: &CheckReport) {
     for outcome in &report.checks {
         let status = match outcome.status {
@@ -151,6 +157,19 @@ pub(crate) fn check_rendered_observability(
                 "live Mimir/Loki/Grafana queries require a reachable deployment endpoint",
             ),
         ],
+    })
+}
+
+pub(crate) fn check_grafana_dashboard(path: &Path) -> Result<CheckReport> {
+    DashboardValidator::validate_file(path)?;
+    Ok(CheckReport {
+        checks: vec![pass(
+            "grafana-dashboard",
+            format!(
+                "{} satisfies the Grafana dashboard style contract",
+                path.display()
+            ),
+        )],
     })
 }
 
@@ -397,6 +416,34 @@ mod tests {
         .unwrap();
 
         let error = check_rendered_observability(rendered.path(), 30).unwrap_err();
+
+        assert!(error.to_string().contains("missing $datasource variable"));
+    }
+
+    #[test]
+    fn focused_grafana_path_validates_one_dashboard() {
+        let rendered = tempfile::tempdir().unwrap();
+        let dashboard = rendered.path().join("health.json");
+        std::fs::write(
+            &dashboard,
+            r#"{"templating":{"list":[{"name":"datasource","type":"datasource"}]},"panels":[]}"#,
+        )
+        .unwrap();
+
+        let report = check_grafana_dashboard(&dashboard).unwrap();
+
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].name, "grafana-dashboard");
+        assert_eq!(report.checks[0].status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn focused_grafana_path_rejects_a_style_violation() {
+        let rendered = tempfile::tempdir().unwrap();
+        let dashboard = rendered.path().join("health.json");
+        std::fs::write(&dashboard, r#"{"panels":[]}"#).unwrap();
+
+        let error = check_grafana_dashboard(&dashboard).unwrap_err();
 
         assert!(error.to_string().contains("missing $datasource variable"));
     }

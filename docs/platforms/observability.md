@@ -123,6 +123,18 @@ The path must contain `alloy.alloy`, `grafana/dashboards/`, and
 Alloy scrape-job validators directly in `tkr`; it does not require a bound
 provisioner. Pass either `--path` or `--deployment`, not both.
 
+To validate one Grafana dashboard without requiring the rest of the rendered
+tree, select Grafana-only mode and pass the dashboard JSON file itself:
+
+```bash
+tkr observability check --grafana --path /path/to/dashboard.json
+```
+
+This mode runs `DashboardValidator` over that file and reports a single
+`grafana-dashboard` `PASS` result. It does not run the Alloy or alert-rule
+checks, report live-backend reachability, or admit a deployment. `--grafana`
+requires `--path`.
+
 The command reports static configuration checks as `PASS`. Live Mimir, Loki,
 and Grafana reachability remains `WARN` because it requires a reachable
 deployment endpoint. Legacy `deployment.toml` deployments continue to run the

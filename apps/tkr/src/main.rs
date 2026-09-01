@@ -271,13 +271,18 @@ async fn run() -> Result<()> {
         Command::Observability { action } => {
             let ObservabilityAction::Check {
                 path,
+                grafana,
                 timeout_seconds,
             } = action;
             if let Some(path) = path {
                 if selected.is_some() {
                     anyhow::bail!("pass either `--path` or `--deployment`, not both");
                 }
-                commands::observability::run_path(&path, timeout_seconds)
+                if grafana {
+                    commands::observability::run_grafana(&path)
+                } else {
+                    commands::observability::run_path(&path, timeout_seconds)
+                }
             } else if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
                 let (verb, extra) = forwarded_observability_verb(timeout_seconds);
@@ -994,6 +999,7 @@ mod tests {
             Command::Observability {
                 action: ObservabilityAction::Check {
                     path: None,
+                    grafana: false,
                     timeout_seconds: 15
                 }
             }
@@ -1011,10 +1017,31 @@ mod tests {
             Command::Observability {
                 action: ObservabilityAction::Check {
                     path: Some(path),
+                    grafana: false,
                     timeout_seconds: 30
                 }
             } if path == std::path::Path::new("/tmp/rendered/config")
         ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "tkr",
+                "observability",
+                "check",
+                "--grafana",
+                "--path",
+                "/tmp/dashboard.json"
+            ])
+            .unwrap()
+            .command,
+            Command::Observability {
+                action: ObservabilityAction::Check {
+                    path: Some(path),
+                    grafana: true,
+                    timeout_seconds: 30
+                }
+            } if path == std::path::Path::new("/tmp/dashboard.json")
+        ));
+        assert!(Cli::try_parse_from(["tkr", "observability", "check", "--grafana"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["tkr", "version"]).unwrap().command,
             Command::Version {

@@ -495,10 +495,13 @@ pub(crate) enum ConfigAction {
 #[derive(Subcommand)]
 pub(crate) enum ObservabilityAction {
     Check {
-        /// Validate an already-rendered config root directly. The directory
-        /// contains `alloy.alloy`, `grafana/dashboards/`, and `mimir/rules/`.
+        /// Validate an already-rendered config root directly, or the dashboard
+        /// JSON file selected by `--grafana`.
         #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
+        /// Validate only the Grafana dashboard supplied by `--path`.
+        #[arg(long, requires = "path")]
+        grafana: bool,
         #[arg(long, default_value = "30")]
         timeout_seconds: u64,
     },

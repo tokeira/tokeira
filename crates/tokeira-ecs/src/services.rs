@@ -30,10 +30,6 @@ pub struct EcsWorkload {
     pub(crate) region: String,
     /// ECS cluster the service runs on, carried for the same reason.
     pub(crate) cluster: String,
-    /// Authored Service Connect namespace used to resolve service aliases.
-    /// This is independent of the VPC private DNS zone and therefore cannot
-    /// be reconstructed from networking defaults by day-2 operations.
-    pub(crate) service_connect_namespace: String,
     pub(crate) scheduling: EcsScheduling,
     pub(crate) capacity_provider: String,
     pub(crate) task_definition: TaskDefinitionSpec,
@@ -323,10 +319,6 @@ impl deploy_engine::Service for EcsWorkload {
             "tokeira-autoscaler" => vec!["tokeira-controller", "tokeira-mimir"],
             _ => Vec::new(),
         }
-    }
-
-    fn operations_metadata(&self) -> Option<serde_json::Value> {
-        Some(crate::operations::workload_descriptor(self))
     }
 
     fn manifests(
@@ -711,7 +703,6 @@ fn workload_from_parts(
         name: name.to_owned(),
         region: config.region.clone(),
         cluster: config.cluster.name.clone(),
-        service_connect_namespace: config.cluster.service_connect_namespace.clone(),
         scheduling,
         capacity_provider: capacity_provider.to_owned(),
         task_definition: TaskDefinitionSpec {

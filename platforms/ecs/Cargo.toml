@@ -18,6 +18,7 @@ definitions = ["deployment.tkd", "definition.tkdp"]
 content = ["observability"]
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 serde.workspace = true
@@ -28,10 +29,11 @@ tokeira-ecs = { path = "../../crates/tokeira-ecs" }
 tokeira-deployment = { workspace = true }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
 tokeira-platform = { path = "../../crates/tokeira-platform" }
+tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 tokeira-observability = { workspace = true }
-tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
 
 [lints]
 workspace = true

@@ -187,7 +187,6 @@ mod tests {
             environment: "dev".into(),
             region: "eu-west-2".into(),
             cluster: "tokeira".into(),
-            service_connect_namespace: "authored.mesh".into(),
             image: "tokeirad:latest".into(),
             replicas: None,
             cpu: 1024,
@@ -233,7 +232,6 @@ mod tests {
             tokeira_deploy_engine::Service::resource_type(&workload),
             workload::TYPE
         );
-        assert_eq!(workload.service_connect_namespace, "authored.mesh");
     }
 
     // The definition's autoscaler policy must reach the task model used to
@@ -247,7 +245,6 @@ mod tests {
             environment: "dev".into(),
             region: "eu-west-2".into(),
             cluster: "tokeira".into(),
-            service_connect_namespace: "tokeira.internal".into(),
             image: "autoscaler:authored".into(),
             replicas: Some(3),
             cpu: 512,
@@ -300,7 +297,6 @@ mod tests {
             environment: "dev".into(),
             region: "eu-west-2".into(),
             cluster: "tokeira".into(),
-            service_connect_namespace: "tokeira.internal".into(),
             image: "autoscaler:authored".into(),
             replicas: Some(1),
             cpu: 128,
@@ -348,7 +344,6 @@ mod tests {
             environment: "dev".into(),
             region: "eu-west-2".into(),
             cluster: "tokeira".into(),
-            service_connect_namespace: "tokeira.internal".into(),
             image: "tokeirad:latest".into(),
             replicas: None,
             cpu: 1024,
@@ -370,7 +365,6 @@ mod tests {
             environment: "dev".into(),
             region: "eu-west-2".into(),
             cluster: "tokeira".into(),
-            service_connect_namespace: "tokeira.internal".into(),
             image: "tokeirad:latest".into(),
             replicas: None,
             cpu: 1024,

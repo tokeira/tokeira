@@ -11,10 +11,27 @@ use std::sync::Arc;
 use tokeira_platform::{declaration::PlatformDeclaration, definition::Namespace};
 
 pub mod observability;
+pub mod ops;
 
 pub use tokeira_ecs::{
     EcsConfig, config, execution::EcsPlatform, gates, images, modules, services,
 };
+
+// Live operations evaluate through this same function so they cannot drift
+// from the namespaces used to admit and realize an ECS definition.
+fn namespaces() -> Vec<Namespace> {
+    vec![
+        tokeira_ecs::kinds::namespace(),
+        tokeira_deployment::server_config::namespace(),
+        observability::namespace(),
+        Namespace {
+            name: tokeira_aws::kinds::NAMESPACE,
+            kinds: tokeira_aws::kinds::KINDS,
+            defaults: None,
+            decode: tokeira_aws::kinds::decode,
+        },
+    ]
+}
 
 /// The ECS platform declaration.
 ///
@@ -24,20 +41,9 @@ pub use tokeira_ecs::{
 /// the integration deliberately registers no second bundle.
 pub fn platform() -> PlatformDeclaration {
     PlatformDeclaration {
-        namespaces: vec![
-            tokeira_ecs::kinds::namespace(),
-            tokeira_deployment::server_config::namespace(),
-            observability::namespace(),
-            Namespace {
-                name: tokeira_aws::kinds::NAMESPACE,
-                kinds: tokeira_aws::kinds::KINDS,
-                defaults: None,
-                decode: tokeira_aws::kinds::decode,
-            },
-        ],
-        // Day-2 ECS operations need authored region and cluster coordinates
-        // that `DeploymentRef` does not carry. They remain unavailable until
-        // the definition-bound operations contract carries those values.
+        namespaces: namespaces(),
+        // The platform-owned coordinate loader is deliberately separate
+        // from registration: handlers are added one capability at a time.
         ops: None,
         observability: None,
         execution: Box::new(tokeira_ecs::execution::EcsExecution),

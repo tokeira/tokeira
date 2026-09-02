@@ -259,10 +259,6 @@ impl deploy_engine::Service for ConcreteService {
         self.service.dependencies()
     }
 
-    fn operations_metadata(&self) -> Option<serde_json::Value> {
-        self.service.operations_metadata()
-    }
-
     fn manifests(
         &self,
         ctx: &deploy_engine::ServiceContext,

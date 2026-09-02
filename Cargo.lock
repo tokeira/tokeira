@@ -9312,11 +9312,13 @@ dependencies = [
 name = "tokeira-ecs-deployment"
 version = "0.1.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokeira-aws",
  "tokeira-deployment",
  "tokeira-ecs",

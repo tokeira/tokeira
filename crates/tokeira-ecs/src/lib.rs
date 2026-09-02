@@ -14,7 +14,6 @@ pub mod gates;
 pub mod images;
 pub mod kinds;
 pub mod modules;
-pub mod operations;
 mod roles;
 pub mod services;
 

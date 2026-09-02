@@ -176,6 +176,12 @@ impl OpenRepository {
             serde_json::from_value(value).map_err(|error| Refusal::ClaimInvalid {
                 error: error.to_string(),
             })?;
+        claim
+            .state
+            .validate()
+            .map_err(|error| Refusal::ClaimInvalid {
+                error: format!("invalid state locator: {error}"),
+            })?;
         if claim.definition.root != carrier {
             return Err(Refusal::ClaimRootMismatch {
                 claimed: claim.definition.root.clone(),

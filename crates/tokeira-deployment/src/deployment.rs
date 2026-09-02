@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use tokeira_orchestrator::{DefinitionFormatId, PlatformId, RelativeDefinitionPath};
 
+use crate::DeploymentStateLocation;
+
 /// Definition identity recorded for a deployment-root source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +70,10 @@ pub struct DeploymentBindingMetadata {
     pub id: uuid::Uuid,
     /// Open platform identity selected at deployment creation.
     pub platform: PlatformId,
+    /// Placement shared by the envelope, infrastructure state, deploy state,
+    /// and operation lock. Absent in older metadata means local state.
+    #[serde(default)]
+    pub state: DeploymentStateLocation,
     /// Recorded definition identity for bound-provisioner deployments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<RecordedDefinition>,
@@ -95,6 +101,7 @@ mod tests {
         .expect("registry extras are outside the bound subset");
 
         assert_eq!(decoded.platform.as_str(), "compose");
+        assert_eq!(decoded.state, DeploymentStateLocation::Local);
         assert_eq!(
             decoded.definition.expect("definition").path.as_str(),
             "definition.tkd"

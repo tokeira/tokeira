@@ -205,6 +205,7 @@ mod tests {
                 name: "test".into(),
                 id: Uuid::nil(),
                 platform: tokeira_orchestrator::PlatformId::new("local").expect("platform"),
+                state: Default::default(),
                 definition: None,
                 deployment_repository: None,
                 storage: StorageKind::InMemory,

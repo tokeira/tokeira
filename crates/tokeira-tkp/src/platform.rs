@@ -16,7 +16,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use tokeira_deployment::DeploymentBindingMetadata;
+use tokeira_deployment::{
+    DeploymentBindingMetadata, DeploymentStateLocation, DeploymentStateStores,
+};
 use tokeira_orchestrator::{DefinitionFormatId, PlatformId, RelativeDefinitionPath};
 use tokeira_platform::{
     declaration::{
@@ -40,6 +42,8 @@ pub struct Admitted {
     pub(crate) metadata: DeploymentBindingMetadata,
     /// The deployment's coordinates: identity, never state.
     pub(crate) deployment_ref: DeploymentRef,
+    /// Stores prepared from the one location admitted for this command.
+    pub(crate) state: DeploymentStateStores,
     content_roots: Vec<RelativeDefinitionPath>,
 }
 
@@ -132,18 +136,68 @@ impl BoundPlatform {
     ///
     /// Called once per command; the returned [`Admitted`] value threads
     /// through every engine verb the command drives.
-    pub(crate) fn admit_deployment(&self, deployment_dir: &Path) -> Result<Admitted> {
+    pub(crate) async fn admit_deployment(&self, deployment_dir: &Path) -> Result<Admitted> {
         let metadata = self.metadata(deployment_dir)?;
         self.validate_bundle(deployment_dir, &metadata)?;
+        let state = self.prepare_state(deployment_dir, &metadata).await?;
+        Ok(self.finish_admission(deployment_dir, metadata, state))
+    }
+
+    /// Synchronous local admission for unit-test fixtures. Production uses
+    /// [`Self::admit_deployment`] so an S3 client can be prepared once.
+    #[cfg(test)]
+    pub(crate) fn admit_local_deployment(&self, deployment_dir: &Path) -> Result<Admitted> {
+        let metadata = self.metadata(deployment_dir)?;
+        self.validate_bundle(deployment_dir, &metadata)?;
+        if metadata.state != DeploymentStateLocation::Local {
+            bail!("the synchronous test admission helper accepts local state only");
+        }
+        Ok(self.finish_admission(
+            deployment_dir,
+            metadata,
+            DeploymentStateStores::local(deployment_dir),
+        ))
+    }
+
+    fn finish_admission(
+        &self,
+        deployment_dir: &Path,
+        metadata: DeploymentBindingMetadata,
+        state: DeploymentStateStores,
+    ) -> Admitted {
         let deployment_ref = DeploymentRef {
             name: metadata.name.clone(),
             dir: deployment_dir.to_path_buf(),
         };
-        Ok(Admitted {
+        Admitted {
             metadata,
             deployment_ref,
+            state,
             content_roots: self.content_roots.clone(),
-        })
+        }
+    }
+
+    async fn prepare_state(
+        &self,
+        deployment_dir: &Path,
+        metadata: &DeploymentBindingMetadata,
+    ) -> Result<DeploymentStateStores> {
+        metadata
+            .state
+            .validate()
+            .context("deployment metadata records an invalid state location")?;
+        match &metadata.state {
+            DeploymentStateLocation::Local => Ok(DeploymentStateStores::local(deployment_dir)),
+            DeploymentStateLocation::S3 {
+                bucket,
+                region,
+                prefix,
+            } => {
+                let clients = tokeira_aws::AwsClients::load(None).await;
+                let client = clients.s3_for(region);
+                Ok(DeploymentStateStores::s3(client, bucket, prefix))
+            }
+        }
     }
 
     fn metadata(&self, deployment_dir: &Path) -> Result<DeploymentBindingMetadata> {
@@ -524,7 +578,7 @@ mod tests {
         let platform =
             BoundPlatform::bind_with_content("test", "tkd", &["observability"], declaration())
                 .unwrap();
-        let admitted = platform.admit_deployment(dir.path()).unwrap();
+        let admitted = platform.admit_local_deployment(dir.path()).unwrap();
         assert_eq!(admitted.metadata.name, "demo");
         assert_eq!(admitted.deployment_ref.name, "demo");
         assert_eq!(admitted.deployment_ref.dir, dir.path());
@@ -547,7 +601,7 @@ mod tests {
         let platform = BoundPlatform::bind("test", "tkd", declaration()).unwrap();
 
         platform
-            .admit_deployment(dir.path())
+            .admit_local_deployment(dir.path())
             .expect("candidate admission checks provenance, not A's artifact bytes");
     }
 
@@ -557,7 +611,7 @@ mod tests {
         write_metadata(dir.path(), "other");
         let platform = BoundPlatform::bind("test", "tkd", declaration()).unwrap();
         let error = platform
-            .admit_deployment(dir.path())
+            .admit_local_deployment(dir.path())
             .unwrap_err()
             .to_string();
         assert!(

@@ -207,6 +207,32 @@ pub(crate) enum DeploymentAction {
         /// `--dev-engine`.
         #[arg(long, conflicts_with = "dev_engine")]
         build_image: Option<String>,
+        /// Pre-existing, operator-owned S3 bucket for authoritative deployment
+        /// state. Supply this together with `--state-region` and
+        /// `--state-prefix`; omit all three to keep state local.
+        #[arg(
+            long,
+            value_name = "BUCKET",
+            requires_all = ["state_region", "state_prefix"]
+        )]
+        state_bucket: Option<String>,
+        /// AWS region containing `--state-bucket`. It may differ from the
+        /// deployment's provider region.
+        #[arg(
+            long,
+            value_name = "REGION",
+            requires_all = ["state_bucket", "state_prefix"]
+        )]
+        state_region: Option<String>,
+        /// Deployment-exclusive key prefix within `--state-bucket`. Tokeira
+        /// retains this prefix after destroy; bucket policy and lifecycle stay
+        /// under operator control.
+        #[arg(
+            long,
+            value_name = "PREFIX",
+            requires_all = ["state_bucket", "state_region"]
+        )]
+        state_prefix: Option<String>,
     },
     List {
         /// Enumerate published deployment repositories instead of local

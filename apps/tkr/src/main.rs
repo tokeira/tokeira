@@ -550,6 +550,58 @@ mod tests {
     }
 
     #[test]
+    fn create_parses_a_complete_remote_state_locator() {
+        let cli = Cli::try_parse_from([
+            "tkr",
+            "deployment",
+            "create",
+            "--name",
+            "dev",
+            "--state-bucket",
+            "shared-state",
+            "--state-region",
+            "eu-west-2",
+            "--state-prefix",
+            "deployments/dev",
+        ])
+        .unwrap();
+        let Command::Deployment {
+            action:
+                DeploymentAction::Create {
+                    state_bucket,
+                    state_region,
+                    state_prefix,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected a create action");
+        };
+        assert_eq!(state_bucket.as_deref(), Some("shared-state"));
+        assert_eq!(state_region.as_deref(), Some("eu-west-2"));
+        assert_eq!(state_prefix.as_deref(), Some("deployments/dev"));
+    }
+
+    #[test]
+    fn create_refuses_a_partial_remote_state_locator() {
+        let error = match Cli::try_parse_from([
+            "tkr",
+            "deployment",
+            "create",
+            "--name",
+            "dev",
+            "--state-bucket",
+            "shared-state",
+        ]) {
+            Ok(_) => panic!("bucket, region, and prefix are one choice"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("--state-region"), "{rendered}");
+        assert!(rendered.contains("--state-prefix"), "{rendered}");
+    }
+
+    #[test]
     fn parses_dev_commands() {
         assert!(matches!(
             Cli::try_parse_from(["tkr", "dev", "build"])
@@ -1101,6 +1153,7 @@ mod tests {
                     platform("local"),
                     StorageKind::InMemory,
                     None,
+                    tokeira_deployment::DeploymentStateLocation::Local,
                     None,
                 )
                 .expect("stage");
@@ -1299,6 +1352,7 @@ mod tests {
             name: "dev".into(),
             id: Uuid::nil(),
             platform: platform("local"),
+            state: Default::default(),
             definition: None,
             deployment_repository: None,
             storage: StorageKind::InMemory,
@@ -1318,6 +1372,11 @@ mod tests {
             name: "dev".into(),
             id: Uuid::nil(),
             platform: platform("compose"),
+            state: tokeira_deployment::DeploymentStateLocation::S3 {
+                bucket: "shared-state".into(),
+                region: "eu-west-2".into(),
+                prefix: "deployments/dev".into(),
+            },
             definition: Some(tokeira_deployment::RecordedDefinition {
                 format: tokeira_orchestrator::DefinitionFormatId::new("tkd").unwrap(),
                 path: tokeira_orchestrator::RelativeDefinitionPath::new("definition.tkd").unwrap(),
@@ -1332,6 +1391,7 @@ mod tests {
         let decoded: metadata::DeploymentMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.name, metadata.name);
         assert_eq!(decoded.id, metadata.id);
+        assert_eq!(decoded.state, metadata.state);
         assert_eq!(decoded.created_at, metadata.created_at);
         assert!(matches!(
             decoded.status,
@@ -1501,6 +1561,7 @@ mod tests {
                     platform("eks"),
                     StorageKind::InMemory,
                     None,
+                    tokeira_deployment::DeploymentStateLocation::Local,
                     Some(deployment_dir::DefinitionSeed {
                         definition: recorded.clone(),
                         bytes: sources.root,
@@ -1569,6 +1630,7 @@ mod tests {
                 platform("compose"),
                 StorageKind::InMemory,
                 None,
+                tokeira_deployment::DeploymentStateLocation::Local,
                 Some(deployment_dir::DefinitionSeed {
                     definition: tokeira_deployment::RecordedDefinition {
                         format: frontend.format.clone(),
@@ -1771,6 +1833,7 @@ mod tests {
                 platform("compose"),
                 StorageKind::InMemory,
                 None,
+                tokeira_deployment::DeploymentStateLocation::Local,
                 Some(deployment_dir::DefinitionSeed {
                     definition: tokeira_deployment::RecordedDefinition {
                         format: format.clone(),

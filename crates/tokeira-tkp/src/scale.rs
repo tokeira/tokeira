@@ -15,7 +15,6 @@ use tokeira_platform::definition::DefinitionFrontend;
 use crate::{
     apply::restamp_applied_revision,
     engine::Engine,
-    envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform::Admitted,
 };
@@ -27,7 +26,7 @@ pub(crate) async fn scale<F: DefinitionFrontend>(
 ) -> Result<()> {
     let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
-    let store = envelope_store(deployment_dir);
+    let store = admitted.state.envelope_store();
     let (mut envelope, version) = store
         .load()
         .await
@@ -79,6 +78,7 @@ pub(crate) async fn scale<F: DefinitionFrontend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope_store;
     use tokeira_deployment::DeploymentStateEnvelope;
 
     #[tokio::test]

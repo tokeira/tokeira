@@ -218,8 +218,13 @@ pub(crate) async fn fetch(
     let result = async {
         let fetched = fetch_into(&staging, &locator, &anchor, s3, &name).await?;
         let facts = crate::launcher::validate_staged_definition(&staging).await?;
-        crate::launcher::realize_staged_deployment(&staging, &facts, fetched.config_revision)
-            .await?;
+        crate::launcher::realize_fetched_deployment(
+            &staging,
+            &facts,
+            fetched.config_revision,
+            &fetched.claimed_deployment_name,
+        )
+        .await?;
         Ok::<_, anyhow::Error>(fetched)
     }
     .await;
@@ -246,6 +251,7 @@ pub(crate) async fn fetch(
 struct FetchedPublication {
     publication_version: u64,
     config_revision: u64,
+    claimed_deployment_name: String,
 }
 
 async fn fetch_into(
@@ -300,6 +306,7 @@ async fn fetch_into(
         name: name.to_string(),
         id: claim.deployment.id,
         platform: claim.platform.clone(),
+        state: claim.state.clone(),
         definition: Some(tokeira_deployment::RecordedDefinition {
             format: claim.format.clone(),
             path: tokeira_orchestrator::RelativeDefinitionPath::new(&claim.definition.root)
@@ -318,6 +325,7 @@ async fn fetch_into(
     Ok(FetchedPublication {
         publication_version: publication.version(),
         config_revision: claim.config_revision,
+        claimed_deployment_name: claim.deployment.name.clone(),
     })
 }
 
@@ -455,18 +463,7 @@ fn repository_absent(locator: &RepositoryLocator) -> bool {
 
 /// The committed configuration revision, from the deployment envelope.
 async fn read_config_revision(deployment_dir: &Path) -> Result<u64> {
-    let store: Box<
-        dyn tokeira_state::DeploymentStore<tokeira_deployment::DeploymentStateEnvelope>,
-    > = Box::new(tokeira_state::CasStore::new(
-        Box::new(tokeira_state::LocalBackend::new(
-            deployment_dir.join("state/envelope"),
-        )),
-        "envelope".to_string(),
-    ));
-    let (envelope, _) = store
-        .load()
-        .await
-        .context("failed to load the deployment envelope")?;
+    let envelope = crate::launcher::load_envelope(deployment_dir).await?;
     Ok(envelope.config_revision)
 }
 
@@ -537,6 +534,13 @@ pub(crate) async fn inspect(deployment_dir: &Path, json: bool) -> Result<()> {
         println!(
             "deployment   {} ({})",
             claim.deployment.name, claim.deployment.id
+        );
+        println!(
+            "state        {}",
+            claim
+                .state
+                .remote_uri()
+                .unwrap_or_else(|| "local".to_string())
         );
         println!(
             "definition   {} + {} companions — identity {}",

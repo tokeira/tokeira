@@ -21,7 +21,7 @@ use tokeira_state::DeploymentStore;
 
 use tokeira_platform::definition::DefinitionFrontend;
 
-use crate::{engine::Engine, envelope_store, platform::Admitted, running_integrity_manifest};
+use crate::{engine::Engine, platform::Admitted, running_integrity_manifest};
 
 pub(crate) async fn upgrade<F: DefinitionFrontend>(
     engine: &Engine<F>,
@@ -30,7 +30,7 @@ pub(crate) async fn upgrade<F: DefinitionFrontend>(
 ) -> Result<()> {
     let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now()); // B
-    let store = envelope_store(deployment_dir);
+    let store = admitted.state.envelope_store();
     let (mut envelope, mut version) = store
         .load()
         .await
@@ -271,6 +271,7 @@ fn transfer_ownership(envelope: &mut DeploymentStateEnvelope, to: ProvenanceStam
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope_store;
     use tokeira_deployment::{BuildMode, DeploymentStateEnvelope};
 
     #[tokio::test]

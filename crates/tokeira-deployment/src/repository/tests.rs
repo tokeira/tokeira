@@ -182,6 +182,7 @@ impl Fixture {
                     id: uuid::Uuid::nil(),
                 },
                 platform: PlatformId::new("compose").expect("platform"),
+                state: crate::DeploymentStateLocation::Local,
                 format,
                 definition: DefinitionSection {
                     root: "deployment.tkd".to_string(),
@@ -341,6 +342,37 @@ fn p2_identity_disagreement_refuses_the_publication() {
             .await
             .expect_err("must refuse");
         assert_eq!(refusal.name(), "identity_mismatch", "{refusal}");
+    });
+}
+
+#[test]
+fn malformed_signed_state_locator_refuses_the_publication() {
+    runtime().block_on(async {
+        let fixture = Fixture::local();
+        let mut input = fixture.input(b"root", &[], &[], Transition::Create, 0);
+        input.claim.state = crate::DeploymentStateLocation::S3 {
+            bucket: "Not A Bucket".to_string(),
+            region: "eu-west-2".to_string(),
+            prefix: "deployments/dev".to_string(),
+        };
+        let receipt = publish_local(&fixture, input, 0, None)
+            .await
+            .expect("publish malformed signed claim");
+        let opened = open(
+            &fixture.config.locator,
+            &receipt.trusted_root,
+            None,
+            Freshness::Enforced,
+            None,
+        )
+        .await
+        .expect("repository transport and signatures remain valid");
+
+        let refusal = opened
+            .verified_publication()
+            .await
+            .expect_err("the state locator is part of claim admission");
+        assert_eq!(refusal.name(), "claim_invalid", "{refusal}");
     });
 }
 

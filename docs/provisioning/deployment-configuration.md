@@ -38,6 +38,32 @@ tkr deployment use compose-dev
 Without `--deployment NAME`, commands use the `.latest` selection written by create or
 `deployment use`. Names are normalized to lowercase filesystem-safe entries.
 
+Definition-backed deployments can place all authoritative provisioner state in one
+pre-existing S3 prefix:
+
+```bash
+tkr deployment create \
+  --name compose-dev \
+  --platform compose \
+  --state-bucket company-tokeira-state \
+  --state-region eu-west-2 \
+  --state-prefix deployments/compose-dev \
+  --dev-engine
+```
+
+`--state-bucket`, `--state-region`, and `--state-prefix` must be supplied together;
+omitting all three selects local state. The selection covers the envelope,
+infrastructure state, runtime state, and renewable operation lease, and is recorded in
+both `metadata.json` and the signed Deployment Claim so `deployment fetch` reconnects a
+second seat to the same state. It does not move workflow history or DSQL storage.
+
+The bucket is an operator-owned prerequisite. Tokeira neither changes its bucket policy
+or lifecycle nor deletes the deployment prefix on destroy; the destroy path captures
+the retained S3 URI before removing the local locator and reports it after teardown
+succeeds. See
+[State and convergence](../iac/state-and-convergence.md#remote-placement) for the object
+layout, permissions, multi-seat verification, and retention contract.
+
 `tkr deployment lock [NAME]` adds a separate mis-apply guard: mutating commands refuse a
 different deployment until `tkr deployment unlock --yes` clears it. This registry lock
 is distinct from TKP's renewable operation lock and from state-store CAS.
@@ -167,6 +193,7 @@ tkr [--deployment NAME] [--json] [--detail]
 │   ├── create [--name NAME] [--platform local|compose|ecs]
 │   │          [--storage in-memory|dsql] [--region REGION]
 │   │          [--bundle --build-image IMAGE@sha256:DIGEST]
+│   │          [--state-bucket BUCKET --state-region REGION --state-prefix PREFIX]
 │   ├── list
 │   ├── use NAME
 │   ├── lock [NAME]

@@ -411,7 +411,9 @@ impl<F: DefinitionFrontend> Engine<F> {
 
     /// The recorded infrastructure state as the last apply persisted it.
     pub(crate) async fn recorded_state(&self, admitted: &Admitted) -> Result<iac::InfraState> {
-        let (state, _) = crate::described::infra_store(&admitted.deployment_ref.dir)
+        let (state, _) = admitted
+            .state
+            .infra_store()
             .load()
             .await
             .context("loading recorded infrastructure state")?;
@@ -560,6 +562,7 @@ impl<F: DefinitionFrontend> Engine<F> {
         let described = DescribedDeployment::new(
             admitted.deployment_ref.clone(),
             self.platform.implementation(),
+            admitted.state.clone(),
         );
         tokeira_orchestrator::DeployEngine::new(described, execution, &admitted.deployment_ref.dir)
             .await
@@ -595,6 +598,7 @@ impl<F: DefinitionFrontend> Engine<F> {
         let described = DescribedDeployment::new(
             admitted.deployment_ref.clone(),
             self.platform.implementation(),
+            admitted.state.clone(),
         );
         InfraEngine::new(described, execution, &admitted.deployment_ref.dir)
             .await
@@ -847,7 +851,10 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let admitted = engine.platform().admit_deployment(dir.path()).unwrap();
+        let admitted = engine
+            .platform()
+            .admit_local_deployment(dir.path())
+            .unwrap();
 
         let error = engine
             .retarget_check(

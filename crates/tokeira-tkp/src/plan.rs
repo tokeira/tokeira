@@ -10,7 +10,7 @@ use tokeira_report::Mode;
 
 use tokeira_platform::definition::DefinitionFrontend;
 
-use crate::{engine::Engine, envelope_store, platform::Admitted, render::ExplanationReport};
+use crate::{engine::Engine, platform::Admitted, render::ExplanationReport};
 
 pub(crate) async fn plan<F: DefinitionFrontend>(
     engine: &Engine<F>,
@@ -20,7 +20,9 @@ pub(crate) async fn plan<F: DefinitionFrontend>(
     explanation_path: Option<&Path>,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
-    let (envelope, _) = envelope_store(&admitted.deployment_ref.dir)
+    let (envelope, _) = admitted
+        .state
+        .envelope_store()
         .load()
         .await
         .context("failed to load the deployment envelope")?;

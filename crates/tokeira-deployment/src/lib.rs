@@ -37,6 +37,7 @@ pub mod marker;
 pub mod migration;
 pub mod repository;
 pub mod server_config;
+pub mod state;
 pub mod upgrade;
 mod version;
 pub use admission::{AdmissionError, RevocationList, admit_artifact};
@@ -51,6 +52,7 @@ pub use deployment::{ConfigSource, DeploymentBindingMetadata, RecordedDefinition
 pub use identity::{AuthorityTier, BuildAuthority, BuildProfile, EngineIdentity};
 pub use integrity::{ChecksumFormatError, IntegrityError, Sha256Digest, sha256_hex};
 pub use migration::{MigrationError, MigrationRegistry, envelope_migrations};
+pub use state::{DeploymentStateLocation, DeploymentStateStores, StateLocationError};
 pub use upgrade::{UpgradeDecision, evaluate_upgrade};
 
 /// Env vars an orchestrator (`tkr`'s two-binary rollback, task 19.3) sets so

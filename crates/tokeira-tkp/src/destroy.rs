@@ -8,8 +8,9 @@
 //!
 //! `infra destroy` removes only the substrate. The aggregate `tkp destroy`,
 //! invoked by `tkr deployment destroy`, removes services first and then the
-//! substrate. It deliberately leaves local records to `tkr`, which removes
-//! them only after the provisioner exits successfully.
+//! substrate. It deliberately leaves deployment records to `tkr`, which
+//! removes the local directory only after the provisioner exits successfully;
+//! operator-owned remote state remains retained under its recorded prefix.
 //!
 //! The engine identity binding is retained (the running binary is still the
 //! authority over the now-empty state) and `effective_config_ref` is cleared to
@@ -25,7 +26,6 @@ use tokeira_platform::definition::DefinitionFrontend;
 use crate::{
     deploy,
     engine::Engine,
-    envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform::Admitted,
 };
@@ -73,9 +73,8 @@ pub(crate) async fn destroy<F: DefinitionFrontend>(
     module: Option<&str>,
     yes: bool,
 ) -> Result<()> {
-    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
-    let store = envelope_store(deployment_dir);
+    let store = admitted.state.envelope_store();
     let (mut envelope, version) = store
         .load()
         .await
@@ -132,6 +131,7 @@ pub(crate) async fn destroy<F: DefinitionFrontend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope_store;
     use std::cell::RefCell;
     use tokeira_deployment::DeploymentStateEnvelope;
 

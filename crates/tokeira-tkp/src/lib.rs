@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use tokeira_deployment::DeploymentStateEnvelope;
 use tokeira_iac::{Change, ChangeKind};
 
+#[cfg(test)]
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 mod apply;
@@ -289,11 +290,6 @@ pub(crate) fn committed_changes(applied: &AppliedOutcome) -> Vec<tokeira_explain
         .collect()
 }
 
-/// The deployment-level envelope store.
-///
-/// For now a local CAS store under `{deployment_dir}/state/envelope`; cloud
-/// deployments will select an `S3StateStore` through the platform store seam
-///, just like the infra/runtime state.
 /// The retarget gate, run by every config-applying verb after the binding
 /// gate and before any mutation: a `#[create]` change is a new deployment,
 /// not an apply. No retained prior revision means nothing has ever applied,
@@ -371,6 +367,7 @@ pub(crate) fn persist_writeback(deployment_dir: &Path, values: &[(String, String
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn envelope_store(
     deployment_dir: &Path,
 ) -> Box<dyn DeploymentStore<DeploymentStateEnvelope>> {

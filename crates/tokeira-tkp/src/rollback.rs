@@ -26,7 +26,6 @@ use tokeira_platform::definition::DefinitionFrontend;
 
 use crate::{
     engine::Engine,
-    envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform::Admitted,
 };
@@ -81,7 +80,7 @@ pub(crate) async fn rollback<F: DefinitionFrontend>(
 ) -> Result<()> {
     let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
-    let store = envelope_store(deployment_dir);
+    let store = admitted.state.envelope_store();
     let (mut envelope, mut version) = store
         .load()
         .await
@@ -233,6 +232,7 @@ pub(crate) async fn rollback<F: DefinitionFrontend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope_store;
     use tokeira_deployment::{BuildMode, DeploymentStateEnvelope, ProvenanceStamp};
 
     #[tokio::test]

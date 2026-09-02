@@ -9,7 +9,7 @@
 use std::future::Future;
 
 use anyhow::{Context, Result, bail};
-use tokeira_deployment::RecordedDefinition;
+use tokeira_deployment::{DeploymentStateLocation, RecordedDefinition};
 use tokeira_orchestrator::StorageKind;
 
 use crate::{
@@ -36,9 +36,13 @@ pub(crate) async fn run(
             region,
             dev_engine,
             build_image,
+            state_bucket,
+            state_region,
+            state_prefix,
         } => {
             let resolved_name = name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let storage = storage.into();
+            let state = state_location(state_bucket, state_region, state_prefix)?;
             // The experimental platforms are refused at the one choke both
             // routes share — the legacy in-process path and the discovered
             // definition path each pass through this create — so the public
@@ -58,8 +62,20 @@ pub(crate) async fn run(
                 if dev_engine || build_image.is_some() {
                     bail!("legacy platform `{platform}` takes no engine options");
                 }
-                let pending =
-                    deployments.begin_create(&resolved_name, platform, storage, region, None)?;
+                if state != DeploymentStateLocation::Local {
+                    bail!(
+                        "remote state requires a definition-bound deployment; legacy platform \
+                         `{platform}` supports local state only"
+                    );
+                }
+                let pending = deployments.begin_create(
+                    &resolved_name,
+                    platform,
+                    storage,
+                    region,
+                    state,
+                    None,
+                )?;
                 let metadata = pending.publish()?;
                 print_metadata(&metadata, json)?;
                 return Ok(());
@@ -97,8 +113,14 @@ pub(crate) async fn run(
                 parts: sources.parts,
                 content,
             };
-            let pending =
-                deployments.begin_create(&resolved_name, platform, storage, region, Some(seed))?;
+            let pending = deployments.begin_create(
+                &resolved_name,
+                platform,
+                storage,
+                region,
+                state,
+                Some(seed),
+            )?;
             if dev_engine {
                 crate::bundle_create::place_dev_provisioner_at(
                     pending.path(),
@@ -243,6 +265,7 @@ pub(crate) async fn run(
             super::require_confirmation(yes, "deployment destroy")?;
             let name = normalize_name(&name);
             let dir = deployments.resolve_dir(Some(&name))?;
+            let retained_state = crate::metadata::read(&dir)?.state;
             remove_after_teardown(deployments, &name, async {
                 if deployments.uses_bound_provisioner(Some(&name))? {
                     let mut extra = vec!["--yes".to_string()];
@@ -280,6 +303,12 @@ pub(crate) async fn run(
             })
             .await?;
             println!("destroyed deployment {name}");
+            if let Some(uri) = retained_state.remote_uri() {
+                eprintln!(
+                    "remote state retained at {uri}; its bucket policy, lifecycle, and eventual \
+                     removal remain operator-managed"
+                );
+            }
         }
         DeploymentAction::Lock { name } => {
             let lock = deployment_lock::lock(deployments, name.as_deref())?;
@@ -351,6 +380,31 @@ fn print_metadata(metadata: &DeploymentMetadata, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the all-or-none remote-state CLI tuple before staging creates any
+/// local or remote record. Clap enforces this for real invocations; keeping the
+/// check here protects direct callers and makes the domain invariant explicit.
+fn state_location(
+    bucket: Option<String>,
+    region: Option<String>,
+    prefix: Option<String>,
+) -> Result<DeploymentStateLocation> {
+    let location = match (bucket, region, prefix) {
+        (None, None, None) => DeploymentStateLocation::Local,
+        (Some(bucket), Some(region), Some(prefix)) => DeploymentStateLocation::S3 {
+            bucket,
+            region,
+            prefix,
+        },
+        _ => bail!(
+            "remote state requires --state-bucket, --state-region, and --state-prefix together"
+        ),
+    };
+    location
+        .validate()
+        .context("invalid remote-state location")?;
+    Ok(location)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +426,9 @@ mod tests {
                     region: None,
                     dev_engine: false,
                     build_image: None,
+                    state_bucket: None,
+                    state_region: None,
+                    state_prefix: None,
                 },
                 &deployments,
                 None,

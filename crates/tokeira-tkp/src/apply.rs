@@ -17,7 +17,6 @@ use tokeira_platform::definition::DefinitionFrontend;
 use crate::{
     config_history,
     engine::Engine,
-    envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform::Admitted,
     render::ExplanationReport,
@@ -33,7 +32,7 @@ pub(crate) async fn apply<F: DefinitionFrontend>(
 ) -> Result<()> {
     let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
-    let store = envelope_store(deployment_dir);
+    let store = admitted.state.envelope_store();
     let (mut envelope, version) = store
         .load()
         .await
@@ -209,6 +208,7 @@ pub(crate) fn config_ref(deployment_dir: &Path, config_source: &crate::ConfigSou
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope_store;
     use tokeira_deployment::DeploymentStateEnvelope;
 
     #[tokio::test]

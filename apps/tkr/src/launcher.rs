@@ -27,10 +27,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tokeira_deployment::{
     BUNDLE_MANIFEST_BASENAME, BinaryStore, BuildMode, ConfigSource, DeploymentStateEnvelope,
-    ORCHESTRATED_LOCK_HOLDER_ENV, ORCHESTRATED_LOCK_TOKEN_ENV, ProvenanceStamp, ProvisionerBundle,
-    Target, config_history,
+    DeploymentStateLocation, DeploymentStateStores, ORCHESTRATED_LOCK_HOLDER_ENV,
+    ORCHESTRATED_LOCK_TOKEN_ENV, ProvenanceStamp, ProvisionerBundle, Target, config_history,
 };
-use tokeira_state::{CasStore, DeploymentStore, LocalBackend, OperationLock};
+use tokeira_state::LocalBackend;
 
 use crate::deployment_dir::PROVISIONER_BIN;
 
@@ -95,19 +95,48 @@ impl TkpBinary {
     }
 }
 
-/// Load the deployment's provisioner envelope. A definition-bound deployment
-/// without a binding is incomplete: creation and fetch both realize Day 0
-/// before publishing their staging directory.
-async fn load_envelope(deployment_dir: &Path) -> Result<DeploymentStateEnvelope> {
-    let store: Box<dyn DeploymentStore<DeploymentStateEnvelope>> = Box::new(CasStore::new(
-        Box::new(LocalBackend::new(deployment_dir.join("state/envelope"))),
-        "envelope".to_string(),
-    ));
-    let (envelope, _version) = store
+/// Prepare every authoritative store from the one placement admitted in
+/// `metadata.json`. A remote client is loaded once for this preparation and
+/// then cloned cheaply by the individual store constructors.
+async fn prepare_state_stores(deployment_dir: &Path) -> Result<DeploymentStateStores> {
+    let metadata = crate::metadata::read(deployment_dir)?;
+    metadata
+        .state
+        .validate()
+        .context("deployment metadata records an invalid state location")?;
+    match metadata.state {
+        DeploymentStateLocation::Local => Ok(DeploymentStateStores::local(deployment_dir)),
+        DeploymentStateLocation::S3 {
+            bucket,
+            region,
+            prefix,
+        } => {
+            let clients = tokeira_aws::AwsClients::load(None).await;
+            Ok(DeploymentStateStores::s3(
+                clients.s3_for(&region),
+                bucket,
+                prefix,
+            ))
+        }
+    }
+}
+
+async fn load_envelope_from(state: &DeploymentStateStores) -> Result<DeploymentStateEnvelope> {
+    let (envelope, _version) = state
+        .envelope_store()
         .load()
         .await
         .context("failed to read the deployment's provisioner state")?;
     Ok(envelope)
+}
+
+/// Load the deployment's provisioner envelope from its recorded placement.
+/// A definition-bound deployment without a binding is incomplete: creation
+/// realizes local/remote Day 0 before publishing its staging directory, while
+/// repository fetch reconnects to the signed locator.
+pub(crate) async fn load_envelope(deployment_dir: &Path) -> Result<DeploymentStateEnvelope> {
+    let state = prepare_state_stores(deployment_dir).await?;
+    load_envelope_from(&state).await
 }
 
 /// Whether this launch must run a concrete installed binary that
@@ -234,7 +263,8 @@ async fn launch_with_envs(
 /// falls back to the single-process rollback (the dev loop, where A and B
 /// are the same build) — same verb, no handoff.
 pub(crate) async fn launch_rollback(deployment_dir: &Path) -> Result<()> {
-    let envelope = load_envelope(deployment_dir).await?;
+    let state = prepare_state_stores(deployment_dir).await?;
+    let envelope = load_envelope_from(&state).await?;
     let retained_identity = envelope
         .checkpoint
         .as_ref()
@@ -245,10 +275,7 @@ pub(crate) async fn launch_rollback(deployment_dir: &Path) -> Result<()> {
         return launch(deployment_dir, &["rollback"], &[]).await;
     };
 
-    let lock = OperationLock::new(
-        Box::new(LocalBackend::new(deployment_dir.join("state/lock"))),
-        "operation",
-    );
+    let lock = state.operation_lock();
     let holder = format!("tkr-rollback-pid{}", std::process::id());
     let guard = lock
         .acquire(&holder, ORCHESTRATION_LOCK_TTL)
@@ -262,7 +289,7 @@ pub(crate) async fn launch_rollback(deployment_dir: &Path) -> Result<()> {
         (ORCHESTRATED_LOCK_TOKEN_ENV, guard.token.clone()),
     ];
 
-    let result = orchestrate_rollback(deployment_dir, &identity, &lease_envs).await;
+    let result = orchestrate_rollback(deployment_dir, &state, &identity, &lease_envs).await;
     // Release regardless of outcome; an interrupted sequence is recovered by
     // re-running `rollback` (19.4), which re-acquires.
     if let Err(release_err) = lock.release(guard).await {
@@ -276,6 +303,7 @@ const ORCHESTRATION_LOCK_TTL: std::time::Duration = std::time::Duration::from_se
 
 async fn orchestrate_rollback(
     deployment_dir: &Path,
+    state: &DeploymentStateStores,
     identity: &tokeira_deployment::EngineIdentity,
     lease_envs: &[(&str, String)],
 ) -> Result<()> {
@@ -293,7 +321,7 @@ async fn orchestrate_rollback(
     // envelope now records A's manifest, so retrieval re-verifies A's exact
     // bytes against it (trust flows from the CAS-guarded manifest, never the
     // stored blob).
-    let repinned = load_envelope(deployment_dir).await?;
+    let repinned = load_envelope_from(state).await?;
     let manifest = repinned.integrity.as_ref().ok_or_else(|| {
         anyhow::anyhow!("the re-pinned envelope records no integrity manifest — cannot place A")
     })?;
@@ -494,6 +522,43 @@ pub(crate) async fn realize_staged_deployment(
     facts: &StagedCheckFacts,
     revision: u64,
 ) -> Result<()> {
+    realize_staged_state(deployment_dir, facts, revision, StagedStateMode::Create).await
+}
+
+/// Reconnect a fetched seat to the state placement authenticated by its
+/// publication. Local publications have no portable state and therefore get a
+/// fresh envelope; remote publications must already expose an exact matching
+/// envelope, otherwise fetch would create a divergent writer or attach to the
+/// wrong deployment.
+pub(crate) async fn realize_fetched_deployment(
+    deployment_dir: &Path,
+    facts: &StagedCheckFacts,
+    revision: u64,
+    claimed_deployment_name: &str,
+) -> Result<()> {
+    realize_staged_state(
+        deployment_dir,
+        facts,
+        revision,
+        StagedStateMode::Fetch {
+            deployment_id: claimed_deployment_name,
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StagedStateMode<'a> {
+    Create,
+    Fetch { deployment_id: &'a str },
+}
+
+async fn realize_staged_state(
+    deployment_dir: &Path,
+    facts: &StagedCheckFacts,
+    revision: u64,
+    mode: StagedStateMode<'_>,
+) -> Result<()> {
     let provenance = facts.provenance.clone().ok_or_else(|| {
         anyhow::anyhow!("staged provisioner check reported no running-engine provenance")
     })?;
@@ -520,32 +585,148 @@ pub(crate) async fn realize_staged_deployment(
         .verify_artifact(&bytes, &Target(env!("TKR_TARGET").to_string()))
         .context("the staged provisioner disagrees with its placed bundle")?;
 
-    let store: Box<dyn DeploymentStore<DeploymentStateEnvelope>> = Box::new(CasStore::new(
-        Box::new(LocalBackend::new(deployment_dir.join("state/envelope"))),
-        "envelope".to_string(),
-    ));
-    let (existing, version) = store
-        .load()
-        .await
-        .context("failed to load the staged deployment envelope")?;
-    if existing.binding.is_some() {
-        bail!("staged deployment already carries a Day-0 binding");
-    }
     let metadata = crate::metadata::read(deployment_dir)?;
-    config_history::snapshot(deployment_dir, source, revision)
-        .context("failed to retain the staged deployment's initial source")?;
-    let envelope = DeploymentStateEnvelope {
-        deployment_id: metadata.name,
-        binding: Some(provenance),
-        integrity: Some(manifest),
-        config_revision: revision,
-        ..Default::default()
+    let state = prepare_state_stores(deployment_dir).await?;
+    let (deployment_id, initialize) = match mode {
+        StagedStateMode::Create => (metadata.name.as_str(), true),
+        StagedStateMode::Fetch { deployment_id } => (
+            deployment_id,
+            matches!(metadata.state, DeploymentStateLocation::Local),
+        ),
     };
-    store
-        .save(&envelope, &version)
-        .await
-        .context("failed to commit the staged deployment's Day-0 envelope")?;
-    Ok(())
+    let remote_create = matches!(mode, StagedStateMode::Create)
+        && matches!(metadata.state, DeploymentStateLocation::S3 { .. });
+    // The operation lease closes the race between checking an unused prefix
+    // and committing Day 0. Its released record may remain, but a competing
+    // create cannot enter this critical section and initialize sibling stores
+    // under the same prefix concurrently.
+    let creation_lock = if remote_create {
+        let lock = state.operation_lock();
+        let holder = format!("tkr-create-pid{}", std::process::id());
+        let guard = lock
+            .acquire(&holder, ORCHESTRATION_LOCK_TTL)
+            .await
+            .context(
+                "failed to reserve the remote-state prefix for Day-0 creation — another \
+                 provisioner may be using it",
+            )?;
+        Some((lock, guard))
+    } else {
+        None
+    };
+
+    let result = async {
+        let store = state.envelope_store();
+        let (existing, version) = store
+            .load()
+            .await
+            .context("failed to load the staged deployment envelope")?;
+
+        if initialize {
+            if remote_create {
+                let (_, infra_version) = state
+                    .infra_store()
+                    .load()
+                    .await
+                    .context("failed to inspect the remote infrastructure-state namespace")?;
+                let (_, deploy_version) = state
+                    .deploy_store()
+                    .load()
+                    .await
+                    .context("failed to inspect the remote deploy-state namespace")?;
+                if [&version, &infra_version, &deploy_version]
+                    .into_iter()
+                    .any(|candidate| !candidate.is_empty())
+                {
+                    let location = metadata
+                        .state
+                        .remote_uri()
+                        .expect("remote creation has an S3 location");
+                    bail!(
+                        "remote-state prefix {location} already contains deployment state; \
+                         choose an unused prefix or fetch its signed deployment publication"
+                    );
+                }
+            } else if existing.binding.is_some() {
+                bail!("staged local deployment already carries a Day-0 binding");
+            }
+        } else {
+            if existing.deployment_id != deployment_id {
+                bail!(
+                    "remote state belongs to deployment `{}` but the signed publication claims \
+                     `{deployment_id}`",
+                    existing.deployment_id
+                );
+            }
+            if !existing
+                .binding
+                .as_ref()
+                .is_some_and(|recorded| same_engine_binding(recorded, &provenance))
+            {
+                bail!(
+                    "remote state binding disagrees with the provisioner authenticated by the \
+                     signed publication"
+                );
+            }
+            if existing.integrity.as_ref() != Some(&manifest) {
+                bail!(
+                    "remote state integrity manifest disagrees with the engine authenticated by \
+                     the signed publication"
+                );
+            }
+            if existing.config_revision != revision {
+                bail!(
+                    "remote state is at configuration revision {} but the signed publication is \
+                     at revision {revision}; publish the committed transition before fetching \
+                     another seat",
+                    existing.config_revision
+                );
+            }
+        }
+
+        config_history::snapshot(deployment_dir, source, revision)
+            .context("failed to retain the staged deployment's initial source")?;
+        if initialize {
+            let envelope = DeploymentStateEnvelope {
+                deployment_id: deployment_id.to_string(),
+                binding: Some(provenance),
+                integrity: Some(manifest),
+                config_revision: revision,
+                ..Default::default()
+            };
+            store
+                .save(&envelope, &version)
+                .await
+                .context("failed to commit the staged deployment's Day-0 envelope")?;
+        }
+        Ok(())
+    }
+    .await;
+
+    let Some((lock, guard)) = creation_lock else {
+        return result;
+    };
+    match (result, lock.release(guard).await) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(anyhow::anyhow!(
+            "Day-0 state committed but its remote-state prefix lease could not be released: {error}"
+        )),
+        (Err(error), Err(release_error)) => Err(error.context(format!(
+            "the remote-state prefix lease also could not be released: {release_error}"
+        ))),
+    }
+}
+
+/// Compare the engine identity carried by two provenance observations.
+/// `recorded_at` says when a seat observed the engine and necessarily differs
+/// on fetch; treating it as identity would reject the exact same verified
+/// binary on every second machine.
+fn same_engine_binding(left: &ProvenanceStamp, right: &ProvenanceStamp) -> bool {
+    left.version == right.version
+        && left.git_sha == right.git_sha
+        && left.source_tree_hash == right.source_tree_hash
+        && left.build_mode == right.build_mode
 }
 
 /// Forward `infra apply`. Creation has already committed the deployment's
@@ -587,6 +768,17 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn fetch_binding_identity_ignores_only_the_observation_time() {
+        let first = ProvenanceStamp::current(Utc::now());
+        let mut later = first.clone();
+        later.recorded_at += chrono::Duration::seconds(1);
+        assert!(same_engine_binding(&first, &later));
+
+        later.source_tree_hash.push_str("-different");
+        assert!(!same_engine_binding(&first, &later));
     }
 
     #[test]

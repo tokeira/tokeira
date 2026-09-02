@@ -84,6 +84,7 @@ pub(crate) fn s3_client(bucket: Bucket) -> aws_sdk_s3::Client {
             "GET" => match store.get(&key) {
                 Some(bytes) => http::Response::builder()
                     .status(200)
+                    .header("etag", "\"testkit\"")
                     .body(SdkBody::from(bytes.clone()))
                     .expect("response"),
                 None => http::Response::builder()

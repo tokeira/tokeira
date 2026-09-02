@@ -82,7 +82,10 @@ executable equivalence. `BuildAuthority` is orthogonal to identity: identical
 engine inputs can be built by a local developer or trusted CI, while
 deployment policy can require one authority tier. The CAS address is
 partitioned by authority tier and keyed by engine identity and target, so
-local bytes cannot satisfy a trusted-CI floor.
+local bytes cannot satisfy a trusted-CI floor. How the engine is composed,
+frozen, identified, built, and married is drawn in
+[How a tkp is built](../diagrams/tkp-construction.svg) and explained in
+[`tkr` and `tkp`](tkr-and-tkp.md).
 
 ## One deployment, two processes
 

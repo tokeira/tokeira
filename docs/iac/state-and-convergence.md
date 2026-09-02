@@ -62,6 +62,11 @@ placement.
 
 ### Remote placement
 
+<p align="center">
+  <img src="../diagrams/remote-state-deployment.svg" width="900"
+       alt="One deployment, two seats, one remote state: metadata.json records one state location for the envelope, infrastructure state, runtime state, and operation lease, which tkr and tkp each open independently; seat A creates with remote state under the operation lease, refusing a prefix that already holds state and committing the Day-0 envelope before the local rename; the birth publication's signed claim carries the location; seat B fetches the publication from the pinned trust anchor, materializes into staging, and joins the remote envelope only when the deployment id, engine binding, integrity manifest, and configuration revision agree; every mutating verb on any seat runs under the same lease with per-document CAS, and destroy retains the remote snapshots.">
+</p>
+
 Remote state is a create-time deployment property:
 
 ```bash

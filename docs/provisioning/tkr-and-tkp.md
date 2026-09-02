@@ -37,6 +37,11 @@ remain versioned configuration data rather than engine-identity input.
 
 ## Constructing and obtaining a versioned TKP
 
+<p align="center">
+  <img src="../diagrams/tkp-construction.svg" width="900"
+       alt="How a tkp is built: platform and frontend packages declare themselves in Cargo metadata and tkr selects one pair without an enum; tokeira-build writes a three-dependency composition root inside a closure-scoped workspace; the source closure is frozen into a content-addressed git tree and EngineIdentity is derived without building; the bundle store is consulted by authority tier, identity, and target, and a miss runs the hermetic Dagger build — closure tests, a locked dist build of the generated root, strip, export, host-side hashing; the ProvisionerBundle is published manifest-last, the dev-engine path stays out of the store, and the bytes are retained and placed beside their sidecar.">
+</p>
+
 The bundled creation path begins from catalog selection rather than an already-installed
 executable or a hard-coded seed package:
 

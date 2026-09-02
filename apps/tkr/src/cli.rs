@@ -86,6 +86,9 @@ pub(crate) enum Command {
     },
     PortForward {
         service: String,
+        /// Local port to bind when the selected platform opens a tunnel.
+        #[arg(long)]
+        local_port: Option<u16>,
     },
     Config {
         #[command(subcommand)]

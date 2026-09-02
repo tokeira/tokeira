@@ -14,7 +14,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use tokeira_orchestrator::DefinitionFormatId;
 
-use tokeira_platform::definition::DefinitionFrontend;
+use tokeira_platform::{declaration::PortForwardOutcome, definition::DefinitionFrontend};
 
 use crate::{
     apply, definition, deploy, describe, destroy, engine::Engine, lock, observability, plan,
@@ -74,6 +74,8 @@ enum Command {
     Logs(LogsArgs),
     /// Print live published port mappings for one logical service.
     PortMappings(ServiceArgs),
+    /// Reach one logical service using the bound platform's forwarding mode.
+    PortForward(PortForwardArgs),
     /// Validate the deployment's realized observability configuration.
     #[command(subcommand)]
     Observability(ObservabilityCommand),
@@ -112,6 +114,7 @@ impl Command {
             Self::Scale(args) => Some(&args.deployment_dir),
             Self::Logs(args) => Some(&args.deployment_dir),
             Self::PortMappings(args) => Some(&args.deployment_dir),
+            Self::PortForward(args) => Some(&args.deployment_dir),
             Self::Observability(ObservabilityCommand::Check(args)) => Some(&args.deployment_dir),
             Self::Revert(args) => Some(&args.deployment_dir),
             Self::Rollback(args) => Some(&args.deployment_dir),
@@ -232,6 +235,18 @@ struct LogsArgs {
 struct ServiceArgs {
     /// Logical service name owned by the platform.
     service: String,
+    /// Deployment directory holding platform state.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct PortForwardArgs {
+    /// Logical service name owned by the platform.
+    service: String,
+    /// Local port to bind when the platform opens a tunnel.
+    #[arg(long)]
+    local_port: Option<u16>,
     /// Deployment directory holding platform state.
     #[arg(long)]
     deployment_dir: PathBuf,
@@ -477,6 +492,37 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
                         mapping.protocol
                     );
                 }
+            }
+            Ok(())
+        }
+        Command::PortForward(args) => {
+            let Some(ops) = engine.platform().ops() else {
+                anyhow::bail!("not applicable: this platform declares no ops surface");
+            };
+            match ops
+                .port_forward(
+                    &require(admitted).deployment_ref,
+                    &args.service,
+                    args.local_port,
+                )
+                .await?
+            {
+                PortForwardOutcome::Mappings(mappings) if mappings.is_empty() => {
+                    println!("no port mappings for service {}", args.service);
+                }
+                PortForwardOutcome::Mappings(mappings) => {
+                    for mapping in mappings {
+                        println!(
+                            "{}:{} -> {}:{}/{}",
+                            mapping.host_addr,
+                            mapping.host_port,
+                            args.service,
+                            mapping.container_port,
+                            mapping.protocol
+                        );
+                    }
+                }
+                PortForwardOutcome::SessionClosed => {}
             }
             Ok(())
         }
@@ -744,5 +790,27 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn parses_platform_owned_port_forward() {
+        let parsed = Cli::try_parse_from([
+            "tkp",
+            "port-forward",
+            "grafana",
+            "--local-port",
+            "33000",
+            "--deployment-dir",
+            "/tmp/d",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::PortForward(PortForwardArgs {
+                service,
+                local_port: Some(33000),
+                ..
+            }) if service == "grafana"
+        ));
     }
 }

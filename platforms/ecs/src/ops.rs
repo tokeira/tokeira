@@ -30,7 +30,7 @@ use tokeira_aws::AwsClients;
 use tokeira_deployment::DeploymentBindingMetadata;
 use tokeira_platform::{
     author::{LocatedValue, from_located_value},
-    declaration::{DeploymentRef, LogStream, Ops, PortMapping},
+    declaration::{DeploymentRef, LogStream, Ops, PortForwardOutcome, PortMapping},
     definition::{
         DefinitionSource, DefinitionSourceName, DirectoryPartSources, evaluate_definition,
     },
@@ -39,6 +39,8 @@ use tokeira_platform::{
 const METADATA_JSON: &str = "metadata.json";
 const DEFAULT_LOG_TAIL: u32 = 100;
 const LOG_FOLLOW_INTERVAL: Duration = Duration::from_secs(1);
+
+mod port_forward;
 
 #[derive(Debug, Serialize)]
 struct EvaluationContext {
@@ -164,6 +166,13 @@ struct Service {
     ecs_name: &'static str,
     port: u16,
     scalable: bool,
+    forward_target: Option<ForwardTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardTarget {
+    TaskAddress,
+    ServiceConnect,
 }
 
 const SERVICES: [Service; 10] = [
@@ -172,60 +181,70 @@ const SERVICES: [Service; 10] = [
         ecs_name: "tokeira-edge-api",
         port: 7233,
         scalable: true,
+        forward_target: Some(ForwardTarget::ServiceConnect),
     },
     Service {
         operator_name: "edge-poll",
         ecs_name: "tokeira-edge-poll",
         port: 7234,
         scalable: true,
+        forward_target: Some(ForwardTarget::ServiceConnect),
     },
     Service {
         operator_name: "runtime",
         ecs_name: "tokeira-runtime",
         port: 7241,
         scalable: false,
+        forward_target: None,
     },
     Service {
         operator_name: "projection",
         ecs_name: "tokeira-projection",
         port: 7242,
         scalable: true,
+        forward_target: None,
     },
     Service {
         operator_name: "controller",
         ecs_name: "tokeira-controller",
         port: 7240,
         scalable: true,
+        forward_target: Some(ForwardTarget::ServiceConnect),
     },
     Service {
         operator_name: "autoscaler",
         ecs_name: "tokeira-autoscaler",
         port: 7243,
         scalable: true,
+        forward_target: None,
     },
     Service {
         operator_name: "admin",
         ecs_name: "tokeira-admin",
         port: 7244,
         scalable: true,
+        forward_target: None,
     },
     Service {
         operator_name: "mimir",
         ecs_name: "tokeira-mimir",
         port: 9009,
         scalable: true,
+        forward_target: Some(ForwardTarget::TaskAddress),
     },
     Service {
         operator_name: "loki",
         ecs_name: "tokeira-loki",
         port: 3100,
         scalable: true,
+        forward_target: Some(ForwardTarget::TaskAddress),
     },
     Service {
         operator_name: "grafana",
         ecs_name: "tokeira-grafana",
         port: 3000,
         scalable: true,
+        forward_target: Some(ForwardTarget::TaskAddress),
     },
 ];
 
@@ -344,6 +363,15 @@ impl Ops for EcsOps {
             );
         }
         Ok(mappings)
+    }
+
+    async fn port_forward(
+        &self,
+        deployment: &DeploymentRef,
+        service: &str,
+        local_port: Option<u16>,
+    ) -> Result<PortForwardOutcome> {
+        port_forward::run(deployment, service, local_port).await
     }
 
     async fn scale(&self, deployment: &DeploymentRef, specs: &[String]) -> Result<usize> {

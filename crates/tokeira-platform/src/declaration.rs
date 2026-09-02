@@ -69,6 +69,22 @@ pub struct DeploymentRef {
 /// Incremental log output for one service.
 pub type LogStream = Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>>;
 
+/// Result of a platform-owned `port-forward` operation.
+///
+/// Platforms whose services are already published on the operator's host
+/// return [`Self::Mappings`]. Private substrates may instead hold the call
+/// open while a provider tunnel runs and return [`Self::SessionClosed`] only
+/// after that session exits. Keeping the process lifecycle behind [`Ops`]
+/// lets each platform choose the secure reachability mechanism without
+/// teaching the generic provisioner about provider credentials or topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortForwardOutcome {
+    /// No tunnel was necessary; these live host mappings are the answer.
+    Mappings(Vec<PortMapping>),
+    /// A platform-managed forwarding session completed successfully.
+    SessionClosed,
+}
+
 /// A platform's ops surface over a running deployment: the live operator
 /// questions answered from the substrate itself.
 ///
@@ -95,6 +111,23 @@ pub trait Ops: Send + Sync + fmt::Debug {
         deployment: &DeploymentRef,
         service: &str,
     ) -> anyhow::Result<Vec<PortMapping>>;
+
+    /// Reach one service from the operator's host.
+    ///
+    /// The default preserves mapping-only platforms: `local_port` has no
+    /// effect because those services are already published. A private
+    /// platform overrides this method to own target discovery, credentials,
+    /// and the lifetime of its tunnel.
+    async fn port_forward(
+        &self,
+        deployment: &DeploymentRef,
+        service: &str,
+        _local_port: Option<u16>,
+    ) -> anyhow::Result<PortForwardOutcome> {
+        Ok(PortForwardOutcome::Mappings(
+            self.port_mappings(deployment, service).await?,
+        ))
+    }
 
     /// Change workload capacity (`<dim>=<n>` specs), returning the change
     /// count. Required, deliberately undefaulted: an ops surface answers

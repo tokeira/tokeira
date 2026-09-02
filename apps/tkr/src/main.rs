@@ -250,13 +250,21 @@ async fn run(cli: Cli) -> Result<()> {
                 commands::logs::run(&service, follow, tail, ctx).await
             }
         }
-        Command::PortForward { service } => {
+        Command::PortForward {
+            service,
+            local_port,
+        } => {
             if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
-                launcher::launch(&dir, &["port-mappings"], &[service]).await
+                let mut extra = vec![service];
+                if let Some(local_port) = local_port {
+                    extra.push("--local-port".to_owned());
+                    extra.push(local_port.to_string());
+                }
+                launcher::launch(&dir, &["port-forward"], &extra).await
             } else {
                 let ctx = load_context(&deployments, selected)?;
-                commands::port_forward::run(&service, ctx).await
+                commands::port_forward::run(&service, local_port, ctx).await
             }
         }
         Command::Config {
@@ -1051,14 +1059,22 @@ mod tests {
             Cli::try_parse_from(["tkr", "port-forward", "grafana"])
                 .unwrap()
                 .command,
-            Command::PortForward { service } if service == "grafana"
+            Command::PortForward {
+                service,
+                local_port: None
+            } if service == "grafana"
         ));
         assert!(Cli::try_parse_from(["tkr", "admin", "schema", "setup"]).is_err());
         assert!(Cli::try_parse_from(["tkr", "exec", "runtime", "--", "sh"]).is_err());
-        assert!(
-            Cli::try_parse_from(["tkr", "port-forward", "grafana", "--local-port", "3000"])
-                .is_err()
-        );
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "port-forward", "grafana", "--local-port", "33000"])
+                .unwrap()
+                .command,
+            Command::PortForward {
+                service,
+                local_port: Some(33000)
+            } if service == "grafana"
+        ));
         assert!(matches!(
             Cli::try_parse_from(["tkr", "config", "show"])
                 .unwrap()

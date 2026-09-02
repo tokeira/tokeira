@@ -36,7 +36,7 @@ tokeira-deployment = { workspace = true }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
 tokeira-platform = { path = "../../crates/tokeira-platform" }
 tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
-tokio = { workspace = true, features = ["process", "time"] }
+tokio = { workspace = true, features = ["process", "signal", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

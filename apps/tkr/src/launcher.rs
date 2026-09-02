@@ -65,6 +65,7 @@ pub(crate) fn resolve_class(verb: &[&str], envelope: &DeploymentStateEnvelope) -
         | ["observability", "check"]
         | ["logs"]
         | ["port-mappings"]
+        | ["port-forward"]
         | [_, "plan"] => LaunchClass::ReadOnly,
         ["upgrade"] => LaunchClass::CandidateUpgrade,
         ["rollback"] => LaunchClass::Rollback,
@@ -832,6 +833,10 @@ mod tests {
             );
             assert_eq!(
                 resolve_class(&["image", "list"], envelope),
+                LaunchClass::ReadOnly
+            );
+            assert_eq!(
+                resolve_class(&["port-forward"], envelope),
                 LaunchClass::ReadOnly
             );
         }

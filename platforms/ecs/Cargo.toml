@@ -20,8 +20,11 @@ content = ["observability"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+aws-sdk-ecs = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dagger-sdk.workspace = true
+futures-util = "0.3"
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -33,7 +36,7 @@ tokeira-deployment = { workspace = true }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
 tokeira-platform = { path = "../../crates/tokeira-platform" }
 tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

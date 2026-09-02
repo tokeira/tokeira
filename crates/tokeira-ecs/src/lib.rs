@@ -1,8 +1,10 @@
 //! ECS definition realization and provider execution.
 //!
-//! This crate owns the ECS kinds, workload derivation, image sources, and the
-//! deploy platform used by generated provisioners. Operator lifecycle is
-//! definition-bound; there is no in-process deployment adapter.
+//! This crate owns the ECS kinds, workload derivation, and deploy platform used
+//! by generated provisioners. Image inventory belongs to the platform
+//! definition; this crate consumes only the image references carried into its
+//! typed workload configuration. Operator lifecycle is definition-bound; there
+//! is no in-process deployment adapter.
 
 // Service construction mirrors the broad ECS/ELB API surface, which takes many
 // parameters.
@@ -11,7 +13,6 @@
 pub mod config;
 pub mod execution;
 pub mod gates;
-pub mod images;
 pub mod kinds;
 pub mod modules;
 mod roles;

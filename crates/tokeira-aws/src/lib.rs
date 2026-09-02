@@ -20,7 +20,8 @@ pub use clients::{
     ecr::{
         DefaultEcrClient, EcrAuthorization, EcrClient, EcrClientHandle, EcrError,
         ImageTagMutability, RepositoryDescription, decode_authorization_data,
-        ensure_ecr_repositories, ensure_ecr_repository,
+        ensure_ecr_repositories, ensure_ecr_repository, prepare_ecr_registry,
+        prepare_ecr_registry_with_client,
     },
     register_infra_extensions,
 };

@@ -17,9 +17,7 @@ mod image_operations;
 pub mod observability;
 pub mod ops;
 
-pub use tokeira_ecs::{
-    EcsConfig, config, execution::EcsPlatform, gates, images, modules, services,
-};
+pub use tokeira_ecs::{EcsConfig, config, execution::EcsPlatform, gates, modules, services};
 
 // Live operations evaluate through this same function so they cannot drift
 // from the namespaces used to admit and realize an ECS definition.
@@ -101,9 +99,7 @@ impl PlatformIntegration for EcsIntegration {
 pub fn platform() -> PlatformDeclaration {
     PlatformDeclaration {
         namespaces: namespaces(),
-        // The platform-owned coordinate loader is deliberately separate
-        // from registration: handlers are added one capability at a time.
-        ops: None,
+        ops: Some(Box::new(ops::EcsOps)),
         observability: None,
         execution: Box::new(tokeira_ecs::execution::EcsExecution),
         implementation: Arc::new(EcsIntegration {
@@ -117,10 +113,10 @@ pub fn platform() -> PlatformDeclaration {
 mod declaration_tests {
     use super::*;
 
-    // The declaration is pure assembly: four namespaces, no ops, and the
-    // execution seams — constructed with no I/O to fail.
+    // The declaration is pure assembly: four namespaces plus live ops and
+    // execution seams, constructed with no I/O to fail.
     #[test]
-    fn platform_declares_four_namespaces_and_no_ops() {
+    fn platform_declares_four_namespaces_and_ops() {
         let declaration = platform();
         let names: Vec<&str> = declaration
             .namespaces
@@ -136,7 +132,7 @@ mod declaration_tests {
                 "tokeira_aws"
             ]
         );
-        assert!(declaration.ops.is_none());
+        assert!(declaration.ops.is_some());
         assert!(declaration.implementation.image_operations().is_some());
     }
 

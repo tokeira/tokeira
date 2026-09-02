@@ -1,7 +1,6 @@
 // The images module: one ECR repository per image the deployment builds or
-// mirrors. Repository names derive from the project — the operator authors
-// which images run (in `services` and `observability`), never where their
-// repositories live.
+// mirrors. The definition's image inventory owns every suffix; this module
+// adds only the deployment-name prefix that keeps ECR repositories isolated.
 
 use platform::Ecs;
 
@@ -9,43 +8,49 @@ pub fn define(d: Deployment, cfg: Ecs, cx: Context, images: Module) {
     images.resource(
         "tokeirad",
         EcrRepository {
-            repository: format!("{}/tokeirad", cx.project_name),
+            repository: format!("{}/{}", cx.project_name, cfg.images.tokeirad.repository),
+        },
+    );
+    images.resource(
+        "tokeira-autoscaler",
+        EcrRepository {
+            repository: format!("{}/{}", cx.project_name, cfg.images.autoscaler.repository),
         },
     );
     images.resource(
         "mimir",
         EcrRepository {
-            repository: format!("{}/mimir", cx.project_name),
+            repository: format!("{}/{}", cx.project_name, cfg.images.mimir.repository),
         },
     );
     images.resource(
         "loki",
         EcrRepository {
-            repository: format!("{}/loki", cx.project_name),
+            repository: format!("{}/{}", cx.project_name, cfg.images.loki.repository),
         },
     );
     images.resource(
         "grafana",
         EcrRepository {
-            repository: format!("{}/grafana", cx.project_name),
+            repository: format!("{}/{}", cx.project_name, cfg.images.grafana.repository),
         },
     );
     images.resource(
         "alloy",
         EcrRepository {
-            repository: format!("{}/alloy", cx.project_name),
+            repository: format!("{}/{}", cx.project_name, cfg.images.alloy.repository),
         },
     );
     images.resource(
         "aws-cli",
         EcrRepository {
-            repository: format!("{}/aws-cli", cx.project_name),
+            repository: format!("{}/{}", cx.project_name, cfg.images.aws_cli.repository),
         },
     );
     images.resource(
         "busybox",
         EcrRepository {
-            repository: format!("{}/busybox", cx.project_name),
+            repository: format!("{}/{}", cx.project_name, cfg.images.busybox.repository),
         },
     );
 }

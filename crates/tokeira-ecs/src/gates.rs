@@ -21,17 +21,19 @@ pub enum EcsError {
     },
 }
 
-const BUILD_REPOSITORIES: [&str; 1] = ["tokeirad"];
-const MIRROR_REPOSITORIES: [&str; 6] = ["mimir", "loki", "grafana", "alloy", "aws-cli", "busybox"];
-
-/// Validate the first-party image repository required by ECS workloads.
-pub fn validate_builds(state: &InfraState, project: &str, region: &str) -> Result<(), EcsError> {
-    validate_set(state, project, region, &BUILD_REPOSITORIES)
-}
-
-/// Validate all third-party image repositories required by ECS workloads.
-pub fn validate_mirrors(state: &InfraState, project: &str, region: &str) -> Result<(), EcsError> {
-    validate_set(state, project, region, &MIRROR_REPOSITORIES)
+/// Validate the definition-owned repository set required by one workload.
+///
+/// This crate deliberately has no catalogue of image names. The definition
+/// passes the exact repositories used by the rendered task, keeping image
+/// ownership at the authoring boundary while this function owns only the
+/// provider-state checks common to every private ECR reference.
+pub fn validate_repositories(
+    state: &InfraState,
+    project: &str,
+    region: &str,
+    repositories: &[&str],
+) -> Result<(), EcsError> {
+    validate_set(state, project, region, repositories)
 }
 
 /// Resolve a recorded ECR repository to the tagged reference ECS executes.
@@ -155,21 +157,16 @@ mod tests {
     const PROJECT: &str = "fixture";
 
     #[test]
-    fn missing_state_names_every_repository_and_remediation() {
+    fn missing_state_names_the_definition_owned_set_and_remediation() {
         let state = InfraState::default();
-
-        let builds = validate_builds(&state, PROJECT, REGION)
-            .expect_err("missing build repository")
+        let repositories = ["runtime", "telemetry"];
+        let error = validate_repositories(&state, PROJECT, REGION, &repositories)
+            .expect_err("missing repositories")
             .to_string();
-        assert!(builds.contains("tokeirad"));
-        assert!(builds.contains("tkr infra apply"));
-
-        let mirrors = validate_mirrors(&state, PROJECT, REGION)
-            .expect_err("missing mirror repositories")
-            .to_string();
-        for name in MIRROR_REPOSITORIES {
-            assert!(mirrors.contains(name), "{mirrors}");
+        for name in repositories {
+            assert!(error.contains(name), "{error}");
         }
+        assert!(error.contains("tkr infra apply"));
     }
 
     #[test]

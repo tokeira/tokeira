@@ -9314,8 +9314,11 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-sdk-ecs",
  "chrono",
  "dagger-sdk",
+ "futures-util",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",

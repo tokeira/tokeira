@@ -45,18 +45,51 @@ pub enum Dsql {
     Preexisting(PreexistingDsql),
 }
 
-// Replica-scheduled service policy: image, capacity, and desired count.
+// A locally produced image published into one deployment-owned ECR
+// repository. The repository is a suffix: the deployment name supplies the
+// collision-free prefix, while the authored tag selects what workloads run.
+pub struct BuildImage {
+    pub name: String,
+    pub repository: String,
+    pub tag: String,
+}
+
+// An upstream image mirrored into one deployment-owned ECR repository.
+// Keeping the source and destination together prevents publication and
+// workload rendering from maintaining parallel image inventories.
+pub struct MirrorImage {
+    pub name: String,
+    pub repository: String,
+    pub tag: String,
+    pub upstream_ref: String,
+}
+
+// Every image the ECS definition publishes and runs. Field names are only
+// authoring handles; each value carries its stable operator-facing name and
+// repository identity explicitly.
+pub struct Images {
+    pub tokeirad: BuildImage,
+    pub autoscaler: BuildImage,
+    pub mimir: MirrorImage,
+    pub loki: MirrorImage,
+    pub grafana: MirrorImage,
+    pub alloy: MirrorImage,
+    pub aws_cli: MirrorImage,
+    pub busybox: MirrorImage,
+}
+
+// Replica-scheduled service policy: capacity and desired count. Image
+// ownership lives in `Images`, and the deployment graph chooses the named
+// image for each workload explicitly.
 pub struct ReplicaPolicy {
-    pub image: String,
     pub replicas: u32,
     pub cpu: u32,
     pub memory_mb: u32,
 }
 
-// Daemon-scheduled service policy: image and capacity; one task per
-// eligible container instance, so there is no replica count to author.
+// Daemon-scheduled service policy: one task per eligible container instance,
+// so there is no replica count to author.
 pub struct DaemonPolicy {
-    pub image: String,
     pub cpu: u32,
     pub memory_mb: u32,
 }
@@ -113,15 +146,13 @@ pub struct Alb {
     pub health_check_interval_secs: u64,
 }
 
-// The observability stack's authored policies: the three backends and the
-// collection sidecar images.
+// The observability stack's authored workload policies. Its backend and
+// collection images live in the common image inventory above.
 pub struct Observability {
     pub mimir: ReplicaPolicy,
     pub loki: ReplicaPolicy,
     pub grafana: ReplicaPolicy,
-    pub alloy_image: String,
-    pub aws_cli_image: String,
-    pub busybox_image: String,
+    pub loki_query_url: String,
 }
 
 // Provider vocabulary for the DSQL cluster kind's lifecycle mode.
@@ -199,6 +230,7 @@ pub struct Ecs {
     pub networking: Networking,
     #[create]
     pub dsql: Dsql,
+    pub images: Images,
     pub services: Services,
     pub capacity: Capacity,
     pub alb: Alb,

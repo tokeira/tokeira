@@ -6,22 +6,17 @@
 //! credentials and Session Manager tokens never cross the platform API.
 //! The child inherits the terminal and is always reaped on exit or Ctrl-C.
 
-use std::{
-    env,
-    ffi::OsStr,
-    future::Future,
-    io,
-    path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
-};
+use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
 use tokeira_aws::AwsClients;
-use tokeira_platform::declaration::{DeploymentRef, PortForwardOutcome};
+use tokeira_platform::{declaration::DeploymentRef, ops::PortForwardOutcome};
 
 use super::{
     EcsOperationCoordinates, ForwardTarget, SERVICES, Service, lookup_service, provider_error,
-    running_tasks, task_private_ip,
+    running_tasks,
+    session_manager::{SessionCommand, require_client_tools, run_session},
+    task_private_ip,
 };
 
 // The direct SSM document connects to the managed EC2 node's loopback
@@ -35,12 +30,6 @@ const SSM_REMOTE_HOST_DOCUMENT: &str = "AWS-StartPortForwardingSessionToRemoteHo
 struct TaskTunnelTarget {
     container_instance_arn: String,
     private_ip: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionCommand {
-    program: PathBuf,
-    args: Vec<String>,
 }
 
 pub(super) async fn run(
@@ -58,8 +47,7 @@ pub(super) async fn run(
     // Session Manager's plugin protocol; keeping it as the subprocess
     // boundary means credentials remain in the operator's normal AWS chain
     // and no session token is exposed through this API.
-    let aws_cli = required_executable("aws", "AWS CLI")?;
-    required_executable("session-manager-plugin", "Session Manager plugin")?;
+    let aws_cli = require_client_tools()?;
 
     let coordinates = EcsOperationCoordinates::read(deployment)?;
     let clients = AwsClients::load(Some(coordinates.region())).await;
@@ -190,40 +178,6 @@ async fn discover_ec2_instance(
         })
 }
 
-fn required_executable(name: &str, display_name: &str) -> Result<PathBuf> {
-    find_executable_in(env::var_os("PATH").as_deref(), name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "{display_name} executable `{name}` is not installed or not executable on PATH"
-        )
-    })
-}
-
-fn find_executable_in(path: Option<&OsStr>, name: &str) -> Option<PathBuf> {
-    env::split_paths(path?).find_map(|directory| {
-        let candidate = directory.join(name);
-        is_executable(&candidate).then_some(candidate)
-    })
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 fn ssm_session_command(
     program: PathBuf,
     region: &str,
@@ -258,57 +212,8 @@ fn ssm_session_command(
     })
 }
 
-async fn run_session(command: SessionCommand) -> Result<()> {
-    let mut child = tokio::process::Command::new(&command.program)
-        .args(&command.args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        // A cancelled provisioner future must not orphan a tunnel even if
-        // cancellation happens outside the explicit Ctrl-C branch.
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to start AWS Session Manager through `{}`",
-                command.program.display()
-            )
-        })?;
-
-    wait_for_session(&mut child, tokio::signal::ctrl_c()).await
-}
-
-async fn wait_for_session<F>(child: &mut tokio::process::Child, interrupted: F) -> Result<()>
-where
-    F: Future<Output = io::Result<()>>,
-{
-    tokio::select! {
-        status = child.wait() => check_session_status(status?),
-        interrupted = interrupted => {
-            interrupted.context("failed to listen for Ctrl-C while the SSM tunnel was active")?;
-            // Reap the subprocess after terminating it so the Session Manager
-            // plugin cannot remain as either a live tunnel or a zombie.
-            if child.try_wait()?.is_none() {
-                child.kill().await.context("failed to terminate the AWS Session Manager process")?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn check_session_status(status: ExitStatus) -> Result<()> {
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("AWS Session Manager exited with status {status}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt as _;
-
     use super::*;
 
     #[test]
@@ -395,46 +300,6 @@ mod tests {
             })
         );
         assert_eq!(command.args[8..], ["--region", "eu-north-1"]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn executable_lookup_requires_an_executable_regular_file() {
-        let temp = tempfile::tempdir().expect("temporary PATH");
-        let executable = temp.path().join("aws");
-        std::fs::write(&executable, "").expect("fake executable");
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
-            .expect("mark executable");
-        std::fs::create_dir(temp.path().join("session-manager-plugin")).expect("fake directory");
-        let search_path = env::join_paths([temp.path()]).expect("PATH value");
-
-        assert_eq!(
-            find_executable_in(Some(&search_path), "aws"),
-            Some(executable)
-        );
-        assert_eq!(
-            find_executable_in(Some(&search_path), "session-manager-plugin"),
-            None
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn an_interrupt_terminates_and_reaps_the_session_process() {
-        let mut child = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "read value"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("blocking child process");
-
-        wait_for_session(&mut child, std::future::ready(Ok(())))
-            .await
-            .expect("operator interruption is a clean session close");
-
-        assert!(
-            child.try_wait().expect("read child status").is_some(),
-            "terminated child is reaped before the operation returns"
-        );
     }
 
     fn ecs_task(

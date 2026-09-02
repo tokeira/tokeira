@@ -90,6 +90,16 @@ pub(crate) enum Command {
         #[arg(long)]
         local_port: Option<u16>,
     },
+    /// Execute an interactive command in a live service container.
+    Exec {
+        service: String,
+        /// Container name; defaults to the platform's primary container.
+        #[arg(long)]
+        container: Option<String>,
+        /// Command and arguments to execute remotely.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     Config {
         #[command(subcommand)]
         action: ConfigAction,

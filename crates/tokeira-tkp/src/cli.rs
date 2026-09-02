@@ -14,7 +14,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use tokeira_orchestrator::DefinitionFormatId;
 
-use tokeira_platform::{declaration::PortForwardOutcome, definition::DefinitionFrontend};
+use tokeira_platform::{definition::DefinitionFrontend, ops::PortForwardOutcome};
 
 use crate::{
     apply, definition, deploy, describe, destroy, engine::Engine, lock, observability, plan,
@@ -76,6 +76,8 @@ enum Command {
     PortMappings(ServiceArgs),
     /// Reach one logical service using the bound platform's forwarding mode.
     PortForward(PortForwardArgs),
+    /// Execute an interactive command in one live service container.
+    Exec(ExecArgs),
     /// Validate the deployment's realized observability configuration.
     #[command(subcommand)]
     Observability(ObservabilityCommand),
@@ -115,6 +117,7 @@ impl Command {
             Self::Logs(args) => Some(&args.deployment_dir),
             Self::PortMappings(args) => Some(&args.deployment_dir),
             Self::PortForward(args) => Some(&args.deployment_dir),
+            Self::Exec(args) => Some(&args.deployment_dir),
             Self::Observability(ObservabilityCommand::Check(args)) => Some(&args.deployment_dir),
             Self::Revert(args) => Some(&args.deployment_dir),
             Self::Rollback(args) => Some(&args.deployment_dir),
@@ -248,6 +251,21 @@ struct PortForwardArgs {
     #[arg(long)]
     local_port: Option<u16>,
     /// Deployment directory holding platform state.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct ExecArgs {
+    /// Logical service name owned by the platform.
+    service: String,
+    /// Container name; the platform defaults to the service's primary container.
+    #[arg(long)]
+    container: Option<String>,
+    /// Command and arguments to execute remotely.
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
+    /// Deployment directory holding platform identity and the admitted definition.
     #[arg(long)]
     deployment_dir: PathBuf,
 }
@@ -525,6 +543,18 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
                 PortForwardOutcome::SessionClosed => {}
             }
             Ok(())
+        }
+        Command::Exec(args) => {
+            let Some(ops) = engine.platform().ops() else {
+                anyhow::bail!("not applicable: this platform declares no ops surface");
+            };
+            ops.exec(
+                &require(admitted).deployment_ref,
+                &args.service,
+                args.container.as_deref(),
+                &args.command,
+            )
+            .await
         }
         Command::Observability(ObservabilityCommand::Check(args)) => {
             observability::check(&engine, require(admitted), args.timeout_seconds)
@@ -812,5 +842,38 @@ mod tests {
                 ..
             }) if service == "grafana"
         ));
+    }
+
+    #[test]
+    fn parses_platform_owned_exec() {
+        let parsed = Cli::try_parse_from([
+            "tkp",
+            "exec",
+            "--deployment-dir",
+            "/tmp/d",
+            "runtime",
+            "--container",
+            "tokeira-runtime",
+            "--",
+            "sh",
+            "-c",
+            "echo ready",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Exec(ExecArgs {
+                service,
+                container: Some(container),
+                command,
+                ..
+            }) if service == "runtime"
+                && container == "tokeira-runtime"
+                && command == ["sh", "-c", "echo ready"]
+        ));
+        assert!(
+            Cli::try_parse_from(["tkp", "exec", "runtime", "--deployment-dir", "/tmp/d"]).is_err(),
+            "the remote command is mandatory"
+        );
     }
 }

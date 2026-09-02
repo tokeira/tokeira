@@ -16,7 +16,7 @@
 //! | Cloud infra       | `tkr infra`      | Plan / apply / destroy declared resources.     |
 //! | Service deploy    | `tkr deploy`     | Plan / apply / destroy service manifests.      |
 //! | DSQL schema       | `tkr schema`     | Schema setup for DSQL-backed deployments.      |
-//! | Scaling + ops     | `tkr scale`, `tkr logs`, `tkr port-forward` | Day-2 operator loops. |
+//! | Scaling + ops     | `tkr scale`, `tkr logs`, `tkr port-forward`, `tkr exec` | Day-2 operator loops. |
 //! | Inspection        | `tkr config show`, `tkr version`            | Debugging aids.       |
 //!
 //! # Architecture pointers
@@ -267,6 +267,24 @@ async fn run(cli: Cli) -> Result<()> {
                 commands::port_forward::run(&service, local_port, ctx).await
             }
         }
+        Command::Exec {
+            service,
+            container,
+            command,
+        } => {
+            if !deployments.uses_bound_provisioner(selected)? {
+                anyhow::bail!(
+                    "interactive exec is not supported by the selected in-process platform"
+                );
+            }
+            let dir = deployments.resolve_dir(selected)?;
+            launcher::launch(
+                &dir,
+                &["exec"],
+                &forwarded_exec_args(&service, container.as_deref(), &command),
+            )
+            .await
+        }
         Command::Config {
             action: ConfigAction::Show,
         } => commands::config::run_show(&deployments, selected),
@@ -428,6 +446,19 @@ fn forwarded_observability_verb(timeout_seconds: u64) -> (&'static [&'static str
         &["observability", "check"],
         vec!["--timeout-seconds".to_string(), timeout_seconds.to_string()],
     )
+}
+
+/// Preserve remote argv boundaries across the `tkr` → married `tkp` process
+/// boundary. The separator prevents a remote flag from being interpreted as
+/// a provisioner flag; the platform performs the final provider encoding.
+fn forwarded_exec_args(service: &str, container: Option<&str>, command: &[String]) -> Vec<String> {
+    let mut args = vec![service.to_owned()];
+    if let Some(container) = container {
+        args.extend(["--container".to_owned(), container.to_owned()]);
+    }
+    args.push("--".to_owned());
+    args.extend(command.iter().cloned());
+    args
 }
 
 /// `--module` crosses to the bound `tkp` verbatim — the platform owns its
@@ -864,6 +895,26 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_preserves_exec_argument_boundaries() {
+        assert_eq!(
+            forwarded_exec_args(
+                "runtime",
+                Some("tokeira-runtime"),
+                &["sh".to_owned(), "-c".to_owned(), "echo ready".to_owned()],
+            ),
+            [
+                "runtime",
+                "--container",
+                "tokeira-runtime",
+                "--",
+                "sh",
+                "-c",
+                "echo ready",
+            ]
+        );
+    }
+
+    #[test]
     fn forwarding_preserves_the_observability_check_timeout() {
         let (verb, extra) = forwarded_observability_verb(15);
         assert_eq!(verb, &["observability", "check"]);
@@ -1065,7 +1116,28 @@ mod tests {
             } if service == "grafana"
         ));
         assert!(Cli::try_parse_from(["tkr", "admin", "schema", "setup"]).is_err());
-        assert!(Cli::try_parse_from(["tkr", "exec", "runtime", "--", "sh"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from([
+                "tkr",
+                "exec",
+                "runtime",
+                "--container",
+                "tokeira-runtime",
+                "--",
+                "sh",
+                "-c",
+                "echo ready",
+            ])
+            .unwrap()
+            .command,
+            Command::Exec {
+                service,
+                container: Some(container),
+                command,
+            } if service == "runtime"
+                && container == "tokeira-runtime"
+                && command == ["sh", "-c", "echo ready"]
+        ));
         assert!(matches!(
             Cli::try_parse_from(["tkr", "port-forward", "grafana", "--local-port", "33000"])
                 .unwrap()

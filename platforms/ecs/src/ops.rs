@@ -30,17 +30,20 @@ use tokeira_aws::AwsClients;
 use tokeira_deployment::DeploymentBindingMetadata;
 use tokeira_platform::{
     author::{LocatedValue, from_located_value},
-    declaration::{DeploymentRef, LogStream, Ops, PortForwardOutcome, PortMapping},
+    declaration::DeploymentRef,
     definition::{
         DefinitionSource, DefinitionSourceName, DirectoryPartSources, evaluate_definition,
     },
+    ops::{LogStream, Ops, PortForwardOutcome, PortMapping},
 };
 
 const METADATA_JSON: &str = "metadata.json";
 const DEFAULT_LOG_TAIL: u32 = 100;
 const LOG_FOLLOW_INTERVAL: Duration = Duration::from_secs(1);
 
+mod exec;
 mod port_forward;
+mod session_manager;
 
 #[derive(Debug, Serialize)]
 struct EvaluationContext {
@@ -372,6 +375,16 @@ impl Ops for EcsOps {
         local_port: Option<u16>,
     ) -> Result<PortForwardOutcome> {
         port_forward::run(deployment, service, local_port).await
+    }
+
+    async fn exec(
+        &self,
+        deployment: &DeploymentRef,
+        service: &str,
+        container: Option<&str>,
+        command: &[String],
+    ) -> Result<()> {
+        exec::run(deployment, service, container, command).await
     }
 
     async fn scale(&self, deployment: &DeploymentRef, specs: &[String]) -> Result<usize> {

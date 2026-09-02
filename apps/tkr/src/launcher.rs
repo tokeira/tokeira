@@ -801,6 +801,10 @@ mod tests {
             resolve_class(&["infra", "apply"], &versioned),
             LaunchClass::Bound
         );
+        // Interactive exec can mutate a running container, so it must use
+        // the manifest-verified bound provisioner rather than the ungated
+        // read-only class.
+        assert_eq!(resolve_class(&["exec"], &versioned), LaunchClass::Bound);
         assert_eq!(
             resolve_class(&["infra", "apply"], &dev),
             LaunchClass::DevCandidate

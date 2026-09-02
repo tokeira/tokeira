@@ -6,16 +6,16 @@
 //! namespaces it exposes, its live operational capabilities, and the
 //! platform implementation that realizes those capabilities.
 
-use std::{fmt, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
+use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
-use futures_util::Stream;
 use serde::Serialize;
 use tokeira_deploy_engine::ImageSourceType;
 
 use crate::definition::Namespace;
 
-/// Live host/container port mapping shape shared with the operator surface.
-pub use tokeira_orchestrator::PortMapping;
+// Compatibility re-exports keep existing platform implementations source
+// stable while `ops` remains the owning module for the operational contract.
+pub use crate::ops::{LogStream, Ops, PortMapping};
 
 /// Everything the framework needs to operate one platform.
 ///
@@ -64,76 +64,6 @@ pub struct DeploymentRef {
     pub name: String,
     /// Deployment directory, for providers whose artifacts are path-scoped.
     pub dir: PathBuf,
-}
-
-/// Incremental log output for one service.
-pub type LogStream = Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>>;
-
-/// Result of a platform-owned `port-forward` operation.
-///
-/// Platforms whose services are already published on the operator's host
-/// return [`Self::Mappings`]. Private substrates may instead hold the call
-/// open while a provider tunnel runs and return [`Self::SessionClosed`] only
-/// after that session exits. Keeping the process lifecycle behind [`Ops`]
-/// lets each platform choose the secure reachability mechanism without
-/// teaching the generic provisioner about provider credentials or topology.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PortForwardOutcome {
-    /// No tunnel was necessary; these live host mappings are the answer.
-    Mappings(Vec<PortMapping>),
-    /// A platform-managed forwarding session completed successfully.
-    SessionClosed,
-}
-
-/// A platform's ops surface over a running deployment: the live operator
-/// questions answered from the substrate itself.
-///
-/// Implemented by platforms that have one; the framework mounts the
-/// corresponding operator verbs by presence and passes the operator's
-/// service name through — an implementation answers for the services it
-/// finds on the substrate, and an unknown name surfaces as the provider's
-/// own error.
-#[async_trait::async_trait]
-pub trait Ops: Send + Sync + fmt::Debug {
-    /// Open incremental logs for one declared service.
-    async fn log_stream(
-        &self,
-        deployment: &DeploymentRef,
-        service: &str,
-        follow: bool,
-        tail: Option<u32>,
-    ) -> anyhow::Result<LogStream>;
-
-    /// Resolve the live host/container port mappings for one declared
-    /// service.
-    async fn port_mappings(
-        &self,
-        deployment: &DeploymentRef,
-        service: &str,
-    ) -> anyhow::Result<Vec<PortMapping>>;
-
-    /// Reach one service from the operator's host.
-    ///
-    /// The default preserves mapping-only platforms: `local_port` has no
-    /// effect because those services are already published. A private
-    /// platform overrides this method to own target discovery, credentials,
-    /// and the lifetime of its tunnel.
-    async fn port_forward(
-        &self,
-        deployment: &DeploymentRef,
-        service: &str,
-        _local_port: Option<u16>,
-    ) -> anyhow::Result<PortForwardOutcome> {
-        Ok(PortForwardOutcome::Mappings(
-            self.port_mappings(deployment, service).await?,
-        ))
-    }
-
-    /// Change workload capacity (`<dim>=<n>` specs), returning the change
-    /// count. Required, deliberately undefaulted: an ops surface answers
-    /// every one of its verbs in its own words — a provider without a scale
-    /// dimension states its own refusal as the error.
-    async fn scale(&self, deployment: &DeploymentRef, specs: &[String]) -> anyhow::Result<usize>;
 }
 
 /// One platform-declared image shown by the generic provisioner shell.

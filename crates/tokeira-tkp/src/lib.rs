@@ -163,10 +163,10 @@ pub(crate) type DesiredSnapshot =
 /// types live with the definition-boundary library and are re-exported here
 /// as the surface platforms speak.
 pub use tokeira_platform::declaration::{
-    DeclaredImage, DeploymentRef, ImageOperations, Ops, PlatformDeclaration, PlatformExecution,
+    DeclaredImage, DeploymentRef, ImageOperations, PlatformDeclaration, PlatformExecution,
     PlatformIntegration, PublishedImage,
 };
-pub use tokeira_platform::{definition::Namespace, kind};
+pub use tokeira_platform::{definition::Namespace, kind, ops::Ops};
 
 /// The typed failure a verb returns after emitting its complete report.
 ///

@@ -187,7 +187,6 @@ mod tests {
             environment: "dev".into(),
             region: "eu-west-2".into(),
             cluster: "tokeira".into(),
-            service_connect_namespace: "tokeira.internal".into(),
             image: "tokeirad:latest".into(),
             replicas: None,
             cpu: 1024,
@@ -203,14 +202,40 @@ mod tests {
             tokeira_deployment::server_config::resource_id(),
         ]))
         .expect("runtime workload");
+        let alloy_init = workload
+            .task_definition
+            .containers
+            .iter()
+            .find(|container| container.name == "alloy-config-init")
+            .expect("alloy config init");
+        assert!(
+            alloy_init
+                .command
+                .join(" ")
+                .contains("/demo/alloy/sidecar/tokeira-runtime"),
+            "the workload and its Alloy parameter share deployment identity"
+        );
+        let wait_for = workload
+            .task_definition
+            .containers
+            .iter()
+            .find(|container| container.name == "wait-for-tokeira-controller")
+            .expect("controller readiness gate");
+        assert!(
+            wait_for
+                .command
+                .join(" ")
+                .contains("nc -z tokeira-controller 7240"),
+            "readiness uses the Service Connect client alias"
+        );
         assert_eq!(
             tokeira_deploy_engine::Service::resource_type(&workload),
             workload::TYPE
         );
     }
 
-    // The definition's autoscaler policy must reach the task model instead
-    // of stopping at the legacy duplicate image coordinate.
+    // The definition's autoscaler policy must reach the task model used to
+    // build the provider manifest.
     #[test]
     fn authored_autoscaler_resources_reach_the_realized_workload() {
         use tokeira_platform::kind::Kind as _;
@@ -220,11 +245,10 @@ mod tests {
             environment: "dev".into(),
             region: "eu-west-2".into(),
             cluster: "tokeira".into(),
-            service_connect_namespace: "tokeira.internal".into(),
             image: "autoscaler:authored".into(),
             replicas: Some(3),
-            cpu: 384,
-            memory_mb: 768,
+            cpu: 512,
+            memory_mb: 1024,
             alloy_image: "alloy:authored".into(),
             aws_cli_image: "aws-cli:authored".into(),
             busybox_image: "busybox:authored".into(),
@@ -236,8 +260,8 @@ mod tests {
         ]))
         .expect("autoscaler workload");
 
-        assert_eq!(workload.task_definition.cpu, 384);
-        assert_eq!(workload.task_definition.memory_mb, 768);
+        assert_eq!(workload.task_definition.cpu, 512);
+        assert_eq!(workload.task_definition.memory_mb, 1024);
         assert!(matches!(
             workload.scheduling,
             crate::services::EcsScheduling::Replica { desired_count: 3 }
@@ -262,6 +286,34 @@ mod tests {
         assert!(workload.task_definition.containers.iter().any(|container| {
             container.name.starts_with("wait-for-") && container.image == "busybox:authored"
         }));
+    }
+
+    #[test]
+    fn invalid_authored_task_resources_refuse_before_manifest_derivation() {
+        use tokeira_platform::kind::Kind as _;
+
+        let error = workload::Workload {
+            service: "tokeira-autoscaler".into(),
+            environment: "dev".into(),
+            region: "eu-west-2".into(),
+            cluster: "tokeira".into(),
+            image: "autoscaler:authored".into(),
+            replicas: Some(1),
+            cpu: 128,
+            memory_mb: 256,
+            alloy_image: "alloy:authored".into(),
+            aws_cli_image: "aws-cli:authored".into(),
+            busybox_image: "busybox:authored".into(),
+        }
+        .realize(&placement(Vec::new()))
+        .expect_err("invalid task totals must be refused before unsigned subtraction");
+
+        assert!(
+            error
+                .message
+                .contains("invalid ECS workload `tokeira-autoscaler`")
+        );
+        assert!(error.message.contains("invalid ECS cpu/memory pair"));
     }
 
     // A managed role without its cluster dependency and an unknown workload
@@ -292,7 +344,6 @@ mod tests {
             environment: "dev".into(),
             region: "eu-west-2".into(),
             cluster: "tokeira".into(),
-            service_connect_namespace: "tokeira.internal".into(),
             image: "tokeirad:latest".into(),
             replicas: None,
             cpu: 1024,
@@ -314,7 +365,6 @@ mod tests {
             environment: "dev".into(),
             region: "eu-west-2".into(),
             cluster: "tokeira".into(),
-            service_connect_namespace: "tokeira.internal".into(),
             image: "tokeirad:latest".into(),
             replicas: None,
             cpu: 1024,

@@ -1,3 +1,10 @@
+//! Canonical ECS workload derivation and deploy-plane manifest production.
+//!
+//! Task topology, fixed sidecars, Service Connect aliases, and dependency
+//! readiness are platform facts. Callers must validate authored task totals
+//! before entering the builders: primary-container reservations are the
+//! remainder after fixed platform overhead.
+
 use serde::{Deserialize, Serialize};
 use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac::ResourceId;
@@ -17,6 +24,8 @@ pub enum EcsScheduling {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EcsWorkload {
     pub(crate) name: String,
+    /// Deployment scope used to resolve recorded ECR repository outputs.
+    pub(crate) project_name: String,
     /// AWS region the workload deploys into. Carried on the workload so its
     /// manifests are self-describing: the deploy platform admits exactly one
     /// region per deployment from the manifests themselves.
@@ -29,9 +38,8 @@ pub struct EcsWorkload {
     pub(crate) service_connect: ServiceConnectSpec,
     pub(crate) placement_constraints: Vec<PlacementConstraint>,
     /// Infrastructure identity of the IAM role assumed by the task's
-    /// containers. Definition-realized workloads resolve its provider ARN
-    /// from the recorded infrastructure state when manifests are produced;
-    /// legacy-built workloads leave it absent and retain their existing path.
+    /// containers. Workloads resolve its provider ARN from recorded
+    /// infrastructure state when manifests are produced.
     #[serde(skip)]
     pub(crate) task_role_dependency: Option<ResourceId>,
     /// Infrastructure identity of the ECS-agent execution role, when the task
@@ -344,6 +352,12 @@ impl deploy_engine::Service for EcsWorkload {
             &self.task_definition,
         )?;
         let mut spec = self.task_definition.clone();
+        resolve_container_images(
+            &mut spec,
+            &ctx.infra_state,
+            &self.project_name,
+            &self.region,
+        )?;
         inject_server_config(
             &ctx.infra_state,
             self.server_config_dependency.as_ref(),
@@ -695,6 +709,7 @@ fn workload_from_parts(
 
     EcsWorkload {
         name: name.to_owned(),
+        project_name: config.project_name.clone(),
         region: config.region.clone(),
         cluster: config.cluster.name.clone(),
         scheduling,
@@ -733,6 +748,57 @@ fn workload_from_parts(
         target_group_dependency: None,
         server_config_dependency: None,
     }
+}
+
+/// Resolve definition-owned repository suffixes through the repositories
+/// already recorded by infrastructure apply.
+///
+/// Repository account and region come from provider-returned infrastructure
+/// outputs. Both repository suffix and tag come from the definition, so this
+/// crate does not maintain a parallel image-to-container policy. This is a
+/// read of existing infrastructure state and never creates another state
+/// persistence path.
+fn resolve_container_images(
+    task: &mut TaskDefinitionSpec,
+    state: &tokeira_iac::InfraState,
+    project: &str,
+    region: &str,
+) -> Result<(), deploy_engine::DeployError> {
+    let declared = task
+        .containers
+        .iter()
+        .map(|container| {
+            declared_image_parts(&container.image)
+                .map(|(repository, tag)| (repository.to_owned(), tag.to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let repositories = declared
+        .iter()
+        .map(|(repository, _)| repository.as_str())
+        .collect::<Vec<_>>();
+    crate::gates::validate_repositories(state, project, region, &repositories)
+        .map_err(|error| deploy_engine::RuntimeError::Image(error.to_string()))?;
+
+    for (container, (repository, tag)) in task.containers.iter_mut().zip(declared) {
+        container.image =
+            crate::gates::resolved_image_ref(state, project, region, &repository, &tag)
+                .map_err(|error| deploy_engine::RuntimeError::Image(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn declared_image_parts(image: &str) -> Result<(&str, &str), deploy_engine::DeployError> {
+    let (repository, tag) = image.rsplit_once(':').ok_or_else(|| {
+        deploy_engine::RuntimeError::Image(format!(
+            "definition-owned ECS image `{image}` must be `<repository>:<tag>`"
+        ))
+    })?;
+    if repository.is_empty() || tag.is_empty() || repository.contains('@') || tag.contains('/') {
+        return Err(deploy_engine::RuntimeError::Image(format!(
+            "definition-owned ECS image `{image}` must contain a non-empty ECR repository suffix and tag"
+        )));
+    }
+    Ok((repository, tag))
 }
 
 fn primary_container(
@@ -818,10 +884,11 @@ fn wait_for_containers(dependencies: &[&str], config: &EcsConfig) -> Vec<Contain
                 command: vec![
                     "sh".into(),
                     "-c".into(),
-                    format!(
-                        "until nc -z {}.{} {}; do sleep 2; done",
-                        dependency, config.networking.private_dns_zone, port
-                    ),
+                    // Client aliases are installed inside every task in the
+                    // Service Connect namespace. Using the alias directly
+                    // keeps readiness independent of the ALB's private DNS
+                    // zone, which operators may author separately.
+                    format!("until nc -z {dependency} {port}; do sleep 2; done"),
                 ],
                 port_mappings: Vec::new(),
                 mount_points: Vec::new(),
@@ -934,6 +1001,54 @@ mod tests {
     use super::*;
     use tokeira_deploy_engine::Service;
     use tokeira_iac::{ResourceState, ResourceType};
+
+    fn service_context_with_repositories() -> deploy_engine::ServiceContext {
+        let mut context = deploy_engine::ServiceContext::default();
+        for repository in [
+            "tokeirad",
+            "tokeira-autoscaler",
+            "mimir",
+            "loki",
+            "grafana",
+            "alloy",
+            "aws-cli",
+            "busybox",
+        ] {
+            let name = format!("tokeira/{repository}");
+            context.infra_state.resources.insert(
+                ResourceId(format!("ecr-{name}")),
+                ResourceState {
+                    resource_type: ResourceType::new("EcrRepository"),
+                    physical_id: format!("arn:aws:ecr:eu-west-2:123456789012:repository/{name}"),
+                    properties: serde_json::json!({
+                        "repository_name": name,
+                        "repository_uri": format!(
+                            "123456789012.dkr.ecr.eu-west-2.amazonaws.com/tokeira/{repository}"
+                        ),
+                    }),
+                    dependencies: Vec::new(),
+                    created_at: "now".into(),
+                    updated_at: "now".into(),
+                    module: "images".into(),
+                },
+            );
+        }
+        context
+    }
+
+    fn definition_config() -> EcsConfig {
+        let mut config = EcsConfig::default();
+        // Realized definitions hand this crate repository-local references;
+        // direct config defaults retain their standalone upstream values for
+        // serialization compatibility and are not deployable inputs.
+        config.observability.mimir_image = "mimir:3.2.0".into();
+        config.observability.loki_image = "loki:3.7.6".into();
+        config.observability.grafana_image = "grafana:12.4.9".into();
+        config.observability.alloy_image = "alloy:v1.19.0".into();
+        config.observability.aws_cli_image = "aws-cli:2.17.0".into();
+        config.observability.busybox_image = "busybox:1.36".into();
+        config
+    }
 
     fn role_state(id: &ResourceId, arn: &str) -> ResourceState {
         ResourceState {
@@ -1159,11 +1274,11 @@ mod tests {
 
     #[test]
     fn service_manifests_are_stable_and_enable_exec() {
-        let workload = EcsWorkload::build_all(&EcsConfig::default())
+        let workload = EcsWorkload::build_all(&definition_config())
             .into_iter()
             .find(|workload| workload.name == "tokeira-runtime")
             .expect("runtime workload");
-        let ctx = deploy_engine::ServiceContext::default();
+        let ctx = service_context_with_repositories();
         let first = workload.manifests(&ctx).expect("first manifests");
         let second = workload.manifests(&ctx).expect("second manifests");
 
@@ -1174,18 +1289,57 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true)
         );
+        let images = second[0]["spec"]["containers"]
+            .as_array()
+            .expect("task containers")
+            .iter()
+            .filter_map(|container| container["image"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            images
+                .iter()
+                .all(|image| image
+                    .starts_with("123456789012.dkr.ecr.eu-west-2.amazonaws.com/tokeira/")),
+            "all managed containers must use recorded private ECR repositories: {images:?}"
+        );
+        assert!(
+            images
+                .iter()
+                .any(|image| image.ends_with("/tokeirad:latest"))
+        );
+        assert!(images.iter().any(|image| image.ends_with("/busybox:1.36")));
+        assert!(images.iter().any(|image| image.ends_with("/alloy:v1.19.0")));
+    }
+
+    #[test]
+    fn definition_workload_requires_recorded_image_repositories() {
+        let workload = EcsWorkload::build_all(&EcsConfig::default())
+            .into_iter()
+            .find(|workload| workload.name == "tokeira-runtime")
+            .expect("runtime workload");
+
+        let error = workload
+            .manifests(&deploy_engine::ServiceContext::default())
+            .expect_err("missing repository state must fail")
+            .to_string();
+
+        assert!(
+            error.contains("ECS image repositories are not deployable"),
+            "{error}"
+        );
+        assert!(error.contains("tkr infra apply"), "{error}");
     }
 
     #[test]
     fn definition_workload_resolves_role_arns_from_recorded_infrastructure() {
         let task = ResourceId("iam-role-demo-tokeira-runtime-task".into());
         let execution = ResourceId("iam-role-demo-tokeira-runtime-execution".into());
-        let workload = EcsWorkload::build_all(&EcsConfig::default())
+        let workload = EcsWorkload::build_all(&definition_config())
             .into_iter()
             .find(|workload| workload.name == "tokeira-runtime")
             .expect("runtime workload")
             .with_role_dependencies(task.clone(), Some(execution.clone()));
-        let mut ctx = deploy_engine::ServiceContext::default();
+        let mut ctx = service_context_with_repositories();
         ctx.infra_state.resources.insert(
             task.clone(),
             role_state(&task, "arn:aws:iam::1:role/runtime-task"),
@@ -1218,7 +1372,7 @@ mod tests {
         let security_group = ResourceId("sg-edge".into());
         let target_group = ResourceId("alb-tg-tokeira-edge-api".into());
         let server_config = tokeira_deployment::server_config::resource_id();
-        let workload = EcsWorkload::build_all(&EcsConfig::default())
+        let workload = EcsWorkload::build_all(&definition_config())
             .into_iter()
             .find(|workload| workload.name == "tokeira-edge-api")
             .expect("edge workload")
@@ -1229,7 +1383,7 @@ mod tests {
                 Some(target_group.clone()),
                 Some(server_config.clone()),
             );
-        let mut ctx = deploy_engine::ServiceContext::default();
+        let mut ctx = service_context_with_repositories();
         ctx.infra_state.resources.insert(
             task.clone(),
             role_state(&task, "arn:aws:iam::1:role/edge-task"),

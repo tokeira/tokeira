@@ -92,11 +92,10 @@ artifacts and renders them into the managed observability config tree.
 
 ## ECS Deployment
 
-The legacy ECS platform services expose process observability endpoints inside
-the private network. Each task gets observability environment values for
-service, cluster, deployment, metrics bind address, and JSON logging. Alloy uses
-task-scoped Docker discovery for log collection and local metrics scrape
-configuration for each service.
+The ECS definition exposes process observability endpoints inside the private
+network. Each task gets observability environment values for service, cluster,
+deployment, metrics bind address, and JSON logging. Alloy uses task-scoped Docker
+discovery for log collection and local metrics scrape configuration for each service.
 
 Dashboard and alert artifacts are included in the ECS observability provisioning
 resources so Grafana and Mimir can be hydrated without public endpoints.
@@ -122,8 +121,8 @@ platform implementation must likewise remain read-only.
 
 The current Compose capability validates Compose's own rendered Alloy scrape
 jobs, Grafana dashboards, and Mimir alert rules. Those checks describe Compose,
-not a requirement on other platforms. Legacy `deployment.toml` deployments
-continue to use their existing in-process local/ECS behavior.
+not a requirement on other platforms. Local `deployment.toml` deployments use
+the Local in-process check.
 
 To validate one Grafana dashboard without selecting a deployment or assuming
 a platform stack, select Grafana-only mode and pass the dashboard JSON file

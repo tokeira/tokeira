@@ -1,3 +1,10 @@
+//! ECS deployment policy and its validation boundary.
+//!
+//! Definition kinds use this as the canonical derivation model for workload
+//! details that are platform-owned rather than author-facing. Consequently,
+//! [`EcsConfig::default`] mirrors the shipped ECS definition defaults; platform
+//! tests fence the authored source and derived model against future drift.
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -56,7 +63,6 @@ pub struct EcsConfig {
     pub networking: NetworkingConfig,
     pub capacity_providers: CapacityProviderConfigs,
     pub services: ServiceConfigs,
-    pub autoscaler: AutoscalerConfig,
     pub alb: AlbConfig,
     pub dsql: DsqlConfig,
     pub observability: ObservabilityConfig,
@@ -75,17 +81,6 @@ pub struct NetworkingConfig {
     pub(crate) vpc_cidr: String,
     pub(crate) availability_zones: Vec<String>,
     pub(crate) private_dns_zone: String,
-    pub(crate) optional_endpoints: OptionalEndpoints,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OptionalEndpoints {
-    pub(crate) sts: bool,
-    pub(crate) kms: bool,
-    pub(crate) secrets_manager: bool,
-    pub(crate) cloudwatch_logs: bool,
-    pub(crate) ec2: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,13 +148,6 @@ pub struct DaemonServiceConfig {
     pub(crate) grpc_port: u16,
     pub(crate) metrics_port: u16,
     pub(crate) http_port: Option<u16>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AutoscalerConfig {
-    pub(crate) image: String,
-    pub(crate) polling_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,7 +316,6 @@ impl Default for EcsConfig {
             networking: NetworkingConfig::default(),
             capacity_providers: CapacityProviderConfigs::default(),
             services: ServiceConfigs::default(),
-            autoscaler: AutoscalerConfig::default(),
             alb: AlbConfig::default(),
             dsql: DsqlConfig::default(),
             observability: ObservabilityConfig::default(),
@@ -340,7 +327,7 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             name: "tokeira".into(),
-            service_connect_namespace: "tokeira.local".into(),
+            service_connect_namespace: "tokeira.internal".into(),
         }
     }
 }
@@ -348,10 +335,13 @@ impl Default for ClusterConfig {
 impl Default for NetworkingConfig {
     fn default() -> Self {
         Self {
-            vpc_cidr: "10.0.0.0/16".into(),
-            availability_zones: vec!["eu-west-2a".into(), "eu-west-2b".into()],
-            private_dns_zone: "tokeira.local".into(),
-            optional_endpoints: OptionalEndpoints::default(),
+            vpc_cidr: "10.42.0.0/16".into(),
+            availability_zones: vec![
+                "eu-west-2a".into(),
+                "eu-west-2b".into(),
+                "eu-west-2c".into(),
+            ],
+            private_dns_zone: "tokeira.internal".into(),
         }
     }
 }
@@ -362,17 +352,17 @@ impl Default for CapacityProviderConfigs {
             edge_api: CapacityProviderConfig::new("c8g.large", 1, 2, 8),
             edge_poll: CapacityProviderConfig::new("c8g.large", 1, 2, 8),
             runtime: RuntimeCapacityProviderConfig {
-                instance_type: "c8g.large".into(),
+                instance_type: "c8g.xlarge".into(),
                 min_capacity: 1,
-                desired_capacity: 3,
-                max_capacity: 16,
+                desired_capacity: 2,
+                max_capacity: 8,
                 scale_in_protection: true,
             },
-            projection: CapacityProviderConfig::new("c8g.large", 1, 1, 8),
-            control: CapacityProviderConfig::new("c8g.large", 1, 1, 3),
-            mimir: CapacityProviderConfig::new("m8g.large", 1, 1, 1),
-            loki: CapacityProviderConfig::new("m8g.large", 1, 1, 1),
-            grafana: CapacityProviderConfig::new("c8g.medium", 1, 1, 1),
+            projection: CapacityProviderConfig::new("c8g.large", 1, 2, 8),
+            control: CapacityProviderConfig::new("c8g.large", 1, 1, 4),
+            mimir: CapacityProviderConfig::new("c8g.large", 1, 1, 1),
+            loki: CapacityProviderConfig::new("c8g.large", 1, 1, 1),
+            grafana: CapacityProviderConfig::new("c8g.large", 1, 1, 1),
         }
     }
 }
@@ -396,13 +386,61 @@ impl CapacityProviderConfig {
 impl Default for ServiceConfigs {
     fn default() -> Self {
         Self {
-            edge_api: ReplicaServiceConfig::new("tokeirad:latest", 2, Some(7233), 9090, None),
-            edge_poll: ReplicaServiceConfig::new("tokeirad:latest", 2, Some(7234), 9090, None),
-            runtime: DaemonServiceConfig::new("tokeirad:latest", 7241, 9090, None),
-            projection: ReplicaServiceConfig::new("tokeirad:latest", 1, Some(7242), 9090, None),
-            controller: ReplicaServiceConfig::new("tokeirad:latest", 1, Some(7240), 9090, None),
-            autoscaler: ReplicaServiceConfig::new("tokeirad:latest", 1, Some(7243), 9090, None),
-            admin: ReplicaServiceConfig::new("tokeirad:latest", 0, Some(7244), 9090, None),
+            edge_api: ReplicaServiceConfig::new(
+                "tokeirad:latest",
+                2,
+                1024,
+                2048,
+                Some(7233),
+                9090,
+                None,
+            ),
+            edge_poll: ReplicaServiceConfig::new(
+                "tokeirad:latest",
+                2,
+                1024,
+                2048,
+                Some(7234),
+                9090,
+                None,
+            ),
+            runtime: DaemonServiceConfig::new("tokeirad:latest", 2048, 4096, 7241, 9090, None),
+            projection: ReplicaServiceConfig::new(
+                "tokeirad:latest",
+                2,
+                1024,
+                2048,
+                Some(7242),
+                9090,
+                None,
+            ),
+            controller: ReplicaServiceConfig::new(
+                "tokeirad:latest",
+                1,
+                512,
+                1024,
+                Some(7240),
+                9090,
+                None,
+            ),
+            autoscaler: ReplicaServiceConfig::new(
+                "tokeira-autoscaler:latest",
+                1,
+                512,
+                1024,
+                Some(7243),
+                9090,
+                None,
+            ),
+            admin: ReplicaServiceConfig::new(
+                "tokeirad:latest",
+                0,
+                512,
+                1024,
+                Some(7244),
+                9090,
+                None,
+            ),
         }
     }
 }
@@ -411,6 +449,8 @@ impl ReplicaServiceConfig {
     fn new(
         image: &str,
         desired_count: u32,
+        cpu: u32,
+        memory_mb: u32,
         grpc_port: Option<u16>,
         metrics_port: u16,
         http_port: Option<u16>,
@@ -418,8 +458,8 @@ impl ReplicaServiceConfig {
         Self {
             image: image.into(),
             desired_count,
-            cpu: 512,
-            memory_mb: 1024,
+            cpu,
+            memory_mb,
             grpc_port,
             metrics_port,
             http_port,
@@ -428,23 +468,21 @@ impl ReplicaServiceConfig {
 }
 
 impl DaemonServiceConfig {
-    fn new(image: &str, grpc_port: u16, metrics_port: u16, http_port: Option<u16>) -> Self {
+    fn new(
+        image: &str,
+        cpu: u32,
+        memory_mb: u32,
+        grpc_port: u16,
+        metrics_port: u16,
+        http_port: Option<u16>,
+    ) -> Self {
         Self {
             image: image.into(),
-            cpu: 1024,
-            memory_mb: 2048,
+            cpu,
+            memory_mb,
             grpc_port,
             metrics_port,
             http_port,
-        }
-    }
-}
-
-impl Default for AutoscalerConfig {
-    fn default() -> Self {
-        Self {
-            image: "tokeirad:latest".into(),
-            polling_interval_secs: 15,
         }
     }
 }
@@ -455,8 +493,8 @@ impl Default for AlbConfig {
             name: "tokeira-internal".into(),
             listener_protocol: AlbListenerProtocol::Http2,
             certificate_arn: None,
-            health_check_path: "/healthz".into(),
-            health_check_interval_secs: 15,
+            health_check_path: "/health".into(),
+            health_check_interval_secs: 30,
         }
     }
 }
@@ -510,6 +548,7 @@ pub fn required_vpc_endpoints(region: &str) -> Vec<String> {
         "ssm",
         "ssmmessages",
         "ec2messages",
+        "secretsmanager",
         "dsql",
         "dsql-control",
     ]
@@ -519,26 +558,6 @@ pub fn required_vpc_endpoints(region: &str) -> Vec<String> {
         other => format!("com.amazonaws.{region}.{other}"),
     })
     .collect()
-}
-
-pub(crate) fn optional_vpc_endpoints(config: &EcsConfig) -> Vec<String> {
-    let mut endpoints = Vec::new();
-    if config.networking.optional_endpoints.sts {
-        endpoints.push(format!("com.amazonaws.{}.sts", config.region));
-    }
-    if config.networking.optional_endpoints.kms {
-        endpoints.push(format!("com.amazonaws.{}.kms", config.region));
-    }
-    if config.networking.optional_endpoints.secrets_manager {
-        endpoints.push(format!("com.amazonaws.{}.secretsmanager", config.region));
-    }
-    if config.networking.optional_endpoints.cloudwatch_logs {
-        endpoints.push(format!("com.amazonaws.{}.logs", config.region));
-    }
-    if config.networking.optional_endpoints.ec2 {
-        endpoints.push(format!("com.amazonaws.{}.ec2", config.region));
-    }
-    endpoints
 }
 
 pub fn validate_cpu_memory(

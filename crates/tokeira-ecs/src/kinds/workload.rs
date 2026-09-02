@@ -22,8 +22,8 @@ pub(crate) const TYPE: &str = "EcsWorkload";
 /// coordinates plus image, capacity, and replica policy. Everything else a
 /// workload carries (container wiring, sidecars, Service Connect ports,
 /// capacity-provider assignment) is derived by the platform's builders from
-/// its default model, the same derivation the legacy path performs; this
-/// kind applies the authored values onto that model and never re-derives.
+/// its default model; this kind applies authored values onto that model and
+/// never re-derives them afterward.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workload {
@@ -35,8 +35,6 @@ pub struct Workload {
     pub(crate) region: String,
     /// ECS cluster name.
     pub(crate) cluster: String,
-    /// Service Connect namespace.
-    pub(crate) service_connect_namespace: String,
     /// Container image for the workload's primary container.
     pub(crate) image: String,
     /// Desired replicas; `None` keeps the service's own scheduling policy
@@ -58,14 +56,14 @@ pub struct Workload {
 impl Workload {
     /// Apply the authored values onto the default model at the slot the
     /// canonical service owns. Refuses unknown names with the buildable set.
-    fn configured(&self) -> Result<EcsConfig, KindError> {
+    fn configured(&self, deployment_id: &str) -> Result<EcsConfig, KindError> {
         let mut config = EcsConfig {
+            project_name: deployment_id.to_owned(),
             environment: self.environment.clone(),
             region: self.region.clone(),
             ..EcsConfig::default()
         };
         config.cluster.name = self.cluster.clone();
-        config.cluster.service_connect_namespace = self.service_connect_namespace.clone();
         config.observability.alloy_image = self.alloy_image.clone();
         config.observability.aws_cli_image = self.aws_cli_image.clone();
         config.observability.busybox_image = self.busybox_image.clone();
@@ -131,10 +129,6 @@ impl Workload {
                 if let Some(replicas) = replicas {
                     service.desired_count = replicas;
                 }
-                // The legacy configuration retains this duplicate image
-                // coordinate. Keep it aligned until that unused surface is
-                // removed so no alternate builder can observe stale policy.
-                config.autoscaler.image = self.image.clone();
             }
             "tokeira-mimir" => {
                 config.observability.mimir_image = self.image.clone();
@@ -164,6 +158,12 @@ impl Workload {
                 )));
             }
         }
+        // The builder subtracts fixed init/sidecar reservations from the task
+        // total. Admission here is the last operator-facing boundary before
+        // those unsigned calculations and the ECS task-definition manifest.
+        config.validate().map_err(|error| {
+            KindError::new(format!("invalid ECS workload `{}`: {error}", self.service))
+        })?;
         Ok(config)
     }
 
@@ -218,7 +218,7 @@ impl Workload {
 
 impl Kind<EcsWorkload> for Workload {
     fn realize(&self, placement: &PlacementContext) -> Result<EcsWorkload, KindError> {
-        let config = self.configured()?;
+        let config = self.configured(&placement.deployment_id)?;
         let mut workloads = EcsWorkload::build_all(&config);
         workloads.extend(EcsWorkload::build_observability(&config));
         let mut workload = workloads

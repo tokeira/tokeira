@@ -46,9 +46,39 @@ class Preexisting:
 
 
 @dataclass
+class BuildImage:
+    # A local image and its deployment-owned ECR destination. Repository is
+    # a suffix; the deployment name supplies the prefix.
+    name: str
+    repository: str
+    tag: str
+
+
+@dataclass
+class MirrorImage:
+    # One upstream and its deployment-owned ECR destination.
+    name: str
+    repository: str
+    tag: str
+    upstream_ref: str
+
+
+@dataclass
+class Images:
+    # The complete image inventory consumed by publication and workloads.
+    tokeirad: BuildImage
+    autoscaler: BuildImage
+    mimir: MirrorImage
+    loki: MirrorImage
+    grafana: MirrorImage
+    alloy: MirrorImage
+    aws_cli: MirrorImage
+    busybox: MirrorImage
+
+
+@dataclass
 class ReplicaPolicy:
     # Desired count and task resources for a replica-scheduled workload.
-    image: str
     replicas: int
     cpu: int
     memory_mb: int
@@ -57,7 +87,6 @@ class ReplicaPolicy:
 @dataclass
 class DaemonPolicy:
     # Task resources for a workload scheduled once per eligible host.
-    image: str
     cpu: int
     memory_mb: int
 
@@ -118,13 +147,11 @@ class Alb:
 
 @dataclass
 class Observability:
-    # Backend workloads and the collection/init image set.
+    # Backend workload policy and the operator-side Loki query endpoint.
     mimir: ReplicaPolicy
     loki: ReplicaPolicy
     grafana: ReplicaPolicy
-    alloy_image: str
-    aws_cli_image: str
-    busybox_image: str
+    loki_query_url: str
 
 
 @dataclass
@@ -137,6 +164,7 @@ class Ecs:
     cluster: Cluster
     networking: Networking
     dsql: Managed | Preexisting
+    images: Images
     services: Services
     capacity: Capacity
     alb: Alb

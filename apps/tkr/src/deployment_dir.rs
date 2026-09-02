@@ -13,7 +13,7 @@
 //! ```text
 //! ~/Library/Application Support/tokeira/tkr/<name>/
 //!   definition.<fmt>  # definition-bound platform source, when recorded
-//!   deployment.toml   # legacy Local/ECS platform config, otherwise
+//!   deployment.toml   # local platform config, otherwise
 //!   tokeirad.toml     # TokeiraConfig consumed by the tokeirad server binary
 //!   metadata.json     # identity + status tracked by the CLI
 //!   tkp               # generated platform/frontend provisioner, when bound
@@ -43,7 +43,6 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
 use tokeira_deployment::{DeploymentStateLocation, RecordedDefinition};
-use tokeira_ecs_deployment::EcsConfig;
 use tokeira_local_deployment::LocalConfig;
 use tokeira_orchestrator::{PlatformId, RelativeDefinitionPath, StorageKind};
 use uuid::Uuid;
@@ -591,20 +590,45 @@ fn write_staged_source(path: &Path, bytes: &[u8]) -> Result<()> {
 /// platform. Definition-bound platform config is owned by its provisioner.
 pub(crate) enum PlatformDeploymentConfig {
     Local(LocalConfig),
-    Ecs(Box<EcsConfig>),
 }
 
 /// Fully-loaded view of a deployment, as consumed by command handlers.
 ///
 /// A handler that receives a `DeploymentContext` never needs to touch the
-/// filesystem again for config — everything in [`DeploymentContext::path`]
-/// has already been parsed into [`DeploymentContext::metadata`] and
-/// [`DeploymentContext::platform_config`].
+/// filesystem again for platform config — `deployment.toml` has already been
+/// parsed into [`DeploymentContext::platform_config`].
 pub(crate) struct DeploymentContext {
     pub name: String,
     pub path: PathBuf,
-    pub metadata: DeploymentMetadata,
     pub platform_config: PlatformDeploymentConfig,
+}
+
+/// Platform-neutral deployment record used by commands that consume only
+/// metadata and the generated `tokeirad.toml`.
+///
+/// Definition-backed deployments intentionally have no `deployment.toml`:
+/// their provider configuration belongs to the married provisioner. Schema
+/// and durable-state diagnostics operate against server configuration, so
+/// loading a legacy platform model for them would create a false dependency
+/// on a file that must not exist.
+pub(crate) struct DeploymentRecordContext {
+    pub path: PathBuf,
+    pub metadata: DeploymentMetadata,
+}
+
+/// Resolve one deployment without opening its platform configuration.
+///
+/// This is the admission path for platform-neutral operator commands. It
+/// validates the selected directory through `metadata.json` only; callers may
+/// then read `tokeirad.toml`, whose writeback is shared by local and
+/// definition-backed deployments.
+pub(crate) fn load_record_context(
+    deployments: &DeploymentResolver,
+    requested_name: Option<&str>,
+) -> Result<DeploymentRecordContext> {
+    let path = deployments.resolve_dir(requested_name)?;
+    let metadata = metadata::read(&path)?;
+    Ok(DeploymentRecordContext { path, metadata })
 }
 
 /// Resolve a deployment by name (or fall back to `.latest`) and return a
@@ -616,12 +640,10 @@ pub(crate) fn load_context(
     deployments: &DeploymentResolver,
     requested_name: Option<&str>,
 ) -> Result<DeploymentContext> {
-    let name = deployments.resolve_name(requested_name)?;
-    let path = deployments.path(&name);
-    if !path.join(METADATA_JSON).exists() {
-        bail!("{}", deployments.not_found_message(&name)?);
-    }
-    let metadata = metadata::read(&path)?;
+    let record = load_record_context(deployments, requested_name)?;
+    let name = record.metadata.name.clone();
+    let path = record.path;
+    let metadata = record.metadata;
     let deployment_config_path = path.join(DEPLOYMENT_TOML);
     // A definition-bound deployment has no in-process platform config. Every
     // caller of this function speaks the legacy dialect, so refuse in domain
@@ -643,11 +665,6 @@ pub(crate) fn load_context(
                 .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
             PlatformDeploymentConfig::Local(config)
         }
-        "ecs" => {
-            let config: EcsConfig = tokeira_config::load_config(&deployment_config_path, None)
-                .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
-            PlatformDeploymentConfig::Ecs(Box::new(config))
-        }
         platform => {
             bail!("deployment '{name}' records unsupported in-process platform `{platform}`")
         }
@@ -655,7 +672,6 @@ pub(crate) fn load_context(
     Ok(DeploymentContext {
         name,
         path,
-        metadata,
         platform_config,
     })
 }
@@ -741,5 +757,41 @@ mod local_snapshot_tests {
             &mut ecs,
         );
         assert!(ecs.policy.snapshot.is_none());
+    }
+
+    #[test]
+    fn definition_record_loads_without_legacy_platform_config() {
+        let temp = tempfile::tempdir().expect("temporary deployment root");
+        let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
+        let path = deployments.path("production");
+        fs::create_dir_all(&path).expect("deployment directory");
+        let metadata = DeploymentMetadata {
+            name: "production".to_owned(),
+            id: Uuid::nil(),
+            platform: platform("ecs"),
+            state: DeploymentStateLocation::Local,
+            definition: Some(RecordedDefinition {
+                format: tokeira_orchestrator::DefinitionFormatId::new("tkd")
+                    .expect("definition format"),
+                path: RelativeDefinitionPath::new("deployment.tkd").expect("definition path"),
+            }),
+            deployment_repository: None,
+            storage: StorageKind::Dsql,
+            status: DeploymentStatus::Created,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        };
+        metadata::write(&path, &metadata).expect("metadata writes");
+
+        let record = load_record_context(&deployments, Some("production"))
+            .expect("metadata-only commands admit definition deployments");
+        assert_eq!(record.path, path);
+        assert_eq!(record.metadata.platform.as_str(), "ecs");
+        assert!(!record.path.join(DEPLOYMENT_TOML).exists());
+
+        let error = load_context(&deployments, Some("production"))
+            .err()
+            .expect("legacy platform commands remain unavailable");
+        assert!(error.to_string().contains("bound `tkp`"));
     }
 }

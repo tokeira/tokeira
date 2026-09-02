@@ -16,8 +16,8 @@ mutation order, change semantics, orchestration, and state publication.
 
 Every convergence operation combines three views:
 
-1. **Desired state** is the graph realized from the admitted definition. On the legacy
-   path it comes from Rust modules owned by the deployment adapter.
+1. **Desired state** is the graph realized from the admitted definition. Local's
+   in-process path derives its desired process directly from `LocalDeployment`.
 2. **Recorded state** preserves logical identities, provider identities, comparison
    properties, dependency edges, outputs, image references, and service manifest
    hashes.
@@ -64,9 +64,8 @@ namespaces. On the bound path the framework supplies the single generic
 
 The complete production implementor set of `tokeira_orchestrator::Deployment` is:
 
-- `DescribedDeployment`, used by every definition-backed platform;
-- `LocalDeployment`, the legacy local in-process adapter; and
-- `EcsDeployment`, the legacy ECS in-process adapter.
+- `DescribedDeployment`, used by every definition-backed platform; and
+- `LocalDeployment`, the Local in-process adapter.
 
 Compose does not implement `Deployment`. Its package is a `PlatformDeclaration`, its
 shape lives in definition documents, and its resource behavior lives in provider kinds.
@@ -582,13 +581,12 @@ pub trait Deployment: Send + Sync {
 
 On the bound path, `DescribedDeployment` derives modules and services from
 `ExecutionState`, delegates extension registration to `PlatformIntegration`, selects
-framework-standard local stores under the deployment directory, keeps hydration as the
-identity function, and resolves only definition-declared writebacks. A platform package
-does not implement this trait or select these stores.
+the stores admitted from the deployment's recorded state location, keeps hydration as
+the identity function, and resolves only definition-declared writebacks. A platform
+package does not implement this trait or select these stores.
 
-The legacy `LocalDeployment` and `EcsDeployment` adapters still construct their own
-modules, stores, and writeback through this trait. That is compatibility surface, not the
-extension recipe for a new platform.
+`LocalDeployment` constructs its own process plan and stores through this trait. That
+special-purpose development path is not the extension recipe for a new platform.
 
 ## Service and image convergence
 
@@ -701,10 +699,10 @@ empty version; an empty expected version is create-only. A stale version returns
 `StateError::Conflict`.
 
 Infrastructure saves after every mutation and after confirmed pruning during a
-mutating refresh. Service apply and destroy save after every changed service. The
-framework-standard bound path uses `CasStore` over `LocalBackend` for both documents;
-legacy ECS selects `S3StateStore`. The complete persistence and locking protocols are
-in [State and convergence](state-and-convergence.md).
+mutating refresh. Service apply and destroy save after every changed service. The bound
+path uses `CasStore` over `LocalBackend` for local state, or `S3StateStore` for a
+deployment whose admitted state location names an S3 prefix. The complete persistence
+and locking protocols are in [State and convergence](state-and-convergence.md).
 
 ## Correctness invariants
 

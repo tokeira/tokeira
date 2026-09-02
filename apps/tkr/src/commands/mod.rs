@@ -2,7 +2,7 @@
 //!
 //! Each submodule owns its own `run(...)` entry point, called from the
 //! dispatcher in `main.rs`. Definition-bound deployments are forwarded to their
-//! married provisioner. These handlers retain the Local/ECS in-process path.
+//! married provisioner. These handlers retain the Local in-process path.
 //!
 //! # Adding a new subcommand
 //!
@@ -11,7 +11,6 @@
 //! 3. Wire up the dispatch arm in `main::main`.
 //! 4. Re-use `require_confirmation` for any destructive operation.
 
-pub(crate) mod admin;
 pub(crate) mod ci;
 pub(crate) mod compat;
 pub(crate) mod config;
@@ -19,7 +18,6 @@ pub(crate) mod deploy;
 pub(crate) mod deployment;
 pub(crate) mod dev;
 pub(crate) mod diagnostics;
-pub(crate) mod exec;
 pub(crate) mod image;
 pub(crate) mod infra;
 pub(crate) mod logs;
@@ -31,27 +29,23 @@ pub(crate) mod schema;
 pub(crate) mod version;
 
 use anyhow::{Result, bail};
-use tokeira_ecs_deployment::{EcsConfig, EcsDeployment};
 use tokeira_local_deployment::{LocalConfig, LocalDeployment};
 use tokeira_orchestrator::Ops;
 
 use crate::deployment_dir::{DeploymentContext, PlatformDeploymentConfig};
 
-/// Legacy facade over the Local and ECS deployment types.
+/// Facade over the local in-process deployment type.
 ///
 /// Each variant carries the platform's `Deployment` implementor together
 /// with the config it needs. The `Deployment` trait is object-unsafe
 /// (it's generic over `Config`), so a plain `Box<dyn Deployment>` won't
-/// work — this enum threads the two remaining in-process platforms explicitly.
+/// work — this enum keeps that boundary explicit for the shared handlers.
 ///
 /// Day-2 handlers (`scale`, `logs`, `port_forward`) go through this facade
 /// so they stay platform-neutral. Handlers that need to reach into
-/// platform-specific APIs (the engine-based `infra` and `deploy`
-/// handlers, or the ECS-only `image push/mirror`) match on
-/// [`PlatformDeploymentConfig`] directly.
+/// platform-specific APIs match on [`PlatformDeploymentConfig`] directly.
 pub(crate) enum PlatformOps {
     Local(LocalDeployment, LocalConfig),
-    Ecs(EcsDeployment, Box<EcsConfig>),
 }
 
 impl PlatformOps {
@@ -60,16 +54,12 @@ impl PlatformOps {
             PlatformDeploymentConfig::Local(config) => {
                 Ok(Self::Local(LocalDeployment, config.clone()))
             }
-            PlatformDeploymentConfig::Ecs(config) => {
-                Ok(Self::Ecs(EcsDeployment::new(&ctx.path), config.clone()))
-            }
         }
     }
 
     pub(crate) fn desired_replicas(&self) -> Vec<tokeira_orchestrator::ServiceReplicas> {
         match self {
             Self::Local(d, c) => d.desired_replicas(c),
-            Self::Ecs(d, c) => d.desired_replicas(c),
         }
     }
 
@@ -80,7 +70,6 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_up(service, replicas, c).await,
-            Self::Ecs(d, c) => d.scale_up(service, replicas, c).await,
         }
     }
 
@@ -91,14 +80,12 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_down(service, replicas, c).await,
-            Self::Ecs(d, c) => d.scale_down(service, replicas, c).await,
         }
     }
 
     pub(crate) async fn logs(&self, service: &str) -> tokeira_orchestrator::Result<Vec<String>> {
         match self {
             Self::Local(d, c) => d.logs(service, c).await,
-            Self::Ecs(d, c) => d.logs(service, c).await,
         }
     }
 
@@ -108,7 +95,6 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<Vec<tokeira_orchestrator::PortMapping>> {
         match self {
             Self::Local(d, c) => d.port_mappings(service, c).await,
-            Self::Ecs(d, c) => d.port_mappings(service, c).await,
         }
     }
 }

@@ -16,7 +16,7 @@
 //! | Cloud infra       | `tkr infra`      | Plan / apply / destroy declared resources.     |
 //! | Service deploy    | `tkr deploy`     | Plan / apply / destroy service manifests.      |
 //! | DSQL schema       | `tkr schema`     | Schema setup for DSQL-backed deployments.      |
-//! | Scaling + ops     | `tkr scale`, `tkr logs`, `tkr port-forward` | Day-2 operator loops. |
+//! | Scaling + ops     | `tkr scale`, `tkr logs`, `tkr port-forward`, `tkr exec`, `tkr admin` | Day-2 operator loops. |
 //! | Inspection        | `tkr config show`, `tkr version`            | Debugging aids.       |
 //!
 //! # Architecture pointers
@@ -24,8 +24,8 @@
 //! - **`cli`** defines the clap surface. Adding a subcommand starts here.
 //! - **`deployment_dir`** owns how deployments are resolved, loaded, and persisted.
 //! - **`commands`** contains one module per top-level subcommand. Definition-bound
-//!   deployments execute through their married provisioner; Local/ECS retain
-//!   the legacy in-process handlers.
+//!   deployments, including ECS deployments, execute through their married
+//!   provisioner; Local retains the in-process handlers.
 //! - **`tui`** wires engine progress events to spinners (human mode) or JSON
 //!   lines (`--json` mode).
 //! - **`platform_discovery`** resolves platform/front-end source used to create bound deployments.
@@ -60,10 +60,10 @@ mod repository_setup;
 mod tui;
 
 use cli::{
-    Cli, Command, ConfigAction, DeployAction, DeploymentAction, ImageCommand, InfraAction,
-    ObservabilityAction, ScaleAction, SchemaAction,
+    Cli, Command, ConfigAction, DeployAction, DeploymentAction, InfraAction, ObservabilityAction,
+    ScaleAction, SchemaAction,
 };
-use deployment_dir::{DeploymentResolver, load_context};
+use deployment_dir::{DeploymentResolver, load_context, load_record_context};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -100,27 +100,34 @@ async fn run(cli: Cli) -> Result<()> {
     let selected = selected.as_deref();
 
     // Each arm resolves the deployment context it needs before dispatching.
-    // `Image` is the odd one out: `image build` works without any deployment
-    // (it operates on the workspace sources directly), while `image
-    // push/mirror/list` need a deployment to look up the platform image
-    // inventory. The subcommand module handles that split internally; we just
-    // opportunistically load a context when one could apply.
+    // Image building operates on workspace sources and needs no deployment.
     match cli.command {
         Command::Dev { action } => commands::dev::run(action),
         Command::Deployment { action } => {
             commands::deployment::run(action, &deployments, selected, cli.json, cli.detail).await
         }
         Command::Image(args) => {
-            let deployment = match args.command {
-                cli::ImageCommand::Build { .. } => None,
-                _ => Some(load_context(&deployments, selected)?),
-            };
             let format = if cli.json {
                 tui::OutputFormat::Json
             } else {
                 tui::OutputFormat::Human
             };
-            commands::image::run(args.command, deployment, format).await
+            match args.command {
+                cli::ImageCommand::Build { arch, tag } => {
+                    commands::image::run(cli::ImageCommand::Build { arch, tag }, format).await
+                }
+                command => {
+                    if !deployments.uses_bound_provisioner(selected)? {
+                        anyhow::bail!(
+                            "the selected deployment has no definition-bound image lifecycle"
+                        );
+                    }
+                    let dir = deployments.resolve_dir(selected)?;
+                    let (verb, mut extra) = forwarded_image_verb(&command);
+                    extra.extend(output_flags(cli.json, cli.detail));
+                    launcher::launch(&dir, verb, &extra).await
+                }
+            }
         }
         Command::Definition { action } => {
             let cli::DefinitionAction::Check { definition, format } = action;
@@ -154,8 +161,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Infra { action } => {
-            // A `.tkd` deployment is forwarded to its bound `tkp`; only the legacy
-            // in-process platforms run through `commands::infra`.
+            // A definition deployment is forwarded to its bound `tkp`; only
+            // Local runs through `commands::infra`.
             if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
                 // `infra apply` is the same forwarded operation as
@@ -204,7 +211,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Schema { action } => {
-            let ctx = load_context(&deployments, selected)?;
+            let ctx = load_record_context(&deployments, selected)?;
             commands::schema::run(action, ctx).await
         }
         Command::Scale { action } => {
@@ -248,13 +255,13 @@ async fn run(cli: Cli) -> Result<()> {
             local_port,
         } => {
             if deployments.uses_bound_provisioner(selected)? {
-                if local_port.is_some() {
-                    anyhow::bail!(
-                        "bound platforms report provider-published mappings; `--local-port` is only available to legacy tunnel adapters"
-                    );
-                }
                 let dir = deployments.resolve_dir(selected)?;
-                launcher::launch(&dir, &["port-mappings"], &[service]).await
+                let mut extra = vec![service];
+                if let Some(local_port) = local_port {
+                    extra.push("--local-port".to_owned());
+                    extra.push(local_port.to_string());
+                }
+                launcher::launch(&dir, &["port-forward"], &extra).await
             } else {
                 let ctx = load_context(&deployments, selected)?;
                 commands::port_forward::run(&service, local_port, ctx).await
@@ -263,10 +270,29 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Exec {
             service,
             container,
-            cmd,
+            command,
         } => {
-            let ctx = load_context(&deployments, selected)?;
-            commands::exec::run(&service, container.as_deref(), &cmd, ctx).await
+            if !deployments.uses_bound_provisioner(selected)? {
+                anyhow::bail!(
+                    "interactive exec is not supported by the selected in-process platform"
+                );
+            }
+            let dir = deployments.resolve_dir(selected)?;
+            launcher::launch(
+                &dir,
+                &["exec"],
+                &forwarded_exec_args(&service, container.as_deref(), &command),
+            )
+            .await
+        }
+        Command::Admin { command } => {
+            if !deployments.uses_bound_provisioner(selected)? {
+                anyhow::bail!(
+                    "on-demand administration is not supported by the selected in-process platform"
+                );
+            }
+            let dir = deployments.resolve_dir(selected)?;
+            launcher::launch(&dir, &["admin"], &forwarded_admin_args(&command)).await
         }
         Command::Config {
             action: ConfigAction::Show,
@@ -296,12 +322,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Diagnostics { action } => {
-            let ctx = load_context(&deployments, selected)?;
+            let ctx = load_record_context(&deployments, selected)?;
             commands::diagnostics::run(action, ctx, cli.json).await
-        }
-        Command::Admin { command } => {
-            let ctx = load_context(&deployments, selected)?;
-            commands::admin::run(command, ctx).await
         }
         Command::Version { verbose, json } => {
             commands::version::run(verbose, cli.json || json);
@@ -317,12 +339,11 @@ async fn run(cli: Cli) -> Result<()> {
 ///
 /// The guarded set is the lifecycle mutations that change a deployment's
 /// infrastructure/services or its registry entry: `infra apply|destroy`,
-/// `deploy apply|destroy`, `schema setup`, `scale up|down`, `image push|mirror`,
-/// `admin`, `exec` (arbitrary in-container commands can mutate the deployment,
-/// exactly like `admin`), `deployment destroy`, and the forwarded `deployment
+/// `deploy apply|destroy`, `image push|mirror`, `schema setup`, `scale
+/// up|down`, `deployment destroy`, and the forwarded `deployment
 /// apply|upgrade|rollback`. Plans, statuses, `describe`, `list`, `version`,
-/// `image list|build`, and registry/selection verbs (`create`/`use`/`lock`/
-/// `unlock`) are never blocked.
+/// image builds, and registry/selection verbs (`create`/`use`/`lock`/`unlock`)
+/// are never blocked.
 fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<String>> {
     let selected = || selected.map(str::to_string);
     match command {
@@ -339,11 +360,9 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
             action: ScaleAction::Up { .. } | ScaleAction::Down { .. },
         }
         | Command::Admin { .. }
-        | Command::Exec { .. } => Some(selected()),
-        Command::Image(args) => match &args.command {
-            ImageCommand::Push { .. } | ImageCommand::Mirror { .. } => Some(selected()),
-            ImageCommand::List { .. } | ImageCommand::Build { .. } => None,
-        },
+        | Command::Image(cli::ImageArgs {
+            command: cli::ImageCommand::Push { .. } | cli::ImageCommand::Mirror { .. },
+        }) => Some(selected()),
         Command::Deployment { action } => match action {
             DeploymentAction::Destroy { name, .. } => Some(Some(name.clone())),
             DeploymentAction::Apply { .. }
@@ -352,6 +371,51 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Map definition-bound image commands onto the married provisioner's
+/// namespace. Build is deliberately absent: it remains deployment-independent
+/// and runs in `tkr` against the current workspace source.
+fn forwarded_image_verb(command: &cli::ImageCommand) -> (&'static [&'static str], Vec<String>) {
+    match command {
+        cli::ImageCommand::List { source_type } => {
+            let extra = source_type.map_or_else(Vec::new, |source| {
+                vec![
+                    "--source-type".to_string(),
+                    match source {
+                        cli::CliImageSource::Build => "build",
+                        cli::CliImageSource::Mirror => "mirror",
+                        cli::CliImageSource::Registry => "registry",
+                    }
+                    .to_string(),
+                ]
+            });
+            (&["image", "list"], extra)
+        }
+        cli::ImageCommand::Push { tag, image, yes } => {
+            let mut extra = vec!["--tag".to_string(), tag.clone()];
+            if let Some(image) = image {
+                extra.extend(["--image".to_string(), image.clone()]);
+            }
+            if *yes {
+                extra.push("--yes".to_string());
+            }
+            (&["image", "push"], extra)
+        }
+        cli::ImageCommand::Mirror { image, yes } => {
+            let mut extra = Vec::new();
+            if let Some(image) = image {
+                extra.extend(["--image".to_string(), image.clone()]);
+            }
+            if *yes {
+                extra.push("--yes".to_string());
+            }
+            (&["image", "mirror"], extra)
+        }
+        cli::ImageCommand::Build { .. } => {
+            unreachable!("deployment-independent builds are handled in-process")
+        }
     }
 }
 
@@ -392,6 +456,27 @@ fn forwarded_observability_verb(timeout_seconds: u64) -> (&'static [&'static str
         &["observability", "check"],
         vec!["--timeout-seconds".to_string(), timeout_seconds.to_string()],
     )
+}
+
+/// Preserve remote argv boundaries across the `tkr` → married `tkp` process
+/// boundary. The separator prevents a remote flag from being interpreted as
+/// a provisioner flag; the platform performs the final provider encoding.
+fn forwarded_exec_args(service: &str, container: Option<&str>, command: &[String]) -> Vec<String> {
+    let mut args = vec![service.to_owned()];
+    if let Some(container) = container {
+        args.extend(["--container".to_owned(), container.to_owned()]);
+    }
+    args.push("--".to_owned());
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// Preserve the admin command as argv across the `tkr` → `tkp` boundary.
+/// The separator keeps a command-local flag from becoming a provisioner flag.
+fn forwarded_admin_args(command: &[String]) -> Vec<String> {
+    let mut args = vec!["--".to_owned()];
+    args.extend(command.iter().cloned());
+    args
 }
 
 /// `--module` crosses to the bound `tkp` verbatim — the platform owns its
@@ -753,13 +838,11 @@ mod tests {
             vec!["tkr", "schema", "setup", "--yes"],
             vec!["tkr", "scale", "up"],
             vec!["tkr", "scale", "down"],
-            vec!["tkr", "image", "push"],
-            vec!["tkr", "image", "mirror"],
-            vec!["tkr", "admin", "schema", "setup"],
-            vec!["tkr", "exec", "runtime", "--", "sh"],
             vec!["tkr", "deployment", "apply"],
             vec!["tkr", "deployment", "upgrade"],
             vec!["tkr", "deployment", "rollback"],
+            vec!["tkr", "image", "push", "--yes"],
+            vec!["tkr", "image", "mirror", "--yes"],
         ] {
             assert!(
                 mutation_target(&parse(&args), Some("prod")).is_some(),
@@ -783,8 +866,8 @@ mod tests {
             vec!["tkr", "deploy", "status"],
             vec!["tkr", "scale", "status"],
             vec!["tkr", "schema", "status"],
-            vec!["tkr", "image", "list"],
             vec!["tkr", "image", "build"],
+            vec!["tkr", "image", "list"],
             vec!["tkr", "observability", "check"],
             vec!["tkr", "deployment", "describe"],
             vec!["tkr", "deployment", "list"],
@@ -827,6 +910,39 @@ mod tests {
         };
         let (_, extra) = forwarded_infra_verb(&bare);
         assert!(extra.is_empty(), "no flag without a request");
+    }
+
+    #[test]
+    fn forwarding_preserves_exec_argument_boundaries() {
+        assert_eq!(
+            forwarded_exec_args(
+                "runtime",
+                Some("tokeira-runtime"),
+                &["sh".to_owned(), "-c".to_owned(), "echo ready".to_owned()],
+            ),
+            [
+                "runtime",
+                "--container",
+                "tokeira-runtime",
+                "--",
+                "sh",
+                "-c",
+                "echo ready",
+            ]
+        );
+    }
+
+    #[test]
+    fn forwarding_preserves_admin_argument_boundaries() {
+        assert_eq!(
+            forwarded_admin_args(&[
+                "schema".to_owned(),
+                "migrate".to_owned(),
+                "--target".to_owned(),
+                "5".to_owned(),
+            ]),
+            ["--", "schema", "migrate", "--target", "5"]
+        );
     }
 
     #[test]
@@ -1025,7 +1141,47 @@ mod tests {
             Cli::try_parse_from(["tkr", "port-forward", "grafana"])
                 .unwrap()
                 .command,
-            Command::PortForward { service, local_port: None } if service == "grafana"
+            Command::PortForward {
+                service,
+                local_port: None
+            } if service == "grafana"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "admin", "schema", "setup"])
+                .unwrap()
+                .command,
+            Command::Admin { command } if command == ["schema", "setup"]
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "tkr",
+                "exec",
+                "runtime",
+                "--container",
+                "tokeira-runtime",
+                "--",
+                "sh",
+                "-c",
+                "echo ready",
+            ])
+            .unwrap()
+            .command,
+            Command::Exec {
+                service,
+                container: Some(container),
+                command,
+            } if service == "runtime"
+                && container == "tokeira-runtime"
+                && command == ["sh", "-c", "echo ready"]
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "port-forward", "grafana", "--local-port", "33000"])
+                .unwrap()
+                .command,
+            Command::PortForward {
+                service,
+                local_port: Some(33000)
+            } if service == "grafana"
         ));
         assert!(matches!(
             Cli::try_parse_from(["tkr", "config", "show"])
@@ -1318,6 +1474,29 @@ mod tests {
         deployments
             .create("local-dsql", platform("local"), StorageKind::Dsql, None)
             .unwrap();
+    }
+
+    #[test]
+    fn new_ecs_deployments_record_the_shipped_definition() {
+        let temp = tempfile::tempdir().expect("deployment root");
+        let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
+        let metadata = deployments
+            .create("ecs-defined", platform("ecs"), StorageKind::InMemory, None)
+            .expect("ECS definition stages");
+        let dir = deployments.path("ecs-defined");
+        let definition = metadata
+            .definition
+            .expect("new ECS deployment records its definition");
+
+        assert_eq!(definition.format.as_str(), "tkd");
+        assert!(dir.join(definition.path.as_path()).is_file());
+        assert!(dir.join("helpers.tkd").is_file());
+        assert!(
+            dir.join("observability/dashboards/broker-runtime-health.json")
+                .is_file()
+        );
+        assert!(!dir.join(DEPLOYMENT_TOML).exists());
+        assert!(dir.join(TOKEIRAD_TOML).exists());
     }
 
     #[test]

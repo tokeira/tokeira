@@ -33,9 +33,9 @@ equally binding.*
 ## Configuration
 
 - Server config `tokeirad.toml` (`TokeiraConfig`: infrastructure, policy, capacity,
-  emergency). Platform config `deployment.toml` (`LocalConfig`/`ComposeConfig`; compose
-  DSQL deployments carry `storage = "dsql"` + `[dsql]` mode/endpoint/arn/region, and
-  writeback updates `tokeirad.toml`'s `infrastructure.storage`/`infrastructure.dsql`).
+  emergency). Local alone uses platform config `deployment.toml` (`LocalConfig`);
+  definition-backed platforms own provider configuration and writeback in their
+  definition sets.
 - `serde(deny_unknown_fields)` on all config structs — typos die at parse time.
 - `RuntimeConfig` is always `Default`, never TOML-configurable; mechanical settings
   auto-tune. No env vars on invocation; defaults characterized by expected performance.
@@ -58,18 +58,15 @@ equally binding.*
 
 ### Adding a New Platform
 
-`platforms/{name}/` with `config.rs`/`modules.rs`/`services.rs`/`compose.rs` (or
-equivalent); implement `Deployment` + `Ops` from `tokeira-orchestrator`; add
-`PlatformKind` + `CliPlatformKind` variants; prototypical config generation in
-`tkr/src/prototypical.rs`; tests for config generation, module composition, service
-ordering.
+Declare Cargo platform metadata, export a pure `PlatformDeclaration`, implement typed
+kinds and provider resources, author the `.tkd`/`.tkdp` source set, and test definition
+admission, realization, dependency ordering, and manifest projection.
 
 ### Adding a New IaC Module
 
-Implement `Module` in the platform's `modules.rs`; register in `infra_modules()`; tests
-for resource enumeration and dependency ordering. For compose storage modules,
-`DsqlModule` is the reference pattern: module-owned config, explicit dependencies,
-provider handles via `register_infra_extensions()`.
+Implement the resource in its provider/platform crate, expose it through a typed kind,
+and author its module placement and dependencies in the platform definition. Test kind
+admission, realized resource IDs, dependency ordering, and desired manifests.
 
 ### Adding a New CLI Command
 

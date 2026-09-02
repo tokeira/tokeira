@@ -10,11 +10,11 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use tokeira_orchestrator::DefinitionFormatId;
 
-use tokeira_platform::definition::DefinitionFrontend;
+use tokeira_platform::{definition::DefinitionFrontend, ops::PortForwardOutcome};
 
 use crate::{
     apply, definition, deploy, describe, destroy, engine::Engine, lock, observability, plan,
@@ -61,6 +61,9 @@ enum Command {
     /// these as the infra verbs.
     #[command(subcommand)]
     Deploy(DeployCommand),
+    /// Container images declared and published by this platform.
+    #[command(subcommand)]
+    Image(ImageCommand),
     /// Tear down workloads and then infrastructure. The owning `tkr`
     /// removes deployment records only after this command succeeds.
     Destroy(DeploymentDestroyArgs),
@@ -71,6 +74,12 @@ enum Command {
     Logs(LogsArgs),
     /// Print live published port mappings for one logical service.
     PortMappings(ServiceArgs),
+    /// Reach one logical service using the bound platform's forwarding mode.
+    PortForward(PortForwardArgs),
+    /// Execute an interactive command in one live service container.
+    Exec(ExecArgs),
+    /// Run one command through the platform's on-demand admin workload.
+    Admin(AdminArgs),
     /// Validate the deployment's realized observability configuration.
     #[command(subcommand)]
     Observability(ObservabilityCommand),
@@ -102,13 +111,85 @@ impl Command {
             }
             Self::Infra(InfraCommand::Destroy(args)) => Some(&args.deployment_dir),
             Self::Deploy(DeployCommand::Destroy(args)) => Some(&args.deployment_dir),
+            Self::Image(ImageCommand::List(args)) => Some(&args.deployment_dir),
+            Self::Image(ImageCommand::Push(args)) => Some(&args.deployment_dir),
+            Self::Image(ImageCommand::Mirror(args)) => Some(&args.deployment_dir),
             Self::Destroy(args) => Some(&args.deployment_dir),
             Self::Scale(args) => Some(&args.deployment_dir),
             Self::Logs(args) => Some(&args.deployment_dir),
             Self::PortMappings(args) => Some(&args.deployment_dir),
+            Self::PortForward(args) => Some(&args.deployment_dir),
+            Self::Exec(args) => Some(&args.deployment_dir),
+            Self::Admin(args) => Some(&args.deployment_dir),
             Self::Observability(ObservabilityCommand::Check(args)) => Some(&args.deployment_dir),
             Self::Revert(args) => Some(&args.deployment_dir),
             Self::Rollback(args) => Some(&args.deployment_dir),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum ImageCommand {
+    /// List the images declared by the bound platform.
+    List(ImageListArgs),
+    /// Publish a locally built image to the platform registry.
+    Push(ImagePushArgs),
+    /// Mirror authored upstream images into the platform registry.
+    Mirror(ImageMirrorArgs),
+}
+
+#[derive(Args)]
+struct ImageListArgs {
+    /// Deployment directory holding the definition and runtime state.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Limit the inventory to one source class.
+    #[arg(long)]
+    source_type: Option<ImageSourceFilter>,
+}
+
+#[derive(Args)]
+struct ImagePushArgs {
+    /// Deployment directory holding the definition and runtime state.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Publish only this logical build image.
+    #[arg(long)]
+    image: Option<String>,
+    /// Additional deployment tag; `latest` is always published.
+    #[arg(long, default_value = "latest")]
+    tag: String,
+    /// Confirm ECR mutation.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct ImageMirrorArgs {
+    /// Deployment directory holding the definition and runtime state.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Mirror only this logical upstream image.
+    #[arg(long)]
+    image: Option<String>,
+    /// Confirm ECR mutation.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ImageSourceFilter {
+    Build,
+    Mirror,
+    Registry,
+}
+
+impl From<ImageSourceFilter> for tokeira_deploy_engine::ImageSourceType {
+    fn from(value: ImageSourceFilter) -> Self {
+        match value {
+            ImageSourceFilter::Build => Self::Build,
+            ImageSourceFilter::Mirror => Self::Mirror,
+            ImageSourceFilter::Registry => Self::Registry,
         }
     }
 }
@@ -161,6 +242,43 @@ struct ServiceArgs {
     /// Logical service name owned by the platform.
     service: String,
     /// Deployment directory holding platform state.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct PortForwardArgs {
+    /// Logical service name owned by the platform.
+    service: String,
+    /// Local port to bind when the platform opens a tunnel.
+    #[arg(long)]
+    local_port: Option<u16>,
+    /// Deployment directory holding platform state.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct ExecArgs {
+    /// Logical service name owned by the platform.
+    service: String,
+    /// Container name; the platform defaults to the service's primary container.
+    #[arg(long)]
+    container: Option<String>,
+    /// Command and arguments to execute remotely.
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
+    /// Deployment directory holding platform identity and the admitted definition.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct AdminArgs {
+    /// Command and arguments passed to the platform's admin workload.
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
+    /// Deployment directory holding platform identity and the admitted definition.
     #[arg(long)]
     deployment_dir: PathBuf,
 }
@@ -362,6 +480,12 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             .await
         }
         Command::Config(ConfigCommand::Seed(_)) => crate::config_seed::seed(require(admitted)),
+        Command::Image(ImageCommand::List(args)) => crate::image::list(
+            &engine,
+            require(admitted),
+            args.source_type.map(Into::into),
+            cli.json,
+        ),
         Command::Logs(args) => {
             let Some(ops) = engine.platform().ops() else {
                 anyhow::bail!("not applicable: this platform declares no ops surface");
@@ -401,6 +525,49 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
                 }
             }
             Ok(())
+        }
+        Command::PortForward(args) => {
+            let Some(ops) = engine.platform().ops() else {
+                anyhow::bail!("not applicable: this platform declares no ops surface");
+            };
+            match ops
+                .port_forward(
+                    &require(admitted).deployment_ref,
+                    &args.service,
+                    args.local_port,
+                )
+                .await?
+            {
+                PortForwardOutcome::Mappings(mappings) if mappings.is_empty() => {
+                    println!("no port mappings for service {}", args.service);
+                }
+                PortForwardOutcome::Mappings(mappings) => {
+                    for mapping in mappings {
+                        println!(
+                            "{}:{} -> {}:{}/{}",
+                            mapping.host_addr,
+                            mapping.host_port,
+                            args.service,
+                            mapping.container_port,
+                            mapping.protocol
+                        );
+                    }
+                }
+                PortForwardOutcome::SessionClosed => {}
+            }
+            Ok(())
+        }
+        Command::Exec(args) => {
+            let Some(ops) = engine.platform().ops() else {
+                anyhow::bail!("not applicable: this platform declares no ops surface");
+            };
+            ops.exec(
+                &require(admitted).deployment_ref,
+                &args.service,
+                args.container.as_deref(),
+                &args.command,
+            )
+            .await
         }
         Command::Observability(ObservabilityCommand::Check(args)) => {
             observability::check(&engine, require(admitted), args.timeout_seconds)
@@ -486,11 +653,45 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             })
             .await
         }
+        Command::Image(ImageCommand::Push(args)) => {
+            if !args.yes {
+                anyhow::bail!("image push changes ECR; re-run with `--yes`");
+            }
+            let admitted = require(admitted);
+            let image = args.image;
+            let tag = args.tag;
+            lock::with_operation_lock(&admitted.state, "image-push", || {
+                crate::image::push(&engine, admitted, image.as_deref(), &tag, cli.json)
+            })
+            .await
+        }
+        Command::Image(ImageCommand::Mirror(args)) => {
+            if !args.yes {
+                anyhow::bail!("image mirror changes ECR; re-run with `--yes`");
+            }
+            let admitted = require(admitted);
+            let image = args.image;
+            lock::with_operation_lock(&admitted.state, "image-mirror", || {
+                crate::image::mirror(&engine, admitted, image.as_deref(), cli.json)
+            })
+            .await
+        }
         Command::Scale(args) => {
             let admitted = require(admitted);
             let specs = args.specs;
             lock::with_operation_lock(&admitted.state, "scale", || {
                 scale::scale(&engine, admitted, &specs)
+            })
+            .await
+        }
+        Command::Admin(args) => {
+            let admitted = require(admitted);
+            let command = args.command;
+            lock::with_operation_lock(&admitted.state, "admin", || async {
+                let Some(ops) = engine.platform().ops() else {
+                    anyhow::bail!("not applicable: this platform declares no ops surface");
+                };
+                ops.admin(&admitted.deployment_ref, &command).await
             })
             .await
         }
@@ -595,5 +796,133 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn parses_definition_bound_image_commands() {
+        let list = Cli::try_parse_from([
+            "tkp",
+            "image",
+            "list",
+            "--deployment-dir",
+            "/tmp/d",
+            "--source-type",
+            "mirror",
+        ])
+        .unwrap();
+        assert!(matches!(
+            list.command,
+            Command::Image(ImageCommand::List(ImageListArgs {
+                source_type: Some(ImageSourceFilter::Mirror),
+                ..
+            }))
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "tkp",
+                "image",
+                "push",
+                "--deployment-dir",
+                "/tmp/d",
+                "--tag",
+                "v1",
+                "--yes",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "tkp",
+                "image",
+                "mirror",
+                "--deployment-dir",
+                "/tmp/d",
+                "--image",
+                "grafana",
+                "--yes",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn parses_platform_owned_port_forward() {
+        let parsed = Cli::try_parse_from([
+            "tkp",
+            "port-forward",
+            "grafana",
+            "--local-port",
+            "33000",
+            "--deployment-dir",
+            "/tmp/d",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::PortForward(PortForwardArgs {
+                service,
+                local_port: Some(33000),
+                ..
+            }) if service == "grafana"
+        ));
+    }
+
+    #[test]
+    fn parses_platform_owned_exec() {
+        let parsed = Cli::try_parse_from([
+            "tkp",
+            "exec",
+            "--deployment-dir",
+            "/tmp/d",
+            "runtime",
+            "--container",
+            "tokeira-runtime",
+            "--",
+            "sh",
+            "-c",
+            "echo ready",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Exec(ExecArgs {
+                service,
+                container: Some(container),
+                command,
+                ..
+            }) if service == "runtime"
+                && container == "tokeira-runtime"
+                && command == ["sh", "-c", "echo ready"]
+        ));
+        assert!(
+            Cli::try_parse_from(["tkp", "exec", "runtime", "--deployment-dir", "/tmp/d"]).is_err(),
+            "the remote command is mandatory"
+        );
+    }
+
+    #[test]
+    fn parses_platform_owned_admin() {
+        let parsed = Cli::try_parse_from([
+            "tkp",
+            "admin",
+            "--deployment-dir",
+            "/tmp/d",
+            "--",
+            "schema",
+            "migrate",
+            "--target",
+            "5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Admin(AdminArgs { command, .. })
+                if command == ["schema", "migrate", "--target", "5"]
+        ));
+        assert!(
+            Cli::try_parse_from(["tkp", "admin", "--deployment-dir", "/tmp/d"]).is_err(),
+            "the admin command is mandatory"
+        );
     }
 }

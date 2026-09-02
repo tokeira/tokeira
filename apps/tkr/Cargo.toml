@@ -15,7 +15,6 @@ anyhow.workspace = true
 async-trait.workspace = true
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 dagger-sdk.workspace = true
-aws-sdk-ecs = "1"
 aws-sdk-s3 = "1"
 base64 = "0.22"
 chrono.workspace = true
@@ -39,7 +38,6 @@ tokeira-build.workspace = true
 tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
 tokeira-local-deployment = { path = "../../platforms/local" }
-tokeira-ecs-deployment = { path = "../../platforms/ecs" }
 tokeira-observability.workspace = true
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
 tokeira-platform.workspace = true

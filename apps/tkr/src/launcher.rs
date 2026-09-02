@@ -61,9 +61,11 @@ pub(crate) fn resolve_class(verb: &[&str], envelope: &DeploymentStateEnvelope) -
     match verb {
         ["describe"]
         | ["definition", "check"]
+        | ["image", "list"]
         | ["observability", "check"]
         | ["logs"]
         | ["port-mappings"]
+        | ["port-forward"]
         | [_, "plan"] => LaunchClass::ReadOnly,
         ["upgrade"] => LaunchClass::CandidateUpgrade,
         ["rollback"] => LaunchClass::Rollback,
@@ -799,6 +801,11 @@ mod tests {
             resolve_class(&["infra", "apply"], &versioned),
             LaunchClass::Bound
         );
+        // Interactive exec can mutate a running container, so it must use
+        // the manifest-verified bound provisioner rather than the ungated
+        // read-only class.
+        assert_eq!(resolve_class(&["exec"], &versioned), LaunchClass::Bound);
+        assert_eq!(resolve_class(&["admin"], &versioned), LaunchClass::Bound);
         assert_eq!(
             resolve_class(&["infra", "apply"], &dev),
             LaunchClass::DevCandidate
@@ -827,6 +834,14 @@ mod tests {
             );
             assert_eq!(
                 resolve_class(&["observability", "check"], envelope),
+                LaunchClass::ReadOnly
+            );
+            assert_eq!(
+                resolve_class(&["image", "list"], envelope),
+                LaunchClass::ReadOnly
+            );
+            assert_eq!(
+                resolve_class(&["port-forward"], envelope),
                 LaunchClass::ReadOnly
             );
         }

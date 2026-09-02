@@ -1,12 +1,8 @@
-//! In-process deployment creation retained for platforms not yet migrated to
-//! generated bound provisioners.
+//! In-process operation for the local development platform.
 //!
-//! Compose is deliberately absent. Its source, config, and binary are selected
-//! through platform discovery. This module exists only to avoid changing the
-//! Local and ECS platform crates during the Compose remediation.
+//! Cloud platforms are definition-bound and never produce `deployment.toml`.
 
 use anyhow::Result;
-use tokeira_ecs_deployment::EcsDeployment;
 use tokeira_local_deployment::LocalDeployment;
 use tokeira_orchestrator::{PlatformConfig, PlatformId, StorageKind};
 use toml_edit::{DocumentMut, value};
@@ -15,7 +11,6 @@ use toml_edit::{DocumentMut, value};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyPlatform {
     Local,
-    Ecs,
 }
 
 impl LegacyPlatform {
@@ -23,7 +18,6 @@ impl LegacyPlatform {
     pub(crate) fn from_id(id: &PlatformId) -> Option<Self> {
         match id.as_str() {
             "local" => Some(Self::Local),
-            "ecs" => Some(Self::Ecs),
             _ => None,
         }
     }
@@ -31,7 +25,6 @@ impl LegacyPlatform {
     pub(crate) fn deployment_config(self, storage: StorageKind) -> String {
         match self {
             Self::Local => LocalDeployment::prototypical_config(storage),
-            Self::Ecs => EcsDeployment::prototypical_config(storage),
         }
     }
 
@@ -42,7 +35,6 @@ impl LegacyPlatform {
     ) -> Result<String> {
         let toml = match self {
             Self::Local => LocalDeployment::prototypical_server_config(storage),
-            Self::Ecs => EcsDeployment::prototypical_server_config(storage),
         };
         let _: tokeira_config::TokeiraConfig = toml::from_str(&toml)?;
         if storage == StorageKind::Dsql {
@@ -67,15 +59,11 @@ fn patch_server_dsql_region(toml: String, region: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use tokeira_ecs_deployment::EcsConfig;
-
     use super::*;
 
     #[test]
-    fn ecs_template_remains_owned_by_the_legacy_ecs_platform() {
-        let toml = LegacyPlatform::Ecs.deployment_config(StorageKind::Dsql);
-        assert!(toml.contains("image = \"tokeirad:latest\""));
-        assert!(toml.contains("populated by `tkr image push`"));
-        let _: EcsConfig = toml::from_str(&toml).expect("ECS template parses");
+    fn cloud_platforms_have_no_in_process_adapter() {
+        let ecs = PlatformId::new("ecs").expect("platform id");
+        assert_eq!(LegacyPlatform::from_id(&ecs), None);
     }
 }

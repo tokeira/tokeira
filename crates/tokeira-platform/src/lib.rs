@@ -15,6 +15,7 @@ pub mod error;
 pub mod graph;
 pub mod inspection;
 pub mod kind;
+pub mod ops;
 
 #[cfg(test)]
 mod tests;

@@ -1,3 +1,10 @@
+//! ECS task-definition and service provider resources.
+//!
+//! Task-definition SDK translation is centralized here so both infrastructure
+//! realization and definition-driven workload deployment register exactly the
+//! same manifest. Role dependencies are resolved by infrastructure callers;
+//! deploy callers pass the role ARNs persisted into their manifest.
+
 use serde::{Deserialize, Serialize};
 use tokeira_iac::{
     ChangeKind, ChangeSemantics, Citation, Confidence, DescribeResult, Disruption, InternalChange,
@@ -100,6 +107,63 @@ pub struct TaskDefinitionResource {
     pub module: String,
 }
 
+/// Register one ECS task-definition revision from the canonical provider spec.
+///
+/// `task_role_arn` belongs to code running inside the containers, while
+/// `execution_role_arn` belongs to the ECS agent for image pulls and secret
+/// injection. Callers must preserve that boundary when resolving role state.
+/// The returned ARN identifies the immutable revision registered by AWS.
+pub async fn register_task_definition(
+    clients: &crate::AwsClients,
+    spec: &TaskDefinitionSpec,
+    task_role_arn: Option<&str>,
+    execution_role_arn: Option<&str>,
+) -> Result<String, IacError> {
+    let containers = spec
+        .containers
+        .iter()
+        .map(container_definition)
+        .collect::<Result<Vec<_>, _>>()?;
+    let volumes = spec
+        .volumes
+        .iter()
+        .map(volume)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut request = clients
+        .ecs
+        .register_task_definition()
+        .family(&spec.family)
+        .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
+        .requires_compatibilities(aws_sdk_ecs::types::Compatibility::Ec2)
+        .cpu(spec.cpu.to_string())
+        .memory(spec.memory_mb.to_string())
+        .set_container_definitions(Some(containers))
+        .set_volumes(Some(volumes));
+    if requires_execution_role(spec) && execution_role_arn.is_none() {
+        tracing::warn!(
+            task_definition = %spec.family,
+            "task definition uses ECS-agent-side features but has no execution role"
+        );
+    }
+    if let Some(task_role_arn) = task_role_arn {
+        request = request.task_role_arn(task_role_arn);
+    }
+    if let Some(execution_role_arn) = execution_role_arn {
+        request = request.execution_role_arn(execution_role_arn);
+    }
+    let output = request.send().await.map_err(|error| {
+        IacError::AwsSdk(format!(
+            "ecs:RegisterTaskDefinition: {}",
+            error.into_service_error()
+        ))
+    })?;
+    Ok(output
+        .task_definition()
+        .and_then(|definition| definition.task_definition_arn())
+        .unwrap_or(&spec.family)
+        .to_owned())
+}
+
 #[async_trait::async_trait]
 impl Resource for TaskDefinitionResource {
     fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
@@ -159,37 +223,7 @@ impl Resource for TaskDefinitionResource {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        let containers = self
-            .spec
-            .containers
-            .iter()
-            .map(container_definition)
-            .collect::<Result<Vec<_>, _>>()?;
-        let volumes = self
-            .spec
-            .volumes
-            .iter()
-            .map(volume)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut request = ctx
-            .extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .ecs
-            .register_task_definition()
-            .family(&self.spec.family)
-            .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
-            .requires_compatibilities(aws_sdk_ecs::types::Compatibility::Ec2)
-            .cpu(self.spec.cpu.to_string())
-            .memory(self.spec.memory_mb.to_string())
-            .set_container_definitions(Some(containers))
-            .set_volumes(Some(volumes));
-        if requires_execution_role(&self.spec) && self.spec.execution_role_dependency.is_none() {
-            tracing::warn!(
-                task_definition = %self.spec.family,
-                "task definition uses ECS-agent-side features but has no execution role dependency"
-            );
-        }
-        if let Some(role_dependency) = &self.spec.task_role_dependency {
+        let task_role_arn = if let Some(role_dependency) = &self.spec.task_role_dependency {
             let role_state = ctx.get_resource_state(role_dependency)?;
             let role_arn = role_state
                 .properties
@@ -198,28 +232,29 @@ impl Resource for TaskDefinitionResource {
                 .ok_or_else(|| IacError::StateNotFound("role_arn missing".into()))?;
             // ECS Exec and the Alloy config init container both use task-role
             // credentials from inside the running container, not the execution role.
-            request = request.task_role_arn(role_arn);
-        }
-        if let Some(role_dependency) = &self.spec.execution_role_dependency {
+            Some(role_arn.to_owned())
+        } else {
+            None
+        };
+        let execution_role_arn = if let Some(role_dependency) = &self.spec.execution_role_dependency
+        {
             let role_state = ctx.get_resource_state(role_dependency)?;
             let role_arn = role_state
                 .properties
                 .get("role_arn")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| IacError::StateNotFound("role_arn missing".into()))?;
-            request = request.execution_role_arn(role_arn);
-        }
-        let output = request.send().await.map_err(|e| {
-            IacError::AwsSdk(format!(
-                "ecs:RegisterTaskDefinition: {}",
-                e.into_service_error()
-            ))
-        })?;
-        let arn = output
-            .task_definition()
-            .and_then(|definition| definition.task_definition_arn())
-            .unwrap_or(&self.spec.family)
-            .to_owned();
+            Some(role_arn.to_owned())
+        } else {
+            None
+        };
+        let arn = register_task_definition(
+            ctx.extension::<crate::AwsClients>().expect("AwsClients"),
+            &self.spec,
+            task_role_arn.as_deref(),
+            execution_role_arn.as_deref(),
+        )
+        .await?;
         Ok(task_definition_state(self, arn))
     }
 

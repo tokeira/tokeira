@@ -9,21 +9,13 @@
 //! 4. On `apply`, re-runs the engine, then writes any discovered values
 //!    (DSQL endpoint, OpenSearch URL, etc.) back into the deployment's
 //!    `tokeirad.toml` via [`write_tokeirad_writeback`].
-//!
-//! The ECS path additionally runs a pre-flight mirror validation
-//! ([`validate_ecs_mirrors`]) so `infra apply` fails loud if the operator
-//! forgot to populate the Mimir/Loki/Grafana/Alloy/aws-cli/busybox mirrors
-//! via `tkr image mirror` first.
 
 use std::{fs, path::Path};
 
 use anyhow::Result;
-use tokeira_aws::{DefaultEcrClient, EcrClient};
-use tokeira_deploy_engine::ImageContext;
-use tokeira_ecs_deployment::{EcsConfig, EcsDeployment};
 use tokeira_iac::{Change, ChangeKind, ModuleSelection};
 use tokeira_local_deployment::LocalDeployment;
-use tokeira_orchestrator::{Deployment, InfraEngine};
+use tokeira_orchestrator::InfraEngine;
 
 use crate::{
     cli::InfraAction,
@@ -40,57 +32,8 @@ pub(crate) async fn run(
     ctx: DeploymentContext,
     format: OutputFormat,
 ) -> Result<()> {
-    match &ctx.platform_config {
-        PlatformDeploymentConfig::Local(config) => {
-            run_with_engine(action, deployments, &ctx, LocalDeployment, config, format).await
-        }
-        PlatformDeploymentConfig::Ecs(config) => {
-            if matches!(&action, InfraAction::Apply { .. }) {
-                validate_ecs_mirrors(config, &ctx.path).await?;
-            }
-            run_with_engine(
-                action,
-                deployments,
-                &ctx,
-                EcsDeployment::new(&ctx.path),
-                config,
-                format,
-            )
-            .await
-        }
-    }
-}
-
-/// Pre-flight check for ECS `infra apply`.
-///
-/// Most observability images (Mimir, Loki, Grafana, Alloy, aws-cli,
-/// busybox) are mirrored into a project-owned ECR repo rather than
-/// pulled directly from Docker Hub — ECR avoids hitting anonymous rate
-/// limits and keeps all image pulls inside the VPC. This function
-/// verifies the operator has populated every mirror before we provision
-/// infrastructure that would otherwise reference missing images.
-///
-/// Failing here saves the operator minutes of rollback work.
-async fn validate_ecs_mirrors(config: &EcsConfig, deployment_dir: &Path) -> Result<()> {
-    let deployment = EcsDeployment::new(deployment_dir);
-    let mut image_ctx = ImageContext::default();
-    deployment
-        .register_image_extensions(config, &mut image_ctx)
-        .await?;
-    let images = tokeira_ecs_deployment::images::all(&image_ctx)?;
-    let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(config.region.clone()))
-        .load()
-        .await;
-    let ecr = DefaultEcrClient::from_aws_config(&aws_config);
-    let auth = ecr.get_authorization_token().await?;
-    tokeira_ecs_deployment::gates::validate_mirrors(
-        config,
-        &auth.registry_host,
-        &images,
-        &image_ctx,
-    )?;
-    Ok(())
+    let PlatformDeploymentConfig::Local(config) = &ctx.platform_config;
+    run_with_engine(action, deployments, &ctx, LocalDeployment, config, format).await
 }
 
 async fn run_with_engine<D>(

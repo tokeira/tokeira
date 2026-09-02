@@ -18,20 +18,29 @@ definitions = ["deployment.tkd", "definition.tkdp"]
 content = ["observability"]
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
+aws-sdk-ecs = "1"
 chrono = { version = "0.4", features = ["serde"] }
+dagger-sdk.workspace = true
+futures-util = "0.3"
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokeira-aws = { path = "../../crates/tokeira-aws" }
+tokeira-build = { path = "../../crates/tokeira-build" }
+tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
 tokeira-ecs = { path = "../../crates/tokeira-ecs" }
 tokeira-deployment = { workspace = true }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
+tokeira-observability = { workspace = true }
 tokeira-platform = { path = "../../crates/tokeira-platform" }
+tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
+tokio = { workspace = true, features = ["process", "rt", "signal", "time"] }
 
 [dev-dependencies]
-tokeira-observability = { workspace = true }
-tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

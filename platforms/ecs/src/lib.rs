@@ -4,18 +4,91 @@
 //! Realization lives in `tokeira-ecs` (`crates/tokeira-ecs`); this package
 //! assembles the definition-driven platform — modular `.tkd` and `.tkdp`
 //! source sets describing the same graph, the platform-owned observability
-//! kinds, and the one entry point — and re-exports the implementation crate's
-//! legacy surface so existing callers keep their import paths.
+//! kinds, and the one entry point.
 
 use std::sync::Arc;
 
-use tokeira_platform::{declaration::PlatformDeclaration, definition::Namespace};
-
-pub mod observability;
-
-pub use tokeira_ecs::{
-    EcsConfig, EcsDeployment, config, execution::EcsPlatform, gates, images, modules, services,
+use tokeira_platform::{
+    declaration::{DeploymentRef, ImageOperations, PlatformDeclaration, PlatformIntegration},
+    definition::Namespace,
 };
+
+mod image_operations;
+pub mod observability;
+pub mod ops;
+
+pub use tokeira_ecs::{EcsConfig, config, execution::EcsPlatform, gates, modules, services};
+
+// Live operations evaluate through this same function so they cannot drift
+// from the namespaces used to admit and realize an ECS definition.
+fn namespaces() -> Vec<Namespace> {
+    vec![
+        tokeira_ecs::kinds::namespace(),
+        tokeira_deployment::server_config::namespace(),
+        observability::namespace(),
+        Namespace {
+            name: tokeira_aws::kinds::NAMESPACE,
+            kinds: tokeira_aws::kinds::KINDS,
+            defaults: None,
+            decode: tokeira_aws::kinds::decode,
+        },
+    ]
+}
+
+/// ECS execution integration plus the platform-owned image lifecycle.
+///
+/// The reusable ECS crate realizes manifests and AWS operations. This
+/// package-level adapter additionally owns definition evaluation, which is
+/// required before image operations can select authored upstreams.
+#[derive(Debug)]
+struct EcsIntegration {
+    execution: tokeira_ecs::execution::EcsIntegration,
+    images: image_operations::EcsImageOperations,
+}
+
+#[async_trait::async_trait]
+impl PlatformIntegration for EcsIntegration {
+    fn image_operations(&self) -> Option<&dyn ImageOperations> {
+        Some(&self.images)
+    }
+
+    async fn register_infra_extensions(
+        &self,
+        deployment: &DeploymentRef,
+        ctx: &mut tokeira_iac::ProvisionContext,
+    ) -> anyhow::Result<()> {
+        self.execution
+            .register_infra_extensions(deployment, ctx)
+            .await
+    }
+
+    async fn register_deploy_extensions(
+        &self,
+        deployment: &DeploymentRef,
+        ctx: &mut tokeira_deploy_engine::ServiceContext,
+    ) -> anyhow::Result<()> {
+        self.execution
+            .register_deploy_extensions(deployment, ctx)
+            .await
+    }
+
+    async fn register_image_extensions(
+        &self,
+        deployment: &DeploymentRef,
+        ctx: &mut tokeira_deploy_engine::ImageContext,
+    ) -> anyhow::Result<()> {
+        self.execution
+            .register_image_extensions(deployment, ctx)
+            .await
+    }
+
+    fn service_platform(
+        &self,
+        deployment: &DeploymentRef,
+    ) -> anyhow::Result<Box<dyn tokeira_deploy_engine::Platform>> {
+        self.execution.service_platform(deployment)
+    }
+}
 
 /// The ECS platform declaration.
 ///
@@ -25,25 +98,14 @@ pub use tokeira_ecs::{
 /// the integration deliberately registers no second bundle.
 pub fn platform() -> PlatformDeclaration {
     PlatformDeclaration {
-        namespaces: vec![
-            tokeira_ecs::kinds::namespace(),
-            tokeira_deployment::server_config::namespace(),
-            observability::namespace(),
-            Namespace {
-                name: tokeira_aws::kinds::NAMESPACE,
-                kinds: tokeira_aws::kinds::KINDS,
-                defaults: None,
-                decode: tokeira_aws::kinds::decode,
-            },
-        ],
-        // The legacy operational surface needs authored region and cluster
-        // coordinates that `DeploymentRef` does not carry; it stays on the
-        // preserved legacy implementation until that contract is addressed
-        // in its own slice.
-        ops: None,
-        observability: None,
+        namespaces: namespaces(),
+        ops: Some(Box::new(ops::EcsOps)),
+        observability: Some(Box::new(observability::EcsObservabilityCheck)),
         execution: Box::new(tokeira_ecs::execution::EcsExecution),
-        implementation: Arc::new(tokeira_ecs::execution::EcsIntegration),
+        implementation: Arc::new(EcsIntegration {
+            execution: tokeira_ecs::execution::EcsIntegration,
+            images: image_operations::EcsImageOperations,
+        }),
     }
 }
 
@@ -51,10 +113,10 @@ pub fn platform() -> PlatformDeclaration {
 mod declaration_tests {
     use super::*;
 
-    // The declaration is pure assembly: four namespaces, no ops, and the
-    // execution seams — constructed with no I/O to fail.
+    // The declaration is pure assembly: four namespaces plus live ops and
+    // execution seams, constructed with no I/O to fail.
     #[test]
-    fn platform_declares_four_namespaces_and_no_ops() {
+    fn platform_declares_four_namespaces_and_ops() {
         let declaration = platform();
         let names: Vec<&str> = declaration
             .namespaces
@@ -70,7 +132,9 @@ mod declaration_tests {
                 "tokeira_aws"
             ]
         );
-        assert!(declaration.ops.is_none());
+        assert!(declaration.ops.is_some());
+        assert!(declaration.observability.is_some());
+        assert!(declaration.implementation.image_operations().is_some());
     }
 
     // Kind names stay collision-free across the declared namespaces — the
@@ -95,65 +159,11 @@ mod declaration_tests {
 /// agreement and the style contracts over the shipped artifacts.
 #[cfg(test)]
 mod content_tests {
-    use tokeira_ecs::{
-        EcsConfig,
-        modules::{ObservabilityModule, observability::load_observability_artifacts},
-    };
-    use tokeira_iac::{
-        InfraState,
-        module::{Module, ModuleContext},
-    };
+    use tokeira_ecs::modules::observability::load_observability_artifacts;
 
     /// The platform-owned content tree: what a staged deployment carries.
     fn content_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("observability")
-    }
-
-    fn module_context() -> ModuleContext<'static> {
-        let state = Box::leak(Box::new(InfraState::default()));
-        let extensions = Box::leak(Box::new(std::collections::HashMap::new()));
-        ModuleContext::new(state, extensions)
-    }
-
-    #[test]
-    fn observability_module_enumerates_storage_alloy_params_and_services() {
-        let module = ObservabilityModule::new(EcsConfig::default(), content_dir());
-        let resources = module.resources(&module_context()).expect("resources");
-        let ids: Vec<String> = resources
-            .iter()
-            .map(|resource| resource.resource_id().0)
-            .collect();
-
-        assert_eq!(
-            ids.iter()
-                .filter(|id| id.starts_with("ssm-parameter:"))
-                .count(),
-            10
-        );
-        assert_eq!(
-            ids.iter()
-                .filter(|id| id.starts_with("task-definition:tokeira-"))
-                .count(),
-            3
-        );
-        assert_eq!(
-            ids.iter()
-                .filter(|id| id.starts_with("ecs-service:tokeira-"))
-                .count(),
-            3
-        );
-        assert_eq!(
-            ids.iter().filter(|id| id.starts_with("iam-role-")).count(),
-            6
-        );
-        assert_eq!(
-            ids.iter().filter(|id| id.starts_with("s3-object:")).count(),
-            11
-        );
-        assert!(ids.contains(&"secret-tokeira/grafana/admin".to_owned()));
-        assert!(ids.iter().any(|id| id.contains("mimir-data")));
-        assert!(ids.iter().any(|id| id.contains("loki-data")));
-        assert!(ids.iter().any(|id| id.contains("observability-artifacts")));
     }
 
     // The content tree and the loader agree: the artifact set is every

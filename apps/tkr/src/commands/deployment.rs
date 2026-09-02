@@ -43,16 +43,12 @@ pub(crate) async fn run(
             let resolved_name = name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let storage = storage.into();
             let state = state_location(state_bucket, state_region, state_prefix)?;
-            // The experimental platforms are refused at the one choke both
-            // routes share — the legacy in-process path and the discovered
-            // definition path each pass through this create — so the public
-            // claim ("local + compose working; ecs/eks upcoming") holds in
-            // the binary, not just the README. Existing deployments are
-            // untouched: only creation is gated.
-            if matches!(platform.as_str(), "ecs" | "eks") {
+            // EKS remains experimental. ECS takes the discovered,
+            // definition-bound path below.
+            if platform.as_str() == "eks" {
                 bail!(
                     "platform `{platform}` is experimental and does not accept new deployments; \
-                     the supported platforms are `local` and `compose`"
+                     the supported platforms are `local`, `compose`, and `ecs`"
                 );
             }
             if crate::legacy::LegacyPlatform::from_id(&platform).is_some() {
@@ -409,46 +405,43 @@ fn state_location(
 mod tests {
     use super::*;
 
-    // Feature: the launch platform claim — `local` + `compose` accept new
-    // deployments; `ecs`/`eks` refuse at create, before any filesystem or
-    // workspace work, with the supported set named.
+    // EKS stays outside this ECS migration and refuses before any filesystem
+    // or workspace work, with the supported set named.
     #[tokio::test]
-    async fn create_refuses_the_experimental_platforms() {
-        for id in ["ecs", "eks"] {
-            let root = tempfile::tempdir().unwrap();
-            let deployments = DeploymentResolver::with_root(root.path().to_path_buf());
-            let error = run(
-                DeploymentAction::Create {
-                    name: Some("dev".to_string()),
-                    platform: tokeira_orchestrator::PlatformId::new(id).unwrap(),
-                    format: None,
-                    storage: crate::cli::CliStorageKind::InMemory,
-                    region: None,
-                    dev_engine: false,
-                    build_image: None,
-                    state_bucket: None,
-                    state_region: None,
-                    state_prefix: None,
-                },
-                &deployments,
-                None,
-                false,
-                false,
-            )
-            .await
-            .expect_err("experimental platform must refuse at create");
-            let message = error.to_string();
-            assert!(message.contains(id), "{message}");
-            assert!(message.contains("experimental"), "{message}");
-            assert!(
-                message.contains("local") && message.contains("compose"),
-                "{message}"
-            );
-            assert!(
-                !deployments.path("dev").exists(),
-                "no deployment records may be created for a refused platform"
-            );
-        }
+    async fn create_still_refuses_eks() {
+        let root = tempfile::tempdir().unwrap();
+        let deployments = DeploymentResolver::with_root(root.path().to_path_buf());
+        let error = run(
+            DeploymentAction::Create {
+                name: Some("dev".to_string()),
+                platform: tokeira_orchestrator::PlatformId::new("eks").unwrap(),
+                format: None,
+                storage: crate::cli::CliStorageKind::InMemory,
+                region: None,
+                dev_engine: false,
+                build_image: None,
+                state_bucket: None,
+                state_region: None,
+                state_prefix: None,
+            },
+            &deployments,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect_err("experimental platform must refuse at create");
+        let message = error.to_string();
+        assert!(message.contains("eks"), "{message}");
+        assert!(message.contains("experimental"), "{message}");
+        assert!(
+            message.contains("local") && message.contains("compose") && message.contains("ecs"),
+            "{message}"
+        );
+        assert!(
+            !deployments.path("dev").exists(),
+            "no deployment records may be created for a refused platform"
+        );
     }
 
     #[tokio::test]

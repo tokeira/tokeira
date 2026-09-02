@@ -122,11 +122,16 @@ def plane(
     )
 
 
-def alloy(observability, region, service):
-    # Each workload receives its own rendered Alloy parameter.
+def alloy(observability, cfg, service):
+    # Identity labels are explicit so realization cannot substitute Rust-side
+    # defaults for operator-authored values.
     observability.resource(
         "alloy-" + service,
-        AlloyConfig(service=service, region=region),
+        AlloyConfig(
+            service=service,
+            environment=cfg.environment,
+            cluster=cfg.cluster.name,
+        ),
     )
 
 
@@ -139,7 +144,7 @@ def task_role(services, region, service):
     )
 
 
-def replica(services, cfg, service, policy, roles):
+def replica(services, cfg, service, image, policy, roles):
     # Replica scheduling carries an explicit desired count.
     services.resource(
         service,
@@ -148,20 +153,19 @@ def replica(services, cfg, service, policy, roles):
             environment=cfg.environment,
             region=cfg.aws.region,
             cluster=cfg.cluster.name,
-            service_connect_namespace=cfg.cluster.service_connect_namespace,
-            image=policy.image,
+            image=image,
             replicas=policy.replicas,
             cpu=policy.cpu,
             memory_mb=policy.memory_mb,
-            alloy_image=cfg.observability.alloy_image,
-            aws_cli_image=cfg.observability.aws_cli_image,
-            busybox_image=cfg.observability.busybox_image,
+            alloy_image=cfg.images.alloy.repository + ":" + cfg.images.alloy.tag,
+            aws_cli_image=cfg.images.aws_cli.repository + ":" + cfg.images.aws_cli.tag,
+            busybox_image=cfg.images.busybox.repository + ":" + cfg.images.busybox.tag,
         ),
         roles,
     )
 
 
-def daemon(services, cfg, service, policy, roles):
+def daemon(services, cfg, service, image, policy, roles):
     # Daemon scheduling omits replicas: ECS runs one task per eligible host.
     services.resource(
         service,
@@ -170,13 +174,12 @@ def daemon(services, cfg, service, policy, roles):
             environment=cfg.environment,
             region=cfg.aws.region,
             cluster=cfg.cluster.name,
-            service_connect_namespace=cfg.cluster.service_connect_namespace,
-            image=policy.image,
+            image=image,
             cpu=policy.cpu,
             memory_mb=policy.memory_mb,
-            alloy_image=cfg.observability.alloy_image,
-            aws_cli_image=cfg.observability.aws_cli_image,
-            busybox_image=cfg.observability.busybox_image,
+            alloy_image=cfg.images.alloy.repository + ":" + cfg.images.alloy.tag,
+            aws_cli_image=cfg.images.aws_cli.repository + ":" + cfg.images.aws_cli.tag,
+            busybox_image=cfg.images.busybox.repository + ":" + cfg.images.busybox.tag,
         ),
         roles,
     )

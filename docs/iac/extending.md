@@ -28,8 +28,8 @@ Start with the smallest contract that owns the behavior.
 
 Do not implement `tokeira_orchestrator::Deployment` for a new platform. The bound path
 uses the framework's `DescribedDeployment`, which adapts every realized definition to
-the orchestrator. `LocalDeployment` and `EcsDeployment` are legacy in-process adapters,
-not templates for new work.
+the orchestrator. `LocalDeployment` is a special-purpose in-process development adapter,
+not a template for new work.
 
 ```mermaid
 flowchart TD

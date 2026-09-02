@@ -26,6 +26,7 @@ struct ShippedConfig {
     cluster: ShippedCluster,
     networking: ShippedNetworking,
     dsql: ShippedDsql,
+    images: ShippedImages,
     services: ShippedServices,
     capacity: ShippedCapacity,
     alb: ShippedAlb,
@@ -67,6 +68,33 @@ struct ShippedPreexistingDsql {
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
+struct ShippedImages {
+    tokeirad: ShippedBuildImage,
+    autoscaler: ShippedBuildImage,
+    mimir: ShippedMirrorImage,
+    loki: ShippedMirrorImage,
+    grafana: ShippedMirrorImage,
+    alloy: ShippedMirrorImage,
+    aws_cli: ShippedMirrorImage,
+    busybox: ShippedMirrorImage,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedBuildImage {
+    name: String,
+    repository: String,
+    tag: String,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ShippedMirrorImage {
+    name: String,
+    repository: String,
+    tag: String,
+    upstream_ref: String,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
 struct ShippedServices {
     edge_api: ShippedReplicaPolicy,
     edge_poll: ShippedReplicaPolicy,
@@ -79,7 +107,6 @@ struct ShippedServices {
 
 #[derive(Debug, PartialEq, Deserialize)]
 struct ShippedReplicaPolicy {
-    image: String,
     replicas: u32,
     cpu: u32,
     memory_mb: u32,
@@ -87,7 +114,6 @@ struct ShippedReplicaPolicy {
 
 #[derive(Debug, PartialEq, Deserialize)]
 struct ShippedDaemonPolicy {
-    image: String,
     cpu: u32,
     memory_mb: u32,
 }
@@ -132,17 +158,10 @@ struct ShippedHttps {
 
 #[derive(Debug, PartialEq, Deserialize)]
 struct ShippedObservability {
-    mimir: ShippedImage,
-    loki: ShippedImage,
-    grafana: ShippedImage,
-    alloy_image: String,
-    aws_cli_image: String,
-    busybox_image: String,
-}
-
-#[derive(Debug, PartialEq, Deserialize)]
-struct ShippedImage {
-    image: String,
+    mimir: ShippedReplicaPolicy,
+    loki: ShippedReplicaPolicy,
+    grafana: ShippedReplicaPolicy,
+    loki_query_url: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -225,6 +244,28 @@ fn shipped_tkdp_root() -> String {
 
 fn decode_config(output: &EvaluatedDefinition<DecodedKind>) -> ShippedConfig {
     from_located_value(output.config.clone()).expect("the shipped config admits")
+}
+
+fn assert_replica_defaults(shipped: &ShippedReplicaPolicy, model: &serde_json::Value) {
+    assert_eq!(
+        model["desired_count"].as_u64(),
+        Some(shipped.replicas.into())
+    );
+    assert_eq!(model["cpu"].as_u64(), Some(shipped.cpu.into()));
+    assert_eq!(model["memory_mb"].as_u64(), Some(shipped.memory_mb.into()));
+}
+
+fn assert_capacity_defaults(shipped: &ShippedCapacityPlane, model: &serde_json::Value) {
+    assert_eq!(
+        model["instance_type"].as_str(),
+        Some(shipped.instance_type.as_str())
+    );
+    assert_eq!(model["min_capacity"].as_u64(), Some(shipped.min.into()));
+    assert_eq!(
+        model["desired_capacity"].as_u64(),
+        Some(shipped.desired.into())
+    );
+    assert_eq!(model["max_capacity"].as_u64(), Some(shipped.max.into()));
 }
 
 fn graph_projection(output: &EvaluatedDefinition<DecodedKind>) -> GraphProjection {
@@ -348,13 +389,184 @@ fn the_shipped_set_pins_current_observability_images() {
         let config: ShippedConfig =
             from_located_value(output.config).expect("the shipped config admits");
 
-        assert_eq!(config.observability.mimir.image, "grafana/mimir:3.2.0");
-        assert_eq!(config.observability.loki.image, "grafana/loki:3.7.6");
-        assert_eq!(config.observability.grafana.image, "grafana/grafana:12.4.9");
-        assert_eq!(config.observability.alloy_image, "grafana/alloy:v1.19.0");
-        assert_eq!(config.observability.aws_cli_image, "amazon/aws-cli:2.17.0");
-        assert_eq!(config.observability.busybox_image, "busybox:1.36");
+        assert_eq!(config.images.mimir.upstream_ref, "grafana/mimir:3.2.0");
+        assert_eq!(config.images.loki.upstream_ref, "grafana/loki:3.7.6");
+        assert_eq!(config.images.grafana.upstream_ref, "grafana/grafana:12.4.9");
+        assert_eq!(config.images.alloy.upstream_ref, "grafana/alloy:v1.19.0");
+        assert_eq!(config.images.aws_cli.upstream_ref, "amazon/aws-cli:2.17.0");
+        assert_eq!(config.images.busybox.upstream_ref, "busybox:1.36");
     }
+}
+
+#[test]
+fn observability_capability_matches_the_realized_definition() {
+    let platform = tokeira_ecs_deployment::platform();
+    assert!(platform.observability.is_some());
+
+    for output in [
+        evaluate_tkd(&shipped_tkd_root()).expect("the shipped TKD set evaluates"),
+        evaluate_tkdp(&shipped_tkdp_root()).expect("the shipped TKDP set evaluates"),
+    ] {
+        let resources = realize(&output);
+        assert_eq!(
+            resources
+                .iter()
+                .filter(|resource| resource.resource_type().0 == "AlloyConfig")
+                .count(),
+            10
+        );
+        assert_eq!(
+            resources
+                .iter()
+                .filter(|resource| resource.resource_type().0 == "ObservabilityArtifacts")
+                .count(),
+            1
+        );
+    }
+}
+
+// The canonical derivation model and shipped roots must encode the same
+// platform-owned policy; kinds apply authored values to that model.
+#[test]
+fn derivation_defaults_match_the_shipped_definition() {
+    let output = evaluate_tkd(&shipped_tkd_root()).expect("the shipped TKD set evaluates");
+    let shipped = decode_config(&output);
+    let model = serde_json::to_value(tokeira_ecs::EcsConfig::default())
+        .expect("derivation defaults serialize");
+
+    assert_eq!(
+        model["environment"].as_str(),
+        Some(shipped.environment.as_str())
+    );
+    assert_eq!(model["region"].as_str(), Some(shipped.aws.region.as_str()));
+    assert_eq!(
+        model["cluster"]["name"].as_str(),
+        Some(shipped.cluster.name.as_str())
+    );
+    assert_eq!(
+        model["cluster"]["service_connect_namespace"].as_str(),
+        Some(shipped.cluster.service_connect_namespace.as_str())
+    );
+    assert_eq!(
+        model["networking"]["vpc_cidr"].as_str(),
+        Some(shipped.networking.vpc_cidr.as_str())
+    );
+    assert_eq!(
+        model["networking"]["availability_zones"],
+        serde_json::json!(&shipped.networking.availability_zones)
+    );
+    assert_eq!(
+        model["networking"]["private_dns_zone"].as_str(),
+        Some(shipped.networking.private_dns_zone.as_str())
+    );
+
+    assert_replica_defaults(&shipped.services.edge_api, &model["services"]["edge_api"]);
+    assert_eq!(
+        model["services"]["edge_api"]["image"].as_str(),
+        Some(
+            format!(
+                "{}:{}",
+                shipped.images.tokeirad.repository, shipped.images.tokeirad.tag
+            )
+            .as_str()
+        )
+    );
+    assert_replica_defaults(&shipped.services.edge_poll, &model["services"]["edge_poll"]);
+    assert_eq!(
+        model["services"]["runtime"]["image"].as_str(),
+        Some(
+            format!(
+                "{}:{}",
+                shipped.images.tokeirad.repository, shipped.images.tokeirad.tag
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        model["services"]["runtime"]["cpu"].as_u64(),
+        Some(shipped.services.runtime.cpu.into())
+    );
+    assert_eq!(
+        model["services"]["runtime"]["memory_mb"].as_u64(),
+        Some(shipped.services.runtime.memory_mb.into())
+    );
+    assert_replica_defaults(
+        &shipped.services.projection,
+        &model["services"]["projection"],
+    );
+    assert_replica_defaults(
+        &shipped.services.controller,
+        &model["services"]["controller"],
+    );
+    assert_replica_defaults(
+        &shipped.services.autoscaler,
+        &model["services"]["autoscaler"],
+    );
+    assert_eq!(
+        model["services"]["autoscaler"]["image"].as_str(),
+        Some(
+            format!(
+                "{}:{}",
+                shipped.images.autoscaler.repository, shipped.images.autoscaler.tag
+            )
+            .as_str()
+        )
+    );
+    assert_replica_defaults(&shipped.services.admin, &model["services"]["admin"]);
+    assert_eq!(
+        shipped.services.admin.replicas, 0,
+        "the admin workload is definition-owned on-demand capacity"
+    );
+
+    for (shipped_capacity, model_key) in [
+        (&shipped.capacity.edge_api, "edge_api"),
+        (&shipped.capacity.edge_poll, "edge_poll"),
+        (&shipped.capacity.runtime, "runtime"),
+        (&shipped.capacity.projection, "projection"),
+        (&shipped.capacity.control, "control"),
+        (&shipped.capacity.mimir, "mimir"),
+        (&shipped.capacity.loki, "loki"),
+        (&shipped.capacity.grafana, "grafana"),
+    ] {
+        assert_capacity_defaults(shipped_capacity, &model["capacity_providers"][model_key]);
+    }
+
+    assert_eq!(
+        model["alb"]["health_check_path"].as_str(),
+        Some(shipped.alb.health_check_path.as_str())
+    );
+    assert_eq!(
+        model["alb"]["health_check_interval_secs"].as_u64(),
+        Some(shipped.alb.health_check_interval_secs)
+    );
+    assert_eq!(
+        model["observability"]["mimir_image"].as_str(),
+        Some(shipped.images.mimir.upstream_ref.as_str())
+    );
+    assert_eq!(
+        model["observability"]["loki_image"].as_str(),
+        Some(shipped.images.loki.upstream_ref.as_str())
+    );
+    assert_eq!(
+        model["observability"]["grafana_image"].as_str(),
+        Some(shipped.images.grafana.upstream_ref.as_str())
+    );
+    assert_eq!(
+        model["observability"]["alloy_image"].as_str(),
+        Some(shipped.images.alloy.upstream_ref.as_str())
+    );
+    assert_eq!(
+        model["observability"]["aws_cli_image"].as_str(),
+        Some(shipped.images.aws_cli.upstream_ref.as_str())
+    );
+    assert_eq!(
+        model["observability"]["busybox_image"].as_str(),
+        Some(shipped.images.busybox.upstream_ref.as_str())
+    );
+    assert_eq!(
+        model["observability"]["loki_query_url"].as_str(),
+        Some(shipped.observability.loki_query_url.as_str())
+    );
 }
 
 // The two source sets are interchangeable authoring projections: a frontend

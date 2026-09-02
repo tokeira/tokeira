@@ -86,22 +86,25 @@ pub(crate) enum Command {
     },
     PortForward {
         service: String,
-        /// Local port to bind. Defaults to the service's canonical port
-        /// (grafana=3000, edge-api=7233, edge-poll=7234, controller=7240,
-        /// mimir=9009, loki=3100).
+        /// Local port to bind when the selected platform opens a tunnel.
         #[arg(long)]
         local_port: Option<u16>,
     },
-    /// Execute a command in a running ECS container.
+    /// Execute an interactive command in a live service container.
     Exec {
         service: String,
-        /// Container name to exec into. Defaults to the primary application
-        /// container for the service (never the Alloy sidecar).
+        /// Container name; defaults to the platform's primary container.
         #[arg(long)]
         container: Option<String>,
-        /// Command to execute inside the container.
-        #[arg(last = true)]
-        cmd: Vec<String>,
+        /// Command and arguments to execute remotely.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Run a command through the platform's on-demand admin workload.
+    Admin {
+        /// Command and arguments passed to the admin container.
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
     },
     Config {
         #[command(subcommand)]
@@ -118,15 +121,6 @@ pub(crate) enum Command {
     Diagnostics {
         #[command(subcommand)]
         action: DiagnosticsAction,
-    },
-    /// Run an admin command against the tokeira-admin ECS service.
-    ///
-    /// Scales the admin service from 0→1, waits for RUNNING, executes the
-    /// command via ECS Exec, streams output, then scales back to 0.
-    Admin {
-        /// The full command to forward to the admin binary (e.g. "schema setup").
-        #[arg(trailing_var_arg = true, required = true)]
-        command: Vec<String>,
     },
     Version {
         #[arg(long)]
@@ -446,9 +440,10 @@ pub(crate) enum CliCiCheck {
 
 #[derive(Subcommand)]
 pub(crate) enum ImageCommand {
+    /// List images declared by the selected definition-bound platform.
     List {
         #[arg(long)]
-        source_type: Option<CliImageSourceType>,
+        source_type: Option<CliImageSource>,
     },
     Build {
         #[arg(long, default_value = "arm64")]
@@ -456,6 +451,7 @@ pub(crate) enum ImageCommand {
         #[arg(long)]
         tag: Option<String>,
     },
+    /// Push a locally built image to the selected platform registry.
     Push {
         #[arg(long, default_value = "latest")]
         tag: String,
@@ -464,6 +460,7 @@ pub(crate) enum ImageCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Mirror authored upstream images into the selected platform registry.
     Mirror {
         #[arg(long)]
         image: Option<String>,
@@ -473,7 +470,7 @@ pub(crate) enum ImageCommand {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum CliImageSourceType {
+pub(crate) enum CliImageSource {
     Build,
     Mirror,
     Registry,
@@ -597,16 +594,6 @@ impl From<CliStorageKind> for StorageKind {
         match value {
             CliStorageKind::InMemory => StorageKind::InMemory,
             CliStorageKind::Dsql => StorageKind::Dsql,
-        }
-    }
-}
-
-impl From<CliImageSourceType> for tokeira_deploy_engine::ImageSourceType {
-    fn from(value: CliImageSourceType) -> Self {
-        match value {
-            CliImageSourceType::Build => Self::Build,
-            CliImageSourceType::Mirror => Self::Mirror,
-            CliImageSourceType::Registry => Self::Registry,
         }
     }
 }

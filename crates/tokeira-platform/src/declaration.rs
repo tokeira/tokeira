@@ -6,14 +6,16 @@
 //! namespaces it exposes, its live operational capabilities, and the
 //! platform implementation that realizes those capabilities.
 
-use std::{fmt, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
+use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
-use futures_util::Stream;
+use serde::Serialize;
+use tokeira_deploy_engine::ImageSourceType;
 
 use crate::definition::Namespace;
 
-/// Live host/container port mapping shape shared with the operator surface.
-pub use tokeira_orchestrator::PortMapping;
+// Compatibility re-exports keep existing platform implementations source
+// stable while `ops` remains the owning module for the operational contract.
+pub use crate::ops::{LogStream, Ops, PortMapping};
 
 /// Everything the framework needs to operate one platform.
 ///
@@ -64,41 +66,73 @@ pub struct DeploymentRef {
     pub dir: PathBuf,
 }
 
-/// Incremental log output for one service.
-pub type LogStream = Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>>;
-
-/// A platform's ops surface over a running deployment: the live operator
-/// questions answered from the substrate itself.
+/// One platform-declared image shown by the generic provisioner shell.
 ///
-/// Implemented by platforms that have one; the framework mounts the
-/// corresponding operator verbs by presence and passes the operator's
-/// service name through — an implementation answers for the services it
-/// finds on the substrate, and an unknown name surfaces as the provider's
-/// own error.
+/// Repository names deliberately exclude a registry host. The owning
+/// platform selects and authenticates its registry only for a mutating image
+/// operation, so a read-only inventory never loads provider credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeclaredImage {
+    /// Stable logical name used by `--image` selection and reports.
+    pub name: String,
+    /// Whether the artifact is built locally, mirrored, or pulled through.
+    pub source_type: ImageSourceType,
+    /// Platform-scoped destination repository without a registry host.
+    pub repository: String,
+    /// Destination tag derived from the authored input.
+    pub tag: String,
+    /// Authored source for mirrored and pull-through images.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_ref: Option<String>,
+}
+
+/// The operator-facing result of one image publication.
+///
+/// Secret registry credentials never cross this boundary. The platform
+/// returns only public image coordinates for the generic shell to render.
+/// Deployment-state persistence remains exclusively in the deployment engine.
+#[derive(Debug, Clone)]
+pub struct PublishedImage {
+    /// Stable logical image name.
+    pub name: String,
+    /// Tagged registry reference selected by the operation.
+    pub resolved_ref: String,
+    /// Registry-returned immutable digest.
+    pub digest: String,
+    /// Every tagged reference published by the operation.
+    pub published_refs: Vec<String>,
+    /// Whether an already-resolved destination made provider publication
+    /// unnecessary.
+    pub skipped: bool,
+}
+
+/// Optional image lifecycle owned by a definition-backed platform.
+///
+/// Implementations own interpretation of image declarations, provider
+/// credentials, registry preparation, and the publication engine. This
+/// capability deliberately has no state-store surface: the existing
+/// deployment engine remains the sole owner of deployment-state persistence.
 #[async_trait::async_trait]
-pub trait Ops: Send + Sync + fmt::Debug {
-    /// Open incremental logs for one declared service.
-    async fn log_stream(
+pub trait ImageOperations: Send + Sync + fmt::Debug {
+    /// Resolve the platform's image inventory without loading credentials or
+    /// touching provider state.
+    fn list(&self, deployment: &DeploymentRef) -> anyhow::Result<Vec<DeclaredImage>>;
+
+    /// Publish selected locally built images and return their public results.
+    async fn push(
         &self,
         deployment: &DeploymentRef,
-        service: &str,
-        follow: bool,
-        tail: Option<u32>,
-    ) -> anyhow::Result<LogStream>;
+        image: Option<&str>,
+        tag: &str,
+    ) -> anyhow::Result<Vec<PublishedImage>>;
 
-    /// Resolve the live host/container port mappings for one declared
-    /// service.
-    async fn port_mappings(
+    /// Mirror selected authored upstream images and return their public
+    /// results.
+    async fn mirror(
         &self,
         deployment: &DeploymentRef,
-        service: &str,
-    ) -> anyhow::Result<Vec<PortMapping>>;
-
-    /// Change workload capacity (`<dim>=<n>` specs), returning the change
-    /// count. Required, deliberately undefaulted: an ops surface answers
-    /// every one of its verbs in its own words — a provider without a scale
-    /// dimension states its own refusal as the error.
-    async fn scale(&self, deployment: &DeploymentRef, specs: &[String]) -> anyhow::Result<usize>;
+        image: Option<&str>,
+    ) -> anyhow::Result<Vec<PublishedImage>>;
 }
 
 /// Result of running one platform's observability checks for a deployment.
@@ -184,6 +218,15 @@ pub trait PlatformExecution: Send + Sync + fmt::Debug {
 /// extensions are installed before this delegation.
 #[async_trait::async_trait]
 pub trait PlatformIntegration: Send + Sync + fmt::Debug {
+    /// Return the platform-owned image lifecycle, when the platform declares
+    /// one.
+    ///
+    /// A default absence keeps platforms with no managed image plane out of
+    /// the generic command surface without forcing placeholder handlers.
+    fn image_operations(&self) -> Option<&dyn ImageOperations> {
+        None
+    }
+
     /// Register infrastructure handles used by realized resources.
     async fn register_infra_extensions(
         &self,

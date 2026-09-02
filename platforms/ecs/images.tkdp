@@ -1,22 +1,41 @@
-# The private image repositories. Operators choose upstream/build images in
-# configuration; repository identities derive from the deployment project.
+# The private image repositories. The image inventory owns each suffix; this
+# module adds only the deployment-name prefix.
 
 from tokeira import EcrRepository
 
 
 def define(d, cfg, cx, images):
     images.resource(
-        "tokeirad", EcrRepository(repository=cx.project_name + "/tokeirad")
-    )
-    images.resource("mimir", EcrRepository(repository=cx.project_name + "/mimir"))
-    images.resource("loki", EcrRepository(repository=cx.project_name + "/loki"))
-    images.resource(
-        "grafana", EcrRepository(repository=cx.project_name + "/grafana")
-    )
-    images.resource("alloy", EcrRepository(repository=cx.project_name + "/alloy"))
-    images.resource(
-        "aws-cli", EcrRepository(repository=cx.project_name + "/aws-cli")
+        "tokeirad",
+        EcrRepository(repository=cx.project_name + "/" + cfg.images.tokeirad.repository),
     )
     images.resource(
-        "busybox", EcrRepository(repository=cx.project_name + "/busybox")
+        "tokeira-autoscaler",
+        EcrRepository(
+            repository=cx.project_name + "/" + cfg.images.autoscaler.repository
+        ),
+    )
+    images.resource(
+        "mimir",
+        EcrRepository(repository=cx.project_name + "/" + cfg.images.mimir.repository),
+    )
+    images.resource(
+        "loki",
+        EcrRepository(repository=cx.project_name + "/" + cfg.images.loki.repository),
+    )
+    images.resource(
+        "grafana",
+        EcrRepository(repository=cx.project_name + "/" + cfg.images.grafana.repository),
+    )
+    images.resource(
+        "alloy",
+        EcrRepository(repository=cx.project_name + "/" + cfg.images.alloy.repository),
+    )
+    images.resource(
+        "aws-cli",
+        EcrRepository(repository=cx.project_name + "/" + cfg.images.aws_cli.repository),
+    )
+    images.resource(
+        "busybox",
+        EcrRepository(repository=cx.project_name + "/" + cfg.images.busybox.repository),
     )

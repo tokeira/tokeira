@@ -1,3 +1,9 @@
+//! Generated S3 object lifecycle with explicit bucket ownership.
+//!
+//! Standalone objects retain their resolved bucket in resource state. Aggregate
+//! resources may own several objects under one state record and use
+//! [`S3Object::delete_from_bucket`] after resolving that shared bucket once.
+
 use aws_sdk_s3::primitives::ByteStream;
 use sha2::{Digest, Sha256};
 use tokeira_iac::{
@@ -89,22 +95,7 @@ impl Resource for S3Object {
             .get("bucket_name")
             .and_then(|value| value.as_str())
             .ok_or_else(|| IacError::StateNotFound("bucket_name missing".into()))?;
-        ctx.extension::<crate::AwsClients>()
-            .expect("AwsClients")
-            .s3
-            .delete_object()
-            .bucket(bucket)
-            .key(&self.key)
-            .send()
-            .await
-            .map_err(|error| {
-                IacError::AwsSdk(format!(
-                    "s3:DeleteObject {}: {}",
-                    self.key,
-                    error.into_service_error()
-                ))
-            })?;
-        Ok(())
+        self.delete_from_bucket(bucket, ctx).await
     }
 
     async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
@@ -140,6 +131,34 @@ impl Resource for S3Object {
 }
 
 impl S3Object {
+    /// Delete this object's key from an already-resolved bucket.
+    ///
+    /// Aggregate resources use this entry point because their state represents
+    /// the collection rather than one child object's `bucket_name` property.
+    /// The caller must resolve the bucket from its declared dependency before
+    /// invoking the provider mutation.
+    pub async fn delete_from_bucket(
+        &self,
+        bucket: &str,
+        ctx: &ProvisionContext,
+    ) -> Result<(), IacError> {
+        ctx.extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .s3
+            .delete_object()
+            .bucket(bucket)
+            .key(&self.key)
+            .send()
+            .await
+            .map_err(|error| {
+                IacError::AwsSdk(format!(
+                    "s3:DeleteObject {}: {}",
+                    self.key,
+                    error.into_service_error()
+                ))
+            })?;
+        Ok(())
+    }
     fn checksum(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.content.as_bytes());

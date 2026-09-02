@@ -5,12 +5,11 @@
 platform application-state convention selected by the `directories` crate.
 
 The architectural deployment shape is a custom `definition.tkd` vocabulary married to
-the platform-specific, provenance-bound `tkp` that defines and realizes it. Current
-operator coverage also retains an in-process shape while platforms move to that contract.
-A deployment records identity and selection metadata, desired configuration, server
-runtime configuration, and deployment-engine state. Today Local and ECS use
-`deployment.toml` with in-process handlers; Compose uses `definition.tkd` and a
-deployment-local engine. EKS does not yet provide a complete operator shape.
+the platform-specific, provenance-bound `tkp` that defines and realizes it. Local alone
+retains an in-process development shape. A deployment records identity and selection
+metadata, desired configuration, server runtime configuration, and deployment-engine
+state. Compose and ECS use definition sets with deployment-local engines. EKS does not
+yet provide a complete operator shape.
 
 ## Create and select a deployment
 
@@ -24,12 +23,11 @@ tkr deployment create \
   --platform compose \
   --storage in-memory
 
-# In-process ECS deployment
+# Definition-backed ECS deployment using the native development engine path
 tkr deployment create \
   --name production \
   --platform ecs \
-  --storage dsql \
-  --region us-east-1
+  --dev-engine
 
 tkr deployment list
 tkr deployment use compose-dev
@@ -70,7 +68,7 @@ is distinct from TKP's renewable operation lock and from state-store CAS.
 
 ## Two directory shapes
 
-### In-process: Local and ECS
+### In-process: Local
 
 ```text
 <registry>/<name>/
@@ -83,7 +81,7 @@ is distinct from TKP's renewable operation lock and from state-store CAS.
 `deployment.toml` contains platform desired configuration. `tkr` loads it into the
 platform's typed config and runs command handlers in-process.
 
-### Forwarded: Compose
+### Forwarded: Compose and ECS
 
 ```text
 <registry>/<name>/
@@ -155,7 +153,7 @@ tkr --deployment compose-dev infra destroy --yes
 |---|---|---|---:|
 | Local | `deployment.toml` | `tkr` in-process handlers | Yes |
 | Compose | `definition.tkd` | Deployment-local Compose `tkp` | Yes |
-| ECS | `deployment.toml` | `tkr` in-process handlers | Yes |
+| ECS | `definition.tkd` or `definition.tkdp` | Deployment-local ECS `tkp` | Yes |
 | EKS implementation components | No complete operator deployment source | No complete TKP route | No |
 
 The EKS crate's TKD bridge and kinds do not add an EKS value to `tkr`'s current
@@ -175,7 +173,8 @@ Some command names are deliberately shared while their executor differs:
 | `scale up/down` | Runs platform operations. | Launches TKP scale; Compose returns `NotApplicable`. |
 | `scale status` | Runs platform status. | Launches TKP describe. |
 | `deployment describe/apply/upgrade/rollback` | These provisioner lifecycle verbs expect a forwarded directory. | Launches the trust-aware TKP flow. |
-| `logs`, `port-forward`, `exec`, `schema` | Runs typed in-process handlers where the platform supports them. | No TKP forwarding path. |
+| `logs`, `port-forward` | Runs typed Local handlers. | Launches the corresponding TKP capability. |
+| `schema` | Runs the Local DSQL handler. | No TKP forwarding path. |
 
 The global `--deployment NAME` selects the target. `--json` and `--detail` control
 operator reports and cross into forwarded read-only commands. `--explanation PATH` can
@@ -217,8 +216,7 @@ tkr [--deployment NAME] [--json] [--detail]
 ├── scale
 │   └── up [SERVICE] [REPLICAS] | down [SERVICE] [REPLICAS] | status
 ├── logs SERVICE [--follow] [--tail N]
-├── port-forward SERVICE [--local-port PORT]
-├── exec SERVICE [--container NAME] [-- COMMAND...]
+├── port-forward SERVICE
 ├── schema
 │   └── setup --yes | status | validate
 └── config
@@ -263,28 +261,25 @@ store transition.
 tkr deployment create \
   --name production \
   --platform ecs \
-  --storage dsql \
-  --region us-east-1
+  --dev-engine
 
-tkr image mirror --yes
-tkr image build --arch arm64 --tag release
-tkr image push --tag release --yes
+tkr definition check
 tkr infra plan
 tkr infra apply --yes
-tkr schema setup --yes
 tkr deploy plan
 tkr deploy apply --yes
-tkr scale up
 ```
 
-ECS uses the compiled in-process platform, including its image, infrastructure, schema,
-workload, and day-2 handlers.
+ECS desired state, image repositories, infrastructure, workloads, and state placement
+are owned by the recorded definition and its bound provisioner. Provider choices are
+edited in the staged definition before the first apply.
 
 ## Image and schema configuration
 
-`tkr image` manages desired image workflows separately from deployment convergence.
-Building uses Dagger; ECS push and mirror also require appropriate ECR access. Runtime
-state recording of `repository:tag` is not proof that an image was built or published.
+`tkr image build` remains deployment-independent and uses Dagger. Definition-backed
+platforms declare their own image inventory and publication behavior; the in-process
+Local platform has no image list, push, or mirror path. Runtime state recording of
+`repository:tag` is not proof that an image was built or published.
 
 DSQL-backed in-process deployments apply schema migrations explicitly with `tkr schema
 setup --yes`, inspect them with `schema status`, and validate the migration set with
@@ -296,7 +291,7 @@ setup --yes`, inspect them with `schema status`, and validate the migration set 
 Use these read paths before mutation or when a gate refuses:
 
 - `tkr deployment list` identifies registry entries and the selected deployment;
-- `tkr config show` renders effective in-process configuration;
+- `tkr config show` renders effective Local configuration;
 - `tkr definition check` verifies a forwarded deployment source;
 - `tkr infra plan` and `tkr deploy plan` show desired changes;
 - `tkr deployment describe` reports the forwarded provisioner binding and state facts;

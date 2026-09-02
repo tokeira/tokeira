@@ -2,8 +2,8 @@
 
 For a definition-backed deployment, `tkr` is more than a process launcher. It constructs
 or obtains the platform engine, applies the deployment's build-authority policy, retains
-and places target-specific bytes, establishes the Day-0 verification material, and
-verifies the married executable before later versioned mutations. The spawned `tkp` then
+and places target-specific bytes, establishes the creation-time verification material, and
+verifies the bound executable before later versioned mutations. The spawned `tkp` then
 owns the lifecycle transition and provider convergence.
 
 This boundary is what makes a deployment definition safe to retain as data. Its format,
@@ -39,11 +39,11 @@ remain versioned configuration data rather than engine-identity input.
 
 <p align="center">
   <img src="../diagrams/tkp-construction.svg" width="900"
-       alt="How a tkp is built: platform and frontend packages declare themselves in Cargo metadata and tkr selects one pair without an enum; tokeira-build writes a three-dependency composition root inside a closure-scoped workspace; the source closure is frozen into a content-addressed git tree and EngineIdentity is derived without building; the bundle store is consulted by authority tier, identity, and target, and a miss runs the hermetic Dagger build — closure tests, a locked dist build of the generated root, strip, export, host-side hashing; the ProvisionerBundle is published manifest-last, the dev-engine path stays out of the store, and the bytes are retained and placed beside their sidecar.">
+       alt="How a tkp is built: a platform package declares itself in Cargo metadata and exports its PlatformDeclaration (the ECS platform shown verbatim), frontend packages declare their formats behind features, and tkr selects one pair without an enum; tokeira-build writes a three-dependency composition root inside a closure-scoped workspace; the source closure is frozen into a content-addressed git tree and EngineIdentity is derived without building; the bundle store is consulted by authority tier, identity, and target, and a miss runs the hermetic Dagger build — closure tests, a locked dist build of the generated root, strip, export, host-side hashing; the ProvisionerBundle is published manifest-last, the dev-engine path stays out of the store, and the bytes are retained and placed beside their sidecar.">
 </p>
 
 The bundled creation path begins from catalog selection rather than an already-installed
-executable or a hard-coded seed package:
+executable or a hard-coded starting package:
 
 1. `tkr` loads the normalized platform/frontend catalog from Cargo metadata, validates
    descriptor contracts and package coordinates, and selects one platform plus one
@@ -157,7 +157,7 @@ Local and ECS currently use the in-process deployment shape, receive `deployment
 and have no deployment-local provisioner. See
 [deployment configuration](deployment-configuration.md) for both layouts.
 
-## Day-0 marriage
+## Binding at creation
 
 Creation realizes the complete local deployment before its staged directory becomes
 visible. It does not create provider resources.
@@ -194,9 +194,9 @@ sequenceDiagram
     TKR-->>TKR: atomically publish complete deployment
 ```
 
-The envelope is now the durable marriage. Retained definition revisions have meaning
+The envelope is now the durable binding. Retained definition revisions have meaning
 under the recorded engine, and ordinary versioned mutation requires both the launcher
-and lifecycle gate to agree that the running engine is the married one.
+and lifecycle gate to agree that the running engine is the bound one.
 
 ## Verification on every launch class
 
@@ -207,7 +207,7 @@ Before spawning, `tkr` loads the envelope and classifies the request:
 | `ReadOnly` | `describe`, `definition check`, and namespaced plans | Resolve an available provisioner so blocked deployments remain diagnosable. | Not required. |
 | `Bound` | Normal mutation of a versioned deployment | Prefer `<deployment>/tkp`; refuse a development fallback. | Verify target-specific size and SHA-256 against the envelope integrity manifest. |
 | `DevCandidate` | Mutation of a development deployment | Use the deployment copy or native source fallback. | No versioned manifest requirement; development binding remains advisory. An unstamped directory is incomplete and the TKP gate refuses it. |
-| `CandidateUpgrade` | Upgrade | Resolve a candidate outside the old deployment-local married copy. | The old manifest describes engine A and cannot attest candidate B; the launcher does not perform replacement prelaunch manifest verification. |
+| `CandidateUpgrade` | Upgrade | Resolve a candidate outside the old deployment-local bound copy. | The old manifest describes engine A and cannot attest candidate B; the launcher does not perform replacement prelaunch manifest verification. |
 | `Rollback` | Engine handback | Start with bound B, then restore retained A. | Verify B against the current envelope and A against A's checkpoint manifest. |
 
 ```mermaid
@@ -301,7 +301,7 @@ Neither replaces state-store CAS.
 merely replacing a file:
 
 1. resolve candidate B from the native source pool, never from `<deployment>/tkp`, which
-   is married engine A;
+   is bound engine A;
 2. compare candidate and bound bytes, treating identical bytes as an idempotent no-op;
 3. launch candidate B's `upgrade` transition;
 4. let B checkpoint A, validate the transition, bind itself, record its running-binary
@@ -313,7 +313,7 @@ merely replacing a file:
 sequenceDiagram
     actor Operator
     participant TKR as tkr
-    participant A as married tkp A
+    participant A as bound tkp A
     participant B as candidate tkp B
     participant Envelope
     participant Provider
@@ -330,14 +330,14 @@ sequenceDiagram
         B->>Envelope: record audit and close marker
         B-->>TKR: success
         TKR->>TKR: replace deployment-local A with B
-        TKR-->>Operator: deployment is married to B
+        TKR-->>Operator: deployment is bound to B
     end
 ```
 
 Candidate-upgrade launch is not equivalent to bound launch verification. A's manifest
 cannot attest B, and the current launcher does not require B to arrive through the bundle
 obtain path before starting it. B self-records integrity during a successful ownership
-transition so subsequent bound launches can verify the married deployment-local bytes.
+transition so subsequent bound launches can verify the bound deployment-local bytes.
 
 ## Rollback: verified handback from B to A
 
@@ -392,7 +392,7 @@ the single-process fallback and cannot claim the verified two-binary handoff.
 A platform `tkp` can be invoked directly for a known deployment directory, but doing so
 does not reproduce TKR's full role. `tkr` adds registry selection, platform-engine obtain
 and placement, authority policy, identity-keyed retention, launch-class byte verification,
-staged Day-0 realization, candidate selection, deployment-level lock enforcement, and
+staged creation-time realization, candidate selection, deployment-level lock enforcement, and
 multi-binary rollback. It is therefore the recommended operator surface; direct TKP
 commands are primarily useful for implementation tests and precise lifecycle diagnosis.
 

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1790" viewBox="0 0 2400 1790">
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1886" viewBox="0 0 2400 1886">
 <defs>
   <linearGradient id="ctrl" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ecfeff"/><stop offset="1" stop-color="#EDF1F3"/></linearGradient>
   <linearGradient id="auto" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff7ed"/><stop offset="1" stop-color="#F7F0DC"/></linearGradient>
@@ -18,11 +18,11 @@
     .flowlabel { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 11px; font-weight: 700; fill:#6E6860; }
   </style>
 </defs>
-<rect x="0" y="0" width="2400" height="1790" fill="#F6F3EE"/>
+<rect x="0" y="0" width="2400" height="1886" fill="#F6F3EE"/>
 
 <text x="70" y="24" font-family="'SF Mono',Menlo,monospace" font-size="14" letter-spacing="3" fill="#9A4A2C">TOKEIRA &#183; PROVISIONING</text>
 <text x="70" y="60" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif" font-size="34" font-weight="700" fill="#1B1714">How a tkp is built</text>
-<text x="70" y="94" class="subtitle">One platform, one definition frontend, one generic shell &#8212; composed into a single static engine, frozen, identified, built hermetically, and married to its deployment.</text>
+<text x="70" y="94" class="subtitle">One platform, one definition frontend, one generic shell &#8212; composed into a single static engine, frozen, identified, built hermetically, and bound to its deployment.</text>
 
 <rect x="1560" y="26" width="770" height="100" rx="18" fill="#FFFFFF" stroke="#D8D2C8" stroke-width="1.2"/>
 <text x="1586" y="52" class="subhead">Flow key</text>
@@ -36,106 +36,149 @@
 <text x="1972" y="106" class="flowlabel">derived without building</text>
 
 <!-- BAND 1: SELECT -->
-<text x="70" y="168" class="section">SELECT &#8212; THE CATALOG, NEVER AN ENUM</text>
-<rect x="70" y="186" width="2260" height="284" rx="26" fill="url(#ctrl)" stroke="#BCD6DB" stroke-width="2"/>
+<text x="70" y="168" class="section">SELECT &#8212; THE CATALOG, NEVER AN ENUM &#183; THE ECS PLATFORM AS THE EXAMPLE</text>
+<rect x="70" y="186" width="2260" height="380" rx="26" fill="url(#ctrl)" stroke="#BCD6DB" stroke-width="2"/>
 
-<rect x="110" y="226" width="680" height="208" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<rect x="110" y="226" width="520" height="300" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
 <circle cx="140" cy="256" r="13" fill="#0B7285"/><text x="140" y="261" class="num" text-anchor="middle">1</text>
-<text x="162" y="261" class="subhead">Platform packages declare themselves</text>
-<text x="136" y="290" class="code">[package.metadata.tokeira.platform]</text>
-<text x="136" y="318" class="micro">
-<tspan x="136" dy="0">an open platform id, the engine version it indicates, the definition seed</tspan>
-<tspan x="136" dy="20">it ships, and its content roots &#8212; read from cargo metadata, so a platform</tspan>
-<tspan x="136" dy="20">is just another workspace member: platforms/compose, platforms/ecs,</tspan>
-<tspan x="136" dy="20">platforms/eks. Nothing in tkr names them.</tspan>
+<text x="162" y="261" class="subhead">A platform package declares itself</text>
+<text x="136" y="290" class="code">
+<tspan x="136" dy="0">[package.metadata.tokeira.platform]</tspan>
+<tspan x="136" dy="19">id = "ecs"</tspan>
+<tspan x="136" dy="19">engine = "0.1.1"</tspan>
+<tspan x="136" dy="19">default = false</tspan>
+<tspan x="136" dy="19">default-format = "tkd"</tspan>
+<tspan x="136" dy="19">definitions = ["deployment.tkd",</tspan>
+<tspan x="136" dy="19">               "definition.tkdp"]</tspan>
+<tspan x="136" dy="19">content = ["observability"]</tspan>
+</text>
+<text x="136" y="452" class="micro">
+<tspan x="136" dy="0">platforms/ecs/Cargo.toml, verbatim: the open id, the engine version,</tspan>
+<tspan x="136" dy="20">the default format, the definition archetypes it ships (one root</tspan>
+<tspan x="136" dy="20">per format), and the content roots. Nothing in tkr names ecs.</tspan>
 </text>
 
-<rect x="850" y="226" width="640" height="208" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
-<circle cx="880" cy="256" r="13" fill="#0B7285"/><text x="880" y="261" class="num" text-anchor="middle">2</text>
-<text x="902" y="261" class="subhead">Frontend packages declare a format</text>
-<text x="876" y="290" class="micro">
-<tspan x="876" dy="0">a definition-frontend descriptor: the format id (tkd | tkdp), its canonical</tspan>
-<tspan x="876" dy="20">source extension, and package coordinates. The frontend exports an</tspan>
-<tspan x="876" dy="20">evaluator; the platform exports its provisioner constructor.</tspan>
+<rect x="670" y="226" width="520" height="300" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<circle cx="700" cy="256" r="13" fill="#0B7285"/><text x="700" y="261" class="num" text-anchor="middle">2</text>
+<text x="722" y="261" class="subhead">&#8230; and exports its declaration</text>
+<text x="696" y="290" class="code">
+<tspan x="696" dy="0">pub fn platform() -&gt; PlatformDeclaration {</tspan>
+<tspan x="696" dy="19">  PlatformDeclaration {</tspan>
+<tspan x="696" dy="19">    namespaces: vec![ tokeira_ecs::kinds::namespace(),</tspan>
+<tspan x="696" dy="19">      server_config::namespace(), observability::namespace(),</tspan>
+<tspan x="696" dy="19">      Namespace { name: tokeira_aws::kinds::NAMESPACE, .. } ],</tspan>
+<tspan x="696" dy="19">    ops: None, observability: None,</tspan>
+<tspan x="696" dy="19">    execution: Box::new(EcsExecution),</tspan>
+<tspan x="696" dy="19">    implementation: Arc::new(EcsIntegration),</tspan>
+<tspan x="696" dy="19">} }</tspan>
 </text>
-<rect x="876" y="374" width="330" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
-<text x="890" y="391" class="chip">descriptors cannot inject Rust paths or dependencies</text>
-
-<rect x="1550" y="226" width="740" height="208" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
-<circle cx="1580" cy="256" r="13" fill="#0B7285"/><text x="1580" y="261" class="num" text-anchor="middle">3</text>
-<text x="1602" y="261" class="subhead">tkr selects one pair</text>
-<text x="1576" y="290" class="micro">
-<tspan x="1576" dy="0">validate every descriptor's contract and coordinates, then choose one platform</tspan>
-<tspan x="1576" dy="20">and one compatible definition frontend; the platform's own definition seed is</tspan>
-<tspan x="1576" dy="20">the evidence the pair exists. No platform enum, no match arm &#8212; adding a</tspan>
-<tspan x="1576" dy="20">platform is adding a package, and tkr never learns its name.</tspan>
+<text x="696" y="471" class="micro">
+<tspan x="696" dy="0">platforms/ecs/src/lib.rs, trimmed: pure assembly with no I/O. The</tspan>
+<tspan x="696" dy="20">namespaces are the vocabulary a definition may use; execution and</tspan>
+<tspan x="696" dy="20">implementation are the seams the generic shell drives.</tspan>
 </text>
 
-<path d="M790,330 L850,330" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
-<path d="M1490,330 L1550,330" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<rect x="1230" y="226" width="520" height="300" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<circle cx="1260" cy="256" r="13" fill="#0B7285"/><text x="1260" y="261" class="num" text-anchor="middle">3</text>
+<text x="1282" y="261" class="subhead">Frontend packages declare a format</text>
+<text x="1256" y="290" class="code">
+<tspan x="1256" dy="0">[[package.metadata.tokeira.definition-frontend]]</tspan>
+<tspan x="1256" dy="19">format = "tkd"</tspan>
+<tspan x="1256" dy="19">source-extension = "tkd"</tspan>
+<tspan x="1256" dy="19">feature = "tkd"</tspan>
+<tspan x="1256" dy="19"></tspan>
+<tspan x="1256" dy="19">[[package.metadata.tokeira.definition-frontend]]</tspan>
+<tspan x="1256" dy="19">format = "tkdp"  &#183;  source-extension = "tkdp"  &#183;  feature = "tkdp"</tspan>
+</text>
+<text x="1256" y="432" class="micro">
+<tspan x="1256" dy="0">crates/tokeira-platform-definition/Cargo.toml: two frontends, one</tspan>
+<tspan x="1256" dy="20">crate. Each evaluator lives behind its feature, so a tkd-only engine</tspan>
+<tspan x="1256" dy="20">never carries the Python train.</tspan>
+</text>
+<rect x="1256" y="486" width="330" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
+<text x="1270" y="503" class="chip">descriptors cannot inject Rust paths or dependencies</text>
+
+<rect x="1790" y="226" width="500" height="300" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<circle cx="1820" cy="256" r="13" fill="#0B7285"/><text x="1820" y="261" class="num" text-anchor="middle">4</text>
+<text x="1842" y="261" class="subhead">tkr selects one pair</text>
+<text x="1816" y="290" class="micro">
+<tspan x="1816" dy="0">validate every descriptor's contract and coordinates,</tspan>
+<tspan x="1816" dy="20">then choose one platform and one compatible definition</tspan>
+<tspan x="1816" dy="20">frontend; the platform's own definition archetype is</tspan>
+<tspan x="1816" dy="20">the evidence the pair exists</tspan>
+<tspan x="1816" dy="26">no platform enum, no match arm &#8212; adding a platform</tspan>
+<tspan x="1816" dy="20">is adding a package, and tkr never learns its name</tspan>
+<tspan x="1816" dy="26">the selection is a fact of the engine's identity: the</tspan>
+<tspan x="1816" dy="20">platform, the format, and the engine version join the</tspan>
+<tspan x="1816" dy="20">generated-root digest below</tspan>
+</text>
+
+<path d="M630,376 L670,376" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M1190,376 L1230,376" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M1750,376 L1790,376" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
 
 <!-- BAND 2: COMPOSE -->
-<text x="70" y="524" class="section">COMPOSE &#8212; THE GENERATED ROOT AND THE SCOPED WORKSPACE</text>
-<rect x="70" y="542" width="2260" height="360" rx="26" fill="url(#auto)" stroke="#E3D5B7" stroke-width="2"/>
+<text x="70" y="620" class="section">COMPOSE &#8212; THE GENERATED ROOT AND THE SCOPED WORKSPACE</text>
+<rect x="70" y="638" width="2260" height="360" rx="26" fill="url(#auto)" stroke="#E3D5B7" stroke-width="2"/>
 
-<rect x="110" y="582" width="780" height="284" rx="14" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.25"/>
-<circle cx="140" cy="612" r="13" fill="#B08D2E"/><text x="140" y="617" class="num" text-anchor="middle">4</text>
-<text x="162" y="617" class="subhead">The composition root &#8212; tokeira-build writes it, cargo builds it</text>
-<text x="136" y="646" class="code">
+<rect x="110" y="678" width="780" height="284" rx="14" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.25"/>
+<circle cx="140" cy="708" r="13" fill="#B08D2E"/><text x="140" y="713" class="num" text-anchor="middle">5</text>
+<text x="162" y="713" class="subhead">The composition root &#8212; tokeira-build writes it, cargo builds it</text>
+<text x="136" y="742" class="code">
 <tspan x="136" dy="0">.tokeira-build/bound-provisioner/</tspan>
 <tspan x="136" dy="19">  Cargo.toml   [package] name = "tokeira-bound-provisioner"</tspan>
 <tspan x="136" dy="19">               [dependencies] &lt;platform&gt; &#183; &lt;frontend&gt; &#183; tokeira-tkp</tspan>
 <tspan x="136" dy="19">  src/main.rs  binds the two conventional exports &#8594; tokeira_tkp::run</tspan>
 </text>
-<text x="136" y="746" class="micro">
+<text x="136" y="842" class="micro">
 <tspan x="136" dy="0">exactly three direct dependencies and no runtime dispatch: the compiler</tspan>
 <tspan x="136" dy="20">assembles one concrete engine, and the tiny entry point's compiled closure</tspan>
 <tspan x="136" dy="20">is the language engine. The generated bytes are digested together with the</tspan>
 <tspan x="136" dy="20">selection facts and both private contract versions (generated-root digest).</tspan>
 </text>
 
-<rect x="950" y="582" width="640" height="284" rx="14" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.25"/>
-<circle cx="980" cy="612" r="13" fill="#B08D2E"/><text x="980" y="617" class="num" text-anchor="middle">5</text>
-<text x="1002" y="617" class="subhead">The closure-scoped workspace</text>
-<text x="976" y="646" class="code">.tokeira-build/scoped-workspace/</text>
-<text x="976" y="676" class="micro">
+<rect x="950" y="678" width="640" height="284" rx="14" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.25"/>
+<circle cx="980" cy="708" r="13" fill="#B08D2E"/><text x="980" y="713" class="num" text-anchor="middle">6</text>
+<text x="1002" y="713" class="subhead">The closure-scoped workspace</text>
+<text x="976" y="742" class="code">.tokeira-build/scoped-workspace/</text>
+<text x="976" y="772" class="micro">
 <tspan x="976" dy="0">an ordinary cargo workspace &#8212; never a detached island with a private</tspan>
 <tspan x="976" dy="20">lock. Members are exactly the closure's crates plus the generated root;</tspan>
 <tspan x="976" dy="20">its Cargo.lock is a pure text filter of the workspace's authoritative</tspan>
 <tspan x="976" dy="20">lock. Cargo stays the sole resolver; --locked proves the scoped lock</tspan>
 <tspan x="976" dy="20">exact for the build and the closure tests alike.</tspan>
 </text>
-<rect x="976" y="800" width="470" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
-<text x="990" y="817" class="chip">one gitignored directory serves the snapshot author and the native dev build</text>
+<rect x="976" y="896" width="470" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
+<text x="990" y="913" class="chip">one gitignored directory serves the snapshot author and the native dev build</text>
 
-<rect x="1650" y="582" width="640" height="284" rx="14" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.25"/>
-<circle cx="1680" cy="612" r="13" fill="#B08D2E"/><text x="1680" y="617" class="num" text-anchor="middle">6</text>
-<text x="1702" y="617" class="subhead">The source closure</text>
-<text x="1676" y="646" class="micro">
+<rect x="1650" y="678" width="640" height="284" rx="14" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.25"/>
+<circle cx="1680" cy="708" r="13" fill="#B08D2E"/><text x="1680" y="713" class="num" text-anchor="middle">7</text>
+<text x="1702" y="713" class="subhead">The source closure</text>
+<text x="1676" y="742" class="micro">
 <tspan x="1676" dy="0">shell &#8746; selected platform &#8746; selected frontend, walked from cargo</tspan>
 <tspan x="1676" dy="20">metadata with all features on &#8212; an over-approximation, which is the</tspan>
 <tspan x="1676" dy="20">safe direction for an identity input: it can only re-key more often,</tspan>
 <tspan x="1676" dy="20">never reuse wrong bytes. The workspace build files join it:</tspan>
 </text>
-<text x="1676" y="752" class="code">
+<text x="1676" y="848" class="code">
 <tspan x="1676" dy="0">Cargo.toml &#183; Cargo.lock &#183; rust-toolchain.toml</tspan>
 <tspan x="1676" dy="19">.cargo/config.toml &#183; the storage schema contract</tspan>
 </text>
-<rect x="1676" y="800" width="300" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
-<text x="1690" y="817" class="chip">the definition is data &#8212; never in the closure</text>
+<rect x="1676" y="896" width="300" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
+<text x="1690" y="913" class="chip">the definition is data &#8212; never in the closure</text>
 
-<path d="M890,724 L950,724" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
-<path d="M1590,724 L1650,724" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
-<path d="M1200,470 L1200,542" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M890,820 L950,820" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M1590,820 L1650,820" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M1200,566 L1200,638" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
 
 <!-- BAND 3 LEFT: FREEZE + IDENTIFY -->
-<text x="70" y="956" class="section">FREEZE + IDENTIFY &#8212; WITHOUT BUILDING</text>
-<rect x="70" y="974" width="1400" height="420" rx="26" fill="url(#infra)" stroke="#D8D2C8" stroke-width="2"/>
+<text x="70" y="1052" class="section">FREEZE + IDENTIFY &#8212; WITHOUT BUILDING</text>
+<rect x="70" y="1070" width="1400" height="420" rx="26" fill="url(#infra)" stroke="#D8D2C8" stroke-width="2"/>
 
-<rect x="110" y="1014" width="640" height="340" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
-<circle cx="140" cy="1044" r="13" fill="#33586E"/><text x="140" y="1049" class="num" text-anchor="middle">7</text>
-<text x="162" y="1049" class="subhead">Freeze the closure</text>
-<text x="136" y="1078" class="micro">
+<rect x="110" y="1110" width="640" height="340" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<circle cx="140" cy="1140" r="13" fill="#33586E"/><text x="140" y="1145" class="num" text-anchor="middle">8</text>
+<text x="162" y="1145" class="subhead">Freeze the closure</text>
+<text x="136" y="1174" class="micro">
 <tspan x="136" dy="0">the tracked worktree bytes under every closure path &#8212; staged and</tspan>
 <tspan x="136" dy="20">unstaged alike &#8212; become a content-addressed git tree, wrapped in a</tspan>
 <tspan x="136" dy="20">deterministic audit commit (fixed identity, fixed timestamps). No ref is</tspan>
@@ -145,20 +188,20 @@
 <tspan x="136" dy="26">identity keys on the tree oid (pure content); the commit is the handle</tspan>
 <tspan x="136" dy="20">a human can git show</tspan>
 </text>
-<rect x="136" y="1300" width="380" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
-<text x="150" y="1317" class="chip">an untracked .rs under the closure refuses by default, listed</text>
+<rect x="136" y="1396" width="380" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
+<text x="150" y="1413" class="chip">an untracked .rs under the closure refuses by default, listed</text>
 
-<rect x="810" y="1014" width="620" height="340" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
-<circle cx="840" cy="1044" r="13" fill="#33586E"/><text x="840" y="1049" class="num" text-anchor="middle">8</text>
-<text x="862" y="1049" class="subhead">EngineIdentity &#8212; are two tkp binaries interchangeable?</text>
-<text x="836" y="1078" class="code">
+<rect x="810" y="1110" width="620" height="340" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<circle cx="840" cy="1140" r="13" fill="#33586E"/><text x="840" y="1145" class="num" text-anchor="middle">9</text>
+<text x="862" y="1145" class="subhead">EngineIdentity &#8212; are two tkp binaries interchangeable?</text>
+<text x="836" y="1174" class="code">
 <tspan x="836" dy="0">source_closure   tree oid &#8853; generated-root digest</tspan>
 <tspan x="836" dy="19">lock_closure     reachable locked deps: name &#183; version &#183; source &#183; checksum</tspan>
 <tspan x="836" dy="19">toolchain        the exact rustc, from rust-toolchain.toml</tspan>
 <tspan x="836" dy="19">build_container  &lt;image&gt;@sha256:&lt;digest&gt;   (None = a native dev build)</tspan>
 <tspan x="836" dy="19">features &#183; profile</tspan>
 </text>
-<text x="836" y="1200" class="micro">
+<text x="836" y="1296" class="micro">
 <tspan x="836" dy="0">bound evidence rides beside it: platform, format, engine version, the</tspan>
 <tspan x="836" dy="20">generated-root and closure digests &#8212; disagreement is an admission failure</tspan>
 <tspan x="836" dy="26">BuildAuthority is orthogonal: LocalDeveloper | TrustedCi says who built</tspan>
@@ -166,26 +209,26 @@
 <tspan x="836" dy="20">so the store is partitioned by it</tspan>
 </text>
 
-<path d="M750,1184 L810,1184" fill="none" stroke="#B85C38" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arr_rust)"/>
-<path d="M640,902 L640,974" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M750,1280 L810,1280" fill="none" stroke="#B85C38" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arr_rust)"/>
+<path d="M640,998 L640,1070" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
 
 <!-- BAND 3 RIGHT: OBTAIN -->
-<text x="1510" y="956" class="section">OBTAIN &#8212; RESOLVE OR BUILD</text>
-<rect x="1500" y="974" width="830" height="420" rx="26" fill="#EDF5EF" stroke="#CBE3D2" stroke-width="2"/>
+<text x="1510" y="1052" class="section">OBTAIN &#8212; RESOLVE OR BUILD</text>
+<rect x="1500" y="1070" width="830" height="420" rx="26" fill="#EDF5EF" stroke="#CBE3D2" stroke-width="2"/>
 
-<rect x="1540" y="1014" width="750" height="128" rx="14" fill="#FFFFFF" stroke="#DDEEE2" stroke-width="1.25"/>
-<circle cx="1570" cy="1044" r="13" fill="#2F7D4F"/><text x="1570" y="1049" class="num" text-anchor="middle">9</text>
-<text x="1592" y="1049" class="subhead">The bundle store &#8212; .bundle-cas</text>
-<text x="1566" y="1078" class="micro">
+<rect x="1540" y="1110" width="750" height="128" rx="14" fill="#FFFFFF" stroke="#DDEEE2" stroke-width="1.25"/>
+<circle cx="1570" cy="1140" r="13" fill="#2F7D4F"/><text x="1570" y="1145" class="num" text-anchor="middle">10</text>
+<text x="1592" y="1145" class="subhead">The bundle store &#8212; .bundle-cas</text>
+<text x="1566" y="1174" class="micro">
 <tspan x="1566" dy="0">keyed authority-tier / identity / target. A hit is re-admitted &#8212; authority floor,</tspan>
 <tspan x="1566" dy="20">revocation list, byte re-hash &#8212; and a present but inadmissible entry is an error,</tspan>
 <tspan x="1566" dy="20">never a quiet rebuild. Zero compilation on a hit.</tspan>
 </text>
 
-<rect x="1540" y="1172" width="750" height="182" rx="14" fill="#FFFFFF" stroke="#DDEEE2" stroke-width="1.25"/>
-<circle cx="1570" cy="1202" r="13" fill="#2F7D4F"/><text x="1570" y="1207" class="num" text-anchor="middle">10</text>
-<text x="1592" y="1207" class="subhead">Hermetic Dagger build &#8212; on a miss, one function for laptop and CI</text>
-<text x="1566" y="1236" class="code">
+<rect x="1540" y="1268" width="750" height="182" rx="14" fill="#FFFFFF" stroke="#DDEEE2" stroke-width="1.25"/>
+<circle cx="1570" cy="1298" r="13" fill="#2F7D4F"/><text x="1570" y="1303" class="num" text-anchor="middle">11</text>
+<text x="1592" y="1303" class="subhead">Hermetic Dagger build &#8212; on a miss, one function for laptop and CI</text>
+<text x="1566" y="1332" class="code">
 <tspan x="1566" dy="0">container &lt;image&gt;@sha256 + pkg-config libssl protobuf &#183; RUSTUP_TOOLCHAIN pinned</tspan>
 <tspan x="1566" dy="19">/src = the frozen snapshot only &#8212; no target/ mounted, no live tree</tspan>
 <tspan x="1566" dy="19">cargo test --locked  (the closure crates)              &#8594; TestEvidence</tspan>
@@ -194,58 +237,58 @@
 <tspan x="1566" dy="19">strip &#183; export &#183; SHA-256 and size measured host-side</tspan>
 </text>
 
-<path d="M1430,1150 L1540,1078" fill="none" stroke="#B85C38" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arr_rust)"/>
-<text x="1444" y="1118" class="flowlabel">identity &#8594; lookup</text>
-<path d="M1690,1142 L1690,1172" fill="none" stroke="#B08D2E" stroke-width="3" marker-end="url(#arr_gold)"/>
-<text x="1704" y="1162" class="flowlabel">miss</text>
+<path d="M1430,1246 L1540,1174" fill="none" stroke="#B85C38" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arr_rust)"/>
+<text x="1444" y="1214" class="flowlabel">identity &#8594; lookup</text>
+<path d="M1690,1238 L1690,1268" fill="none" stroke="#B08D2E" stroke-width="3" marker-end="url(#arr_gold)"/>
+<text x="1704" y="1258" class="flowlabel">miss</text>
 
-<!-- BAND 4: PACKAGE + MARRY -->
-<text x="70" y="1448" class="section">PACKAGE + MARRY</text>
-<rect x="70" y="1466" width="2260" height="290" rx="26" fill="url(#ctrl)" stroke="#BCD6DB" stroke-width="2"/>
+<!-- BAND 4: PACKAGE + BIND -->
+<text x="70" y="1544" class="section">PACKAGE + BIND</text>
+<rect x="70" y="1562" width="2260" height="290" rx="26" fill="url(#ctrl)" stroke="#BCD6DB" stroke-width="2"/>
 
-<rect x="110" y="1506" width="760" height="212" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
-<circle cx="140" cy="1536" r="13" fill="#0B7285"/><text x="140" y="1541" class="num" text-anchor="middle">11</text>
-<text x="162" y="1541" class="subhead">ProvisionerBundle &#8212; the unit the build produces and the store keeps</text>
-<text x="136" y="1570" class="code">
+<rect x="110" y="1602" width="760" height="212" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<circle cx="140" cy="1632" r="13" fill="#0B7285"/><text x="140" y="1637" class="num" text-anchor="middle">12</text>
+<text x="162" y="1637" class="subhead">ProvisionerBundle &#8212; the unit the build produces and the store keeps</text>
+<text x="136" y="1666" class="code">
 <tspan x="136" dy="0">identity &#183; bound evidence &#183; authority &#183; provisioner_version</tspan>
 <tspan x="136" dy="19">artifacts[ target &#183; sha256 &#183; size &#183; retrieval_ref ]</tspan>
 <tspan x="136" dy="19">tests { command, passed }</tspan>
 <tspan x="136" dy="19">build { request id, tree oid, commit oid, toolchain, builder }</tspan>
 </text>
-<text x="136" y="1670" class="micro">
+<text x="136" y="1766" class="micro">
 <tspan x="136" dy="0">publish &#8594; the store verifies every artifact against its descriptor, refuses</tspan>
 <tspan x="136" dy="20">failed test evidence outright, and writes the manifest last</tspan>
 </text>
 
-<rect x="930" y="1506" width="640" height="212" rx="14" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1.25"/>
-<circle cx="960" cy="1536" r="13" fill="#B08D2E"/><text x="960" y="1541" class="num" text-anchor="middle">12</text>
-<text x="982" y="1541" class="subhead" fill="#8A6A14">--dev-engine &#8212; the stated development path</text>
-<text x="956" y="1570" class="micro">
+<rect x="930" y="1602" width="640" height="212" rx="14" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1.25"/>
+<circle cx="960" cy="1632" r="13" fill="#B08D2E"/><text x="960" y="1637" class="num" text-anchor="middle">13</text>
+<text x="982" y="1637" class="subhead" fill="#8A6A14">--dev-engine &#8212; the stated development path</text>
+<text x="956" y="1666" class="micro">
 <tspan x="956" dy="0">a native cargo build of the same generated root in the scoped workspace,</tspan>
 <tspan x="956" dy="20">on the host, incremental. The sidecar is honest about what it is: a</tspan>
 <tspan x="956" dy="20">synthesized dev-tier bundle with build_container None, profile dev,</tspan>
 <tspan x="956" dy="20">tests.passed: false ("native workspace build"), LocalDeveloper authority</tspan>
 </text>
-<rect x="956" y="1672" width="330" height="26" rx="13" fill="#FFFFFF" stroke="#E3CF8E" stroke-width="1"/>
-<text x="970" y="1689" class="chip">never enters the CAS; an S3 publication refuses it</text>
+<rect x="956" y="1768" width="330" height="26" rx="13" fill="#FFFFFF" stroke="#E3CF8E" stroke-width="1"/>
+<text x="970" y="1785" class="chip">never enters the CAS; an S3 publication refuses it</text>
 
-<rect x="1630" y="1506" width="660" height="212" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
-<circle cx="1660" cy="1536" r="13" fill="#0B7285"/><text x="1660" y="1541" class="num" text-anchor="middle">13</text>
-<text x="1682" y="1541" class="subhead">Marriage &#8212; the bytes take up residence</text>
-<text x="1656" y="1570" class="code">
+<rect x="1630" y="1602" width="660" height="212" rx="14" fill="#FFFFFF" stroke="#D9E8EB" stroke-width="1.25"/>
+<circle cx="1660" cy="1632" r="13" fill="#0B7285"/><text x="1660" y="1637" class="num" text-anchor="middle">14</text>
+<text x="1682" y="1637" class="subhead">Binding &#8212; the bytes take up residence</text>
+<text x="1656" y="1666" class="code">
 <tspan x="1656" dy="0">state/binaries/&lt;identity&gt;/&lt;triple&gt;   retained, checksum-verified on retrieval</tspan>
 <tspan x="1656" dy="19">&lt;deployment&gt;/tkp                    placed, 0755</tspan>
 <tspan x="1656" dy="19">&lt;deployment&gt;/tkp.manifest.json      the full bundle as the sidecar</tspan>
 </text>
-<text x="1656" y="1650" class="micro">
-<tspan x="1656" dy="0">at Day 0 the envelope records the integrity manifest and the engine's</tspan>
+<text x="1656" y="1746" class="micro">
+<tspan x="1656" dy="0">at creation the envelope records the integrity manifest and the engine's</tspan>
 <tspan x="1656" dy="20">provenance &#8212; from here, "How a deployment is born" continues, and every</tspan>
 <tspan x="1656" dy="20">later launch re-hashes these bytes against that manifest</tspan>
 </text>
 
-<path d="M1900,1394 L1900,1466" fill="none" stroke="#2F7D4F" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_green)"/>
-<text x="1914" y="1436" class="flowlabel">obtained bytes</text>
-<path d="M470,1394 L470,1466" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
-<path d="M870,1612 L930,1612" fill="none" stroke="#B08D2E" stroke-width="3" marker-end="url(#arr_gold)"/>
-<path d="M1570,1612 L1630,1612" fill="none" stroke="#2F7D4F" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_green)"/>
+<path d="M1900,1490 L1900,1562" fill="none" stroke="#2F7D4F" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_green)"/>
+<text x="1914" y="1532" class="flowlabel">obtained bytes</text>
+<path d="M470,1490 L470,1562" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M870,1708 L930,1708" fill="none" stroke="#B08D2E" stroke-width="3" marker-end="url(#arr_gold)"/>
+<path d="M1570,1708 L1630,1708" fill="none" stroke="#2F7D4F" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_green)"/>
 </svg>

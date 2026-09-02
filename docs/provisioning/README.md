@@ -83,7 +83,7 @@ engine inputs can be built by a local developer or trusted CI, while
 deployment policy can require one authority tier. The CAS address is
 partitioned by authority tier and keyed by engine identity and target, so
 local bytes cannot satisfy a trusted-CI floor. How the engine is composed,
-frozen, identified, built, and married is drawn in
+frozen, identified, built, and bound is drawn in
 [How a tkp is built](../diagrams/tkp-construction.svg) and explained in
 [`tkr` and `tkp`](tkr-and-tkp.md).
 
@@ -125,7 +125,8 @@ by identity, never found by name.
 
 ## The deployment repository
 
-Every named deployment is backed by a TUF repository: a signed, pinned trust
+Every named deployment is backed by a [TUF](https://theupdateframework.io)
+repository (The Update Framework): a signed, pinned trust
 anchor under `state/repository/`, a publisher configuration, and a publication
 lineage of claims — the definition root, companion parts, the config tree,
 the engine manifest, and one engine binary per target. Residency at create is

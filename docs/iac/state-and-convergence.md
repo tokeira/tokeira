@@ -64,7 +64,7 @@ placement.
 
 <p align="center">
   <img src="../diagrams/remote-state-deployment.svg" width="900"
-       alt="One deployment, two seats, one remote state: metadata.json records one state location for the envelope, infrastructure state, runtime state, and operation lease, which tkr and tkp each open independently; seat A creates with remote state under the operation lease, refusing a prefix that already holds state and committing the Day-0 envelope before the local rename; the birth publication's signed claim carries the location; seat B fetches the publication from the pinned trust anchor, materializes into staging, and joins the remote envelope only when the deployment id, engine binding, integrity manifest, and configuration revision agree; every mutating verb on any seat runs under the same lease with per-document CAS, and destroy retains the remote snapshots.">
+       alt="One deployment, two seats, one remote state: metadata.json records one state location for the envelope, infrastructure state, runtime state, and operation lease, which tkr and tkp each open independently; seat A creates with remote state under the operation lease, refusing a prefix that already holds state and committing the creation envelope before the local rename; the birth publication's signed claim carries the location; seat B fetches the publication from the pinned trust anchor, materializes into staging, and joins the remote envelope only when the deployment id, engine binding, integrity manifest, and configuration revision agree; the deployment repository band states what a consumer trusts, why TUF was selected, and what Tokeira adds on top; every mutating verb on any seat runs under the same lease with per-document CAS, and destroy retains the remote snapshots.">
 </p>
 
 Remote state is a create-time deployment property:
@@ -86,7 +86,7 @@ state writes request S3-managed encryption and use conditional writes for CAS. T
 bucket region is recorded independently of the platform region and selects the S3
 client used for every state access.
 
-Day 0 creates the remote envelope before the deployment directory becomes visible. An
+Creation writes the remote envelope before the deployment directory becomes visible. An
 already-bound prefix is refused, preventing two deployments from accidentally sharing
 state. The signed Deployment Claim carries the locator (never credentials). A fetched
 seat reconstructs `metadata.json` from that claim, loads the same remote envelope, and
@@ -94,7 +94,7 @@ verifies the claimed deployment name, engine binding/integrity, and configuratio
 revision before committing its local directory. A local-state publication continues to
 receive a fresh local envelope because local state is not portable.
 
-If Day 0 commits remotely but the subsequent atomic publication of the local directory
+If creation commits remotely but the subsequent atomic publication of the local directory
 fails, Tokeira leaves the remote snapshots intact rather than guessing whether they are
 safe to delete. The prefix remains reserved until an operator investigates it and
 retires it under the bucket's retention policy.

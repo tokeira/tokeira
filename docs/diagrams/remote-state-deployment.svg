@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1900" viewBox="0 0 2400 1900">
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="2222" viewBox="0 0 2400 2222">
 <defs>
   <linearGradient id="ctrl" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ecfeff"/><stop offset="1" stop-color="#EDF1F3"/></linearGradient>
   <linearGradient id="auto" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff7ed"/><stop offset="1" stop-color="#F7F0DC"/></linearGradient>
@@ -18,7 +18,7 @@
     .flowlabel { font-family: 'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif; font-size: 11px; font-weight: 700; fill:#6E6860; }
   </style>
 </defs>
-<rect x="0" y="0" width="2400" height="1900" fill="#F6F3EE"/>
+<rect x="0" y="0" width="2400" height="2222" fill="#F6F3EE"/>
 
 <text x="70" y="24" font-family="'SF Mono',Menlo,monospace" font-size="14" letter-spacing="3" fill="#9A4A2C">TOKEIRA &#183; PROVISIONING</text>
 <text x="70" y="60" font-family="'Avenir Next',Avenir,'Segoe UI',system-ui,sans-serif" font-size="34" font-weight="700" fill="#1B1714">One deployment, two seats, one remote state</text>
@@ -111,14 +111,14 @@
 
 <rect x="110" y="838" width="600" height="340" rx="14" fill="#FFFFFF" stroke="#EADFC5" stroke-width="1.25"/>
 <circle cx="140" cy="868" r="13" fill="#B08D2E"/><text x="140" y="873" class="num" text-anchor="middle">5</text>
-<text x="162" y="873" class="subhead">Day 0 under the lease &#8212; while still staged</text>
+<text x="162" y="873" class="subhead">Creation under the lease &#8212; while still staged</text>
 <text x="136" y="902" class="micro">
 <tspan x="136" dy="0">acquire &lt;prefix&gt;/lock/operation as tkr-create &#8212; the lease closes the</tspan>
 <tspan x="136" dy="20">race between checking a prefix and committing to it</tspan>
 <tspan x="136" dy="26">read the envelope, infra, and deploy heads: any non-empty head refuses</tspan>
 <tspan x="136" dy="20">&#8212; "prefix already contains deployment state; choose an unused prefix</tspan>
 <tspan x="136" dy="20">or fetch its signed publication"</tspan>
-<tspan x="136" dy="26">commit the Day-0 envelope { deployment id, binding, integrity,</tspan>
+<tspan x="136" dy="26">commit the creation envelope { deployment id, binding, integrity,</tspan>
 <tspan x="136" dy="20">revision 0 } with a create-only save; release the lease</tspan>
 <tspan x="136" dy="26">only then the local atomic rename makes the deployment visible</tspan>
 </text>
@@ -176,7 +176,7 @@
 
 <rect x="1790" y="806" width="500" height="372" rx="14" fill="#FFFFFF" stroke="#DDEEE2" stroke-width="1.25"/>
 <circle cx="1820" cy="836" r="13" fill="#2F7D4F"/><text x="1820" y="841" class="num" text-anchor="middle">9</text>
-<text x="1842" y="841" class="subhead">Join the remote envelope &#8212; no Day-0 write</text>
+<text x="1842" y="841" class="subhead">Join the remote envelope &#8212; no creation write</text>
 <text x="1816" y="870" class="micro">
 <tspan x="1816" dy="0">verify the placed tkp against its sidecar, then load</tspan>
 <tspan x="1816" dy="20">&lt;prefix&gt;/envelope and refuse unless all four agree</tspan>
@@ -201,33 +201,77 @@
 <path d="M1140,1000 L1220,1000" fill="none" stroke="#2F7D4F" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_green)"/>
 <text x="1148" y="990" class="flowlabel">the claim</text>
 
-<!-- BAND 3: EVERY VERB -->
-<text x="70" y="1272" class="section">EVERY VERB &#8212; TWO PROCESSES, ONE LEASE, ANY SEAT</text>
-<rect x="70" y="1290" width="2260" height="400" rx="26" fill="url(#infra)" stroke="#D8D2C8" stroke-width="2"/>
+<!-- BAND 3: THE REPOSITORY -->
+<text x="70" y="1272" class="section">THE DEPLOYMENT REPOSITORY &#8212; WHY TUF</text>
+<rect x="70" y="1290" width="2260" height="250" rx="26" fill="url(#infra)" stroke="#D8D2C8" stroke-width="2"/>
 
-<rect x="110" y="1330" width="700" height="320" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<rect x="110" y="1330" width="700" height="190" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
 <circle cx="140" cy="1360" r="13" fill="#33586E"/><text x="140" y="1365" class="num" text-anchor="middle">10</text>
-<text x="162" y="1365" class="subhead">tkr launches</text>
+<text x="162" y="1365" class="subhead">What a consumer trusts</text>
 <text x="136" y="1394" class="micro">
+<tspan x="136" dy="0">exactly one thing, out of band: the pinned root.json. Which metadata is current,</tspan>
+<tspan x="136" dy="20">which targets exist, and what bytes they must hash to arrive through the signed</tspan>
+<tspan x="136" dy="20">chain &#8212; root, targets, snapshot, timestamp &#8212; enforced on load and on every read.</tspan>
+<tspan x="136" dy="20">Expiry fails closed; the datastore under state/repository/ remembers trusted</tspan>
+<tspan x="136" dy="20">versions, so a rewound repository is refused as rollback</tspan>
+</text>
+
+<rect x="850" y="1330" width="720" height="190" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<circle cx="880" cy="1360" r="13" fill="#33586E"/><text x="880" y="1365" class="num" text-anchor="middle">11</text>
+<text x="902" y="1365" class="subhead">Why TUF was selected</text>
+<text x="876" y="1394" class="micro">
+<tspan x="876" dy="0">the earlier design hand-rolled digests, an evidence envelope, and an authority</tspan>
+<tspan x="876" dy="20">policy that The Update Framework already standardizes &#8212; and lacked what TUF adds:</tspan>
+<tspan x="876" dy="20">freshness against a frozen repository and rollback detection. The spike proved the</tspan>
+<tspan x="876" dy="20">fit before the spec committed: consistent snapshots yield exactly the create-only S3</tspan>
+<tspan x="876" dy="20">layout (only timestamp.json ever mutates); the transport is one GetObject; tamper,</tspan>
+<tspan x="876" dy="20">rollback, and freeze are refused; keys rotate in place; KMS can hold role keys</tspan>
+</text>
+<text x="876" y="1512" class="code">theupdateframework.io &#183; The Update Framework 1.0 via tough 0.24 &#183; proven in the spike, PR #81</text>
+
+<rect x="1610" y="1330" width="680" height="190" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<circle cx="1640" cy="1360" r="13" fill="#33586E"/><text x="1640" y="1365" class="num" text-anchor="middle">12</text>
+<text x="1662" y="1365" class="subhead">What Tokeira adds on top</text>
+<text x="1636" y="1394" class="micro">
+<tspan x="1636" dy="0">the Deployment Claim, signed custom metadata on the definition root's target,</tspan>
+<tspan x="1636" dy="20">binds the definition half to the engine half and carries the state location</tspan>
+<tspan x="1636" dy="26">publications are monotonic and derived from committed state &#8212; the envelope</tspan>
+<tspan x="1636" dy="20">stays the commit authority, a failed publication is pending, never an unwind</tspan>
+<tspan x="1636" dy="26">one write policy in two homes: create-only objects first, mutable heads last</tspan>
+</text>
+
+<path d="M600,1218 L600,1290" fill="none" stroke="#2F7D4F" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_green)"/>
+<text x="612" y="1260" class="flowlabel">publish</text>
+<path d="M1800,1290 L1800,1218" fill="none" stroke="#B85C38" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arr_rust)"/>
+<text x="1812" y="1260" class="flowlabel">verified fetch</text>
+
+<!-- BAND 4: EVERY VERB -->
+<text x="70" y="1594" class="section">EVERY VERB &#8212; TWO PROCESSES, ONE LEASE, ANY SEAT</text>
+<rect x="70" y="1612" width="2260" height="400" rx="26" fill="url(#infra)" stroke="#D8D2C8" stroke-width="2"/>
+
+<rect x="110" y="1652" width="700" height="320" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<circle cx="140" cy="1682" r="13" fill="#33586E"/><text x="140" y="1687" class="num" text-anchor="middle">13</text>
+<text x="162" y="1687" class="subhead">tkr launches</text>
+<text x="136" y="1716" class="micro">
 <tspan x="136" dy="0">route by metadata's definition record, never file presence</tspan>
 <tspan x="136" dy="26">open the envelope from the recorded location to classify the verb:</tspan>
 <tspan x="136" dy="20">read-only &#183; bound mutation &#183; dev candidate &#183; upgrade &#183; rollback</tspan>
 <tspan x="136" dy="26">a bound mutation re-hashes &lt;dir&gt;/tkp against the envelope's</tspan>
 <tspan x="136" dy="20">integrity manifest for this host target before anything runs</tspan>
 </text>
-<text x="136" y="1548" class="code">
+<text x="136" y="1870" class="code">
 <tspan x="136" dy="0">&lt;dir&gt;/tkp &lt;verb&#8230;&gt; --deployment-dir &lt;dir&gt; [--yes]</tspan>
 </text>
-<text x="136" y="1580" class="micro">
+<text x="136" y="1902" class="micro">
 <tspan x="136" dy="0">spawned with inherited stdio; the exit status propagates verbatim.</tspan>
 <tspan x="136" dy="20">Read-only verbs run with no lock and no gate, so a blocked deployment</tspan>
 <tspan x="136" dy="20">stays diagnosable from any seat.</tspan>
 </text>
 
-<rect x="870" y="1330" width="760" height="320" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
-<circle cx="900" cy="1360" r="13" fill="#33586E"/><text x="900" y="1365" class="num" text-anchor="middle">11</text>
-<text x="922" y="1365" class="subhead">tkp admits, locks, commits</text>
-<text x="896" y="1394" class="micro">
+<rect x="870" y="1652" width="760" height="320" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<circle cx="900" cy="1682" r="13" fill="#33586E"/><text x="900" y="1687" class="num" text-anchor="middle">14</text>
+<text x="922" y="1687" class="subhead">tkp admits, locks, commits</text>
+<text x="896" y="1716" class="micro">
 <tspan x="896" dy="0">reads metadata.json itself, validates the placed bundle, and prepares the</tspan>
 <tspan x="896" dy="20">same four handles &#8212; the S3 client for the recorded bucket region</tspan>
 <tspan x="896" dy="26">admission and the gate spine, then with_operation_lock around the</tspan>
@@ -237,13 +281,13 @@
 <tspan x="896" dy="20">the envelope's CAS commit advances the config revision; the transition</tspan>
 <tspan x="896" dy="20">publishes to the repository; the lease releases</tspan>
 </text>
-<rect x="896" y="1594" width="500" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
-<text x="910" y="1611" class="chip">rollback: tkr acquires, hands holder + token by env, both tkp launches adopt &#8212; one lock</text>
+<rect x="896" y="1916" width="500" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
+<text x="910" y="1933" class="chip">rollback: tkr acquires, hands holder + token by env, both tkp launches adopt &#8212; one lock</text>
 
-<rect x="1690" y="1330" width="600" height="320" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
-<circle cx="1720" cy="1360" r="13" fill="#33586E"/><text x="1720" y="1365" class="num" text-anchor="middle">12</text>
-<text x="1742" y="1365" class="subhead">Two seats at once</text>
-<text x="1716" y="1394" class="micro">
+<rect x="1690" y="1652" width="600" height="320" rx="14" fill="#FFFFFF" stroke="#E4E0D8" stroke-width="1.25"/>
+<circle cx="1720" cy="1682" r="13" fill="#33586E"/><text x="1720" y="1687" class="num" text-anchor="middle">15</text>
+<text x="1742" y="1687" class="subhead">Two seats at once</text>
+<text x="1716" y="1716" class="micro">
 <tspan x="1716" dy="0">the lease serializes mutations across seats: a second mutating</tspan>
 <tspan x="1716" dy="20">command does not wait &#8212; it refuses while another provisioner</tspan>
 <tspan x="1716" dy="20">holds the lease</tspan>
@@ -254,26 +298,26 @@
 <tspan x="1716" dy="20">truth. Local state is not portable: fetching a local-state</tspan>
 <tspan x="1716" dy="20">publication yields a fresh local envelope, not a shared seat</tspan>
 </text>
-<rect x="1716" y="1594" width="360" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
-<text x="1730" y="1611" class="chip">tkr deployment lock is a local mis-apply guard, not this lease</text>
+<rect x="1716" y="1916" width="360" height="26" rx="13" fill="#FDF6E3" stroke="#E3CF8E" stroke-width="1"/>
+<text x="1730" y="1933" class="chip">tkr deployment lock is a local mis-apply guard, not this lease</text>
 
-<path d="M810,1490 L870,1490" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
-<text x="816" y="1480" class="flowlabel">spawn</text>
-<path d="M1630,1490 L1690,1490" fill="none" stroke="#2F7D4F" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_green)"/>
-<path d="M600,1218 L600,1290" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
-<path d="M1800,1218 L1800,1290" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M810,1812 L870,1812" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<text x="816" y="1802" class="flowlabel">spawn</text>
+<path d="M1630,1812 L1690,1812" fill="none" stroke="#2F7D4F" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arr_green)"/>
+<path d="M600,1540 L600,1612" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<path d="M1800,1540 L1800,1612" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
 
-<!-- BAND 4: DESTROY + RETENTION -->
-<text x="70" y="1744" class="section">DESTROY + RETENTION</text>
-<rect x="70" y="1762" width="2260" height="104" rx="26" fill="url(#ctrl)" stroke="#BCD6DB" stroke-width="2"/>
-<circle cx="140" cy="1814" r="13" fill="#0B7285"/><text x="140" y="1819" class="num" text-anchor="middle">13</text>
-<text x="162" y="1819" class="code">tkr deployment destroy --yes</text>
-<path d="M410,1814 L470,1814" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
-<text x="482" y="1819" class="micro">tkp destroy under the lease tears down provider resources</text>
-<path d="M866,1814 L926,1814" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
-<text x="938" y="1819" class="micro">the local record is removed</text>
-<path d="M1120,1814 L1180,1814" fill="none" stroke="#B85C38" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arr_rust)"/>
-<text x="1192" y="1813" class="micro">
+<!-- BAND 5: DESTROY + RETENTION -->
+<text x="70" y="2066" class="section">DESTROY + RETENTION</text>
+<rect x="70" y="2084" width="2260" height="104" rx="26" fill="url(#ctrl)" stroke="#BCD6DB" stroke-width="2"/>
+<circle cx="140" cy="2136" r="13" fill="#0B7285"/><text x="140" y="2141" class="num" text-anchor="middle">16</text>
+<text x="162" y="2141" class="code">tkr deployment destroy --yes</text>
+<path d="M410,2136 L470,2136" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<text x="482" y="2141" class="micro">tkp destroy under the lease tears down provider resources</text>
+<path d="M866,2136 L926,2136" fill="none" stroke="#0B7285" stroke-width="3" marker-end="url(#arr_cyan)"/>
+<text x="938" y="2141" class="micro">the local record is removed</text>
+<path d="M1120,2136 L1180,2136" fill="none" stroke="#B85C38" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arr_rust)"/>
+<text x="1192" y="2135" class="micro">
 <tspan x="1192" dy="0">"remote state retained at s3://&lt;bucket&gt;/&lt;prefix&gt;" &#8212; manifests, snapshots, and the released lock record stay as</tspan>
 <tspan x="1192" dy="18">recovery and audit material; bucket policy and lifecycle decide removal, and a later create never reuses the prefix</tspan>
 </text>

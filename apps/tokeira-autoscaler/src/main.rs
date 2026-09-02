@@ -50,9 +50,6 @@ static PROCESS_MANIFESTS: &[&MetricManifest] = &[&PROCESS_METRIC_MANIFEST];
 /// Auto Scaling group backing the runtime fleet (045: the runtime scale lever
 /// is ASG desired capacity, not ECS desired count).
 const RUNTIME_ASG_NAME: &str = "tokeira-runtime-asg";
-/// Runtime hosts the envelope reasons about until the actuator's ASG describe
-/// feeds the live count.
-const RUNTIME_HOSTS_PLACEHOLDER: u32 = 10;
 /// CPU utilisation treated as one host's worth of load when judging excess
 /// capacity: the saturation threshold Loop B scales out at.
 const RETIREMENT_TARGET_LOAD_PER_HOST: f64 = 0.70;
@@ -355,55 +352,81 @@ async fn run_leader_loop(
             loop_started.elapsed(),
         );
 
+        // The runtime fleet's size is the platform's own report, read once per
+        // cycle for both runtime loops. A guessed count would let a small,
+        // lightly loaded fleet look oversized, and with retirement marking
+        // nodes through the controller that would drain a real node each
+        // cycle. When the platform cannot be read, both loops hold, including
+        // open retirements, which do not advance without a fleet to reason
+        // about.
+        let runtime_fleet = match actuator.describe_asg(RUNTIME_ASG_NAME).await {
+            Ok(fleet) => Some(fleet),
+            Err(e) => {
+                mark_error_biased_sample(ErrorBiasedSamplingReason::AutoscalerReconciliationError);
+                warn!(error = %e, "failed to describe the runtime fleet; scale-out and retirement hold");
+                autoscaler_metrics::record_scaling_decision(
+                    AutoscalerLoopLabel::ScaleOut,
+                    ScalingDirectionLabel::Hold,
+                    "fleet_unknown",
+                );
+                autoscaler_metrics::record_scaling_decision(
+                    AutoscalerLoopLabel::Retirement,
+                    ScalingDirectionLabel::Hold,
+                    "fleet_unknown",
+                );
+                None
+            }
+        };
+
         // Loop B: runtime scale-out gated by DSQL headroom.
         let loop_started = std::time::Instant::now();
-        let current_hosts = envelope
-            .effective_max_runtime_hosts()
-            .min(RUNTIME_HOSTS_PLACEHOLDER);
-        let runtime_input = signals::query_runtime_pressure(
-            &mimir,
-            current_hosts,
-            1,
-            config.per_runtime_reserved_connections,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            mark_error_biased_sample(ErrorBiasedSamplingReason::AutoscalerReconciliationError);
-            warn!(error = %e, "failed to query runtime pressure");
-            tokeira_autoscaler::loop_b::RuntimeScaleOutInput {
-                current_hosts: 0,
-                step: 1,
-                pressure: tokeira_autoscaler::loop_b::RuntimePressure::None,
-                dsql_headroom_available: false,
-            }
-        });
-        let direction = match runtime_input.pressure {
-            tokeira_autoscaler::loop_b::RuntimePressure::BroadSaturation
-                if runtime_input.dsql_headroom_available =>
-            {
-                ScalingDirectionLabel::Up
-            }
-            _ => ScalingDirectionLabel::Hold,
-        };
-        autoscaler_metrics::record_scaling_decision(
-            AutoscalerLoopLabel::ScaleOut,
-            direction,
-            "runtime_pressure",
-        );
-        apply_runtime_scale_out(&mut desired, RUNTIME_ASG_NAME, envelope, runtime_input);
+        if let Some(fleet) = &runtime_fleet {
+            let runtime_input = signals::query_runtime_pressure(
+                &mimir,
+                fleet.desired_capacity,
+                1,
+                config.per_runtime_reserved_connections,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                mark_error_biased_sample(ErrorBiasedSamplingReason::AutoscalerReconciliationError);
+                warn!(error = %e, "failed to query runtime pressure");
+                tokeira_autoscaler::loop_b::RuntimeScaleOutInput {
+                    current_hosts: fleet.desired_capacity,
+                    step: 1,
+                    pressure: tokeira_autoscaler::loop_b::RuntimePressure::None,
+                    dsql_headroom_available: false,
+                }
+            });
+            let direction = match runtime_input.pressure {
+                tokeira_autoscaler::loop_b::RuntimePressure::BroadSaturation
+                    if runtime_input.dsql_headroom_available =>
+                {
+                    ScalingDirectionLabel::Up
+                }
+                _ => ScalingDirectionLabel::Hold,
+            };
+            autoscaler_metrics::record_scaling_decision(
+                AutoscalerLoopLabel::ScaleOut,
+                direction,
+                "runtime_pressure",
+            );
+            apply_runtime_scale_out(&mut desired, RUNTIME_ASG_NAME, envelope, runtime_input);
+        }
         autoscaler_metrics::record_loop_duration(
             AutoscalerLoopLabel::ScaleOut,
             loop_started.elapsed(),
         );
 
         // Loop C: runtime retirement. Mimir answers whether the fleet has
-        // excess capacity; the controller chooses the node and confirms,
-        // from the node's own heartbeat, when it is safe to terminate.
+        // excess capacity against the size the platform reports; the
+        // controller chooses the node and confirms, from the node's own
+        // heartbeat, when it is safe to terminate.
         let loop_started = std::time::Instant::now();
-        if let Some(controller) = controller.as_deref() {
+        if let (Some(controller), Some(fleet)) = (controller.as_deref(), &runtime_fleet) {
             let excess_capacity = signals::query_excess_runtime_capacity(
                 &mimir,
-                current_hosts,
+                fleet,
                 RETIREMENT_TARGET_LOAD_PER_HOST,
             )
             .await

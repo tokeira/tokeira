@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 
 use crate::{
+    actuator::AsgState,
     config::AutoscalerServiceConfig,
     loop_a::{ServicePressure, ServiceSignal},
     loop_b::{RuntimePressure, RuntimeScaleOutInput},
@@ -171,12 +172,13 @@ pub async fn query_runtime_pressure(
 ///
 /// This is the *whether* half of scale-in (architecture note 045, step 1).
 /// The *which* half, the node to retire, is the controller's nomination from
-/// its placement view, so no candidate is derived from metrics here. Absent
+/// its placement view, so no candidate is derived from metrics here. The
+/// fleet size is the platform's own report, never an estimate, and absent
 /// metrics never claim excess: the autoscaler does not scale in on missing
 /// data.
 pub async fn query_excess_runtime_capacity(
     mimir: &MimirClient,
-    current_hosts: u32,
+    fleet: &AsgState,
     target_load_per_host: f64,
 ) -> Result<bool> {
     let total_cpu = mimir
@@ -191,5 +193,39 @@ pub async fn query_excess_runtime_capacity(
     };
 
     let needed_hosts = (total / target_load_per_host).ceil() as u32;
-    Ok(current_hosts > needed_hosts)
+    Ok(fleet_has_excess(fleet, needed_hosts))
+}
+
+/// A fleet has excess capacity only above both its floor and its load's need.
+///
+/// The floor is the platform's own minimum: retiring into it would only be
+/// undone by the group launching a replacement. A fleet the platform reports
+/// as empty (a logging actuator, or a group that does not exist yet) never
+/// has excess, so retirement cannot open on a guessed fleet.
+pub fn fleet_has_excess(fleet: &AsgState, needed_hosts: u32) -> bool {
+    fleet.desired_capacity > fleet.min_size && fleet.desired_capacity > needed_hosts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fleet(desired_capacity: u32, min_size: u32) -> AsgState {
+        AsgState {
+            desired_capacity,
+            min_size,
+            max_size: 10,
+        }
+    }
+
+    #[test]
+    fn excess_requires_headroom_above_both_the_floor_and_the_need() {
+        assert!(fleet_has_excess(&fleet(3, 1), 2));
+        // The load needs every host.
+        assert!(!fleet_has_excess(&fleet(3, 1), 3));
+        // At the platform's floor, however idle.
+        assert!(!fleet_has_excess(&fleet(2, 2), 0));
+        // An empty or unreported fleet.
+        assert!(!fleet_has_excess(&fleet(0, 0), 0));
+    }
 }

@@ -366,13 +366,9 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             let Some(ops) = engine.platform().ops() else {
                 anyhow::bail!("not applicable: this platform declares no ops surface");
             };
+            let context = engine.operations_context(require(admitted))?;
             let mut stream = ops
-                .log_stream(
-                    &require(admitted).deployment_ref,
-                    &args.service,
-                    args.follow,
-                    args.tail,
-                )
+                .log_stream_with_context(&context, &args.service, args.follow, args.tail)
                 .await?;
             while let Some(line) = stream.next().await {
                 println!("{}", line?);
@@ -383,8 +379,9 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             let Some(ops) = engine.platform().ops() else {
                 anyhow::bail!("not applicable: this platform declares no ops surface");
             };
+            let context = engine.operations_context(require(admitted))?;
             let mappings = ops
-                .port_mappings(&require(admitted).deployment_ref, &args.service)
+                .port_mappings_with_context(&context, &args.service)
                 .await?;
             if mappings.is_empty() {
                 println!("no port mappings for service {}", args.service);

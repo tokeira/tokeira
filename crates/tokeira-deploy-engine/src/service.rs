@@ -104,6 +104,19 @@ pub trait Service: Debug + Send + Sync {
     /// platform implementation may also use it when ordering manifest apply.
     fn dependencies(&self) -> Vec<&str>;
 
+    /// Sanitized platform-owned coordinates needed for live operations.
+    ///
+    /// This descriptor is an ephemeral hand-off from the realized definition,
+    /// not desired state and not a substitute for provider state. It must
+    /// contain only non-secret routing facts that an operator capability needs
+    /// (for example, a cluster and service name). Images, environment values,
+    /// credentials, secret references, and resolved infrastructure outputs do
+    /// not belong here. Platforms should deserialize their descriptor into a
+    /// closed, validated type before using it.
+    fn operations_metadata(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Produce the deployment manifests for this service.
     ///
     /// The manifest values are provider-specific JSON documents. They must be

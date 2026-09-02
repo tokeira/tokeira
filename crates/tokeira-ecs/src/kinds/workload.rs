@@ -35,6 +35,9 @@ pub struct Workload {
     pub(crate) region: String,
     /// ECS cluster name.
     pub(crate) cluster: String,
+    /// Service Connect namespace. This is authored independently from the
+    /// networking private DNS zone and must survive workload realization.
+    pub(crate) service_connect_namespace: String,
     /// Container image for the workload's primary container.
     pub(crate) image: String,
     /// Desired replicas; `None` keeps the service's own scheduling policy
@@ -64,6 +67,7 @@ impl Workload {
             ..EcsConfig::default()
         };
         config.cluster.name = self.cluster.clone();
+        config.cluster.service_connect_namespace = self.service_connect_namespace.clone();
         config.observability.alloy_image = self.alloy_image.clone();
         config.observability.aws_cli_image = self.aws_cli_image.clone();
         config.observability.busybox_image = self.busybox_image.clone();

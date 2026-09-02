@@ -54,7 +54,8 @@ pub(crate) async fn scale<F: DefinitionFrontend>(
     let Some(ops) = engine.platform().ops() else {
         anyhow::bail!("not applicable: this platform declares no ops surface");
     };
-    let change_count = ops.scale(&admitted.deployment_ref, specs).await?;
+    let context = engine.operations_context(admitted)?;
+    let change_count = ops.scale_with_context(&context, specs).await?;
     println!(
         "[{}] scale {}: {}",
         engine.platform().id(),

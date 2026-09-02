@@ -21,6 +21,7 @@ use tokeira_iac::{self as iac, ResourceId};
 use tokeira_orchestrator::InfraEngine;
 use tokeira_platform::{
     author::{LocatedValue, from_located_value},
+    declaration::{DefinitionOperationsContext, OperationalService},
     definition::{
         DefinitionFrontend, DefinitionSource, DefinitionSourceName, DirectoryPartSources,
         EvaluatedDefinition, FrontendSource, RealizedResourceIndex, evaluate_definition,
@@ -292,6 +293,33 @@ impl<F: DefinitionFrontend> Engine<F> {
                 .map(|(name, _)| name.clone())
                 .collect(),
         })
+    }
+
+    /// Realize and admit the platform's sanitized live-operations context.
+    ///
+    /// Re-realizing here is intentional: day-2 operations must use the same
+    /// admitted definition contract as lifecycle commands, never a
+    /// parallel config file or provider-name convention. The descriptors do
+    /// not contain live task state; each operation still queries its provider.
+    pub(crate) fn operations_context(
+        &self,
+        admitted: &Admitted,
+    ) -> Result<DefinitionOperationsContext> {
+        let execution = self.execution(admitted, None)?;
+        let services = execution
+            .services
+            .iter()
+            .filter_map(|service| {
+                service.operations_metadata().map(|attributes| {
+                    OperationalService::new(service.resource_type(), service.name(), attributes)
+                })
+            })
+            .collect();
+        let context = DefinitionOperationsContext::new(admitted.deployment_ref.clone(), services);
+        self.platform
+            .implementation()
+            .validate_operations_context(&context)?;
+        Ok(context)
     }
 
     // ------------------------------------------------------------------

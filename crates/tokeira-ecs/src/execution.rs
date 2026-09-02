@@ -16,7 +16,9 @@ use tokio::sync::OnceCell;
 
 use tokeira_aws::resources::ecs_service as aws_ecs;
 use tokeira_deploy_engine as deploy_engine;
-use tokeira_platform::declaration::{DeploymentRef, PlatformExecution, PlatformIntegration};
+use tokeira_platform::declaration::{
+    DefinitionOperationsContext, DeploymentRef, PlatformExecution, PlatformIntegration,
+};
 
 use crate::services::{
     EcsScheduling, LoadBalancerSpec, NetworkSpec, PlacementConstraint, ServiceConnectSpec,
@@ -49,6 +51,17 @@ pub struct EcsIntegration;
 
 #[async_trait::async_trait]
 impl PlatformIntegration for EcsIntegration {
+    fn validate_operations_context(
+        &self,
+        context: &DefinitionOperationsContext,
+    ) -> anyhow::Result<()> {
+        // Closing the generic hand-off here makes malformed, mixed-region, or
+        // mixed-cluster definitions fail before an operation can choose an
+        // AWS client. Live provider state remains outside this admission step.
+        crate::operations::EcsOperationsContext::from_definition(context)?;
+        Ok(())
+    }
+
     /// No platform extensions: the declaration includes the `tokeira_aws`
     /// namespace, which is the framework's signal to install the standard
     /// deployment-scoped `AwsClients` bundle (with the authored `aws.region`)

@@ -64,6 +64,99 @@ pub struct DeploymentRef {
     pub dir: PathBuf,
 }
 
+/// One realized service's sanitized hand-off to live platform operations.
+///
+/// The framework owns the envelope (resource type and service name); the
+/// platform owns the attribute schema. Attributes are deliberately opaque to
+/// the framework and must obey [`tokeira_deploy_engine::Service::operations_metadata`].
+#[derive(Clone, PartialEq)]
+pub struct OperationalService {
+    resource_type: String,
+    name: String,
+    attributes: serde_json::Value,
+}
+
+impl OperationalService {
+    /// Capture metadata emitted by one realized service.
+    pub fn new(resource_type: &str, name: &str, attributes: serde_json::Value) -> Self {
+        Self {
+            resource_type: resource_type.to_owned(),
+            name: name.to_owned(),
+            attributes,
+        }
+    }
+
+    /// Author-visible kind that produced the service.
+    pub fn resource_type(&self) -> &str {
+        &self.resource_type
+    }
+
+    /// Stable service name from the realized graph.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Platform-owned, non-secret descriptor attributes.
+    pub fn attributes(&self) -> &serde_json::Value {
+        &self.attributes
+    }
+}
+
+impl fmt::Debug for OperationalService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Attribute values are operational coordinates today, but keeping
+        // them out of generic diagnostics prevents a future descriptor bug
+        // from turning framework debug output into a disclosure path.
+        f.debug_struct("OperationalService")
+            .field("resource_type", &self.resource_type)
+            .field("name", &self.name)
+            .field("attributes", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Definition-derived input to one platform live-operation call.
+///
+/// The context is rebuilt from the admitted definition for each operator
+/// command. It carries authored service coordinates but no provider state;
+/// live state remains authoritative for task identity, health, and current
+/// capacity. The platform validates its closed descriptor schema before any
+/// provider call, so stale or mixed deployment coordinates fail at admission.
+#[derive(Clone)]
+pub struct DefinitionOperationsContext {
+    deployment: DeploymentRef,
+    services: Vec<OperationalService>,
+}
+
+impl DefinitionOperationsContext {
+    /// Assemble the admitted deployment identity and realized service descriptors.
+    pub fn new(deployment: DeploymentRef, services: Vec<OperationalService>) -> Self {
+        Self {
+            deployment,
+            services,
+        }
+    }
+
+    /// Admitted deployment identity associated with every descriptor.
+    pub fn deployment(&self) -> &DeploymentRef {
+        &self.deployment
+    }
+
+    /// Sanitized descriptors in definition declaration order.
+    pub fn services(&self) -> &[OperationalService] {
+        &self.services
+    }
+}
+
+impl fmt::Debug for DefinitionOperationsContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DefinitionOperationsContext")
+            .field("deployment", &self.deployment)
+            .field("service_count", &self.services.len())
+            .finish()
+    }
+}
+
 /// Incremental log output for one service.
 pub type LogStream = Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>>;
 
@@ -86,6 +179,22 @@ pub trait Ops: Send + Sync + fmt::Debug {
         tail: Option<u32>,
     ) -> anyhow::Result<LogStream>;
 
+    /// Open logs using the realized definition's operational coordinates.
+    ///
+    /// Existing identity-only implementations retain their behaviour through
+    /// this default. Definition-aware platforms override it when provider
+    /// routing needs authored service coordinates beyond [`DeploymentRef`].
+    async fn log_stream_with_context(
+        &self,
+        context: &DefinitionOperationsContext,
+        service: &str,
+        follow: bool,
+        tail: Option<u32>,
+    ) -> anyhow::Result<LogStream> {
+        self.log_stream(context.deployment(), service, follow, tail)
+            .await
+    }
+
     /// Resolve the live host/container port mappings for one declared
     /// service.
     async fn port_mappings(
@@ -94,11 +203,29 @@ pub trait Ops: Send + Sync + fmt::Debug {
         service: &str,
     ) -> anyhow::Result<Vec<PortMapping>>;
 
+    /// Resolve port mappings using realized operational coordinates.
+    async fn port_mappings_with_context(
+        &self,
+        context: &DefinitionOperationsContext,
+        service: &str,
+    ) -> anyhow::Result<Vec<PortMapping>> {
+        self.port_mappings(context.deployment(), service).await
+    }
+
     /// Change workload capacity (`<dim>=<n>` specs), returning the change
     /// count. Required, deliberately undefaulted: an ops surface answers
     /// every one of its verbs in its own words — a provider without a scale
     /// dimension states its own refusal as the error.
     async fn scale(&self, deployment: &DeploymentRef, specs: &[String]) -> anyhow::Result<usize>;
+
+    /// Change capacity using realized operational coordinates.
+    async fn scale_with_context(
+        &self,
+        context: &DefinitionOperationsContext,
+        specs: &[String],
+    ) -> anyhow::Result<usize> {
+        self.scale(context.deployment(), specs).await
+    }
 }
 
 /// Result of running one platform's observability checks for a deployment.
@@ -184,6 +311,18 @@ pub trait PlatformExecution: Send + Sync + fmt::Debug {
 /// extensions are installed before this delegation.
 #[async_trait::async_trait]
 pub trait PlatformIntegration: Send + Sync + fmt::Debug {
+    /// Validate the definition-derived operational hand-off for this platform.
+    ///
+    /// The framework calls this after realizing service descriptors and before
+    /// exposing them to an operations implementation. Platforms that emit no
+    /// descriptors need no validation and retain this default.
+    fn validate_operations_context(
+        &self,
+        _context: &DefinitionOperationsContext,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Register infrastructure handles used by realized resources.
     async fn register_infra_extensions(
         &self,

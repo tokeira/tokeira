@@ -9,13 +9,11 @@
 //! unit-testable without mocking HTTP calls.
 
 use anyhow::{Context, Result};
-use tracing::warn;
 
 use crate::{
     config::AutoscalerServiceConfig,
     loop_a::{ServicePressure, ServiceSignal},
     loop_b::{RuntimePressure, RuntimeScaleOutInput},
-    loop_c::RetirementCandidate,
     mimir::MimirClient,
 };
 
@@ -167,19 +165,20 @@ pub async fn query_runtime_pressure(
     })
 }
 
-// ── Loop C: retirement candidates ───────────────────────────────────────────
+// ── Loop C: excess runtime capacity ─────────────────────────────────────────
 
-/// Identify runtime hosts that are candidates for retirement.
+/// Whether the runtime fleet has more hosts than its aggregate load needs.
 ///
-/// The controller gRPC (NominateScaleInCandidates, MarkNodeDraining) is not
-/// yet implemented — blocked on the shard-placement-membership spec. This
-/// placeholder identifies the least-loaded host from Mimir metrics and
-/// returns it as a retirement candidate when excess capacity exists.
-pub async fn query_retirement_candidates(
+/// This is the *whether* half of scale-in (architecture note 045, step 1).
+/// The *which* half, the node to retire, is the controller's nomination from
+/// its placement view, so no candidate is derived from metrics here. Absent
+/// metrics never claim excess: the autoscaler does not scale in on missing
+/// data.
+pub async fn query_excess_runtime_capacity(
     mimir: &MimirClient,
     current_hosts: u32,
     target_load_per_host: f64,
-) -> Result<Vec<RetirementCandidate>> {
+) -> Result<bool> {
     let total_cpu = mimir
         .query_instant_value(
             "sum(rate(container_cpu_usage_seconds_total{service=\"tokeira-runtime\"}[5m]))",
@@ -188,39 +187,9 @@ pub async fn query_retirement_candidates(
         .context("total CPU query for retirement failed")?;
 
     let Some(total) = total_cpu else {
-        return Ok(Vec::new());
+        return Ok(false);
     };
 
-    // Derive needed hosts from current aggregate load.
     let needed_hosts = (total / target_load_per_host).ceil() as u32;
-    if current_hosts <= needed_hosts {
-        return Ok(Vec::new());
-    }
-
-    // Identify the least-loaded host. In production this would come from the
-    // controller's shard-placement view; for now we query per-instance CPU.
-    let least_loaded_instance = mimir
-        .query_instant_value(
-            "bottomk(1, sum by (instance_id) (rate(container_cpu_usage_seconds_total{service=\"tokeira-runtime\"}[5m])))",
-        )
-        .await
-        .context("least-loaded instance query failed")?;
-
-    if least_loaded_instance.is_none() {
-        warn!("retirement: could not identify least-loaded instance from metrics");
-        return Ok(Vec::new());
-    }
-
-    // TODO(shard-placement-membership): Replace this placeholder with actual
-    // controller interaction:
-    // 1. NominateScaleInCandidates — ask controller which host to retire
-    // 2. MarkNodeDraining — tell controller to stop assigning bundles
-    // For now, use a synthetic instance ID derived from the query. The real
-    // implementation will resolve instance IDs from the controller's membership
-    // view.
-    let candidate = RetirementCandidate {
-        instance_id: format!("runtime-host-excess-{}", current_hosts - needed_hosts),
-    };
-
-    Ok(vec![candidate])
+    Ok(current_hosts > needed_hosts)
 }

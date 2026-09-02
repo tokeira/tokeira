@@ -30,30 +30,30 @@ pub struct DesiredState {
 }
 
 /// The platform's actual state, read via the actuator before reconciliation.
+/// Drain phases come from the retirement loop's record of applied platform
+/// steps rather than from the platform, which has no notion of the sequence.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CurrentState {
-    pub(crate) service_counts: BTreeMap<String, u32>,
-    pub(crate) asg_capacities: BTreeMap<String, u32>,
-    pub(crate) drain_intents: BTreeMap<String, DrainPhase>,
+    pub service_counts: BTreeMap<String, u32>,
+    pub asg_capacities: BTreeMap<String, u32>,
+    pub drain_intents: BTreeMap<String, DrainPhase>,
 }
 
-/// Phases of the instance retirement state machine.
-///
-/// Each phase represents a durable checkpoint — if the autoscaler crashes
-/// mid-retirement, it resumes from the last persisted phase rather than
-/// restarting the entire sequence.
+/// Phases of the node retirement state machine, keyed on the controller's
+/// node id. Carried across polls by the leader's retirement loop; the
+/// sequence and its gates are documented in `loop_c`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainPhase {
-    /// The autoscaler's controller has decided to retire this instance.
-    /// Workload migration has begun at the application layer.
+    /// The controller accepted the mark and sent the node its drain
+    /// directive; the runtime is relinquishing its bundles.
     ControllerDraining,
-    /// The platform has been told to stop scheduling new work onto this
-    /// instance (e.g., ECS DRAINING status).
+    /// The platform has been told to stop scheduling new work onto the host
+    /// (e.g., ECS DRAINING status).
     EcsDraining,
-    /// Scale-in protection has been removed. The instance is eligible for
-    /// termination by the fleet manager.
+    /// The controller reported the node safe to terminate and scale-in
+    /// protection has been removed.
     ProtectionCleared,
-    /// The instance has been terminated and its capacity decremented.
+    /// The host has been terminated and its capacity decremented.
     Terminated,
 }
 
@@ -61,18 +61,9 @@ pub enum DrainPhase {
 /// converge desired state with current state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalingAction {
-    UpdateService {
-        service: String,
-        desired_count: u32,
-    },
-    UpdateAsg {
-        asg: String,
-        desired_capacity: u32,
-    },
-    AdvanceDrain {
-        instance_id: String,
-        phase: DrainPhase,
-    },
+    UpdateService { service: String, desired_count: u32 },
+    UpdateAsg { asg: String, desired_capacity: u32 },
+    AdvanceDrain { node_id: String, phase: DrainPhase },
 }
 
 /// Diff desired against current and produce the minimal set of actions needed
@@ -99,10 +90,10 @@ pub fn reconcile(desired: &DesiredState, current: &CurrentState) -> Vec<ScalingA
             });
         }
     }
-    for (instance_id, desired_phase) in &desired.drain_intents {
-        if current.drain_intents.get(instance_id) != Some(desired_phase) {
+    for (node_id, desired_phase) in &desired.drain_intents {
+        if current.drain_intents.get(node_id) != Some(desired_phase) {
             actions.push(ScalingAction::AdvanceDrain {
-                instance_id: instance_id.clone(),
+                node_id: node_id.clone(),
                 phase: *desired_phase,
             });
         }
@@ -163,7 +154,7 @@ mod tests {
                     desired_capacity: 5,
                 },
                 ScalingAction::AdvanceDrain {
-                    instance_id: "i-123".into(),
+                    node_id: "i-123".into(),
                     phase: DrainPhase::ProtectionCleared,
                 },
             ]

@@ -60,6 +60,9 @@ pub enum ControllerDirective {
     DesiredPlacement(DesiredPlacementDirective),
     /// This runtime's share of the cluster-wide DSQL connection budget.
     ConnectionBudget(ConnectionBudgetDirective),
+    /// Begin the two-phase drain: relinquish every owned bundle and report
+    /// progress through heartbeats until `SafeToTerminate`.
+    Drain,
 }
 
 /// Local stream state for one runtime node.

@@ -1299,6 +1299,9 @@ where
         self.runtime_drain.clone()
     }
 
+    /// Snapshot this node's load for a membership heartbeat: owned shards,
+    /// per-lane queue pressure, outstanding workflow-task replies, and the
+    /// caller-supplied connection headroom.
     pub fn heartbeat_inputs(
         &self,
         available_connections: u32,
@@ -1310,6 +1313,7 @@ where
             &self.lanes,
             available_connections,
             connection_rate_headroom,
+            self.wft_timeout_tracking.tracked_count() as u64,
         )
     }
 

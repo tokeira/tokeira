@@ -85,6 +85,12 @@ impl WftTimeoutTrackingState {
             .insert(entry.run_key, entry);
     }
 
+    /// Number of started workflow tasks still awaiting a worker's reply.
+    /// Drain reports it as `pending_wft_replies` (Req 8.2.8).
+    pub fn tracked_count(&self) -> usize {
+        self.inner.lock().expect("inner lock poisoned").len()
+    }
+
     /// Stop tracking a run's workflow task, called when it completes or times out
     /// so a finished task is never scanned again.
     pub fn remove(&self, run_key: RunKey) {

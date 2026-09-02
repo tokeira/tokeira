@@ -18,12 +18,13 @@ use time::Duration;
 use tokeira_autoscaler::{
     actuator::Actuator,
     config::AutoscalerServiceConfig,
+    controller_client::{ControllerClient, PlacementControl},
     envelope::ScalingEnvelope,
     freshness::{FreshnessTracker, MetricFreshness, ScalingPermission},
     leader::AutoscalerLeader,
     loop_a::{ReplicaScalingLoop, ServicePressure},
     loop_b::apply_runtime_scale_out,
-    loop_c::{advance_drain_phase, request_runtime_retirement},
+    loop_c::{RetirementLoop, apply_drain_phase},
     metrics as autoscaler_metrics,
     mimir::MimirClient,
     reconciler::{CurrentState, DesiredState, ScalingAction},
@@ -31,10 +32,10 @@ use tokeira_autoscaler::{
 };
 use tokeira_observability::{
     AutoscalerLoopLabel, ErrorBiasedSamplingReason, LogFormat, MetricManifest,
-    NominationOutcomeLabel, ObservabilityRuntime, OtlpMetricsConfig, PROCESS_METRIC_MANIFEST,
-    ProcessObservabilityConfig, ReadinessCheck, ReadinessCheckResult, ReadinessHandle,
-    ReadinessRegistry, ReadinessStatus, ScalingDirectionLabel, ServiceName, TraceExportConfig,
-    install_observability, mark_error_biased_sample,
+    ObservabilityRuntime, OtlpMetricsConfig, PROCESS_METRIC_MANIFEST, ProcessObservabilityConfig,
+    ReadinessCheck, ReadinessCheckResult, ReadinessHandle, ReadinessRegistry, ReadinessStatus,
+    ScalingDirectionLabel, ServiceName, TraceExportConfig, install_observability,
+    mark_error_biased_sample,
 };
 use tokeira_storage::{
     LeaseRepository,
@@ -45,6 +46,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 static PROCESS_MANIFESTS: &[&MetricManifest] = &[&PROCESS_METRIC_MANIFEST];
+
+/// Auto Scaling group backing the runtime fleet (045: the runtime scale lever
+/// is ASG desired capacity, not ECS desired count).
+const RUNTIME_ASG_NAME: &str = "tokeira-runtime-asg";
+/// Runtime hosts the envelope reasons about until the actuator's ASG describe
+/// feeds the live count.
+const RUNTIME_HOSTS_PLACEHOLDER: u32 = 10;
+/// CPU utilisation treated as one host's worth of load when judging excess
+/// capacity: the saturation threshold Loop B scales out at.
+const RETIREMENT_TARGET_LOAD_PER_HOST: f64 = 0.70;
 
 #[derive(Clone, Debug)]
 struct AutoscalerReadiness {
@@ -136,9 +147,31 @@ async fn main() -> Result<()> {
     readiness.leader_lease.ready();
 
     let actuator = Arc::new(LoggingActuator);
+    let controller = build_controller_client(&config)?;
     readiness.control_plane.ready();
 
-    run_leader_loop(config, mimir, lease_repo, actuator, cancel).await
+    run_leader_loop(config, mimir, lease_repo, actuator, controller, cancel).await
+}
+
+/// Build the placement-controller client Loop C retires runtime nodes through.
+///
+/// Without an endpoint the autoscaler still scales replicas and runtime hosts
+/// out, but never retires a node: it has no one to nominate a safe candidate
+/// or confirm a drain, and guessing would terminate hosts that own bundles.
+fn build_controller_client(
+    config: &AutoscalerServiceConfig,
+) -> Result<Option<Arc<dyn PlacementControl>>> {
+    let Some(endpoint) = config.controller_endpoint.as_deref() else {
+        warn!(
+            "controller_endpoint not configured — runtime retirement (loop C) is disabled; \
+             runtime hosts are never terminated by this autoscaler"
+        );
+        return Ok(None);
+    };
+    let client = ControllerClient::new(endpoint)
+        .with_context(|| format!("invalid controller_endpoint {endpoint}"))?;
+    info!(controller_endpoint = endpoint, "runtime retirement enabled");
+    Ok(Some(Arc::new(client)))
 }
 
 fn log_build_info(process: &'static str) {
@@ -223,6 +256,7 @@ async fn run_leader_loop(
     mimir: MimirClient,
     lease_repo: Arc<dyn LeaseRepository>,
     actuator: Arc<dyn Actuator>,
+    controller: Option<Arc<dyn PlacementControl>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut leader = AutoscalerLeader::new(
@@ -234,6 +268,9 @@ async fn run_leader_loop(
     );
 
     let mut loop_a = ReplicaScalingLoop::default();
+    // Retirements span many polls; their phases live here for the leader's
+    // lifetime rather than in the per-cycle desired state.
+    let mut loop_c = RetirementLoop::default();
     let polling_interval =
         tokio::time::Duration::from_secs(config.polling_interval.whole_seconds().max(1) as u64);
 
@@ -320,9 +357,12 @@ async fn run_leader_loop(
 
         // Loop B: runtime scale-out gated by DSQL headroom.
         let loop_started = std::time::Instant::now();
+        let current_hosts = envelope
+            .effective_max_runtime_hosts()
+            .min(RUNTIME_HOSTS_PLACEHOLDER);
         let runtime_input = signals::query_runtime_pressure(
             &mimir,
-            envelope.effective_max_runtime_hosts().min(10), // current hosts placeholder
+            current_hosts,
             1,
             config.per_runtime_reserved_connections,
         )
@@ -350,58 +390,44 @@ async fn run_leader_loop(
             direction,
             "runtime_pressure",
         );
-        apply_runtime_scale_out(&mut desired, "tokeira-runtime-asg", envelope, runtime_input);
+        apply_runtime_scale_out(&mut desired, RUNTIME_ASG_NAME, envelope, runtime_input);
         autoscaler_metrics::record_loop_duration(
             AutoscalerLoopLabel::ScaleOut,
             loop_started.elapsed(),
         );
 
-        // Loop C: runtime retirement.
-        // Target load per host: 70% CPU utilization is the saturation threshold.
+        // Loop C: runtime retirement. Mimir answers whether the fleet has
+        // excess capacity; the controller chooses the node and confirms,
+        // from the node's own heartbeat, when it is safe to terminate.
         let loop_started = std::time::Instant::now();
-        let retirement_candidates = signals::query_retirement_candidates(&mimir, 10, 0.70)
+        if let Some(controller) = controller.as_deref() {
+            let excess_capacity = signals::query_excess_runtime_capacity(
+                &mimir,
+                current_hosts,
+                RETIREMENT_TARGET_LOAD_PER_HOST,
+            )
             .await
             .unwrap_or_else(|e| {
                 mark_error_biased_sample(ErrorBiasedSamplingReason::AutoscalerReconciliationError);
-                warn!(error = %e, "failed to query retirement candidates");
-                Vec::new()
+                warn!(error = %e, "failed to query excess runtime capacity");
+                false
             });
-        if retirement_candidates.is_empty() {
-            autoscaler_metrics::record_nomination(NominationOutcomeLabel::Rejected);
-            autoscaler_metrics::record_scaling_decision(
-                AutoscalerLoopLabel::Retirement,
-                ScalingDirectionLabel::Hold,
-                "no_candidate",
-            );
-        }
-        for candidate in retirement_candidates {
-            if request_runtime_retirement(&mut desired, candidate) {
-                autoscaler_metrics::record_nomination(NominationOutcomeLabel::Accepted);
-                autoscaler_metrics::record_scaling_decision(
-                    AutoscalerLoopLabel::Retirement,
-                    ScalingDirectionLabel::Down,
-                    "retirement_candidate",
-                );
-                // Advance through drain phases for any newly-added candidates.
-                // In production, each phase transition would be gated by
-                // confirmation from the controller/platform.
+            if let Err(e) = loop_c.plan(controller, excess_capacity).await {
+                mark_error_biased_sample(ErrorBiasedSamplingReason::AutoscalerReconciliationError);
+                warn!(error = %e, "retirement planning failed; open retirements hold");
             }
         }
-
-        // Advance existing drain intents that are ready for the next phase.
-        // TODO(shard-placement-membership): gate phase transitions on actual
-        // controller confirmation (bundle migration complete, etc.).
-        let drain_keys: Vec<String> = desired.drain_intents.keys().cloned().collect();
-        for instance_id in &drain_keys {
-            advance_drain_phase(&mut desired, instance_id);
-        }
+        desired.drain_intents = loop_c.desired_intents();
         autoscaler_metrics::record_loop_duration(
             AutoscalerLoopLabel::Retirement,
             loop_started.elapsed(),
         );
 
         // Reconcile desired vs current and apply actions via actuator.
-        let current = CurrentState::default();
+        let current = CurrentState {
+            drain_intents: loop_c.applied_intents(),
+            ..CurrentState::default()
+        };
         let actions = tokeira_autoscaler::reconciler::reconcile(&desired, &current);
 
         if !actions.is_empty() {
@@ -410,13 +436,23 @@ async fn run_leader_loop(
                 "reconciler produced scaling actions"
             );
             for action in &actions {
-                apply_action(&actuator, &config.cluster_name, action).await;
+                if apply_action(&actuator, &config.cluster_name, action)
+                    .await
+                    .is_ok()
+                    && let ScalingAction::AdvanceDrain { node_id, phase } = action
+                {
+                    loop_c.record_applied(node_id, *phase);
+                }
             }
         }
     }
 }
 
-async fn apply_action(actuator: &Arc<dyn Actuator>, cluster: &str, action: &ScalingAction) {
+async fn apply_action(
+    actuator: &Arc<dyn Actuator>,
+    cluster: &str,
+    action: &ScalingAction,
+) -> Result<()> {
     let result = match action {
         ScalingAction::UpdateService {
             service,
@@ -432,16 +468,24 @@ async fn apply_action(actuator: &Arc<dyn Actuator>, cluster: &str, action: &Scal
             .set_asg_desired_capacity(asg, *desired_capacity)
             .await
             .map(|_| ()),
-        ScalingAction::AdvanceDrain { instance_id, phase } => {
-            info!(?phase, instance_id, "advancing drain phase");
-            Ok(())
+        ScalingAction::AdvanceDrain { node_id, phase } => {
+            info!(?phase, node_id, "advancing drain phase");
+            apply_drain_phase(
+                actuator.as_ref(),
+                cluster,
+                RUNTIME_ASG_NAME,
+                node_id,
+                *phase,
+            )
+            .await
         }
     };
 
-    if let Err(e) = result {
+    if let Err(e) = &result {
         mark_error_biased_sample(ErrorBiasedSamplingReason::AutoscalerReconciliationError);
         warn!(error = %e, ?action, "failed to apply scaling action");
     }
+    result
 }
 
 // ── Placeholder actuator ────────────────────────────────────────────────────

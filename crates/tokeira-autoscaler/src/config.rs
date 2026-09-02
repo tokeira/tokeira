@@ -51,6 +51,12 @@ pub struct AutoscalerServiceConfig {
     pub cluster_name: String,
     pub dsql_endpoint: String,
     pub dsql_region: String,
+    /// Placement-controller endpoint for runtime retirement (Loop C):
+    /// nomination, drain marking, and drain progress. Unset disables Loop C,
+    /// so the autoscaler never chooses a runtime node to leave and never
+    /// terminates one.
+    #[serde(default)]
+    pub controller_endpoint: Option<String>,
     pub service_configs: BTreeMap<String, ServiceScaleConfig>,
 }
 
@@ -80,6 +86,7 @@ impl Default for AutoscalerServiceConfig {
             cluster_name: "tokeira".into(),
             dsql_endpoint: String::new(),
             dsql_region: String::new(),
+            controller_endpoint: None,
             service_configs: default_service_configs(),
         }
     }

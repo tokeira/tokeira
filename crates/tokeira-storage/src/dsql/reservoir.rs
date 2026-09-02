@@ -207,12 +207,30 @@ impl Reservoir {
         self.ready.len()
     }
 
+    /// Live warm-connection target: the configured `target_ready` until a
+    /// controller connection budget caps it.
+    pub fn target_ready(&self) -> usize {
+        self.target_ready.load(Ordering::Acquire)
+    }
+
+    /// Cap the warm-connection target to a controller-issued budget.
+    ///
+    /// Floored at one: a node with no warm connection could not renew or
+    /// relinquish its own leases, so a directive may throttle a node but never
+    /// silence it. The refiller reads the target on its next idle check; warm
+    /// connections already above the cap are retired by
+    /// [`retire_excess`](Self::retire_excess), not here.
     pub fn reconfigure_target(&self, new_target: u32) {
         self.target_ready
             .store((new_target as usize).max(1), Ordering::Release);
         metrics::set_dsql_reservoir_target_connections((new_target as usize).max(1));
     }
 
+    /// Retire idle warm connections above `new_target` now instead of waiting
+    /// for their lifetimes to expire, so a lowered cluster budget takes effect
+    /// promptly. Only entries in the ready queue are touched: a connection
+    /// checked out by in-flight work returns through the normal path and the
+    /// refiller simply declines to replace it, so a cap never interrupts work.
     pub fn retire_excess(&self, new_target: u32) -> usize {
         let target = (new_target as usize).max(1);
         let mut retired = 0usize;
@@ -232,6 +250,35 @@ impl Reservoir {
 
     pub fn config(&self) -> &ReservoirConfig {
         &self.config
+    }
+
+    /// A reservoir with an empty ready queue and no refiller, scanner, or
+    /// return processor, for tests of target and retirement bookkeeping.
+    ///
+    /// A physical `PgConnection` cannot be fabricated offline, so tests that
+    /// need the queue populated must run against a live database instead.
+    /// Must be called inside a Tokio runtime: the idle task that keeps the
+    /// ready channel open is spawned on it.
+    #[cfg(any(test, feature = "dsql-integration"))]
+    pub fn idle_for_tests(config: ReservoirConfig) -> Self {
+        let (ready_tx, ready) = async_channel::bounded(config.target_ready);
+        let (return_tx, _return_rx) = mpsc::unbounded_channel();
+        let idle = |sender: async_channel::Sender<ReservoirEntry>| {
+            tokio::spawn(async move {
+                let _keep_open = sender;
+                std::future::pending::<()>().await;
+            })
+        };
+        Self {
+            ready,
+            return_tx,
+            target_ready: Arc::new(AtomicUsize::new(config.target_ready)),
+            slot_manager: SlotBlockManager::local_for_tests(config.target_ready),
+            refiller_handle: idle(ready_tx.clone()),
+            scanner_handle: idle(ready_tx.clone()),
+            return_processor_handle: idle(ready_tx),
+            config,
+        }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -536,5 +583,33 @@ mod tests {
             StdDuration::from_secs(140),
             StdDuration::from_secs(25)
         ));
+    }
+
+    #[tokio::test]
+    async fn budget_cap_lowers_live_target_and_floors_at_one() {
+        let reservoir = Reservoir::idle_for_tests(ReservoirConfig {
+            target_ready: 8,
+            ..ReservoirConfig::default()
+        });
+        assert_eq!(reservoir.target_ready(), 8);
+
+        reservoir.reconfigure_target(3);
+        assert_eq!(reservoir.target_ready(), 3);
+        assert_eq!(reservoir.config().target_ready, 8);
+
+        reservoir.reconfigure_target(0);
+        assert_eq!(reservoir.target_ready(), 1);
+    }
+
+    #[tokio::test]
+    async fn retire_excess_leaves_a_pool_within_target_untouched() {
+        let reservoir = Reservoir::idle_for_tests(ReservoirConfig {
+            target_ready: 4,
+            ..ReservoirConfig::default()
+        });
+
+        assert_eq!(reservoir.retire_excess(2), 0);
+        assert_eq!(reservoir.ready_count(), 0);
+        assert!(matches!(reservoir.checkout(), Err(ReservoirError::Empty)));
     }
 }

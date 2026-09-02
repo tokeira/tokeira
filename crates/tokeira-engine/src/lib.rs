@@ -2601,6 +2601,9 @@ async fn build_dsql_stack(
     // Every repository and visibility surface shares this exact director. The
     // embedded caller retains another Arc solely for ordered pool shutdown;
     // no second pool or DynamoDB coordinator is constructed here.
+    let budget_applier: Arc<dyn ConnectionBudgetApplier> = Arc::new(DsqlConnectionBudgetApplier {
+        director: director.clone(),
+    });
     let chasm_node_repo = Arc::new(tokeira_storage::dsql::DsqlChasmNodeRepository::new(
         director.clone(),
     ));
@@ -2635,6 +2638,7 @@ async fn build_dsql_stack(
         Some(endpoint),
         chasm_node_repo,
         false,
+        budget_applier,
     )
     .await
 }
@@ -2688,6 +2692,8 @@ async fn build_in_memory_stack(
         None,
         Arc::new(tokeira_storage::InMemoryChasmNodeStore::new()),
         recover_self_assigned_shard,
+        // The in-memory store has no connection reservoir to budget.
+        Arc::new(NoopConnectionBudgetApplier),
     )
     .await
 }
@@ -2831,6 +2837,7 @@ async fn build_service_stack_with_storage<R, L, S, V, F>(
     dsql_endpoint: Option<String>,
     chasm_node_repo: Arc<dyn tokeira_storage::ChasmNodeRepository>,
     recover_self_assigned_shard: bool,
+    budget_applier: Arc<dyn ConnectionBudgetApplier>,
 ) -> Result<ConstructedStack>
 where
     R: LeaseRepository + RunRepository + 'static,
@@ -3163,7 +3170,7 @@ where
                     node_endpoint.clone(),
                     controller_endpoint,
                 ),
-                Arc::new(NoopConnectionBudgetApplier),
+                budget_applier,
                 background_cancel.clone(),
             )
         });
@@ -4041,6 +4048,8 @@ fn membership_config(
     }
 }
 
+/// Budget applier for stacks without a connection reservoir (the in-memory
+/// store): directives are accepted and discarded, and no headroom is reported.
 #[derive(Debug)]
 struct NoopConnectionBudgetApplier;
 
@@ -4052,6 +4061,49 @@ impl ConnectionBudgetApplier for NoopConnectionBudgetApplier {
         _max_reservoir_size: u32,
     ) -> Result<()> {
         Ok(())
+    }
+
+    fn available_connections(&self) -> u32 {
+        0
+    }
+}
+
+/// Applies controller connection budgets to the DSQL connection director the
+/// whole stack shares, and reports its warm headroom in heartbeats.
+///
+/// Only the reservoir cap is applied. The directive's `rate_per_second` and
+/// `capacity` describe this node's share of the cluster creation rate, but on
+/// the distributed path the creation-rate limiter is the DynamoDB token bucket
+/// every node shares, which already enforces the cluster rate as one row: a
+/// node writing its per-node share into that row would replace the cluster
+/// rate with a fraction of it. A process-local governor in front of the shared
+/// bucket is the mechanism the share would drive, and does not exist yet.
+#[derive(Debug)]
+struct DsqlConnectionBudgetApplier {
+    director: Arc<DsqlConnectionDirector>,
+}
+
+impl ConnectionBudgetApplier for DsqlConnectionBudgetApplier {
+    fn apply_budget(
+        &self,
+        rate_per_second: f64,
+        capacity: u64,
+        max_reservoir_size: u32,
+    ) -> Result<()> {
+        let retired = self.director.apply_connection_budget(max_reservoir_size)?;
+        tracing::debug!(
+            rate_per_second,
+            capacity,
+            max_reservoir_size,
+            reservoir_target = self.director.reservoir_target(),
+            retired,
+            "applied controller connection budget to the DSQL reservoir"
+        );
+        Ok(())
+    }
+
+    fn available_connections(&self) -> u32 {
+        u32::try_from(self.director.ready_connections()).unwrap_or(u32::MAX)
     }
 }
 

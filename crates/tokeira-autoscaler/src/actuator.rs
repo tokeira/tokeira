@@ -29,7 +29,7 @@ use async_trait::async_trait;
 ///
 /// Platform-agnostic: represents the desired and running counts regardless
 /// of whether the underlying platform is ECS, Kubernetes, or something else.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServiceState {
     pub desired_count: u32,
     pub running_count: u32,
@@ -131,16 +131,27 @@ pub trait Actuator: Send + Sync + std::fmt::Debug {
 // internally. See `platforms/ecs/` for the ECS implementation which uses
 // exponential backoff on AWS API throttling errors.
 
+/// Recording actuator shared by the crate's tests.
 #[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
+pub(crate) mod test_support {
+    use std::sync::Mutex;
 
     use super::*;
 
-    #[derive(Debug)]
-    struct MockActuator {
-        service_state: ServiceState,
-        calls: Arc<Mutex<Vec<String>>>,
+    #[derive(Debug, Default)]
+    pub(crate) struct MockActuator {
+        pub(crate) service_state: ServiceState,
+        pub(crate) calls: Mutex<Vec<String>>,
+    }
+
+    impl MockActuator {
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().expect("calls lock").push(call);
+        }
     }
 
     #[async_trait]
@@ -154,10 +165,7 @@ mod tests {
             if self.service_state.desired_count == desired {
                 return Ok(false);
             }
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push(format!("{service}:{desired}"));
+            self.record(format!("{service}:{desired}"));
             Ok(true)
         }
 
@@ -167,21 +175,20 @@ mod tests {
 
         async fn drain_container_instance(
             &self,
-            _cluster: &str,
-            _container_instance_arn: &str,
+            cluster: &str,
+            container_instance_arn: &str,
         ) -> Result<()> {
+            self.record(format!("drain:{cluster}:{container_instance_arn}"));
             Ok(())
         }
 
-        async fn clear_instance_protection(
-            &self,
-            _asg_name: &str,
-            _instance_id: &str,
-        ) -> Result<()> {
+        async fn clear_instance_protection(&self, asg_name: &str, instance_id: &str) -> Result<()> {
+            self.record(format!("clear_protection:{asg_name}:{instance_id}"));
             Ok(())
         }
 
-        async fn terminate_instance_with_decrement(&self, _instance_id: &str) -> Result<()> {
+        async fn terminate_instance_with_decrement(&self, instance_id: &str) -> Result<()> {
+            self.record(format!("terminate:{instance_id}"));
             Ok(())
         }
 
@@ -199,22 +206,27 @@ mod tests {
 
         async fn resolve_container_instance_for_ec2(
             &self,
-            _cluster: &str,
+            cluster: &str,
             ec2_instance_id: &str,
         ) -> Result<String> {
+            self.record(format!("resolve:{cluster}:{ec2_instance_id}"));
             Ok(format!("container:{ec2_instance_id}"))
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{test_support::MockActuator, *};
 
     #[tokio::test]
     async fn mock_actuator_noops_when_service_state_matches_target() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
         let actuator = MockActuator {
             service_state: ServiceState {
                 desired_count: 3,
                 running_count: 3,
             },
-            calls: calls.clone(),
+            ..MockActuator::default()
         };
 
         assert!(
@@ -223,6 +235,6 @@ mod tests {
                 .await
                 .expect("no-op update succeeds")
         );
-        assert!(calls.lock().expect("calls lock").is_empty());
+        assert!(actuator.calls().is_empty());
     }
 }

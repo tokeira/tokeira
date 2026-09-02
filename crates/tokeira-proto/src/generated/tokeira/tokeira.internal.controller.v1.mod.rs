@@ -56,6 +56,8 @@ pub mod __buffa {
         reg.register_json_any(super::__SCALE_IN_CANDIDATE_JSON_ANY);
         reg.register_json_any(super::__MARK_DRAINING_REQUEST_JSON_ANY);
         reg.register_json_any(super::__MARK_DRAINING_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__DESCRIBE_NODE_DRAIN_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__DESCRIBE_NODE_DRAIN_RESPONSE_JSON_ANY);
     }
 }
 #[doc(inline)]
@@ -106,6 +108,10 @@ pub use self::__buffa::view::ScaleInCandidateView;
 pub use self::__buffa::view::MarkDrainingRequestView;
 #[doc(inline)]
 pub use self::__buffa::view::MarkDrainingResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::DescribeNodeDrainRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::DescribeNodeDrainResponseView;
 #[doc(inline)]
 pub use self::__buffa::register_types;
 include!("tokeira.internal.controller.v1.controller.__connect.rs");

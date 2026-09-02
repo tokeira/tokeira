@@ -227,27 +227,27 @@ fn decode_config(output: &EvaluatedDefinition<DecodedKind>) -> ShippedConfig {
     from_located_value(output.config.clone()).expect("the shipped config admits")
 }
 
-fn assert_replica_defaults(shipped: &ShippedReplicaPolicy, legacy: &serde_json::Value) {
-    assert_eq!(legacy["image"].as_str(), Some(shipped.image.as_str()));
+fn assert_replica_defaults(shipped: &ShippedReplicaPolicy, model: &serde_json::Value) {
+    assert_eq!(model["image"].as_str(), Some(shipped.image.as_str()));
     assert_eq!(
-        legacy["desired_count"].as_u64(),
+        model["desired_count"].as_u64(),
         Some(shipped.replicas.into())
     );
-    assert_eq!(legacy["cpu"].as_u64(), Some(shipped.cpu.into()));
-    assert_eq!(legacy["memory_mb"].as_u64(), Some(shipped.memory_mb.into()));
+    assert_eq!(model["cpu"].as_u64(), Some(shipped.cpu.into()));
+    assert_eq!(model["memory_mb"].as_u64(), Some(shipped.memory_mb.into()));
 }
 
-fn assert_capacity_defaults(shipped: &ShippedCapacityPlane, legacy: &serde_json::Value) {
+fn assert_capacity_defaults(shipped: &ShippedCapacityPlane, model: &serde_json::Value) {
     assert_eq!(
-        legacy["instance_type"].as_str(),
+        model["instance_type"].as_str(),
         Some(shipped.instance_type.as_str())
     );
-    assert_eq!(legacy["min_capacity"].as_u64(), Some(shipped.min.into()));
+    assert_eq!(model["min_capacity"].as_u64(), Some(shipped.min.into()));
     assert_eq!(
-        legacy["desired_capacity"].as_u64(),
+        model["desired_capacity"].as_u64(),
         Some(shipped.desired.into())
     );
-    assert_eq!(legacy["max_capacity"].as_u64(), Some(shipped.max.into()));
+    assert_eq!(model["max_capacity"].as_u64(), Some(shipped.max.into()));
 }
 
 fn graph_projection(output: &EvaluatedDefinition<DecodedKind>) -> GraphProjection {
@@ -380,78 +380,70 @@ fn the_shipped_set_pins_current_observability_images() {
     }
 }
 
-// The legacy model remains a derivation dependency for definition kinds. Its
-// defaults must therefore be the same authored policy as the shipped roots,
-// even though the live creation path is definition-driven.
+// The canonical derivation model and shipped roots must encode the same
+// platform-owned policy; kinds apply authored values to that model.
 #[test]
-fn legacy_derivation_defaults_match_the_shipped_definition() {
+fn derivation_defaults_match_the_shipped_definition() {
     let output = evaluate_tkd(&shipped_tkd_root()).expect("the shipped TKD set evaluates");
     let shipped = decode_config(&output);
-    let legacy =
-        serde_json::to_value(tokeira_ecs::EcsConfig::default()).expect("legacy defaults serialize");
+    let model = serde_json::to_value(tokeira_ecs::EcsConfig::default())
+        .expect("derivation defaults serialize");
 
     assert_eq!(
-        legacy["environment"].as_str(),
+        model["environment"].as_str(),
         Some(shipped.environment.as_str())
     );
-    assert_eq!(legacy["region"].as_str(), Some(shipped.aws.region.as_str()));
+    assert_eq!(model["region"].as_str(), Some(shipped.aws.region.as_str()));
     assert_eq!(
-        legacy["cluster"]["name"].as_str(),
+        model["cluster"]["name"].as_str(),
         Some(shipped.cluster.name.as_str())
     );
     assert_eq!(
-        legacy["cluster"]["service_connect_namespace"].as_str(),
+        model["cluster"]["service_connect_namespace"].as_str(),
         Some(shipped.cluster.service_connect_namespace.as_str())
     );
     assert_eq!(
-        legacy["networking"]["vpc_cidr"].as_str(),
+        model["networking"]["vpc_cidr"].as_str(),
         Some(shipped.networking.vpc_cidr.as_str())
     );
     assert_eq!(
-        legacy["networking"]["availability_zones"],
+        model["networking"]["availability_zones"],
         serde_json::json!(&shipped.networking.availability_zones)
     );
     assert_eq!(
-        legacy["networking"]["private_dns_zone"].as_str(),
+        model["networking"]["private_dns_zone"].as_str(),
         Some(shipped.networking.private_dns_zone.as_str())
     );
 
-    assert_replica_defaults(&shipped.services.edge_api, &legacy["services"]["edge_api"]);
-    assert_replica_defaults(
-        &shipped.services.edge_poll,
-        &legacy["services"]["edge_poll"],
-    );
+    assert_replica_defaults(&shipped.services.edge_api, &model["services"]["edge_api"]);
+    assert_replica_defaults(&shipped.services.edge_poll, &model["services"]["edge_poll"]);
     assert_eq!(
-        legacy["services"]["runtime"]["image"].as_str(),
+        model["services"]["runtime"]["image"].as_str(),
         Some(shipped.services.runtime.image.as_str())
     );
     assert_eq!(
-        legacy["services"]["runtime"]["cpu"].as_u64(),
+        model["services"]["runtime"]["cpu"].as_u64(),
         Some(shipped.services.runtime.cpu.into())
     );
     assert_eq!(
-        legacy["services"]["runtime"]["memory_mb"].as_u64(),
+        model["services"]["runtime"]["memory_mb"].as_u64(),
         Some(shipped.services.runtime.memory_mb.into())
     );
     assert_replica_defaults(
         &shipped.services.projection,
-        &legacy["services"]["projection"],
+        &model["services"]["projection"],
     );
     assert_replica_defaults(
         &shipped.services.controller,
-        &legacy["services"]["controller"],
+        &model["services"]["controller"],
     );
     assert_replica_defaults(
         &shipped.services.autoscaler,
-        &legacy["services"]["autoscaler"],
+        &model["services"]["autoscaler"],
     );
-    assert_replica_defaults(&shipped.services.admin, &legacy["services"]["admin"]);
-    assert_eq!(
-        legacy["autoscaler"]["image"].as_str(),
-        Some(shipped.services.autoscaler.image.as_str())
-    );
+    assert_replica_defaults(&shipped.services.admin, &model["services"]["admin"]);
 
-    for (shipped_capacity, legacy_key) in [
+    for (shipped_capacity, model_key) in [
         (&shipped.capacity.edge_api, "edge_api"),
         (&shipped.capacity.edge_poll, "edge_poll"),
         (&shipped.capacity.runtime, "runtime"),
@@ -461,27 +453,27 @@ fn legacy_derivation_defaults_match_the_shipped_definition() {
         (&shipped.capacity.loki, "loki"),
         (&shipped.capacity.grafana, "grafana"),
     ] {
-        assert_capacity_defaults(shipped_capacity, &legacy["capacity_providers"][legacy_key]);
+        assert_capacity_defaults(shipped_capacity, &model["capacity_providers"][model_key]);
     }
 
     assert_eq!(
-        legacy["alb"]["health_check_path"].as_str(),
+        model["alb"]["health_check_path"].as_str(),
         Some(shipped.alb.health_check_path.as_str())
     );
     assert_eq!(
-        legacy["alb"]["health_check_interval_secs"].as_u64(),
+        model["alb"]["health_check_interval_secs"].as_u64(),
         Some(shipped.alb.health_check_interval_secs)
     );
     assert_eq!(
-        legacy["observability"]["mimir_image"].as_str(),
+        model["observability"]["mimir_image"].as_str(),
         Some(shipped.observability.mimir.image.as_str())
     );
     assert_eq!(
-        legacy["observability"]["loki_image"].as_str(),
+        model["observability"]["loki_image"].as_str(),
         Some(shipped.observability.loki.image.as_str())
     );
     assert_eq!(
-        legacy["observability"]["grafana_image"].as_str(),
+        model["observability"]["grafana_image"].as_str(),
         Some(shipped.observability.grafana.image.as_str())
     );
 }

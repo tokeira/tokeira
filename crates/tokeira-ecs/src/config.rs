@@ -1,10 +1,9 @@
 //! ECS deployment policy and its validation boundary.
 //!
-//! The legacy in-process adapter still consumes this model directly, while
-//! definition kinds use it as the canonical derivation model for workload
-//! details that are not author-facing. [`EcsConfig::default`] therefore mirrors
-//! the shipped ECS definition defaults; tests in the platform package fence the
-//! two authoring surfaces against future drift.
+//! Definition kinds use this as the canonical derivation model for workload
+//! details that are platform-owned rather than author-facing. Consequently,
+//! [`EcsConfig::default`] mirrors the shipped ECS definition defaults; platform
+//! tests fence the authored source and derived model against future drift.
 
 use std::collections::HashMap;
 
@@ -64,7 +63,6 @@ pub struct EcsConfig {
     pub networking: NetworkingConfig,
     pub capacity_providers: CapacityProviderConfigs,
     pub services: ServiceConfigs,
-    pub autoscaler: AutoscalerConfig,
     pub alb: AlbConfig,
     pub dsql: DsqlConfig,
     pub observability: ObservabilityConfig,
@@ -83,21 +81,6 @@ pub struct NetworkingConfig {
     pub(crate) vpc_cidr: String,
     pub(crate) availability_zones: Vec<String>,
     pub(crate) private_dns_zone: String,
-    pub(crate) optional_endpoints: OptionalEndpoints,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OptionalEndpoints {
-    pub(crate) sts: bool,
-    pub(crate) kms: bool,
-    /// Retained so existing deployment TOML continues to deserialize. Secrets
-    /// Manager is required by the Grafana execution role and is always
-    /// provisioned; setting this compatibility field no longer adds a second
-    /// endpoint.
-    pub(crate) secrets_manager: bool,
-    pub(crate) cloudwatch_logs: bool,
-    pub(crate) ec2: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,13 +148,6 @@ pub struct DaemonServiceConfig {
     pub(crate) grpc_port: u16,
     pub(crate) metrics_port: u16,
     pub(crate) http_port: Option<u16>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AutoscalerConfig {
-    pub(crate) image: String,
-    pub(crate) polling_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,7 +316,6 @@ impl Default for EcsConfig {
             networking: NetworkingConfig::default(),
             capacity_providers: CapacityProviderConfigs::default(),
             services: ServiceConfigs::default(),
-            autoscaler: AutoscalerConfig::default(),
             alb: AlbConfig::default(),
             dsql: DsqlConfig::default(),
             observability: ObservabilityConfig::default(),
@@ -367,7 +342,6 @@ impl Default for NetworkingConfig {
                 "eu-west-2c".into(),
             ],
             private_dns_zone: "tokeira.internal".into(),
-            optional_endpoints: OptionalEndpoints::default(),
         }
     }
 }
@@ -513,15 +487,6 @@ impl DaemonServiceConfig {
     }
 }
 
-impl Default for AutoscalerConfig {
-    fn default() -> Self {
-        Self {
-            image: "tokeira-autoscaler:latest".into(),
-            polling_interval_secs: 15,
-        }
-    }
-}
-
 impl Default for AlbConfig {
     fn default() -> Self {
         Self {
@@ -593,23 +558,6 @@ pub fn required_vpc_endpoints(region: &str) -> Vec<String> {
         other => format!("com.amazonaws.{region}.{other}"),
     })
     .collect()
-}
-
-pub(crate) fn optional_vpc_endpoints(config: &EcsConfig) -> Vec<String> {
-    let mut endpoints = Vec::new();
-    if config.networking.optional_endpoints.sts {
-        endpoints.push(format!("com.amazonaws.{}.sts", config.region));
-    }
-    if config.networking.optional_endpoints.kms {
-        endpoints.push(format!("com.amazonaws.{}.kms", config.region));
-    }
-    if config.networking.optional_endpoints.cloudwatch_logs {
-        endpoints.push(format!("com.amazonaws.{}.logs", config.region));
-    }
-    if config.networking.optional_endpoints.ec2 {
-        endpoints.push(format!("com.amazonaws.{}.ec2", config.region));
-    }
-    endpoints
 }
 
 pub fn validate_cpu_memory(

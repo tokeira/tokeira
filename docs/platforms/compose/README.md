@@ -243,8 +243,8 @@ definition-backed deployment.
 | `tkr scale up/down` | Forwards to TKP; Compose reports that it exposes no scale dimension. |
 | `tkr infra status`, `deploy status`, `scale status` | Render TKP `describe`. |
 | `tkr logs` | Forwards to TKP's Docker log stream. |
-| `tkr port-forward` | Reports provider-published port mappings; `--local-port` is not available on the bound path. |
-| `tkr exec`, `schema` | In-process-only; there is no forwarded Compose path. |
+| `tkr port-forward` | Reports provider-published port mappings. |
+| `schema` | Local-only; there is no forwarded Compose path. |
 
 ## See also
 

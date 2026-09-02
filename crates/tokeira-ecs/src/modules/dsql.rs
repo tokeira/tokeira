@@ -1,4 +1,4 @@
-//! Legacy DSQL substrate and task-access identities for ECS.
+//! DSQL adoption records and task-access identities for ECS definitions.
 //!
 //! Managed mode owns the cluster, private endpoints, and least-privilege IAM
 //! roles. Preexisting mode validates and records operator-supplied identities
@@ -8,151 +8,12 @@ use std::collections::HashMap;
 
 use tokeira_aws::{
     ResourceContext,
-    resources::{
-        dsql_cluster::{DsqlCluster, DsqlClusterMode as AwsDsqlClusterMode},
-        dsql_connection_endpoint::{DsqlConnectionEndpoint, DsqlConnectionEndpointConfig},
-        iam_role::{IamRole, IamRoleConfig},
-        vpc_endpoint::{EndpointType, VpcEndpoint, VpcEndpointConfig},
-    },
+    resources::iam_role::{IamRole, IamRoleConfig},
 };
 use tokeira_iac::{
-    DescribeResult, IacError, InternalChange, Module, ModuleContext, ProvisionContext, Resource,
-    ResourceId, ResourceState, ResourceType,
+    DescribeResult, IacError, InternalChange, ProvisionContext, Resource, ResourceId,
+    ResourceState, ResourceType,
 };
-
-use crate::config::{DsqlClusterMode, DsqlConfig, EcsConfig};
-
-const DSQL_CLUSTER_ID: &str = "dsql:cluster";
-const DSQL_MANAGEMENT_ENDPOINT_ID: &str = "dsql:management-endpoint";
-const DSQL_CONNECTION_ENDPOINT_ID: &str = "dsql:connection-endpoint";
-const DSQL_RUNTIME_ROLE_ID: &str = "dsql:runtime-role";
-const DSQL_ADMIN_ROLE_ID: &str = "dsql:admin-role";
-
-#[derive(Debug, Clone)]
-pub struct DsqlModule {
-    config: EcsConfig,
-}
-
-impl DsqlModule {
-    pub(crate) fn new(config: EcsConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl Module for DsqlModule {
-    fn name(&self) -> &str {
-        "dsql"
-    }
-
-    fn dependencies(&self) -> Vec<&str> {
-        vec!["networking"]
-    }
-
-    fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
-        validate_preexisting(&self.config.dsql)?;
-        let rctx = resource_context(&self.config);
-        let vpc_id = vpc_resource_id(&self.config);
-        let endpoint_sg_id = ResourceId("sg-vpc-endpoints".to_owned());
-        let cluster_id = ResourceId(DSQL_CLUSTER_ID.to_owned());
-        let mode = match self.config.dsql.mode {
-            DsqlClusterMode::Managed => AwsDsqlClusterMode::Managed,
-            DsqlClusterMode::Preexisting => AwsDsqlClusterMode::Preexisting,
-        };
-        let mut resources: Vec<Box<dyn Resource>> = vec![Box::new(DsqlCluster {
-            identity: format!("{}-{}", self.config.project_name, self.config.environment),
-            mode,
-            endpoint: self.config.dsql.endpoint.clone(),
-            resource_id: Some(cluster_id.clone()),
-            module: self.name().to_owned(),
-            project: rctx.project.clone(),
-            region: rctx.region.clone(),
-            tags: rctx.tags.clone(),
-            ..Default::default()
-        })];
-
-        match self.config.dsql.mode {
-            DsqlClusterMode::Managed => {
-                resources.push(Box::new(VpcEndpoint::new(
-                    "dsql-management".to_owned(),
-                    VpcEndpointConfig {
-                        service_name: format!("com.amazonaws.{}.dsql-control", self.config.region),
-                        endpoint_type: EndpointType::Interface,
-                        vpc_dependency: vpc_id.clone(),
-                        security_group_dependency: Some(endpoint_sg_id.clone()),
-                        resource_id: Some(ResourceId(DSQL_MANAGEMENT_ENDPOINT_ID.to_owned())),
-                        module: self.name().to_owned(),
-                    },
-                    &rctx,
-                )));
-                resources.push(Box::new(DsqlConnectionEndpoint::new(
-                    format!("{}-connection", self.config.project_name),
-                    DsqlConnectionEndpointConfig {
-                        vpc_dependency: vpc_id.clone(),
-                        security_group_dependency: endpoint_sg_id,
-                        dsql_cluster_dependency: cluster_id.clone(),
-                        resource_id: Some(ResourceId(DSQL_CONNECTION_ENDPOINT_ID.to_owned())),
-                        module: self.name().to_owned(),
-                    },
-                    &rctx,
-                )));
-                resources.push(Box::new(DsqlIamRoleResource::managed(
-                    ResourceId(DSQL_RUNTIME_ROLE_ID.to_owned()),
-                    format!("{}-dsql-runtime", self.config.project_name),
-                    "dsql-runtime",
-                    "dsql:DbConnect",
-                    cluster_id.clone(),
-                    self.name().to_owned(),
-                    rctx.clone(),
-                )));
-                resources.push(Box::new(DsqlIamRoleResource::managed(
-                    ResourceId(DSQL_ADMIN_ROLE_ID.to_owned()),
-                    format!("{}-dsql-admin", self.config.project_name),
-                    "dsql-admin",
-                    "dsql:DbConnectAdmin",
-                    cluster_id,
-                    self.name().to_owned(),
-                    rctx,
-                )));
-            }
-            DsqlClusterMode::Preexisting => {
-                resources.push(Box::new(AdoptedDsqlResource::endpoint(
-                    ResourceId(DSQL_MANAGEMENT_ENDPOINT_ID.to_owned()),
-                    self.config
-                        .dsql
-                        .management_endpoint_id
-                        .clone()
-                        .unwrap_or_default(),
-                    self.name(),
-                )));
-                resources.push(Box::new(AdoptedDsqlResource::endpoint(
-                    ResourceId(DSQL_CONNECTION_ENDPOINT_ID.to_owned()),
-                    self.config
-                        .dsql
-                        .connection_endpoint_id
-                        .clone()
-                        .unwrap_or_default(),
-                    self.name(),
-                )));
-                resources.push(Box::new(DsqlIamRoleResource::preexisting(
-                    ResourceId(DSQL_RUNTIME_ROLE_ID.to_owned()),
-                    self.config
-                        .dsql
-                        .runtime_role_arn
-                        .clone()
-                        .unwrap_or_default(),
-                    self.name().to_owned(),
-                )));
-                resources.push(Box::new(DsqlIamRoleResource::preexisting(
-                    ResourceId(DSQL_ADMIN_ROLE_ID.to_owned()),
-                    self.config.dsql.admin_role_arn.clone().unwrap_or_default(),
-                    self.name().to_owned(),
-                )));
-            }
-        }
-
-        Ok(resources)
-    }
-}
 
 #[derive(Debug)]
 pub(crate) struct AdoptedDsqlResource {
@@ -548,148 +409,14 @@ impl Resource for DsqlIamRoleResource {
     }
 }
 
-fn validate_preexisting(config: &DsqlConfig) -> Result<(), IacError> {
-    if config.mode == DsqlClusterMode::Managed {
-        return Ok(());
-    }
-    let missing = [
-        ("dsql.endpoint", config.endpoint.as_ref()),
-        (
-            "dsql.management_endpoint_id",
-            config.management_endpoint_id.as_ref(),
-        ),
-        (
-            "dsql.connection_endpoint_id",
-            config.connection_endpoint_id.as_ref(),
-        ),
-        ("dsql.runtime_role_arn", config.runtime_role_arn.as_ref()),
-        ("dsql.admin_role_arn", config.admin_role_arn.as_ref()),
-    ]
-    .into_iter()
-    .filter_map(|(name, value)| {
-        value
-            .filter(|value| !value.is_empty())
-            .map(|_| ())
-            .is_none()
-            .then_some(name)
-    })
-    .collect::<Vec<_>>();
-
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(IacError::DependencyResolution(format!(
-            "preexisting DSQL mode is missing required fields: {}",
-            missing.join(", ")
-        )))
-    }
-}
-
-fn resource_context(config: &EcsConfig) -> ResourceContext {
-    ResourceContext {
-        project: config.project_name.clone(),
-        region: config.region.clone(),
-        tags: config.tags.clone(),
-    }
-}
-
-fn vpc_resource_id(config: &EcsConfig) -> ResourceId {
-    ResourceId(format!("{}-vpc", config.project_name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokeira_iac::InfraState;
-
-    fn module_context() -> ModuleContext<'static> {
-        let state = Box::leak(Box::new(InfraState::default()));
-        let extensions = Box::leak(Box::new(HashMap::new()));
-        ModuleContext::new(state, extensions)
-    }
-
-    #[test]
-    fn dsql_module_reports_name_and_networking_dependency() {
-        let module = DsqlModule::new(EcsConfig::default());
-
-        assert_eq!(module.name(), "dsql");
-        assert_eq!(module.dependencies(), &["networking"]);
-    }
-
-    #[test]
-    fn managed_mode_enumerates_authoritative_dsql_resources() {
-        let module = DsqlModule::new(EcsConfig::default());
-        let resources = module.resources(&module_context()).expect("resources");
-        let ids: Vec<String> = resources
-            .iter()
-            .map(|resource| resource.resource_id().0)
-            .collect();
-
-        assert_eq!(ids.len(), 5);
-        assert_eq!(
-            ids,
-            vec![
-                DSQL_CLUSTER_ID,
-                DSQL_MANAGEMENT_ENDPOINT_ID,
-                DSQL_CONNECTION_ENDPOINT_ID,
-                DSQL_RUNTIME_ROLE_ID,
-                DSQL_ADMIN_ROLE_ID,
-            ]
-        );
-    }
-
-    #[test]
-    fn managed_mode_declares_dsql_endpoint_categories() {
-        let module = DsqlModule::new(EcsConfig::default());
-        let resources = module.resources(&module_context()).expect("resources");
-        let ids: Vec<String> = resources
-            .iter()
-            .map(|resource| resource.resource_id().0)
-            .collect();
-
-        assert!(ids.contains(&DSQL_MANAGEMENT_ENDPOINT_ID.to_owned()));
-        assert!(ids.contains(&DSQL_CONNECTION_ENDPOINT_ID.to_owned()));
-    }
-
-    #[test]
-    fn preexisting_mode_requires_all_hydration_fields() {
-        let mut config = EcsConfig::default();
-        config.dsql.mode = DsqlClusterMode::Preexisting;
-        let module = DsqlModule::new(config);
-
-        let err = match module.resources(&module_context()) {
-            Ok(_) => panic!("missing preexisting fields should fail"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("dsql.endpoint"));
-    }
-
-    #[test]
-    fn preexisting_mode_enumerates_adopter_resources() {
-        let mut config = EcsConfig::default();
-        config.dsql.mode = DsqlClusterMode::Preexisting;
-        config.dsql.endpoint = Some("cluster.example.dsql".into());
-        config.dsql.management_endpoint_id = Some("vpce-management".into());
-        config.dsql.connection_endpoint_id = Some("vpce-connection".into());
-        config.dsql.runtime_role_arn = Some("arn:aws:iam::123456789012:role/runtime".into());
-        config.dsql.admin_role_arn = Some("arn:aws:iam::123456789012:role/admin".into());
-        let module = DsqlModule::new(config);
-
-        let resources = module.resources(&module_context()).expect("resources");
-        let ids: Vec<String> = resources
-            .iter()
-            .map(|resource| resource.resource_id().0)
-            .collect();
-
-        assert_eq!(ids.len(), 5);
-        assert!(ids.contains(&DSQL_MANAGEMENT_ENDPOINT_ID.to_owned()));
-        assert!(ids.contains(&DSQL_CONNECTION_ENDPOINT_ID.to_owned()));
-    }
 
     #[test]
     fn preexisting_role_state_exposes_role_arn() {
         let resource = DsqlIamRoleResource::preexisting(
-            ResourceId(DSQL_RUNTIME_ROLE_ID.to_owned()),
+            ResourceId("dsql:runtime-role".to_owned()),
             "arn:aws:iam::123456789012:role/runtime".into(),
             "dsql".into(),
         );

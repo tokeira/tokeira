@@ -234,8 +234,8 @@ mod tests {
         );
     }
 
-    // The definition's autoscaler policy must reach the task model instead
-    // of stopping at the legacy duplicate image coordinate.
+    // The definition's autoscaler policy must reach the task model used to
+    // build the provider manifest.
     #[test]
     fn authored_autoscaler_resources_reach_the_realized_workload() {
         use tokeira_platform::kind::Kind as _;

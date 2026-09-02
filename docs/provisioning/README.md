@@ -51,8 +51,8 @@ atomic rename, and obtains the engine content-addressed:
   internal steps, never operator commands — then independently re-hashes the
   placed binary against its manifest sidecar. A sidecar that does not
   describe the placed bytes is a creation refusal.
-- **`ecs` and `eks` are refused at create** while those platforms are
-  experimental; the creatable set is `local` and `compose`.
+- **EKS is refused at create** while that platform is experimental; the creatable set
+  is `local`, `compose`, and `ecs`.
 - **Birth publication is non-fatal.** A failed publication leaves the
   deployment created with its publication pending, completed later by
   `tkr deployment publish`.
@@ -153,7 +153,7 @@ realization at the fetched revision.
 |---|---|---:|---|
 | Local | Legacy in-process (`deployment.toml`, `tkr` handlers) | No | Yes |
 | Compose | Definition-backed, forwarded to its own `tkp` | Yes | Yes |
-| ECS | Definition-backed platform package | Yes | No — refused at create as experimental |
+| ECS | Definition-backed, forwarded to its own `tkp` | Yes | Yes |
 | EKS | Definition-backed platform package | Yes | No — refused at create as experimental |
 
 ## Read next

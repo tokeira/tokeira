@@ -398,9 +398,7 @@ change detection and semantics, confirmation gating, and progress reporting.
 Platform code focuses on provider-specific behaviour; definitions focus on
 deployment shape.
 
-## Legacy In-Process Path
+## In-Process Local Path
 
-Two deployment types — bare-host Local and `deployment.toml` ECS — still run
-through `tkr`'s own in-process `InfraEngine` behind a facade documented as
-legacy in `apps/tkr`. New platform work happens on the definition-bound path
-above.
+Bare-host Local still runs through `tkr`'s in-process engines. Cloud platforms
+use the definition-bound path above.

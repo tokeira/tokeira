@@ -1,195 +1,19 @@
-//! Legacy observability infrastructure and shared Alloy rendering.
+//! Definition-owned observability content, credentials, and Alloy rendering.
 //!
-//! This module owns storage, credentials, and the legacy infrastructure-plane
-//! workload resources. The definition-driven platform reuses only the content
-//! loader and renderer; [`AlloyRenderContext`] keeps that shared renderer from
-//! reconstructing operator identity from legacy defaults.
+//! Artifact loading follows the staged definition directory. Role helpers keep
+//! S3 and Secrets Manager permissions scoped to the resources declared by the
+//! definition, while [`AlloyRenderContext`] carries authored identity without
+//! reconstructing it from defaults.
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::Path};
 
 use tokeira_aws::{
     ResourceContext,
-    resources::{
-        ecs_service as aws_ecs,
-        iam_role::{IamRole, IamRoleConfig},
-        s3_bucket::{S3Bucket, S3BucketConfig},
-        s3_object::S3Object,
-        secrets_manager_secret::{SecretValue, SecretsManagerSecret, SecretsManagerSecretConfig},
-        ssm_parameter::SsmParameterResource,
-    },
+    resources::iam_role::{IamRole, IamRoleConfig},
 };
-use tokeira_iac::{IacError, Module, ModuleContext, Resource, ResourceId};
+use tokeira_iac::IacError;
 
-use crate::{config::EcsConfig, services::EcsWorkload};
-
-#[derive(Debug, Clone)]
-pub struct ObservabilityModule {
-    config: EcsConfig,
-    /// The deployment's observability content directory: `dashboards/*.json`
-    /// plus `alerts/observability-alerts.yaml`, mirroring the layout the
-    /// platform ships under `platforms/ecs/observability/`.
-    content_dir: PathBuf,
-}
-
-impl ObservabilityModule {
-    pub fn new(config: EcsConfig, content_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            config,
-            content_dir: content_dir.into(),
-        }
-    }
-}
-
-impl Module for ObservabilityModule {
-    fn name(&self) -> &str {
-        "observability"
-    }
-
-    fn dependencies(&self) -> Vec<&str> {
-        vec!["cluster", "images"]
-    }
-
-    fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
-        let rctx = resource_context(&self.config);
-        let mut resources: Vec<Box<dyn Resource>> = vec![
-            Box::new(storage_bucket(
-                format!("{}-mimir-data", self.config.project_name),
-                &rctx,
-                self.name(),
-            )),
-            Box::new(storage_bucket(
-                format!("{}-loki-data", self.config.project_name),
-                &rctx,
-                self.name(),
-            )),
-            Box::new(storage_bucket(
-                format!("{}-observability-artifacts", self.config.project_name),
-                &rctx,
-                self.name(),
-            )),
-            Box::new(storage_role(
-                format!("{}-mimir-s3", self.config.project_name),
-                format!("{}-mimir-data", self.config.project_name),
-                &rctx,
-                self.name(),
-            )),
-            Box::new(storage_role(
-                format!("{}-loki-s3", self.config.project_name),
-                format!("{}-loki-data", self.config.project_name),
-                &rctx,
-                self.name(),
-            )),
-            Box::new(SecretsManagerSecret::new(
-                format!("{}/grafana/admin", self.config.project_name),
-                SecretsManagerSecretConfig {
-                    value: SecretValue::GeneratedPasswordJson {
-                        username: "admin".to_owned(),
-                        password_length: 32,
-                    },
-                    recovery_window_days: Some(7),
-                    module: self.name().to_owned(),
-                },
-                &rctx,
-            )),
-        ];
-
-        for service_name in all_alloy_services() {
-            resources.push(Box::new(SsmParameterResource {
-                name: format!("/{}/alloy/sidecar/{service_name}", self.config.project_name),
-                value: render_alloy_config(service_name, &AlloyRenderContext::from(&self.config)),
-                secure: true,
-                module: self.name().to_owned(),
-            }));
-        }
-
-        let artifacts_bucket = ResourceId(format!(
-            "s3-{}-observability-artifacts",
-            self.config.project_name
-        ));
-        for artifact in load_observability_artifacts(&self.content_dir)? {
-            resources.push(Box::new(S3Object {
-                bucket_dependency: artifacts_bucket.clone(),
-                key: artifact.key,
-                content: artifact.content,
-                content_type: artifact.content_type.to_owned(),
-                module: self.name().to_owned(),
-            }));
-        }
-
-        let vpc_id = ResourceId(format!("{}-vpc", self.config.project_name));
-        for workload in EcsWorkload::build_observability(&self.config) {
-            let mut task_role =
-                super::services::service_task_role(&workload.name, &self.config, self.name());
-            if workload.name == "tokeira-grafana" {
-                task_role.config.inline_policies.insert(
-                    "grafana-admin-secret-read".to_owned(),
-                    grafana_secret_read_policy(&self.config),
-                );
-            }
-            let task_role_dependency = task_role.resource_id();
-            let execution_role =
-                super::services::execution_role_for_workload(&workload, &self.config, self.name());
-            let execution_role_dependency = execution_role.as_ref().map(Resource::resource_id);
-            resources.push(Box::new(task_role));
-            if let Some(role) = execution_role {
-                resources.push(Box::new(role));
-            }
-            let task_definition = super::services::to_aws_task_definition(
-                &workload.task_definition,
-                Some(task_role_dependency),
-                execution_role_dependency,
-            );
-            let task_definition_manifest =
-                super::services::task_definition_manifest(&task_definition)?;
-            resources.push(Box::new(aws_ecs::TaskDefinitionResource {
-                spec: task_definition,
-                module: self.name().to_owned(),
-            }));
-            resources.push(Box::new(aws_ecs::EcsServiceResource {
-                service_name: workload.name.clone(),
-                scheduling: super::services::to_aws_scheduling(&workload.scheduling),
-                capacity_provider: workload.capacity_provider.clone(),
-                service_connect: super::services::to_aws_service(&workload.service_connect),
-                placement_constraints: workload
-                    .placement_constraints
-                    .iter()
-                    .map(super::services::to_aws_placement_constraint)
-                    .collect(),
-                cluster_dependency: ResourceId("ecs:cluster".to_owned()),
-                task_definition_dependency: ResourceId(format!(
-                    "task-definition:{}",
-                    workload.task_definition.family
-                )),
-                task_definition_manifest,
-                vpc_dependency: vpc_id.clone(),
-                security_group_dependency: super::services::security_group_for_workload(
-                    &workload.name,
-                ),
-                module: self.name().to_owned(),
-            }));
-        }
-
-        Ok(resources)
-    }
-}
-
-pub fn all_alloy_services() -> [&'static str; 10] {
-    [
-        "tokeira-edge-api",
-        "tokeira-edge-poll",
-        "tokeira-runtime",
-        "tokeira-projection",
-        "tokeira-controller",
-        "tokeira-autoscaler",
-        "tokeira-admin",
-        "tokeira-mimir",
-        "tokeira-loki",
-        "tokeira-grafana",
-    ]
-}
+use crate::config::EcsConfig;
 
 /// One deployed observability document: its artifact-bucket key, content
 /// type, and content, loaded from the deployment's observability content
@@ -262,18 +86,6 @@ pub fn load_observability_artifacts(
     Ok(artifacts)
 }
 
-fn storage_bucket(name: String, rctx: &ResourceContext, module: &str) -> S3Bucket {
-    S3Bucket::new(
-        name,
-        S3BucketConfig {
-            versioning: true,
-            module: module.to_owned(),
-            key_prefix: None,
-        },
-        rctx,
-    )
-}
-
 pub(crate) fn storage_role(
     role_name: String,
     bucket_name: String,
@@ -339,8 +151,8 @@ pub(crate) fn grafana_secret_read_policy(config: &EcsConfig) -> String {
 /// Deployment identity required to render one Alloy sidecar configuration.
 ///
 /// These values are labels and provider coordinates, not secrets. Keeping them
-/// explicit prevents definition kinds from silently substituting the legacy
-/// model's project, environment, or cluster defaults.
+/// explicit prevents definition kinds from silently substituting canonical
+/// model defaults for authored project, environment, or cluster values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlloyRenderContext<'a> {
     /// Deployment-scoped project name used in observability labels.
@@ -450,14 +262,6 @@ fn metrics_port_for(service_name: &str) -> u16 {
     }
 }
 
-fn resource_context(config: &EcsConfig) -> ResourceContext {
-    ResourceContext {
-        project: config.project_name.clone(),
-        region: config.region.clone(),
-        tags: config.tags.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,17 +270,6 @@ mod tests {
     // contracts, resource enumeration over real artifacts) lives with the
     // content itself in the `tokeira-ecs-deployment` package — this crate
     // never ships the observability tree.
-
-    #[test]
-    fn observability_module_reports_name_and_dependencies() {
-        let module = ObservabilityModule::new(
-            EcsConfig::default(),
-            std::env::temp_dir().join("ecs-observability-shape-test"),
-        );
-
-        assert_eq!(module.name(), "observability");
-        assert_eq!(module.dependencies(), &["cluster", "images"]);
-    }
 
     // A deployment without staged content refuses with the expected layout
     // named — the operator learns what belongs where, not just "not found".

@@ -43,16 +43,15 @@ pub(crate) async fn run(
             let resolved_name = name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let storage = storage.into();
             let state = state_location(state_bucket, state_region, state_prefix)?;
-            // EKS remains experimental. ECS now takes the discovered,
-            // definition-bound path below; existing legacy ECS directories
-            // are still recognized when they are loaded.
+            // EKS remains experimental. ECS takes the discovered,
+            // definition-bound path below.
             if platform.as_str() == "eks" {
                 bail!(
                     "platform `{platform}` is experimental and does not accept new deployments; \
                      the supported platforms are `local`, `compose`, and `ecs`"
                 );
             }
-            if crate::legacy::LegacyPlatform::creation_adapter(&platform).is_some() {
+            if crate::legacy::LegacyPlatform::from_id(&platform).is_some() {
                 if format.is_some() {
                     bail!("legacy platform `{platform}` does not use a definition frontend");
                 }

@@ -15,7 +15,7 @@ engineering rules (lint wall, kernel purity, documentation standards), see
   time (`apt install protobuf-compiler` / `brew install protobuf`).
 - **Docker** — only for the compose platform and container image work; the
   default test suite does not need it.
-- **Dagger 0.20+** — only for `tkr image` build/push/mirror commands.
+- **Dagger 0.20+** — only for `tkr image build`.
 
 The default test suite requires no live AWS credentials and no Docker.
 

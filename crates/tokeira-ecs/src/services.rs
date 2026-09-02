@@ -36,9 +36,8 @@ pub struct EcsWorkload {
     pub(crate) service_connect: ServiceConnectSpec,
     pub(crate) placement_constraints: Vec<PlacementConstraint>,
     /// Infrastructure identity of the IAM role assumed by the task's
-    /// containers. Definition-realized workloads resolve its provider ARN
-    /// from the recorded infrastructure state when manifests are produced;
-    /// legacy-built workloads leave it absent and retain their existing path.
+    /// containers. Workloads resolve its provider ARN from recorded
+    /// infrastructure state when manifests are produced.
     #[serde(skip)]
     pub(crate) task_role_dependency: Option<ResourceId>,
     /// Infrastructure identity of the ECS-agent execution role, when the task

@@ -119,8 +119,8 @@ IMAGE@sha256:DIGEST` implementation is intentionally narrower than the platform 
 - it excludes untracked Rust sources from the snapshot request, which makes their
   presence a refusal.
 
-This is the complete versioned construction path implemented today for Compose. Local
-remains on its isolated legacy route; ECS and EKS are not migrated by this work.
+This is the versioned construction path used by Compose and ECS. Local remains on its
+isolated in-process route; EKS is not operator-enabled.
 
 ## Retention and placement
 
@@ -153,8 +153,8 @@ bundle sidecar in the deployment. The sidecar honestly records a native, non-her
 build and local-developer authority. This path is useful for native iteration; it is not
 interchangeable with the hermetic bundle guarantee.
 
-Local and ECS currently use the in-process deployment shape, receive `deployment.toml`,
-and have no deployment-local provisioner. See
+Local uses the in-process deployment shape and receives `deployment.toml`. Compose and
+ECS receive definition source sets and a deployment-local provisioner. See
 [deployment configuration](deployment-configuration.md) for both layouts.
 
 ## Binding at creation
@@ -261,8 +261,8 @@ without a TKP implementation is refused rather than sent to a legacy in-process 
 `--yes` and `--explanation PATH` cross the apply boundary where TKP supports them.
 `--json` and `--detail` cross the read-only reporting boundary. In-process-only options
 are not invented on the other side; for example, `tkr deploy apply --force` has no TKP
-flag and is not forwarded. Logs, port forwarding, exec, and schema remain current
-in-process command paths.
+flag and is not forwarded. Logs and port mappings have bound-platform capabilities;
+schema remains a Local in-process command path.
 
 ## Normal bound apply
 

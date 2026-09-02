@@ -86,22 +86,6 @@ pub(crate) enum Command {
     },
     PortForward {
         service: String,
-        /// Local port to bind. Defaults to the service's canonical port
-        /// (grafana=3000, edge-api=7233, edge-poll=7234, controller=7240,
-        /// mimir=9009, loki=3100).
-        #[arg(long)]
-        local_port: Option<u16>,
-    },
-    /// Execute a command in a running ECS container.
-    Exec {
-        service: String,
-        /// Container name to exec into. Defaults to the primary application
-        /// container for the service (never the Alloy sidecar).
-        #[arg(long)]
-        container: Option<String>,
-        /// Command to execute inside the container.
-        #[arg(last = true)]
-        cmd: Vec<String>,
     },
     Config {
         #[command(subcommand)]
@@ -118,15 +102,6 @@ pub(crate) enum Command {
     Diagnostics {
         #[command(subcommand)]
         action: DiagnosticsAction,
-    },
-    /// Run an admin command against the tokeira-admin ECS service.
-    ///
-    /// Scales the admin service from 0→1, waits for RUNNING, executes the
-    /// command via ECS Exec, streams output, then scales back to 0.
-    Admin {
-        /// The full command to forward to the admin binary (e.g. "schema setup").
-        #[arg(trailing_var_arg = true, required = true)]
-        command: Vec<String>,
     },
     Version {
         #[arg(long)]
@@ -446,37 +421,12 @@ pub(crate) enum CliCiCheck {
 
 #[derive(Subcommand)]
 pub(crate) enum ImageCommand {
-    List {
-        #[arg(long)]
-        source_type: Option<CliImageSourceType>,
-    },
     Build {
         #[arg(long, default_value = "arm64")]
         arch: CliArch,
         #[arg(long)]
         tag: Option<String>,
     },
-    Push {
-        #[arg(long, default_value = "latest")]
-        tag: String,
-        #[arg(long)]
-        image: Option<String>,
-        #[arg(long)]
-        yes: bool,
-    },
-    Mirror {
-        #[arg(long)]
-        image: Option<String>,
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum CliImageSourceType {
-    Build,
-    Mirror,
-    Registry,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -597,16 +547,6 @@ impl From<CliStorageKind> for StorageKind {
         match value {
             CliStorageKind::InMemory => StorageKind::InMemory,
             CliStorageKind::Dsql => StorageKind::Dsql,
-        }
-    }
-}
-
-impl From<CliImageSourceType> for tokeira_deploy_engine::ImageSourceType {
-    fn from(value: CliImageSourceType) -> Self {
-        match value {
-            CliImageSourceType::Build => Self::Build,
-            CliImageSourceType::Mirror => Self::Mirror,
-            CliImageSourceType::Registry => Self::Registry,
         }
     }
 }

@@ -1,12 +1,8 @@
-//! In-process operation retained for deployments created before their platform
-//! migrated to generated bound provisioners.
+//! In-process operation for the local development platform.
 //!
-//! New ECS deployments are definition-bound; `from_id` still recognizes ECS
-//! so existing directories carrying `deployment.toml` remain operable. Local
-//! is the sole platform that still creates through this adapter.
+//! Cloud platforms are definition-bound and never produce `deployment.toml`.
 
 use anyhow::Result;
-use tokeira_ecs_deployment::EcsDeployment;
 use tokeira_local_deployment::LocalDeployment;
 use tokeira_orchestrator::{PlatformConfig, PlatformId, StorageKind};
 use toml_edit::{DocumentMut, value};
@@ -15,26 +11,11 @@ use toml_edit::{DocumentMut, value};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyPlatform {
     Local,
-    Ecs,
 }
 
 impl LegacyPlatform {
     /// Recognize an id without extending the public platform vocabulary.
     pub(crate) fn from_id(id: &PlatformId) -> Option<Self> {
-        match id.as_str() {
-            "local" => Some(Self::Local),
-            "ecs" => Some(Self::Ecs),
-            _ => None,
-        }
-    }
-
-    /// Select the in-process adapter allowed to create a new deployment.
-    ///
-    /// Recognition and creation are deliberately separate: dropping ECS from
-    /// [`Self::from_id`] would strand existing deployments, while routing new
-    /// ECS deployments here would bypass its recorded definition and remote
-    /// state contract.
-    pub(crate) fn creation_adapter(id: &PlatformId) -> Option<Self> {
         match id.as_str() {
             "local" => Some(Self::Local),
             _ => None,
@@ -44,7 +25,6 @@ impl LegacyPlatform {
     pub(crate) fn deployment_config(self, storage: StorageKind) -> String {
         match self {
             Self::Local => LocalDeployment::prototypical_config(storage),
-            Self::Ecs => EcsDeployment::prototypical_config(storage),
         }
     }
 
@@ -55,7 +35,6 @@ impl LegacyPlatform {
     ) -> Result<String> {
         let toml = match self {
             Self::Local => LocalDeployment::prototypical_server_config(storage),
-            Self::Ecs => EcsDeployment::prototypical_server_config(storage),
         };
         let _: tokeira_config::TokeiraConfig = toml::from_str(&toml)?;
         if storage == StorageKind::Dsql {
@@ -80,18 +59,11 @@ fn patch_server_dsql_region(toml: String, region: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use tokeira_ecs_deployment::EcsConfig;
-
     use super::*;
 
     #[test]
-    fn ecs_template_remains_available_only_for_existing_deployments() {
-        let toml = LegacyPlatform::Ecs.deployment_config(StorageKind::Dsql);
-        assert!(toml.contains("image = \"tokeirad:latest\""));
-        assert!(toml.contains("populated by `tkr image push`"));
-        let _: EcsConfig = toml::from_str(&toml).expect("ECS template parses");
+    fn cloud_platforms_have_no_in_process_adapter() {
         let ecs = PlatformId::new("ecs").expect("platform id");
-        assert_eq!(LegacyPlatform::from_id(&ecs), Some(LegacyPlatform::Ecs));
-        assert_eq!(LegacyPlatform::creation_adapter(&ecs), None);
+        assert_eq!(LegacyPlatform::from_id(&ecs), None);
     }
 }

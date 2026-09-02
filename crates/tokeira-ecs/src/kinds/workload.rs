@@ -22,8 +22,8 @@ pub(crate) const TYPE: &str = "EcsWorkload";
 /// coordinates plus image, capacity, and replica policy. Everything else a
 /// workload carries (container wiring, sidecars, Service Connect ports,
 /// capacity-provider assignment) is derived by the platform's builders from
-/// its default model, the same derivation the legacy path performs; this
-/// kind applies the authored values onto that model and never re-derives.
+/// its default model; this kind applies authored values onto that model and
+/// never re-derives them afterward.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workload {
@@ -129,10 +129,6 @@ impl Workload {
                 if let Some(replicas) = replicas {
                     service.desired_count = replicas;
                 }
-                // The legacy configuration retains this duplicate image
-                // coordinate. Keep it aligned until that unused surface is
-                // removed so no alternate builder can observe stale policy.
-                config.autoscaler.image = self.image.clone();
             }
             "tokeira-mimir" => {
                 config.observability.mimir_image = self.image.clone();

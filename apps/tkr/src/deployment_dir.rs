@@ -13,7 +13,7 @@
 //! ```text
 //! ~/Library/Application Support/tokeira/tkr/<name>/
 //!   definition.<fmt>  # definition-bound platform source, when recorded
-//!   deployment.toml   # Local or pre-definition ECS platform config, otherwise
+//!   deployment.toml   # local platform config, otherwise
 //!   tokeirad.toml     # TokeiraConfig consumed by the tokeirad server binary
 //!   metadata.json     # identity + status tracked by the CLI
 //!   tkp               # generated platform/frontend provisioner, when bound
@@ -43,7 +43,6 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
 use tokeira_deployment::{DeploymentStateLocation, RecordedDefinition};
-use tokeira_ecs_deployment::EcsConfig;
 use tokeira_local_deployment::LocalConfig;
 use tokeira_orchestrator::{PlatformId, RelativeDefinitionPath, StorageKind};
 use uuid::Uuid;
@@ -454,7 +453,7 @@ impl DeploymentResolver {
         storage: StorageKind,
         region: Option<String>,
     ) -> Result<DeploymentMetadata> {
-        let seed = if crate::legacy::LegacyPlatform::creation_adapter(&platform).is_some() {
+        let seed = if crate::legacy::LegacyPlatform::from_id(&platform).is_some() {
             None
         } else {
             let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -591,7 +590,6 @@ fn write_staged_source(path: &Path, bytes: &[u8]) -> Result<()> {
 /// platform. Definition-bound platform config is owned by its provisioner.
 pub(crate) enum PlatformDeploymentConfig {
     Local(LocalConfig),
-    Ecs(Box<EcsConfig>),
 }
 
 /// Fully-loaded view of a deployment, as consumed by command handlers.
@@ -642,11 +640,6 @@ pub(crate) fn load_context(
             let config: LocalConfig = tokeira_config::load_config(&deployment_config_path, None)
                 .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
             PlatformDeploymentConfig::Local(config)
-        }
-        "ecs" => {
-            let config: EcsConfig = tokeira_config::load_config(&deployment_config_path, None)
-                .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
-            PlatformDeploymentConfig::Ecs(Box::new(config))
         }
         platform => {
             bail!("deployment '{name}' records unsupported in-process platform `{platform}`")

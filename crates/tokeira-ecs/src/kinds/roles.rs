@@ -2,7 +2,7 @@
 //!
 //! Policies are the platform's facts, not the operator's: the authored
 //! surface is identity coordinates only, and each kind derives its trust
-//! and inline policies through the same builders the legacy modules use.
+//! and inline policies through the shared provider builders.
 
 use serde::Deserialize;
 use tokeira_platform::{

@@ -1,3 +1,11 @@
+//! ECS deployment policy and its validation boundary.
+//!
+//! The legacy in-process adapter still consumes this model directly, while
+//! definition kinds use it as the canonical derivation model for workload
+//! details that are not author-facing. [`EcsConfig::default`] therefore mirrors
+//! the shipped ECS definition defaults; tests in the platform package fence the
+//! two authoring surfaces against future drift.
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -83,6 +91,10 @@ pub struct NetworkingConfig {
 pub struct OptionalEndpoints {
     pub(crate) sts: bool,
     pub(crate) kms: bool,
+    /// Retained so existing deployment TOML continues to deserialize. Secrets
+    /// Manager is required by the Grafana execution role and is always
+    /// provisioned; setting this compatibility field no longer adds a second
+    /// endpoint.
     pub(crate) secrets_manager: bool,
     pub(crate) cloudwatch_logs: bool,
     pub(crate) ec2: bool,
@@ -340,7 +352,7 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             name: "tokeira".into(),
-            service_connect_namespace: "tokeira.local".into(),
+            service_connect_namespace: "tokeira.internal".into(),
         }
     }
 }
@@ -348,9 +360,13 @@ impl Default for ClusterConfig {
 impl Default for NetworkingConfig {
     fn default() -> Self {
         Self {
-            vpc_cidr: "10.0.0.0/16".into(),
-            availability_zones: vec!["eu-west-2a".into(), "eu-west-2b".into()],
-            private_dns_zone: "tokeira.local".into(),
+            vpc_cidr: "10.42.0.0/16".into(),
+            availability_zones: vec![
+                "eu-west-2a".into(),
+                "eu-west-2b".into(),
+                "eu-west-2c".into(),
+            ],
+            private_dns_zone: "tokeira.internal".into(),
             optional_endpoints: OptionalEndpoints::default(),
         }
     }
@@ -362,17 +378,17 @@ impl Default for CapacityProviderConfigs {
             edge_api: CapacityProviderConfig::new("c8g.large", 1, 2, 8),
             edge_poll: CapacityProviderConfig::new("c8g.large", 1, 2, 8),
             runtime: RuntimeCapacityProviderConfig {
-                instance_type: "c8g.large".into(),
+                instance_type: "c8g.xlarge".into(),
                 min_capacity: 1,
-                desired_capacity: 3,
-                max_capacity: 16,
+                desired_capacity: 2,
+                max_capacity: 8,
                 scale_in_protection: true,
             },
-            projection: CapacityProviderConfig::new("c8g.large", 1, 1, 8),
-            control: CapacityProviderConfig::new("c8g.large", 1, 1, 3),
-            mimir: CapacityProviderConfig::new("m8g.large", 1, 1, 1),
-            loki: CapacityProviderConfig::new("m8g.large", 1, 1, 1),
-            grafana: CapacityProviderConfig::new("c8g.medium", 1, 1, 1),
+            projection: CapacityProviderConfig::new("c8g.large", 1, 2, 8),
+            control: CapacityProviderConfig::new("c8g.large", 1, 1, 4),
+            mimir: CapacityProviderConfig::new("c8g.large", 1, 1, 1),
+            loki: CapacityProviderConfig::new("c8g.large", 1, 1, 1),
+            grafana: CapacityProviderConfig::new("c8g.large", 1, 1, 1),
         }
     }
 }
@@ -396,13 +412,61 @@ impl CapacityProviderConfig {
 impl Default for ServiceConfigs {
     fn default() -> Self {
         Self {
-            edge_api: ReplicaServiceConfig::new("tokeirad:latest", 2, Some(7233), 9090, None),
-            edge_poll: ReplicaServiceConfig::new("tokeirad:latest", 2, Some(7234), 9090, None),
-            runtime: DaemonServiceConfig::new("tokeirad:latest", 7241, 9090, None),
-            projection: ReplicaServiceConfig::new("tokeirad:latest", 1, Some(7242), 9090, None),
-            controller: ReplicaServiceConfig::new("tokeirad:latest", 1, Some(7240), 9090, None),
-            autoscaler: ReplicaServiceConfig::new("tokeirad:latest", 1, Some(7243), 9090, None),
-            admin: ReplicaServiceConfig::new("tokeirad:latest", 0, Some(7244), 9090, None),
+            edge_api: ReplicaServiceConfig::new(
+                "tokeirad:latest",
+                2,
+                1024,
+                2048,
+                Some(7233),
+                9090,
+                None,
+            ),
+            edge_poll: ReplicaServiceConfig::new(
+                "tokeirad:latest",
+                2,
+                1024,
+                2048,
+                Some(7234),
+                9090,
+                None,
+            ),
+            runtime: DaemonServiceConfig::new("tokeirad:latest", 2048, 4096, 7241, 9090, None),
+            projection: ReplicaServiceConfig::new(
+                "tokeirad:latest",
+                2,
+                1024,
+                2048,
+                Some(7242),
+                9090,
+                None,
+            ),
+            controller: ReplicaServiceConfig::new(
+                "tokeirad:latest",
+                1,
+                512,
+                1024,
+                Some(7240),
+                9090,
+                None,
+            ),
+            autoscaler: ReplicaServiceConfig::new(
+                "tokeira-autoscaler:latest",
+                1,
+                512,
+                1024,
+                Some(7243),
+                9090,
+                None,
+            ),
+            admin: ReplicaServiceConfig::new(
+                "tokeirad:latest",
+                1,
+                512,
+                1024,
+                Some(7244),
+                9090,
+                None,
+            ),
         }
     }
 }
@@ -411,6 +475,8 @@ impl ReplicaServiceConfig {
     fn new(
         image: &str,
         desired_count: u32,
+        cpu: u32,
+        memory_mb: u32,
         grpc_port: Option<u16>,
         metrics_port: u16,
         http_port: Option<u16>,
@@ -418,8 +484,8 @@ impl ReplicaServiceConfig {
         Self {
             image: image.into(),
             desired_count,
-            cpu: 512,
-            memory_mb: 1024,
+            cpu,
+            memory_mb,
             grpc_port,
             metrics_port,
             http_port,
@@ -428,11 +494,18 @@ impl ReplicaServiceConfig {
 }
 
 impl DaemonServiceConfig {
-    fn new(image: &str, grpc_port: u16, metrics_port: u16, http_port: Option<u16>) -> Self {
+    fn new(
+        image: &str,
+        cpu: u32,
+        memory_mb: u32,
+        grpc_port: u16,
+        metrics_port: u16,
+        http_port: Option<u16>,
+    ) -> Self {
         Self {
             image: image.into(),
-            cpu: 1024,
-            memory_mb: 2048,
+            cpu,
+            memory_mb,
             grpc_port,
             metrics_port,
             http_port,
@@ -443,7 +516,7 @@ impl DaemonServiceConfig {
 impl Default for AutoscalerConfig {
     fn default() -> Self {
         Self {
-            image: "tokeirad:latest".into(),
+            image: "tokeira-autoscaler:latest".into(),
             polling_interval_secs: 15,
         }
     }
@@ -455,8 +528,8 @@ impl Default for AlbConfig {
             name: "tokeira-internal".into(),
             listener_protocol: AlbListenerProtocol::Http2,
             certificate_arn: None,
-            health_check_path: "/healthz".into(),
-            health_check_interval_secs: 15,
+            health_check_path: "/health".into(),
+            health_check_interval_secs: 30,
         }
     }
 }
@@ -510,6 +583,7 @@ pub fn required_vpc_endpoints(region: &str) -> Vec<String> {
         "ssm",
         "ssmmessages",
         "ec2messages",
+        "secretsmanager",
         "dsql",
         "dsql-control",
     ]
@@ -528,9 +602,6 @@ pub(crate) fn optional_vpc_endpoints(config: &EcsConfig) -> Vec<String> {
     }
     if config.networking.optional_endpoints.kms {
         endpoints.push(format!("com.amazonaws.{}.kms", config.region));
-    }
-    if config.networking.optional_endpoints.secrets_manager {
-        endpoints.push(format!("com.amazonaws.{}.secretsmanager", config.region));
     }
     if config.networking.optional_endpoints.cloudwatch_logs {
         endpoints.push(format!("com.amazonaws.{}.logs", config.region));

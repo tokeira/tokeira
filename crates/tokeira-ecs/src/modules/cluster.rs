@@ -1,3 +1,9 @@
+//! Legacy ECS cluster and EC2 capacity-provider resources.
+//!
+//! The cluster is the sole owner of the Service Connect default namespace.
+//! Capacity providers remain explicit so scheduling intent and scale-in
+//! protection survive the translation to AWS resources.
+
 use tokeira_aws::{
     ResourceContext,
     resources::{
@@ -40,7 +46,7 @@ impl Module for ClusterModule {
         let cluster_id = ResourceId("ecs:cluster".to_owned());
         let mut resources: Vec<Box<dyn Resource>> = vec![Box::new(EcsClusterResource::new(
             cluster_name.clone(),
-            self.config.networking.private_dns_zone.clone(),
+            self.config.cluster.service_connect_namespace.clone(),
             self.name(),
         ))];
 

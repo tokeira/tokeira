@@ -1,27 +1,16 @@
-// The services module: the Service Connect namespace, the application
-// workloads' task and execution roles (infrastructure), and every workload
+// The services module: the application workloads' task and execution roles
+// (infrastructure), and every workload
 // as a deploy-plane service. Infrastructure apply never deploys a workload:
 // the Workload resources here carry manifests the deploy engine applies in
 // its own `deploy plan`/`deploy apply` pass.
+//
+// The cluster owns its Service Connect default namespace. ECS creates that
+// namespace as part of the cluster contract, so declaring a second Cloud Map
+// namespace here would create two resources for the same authored name.
 
 use platform::{DaemonPolicy, Ecs, ReplicaPolicy};
 
-pub fn define(
-    d: Deployment,
-    cfg: Ecs,
-    cx: Context,
-    services: Module,
-    vpc: Resource,
-    control_sg: Resource,
-) {
-    services.resource(
-        "namespace",
-        CloudMapNamespace {
-            name: cfg.cluster.service_connect_namespace.clone(),
-        },
-        vec![vpc],
-    );
-
+pub fn define(cfg: Ecs, services: Module, vpc: Resource, control_sg: Resource) {
     let task_role = services.resource(
         "task-role-tokeira-autoscaler",
         EcsTaskRole {
@@ -36,7 +25,6 @@ pub fn define(
             environment: cfg.environment.clone(),
             region: cfg.aws.region.clone(),
             cluster: cfg.cluster.name.clone(),
-            service_connect_namespace: cfg.cluster.service_connect_namespace.clone(),
             image: cfg.services.autoscaler.image.clone(),
             replicas: cfg.services.autoscaler.replicas,
             cpu: cfg.services.autoscaler.cpu,

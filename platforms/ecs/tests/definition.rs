@@ -227,6 +227,29 @@ fn decode_config(output: &EvaluatedDefinition<DecodedKind>) -> ShippedConfig {
     from_located_value(output.config.clone()).expect("the shipped config admits")
 }
 
+fn assert_replica_defaults(shipped: &ShippedReplicaPolicy, legacy: &serde_json::Value) {
+    assert_eq!(legacy["image"].as_str(), Some(shipped.image.as_str()));
+    assert_eq!(
+        legacy["desired_count"].as_u64(),
+        Some(shipped.replicas.into())
+    );
+    assert_eq!(legacy["cpu"].as_u64(), Some(shipped.cpu.into()));
+    assert_eq!(legacy["memory_mb"].as_u64(), Some(shipped.memory_mb.into()));
+}
+
+fn assert_capacity_defaults(shipped: &ShippedCapacityPlane, legacy: &serde_json::Value) {
+    assert_eq!(
+        legacy["instance_type"].as_str(),
+        Some(shipped.instance_type.as_str())
+    );
+    assert_eq!(legacy["min_capacity"].as_u64(), Some(shipped.min.into()));
+    assert_eq!(
+        legacy["desired_capacity"].as_u64(),
+        Some(shipped.desired.into())
+    );
+    assert_eq!(legacy["max_capacity"].as_u64(), Some(shipped.max.into()));
+}
+
 fn graph_projection(output: &EvaluatedDefinition<DecodedKind>) -> GraphProjection {
     let namespaces = output.graph.namespaces().to_vec();
     let modules = output
@@ -355,6 +378,112 @@ fn the_shipped_set_pins_current_observability_images() {
         assert_eq!(config.observability.aws_cli_image, "amazon/aws-cli:2.17.0");
         assert_eq!(config.observability.busybox_image, "busybox:1.36");
     }
+}
+
+// The legacy model remains a derivation dependency for definition kinds. Its
+// defaults must therefore be the same authored policy as the shipped roots,
+// even though the live creation path is definition-driven.
+#[test]
+fn legacy_derivation_defaults_match_the_shipped_definition() {
+    let output = evaluate_tkd(&shipped_tkd_root()).expect("the shipped TKD set evaluates");
+    let shipped = decode_config(&output);
+    let legacy =
+        serde_json::to_value(tokeira_ecs::EcsConfig::default()).expect("legacy defaults serialize");
+
+    assert_eq!(
+        legacy["environment"].as_str(),
+        Some(shipped.environment.as_str())
+    );
+    assert_eq!(legacy["region"].as_str(), Some(shipped.aws.region.as_str()));
+    assert_eq!(
+        legacy["cluster"]["name"].as_str(),
+        Some(shipped.cluster.name.as_str())
+    );
+    assert_eq!(
+        legacy["cluster"]["service_connect_namespace"].as_str(),
+        Some(shipped.cluster.service_connect_namespace.as_str())
+    );
+    assert_eq!(
+        legacy["networking"]["vpc_cidr"].as_str(),
+        Some(shipped.networking.vpc_cidr.as_str())
+    );
+    assert_eq!(
+        legacy["networking"]["availability_zones"],
+        serde_json::json!(&shipped.networking.availability_zones)
+    );
+    assert_eq!(
+        legacy["networking"]["private_dns_zone"].as_str(),
+        Some(shipped.networking.private_dns_zone.as_str())
+    );
+
+    assert_replica_defaults(&shipped.services.edge_api, &legacy["services"]["edge_api"]);
+    assert_replica_defaults(
+        &shipped.services.edge_poll,
+        &legacy["services"]["edge_poll"],
+    );
+    assert_eq!(
+        legacy["services"]["runtime"]["image"].as_str(),
+        Some(shipped.services.runtime.image.as_str())
+    );
+    assert_eq!(
+        legacy["services"]["runtime"]["cpu"].as_u64(),
+        Some(shipped.services.runtime.cpu.into())
+    );
+    assert_eq!(
+        legacy["services"]["runtime"]["memory_mb"].as_u64(),
+        Some(shipped.services.runtime.memory_mb.into())
+    );
+    assert_replica_defaults(
+        &shipped.services.projection,
+        &legacy["services"]["projection"],
+    );
+    assert_replica_defaults(
+        &shipped.services.controller,
+        &legacy["services"]["controller"],
+    );
+    assert_replica_defaults(
+        &shipped.services.autoscaler,
+        &legacy["services"]["autoscaler"],
+    );
+    assert_replica_defaults(&shipped.services.admin, &legacy["services"]["admin"]);
+    assert_eq!(
+        legacy["autoscaler"]["image"].as_str(),
+        Some(shipped.services.autoscaler.image.as_str())
+    );
+
+    for (shipped_capacity, legacy_key) in [
+        (&shipped.capacity.edge_api, "edge_api"),
+        (&shipped.capacity.edge_poll, "edge_poll"),
+        (&shipped.capacity.runtime, "runtime"),
+        (&shipped.capacity.projection, "projection"),
+        (&shipped.capacity.control, "control"),
+        (&shipped.capacity.mimir, "mimir"),
+        (&shipped.capacity.loki, "loki"),
+        (&shipped.capacity.grafana, "grafana"),
+    ] {
+        assert_capacity_defaults(shipped_capacity, &legacy["capacity_providers"][legacy_key]);
+    }
+
+    assert_eq!(
+        legacy["alb"]["health_check_path"].as_str(),
+        Some(shipped.alb.health_check_path.as_str())
+    );
+    assert_eq!(
+        legacy["alb"]["health_check_interval_secs"].as_u64(),
+        Some(shipped.alb.health_check_interval_secs)
+    );
+    assert_eq!(
+        legacy["observability"]["mimir_image"].as_str(),
+        Some(shipped.observability.mimir.image.as_str())
+    );
+    assert_eq!(
+        legacy["observability"]["loki_image"].as_str(),
+        Some(shipped.observability.loki.image.as_str())
+    );
+    assert_eq!(
+        legacy["observability"]["grafana_image"].as_str(),
+        Some(shipped.observability.grafana.image.as_str())
+    );
 }
 
 // The two source sets are interchangeable authoring projections: a frontend

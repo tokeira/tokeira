@@ -122,11 +122,16 @@ def plane(
     )
 
 
-def alloy(observability, region, service):
-    # Each workload receives its own rendered Alloy parameter.
+def alloy(observability, cfg, service):
+    # Identity labels are explicit so realization cannot substitute Rust-side
+    # defaults for operator-authored values.
     observability.resource(
         "alloy-" + service,
-        AlloyConfig(service=service, region=region),
+        AlloyConfig(
+            service=service,
+            environment=cfg.environment,
+            cluster=cfg.cluster.name,
+        ),
     )
 
 
@@ -148,7 +153,6 @@ def replica(services, cfg, service, policy, roles):
             environment=cfg.environment,
             region=cfg.aws.region,
             cluster=cfg.cluster.name,
-            service_connect_namespace=cfg.cluster.service_connect_namespace,
             image=policy.image,
             replicas=policy.replicas,
             cpu=policy.cpu,
@@ -170,7 +174,6 @@ def daemon(services, cfg, service, policy, roles):
             environment=cfg.environment,
             region=cfg.aws.region,
             cluster=cfg.cluster.name,
-            service_connect_namespace=cfg.cluster.service_connect_namespace,
             image=policy.image,
             cpu=policy.cpu,
             memory_mb=policy.memory_mb,

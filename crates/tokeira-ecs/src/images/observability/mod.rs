@@ -1,3 +1,9 @@
+//! Mirrored third-party observability image declarations.
+//!
+//! Each declaration keeps the upstream image as input while deriving a
+//! deployment-owned ECR repository and an explicit configuration writeback
+//! target.
+
 use tokeira_deploy_engine::{
     DesiredImageRef, Image, ImageContext, ImageSourceType, RuntimeError, WritebackTarget,
 };

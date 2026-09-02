@@ -9,7 +9,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use tokeira_ecs_deployment::{
-    modules::{ObservabilityModule, observability::all_alloy_services},
+    modules::{
+        ObservabilityModule,
+        observability::{AlloyRenderContext, all_alloy_services},
+    },
     services::EcsWorkload,
 };
 use tokeira_iac::{Module, ModuleContext};
@@ -102,7 +105,7 @@ fn ecs_checks(
     for service_name in all_alloy_services() {
         let alloy_config = tokeira_ecs_deployment::modules::observability::render_alloy_config(
             service_name,
-            config,
+            &AlloyRenderContext::from(config),
         );
         require_contains(&alloy_config, "localhost:", "ECS Alloy local scrape")?;
         require_contains(

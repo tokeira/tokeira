@@ -1,3 +1,9 @@
+//! Legacy ECR repository resources for the ECS image set.
+//!
+//! Repository enumeration delegates to the same image declarations used by
+//! build and mirror commands, preventing provisioning from inventing a second
+//! repository naming scheme.
+
 use tokeira_aws::resources::ecr_repository::EcrRepository;
 use tokeira_deploy_engine::ImageContext;
 use tokeira_iac::{IacError, Module, ModuleContext, Resource};

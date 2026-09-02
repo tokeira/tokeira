@@ -79,8 +79,8 @@ fn config() -> Ecs {
             autoscaler: ReplicaPolicy {
                 image: "tokeira-autoscaler:latest".into(),
                 replicas: 1,
-                cpu: 256,
-                memory_mb: 512,
+                cpu: 512,
+                memory_mb: 1024,
             },
             admin: ReplicaPolicy {
                 image: "tokeirad:latest".into(),
@@ -660,20 +660,20 @@ fn deployment(cfg: Ecs, cx: Context) -> Deployment {
             recovery_window_days: 7,
         },
     );
-    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-edge-api");
-    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-edge-poll");
-    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-runtime");
-    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-projection");
-    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-controller");
-    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-autoscaler");
-    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-admin");
-    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-mimir");
-    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-loki");
-    helpers::alloy(observability, cfg.aws.region.clone(), "tokeira-grafana");
+    helpers::alloy(observability, cfg, "tokeira-edge-api");
+    helpers::alloy(observability, cfg, "tokeira-edge-poll");
+    helpers::alloy(observability, cfg, "tokeira-runtime");
+    helpers::alloy(observability, cfg, "tokeira-projection");
+    helpers::alloy(observability, cfg, "tokeira-controller");
+    helpers::alloy(observability, cfg, "tokeira-autoscaler");
+    helpers::alloy(observability, cfg, "tokeira-admin");
+    helpers::alloy(observability, cfg, "tokeira-mimir");
+    helpers::alloy(observability, cfg, "tokeira-loki");
+    helpers::alloy(observability, cfg, "tokeira-grafana");
 
     let services = d.module("services", vec![observability, images]);
     let server_config = services.resource("server_config", ServerConfig {});
-    services::define(d, cfg, cx, services, vpc, control_sg);
+    services::define(cfg, services, vpc, control_sg);
     let edge_api_task_role =
         helpers::task_role(services, cfg.aws.region.clone(), "tokeira-edge-api");
     let edge_poll_task_role =

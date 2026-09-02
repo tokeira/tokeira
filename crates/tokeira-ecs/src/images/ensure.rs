@@ -1,3 +1,8 @@
+//! ECR repository preparation derived from declared ECS image sources.
+//!
+//! Repository names come from each image's desired reference so provisioning
+//! and later writeback share one naming contract.
+
 use std::collections::HashMap;
 
 use tokeira_aws::{EcrClient, ensure_ecr_repositories};

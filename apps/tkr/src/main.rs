@@ -24,7 +24,8 @@
 //! - **`cli`** defines the clap surface. Adding a subcommand starts here.
 //! - **`deployment_dir`** owns how deployments are resolved, loaded, and persisted.
 //! - **`commands`** contains one module per top-level subcommand. Definition-bound
-//!   deployments execute through their married provisioner; Local/ECS retain
+//!   deployments, including newly created ECS deployments, execute through
+//!   their married provisioner; Local and pre-definition ECS deployments retain
 //!   the legacy in-process handlers.
 //! - **`tui`** wires engine progress events to spinners (human mode) or JSON
 //!   lines (`--json` mode).
@@ -1318,6 +1319,29 @@ mod tests {
         deployments
             .create("local-dsql", platform("local"), StorageKind::Dsql, None)
             .unwrap();
+    }
+
+    #[test]
+    fn new_ecs_deployments_record_the_shipped_definition() {
+        let temp = tempfile::tempdir().expect("deployment root");
+        let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
+        let metadata = deployments
+            .create("ecs-defined", platform("ecs"), StorageKind::InMemory, None)
+            .expect("ECS definition stages");
+        let dir = deployments.path("ecs-defined");
+        let definition = metadata
+            .definition
+            .expect("new ECS deployment records its definition");
+
+        assert_eq!(definition.format.as_str(), "tkd");
+        assert!(dir.join(definition.path.as_path()).is_file());
+        assert!(dir.join("helpers.tkd").is_file());
+        assert!(
+            dir.join("observability/dashboards/broker-runtime-health.json")
+                .is_file()
+        );
+        assert!(!dir.join(DEPLOYMENT_TOML).exists());
+        assert!(dir.join(TOKEIRAD_TOML).exists());
     }
 
     #[test]

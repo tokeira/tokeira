@@ -7,8 +7,9 @@
 //!   [`crate::process::spawn_tokeirad`]. Status toggles to `Running` at
 //!   spawn and back to `Stopped` when the process exits (normally or via
 //!   ctrl-c).
-//! - **ECS**: currently a `todo` surface — the runtime engine for ECS
-//!   exists but this CLI path hasn't been wired yet (tracked separately).
+//! - **Legacy ECS**: apply remains unavailable on directories created before
+//!   the definition migration; new ECS deployments are forwarded to their
+//!   married provisioner and never enter this module.
 //!
 //! Definition-bound platforms, including Compose, never enter this module;
 //! `tkr` forwards their deploy verbs to the married provisioner.

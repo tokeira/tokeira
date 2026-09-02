@@ -8,12 +8,14 @@
 //! content tree with one digest — mirroring how Compose treats its rendered
 //! configuration files.
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use serde::Deserialize;
 use sha2::Digest;
 use tokeira_aws::resources::{s3_object::S3Object, ssm_parameter::SsmParameterResource};
-use tokeira_ecs::modules::observability::{load_observability_artifacts, render_alloy_config};
+use tokeira_ecs::modules::observability::{
+    AlloyRenderContext, load_observability_artifacts, render_alloy_config,
+};
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
     ResourceType,
@@ -125,12 +127,13 @@ impl ObservabilityArtifactsResource {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
-    fn state(&self, digest: String, keys: Vec<String>) -> ResourceState {
+    fn state(&self, bucket_name: String, digest: String, keys: Vec<String>) -> ResourceState {
         let now = chrono_now();
         ResourceState {
             resource_type: Resource::resource_type(self),
             physical_id: self.resource_id().0,
             properties: serde_json::json!({
+                "bucket_name": bucket_name,
                 "content_digest": digest,
                 "keys": keys,
             }),
@@ -139,6 +142,37 @@ impl ObservabilityArtifactsResource {
             updated_at: now,
             module: self.module.clone(),
         }
+    }
+
+    fn recorded_keys(current: &ResourceState) -> BTreeSet<String> {
+        current
+            .properties
+            .get("keys")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    fn bucket_name(
+        &self,
+        current: Option<&ResourceState>,
+        ctx: &ProvisionContext,
+    ) -> Result<String, tokeira_iac::IacError> {
+        if let Some(bucket_name) = current
+            .and_then(|state| state.properties.get("bucket_name"))
+            .and_then(|value| value.as_str())
+        {
+            return Ok(bucket_name.to_owned());
+        }
+
+        // State written before the aggregate recorded its bucket contains only
+        // the digest and keys. Resolving the declared dependency preserves
+        // destroy compatibility for those already-applied deployments.
+        ctx.get_resource_state(&self.bucket_dependency)?
+            .properties
+            .get("bucket_name")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| tokeira_iac::IacError::StateNotFound("bucket_name missing".into()))
     }
 }
 
@@ -165,6 +199,7 @@ impl Resource for ObservabilityArtifactsResource {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, tokeira_iac::IacError> {
+        let bucket_name = self.bucket_name(None, ctx)?;
         let objects = self.objects()?;
         let mut keys = Vec::with_capacity(objects.len());
         // Each object rides the provider's own upsert; the set is fenced as
@@ -173,15 +208,39 @@ impl Resource for ObservabilityArtifactsResource {
             object.create(ctx).await?;
             keys.push(object.key.clone());
         }
-        Ok(self.state(self.digest()?, keys))
+        Ok(self.state(bucket_name, self.digest()?, keys))
     }
 
     async fn update(
         &self,
-        _current: &ResourceState,
+        current: &ResourceState,
         ctx: &ProvisionContext,
     ) -> Result<ResourceState, tokeira_iac::IacError> {
-        self.create(ctx).await
+        let bucket_name = self.bucket_name(Some(current), ctx)?;
+        let objects = self.objects()?;
+        let desired_keys = objects
+            .iter()
+            .map(|object| object.key.clone())
+            .collect::<BTreeSet<_>>();
+
+        for object in &objects {
+            object.create(ctx).await?;
+        }
+
+        // Remove keys no longer present in the shipped tree before advancing
+        // state. A failed delete leaves the prior key recorded, so retry still
+        // owns and attempts cleanup of the stale object.
+        for key in Self::recorded_keys(current).difference(&desired_keys) {
+            self.object_for_delete(key.clone())
+                .delete_from_bucket(&bucket_name, ctx)
+                .await?;
+        }
+
+        Ok(self.state(
+            bucket_name,
+            self.digest()?,
+            desired_keys.into_iter().collect(),
+        ))
     }
 
     async fn delete(
@@ -189,22 +248,11 @@ impl Resource for ObservabilityArtifactsResource {
         current: &ResourceState,
         ctx: &ProvisionContext,
     ) -> Result<(), tokeira_iac::IacError> {
-        // Delete per recorded key through the per-object resource so bucket
-        // resolution stays in one place.
-        let keys: Vec<String> = current
-            .properties
-            .get("keys")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or_default();
-        for key in keys {
-            let object = S3Object {
-                bucket_dependency: self.bucket_dependency.clone(),
-                key,
-                content: String::new(),
-                content_type: String::new(),
-                module: self.module.clone(),
-            };
-            object.delete(current, ctx).await?;
+        let bucket_name = self.bucket_name(Some(current), ctx)?;
+        for key in Self::recorded_keys(current) {
+            self.object_for_delete(key)
+                .delete_from_bucket(&bucket_name, ctx)
+                .await?;
         }
         Ok(())
     }
@@ -257,6 +305,18 @@ impl Resource for ObservabilityArtifactsResource {
     }
 }
 
+impl ObservabilityArtifactsResource {
+    fn object_for_delete(&self, key: String) -> S3Object {
+        S3Object {
+            bucket_dependency: self.bucket_dependency.clone(),
+            key,
+            content: String::new(),
+            content_type: String::new(),
+            module: self.module.clone(),
+        }
+    }
+}
+
 /// Reusable author input for one service's rendered Alloy sidecar
 /// configuration parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -264,16 +324,18 @@ impl Resource for ObservabilityArtifactsResource {
 pub struct AlloyConfig {
     /// Canonical service name the sidecar scrapes.
     pub(crate) service: String,
-    /// AWS region.
-    pub(crate) region: String,
+    /// Operator-authored deployment environment retained in observability labels.
+    pub(crate) environment: String,
+    /// Operator-authored ECS cluster retained in metric labels.
+    pub(crate) cluster: String,
 }
 
 impl Kind<AlloyConfigResource> for AlloyConfig {
     fn realize(&self, placement: &PlacementContext) -> Result<AlloyConfigResource, KindError> {
-        let config = tokeira_ecs::EcsConfig {
-            project_name: placement.deployment_id.clone(),
-            region: self.region.clone(),
-            ..tokeira_ecs::EcsConfig::default()
+        let render_context = AlloyRenderContext {
+            project_name: &placement.deployment_id,
+            environment: &self.environment,
+            cluster_name: &self.cluster,
         };
         Ok(AlloyConfigResource {
             inner: SsmParameterResource {
@@ -281,7 +343,7 @@ impl Kind<AlloyConfigResource> for AlloyConfig {
                     "/{}/alloy/sidecar/{}",
                     placement.deployment_id, self.service
                 ),
-                value: render_alloy_config(&self.service, &config),
+                value: render_alloy_config(&self.service, &render_context),
                 secure: true,
                 module: placement.module.clone(),
             },
@@ -359,5 +421,121 @@ impl Resource for AlloyConfigResource {
         ctx: &tokeira_iac::SemanticsContext<'_>,
     ) -> tokeira_iac::ChangeSemantics {
         self.inner.change_semantics(ctx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use super::*;
+
+    fn recorded_state(properties: serde_json::Value) -> ResourceState {
+        ResourceState {
+            resource_type: ResourceType::new(ARTIFACTS_TYPE),
+            physical_id: "observability:artifacts".to_owned(),
+            properties,
+            dependencies: Vec::new(),
+            created_at: "then".to_owned(),
+            updated_at: "then".to_owned(),
+            module: "observability".to_owned(),
+        }
+    }
+
+    fn artifact_resource() -> ObservabilityArtifactsResource {
+        ObservabilityArtifactsResource {
+            bucket_dependency: ResourceId("s3-demo-observability-artifacts".to_owned()),
+            content_dir: PathBuf::from("unused"),
+            module: "observability".to_owned(),
+        }
+    }
+
+    #[test]
+    fn aggregate_state_retains_bucket_and_sorted_key_ownership() {
+        let resource = artifact_resource();
+        let state = resource.state(
+            "demo-artifacts".to_owned(),
+            "digest".to_owned(),
+            vec!["dashboards/workflows.json".to_owned()],
+        );
+
+        assert_eq!(state.properties["bucket_name"], "demo-artifacts");
+        assert_eq!(
+            ObservabilityArtifactsResource::recorded_keys(&state),
+            BTreeSet::from(["dashboards/workflows.json".to_owned()])
+        );
+    }
+
+    #[test]
+    fn old_aggregate_state_resolves_bucket_from_declared_dependency() {
+        let resource = artifact_resource();
+        let old_state = recorded_state(serde_json::json!({
+            "content_digest": "old",
+            "keys": ["alerts/observability-alerts.yaml"],
+        }));
+        let mut ctx = ProvisionContext::new("demo", HashMap::new());
+        ctx.state.resources.insert(
+            resource.bucket_dependency.clone(),
+            recorded_state(serde_json::json!({"bucket_name": "demo-artifacts"})),
+        );
+
+        assert_eq!(
+            resource
+                .bucket_name(Some(&old_state), &ctx)
+                .expect("legacy state resolves through its dependency"),
+            "demo-artifacts"
+        );
+    }
+
+    #[test]
+    fn alloy_parameter_preserves_authored_identity_and_service_connect_names() {
+        let placement = PlacementContext {
+            deployment_id: "author-project".to_owned(),
+            deployment_dir: PathBuf::from("."),
+            definition_dir: PathBuf::from("."),
+            module: "observability".to_owned(),
+            logical_id: "alloy-runtime".to_owned(),
+            dependencies: Vec::new(),
+            dependency_content: BTreeMap::new(),
+            tags: BTreeMap::new(),
+        };
+        let resource = AlloyConfig {
+            service: "tokeira-runtime".to_owned(),
+            environment: "production".to_owned(),
+            cluster: "author-cluster".to_owned(),
+        }
+        .realize(&placement)
+        .expect("Alloy config realizes");
+
+        assert_eq!(
+            resource.inner.name,
+            "/author-project/alloy/sidecar/tokeira-runtime"
+        );
+        assert!(resource.inner.secure);
+        assert!(
+            resource
+                .inner
+                .value
+                .contains("environment = \"production\"")
+        );
+        assert!(
+            resource
+                .inner
+                .value
+                .contains("cluster = \"author-cluster\"")
+        );
+        assert!(
+            resource
+                .inner
+                .value
+                .contains("http://tokeira-mimir:9009/api/v1/push")
+        );
+        assert!(
+            resource
+                .inner
+                .value
+                .contains("http://tokeira-loki:3100/loki/api/v1/push")
+        );
+        assert!(!resource.inner.value.contains("tokeira.local"));
     }
 }

@@ -123,13 +123,16 @@ pub fn plane(
     );
 }
 
-// One rendered Alloy sidecar configuration parameter.
-pub fn alloy(observability: Module, region: String, service: String) {
+// One rendered Alloy sidecar configuration parameter. Identity labels are
+// passed explicitly; reconstructing them from Rust-side defaults would make
+// definition edits disappear during realization.
+pub fn alloy(observability: Module, cfg: Ecs, service: String) {
     observability.resource(
         format!("alloy-{}", service),
         AlloyConfig {
             service: service,
-            region: region,
+            environment: cfg.environment.clone(),
+            cluster: cfg.cluster.name.clone(),
         },
     );
 }
@@ -161,7 +164,6 @@ pub fn replica(
             environment: cfg.environment.clone(),
             region: cfg.aws.region.clone(),
             cluster: cfg.cluster.name.clone(),
-            service_connect_namespace: cfg.cluster.service_connect_namespace.clone(),
             image: policy.image.clone(),
             replicas: policy.replicas,
             cpu: policy.cpu,
@@ -189,7 +191,6 @@ pub fn daemon(
             environment: cfg.environment.clone(),
             region: cfg.aws.region.clone(),
             cluster: cfg.cluster.name.clone(),
-            service_connect_namespace: cfg.cluster.service_connect_namespace.clone(),
             image: policy.image.clone(),
             cpu: policy.cpu,
             memory_mb: policy.memory_mb,

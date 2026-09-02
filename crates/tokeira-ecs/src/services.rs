@@ -1,3 +1,10 @@
+//! Canonical ECS workload derivation and deploy-plane manifest production.
+//!
+//! Task topology, fixed sidecars, Service Connect aliases, and dependency
+//! readiness are platform facts. Callers must validate authored task totals
+//! before entering the builders: primary-container reservations are the
+//! remainder after fixed platform overhead.
+
 use serde::{Deserialize, Serialize};
 use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac::ResourceId;
@@ -818,10 +825,11 @@ fn wait_for_containers(dependencies: &[&str], config: &EcsConfig) -> Vec<Contain
                 command: vec![
                     "sh".into(),
                     "-c".into(),
-                    format!(
-                        "until nc -z {}.{} {}; do sleep 2; done",
-                        dependency, config.networking.private_dns_zone, port
-                    ),
+                    // Client aliases are installed inside every task in the
+                    // Service Connect namespace. Using the alias directly
+                    // keeps readiness independent of the ALB's private DNS
+                    // zone, which operators may author separately.
+                    format!("until nc -z {dependency} {port}; do sleep 2; done"),
                 ],
                 port_mappings: Vec::new(),
                 mount_points: Vec::new(),

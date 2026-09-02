@@ -1,3 +1,9 @@
+//! ECS image-publication gates.
+//!
+//! These checks refuse infrastructure or workload use until every image field
+//! that a build or mirror operation owns points at the deployment's ECR
+//! registry. They validate ownership metadata without performing mutations.
+
 use tokeira_deploy_engine::{Image, ImageContext, ImageSourceType};
 
 use crate::EcsConfig;

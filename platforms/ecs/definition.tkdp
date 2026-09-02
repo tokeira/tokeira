@@ -117,8 +117,8 @@ def config() -> Ecs:
             autoscaler=ReplicaPolicy(
                 image="tokeira-autoscaler:latest",
                 replicas=1,
-                cpu=256,
-                memory_mb=512,
+                cpu=512,
+                memory_mb=1024,
             ),
             admin=ReplicaPolicy(
                 image="tokeirad:latest",
@@ -516,14 +516,14 @@ def deployment(cfg: Ecs, cx: Context) -> Deployment:
         "tokeira-loki",
         "tokeira-grafana",
     ]:
-        helpers.alloy(observability_module, cfg.aws.region, service)
+        helpers.alloy(observability_module, cfg, service)
 
     # The deploy plane owns all workloads. ServerConfig is a stable graph
     # identity whose content and digest are resolved into the five binaries
     # that consume TokeiraConfig.
     services_module = d.module("services", [observability_module, images_module])
     server_config = services_module.resource("server_config", ServerConfig())
-    services.define(d, cfg, cx, services_module, vpc, control_sg)
+    services.define(cfg, services_module, vpc, control_sg)
     edge_api_task_role = helpers.task_role(
         services_module, cfg.aws.region, "tokeira-edge-api"
     )

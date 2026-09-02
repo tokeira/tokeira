@@ -1,3 +1,8 @@
+//! First-party `tokeirad` image declaration for ECS.
+//!
+//! One build feeds every Tokeira service image field; writeback records the
+//! resulting deployment-registry reference in each owned field.
+
 use tokeira_deploy_engine::{
     DesiredImageRef, Image, ImageContext, ImageSourceType, RuntimeError, WritebackTarget,
 };

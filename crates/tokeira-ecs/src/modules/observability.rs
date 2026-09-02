@@ -1,3 +1,10 @@
+//! Legacy observability infrastructure and shared Alloy rendering.
+//!
+//! This module owns storage, credentials, and the legacy infrastructure-plane
+//! workload resources. The definition-driven platform reuses only the content
+//! loader and renderer; [`AlloyRenderContext`] keeps that shared renderer from
+//! reconstructing operator identity from legacy defaults.
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -42,7 +49,7 @@ impl Module for ObservabilityModule {
     }
 
     fn dependencies(&self) -> Vec<&str> {
-        vec!["cluster"]
+        vec!["cluster", "images"]
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
@@ -92,7 +99,7 @@ impl Module for ObservabilityModule {
         for service_name in all_alloy_services() {
             resources.push(Box::new(SsmParameterResource {
                 name: format!("/{}/alloy/sidecar/{service_name}", self.config.project_name),
-                value: render_alloy_config(service_name, &self.config),
+                value: render_alloy_config(service_name, &AlloyRenderContext::from(&self.config)),
                 secure: true,
                 module: self.name().to_owned(),
             }));
@@ -158,7 +165,9 @@ impl Module for ObservabilityModule {
                 )),
                 task_definition_manifest,
                 vpc_dependency: vpc_id.clone(),
-                security_group_dependency: ResourceId("sg-control".to_owned()),
+                security_group_dependency: super::services::security_group_for_workload(
+                    &workload.name,
+                ),
                 module: self.name().to_owned(),
             }));
         }
@@ -327,9 +336,38 @@ pub(crate) fn grafana_secret_read_policy(config: &EcsConfig) -> String {
     .to_string()
 }
 
-pub fn render_alloy_config(service_name: &str, config: &EcsConfig) -> String {
-    let namespace = &config.networking.private_dns_zone;
-    let metrics_port = metrics_port_for(service_name, config);
+/// Deployment identity required to render one Alloy sidecar configuration.
+///
+/// These values are labels and provider coordinates, not secrets. Keeping them
+/// explicit prevents definition kinds from silently substituting the legacy
+/// model's project, environment, or cluster defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlloyRenderContext<'a> {
+    /// Deployment-scoped project name used in observability labels.
+    pub project_name: &'a str,
+    /// Operator-authored deployment environment.
+    pub environment: &'a str,
+    /// Operator-authored ECS cluster name.
+    pub cluster_name: &'a str,
+}
+
+impl<'a> From<&'a EcsConfig> for AlloyRenderContext<'a> {
+    fn from(config: &'a EcsConfig) -> Self {
+        Self {
+            project_name: &config.project_name,
+            environment: &config.environment,
+            cluster_name: &config.cluster.name,
+        }
+    }
+}
+
+/// Render the Alloy sidecar configuration for one canonical ECS workload.
+///
+/// Mimir and Loki are reached through their task-local Service Connect client
+/// aliases. They deliberately do not use the independently authored private
+/// ALB zone, and the rendered document contains no credential material.
+pub fn render_alloy_config(service_name: &str, context: &AlloyRenderContext<'_>) -> String {
+    let metrics_port = metrics_port_for(service_name);
     let target_kind = if matches!(
         service_name,
         "tokeira-mimir" | "tokeira-loki" | "tokeira-grafana"
@@ -348,7 +386,7 @@ pub fn render_alloy_config(service_name: &str, config: &EcsConfig) -> String {
 
 prometheus.remote_write "mimir" {{
   endpoint {{
-    url = "http://mimir.{namespace}:9009/api/v1/push"
+    url = "http://tokeira-mimir:9009/api/v1/push"
   }}
   external_labels = {{
     service     = "{service_name}"
@@ -382,7 +420,7 @@ loki.source.docker "task" {{
 
 loki.write "default" {{
   endpoint {{
-    url = "http://loki.{namespace}:3100/loki/api/v1/push"
+    url = "http://tokeira-loki:3100/loki/api/v1/push"
   }}
   external_labels = {{
     service_name = "{service_name}"
@@ -392,29 +430,22 @@ loki.write "default" {{
   }}
 }}
 "#,
-        config.cluster.name,
-        config.environment,
-        config.cluster.name,
-        config.environment,
-        config.environment,
-        config.project_name,
-        config.environment,
-        config.project_name
+        context.cluster_name,
+        context.environment,
+        context.cluster_name,
+        context.environment,
+        context.environment,
+        context.project_name,
+        context.environment,
+        context.project_name
     )
 }
 
-fn metrics_port_for(service_name: &str, config: &EcsConfig) -> u16 {
+fn metrics_port_for(service_name: &str) -> u16 {
     match service_name {
         "tokeira-mimir" => 9009,
         "tokeira-loki" => 3100,
         "tokeira-grafana" => 3000,
-        "tokeira-runtime" => config.services.runtime.metrics_port,
-        "tokeira-edge-api" => config.services.edge_api.metrics_port,
-        "tokeira-edge-poll" => config.services.edge_poll.metrics_port,
-        "tokeira-projection" => config.services.projection.metrics_port,
-        "tokeira-controller" => config.services.controller.metrics_port,
-        "tokeira-autoscaler" => config.services.autoscaler.metrics_port,
-        "tokeira-admin" => config.services.admin.metrics_port,
         _ => 9090,
     }
 }
@@ -437,14 +468,14 @@ mod tests {
     // never ships the observability tree.
 
     #[test]
-    fn observability_module_reports_name_and_cluster_dependency() {
+    fn observability_module_reports_name_and_dependencies() {
         let module = ObservabilityModule::new(
             EcsConfig::default(),
             std::env::temp_dir().join("ecs-observability-shape-test"),
         );
 
         assert_eq!(module.name(), "observability");
-        assert_eq!(module.dependencies(), &["cluster"]);
+        assert_eq!(module.dependencies(), &["cluster", "images"]);
     }
 
     // A deployment without staged content refuses with the expected layout
@@ -477,7 +508,8 @@ mod tests {
 
     #[test]
     fn alloy_config_contains_task_placeholders_and_localhost_scrape() {
-        let config = render_alloy_config("tokeira-runtime", &EcsConfig::default());
+        let model = EcsConfig::default();
+        let config = render_alloy_config("tokeira-runtime", &AlloyRenderContext::from(&model));
 
         assert!(config.contains("localhost:9090"));
         assert!(config.contains("service = \"tokeira-runtime\""));
@@ -487,11 +519,14 @@ mod tests {
         assert!(config.contains("TASK_ARN_PLACEHOLDER"));
         assert!(config.contains("TASK_ID_PLACEHOLDER"));
         assert!(config.contains("loki.source.docker"));
+        assert!(config.contains("http://tokeira-mimir:9009/api/v1/push"));
+        assert!(config.contains("http://tokeira-loki:3100/loki/api/v1/push"));
     }
 
     #[test]
     fn infrastructure_alloy_config_uses_infrastructure_target_kind() {
-        let config = render_alloy_config("tokeira-mimir", &EcsConfig::default());
+        let model = EcsConfig::default();
+        let config = render_alloy_config("tokeira-mimir", &AlloyRenderContext::from(&model));
 
         assert!(config.contains("localhost:9009"));
         assert!(config.contains("service = \"tokeira-mimir\""));

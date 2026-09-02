@@ -193,9 +193,10 @@ impl EcsPlatform {
 
     /// Parse every manifest and admit their single region.
     ///
-    /// The refusal comes before any client construction: mixed regions in
-    /// one call, or a region differing from the instance's admitted one,
-    /// never reach AWS.
+    /// Mixed regions in one call are refused before client construction. The
+    /// existing-cell check is an early refusal; [`Self::clients`] repeats it
+    /// after one concurrent initializer wins, which is the authoritative
+    /// admission point before any service operation reaches AWS.
     fn parse_and_admit(
         &self,
         manifests: &[serde_json::Value],
@@ -229,9 +230,16 @@ impl EcsPlatform {
         Ok((parsed, region))
     }
 
-    /// The admitted region's client bundle, built once on first use.
-    async fn clients(&self, region: &str) -> &tokeira_aws::AwsClients {
-        let (_, clients) = self
+    /// Return the admitted region's client bundle, built once on first use.
+    ///
+    /// Checking the winning region after `get_or_init` closes the first-use
+    /// race: two callers may both observe an empty cell, but only the caller
+    /// whose region initialized it can receive the shared bundle.
+    async fn clients(
+        &self,
+        region: &str,
+    ) -> Result<&tokeira_aws::AwsClients, deploy_engine::RuntimeError> {
+        let (admitted, clients) = self
             .clients
             .get_or_init(|| async {
                 let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -244,7 +252,13 @@ impl EcsPlatform {
                 )
             })
             .await;
-        clients
+        if admitted != region {
+            return Err(runtime_error(format!(
+                "this deployment's ECS platform is bound to region {admitted}; \
+                 manifests for {region} are refused"
+            )));
+        }
+        Ok(clients)
     }
 
     async fn ensure_service(
@@ -560,7 +574,7 @@ impl deploy_engine::Platform for EcsPlatform {
         manifests: &[serde_json::Value],
     ) -> Result<usize, deploy_engine::RuntimeError> {
         let (parsed, region) = self.parse_and_admit(manifests)?;
-        let clients = self.clients(&region).await;
+        let clients = self.clients(&region).await?;
         let mut applied = 0;
         // Task definitions first: a service manifest references its family
         // by name and must land on the freshest revision.
@@ -597,7 +611,13 @@ impl deploy_engine::Platform for EcsPlatform {
         }) else {
             return false;
         };
-        let clients = self.clients(&region).await;
+        let clients = match self.clients(&region).await {
+            Ok(clients) => clients,
+            Err(error) => {
+                tracing::warn!(service = service_name, %error, "ECS drift check refused region");
+                return false;
+            }
+        };
         let live = match self.describe_service(desired, clients).await {
             Ok(Some(live)) => live,
             Ok(None) => return false,
@@ -649,7 +669,7 @@ impl deploy_engine::Platform for EcsPlatform {
             // is complete by definition (idempotent boundary).
             return Ok(());
         };
-        let clients = self.clients(&region).await;
+        let clients = self.clients(&region).await?;
         if self.describe_service(service, clients).await?.is_none() {
             // Already gone: deletion is idempotent at this boundary.
             return Ok(());
@@ -674,165 +694,28 @@ impl deploy_engine::Platform for EcsPlatform {
 
 /// Register one task-definition revision from a deploy manifest.
 ///
-/// The SDK call mirrors `TaskDefinitionResource::create` in
-/// `tokeira-aws/src/resources/ecs_service.rs` — the correctness reference —
-/// with role ARNs already resolved from the infrastructure state while the
-/// workload produced this self-describing manifest. The builder helpers below
-/// remain mirrored from the same file because they are private there.
+/// Role ARNs were resolved from infrastructure state when the workload
+/// produced this self-describing manifest. SDK translation remains owned by
+/// `tokeira-aws`, so infrastructure and deployment cannot drift apart.
 async fn register_task_definition(
     clients: &tokeira_aws::AwsClients,
     manifest: &TaskDefinitionManifest,
 ) -> Result<(), deploy_engine::RuntimeError> {
     let spec = crate::modules::services::to_aws_task_definition(&manifest.spec, None, None);
-    if requires_execution_role(&spec) && manifest.execution_role_arn.is_none() {
-        tracing::warn!(
-            service = %manifest.service,
-            task_definition = %spec.family,
-            "task definition uses ECS-agent-side features but its deploy \
-             manifest carries no execution role"
-        );
-    }
-    let containers = spec
-        .containers
-        .iter()
-        .map(container_definition)
-        .collect::<Result<Vec<_>, _>>()?;
-    let volumes = spec.volumes.iter().map(volume).collect::<Vec<_>>();
-    let mut request = clients
-        .ecs
-        .register_task_definition()
-        .family(&spec.family)
-        .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
-        .requires_compatibilities(aws_sdk_ecs::types::Compatibility::Ec2)
-        .cpu(spec.cpu.to_string())
-        .memory(spec.memory_mb.to_string())
-        .set_container_definitions(Some(containers))
-        .set_volumes(Some(volumes));
-    if let Some(task_role_arn) = &manifest.task_role_arn {
-        request = request.task_role_arn(task_role_arn);
-    }
-    if let Some(execution_role_arn) = &manifest.execution_role_arn {
-        request = request.execution_role_arn(execution_role_arn);
-    }
-    request.send().await.map_err(|error| {
+    aws_ecs::register_task_definition(
+        clients,
+        &spec,
+        manifest.task_role_arn.as_deref(),
+        manifest.execution_role_arn.as_deref(),
+    )
+    .await
+    .map_err(|error| {
         runtime_error(format!(
-            "ecs:RegisterTaskDefinition for service {} (family {}): {}",
-            manifest.service,
-            spec.family,
-            error.into_service_error()
+            "registering task definition for service {} (family {}): {error}",
+            manifest.service, spec.family
         ))
     })?;
     Ok(())
-}
-
-fn requires_execution_role(spec: &aws_ecs::TaskDefinitionSpec) -> bool {
-    spec.containers
-        .iter()
-        .any(|container| !container.secrets.is_empty() || container.image.contains(".dkr.ecr."))
-}
-
-fn container_definition(
-    spec: &aws_ecs::ContainerSpec,
-) -> Result<aws_sdk_ecs::types::ContainerDefinition, deploy_engine::RuntimeError> {
-    let mut builder = aws_sdk_ecs::types::ContainerDefinition::builder()
-        .name(&spec.name)
-        .image(&spec.image)
-        .essential(spec.essential)
-        .cpu(spec.cpu as i32)
-        .memory(spec.memory_mb as i32)
-        .set_command((!spec.command.is_empty()).then_some(spec.command.clone()))
-        .set_port_mappings(Some(
-            spec.port_mappings
-                .iter()
-                .map(port_mapping)
-                .collect::<Vec<_>>(),
-        ))
-        .set_mount_points(Some(
-            spec.mount_points
-                .iter()
-                .map(mount_point)
-                .collect::<Vec<_>>(),
-        ))
-        .set_environment(Some(
-            spec.environment
-                .iter()
-                .map(|environment| {
-                    aws_sdk_ecs::types::KeyValuePair::builder()
-                        .name(&environment.name)
-                        .value(&environment.value)
-                        .build()
-                })
-                .collect(),
-        ))
-        .set_secrets(Some(
-            spec.secrets
-                .iter()
-                .map(|secret| {
-                    aws_sdk_ecs::types::Secret::builder()
-                        .name(&secret.name)
-                        .value_from(&secret.value_from)
-                        .build()
-                        .map_err(|error| runtime_error(format!("ecs:Secret build: {error}")))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))
-        .set_depends_on(Some(
-            spec.depends_on
-                .iter()
-                .map(container_dependency)
-                .collect::<Result<Vec<_>, _>>()?,
-        ));
-    if spec.init_process_enabled {
-        builder = builder.linux_parameters(
-            aws_sdk_ecs::types::LinuxParameters::builder()
-                .init_process_enabled(true)
-                .build(),
-        );
-    }
-    Ok(builder.build())
-}
-
-fn port_mapping(spec: &aws_ecs::PortMappingSpec) -> aws_sdk_ecs::types::PortMapping {
-    aws_sdk_ecs::types::PortMapping::builder()
-        .name(&spec.name)
-        .container_port(spec.container_port as i32)
-        .protocol(aws_sdk_ecs::types::TransportProtocol::Tcp)
-        .build()
-}
-
-fn mount_point(spec: &aws_ecs::MountPointSpec) -> aws_sdk_ecs::types::MountPoint {
-    aws_sdk_ecs::types::MountPoint::builder()
-        .source_volume(&spec.source_volume)
-        .container_path(&spec.container_path)
-        .read_only(spec.read_only)
-        .build()
-}
-
-fn container_dependency(
-    spec: &aws_ecs::ContainerDependencySpec,
-) -> Result<aws_sdk_ecs::types::ContainerDependency, deploy_engine::RuntimeError> {
-    aws_sdk_ecs::types::ContainerDependency::builder()
-        .container_name(&spec.container_name)
-        .condition(match spec.condition.as_str() {
-            "SUCCESS" => aws_sdk_ecs::types::ContainerCondition::Success,
-            "HEALTHY" => aws_sdk_ecs::types::ContainerCondition::Healthy,
-            "COMPLETE" => aws_sdk_ecs::types::ContainerCondition::Complete,
-            _ => aws_sdk_ecs::types::ContainerCondition::Start,
-        })
-        .build()
-        .map_err(|error| runtime_error(format!("ecs:ContainerDependency build: {error}")))
-}
-
-fn volume(spec: &aws_ecs::VolumeSpec) -> aws_sdk_ecs::types::Volume {
-    let mut builder = aws_sdk_ecs::types::Volume::builder().name(&spec.name);
-    if let Some(host_path) = &spec.host_path {
-        builder = builder.host(
-            aws_sdk_ecs::types::HostVolumeProperties::builder()
-                .source_path(host_path)
-                .build(),
-        );
-    }
-    builder.build()
 }
 
 fn service_connect_configuration(
@@ -1051,6 +934,30 @@ mod tests {
             .parse_and_admit(&[serde_json::json!({"kind": "helm-chart", "region": "eu-west-2"})])
             .expect_err("unknown kind");
         assert!(error.to_string().contains("helm-chart"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn initialized_client_bundle_refuses_a_different_region() {
+        let platform = EcsPlatform::new();
+        let sdk_config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("eu-west-2"))
+            .build();
+        assert!(
+            platform
+                .clients
+                .set((
+                    "eu-west-2".to_owned(),
+                    tokeira_aws::AwsClients::new(&sdk_config),
+                ))
+                .is_ok()
+        );
+
+        let Err(error) = platform.clients("us-east-1").await else {
+            panic!("different region must be refused after initialization");
+        };
+        assert!(error.to_string().contains("eu-west-2"), "{error}");
+        assert!(error.to_string().contains("us-east-1"), "{error}");
     }
 
     // Deleting a service no manifest describes is complete by definition —

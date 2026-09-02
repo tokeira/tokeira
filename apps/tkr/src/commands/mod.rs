@@ -2,7 +2,8 @@
 //!
 //! Each submodule owns its own `run(...)` entry point, called from the
 //! dispatcher in `main.rs`. Definition-bound deployments are forwarded to their
-//! married provisioner. These handlers retain the Local/ECS in-process path.
+//! married provisioner. These handlers retain the Local and pre-definition
+//! ECS in-process path.
 //!
 //! # Adding a new subcommand
 //!

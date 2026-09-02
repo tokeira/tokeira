@@ -1,9 +1,9 @@
-//! In-process deployment creation retained for platforms not yet migrated to
-//! generated bound provisioners.
+//! In-process operation retained for deployments created before their platform
+//! migrated to generated bound provisioners.
 //!
-//! Compose is deliberately absent. Its source, config, and binary are selected
-//! through platform discovery. This module exists only to avoid changing the
-//! Local and ECS platform crates during the Compose remediation.
+//! New ECS deployments are definition-bound; `from_id` still recognizes ECS
+//! so existing directories carrying `deployment.toml` remain operable. Local
+//! is the sole platform that still creates through this adapter.
 
 use anyhow::Result;
 use tokeira_ecs_deployment::EcsDeployment;
@@ -24,6 +24,19 @@ impl LegacyPlatform {
         match id.as_str() {
             "local" => Some(Self::Local),
             "ecs" => Some(Self::Ecs),
+            _ => None,
+        }
+    }
+
+    /// Select the in-process adapter allowed to create a new deployment.
+    ///
+    /// Recognition and creation are deliberately separate: dropping ECS from
+    /// [`Self::from_id`] would strand existing deployments, while routing new
+    /// ECS deployments here would bypass its recorded definition and remote
+    /// state contract.
+    pub(crate) fn creation_adapter(id: &PlatformId) -> Option<Self> {
+        match id.as_str() {
+            "local" => Some(Self::Local),
             _ => None,
         }
     }
@@ -72,10 +85,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ecs_template_remains_owned_by_the_legacy_ecs_platform() {
+    fn ecs_template_remains_available_only_for_existing_deployments() {
         let toml = LegacyPlatform::Ecs.deployment_config(StorageKind::Dsql);
         assert!(toml.contains("image = \"tokeirad:latest\""));
         assert!(toml.contains("populated by `tkr image push`"));
         let _: EcsConfig = toml::from_str(&toml).expect("ECS template parses");
+        let ecs = PlatformId::new("ecs").expect("platform id");
+        assert_eq!(LegacyPlatform::from_id(&ecs), Some(LegacyPlatform::Ecs));
+        assert_eq!(LegacyPlatform::creation_adapter(&ecs), None);
     }
 }

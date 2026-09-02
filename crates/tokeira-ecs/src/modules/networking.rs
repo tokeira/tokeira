@@ -1,3 +1,10 @@
+//! Legacy ECS network, security boundary, and private AWS endpoint resources.
+//!
+//! Ingress is scoped to the authored VPC CIDR because Service Connect traffic
+//! arrives through task-local proxies rather than carrying the destination
+//! task security group as its source. Each workload family owns only its
+//! canonical listener port.
+
 use tokeira_aws::{
     ResourceContext,
     resources::{
@@ -53,6 +60,7 @@ impl Module for NetworkingModule {
                 "alb",
                 "internal ALB",
                 listener_mode.listener_port(),
+                &self.config.networking.vpc_cidr,
                 &vpc_id,
                 &rctx,
             )),
@@ -60,6 +68,7 @@ impl Module for NetworkingModule {
                 "edge",
                 "edge services",
                 7233,
+                &self.config.networking.vpc_cidr,
                 &vpc_id,
                 &rctx,
             )),
@@ -67,6 +76,7 @@ impl Module for NetworkingModule {
                 "runtime",
                 "runtime services",
                 7241,
+                &self.config.networking.vpc_cidr,
                 &vpc_id,
                 &rctx,
             )),
@@ -74,6 +84,7 @@ impl Module for NetworkingModule {
                 "projection",
                 "projection services",
                 7242,
+                &self.config.networking.vpc_cidr,
                 &vpc_id,
                 &rctx,
             )),
@@ -81,6 +92,31 @@ impl Module for NetworkingModule {
                 "control",
                 "control services",
                 7240,
+                &self.config.networking.vpc_cidr,
+                &vpc_id,
+                &rctx,
+            )),
+            Box::new(security_group(
+                "mimir",
+                "Mimir service",
+                9009,
+                &self.config.networking.vpc_cidr,
+                &vpc_id,
+                &rctx,
+            )),
+            Box::new(security_group(
+                "loki",
+                "Loki service",
+                3100,
+                &self.config.networking.vpc_cidr,
+                &vpc_id,
+                &rctx,
+            )),
+            Box::new(security_group(
+                "grafana",
+                "Grafana service",
+                3000,
+                &self.config.networking.vpc_cidr,
                 &vpc_id,
                 &rctx,
             )),
@@ -88,6 +124,7 @@ impl Module for NetworkingModule {
                 "vpc-endpoints",
                 "VPC endpoints",
                 443,
+                &self.config.networking.vpc_cidr,
                 &vpc_id,
                 &rctx,
             )),
@@ -182,6 +219,7 @@ pub(crate) fn required_endpoint_specs(region: &str) -> Vec<EndpointSpec> {
         ("ssm", "ssm", EndpointType::Interface),
         ("ssmmessages", "ssmmessages", EndpointType::Interface),
         ("ec2messages", "ec2messages", EndpointType::Interface),
+        ("secretsmanager", "secretsmanager", EndpointType::Interface),
     ]
     .into_iter()
     .map(|(short_name, service, endpoint_type)| EndpointSpec {
@@ -208,6 +246,7 @@ fn security_group(
     name: &str,
     description: &str,
     port: u16,
+    source: &str,
     vpc_dependency: &ResourceId,
     rctx: &ResourceContext,
 ) -> SecurityGroup {
@@ -217,11 +256,11 @@ fn security_group(
             vpc_dependency: vpc_dependency.clone(),
             description: format!("Tokeira ECS {description} security group"),
             ingress_rules: vec![SecurityRule {
-                description: format!("self {description} traffic"),
+                description: format!("private VPC {description} traffic"),
                 protocol: "tcp".into(),
                 from_port: port,
                 to_port: port,
-                source: "self".into(),
+                source: source.to_owned(),
             }],
             module: "networking".into(),
         },
@@ -293,10 +332,14 @@ mod tests {
 
         assert!(ids.contains(&"tokeira-vpc".to_owned()));
         assert!(ids.contains(&"sg-vpc-endpoints".to_owned()));
+        assert!(ids.contains(&"sg-mimir".to_owned()));
+        assert!(ids.contains(&"sg-loki".to_owned()));
+        assert!(ids.contains(&"sg-grafana".to_owned()));
         assert!(ids.contains(&"vpce-s3".to_owned()));
         assert!(ids.contains(&"vpce-ssm".to_owned()));
         assert!(ids.contains(&"vpce-ssmmessages".to_owned()));
         assert!(ids.contains(&"vpce-ec2messages".to_owned()));
+        assert!(ids.contains(&"vpce-secretsmanager".to_owned()));
         assert!(ids.contains(&"alb-tokeira-internal".to_owned()));
         assert!(ids.contains(&"alb-tg-tokeira-edge-api".to_owned()));
         assert!(ids.contains(&"alb-tg-tokeira-edge-poll".to_owned()));
@@ -312,7 +355,7 @@ mod tests {
             .expect("s3 endpoint");
 
         assert_eq!(s3.endpoint_type, EndpointType::Gateway);
-        assert_eq!(endpoints.len(), 11);
+        assert_eq!(endpoints.len(), 12);
     }
 
     #[test]

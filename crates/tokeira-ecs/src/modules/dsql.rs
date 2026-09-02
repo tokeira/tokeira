@@ -1,3 +1,9 @@
+//! Legacy DSQL substrate and task-access identities for ECS.
+//!
+//! Managed mode owns the cluster, private endpoints, and least-privilege IAM
+//! roles. Preexisting mode validates and records operator-supplied identities
+//! without taking lifecycle ownership of them.
+
 use std::collections::HashMap;
 
 use tokeira_aws::{

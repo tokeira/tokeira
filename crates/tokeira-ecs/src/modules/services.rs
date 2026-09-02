@@ -1,3 +1,9 @@
+//! Legacy ECS service materialization for previously recorded deployments.
+//!
+//! This module converts validated ECS workload plans into provider resources.
+//! The ECS cluster owns its Service Connect default namespace; services only
+//! publish endpoints into that namespace.
+
 use std::collections::HashMap;
 
 use tokeira_aws::{
@@ -39,12 +45,7 @@ impl Module for ServicesModule {
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
         let vpc_id = ResourceId(format!("{}-vpc", self.config.project_name));
-        let mut resources: Vec<Box<dyn Resource>> =
-            vec![Box::new(aws_ecs::CloudMapNamespaceResource {
-                name: self.config.networking.private_dns_zone.clone(),
-                vpc_dependency: vpc_id.clone(),
-                module: self.name().to_owned(),
-            })];
+        let mut resources: Vec<Box<dyn Resource>> = Vec::new();
 
         for workload in EcsWorkload::build_all(&self.config) {
             let task_role = service_task_role(&workload.name, &self.config, self.name());
@@ -212,11 +213,14 @@ pub(crate) fn to_aws_placement_constraint(
     }
 }
 
-fn security_group_for_workload(service: &str) -> ResourceId {
+pub(crate) fn security_group_for_workload(service: &str) -> ResourceId {
     match service {
         "tokeira-edge-api" | "tokeira-edge-poll" => ResourceId("sg-edge".to_owned()),
         "tokeira-runtime" => ResourceId("sg-runtime".to_owned()),
         "tokeira-projection" => ResourceId("sg-projection".to_owned()),
+        "tokeira-mimir" => ResourceId("sg-mimir".to_owned()),
+        "tokeira-loki" => ResourceId("sg-loki".to_owned()),
+        "tokeira-grafana" => ResourceId("sg-grafana".to_owned()),
         _ => ResourceId("sg-control".to_owned()),
     }
 }
@@ -421,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn services_module_enumerates_namespace_task_definitions_and_services() {
+    fn services_module_enumerates_task_definitions_and_services() {
         let module = ServicesModule::new(EcsConfig::default());
         let resources = module.resources(&module_context()).expect("resources");
         let ids: Vec<String> = resources
@@ -429,8 +433,7 @@ mod tests {
             .map(|resource| resource.resource_id().0)
             .collect();
 
-        assert_eq!(ids.len(), 22);
-        assert!(ids.contains(&"cloudmap:namespace".to_owned()));
+        assert_eq!(ids.len(), 21);
         assert_eq!(
             ids.iter().filter(|id| id.starts_with("iam-role-")).count(),
             7

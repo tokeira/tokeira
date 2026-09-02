@@ -13,7 +13,7 @@
 //! ```text
 //! ~/Library/Application Support/tokeira/tkr/<name>/
 //!   definition.<fmt>  # definition-bound platform source, when recorded
-//!   deployment.toml   # legacy Local/ECS platform config, otherwise
+//!   deployment.toml   # Local or pre-definition ECS platform config, otherwise
 //!   tokeirad.toml     # TokeiraConfig consumed by the tokeirad server binary
 //!   metadata.json     # identity + status tracked by the CLI
 //!   tkp               # generated platform/frontend provisioner, when bound
@@ -454,7 +454,7 @@ impl DeploymentResolver {
         storage: StorageKind,
         region: Option<String>,
     ) -> Result<DeploymentMetadata> {
-        let seed = if crate::legacy::LegacyPlatform::from_id(&platform).is_some() {
+        let seed = if crate::legacy::LegacyPlatform::creation_adapter(&platform).is_some() {
             None
         } else {
             let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

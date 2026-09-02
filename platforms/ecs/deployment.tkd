@@ -176,7 +176,9 @@ fn config() -> Ecs {
 fn deployment(cfg: Ecs, cx: Context) -> Deployment {
     let d = Deployment::new(&["default"]);
 
-    // Bootstrap: the remote-state bucket everything else stands on.
+    // State admission is the ordering root everything else stands on. The
+    // shell already opened the selected local/S3 stores; the module must not
+    // re-author that deployment-level location as ECS desired state.
     let remote_state = d.module("remote_state", vec![]);
     remote_state::define(d, cfg, cx, remote_state);
 

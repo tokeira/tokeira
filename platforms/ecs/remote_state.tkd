@@ -1,16 +1,22 @@
-// The remote-state module: the deployment's one bootstrap resource. The
-// bucket name and key prefix are derived, not authored — they follow the
-// platform's state-location convention so every tool finds the same state.
+// The state bootstrap is deliberately a resource-free ordering anchor.
+//
+// The shared deployment shell admits exactly one DeploymentStateLocation
+// from authenticated deployment metadata before this definition is
+// evaluated. It validates the local/S3 locator and prepares the envelope,
+// infrastructure, runtime, and operation-lock stores from that one value, so
+// reproducing the locator in ECS configuration would create a second source
+// of truth that could drift from the stores already in use.
+//
+// For S3, the bucket is a primordial, operator-owned prerequisite. Ambient
+// AWS credentials must supply prefix-scoped object access; the recorded
+// locator carries no credentials. Tokeira's state layer supplies encryption
+// and conditional-write/CAS semantics. ECS must not
+// create the bucket or take ownership of its public-access, versioning,
+// policy, lifecycle, or deletion controls. For local state, the shared layer
+// keeps every document under the deployment directory. This empty module
+// remains the graph's unique dependency-free root so all provider work is
+// still ordered after state admission.
 
 use platform::Ecs;
 
-pub fn define(d: Deployment, cfg: Ecs, cx: Context, remote_state: Module) {
-    remote_state.resource(
-        "bucket",
-        RemoteStateBucket {
-            region: cfg.aws.region.clone(),
-            bucket: format!("{}-state-{}", cx.project_name, cfg.aws.region),
-            key_prefix: format!("{}/{}", cx.project_name, cfg.environment),
-        },
-    );
-}
+pub fn define(_d: Deployment, _cfg: Ecs, _cx: Context, _remote_state: Module) {}

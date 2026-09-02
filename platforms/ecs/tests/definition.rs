@@ -286,6 +286,43 @@ fn assert_definition_parity(
     assert_eq!(tkdp.served_companions.len(), 9);
 }
 
+/// State placement is admitted before definition evaluation and therefore
+/// cannot safely be duplicated as provider desired state. The dependency-free
+/// module remains as the graph's ordering root, but it must never realize a
+/// bucket whose security or retention policy ECS would then own.
+fn assert_state_location_is_shell_owned(output: &EvaluatedDefinition<DecodedKind>) {
+    let bootstrap = output
+        .graph
+        .modules()
+        .iter()
+        .find(|module| module.name() == "remote_state")
+        .expect("the state ordering root exists");
+    assert!(bootstrap.dependencies().is_empty());
+    assert!(
+        output
+            .graph
+            .resources()
+            .iter()
+            .all(|resource| resource.module() != "remote_state")
+    );
+
+    for dependent in ["images", "networking"] {
+        let module = output
+            .graph
+            .modules()
+            .iter()
+            .find(|module| module.name() == dependent)
+            .expect("state-dependent module exists");
+        assert_eq!(module.dependencies(), &["remote_state"]);
+    }
+
+    assert!(
+        realize(output)
+            .iter()
+            .all(|resource| resource.resource_type().0 != "RemoteStateBucket")
+    );
+}
+
 #[test]
 fn cluster_uses_the_authored_service_connect_namespace() {
     let cluster =
@@ -328,6 +365,19 @@ fn the_shipped_definition_formats_are_exact_peers() {
     let tkdp = evaluate_tkdp(&shipped_tkdp_root()).expect("the shipped TKDP set evaluates");
 
     assert_definition_parity(&tkd, &tkdp);
+}
+
+// Both frontends must preserve the shared shell's state authority. A bucket
+// resource here would be too late to bootstrap remote state and would let an
+// ECS apply mutate an operator-owned bucket's security or retention controls.
+#[test]
+fn state_location_remains_outside_ecs_desired_state() {
+    for output in [
+        evaluate_tkd(&shipped_tkd_root()).expect("the shipped TKD set evaluates"),
+        evaluate_tkdp(&shipped_tkdp_root()).expect("the shipped TKDP set evaluates"),
+    ] {
+        assert_state_location_is_shell_owned(&output);
+    }
 }
 
 // The shipped defaults select managed DSQL: seven modules in dependency

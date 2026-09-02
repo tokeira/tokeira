@@ -41,6 +41,7 @@ const METADATA_JSON: &str = "metadata.json";
 const DEFAULT_LOG_TAIL: u32 = 100;
 const LOG_FOLLOW_INTERVAL: Duration = Duration::from_secs(1);
 
+mod admin;
 mod exec;
 mod port_forward;
 mod session_manager;
@@ -385,6 +386,10 @@ impl Ops for EcsOps {
         command: &[String],
     ) -> Result<()> {
         exec::run(deployment, service, container, command).await
+    }
+
+    async fn admin(&self, deployment: &DeploymentRef, command: &[String]) -> Result<()> {
+        admin::run(deployment, command).await
     }
 
     async fn scale(&self, deployment: &DeploymentRef, specs: &[String]) -> Result<usize> {

@@ -100,6 +100,12 @@ pub(crate) enum Command {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// Run a command through the platform's on-demand admin workload.
+    Admin {
+        /// Command and arguments passed to the admin container.
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
     Config {
         #[command(subcommand)]
         action: ConfigAction,

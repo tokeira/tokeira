@@ -34,13 +34,13 @@ tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
 tokeira-ecs = { path = "../../crates/tokeira-ecs" }
 tokeira-deployment = { workspace = true }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
+tokeira-observability = { workspace = true }
 tokeira-platform = { path = "../../crates/tokeira-platform" }
 tokeira-platform-definition = { workspace = true, features = ["tkd", "tkdp"] }
-tokio = { workspace = true, features = ["process", "signal", "time"] }
+tokio = { workspace = true, features = ["process", "rt", "signal", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokeira-observability = { workspace = true }
 
 [lints]
 workspace = true

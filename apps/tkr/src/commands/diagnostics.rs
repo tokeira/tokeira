@@ -16,12 +16,12 @@ use uuid::Uuid;
 
 use crate::{
     cli::DiagnosticsAction,
-    deployment_dir::{DeploymentContext, TOKEIRAD_TOML},
+    deployment_dir::{DeploymentRecordContext, TOKEIRAD_TOML},
 };
 
 pub(crate) async fn run(
     action: DiagnosticsAction,
-    ctx: DeploymentContext,
+    ctx: DeploymentRecordContext,
     json: bool,
 ) -> Result<()> {
     match action {
@@ -31,7 +31,7 @@ pub(crate) async fn run(
     }
 }
 
-async fn worker_compute(ctx: DeploymentContext, namespace: &str, json: bool) -> Result<()> {
+async fn worker_compute(ctx: DeploymentRecordContext, namespace: &str, json: bool) -> Result<()> {
     if ctx.metadata.storage != StorageKind::Dsql {
         bail!("worker-compute diagnostics require dsql storage");
     }

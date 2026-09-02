@@ -164,7 +164,7 @@ def config() -> Ecs:
                 memory_mb=1024,
             ),
             admin=ReplicaPolicy(
-                replicas=1,
+                replicas=0,
                 cpu=512,
                 memory_mb=1024,
             ),

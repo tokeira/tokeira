@@ -16,7 +16,7 @@
 //! | Cloud infra       | `tkr infra`      | Plan / apply / destroy declared resources.     |
 //! | Service deploy    | `tkr deploy`     | Plan / apply / destroy service manifests.      |
 //! | DSQL schema       | `tkr schema`     | Schema setup for DSQL-backed deployments.      |
-//! | Scaling + ops     | `tkr scale`, `tkr logs`, `tkr port-forward`, `tkr exec` | Day-2 operator loops. |
+//! | Scaling + ops     | `tkr scale`, `tkr logs`, `tkr port-forward`, `tkr exec`, `tkr admin` | Day-2 operator loops. |
 //! | Inspection        | `tkr config show`, `tkr version`            | Debugging aids.       |
 //!
 //! # Architecture pointers
@@ -63,7 +63,7 @@ use cli::{
     Cli, Command, ConfigAction, DeployAction, DeploymentAction, InfraAction, ObservabilityAction,
     ScaleAction, SchemaAction,
 };
-use deployment_dir::{DeploymentResolver, load_context};
+use deployment_dir::{DeploymentResolver, load_context, load_record_context};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -211,7 +211,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Schema { action } => {
-            let ctx = load_context(&deployments, selected)?;
+            let ctx = load_record_context(&deployments, selected)?;
             commands::schema::run(action, ctx).await
         }
         Command::Scale { action } => {
@@ -285,6 +285,15 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Command::Admin { command } => {
+            if !deployments.uses_bound_provisioner(selected)? {
+                anyhow::bail!(
+                    "on-demand administration is not supported by the selected in-process platform"
+                );
+            }
+            let dir = deployments.resolve_dir(selected)?;
+            launcher::launch(&dir, &["admin"], &forwarded_admin_args(&command)).await
+        }
         Command::Config {
             action: ConfigAction::Show,
         } => commands::config::run_show(&deployments, selected),
@@ -313,7 +322,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Diagnostics { action } => {
-            let ctx = load_context(&deployments, selected)?;
+            let ctx = load_record_context(&deployments, selected)?;
             commands::diagnostics::run(action, ctx, cli.json).await
         }
         Command::Version { verbose, json } => {
@@ -350,6 +359,7 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
         | Command::Scale {
             action: ScaleAction::Up { .. } | ScaleAction::Down { .. },
         }
+        | Command::Admin { .. }
         | Command::Image(cli::ImageArgs {
             command: cli::ImageCommand::Push { .. } | cli::ImageCommand::Mirror { .. },
         }) => Some(selected()),
@@ -457,6 +467,14 @@ fn forwarded_exec_args(service: &str, container: Option<&str>, command: &[String
         args.extend(["--container".to_owned(), container.to_owned()]);
     }
     args.push("--".to_owned());
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// Preserve the admin command as argv across the `tkr` → `tkp` boundary.
+/// The separator keeps a command-local flag from becoming a provisioner flag.
+fn forwarded_admin_args(command: &[String]) -> Vec<String> {
+    let mut args = vec!["--".to_owned()];
     args.extend(command.iter().cloned());
     args
 }
@@ -915,6 +933,19 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_preserves_admin_argument_boundaries() {
+        assert_eq!(
+            forwarded_admin_args(&[
+                "schema".to_owned(),
+                "migrate".to_owned(),
+                "--target".to_owned(),
+                "5".to_owned(),
+            ]),
+            ["--", "schema", "migrate", "--target", "5"]
+        );
+    }
+
+    #[test]
     fn forwarding_preserves_the_observability_check_timeout() {
         let (verb, extra) = forwarded_observability_verb(15);
         assert_eq!(verb, &["observability", "check"]);
@@ -1115,7 +1146,12 @@ mod tests {
                 local_port: None
             } if service == "grafana"
         ));
-        assert!(Cli::try_parse_from(["tkr", "admin", "schema", "setup"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "admin", "schema", "setup"])
+                .unwrap()
+                .command,
+            Command::Admin { command } if command == ["schema", "setup"]
+        ));
         assert!(matches!(
             Cli::try_parse_from([
                 "tkr",

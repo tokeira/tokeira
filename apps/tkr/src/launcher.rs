@@ -805,6 +805,7 @@ mod tests {
         // the manifest-verified bound provisioner rather than the ungated
         // read-only class.
         assert_eq!(resolve_class(&["exec"], &versioned), LaunchClass::Bound);
+        assert_eq!(resolve_class(&["admin"], &versioned), LaunchClass::Bound);
         assert_eq!(
             resolve_class(&["infra", "apply"], &dev),
             LaunchClass::DevCandidate

@@ -96,29 +96,12 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::{
-        deployment_dir::{DeploymentContext, PlatformDeploymentConfig},
-        metadata::{DeploymentMetadata, DeploymentStatus},
-    };
-    use tokeira_orchestrator::StorageKind;
-    use uuid::Uuid;
+    use crate::deployment_dir::{DeploymentContext, PlatformDeploymentConfig};
 
     fn context(platform_config: PlatformDeploymentConfig) -> DeploymentContext {
         DeploymentContext {
             name: "test".into(),
             path: PathBuf::new(),
-            metadata: DeploymentMetadata {
-                name: "test".into(),
-                id: Uuid::nil(),
-                platform: tokeira_orchestrator::PlatformId::new("local").expect("platform"),
-                state: Default::default(),
-                definition: None,
-                deployment_repository: None,
-                storage: StorageKind::InMemory,
-                status: DeploymentStatus::Created,
-                created_at: "2026-01-01T00:00:00Z".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-            },
             platform_config,
         }
     }

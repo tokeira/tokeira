@@ -434,7 +434,7 @@ impl Default for ServiceConfigs {
             ),
             admin: ReplicaServiceConfig::new(
                 "tokeirad:latest",
-                1,
+                0,
                 512,
                 1024,
                 Some(7244),

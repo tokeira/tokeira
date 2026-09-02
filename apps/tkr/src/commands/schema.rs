@@ -11,10 +11,10 @@ use tokeira_storage::dsql::{ConnectionFactory, DsqlAuthConfig, MigrationRunner};
 
 use crate::{
     cli::SchemaAction,
-    deployment_dir::{DeploymentContext, TOKEIRAD_TOML},
+    deployment_dir::{DeploymentRecordContext, TOKEIRAD_TOML},
 };
 
-pub(crate) async fn run(action: SchemaAction, ctx: DeploymentContext) -> Result<()> {
+pub(crate) async fn run(action: SchemaAction, ctx: DeploymentRecordContext) -> Result<()> {
     if ctx.metadata.storage != StorageKind::Dsql {
         bail!("schema commands require dsql storage");
     }

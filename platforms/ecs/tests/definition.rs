@@ -398,6 +398,33 @@ fn the_shipped_set_pins_current_observability_images() {
     }
 }
 
+#[test]
+fn observability_capability_matches_the_realized_definition() {
+    let platform = tokeira_ecs_deployment::platform();
+    assert!(platform.observability.is_some());
+
+    for output in [
+        evaluate_tkd(&shipped_tkd_root()).expect("the shipped TKD set evaluates"),
+        evaluate_tkdp(&shipped_tkdp_root()).expect("the shipped TKDP set evaluates"),
+    ] {
+        let resources = realize(&output);
+        assert_eq!(
+            resources
+                .iter()
+                .filter(|resource| resource.resource_type().0 == "AlloyConfig")
+                .count(),
+            10
+        );
+        assert_eq!(
+            resources
+                .iter()
+                .filter(|resource| resource.resource_type().0 == "ObservabilityArtifacts")
+                .count(),
+            1
+        );
+    }
+}
+
 // The canonical derivation model and shipped roots must encode the same
 // platform-owned policy; kinds apply authored values to that model.
 #[test]
@@ -486,6 +513,10 @@ fn derivation_defaults_match_the_shipped_definition() {
         )
     );
     assert_replica_defaults(&shipped.services.admin, &model["services"]["admin"]);
+    assert_eq!(
+        shipped.services.admin.replicas, 0,
+        "the admin workload is definition-owned on-demand capacity"
+    );
 
     for (shipped_capacity, model_key) in [
         (&shipped.capacity.edge_api, "edge_api"),

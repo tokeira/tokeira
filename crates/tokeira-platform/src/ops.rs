@@ -90,6 +90,17 @@ pub trait Ops: Send + Sync + fmt::Debug {
         anyhow::bail!("interactive exec is not supported for service `{service}` on this platform")
     }
 
+    /// Run one command through the platform's on-demand administrative
+    /// workload.
+    ///
+    /// Platforms that support this operation own temporary capacity,
+    /// readiness, command execution, and restoration of the prior capacity.
+    /// The generic shell never assumes that an admin workload is continuously
+    /// running or that it is named in a particular way.
+    async fn admin(&self, _deployment: &DeploymentRef, _command: &[String]) -> anyhow::Result<()> {
+        anyhow::bail!("on-demand administration is not supported on this platform")
+    }
+
     /// Change workload capacity (`<dim>=<n>` specs), returning the change
     /// count. Required, deliberately undefaulted: an ops surface answers
     /// every one of its verbs in its own words — a provider without a scale

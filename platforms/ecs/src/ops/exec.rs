@@ -20,7 +20,7 @@ use super::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExecTarget {
+pub(super) struct ExecTarget {
     task_arn: String,
     container_name: String,
 }
@@ -50,7 +50,7 @@ pub(super) async fn run(
     run_session(session).await
 }
 
-async fn discover_exec_target(
+pub(super) async fn discover_exec_target(
     clients: &AwsClients,
     coordinates: &EcsOperationCoordinates,
     service: Service,

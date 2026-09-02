@@ -78,6 +78,8 @@ enum Command {
     PortForward(PortForwardArgs),
     /// Execute an interactive command in one live service container.
     Exec(ExecArgs),
+    /// Run one command through the platform's on-demand admin workload.
+    Admin(AdminArgs),
     /// Validate the deployment's realized observability configuration.
     #[command(subcommand)]
     Observability(ObservabilityCommand),
@@ -118,6 +120,7 @@ impl Command {
             Self::PortMappings(args) => Some(&args.deployment_dir),
             Self::PortForward(args) => Some(&args.deployment_dir),
             Self::Exec(args) => Some(&args.deployment_dir),
+            Self::Admin(args) => Some(&args.deployment_dir),
             Self::Observability(ObservabilityCommand::Check(args)) => Some(&args.deployment_dir),
             Self::Revert(args) => Some(&args.deployment_dir),
             Self::Rollback(args) => Some(&args.deployment_dir),
@@ -263,6 +266,16 @@ struct ExecArgs {
     #[arg(long)]
     container: Option<String>,
     /// Command and arguments to execute remotely.
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
+    /// Deployment directory holding platform identity and the admitted definition.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct AdminArgs {
+    /// Command and arguments passed to the platform's admin workload.
     #[arg(last = true, required = true)]
     command: Vec<String>,
     /// Deployment directory holding platform identity and the admitted definition.
@@ -671,6 +684,17 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             })
             .await
         }
+        Command::Admin(args) => {
+            let admitted = require(admitted);
+            let command = args.command;
+            lock::with_operation_lock(&admitted.state, "admin", || async {
+                let Some(ops) = engine.platform().ops() else {
+                    anyhow::bail!("not applicable: this platform declares no ops surface");
+                };
+                ops.admin(&admitted.deployment_ref, &command).await
+            })
+            .await
+        }
         Command::Revert(args) => {
             let admitted = require(admitted);
             let to = args.to;
@@ -874,6 +898,31 @@ mod tests {
         assert!(
             Cli::try_parse_from(["tkp", "exec", "runtime", "--deployment-dir", "/tmp/d"]).is_err(),
             "the remote command is mandatory"
+        );
+    }
+
+    #[test]
+    fn parses_platform_owned_admin() {
+        let parsed = Cli::try_parse_from([
+            "tkp",
+            "admin",
+            "--deployment-dir",
+            "/tmp/d",
+            "--",
+            "schema",
+            "migrate",
+            "--target",
+            "5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Admin(AdminArgs { command, .. })
+                if command == ["schema", "migrate", "--target", "5"]
+        ));
+        assert!(
+            Cli::try_parse_from(["tkp", "admin", "--deployment-dir", "/tmp/d"]).is_err(),
+            "the admin command is mandatory"
         );
     }
 }

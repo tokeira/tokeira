@@ -100,7 +100,7 @@ pub fn platform() -> PlatformDeclaration {
     PlatformDeclaration {
         namespaces: namespaces(),
         ops: Some(Box::new(ops::EcsOps)),
-        observability: None,
+        observability: Some(Box::new(observability::EcsObservabilityCheck)),
         execution: Box::new(tokeira_ecs::execution::EcsExecution),
         implementation: Arc::new(EcsIntegration {
             execution: tokeira_ecs::execution::EcsIntegration,
@@ -133,6 +133,7 @@ mod declaration_tests {
             ]
         );
         assert!(declaration.ops.is_some());
+        assert!(declaration.observability.is_some());
         assert!(declaration.implementation.image_operations().is_some());
     }
 

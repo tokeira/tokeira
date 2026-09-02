@@ -8,8 +8,9 @@
 //! content tree with one digest — mirroring how Compose treats its rendered
 //! configuration files.
 
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
+use anyhow::Context as _;
 use serde::Deserialize;
 use sha2::Digest;
 use tokeira_aws::resources::{s3_object::S3Object, ssm_parameter::SsmParameterResource};
@@ -20,12 +21,21 @@ use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
     ResourceType,
 };
+use tokeira_observability::validation::{
+    AlertRuleValidator, AlloyConfigValidator, DashboardValidator,
+};
 use tokeira_platform::{
     author::LocatedValue,
+    declaration::{
+        DeploymentRef, ObservabilityCheck, ObservabilityCheckOutcome, ObservabilityCheckReport,
+        ObservabilityCheckStatus,
+    },
     definition::Namespace,
     error::KindError,
     kind::{self, DecodedKind, Kind, PlacementContext},
 };
+
+use crate::ops::EcsOperationCoordinates;
 
 /// Author-visible name of the artifact-tree resource type.
 pub(crate) const ARTIFACTS_TYPE: &str = "ObservabilityArtifacts";
@@ -61,6 +71,214 @@ pub(crate) fn namespace() -> Namespace {
         defaults: None,
         decode,
     }
+}
+
+/// ECS's read-only validation of one definition-derived observability stack.
+///
+/// The check reuses the admitted deployment's staged content and realized
+/// resource identities. It performs no AWS mutation and does not load
+/// deployment state. The only network action is a timeout-bounded HTTP
+/// readiness request to the authored Loki query endpoint; unreachable private
+/// endpoints are reported as a warning because operators may intentionally
+/// require `port-forward` first.
+#[derive(Debug, Default)]
+pub(crate) struct EcsObservabilityCheck;
+
+impl ObservabilityCheck for EcsObservabilityCheck {
+    fn check(
+        &self,
+        deployment: &DeploymentRef,
+        resources: &[Arc<dyn Resource>],
+        timeout: Duration,
+    ) -> anyhow::Result<ObservabilityCheckReport> {
+        if timeout.is_zero() {
+            anyhow::bail!("observability check timeout must be positive");
+        }
+
+        let coordinates = EcsOperationCoordinates::read(deployment)?;
+        let artifact_count = validate_artifacts(deployment)?;
+        let alloy_services = validate_realized_resources(deployment, resources)?;
+        let alloy_count = validate_alloy_rendering(deployment, &coordinates, &alloy_services)?;
+        let live = probe_loki_readiness(coordinates.loki_query_url(), timeout)?;
+
+        Ok(ObservabilityCheckReport {
+            checks: vec![
+                ObservabilityCheckOutcome {
+                    name: "ecs-alloy",
+                    status: ObservabilityCheckStatus::Pass,
+                    detail: format!("{alloy_count} task-scoped Alloy configurations render"),
+                },
+                ObservabilityCheckOutcome {
+                    name: "ecs-artifacts",
+                    status: ObservabilityCheckStatus::Pass,
+                    detail: format!(
+                        "{artifact_count} dashboard and alert artifacts satisfy the style contract"
+                    ),
+                },
+                ObservabilityCheckOutcome {
+                    name: "ecs-resources",
+                    status: ObservabilityCheckStatus::Pass,
+                    detail: format!(
+                        "the artifact tree and {alloy_count} definition-declared Alloy parameters are realized"
+                    ),
+                },
+                live,
+            ],
+        })
+    }
+}
+
+fn validate_artifacts(deployment: &DeploymentRef) -> anyhow::Result<usize> {
+    let content = deployment.dir.join("observability");
+    let artifacts = load_observability_artifacts(&content)?;
+    let mut dashboard_count = 0usize;
+    let mut alert_count = 0usize;
+    for artifact in &artifacts {
+        let path = content.join(&artifact.key);
+        if artifact.key.starts_with("dashboards/") {
+            DashboardValidator::validate_str(&path, &artifact.content)?;
+            dashboard_count += 1;
+        } else if artifact.key.starts_with("alerts/") {
+            AlertRuleValidator::validate_str(&path, &artifact.content, &deployment.dir)?;
+            alert_count += 1;
+        }
+    }
+    if dashboard_count == 0 || alert_count == 0 {
+        anyhow::bail!(
+            "ECS observability content must contain at least one dashboard and one alert bundle"
+        );
+    }
+    Ok(artifacts.len())
+}
+
+fn validate_alloy_rendering(
+    deployment: &DeploymentRef,
+    coordinates: &EcsOperationCoordinates,
+    services: &[String],
+) -> anyhow::Result<usize> {
+    let context = AlloyRenderContext {
+        project_name: &deployment.name,
+        environment: coordinates.environment(),
+        cluster_name: coordinates.cluster(),
+    };
+    for service in services {
+        let rendered = render_alloy_config(service, &context);
+        let path = PathBuf::from(format!("alloy/{service}.alloy"));
+        AlloyConfigValidator::validate_scrape_jobs(&path, &rendered, &["tokeira"])?;
+        for required in [
+            "TASK_ARN_PLACEHOLDER",
+            "loki.source.docker",
+            "http://tokeira-mimir:9009/api/v1/push",
+            "http://tokeira-loki:3100/loki/api/v1/push",
+        ] {
+            if !rendered.contains(required) {
+                anyhow::bail!(
+                    "rendered Alloy configuration for `{service}` is missing `{required}`"
+                );
+            }
+        }
+    }
+    Ok(services.len())
+}
+
+fn validate_realized_resources(
+    deployment: &DeploymentRef,
+    resources: &[Arc<dyn Resource>],
+) -> anyhow::Result<Vec<String>> {
+    let actual = resources
+        .iter()
+        .map(|resource| (resource.resource_type().0, resource.resource_id().0))
+        .collect::<BTreeSet<_>>();
+    if !actual.contains(&(
+        ARTIFACTS_TYPE.to_owned(),
+        "observability:artifacts".to_owned(),
+    )) {
+        anyhow::bail!("the realized ECS definition contains no observability artifact tree");
+    }
+
+    let prefix = format!("ssm-parameter:/{}/alloy/sidecar/", deployment.name);
+    let services = actual
+        .iter()
+        .filter(|(resource_type, _)| resource_type == ALLOY_CONFIG_TYPE)
+        .map(|(_, id)| {
+            id.strip_prefix(&prefix)
+                .filter(|service| !service.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "realized Alloy parameter `{id}` is outside deployment `{}`",
+                        deployment.name
+                    )
+                })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if services.is_empty() {
+        anyhow::bail!("the realized ECS definition contains no Alloy configuration parameters");
+    }
+    Ok(services)
+}
+
+fn probe_loki_readiness(
+    base_url: &str,
+    timeout: Duration,
+) -> anyhow::Result<ObservabilityCheckOutcome> {
+    let url = loki_readiness_url(base_url)?;
+    let endpoint = url.to_string();
+
+    // `ObservabilityCheck` predates asynchronous reachability. Run the async
+    // HTTP client on a short-lived dedicated runtime so this synchronous
+    // capability never nests a runtime inside the provisioner's Tokio
+    // executor. The reqwest total timeout bounds connect, response, and body
+    // work; joining therefore cannot outlive the operator's stated budget.
+    let result = std::thread::spawn(move || -> anyhow::Result<reqwest::StatusCode> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build Loki readiness runtime")?;
+        runtime.block_on(async move {
+            let client = reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .context("build Loki readiness client")?;
+            Ok(client.get(&endpoint).send().await?.status())
+        })
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("Loki readiness worker panicked"))?;
+
+    Ok(match result {
+        Ok(status) if status.is_success() => ObservabilityCheckOutcome {
+            name: "ecs-loki-readiness",
+            status: ObservabilityCheckStatus::Pass,
+            detail: format!("{url} returned {status}"),
+        },
+        Ok(status) => ObservabilityCheckOutcome {
+            name: "ecs-loki-readiness",
+            status: ObservabilityCheckStatus::Warn,
+            detail: format!("{url} returned {status}"),
+        },
+        Err(error) => ObservabilityCheckOutcome {
+            name: "ecs-loki-readiness",
+            status: ObservabilityCheckStatus::Warn,
+            detail: format!("{url} was not reachable within {timeout:?}: {error}"),
+        },
+    })
+}
+
+fn loki_readiness_url(base_url: &str) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url)
+        .map_err(|error| anyhow::anyhow!("invalid observability.loki_query_url: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("observability.loki_query_url must use http or https");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("observability.loki_query_url must not contain credentials");
+    }
+    let base_path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&format!("{base_path}/ready"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
 }
 
 /// Reusable author input for the shipped observability artifact tree. The
@@ -537,5 +755,21 @@ mod tests {
                 .contains("http://tokeira-loki:3100/loki/api/v1/push")
         );
         assert!(!resource.inner.value.contains("tokeira.local"));
+    }
+
+    #[test]
+    fn loki_readiness_uses_the_authored_endpoint() {
+        let endpoint = loki_readiness_url("https://loki.example/base/?ignored=yes#fragment")
+            .expect("readiness endpoint derives");
+
+        assert_eq!(endpoint.as_str(), "https://loki.example/base/ready");
+    }
+
+    #[test]
+    fn loki_readiness_url_must_not_embed_credentials() {
+        let error = loki_readiness_url("http://operator:secret@127.0.0.1:3100")
+            .expect_err("credentials in a diagnostic URL must be refused");
+
+        assert!(error.to_string().contains("must not contain credentials"));
     }
 }

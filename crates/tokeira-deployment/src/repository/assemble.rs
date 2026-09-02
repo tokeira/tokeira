@@ -18,7 +18,7 @@ use super::{
     error::PublishError,
     publish::PublicationInput,
 };
-use crate::{AuthorityTier, BUNDLE_MANIFEST_BASENAME, ProvisionerBundle};
+use crate::{AuthorityTier, BUNDLE_MANIFEST_BASENAME, DeploymentStateLocation, ProvisionerBundle};
 
 /// The engine-computed identity facts a publisher supplies; everything else
 /// is read from the committed dir.
@@ -42,6 +42,8 @@ struct PublisherMetadata {
     name: String,
     id: Uuid,
     platform: PlatformId,
+    #[serde(default)]
+    state: DeploymentStateLocation,
     definition: Option<RecordedDefinitionSlice>,
 }
 
@@ -91,6 +93,7 @@ pub fn claim_from_dir(
             id: metadata.id,
         },
         platform: metadata.platform,
+        state: metadata.state,
         format: definition.format,
         definition: DefinitionSection {
             root: definition.path,

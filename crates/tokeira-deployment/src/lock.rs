@@ -12,27 +12,18 @@
 // operation-lease spec reworks this module and retires the allow.
 #![allow(clippy::print_stderr)]
 
-use std::{path::Path, process, time::Duration};
+use std::{process, time::Duration};
 
-use crate::{ORCHESTRATED_LOCK_HOLDER_ENV, ORCHESTRATED_LOCK_TOKEN_ENV};
+use crate::{DeploymentStateStores, ORCHESTRATED_LOCK_HOLDER_ENV, ORCHESTRATED_LOCK_TOKEN_ENV};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tokeira_state::{LocalBackend, OperationLock};
+use tokeira_state::OperationLock;
 
 /// Lease duration.
 const LOCK_TTL: Duration = Duration::from_secs(120);
 /// How often to renew while the operation runs — comfortably inside `LOCK_TTL` so
 /// a single missed/slow renew still leaves the lease valid.
 const RENEW_INTERVAL: Duration = Duration::from_secs(40);
-
-fn operation_lock(deployment_dir: &Path) -> OperationLock {
-    // A dedicated lock object, distinct from the envelope and the state docs. For
-    // now a local file; the cloud path uses the S3 backend via the same primitive.
-    OperationLock::new(
-        Box::new(LocalBackend::new(deployment_dir.join("state/lock"))),
-        "operation",
-    )
-}
 
 /// Run `body` while holding the deployment's operation lock. Two modes:
 ///
@@ -44,12 +35,16 @@ fn operation_lock(deployment_dir: &Path) -> OperationLock {
 ///   the orchestrator owns the lease lifecycle, so the lock is held
 ///   continuously across the two-binary relaunch boundary (extends 12.2
 ///   from single-process to two-binary).
-pub async fn with_operation_lock<F, Fut>(deployment_dir: &Path, verb: &str, body: F) -> Result<()>
+pub async fn with_operation_lock<F, Fut>(
+    state: &DeploymentStateStores,
+    verb: &str,
+    body: F,
+) -> Result<()>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let lock = operation_lock(deployment_dir);
+    let lock = state.operation_lock();
     let orchestrated = std::env::var(ORCHESTRATED_LOCK_HOLDER_ENV)
         .ok()
         .zip(std::env::var(ORCHESTRATED_LOCK_TOKEN_ENV).ok());
@@ -165,10 +160,11 @@ mod tests {
     #[tokio::test]
     async fn runs_body_under_the_lock_and_releases() {
         let tmp = tempfile::tempdir().unwrap();
+        let state = DeploymentStateStores::local(tmp.path());
         let ran = Arc::new(AtomicBool::new(false));
         let flag = ran.clone();
 
-        with_operation_lock(tmp.path(), "test", || async move {
+        with_operation_lock(&state, "test", || async move {
             flag.store(true, Ordering::SeqCst);
             Ok(())
         })
@@ -177,7 +173,7 @@ mod tests {
         assert!(ran.load(Ordering::SeqCst), "the body ran");
 
         // The lock was released, so a second operation acquires it.
-        with_operation_lock(tmp.path(), "test2", || async { Ok(()) })
+        with_operation_lock(&state, "test2", || async { Ok(()) })
             .await
             .expect("lock is free after release");
     }
@@ -185,11 +181,12 @@ mod tests {
     #[tokio::test]
     async fn refuses_when_the_lock_is_already_held() {
         let tmp = tempfile::tempdir().unwrap();
+        let state = DeploymentStateStores::local(tmp.path());
         // Another holder keeps the lock (guard not dropped/released).
-        let held = operation_lock(tmp.path());
+        let held = state.operation_lock();
         let _guard = held.acquire("other", LOCK_TTL).await.unwrap();
 
-        let err = with_operation_lock(tmp.path(), "test", || async { Ok(()) })
+        let err = with_operation_lock(&state, "test", || async { Ok(()) })
             .await
             .expect_err("a held lock refuses");
         assert!(
@@ -204,7 +201,8 @@ mod tests {
     #[tokio::test]
     async fn adopted_mode_works_under_the_orchestrators_lease_and_never_releases() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = operation_lock(tmp.path());
+        let state = DeploymentStateStores::local(tmp.path());
+        let lock = state.operation_lock();
         // The orchestrator (tkr) acquires…
         let orchestrator = lock.acquire("tkr-rollback", LOCK_TTL).await.unwrap();
         let token = orchestrator.token.clone();
@@ -242,7 +240,8 @@ mod tests {
     #[tokio::test]
     async fn adoption_with_a_wrong_token_refuses_before_any_work() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = operation_lock(tmp.path());
+        let state = DeploymentStateStores::local(tmp.path());
+        let lock = state.operation_lock();
         let _held = lock.acquire("tkr-rollback", LOCK_TTL).await.unwrap();
 
         let ran = Arc::new(AtomicBool::new(false));
@@ -269,7 +268,8 @@ mod tests {
     #[tokio::test]
     async fn renews_the_lease_so_a_long_operation_keeps_the_lock() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = operation_lock(tmp.path());
+        let state = DeploymentStateStores::local(tmp.path());
+        let lock = state.operation_lock();
         let ttl = Duration::from_millis(1000);
         let renew = Duration::from_millis(200);
 
@@ -283,7 +283,7 @@ mod tests {
         // must still be refused — holder-A kept renewing.
         let probe = async {
             tokio::time::sleep(Duration::from_millis(1400)).await;
-            operation_lock(tmp.path()).acquire("holder-B", ttl).await
+            state.operation_lock().acquire("holder-B", ttl).await
         };
 
         let (run_res, probe_res) = tokio::join!(run, probe);
@@ -294,7 +294,7 @@ mod tests {
         );
 
         // After the operation releases, the lock is free again.
-        with_operation_lock(tmp.path(), "after", || async { Ok(()) })
+        with_operation_lock(&state, "after", || async { Ok(()) })
             .await
             .expect("lock is free once the renewed operation releases");
     }

@@ -170,7 +170,9 @@ pub(crate) async fn check<F: DefinitionFrontend>(
             (
                 Some(admitted.deployment_ref.name.clone()),
                 config_source.path.as_str().to_string(),
-                crate::envelope_store(&admitted.deployment_ref.dir)
+                admitted
+                    .state
+                    .envelope_store()
                     .load()
                     .await
                     .ok()

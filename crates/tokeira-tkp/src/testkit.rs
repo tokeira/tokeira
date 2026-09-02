@@ -197,7 +197,7 @@ pub(crate) fn engine_over(
     let platform =
         BoundPlatform::bind("test", "tkd", declaration(probe)).expect("test declaration binds");
     let admitted = platform
-        .admit_deployment(dir)
+        .admit_local_deployment(dir)
         .expect("the test deployment admits");
     let engine = Engine::new(platform, frontend).expect("format agreement holds");
     (engine, admitted)
@@ -213,7 +213,7 @@ pub(crate) fn engine(dir: &Path) -> (Engine<StubFrontend>, Admitted) {
 /// supplies the same envelope/source precondition to shell unit tests.
 pub(crate) async fn realize_creation(admitted: &Admitted) {
     let deployment_dir = &admitted.deployment_ref.dir;
-    let store = crate::envelope_store(deployment_dir);
+    let store = admitted.state.envelope_store();
     let (existing, version) = store.load().await.expect("load test envelope");
     assert!(existing.binding.is_none(), "test deployment starts unbound");
     crate::config_history::snapshot(deployment_dir, &admitted.config_source(), 0)

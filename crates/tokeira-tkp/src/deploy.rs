@@ -24,7 +24,6 @@ use tokeira_platform::definition::DefinitionFrontend;
 use crate::{
     apply::restamp_applied_revision,
     engine::{Engine, ServiceOperationError},
-    envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform::Admitted,
     render::{ServiceFailureReport, ServiceReport},
@@ -40,7 +39,9 @@ pub(crate) async fn deploy_plan<F: DefinitionFrontend>(
     explanation_path: Option<&Path>,
 ) -> Result<()> {
     refuse_explanation(explanation_path)?;
-    let (envelope, _) = envelope_store(&admitted.deployment_ref.dir)
+    let (envelope, _) = admitted
+        .state
+        .envelope_store()
         .load()
         .await
         .context("failed to load the deployment envelope")?;
@@ -76,7 +77,7 @@ pub(crate) async fn deploy_apply<F: DefinitionFrontend>(
     refuse_explanation(explanation_path)?;
     let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
-    let store = envelope_store(deployment_dir);
+    let store = admitted.state.envelope_store();
     let (mut envelope, version) = store
         .load()
         .await
@@ -172,9 +173,10 @@ pub(crate) async fn deploy_destroy<F: DefinitionFrontend>(
     yes: bool,
     mode: tokeira_report::Mode,
 ) -> Result<()> {
-    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
-    let (envelope, _) = envelope_store(deployment_dir)
+    let (envelope, _) = admitted
+        .state
+        .envelope_store()
         .load()
         .await
         .context("failed to load the deployment envelope")?;
@@ -253,6 +255,7 @@ fn emit_service_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope_store;
     use tokeira_deployment::DeploymentStateEnvelope;
 
     #[tokio::test]

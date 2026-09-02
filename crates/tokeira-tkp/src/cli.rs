@@ -339,7 +339,7 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
     // between the verbs one command drives. The authoring-mode definition
     // check is the one admission-free path — no deployment exists to admit.
     let admitted = match cli.command.admission_dir() {
-        Some(dir) => Some(engine.platform().admit_deployment(dir)?),
+        Some(dir) => Some(engine.platform().admit_deployment(dir).await?),
         None => None,
     };
     let admitted = admitted.as_ref();
@@ -436,7 +436,7 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             let yes = args.yes;
             let module = args.module;
             let explanation = args.explanation;
-            lock::with_operation_lock(&admitted.deployment_ref.dir, "apply", || {
+            lock::with_operation_lock(&admitted.state, "apply", || {
                 apply::apply(
                     &engine,
                     admitted,
@@ -452,7 +452,7 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             let admitted = require(admitted);
             let yes = args.yes;
             let module = args.module;
-            lock::with_operation_lock(&admitted.deployment_ref.dir, "destroy", || {
+            lock::with_operation_lock(&admitted.state, "destroy", || {
                 destroy::destroy(&engine, admitted, module.as_deref(), yes)
             })
             .await
@@ -460,7 +460,7 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
         Command::Deploy(DeployCommand::Destroy(args)) => {
             let admitted = require(admitted);
             let yes = args.yes;
-            lock::with_operation_lock(&admitted.deployment_ref.dir, "deploy-destroy", || {
+            lock::with_operation_lock(&admitted.state, "deploy-destroy", || {
                 deploy::deploy_destroy(&engine, admitted, yes, mode)
             })
             .await
@@ -468,7 +468,7 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
         Command::Destroy(args) => {
             let admitted = require(admitted);
             let yes = args.yes;
-            lock::with_operation_lock(&admitted.deployment_ref.dir, "deployment-destroy", || {
+            lock::with_operation_lock(&admitted.state, "deployment-destroy", || {
                 destroy::destroy_deployment(&engine, admitted, yes, mode)
             })
             .await
@@ -481,7 +481,7 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             let admitted = require(admitted);
             let yes = args.yes;
             let explanation = args.explanation;
-            lock::with_operation_lock(&admitted.deployment_ref.dir, "deploy-apply", || {
+            lock::with_operation_lock(&admitted.state, "deploy-apply", || {
                 deploy::deploy_apply(&engine, admitted, yes, mode, explanation.as_deref())
             })
             .await
@@ -489,7 +489,7 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
         Command::Scale(args) => {
             let admitted = require(admitted);
             let specs = args.specs;
-            lock::with_operation_lock(&admitted.deployment_ref.dir, "scale", || {
+            lock::with_operation_lock(&admitted.state, "scale", || {
                 scale::scale(&engine, admitted, &specs)
             })
             .await
@@ -497,14 +497,14 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
         Command::Revert(args) => {
             let admitted = require(admitted);
             let to = args.to;
-            lock::with_operation_lock(&admitted.deployment_ref.dir, "revert", || {
+            lock::with_operation_lock(&admitted.state, "revert", || {
                 revert::revert(&engine, admitted, to)
             })
             .await
         }
         Command::Upgrade(_) => {
             let admitted = require(admitted);
-            lock::with_operation_lock(&admitted.deployment_ref.dir, "upgrade", || {
+            lock::with_operation_lock(&admitted.state, "upgrade", || {
                 upgrade::upgrade(&engine, admitted, mode)
             })
             .await
@@ -512,7 +512,7 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
         Command::Rollback(args) => {
             let admitted = require(admitted);
             let handoff = args.handoff;
-            lock::with_operation_lock(&admitted.deployment_ref.dir, "rollback", || {
+            lock::with_operation_lock(&admitted.state, "rollback", || {
                 rollback::rollback(&engine, admitted, handoff)
             })
             .await

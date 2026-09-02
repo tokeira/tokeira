@@ -29,6 +29,15 @@ pub struct AwsClients {
 }
 
 impl AwsClients {
+    /// Load the shared SDK configuration and construct the client bundle.
+    pub async fn load(platform_region: Option<&str>) -> Self {
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(region) = platform_region {
+            loader = loader.region(aws_config::Region::new(region.to_owned()));
+        }
+        Self::new(&loader.load().await)
+    }
+
     /// Construct all SDK clients from a shared config.
     pub fn new(sdk_config: &aws_config::SdkConfig) -> Self {
         Self {
@@ -60,6 +69,11 @@ impl AwsClients {
         aws_sdk_dynamodb::Client::new(&self.sdk_config_for(region))
     }
 
+    /// Return an S3 client using the resource-selected region.
+    pub fn s3_for(&self, region: &str) -> aws_sdk_s3::Client {
+        aws_sdk_s3::Client::new(&self.sdk_config_for(region))
+    }
+
     fn sdk_config_for(&self, region: &str) -> aws_config::SdkConfig {
         self.sdk_config
             .to_builder()
@@ -71,12 +85,7 @@ impl AwsClients {
 /// Install the shared AWS client bundle, preserving SDK-chain defaults and
 /// applying the platform region when one was authored.
 pub async fn register_infra_extensions(platform_region: Option<&str>, ctx: &mut ProvisionContext) {
-    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-    if let Some(region) = platform_region {
-        loader = loader.region(aws_config::Region::new(region.to_string()));
-    }
-    let sdk_config = loader.load().await;
-    ctx.set_extension(AwsClients::new(&sdk_config));
+    ctx.set_extension(AwsClients::load(platform_region).await);
 }
 
 #[cfg(test)]
@@ -98,6 +107,10 @@ mod tests {
         assert_eq!(
             clients.dynamodb_for("ap-southeast-2").config().region(),
             Some(&aws_config::Region::new("ap-southeast-2"))
+        );
+        assert_eq!(
+            clients.s3_for("ca-central-1").config().region(),
+            Some(&aws_config::Region::new("ca-central-1"))
         );
     }
 }

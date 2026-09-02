@@ -17,12 +17,16 @@
 //!   tokeirad.toml     # TokeiraConfig consumed by the tokeirad server binary
 //!   metadata.json     # identity + status tracked by the CLI
 //!   tkp               # generated platform/frontend provisioner, when bound
-//!   state/            # infra + deploy engine state (single-doc CAS files)
+//!   state/            # local state, retained config/binaries, repository client data
 //!   tokeirad.pid      # written while `tkr deploy apply` runs against local platform
 //! ```
 //!
 //! The parent directory also carries a `.latest` sentinel (name of the
 //! deployment most recently targeted or selected via `tkr deployment use`).
+//! For an S3-backed definition deployment, `metadata.json` points the
+//! envelope, infra/runtime documents, and operation lease at one remote
+//! prefix; seat-local retained config, binaries, and repository client data
+//! remain under this directory.
 //!
 //! # Naming invariant
 //!
@@ -38,7 +42,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
-use tokeira_deployment::RecordedDefinition;
+use tokeira_deployment::{DeploymentStateLocation, RecordedDefinition};
 use tokeira_ecs_deployment::EcsConfig;
 use tokeira_local_deployment::LocalConfig;
 use tokeira_orchestrator::{PlatformId, RelativeDefinitionPath, StorageKind};
@@ -333,6 +337,7 @@ impl DeploymentResolver {
         platform: PlatformId,
         storage: StorageKind,
         region: Option<String>,
+        state: DeploymentStateLocation,
         definition_seed: Option<DefinitionSeed>,
     ) -> Result<PendingDeployment> {
         let name = normalize_name(name);
@@ -355,6 +360,7 @@ impl DeploymentResolver {
                 name: String::new(),
                 id: Uuid::nil(),
                 platform: platform.clone(),
+                state: state.clone(),
                 definition: None,
                 deployment_repository: None,
                 storage,
@@ -424,6 +430,7 @@ impl DeploymentResolver {
             name: name.clone(),
             id: Uuid::new_v4(),
             platform,
+            state,
             definition: recorded_definition,
             deployment_repository: None,
             storage,
@@ -473,8 +480,15 @@ impl DeploymentResolver {
                 content,
             })
         };
-        self.begin_create(name, platform, storage, region, seed)?
-            .publish()
+        self.begin_create(
+            name,
+            platform,
+            storage,
+            region,
+            DeploymentStateLocation::Local,
+            seed,
+        )?
+        .publish()
     }
 
     pub(crate) fn list(&self) -> Result<Vec<DeploymentMetadata>> {

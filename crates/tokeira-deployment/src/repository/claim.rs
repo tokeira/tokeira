@@ -13,6 +13,8 @@ use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
 use tokeira_platform::definition::ConfigurationIdentity;
 use uuid::Uuid;
 
+use crate::DeploymentStateLocation;
+
 /// Custom-metadata key carrying the claim on the definition root's target.
 pub(crate) const CLAIM_KEY: &str = "tokeira:deployment";
 /// Custom-metadata key marking definition companion targets.
@@ -85,6 +87,11 @@ pub struct DeploymentClaim {
     pub deployment: DeploymentRef,
     /// The deployment's platform id.
     pub platform: PlatformId,
+    /// Durable placement shared by every authoritative state document and
+    /// operation lease. Older claims omit this field and therefore resolve to
+    /// local state; credentials are deliberately never part of the claim.
+    #[serde(default)]
+    pub state: DeploymentStateLocation,
     /// The format selected at create — one format per Deployment, for life.
     pub format: DefinitionFormatId,
     /// The definition half.
@@ -115,6 +122,7 @@ mod tests {
                 id: Uuid::nil(),
             },
             platform: PlatformId::new("compose").unwrap(),
+            state: DeploymentStateLocation::Local,
             format: DefinitionFormatId::new("tkd").unwrap(),
             definition: DefinitionSection {
                 root: "deployment.tkd".to_string(),
@@ -139,6 +147,7 @@ mod tests {
     fn claim_serde_round_trips_with_snake_case_transitions() {
         let value = serde_json::to_value(claim()).unwrap();
         assert_eq!(value["transition"], "create");
+        assert_eq!(value["state"]["backend"], "local");
         assert_eq!(value["definition"]["identity"]["algorithm"], "sha256-v1");
         let back: DeploymentClaim = serde_json::from_value(value).unwrap();
         assert_eq!(back, claim());
@@ -147,6 +156,15 @@ mod tests {
         let mut loose = serde_json::to_value(claim()).unwrap();
         loose["surprise"] = serde_json::json!(1);
         assert!(serde_json::from_value::<DeploymentClaim>(loose).is_err());
+    }
+
+    #[test]
+    fn claims_without_a_state_locator_remain_local() {
+        let mut value = serde_json::to_value(claim()).unwrap();
+        value.as_object_mut().unwrap().remove("state");
+
+        let decoded: DeploymentClaim = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.state, DeploymentStateLocation::Local);
     }
 
     #[test]

@@ -42,19 +42,63 @@ rollback checkpoint, in-flight marker, infra/runtime heads, and the effective co
 reference. The envelope coordinates the deployment lifecycle; it does not replace
 `InfraState` or `RuntimeState`.
 
-On the bound path these documents have separate deployment-local stores:
+On the bound path these documents have separate namespaces under one admitted
+placement:
 
-| Document | Store root | Publication cadence |
+| Document | Local root / remote suffix | Publication cadence |
 |---|---|---|
-| Infrastructure state | `state/infra` | After every infra state transition and confirmed pruning during mutation |
-| Runtime state | `state/deploy` | After every changed or deleted service; once for image-only recording when all services are unchanged |
-| Deployment envelope | `state/envelope` | At lifecycle commit points owned by the shell |
-| Operation lease | `state/lock` | Acquire, renew, adopt, and release around a complete mutating command |
+| Infrastructure state | `state/infra` / `<prefix>/infra` | After every infra state transition and confirmed pruning during mutation |
+| Runtime state | `state/deploy` / `<prefix>/deploy` | After every changed or deleted service; once for image-only recording when all services are unchanged |
+| Deployment envelope | `state/envelope` / `<prefix>/envelope` | At lifecycle commit points owned by the shell |
+| Operation lease | `state/lock` / `<prefix>/lock` | Acquire, renew, adopt, and release around a complete mutating command |
 
-All four currently use framework-selected local persistence on the definition-bound
-path. A `PlatformDeclaration` does not choose these stores. The legacy local adapter
-also uses local stores; the legacy ECS adapter selects `S3StateStore` for infra and
-runtime state when its AWS clients are available.
+`metadata.json` records one `DeploymentStateLocation` for all four; individual verbs
+cannot select their own backend. Local is the backward-compatible default. A
+definition-bound create may instead select a pre-existing S3 bucket, its region, and a
+deployment-exclusive prefix. Command admission prepares one `DeploymentStateStores`
+bundle and threads its envelope, infra, runtime, and lock handles through the entire
+verb. `PlatformDeclaration` remains provider behavior and does not choose state
+placement.
+
+### Remote placement
+
+Remote state is a create-time deployment property:
+
+```bash
+tkr deployment create \
+  --name shared \
+  --platform compose \
+  --state-bucket company-tokeira-state \
+  --state-region eu-west-2 \
+  --state-prefix deployments/shared \
+  --dev-engine
+```
+
+The three state flags are all-or-none. The bucket is primordial and operator-owned:
+Tokeira does not create it, modify its policy/lifecycle, or delete the prefix. The
+ambient AWS identity needs `s3:GetObject` and `s3:PutObject` over the selected prefix;
+state writes request S3-managed encryption and use conditional writes for CAS. The
+bucket region is recorded independently of the platform region and selects the S3
+client used for every state access.
+
+Day 0 creates the remote envelope before the deployment directory becomes visible. An
+already-bound prefix is refused, preventing two deployments from accidentally sharing
+state. The signed Deployment Claim carries the locator (never credentials). A fetched
+seat reconstructs `metadata.json` from that claim, loads the same remote envelope, and
+verifies the claimed deployment name, engine binding/integrity, and configuration
+revision before committing its local directory. A local-state publication continues to
+receive a fresh local envelope because local state is not portable.
+
+If Day 0 commits remotely but the subsequent atomic publication of the local directory
+fails, Tokeira leaves the remote snapshots intact rather than guessing whether they are
+safe to delete. The prefix remains reserved until an operator investigates it and
+retires it under the bucket's retention policy.
+
+Remote manifests, snapshots, and the released operation-lock record are retained after
+`deployment destroy`. This is deliberate recovery/audit retention; an operator-owned
+bucket lifecycle or a later explicit prune workflow decides eventual removal. Bucket
+policy should protect `<prefix>/*/snapshots/*` according to the organization's retention
+requirements because Tokeira does not take policy ownership of an adopted bucket.
 
 ## Inputs to infrastructure convergence
 

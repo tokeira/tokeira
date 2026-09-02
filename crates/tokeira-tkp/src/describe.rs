@@ -22,7 +22,7 @@ use tokeira_deployment::{
 
 use tokeira_platform::definition::DefinitionFrontend;
 
-use crate::{config_history, engine::Engine, envelope_store, platform::Admitted};
+use crate::{config_history, engine::Engine, platform::Admitted};
 
 pub(crate) async fn describe<F: DefinitionFrontend>(
     engine: &Engine<F>,
@@ -32,7 +32,7 @@ pub(crate) async fn describe<F: DefinitionFrontend>(
 ) -> Result<()> {
     let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
-    let (envelope, _version) = envelope_store(deployment_dir).load().await?;
+    let (envelope, _version) = admitted.state.envelope_store().load().await?;
     let source = admitted.config_source();
     let retained = config_history::retained_revisions(deployment_dir, &source);
     let report = DescribeReport::build(
@@ -567,6 +567,7 @@ fn verdict_label(verdict: BindingVerdict) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope_store;
 
     #[tokio::test]
     async fn describe_uninitialized_deployment_is_unknown() {

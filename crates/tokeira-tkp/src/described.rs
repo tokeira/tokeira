@@ -15,13 +15,14 @@ use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use tokeira_deploy_engine as deploy_engine;
+use tokeira_deployment::DeploymentStateStores;
 use tokeira_iac::{self as iac, ResourceId};
 use tokeira_orchestrator as orchestrator;
 use tokeira_platform::{
     declaration::{DeploymentRef, PlatformIntegration},
     graph::WritebackValue,
 };
-use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
+use tokeira_state::DeploymentStore;
 
 use crate::engine::{ExecutionState, ModuleSpec};
 
@@ -32,16 +33,19 @@ use crate::engine::{ExecutionState, ModuleSpec};
 pub(crate) struct DescribedDeployment {
     deployment: DeploymentRef,
     implementation: Arc<dyn PlatformIntegration>,
+    state: DeploymentStateStores,
 }
 
 impl DescribedDeployment {
     pub(crate) fn new(
         deployment: DeploymentRef,
         implementation: Arc<dyn PlatformIntegration>,
+        state: DeploymentStateStores,
     ) -> Self {
         Self {
             deployment,
             implementation,
+            state,
         }
     }
 
@@ -168,20 +172,17 @@ impl orchestrator::Deployment for DescribedDeployment {
     fn create_infra_store(
         &self,
         _config: &Self::Config,
-        deployment_dir: &Path,
+        _deployment_dir: &Path,
     ) -> Box<dyn DeploymentStore<iac::InfraState>> {
-        infra_store(deployment_dir)
+        self.state.infra_store()
     }
 
     fn create_deploy_store(
         &self,
         _config: &Self::Config,
-        deployment_dir: &Path,
+        _deployment_dir: &Path,
     ) -> Box<dyn DeploymentStore<iac::RuntimeState>> {
-        Box::new(CasStore::new(
-            Box::new(LocalBackend::new(deployment_dir.join("state/deploy"))),
-            "deploy".to_string(),
-        ))
+        self.state.deploy_store()
     }
 
     // Identity: config projection is owned by the declared writeback and
@@ -264,15 +265,6 @@ impl deploy_engine::Service for ConcreteService {
     ) -> Result<Vec<serde_json::Value>, deploy_engine::RuntimeError> {
         self.service.manifests(ctx)
     }
-}
-
-/// The framework-standard infra state store: CAS over the deployment's
-/// `state/infra` directory.
-pub(crate) fn infra_store(deployment_dir: &Path) -> Box<dyn DeploymentStore<iac::InfraState>> {
-    Box::new(CasStore::new(
-        Box::new(LocalBackend::new(deployment_dir.join("state/infra"))),
-        "infra".to_string(),
-    ))
 }
 
 /// A graph module realized as an engine module: the spec's identity and
@@ -506,6 +498,7 @@ mod tests {
                 namespace: "compose",
                 log: log.clone(),
             }),
+            DeploymentStateStores::local("/tmp/demo"),
         );
         let config = execution_state();
         let mut ctx = iac::ProvisionContext::default();

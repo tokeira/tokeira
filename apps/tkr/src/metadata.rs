@@ -10,7 +10,7 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokeira_deployment::RecordedDefinition;
+use tokeira_deployment::{DeploymentStateLocation, RecordedDefinition};
 use tokeira_orchestrator::{PlatformId, StorageKind};
 use uuid::Uuid;
 
@@ -48,6 +48,10 @@ pub(crate) struct DeploymentMetadata {
     pub name: String,
     pub id: Uuid,
     pub platform: PlatformId,
+    /// Placement shared by all authoritative provisioner state. Existing
+    /// deployments default to local placement.
+    #[serde(default)]
+    pub state: DeploymentStateLocation,
     /// Format and safe live source path for a bound-provisioner deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<RecordedDefinition>,

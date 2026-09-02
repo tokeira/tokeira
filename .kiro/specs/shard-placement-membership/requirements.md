@@ -95,6 +95,7 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 4. THE gRPC service SHALL include a unary RPC for the autoscaler to request scale-in candidates (`NominateScaleInCandidates`).
 5. THE gRPC service SHALL include a unary RPC for the autoscaler to mark nodes as draining (`MarkNodeDraining`).
 6. THE gRPC service SHALL include a unary RPC for edge bundle refresh (`RefreshBundle`).
+7. THE gRPC service SHALL include a read-only unary RPC for the autoscaler to read a node's drain progress (`DescribeNodeDrain`), separate from `MarkNodeDraining` so that polling for progress never re-marks a node.
 
 ### Requirement 1.3: Controller Availability Model
 
@@ -145,7 +146,7 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 1. THE heartbeat message SHALL include the Runtime_Node's current owned bundle count and list of owned bundle IDs.
 2. THE heartbeat message SHALL include queue pressure metrics: runnable transitions queued per lane, backlog depth.
 3. THE heartbeat message SHALL include per-lane pressure metrics via a repeated `LanePressure` field containing: lane identifier, runnable depth, active actor count, and utilization ratio.
-4. THE heartbeat message SHALL include DSQL connection-budget headroom: available connections, connection creation rate headroom.
+4. THE heartbeat message SHALL include DSQL connection-budget headroom: available connections, reported as the reservoir's warm ready count, and connection creation-rate headroom, reported as zero on the distributed path because the creation rate is enforced by the cluster-shared token bucket and a node cannot measure its own share of it.
 5. THE heartbeat message SHALL include the Runtime_Node's current Drain_State (active, draining, or safe-to-terminate).
 
 ### Requirement 2.3: Stream Drop Handling
@@ -402,7 +403,12 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 1. WHEN the Placement_Controller receives a `MarkNodeDraining` request for a node, THE Placement_Controller SHALL update the node's state to `DRAINING` in its live membership map.
 2. THE Placement_Controller SHALL stop assigning new bundles to a node in `DRAINING` state.
 3. THE Placement_Controller SHALL NOT assign separate queue-home preferences in this MVP; queue-home drain behavior follows bundle reassignment because queue-home is derived from bundle ownership.
-4. THE Placement_Controller SHALL notify the Runtime_Node of its drain state via the Membership_Stream.
+4. WHEN a `MarkNodeDraining` request is accepted, THE Placement_Controller SHALL send a `DrainDirective` on the node's Membership_Stream, releasing its membership lock before awaiting stream capacity so a slow runtime cannot stall heartbeat processing for the rest of the controller.
+5. WHEN a `MarkNodeDraining` request names a node the Placement_Controller has no membership record of, THE Placement_Controller SHALL reject it with `accepted = false` and send nothing.
+6. WHEN a `MarkNodeDraining` request repeats for a node already draining, THE Placement_Controller SHALL accept it and SHALL NOT demote a recorded `SAFE_TO_TERMINATE` to `DRAINING`.
+7. WHEN a node under drain reopens its Membership_Stream, THE Placement_Controller SHALL keep it in `DRAINING`, exclude it from placement and budget allocation, and send the `DrainDirective` again in place of the placement and budget baseline (drain is level-triggered).
+8. WHILE a node is under controller-initiated drain, THE Placement_Controller SHALL treat an `ACTIVE` heartbeat as the directive not yet applied and SHALL keep the node's recorded drain state `DRAINING`; `DRAINING` and `SAFE_TO_TERMINATE` heartbeats SHALL be recorded as reported.
+9. WHEN the Placement_Controller receives a `DescribeNodeDrain` request, THE Placement_Controller SHALL return `known = false` for a node it has no record of, `ACTIVE` for a registered node that is not draining, and otherwise the drain state last recorded for the node, without changing any state.
 
 ### Requirement 8.2: Two-Phase Drain Protocol
 
@@ -414,11 +420,12 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 2. THE Placement_Controller SHALL publish a routing snapshot that stops sending new queue work to the draining node.
 3. THE draining Runtime_Node SHALL stop acquiring new bundles.
 4. THE draining Runtime_Node SHALL stop accepting new externally-routed work except for owned in-flight execution work.
-5. THE draining Runtime_Node SHALL complete or reject in-flight transitions.
+5. THE draining Runtime_Node SHALL NOT wait for in-flight transitions before relinquishing; a transition still in flight for a relinquished bundle SHALL be rejected at commit by the epoch fence rather than committed under the relinquished epoch, and the successor's recovery sweep rebuilds any state not committed.
 6. THE draining Runtime_Node SHALL relinquish bundle leases using epoch-checked CAS.
 7. THE Placement_Controller SHALL observe actual DSQL ownership moved/expired before advertising new owners in the routing snapshot.
-8. THE Runtime_Node SHALL report `SAFE_TO_TERMINATE` only when: `owned_bundle_count == 0`, `inflight_transition_count == 0`, and `pending_wft_replies == 0`.
+8. THE Runtime_Node SHALL report `SAFE_TO_TERMINATE` only when: `owned_bundle_count == 0`, `inflight_transition_count == 0` (commands queued on its lanes), and `pending_wft_replies == 0` (started workflow tasks awaiting a worker's reply).
 9. Routing MUST move before ownership is relinquished, but routing MUST NOT advertise the new owner until DSQL confirms the new lease.
+10. THE draining Runtime_Node SHALL re-evaluate the `SAFE_TO_TERMINATE` conditions on every heartbeat, so that work finishing after relinquishment is reported on the next heartbeat rather than never.
 
 ### Requirement 8.3: Scale-In Candidate Nomination
 
@@ -456,11 +463,12 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 
 #### Acceptance Criteria
 
-1. WHEN a Runtime_Node receives a `ConnectionBudgetDirective`, THE Runtime_Node SHALL call `TokenBucketRateLimiter::reconfigure(rate_per_second, capacity)` on its local rate limiter.
-2. WHEN a Runtime_Node receives a `ConnectionBudgetDirective`, THE Runtime_Node SHALL cap its reservoir `target_ready` to `min(configured_target_ready, max_reservoir_size)` via a `reconfigure_target(new_target: u32)` method on the reservoir.
-3. IF the current reservoir size exceeds the new cap, THE Runtime_Node SHALL proactively retire excess connections via a `retire_excess(target: u32)` method on the reservoir.
-4. WHEN the Membership_Stream is disconnected, THE Runtime_Node SHALL retain its last-known connection budget share until the `valid_until` expiry, then degrade to conservative defaults.
-5. WHEN a Runtime_Node starts without a controller connection, THE Runtime_Node SHALL use a conservative default share (e.g., `cluster_rate / expected_max_nodes`) until the controller assigns a share.
+1. WHEN a Runtime_Node receives a `ConnectionBudgetDirective`, THE Runtime_Node SHALL NOT apply `rate_per_second` or `capacity` to a per-node limiter: on the distributed path the connection creation rate is enforced cluster-wide by the DynamoDB token bucket every node's refiller draws from, and a per-node share written to that shared row would replace the cluster rate with a fraction of it. The two fields are carried for a process-local governor in front of the shared bucket, which does not exist.
+2. WHEN a Runtime_Node receives a `ConnectionBudgetDirective`, THE Runtime_Node SHALL cap its reservoir `target_ready` to `min(configured_target_ready, max_reservoir_size)`, floored at one, through the connection director's `apply_connection_budget(max_reservoir_size)`, which calls `reconfigure_target(new_target: u32)` on the reservoir. A directive never raises the target above the operator's configuration.
+3. IF the ready reservoir exceeds the new cap, THE Runtime_Node SHALL proactively retire idle excess connections via `retire_excess(target: u32)` on the reservoir; connections checked out by in-flight work are not interrupted and the refiller simply declines to replace them.
+4. WHEN the Membership_Stream drops, THE Runtime_Node SHALL retain its last-known connection budget share until the `valid_until` expiry; WHEN a drop or a failed reconnect finds the last share expired, THE Runtime_Node SHALL cap the reservoir to one warm connection, the floor that keeps lease renewal and relinquishment possible, until the next directive.
+5. WHEN a Runtime_Node starts without a controller connection, THE Runtime_Node SHALL run its reservoir at the operator-configured `target_ready` until a directive arrives.
+6. WHERE the Runtime_Node runs on the in-memory store, THE Runtime_Node SHALL accept and discard connection budget directives: there is no reservoir to budget.
 
 ### Requirement 9.3: Connection Budget Configuration
 
@@ -493,7 +501,7 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 1. THE `apps/tokeira-controller/` binary SHALL load a `ControllerConfig` from a TOML file (default path: `controller.toml`, overridable via `--config`).
 2. THE binary SHALL validate the config at startup and fail with a clear error message if `dsql_endpoint` is empty (the controller requires DSQL — there is no in-memory fallback for multi-node coordination).
 3. THE binary SHALL construct a DSQL connection from the config to obtain `LeaseRepository` and `ControlRepository` implementations.
-4. THE binary SHALL start a gRPC server on `grpc_listen_addr` serving the `PlacementController` service (bidirectional streaming for runtime membership, server-streaming for routing subscriptions, unary RPCs for refresh/nominate/drain).
+4. THE binary SHALL start a gRPC server on `grpc_listen_addr` serving the `PlacementController` service (bidirectional streaming for runtime membership, server-streaming for routing subscriptions, unary RPCs for refresh, nominate, mark-draining, and describe-drain).
 5. THE binary SHALL run the placement loop on `placement_interval`: scan DSQL lease state → compute routing snapshot → advance generation via CAS → publish to subscribed edges and runtimes.
 6. THE binary SHALL run the budget allocation loop on `budget_interval`: aggregate heartbeat data from live membership → compute per-node connection budgets → send `ConnectionBudgetDirective` over membership streams.
 7. THE binary SHALL shut down gracefully on SIGTERM or ctrl-c: stop accepting new streams, drain active streams, allow in-flight RPCs to complete.

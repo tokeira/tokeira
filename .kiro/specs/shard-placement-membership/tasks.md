@@ -192,8 +192,9 @@ Key changes from the previous plan:
   - Run `cargo test --workspace` and verify all new and existing tests pass.
 
 - [x] 5. Phase 3 — Controller gRPC Service and Active-Active Placement Logic
-  - [x] 5.1 Define controller proto in `proto/tokeira/internal/controller/controller.proto`
-    - Define `PlacementController` service with 5 RPCs: `RuntimeMembership`, `SubscribeRouting`, `RefreshBundle`, `NominateScaleInCandidates`, `MarkNodeDraining`
+  - [x] 5.1 Define controller proto in `proto/tokeira/internal/controller/v1/controller.proto`
+    - Define `PlacementController` service with six RPCs: `RuntimeMembership`, `SubscribeRouting`, `RefreshBundle`, `NominateScaleInCandidates`, `MarkNodeDraining`, `DescribeNodeDrain`
+    - Define `DescribeNodeDrainRequest` (node_id) and `DescribeNodeDrainResponse` (known, `NodeDrainState`); regenerate the checked-in bindings with `cargo run -p proto-sync -- generate`
     - Define `RuntimeMembershipRequest` with `oneof request { RuntimeRegistration, RuntimeHeartbeat }` — not empty-string sentinels
     - Define `RuntimeRegistration` with node_id, host, port, zone, version, build_id
     - Define `RuntimeHeartbeat` with pressure metrics, repeated `LanePressure` field (lane_id, runnable_depth, active_actors, utilization), and drain state
@@ -252,17 +253,20 @@ Key changes from the previous plan:
     - `SubscribeRouting`: send full snapshot on connect, then stream deltas with base_generation
     - `RefreshBundle`: look up current bundle owner from DSQL, return BundleOwnershipEntry with epoch and NodeEndpointEntry
     - `NominateScaleInCandidates`: query membership, rank by bundle count and pressure
-    - `MarkNodeDraining`: update membership state, send drain directive to runtime
+    - `MarkNodeDraining`: update membership state and the drain coordinator, send the drain directive on the node's stream; reject unknown nodes; a repeat mark never demotes `SAFE_TO_TERMINATE`
+    - `DescribeNodeDrain`: read-only drain progress (`known`, last recorded state; `ACTIVE` for a registered node not draining)
     - All controller instances serve active responses (no leader check)
-    - _Requirements: 1.1.1, 1.1.2, 1.2.2, 1.2.3, 1.2.4, 1.2.5, 1.2.6, 4.2.1, 4.2.2, 4.2.3, 8.1.1, 8.1.4, 8.3.1, 8.3.2, 8.3.3, 8.3.4, 8.3.5_
+    - DONE 2026-09-02 (PR #173): the served handlers deliver the drain and serve the read; proof `served_drain_reaches_the_stream_and_describe_follows_the_heartbeat` in `connect_service.rs`
+    - _Requirements: 1.1.1, 1.1.2, 1.2.2, 1.2.3, 1.2.4, 1.2.5, 1.2.6, 1.2.7, 4.2.1, 4.2.2, 4.2.3, 8.1.1, 8.1.4, 8.1.5, 8.1.6, 8.1.9, 8.3.1, 8.3.2, 8.3.3, 8.3.4, 8.3.5_
 
   - [x] 5.7 Implement two-phase drain coordination in `drain.rs`
-    - Implement `DrainCoordinator` that tracks draining nodes
-    - On `MarkNodeDraining`: update membership, send `DrainDirective` via stream
+    - Implement `DrainCoordinator` that records controller intent and the last reported drain state per node; an `ACTIVE` heartbeat from a marked node keeps the intent, a re-mark never demotes `SAFE_TO_TERMINATE`
+    - On `MarkNodeDraining`: update membership, send `DrainDirective` via stream; re-send it, not the placement/budget baseline, when a draining node reopens its stream
     - Publish routing snapshot that stops sending new queue work to draining node (phase 1: routing moves)
     - Track drain progress via heartbeat `drain_state` field
     - Observe actual DSQL ownership moved/expired before advertising new owners (phase 2: ownership confirmed)
-    - _Requirements: 8.1.1, 8.1.2, 8.1.3, 8.1.4, 8.2.1, 8.2.2, 8.2.7, 8.2.9_
+    - DONE 2026-09-02 (PR #173): intent, re-send, and progress recording; proofs in `drain.rs` and `connect_service.rs` (`reopened_stream_of_a_draining_node_receives_the_drain_again`). Routing follows the lease rows; the delta-streaming half of the snapshot bullet is the open Requirement 4.2 work.
+    - _Requirements: 8.1.1, 8.1.2, 8.1.3, 8.1.4, 8.1.7, 8.1.8, 8.2.1, 8.2.2, 8.2.7, 8.2.9_
 
   - [x] 5.8 Implement controller configuration in `config.rs`
     - Define `ControllerConfig` with fields: `controller_addr`, `heartbeat_interval`, `grace_interval`, `snapshot_publish_interval`, `bundle_count`, `partition_count`, `shard_count`, `hash_version`, `budget_directive_validity`, `dsql_connection_rate_budget`, `dsql_connection_capacity_budget`
@@ -308,36 +312,38 @@ Key changes from the previous plan:
     - Send periodic `RuntimeHeartbeat` messages at configurable interval (default 5s)
     - Receive and process `ControllerDirective` messages:
       - `DesiredPlacementDirective`: attempt to acquire/relinquish bundles in DSQL
-      - `ConnectionBudgetDirective`: call `TokenBucketRateLimiter::reconfigure(rate_per_second, capacity)`, call `Reservoir::reconfigure_target(max_reservoir_size)` to cap reservoir size, call `Reservoir::retire_excess(max_reservoir_size)` if current size exceeds cap, track `valid_until`
+      - `ConnectionBudgetDirective`: track `valid_until`, then hand the directive to the `ConnectionBudgetApplier`; the engine's DSQL applier caps the reservoir through `DsqlConnectionDirector::apply_connection_budget(max_reservoir_size)` (`Reservoir::reconfigure_target` then `retire_excess`, floor one); `rate_per_second` and `capacity` are not applied (Requirement 9.2.1)
       - `DrainDirective`: begin two-phase drain
       - `RoutingUpdate`: update local routing state
-    - On stream drop: reconnect with exponential backoff (1s base, 30s max); retain last-known connection budget until `valid_until` expiry, then degrade to conservative default
-    - _Requirements: 2.1.1, 2.1.2, 2.1.3, 2.1.4, 2.1.5, 2.2.1, 2.2.2, 2.2.3, 2.2.4, 2.2.5, 9.2.1, 9.2.2, 9.2.3, 9.2.4, 9.2.5_
+    - On stream drop: reconnect with exponential backoff (1s base, 30s max); retain last-known connection budget until `valid_until` expiry; a drop or failed reconnect past expiry caps the reservoir to one warm connection
+    - DONE 2026-09-02 (PR #173): `DsqlConnectionBudgetApplier` in `tokeira-engine` wired at `build_dsql_stack`; storage proofs `connection_budget_caps_distributed_reservoir_target` and `connection_budget_never_raises_target_above_configuration`
+    - _Requirements: 2.1.1, 2.1.2, 2.1.3, 2.1.4, 2.1.5, 2.2.1, 2.2.2, 2.2.3, 2.2.4, 2.2.5, 9.2.1, 9.2.2, 9.2.3, 9.2.4, 9.2.5, 9.2.6_
 
   - [x] 7.2 Implement heartbeat data collection
     - Collect owned bundle count and IDs from `ShardOwner`
     - Collect queue pressure from lane handles (runnable transitions, backlog depth)
     - Collect per-lane pressure via repeated `LanePressure` field: lane id, runnable depth, active actors, utilization
-    - Collect DSQL connection headroom from `ConnectionDirector` (if available)
-    - Collect drain state from runtime drain flag
-    - _Requirements: 2.2.1, 2.2.2, 2.2.3, 2.2.4, 2.2.5_
+    - Collect DSQL connection headroom through `ConnectionBudgetApplier::available_connections` (the reservoir's warm ready count); report creation-rate headroom as zero on the distributed path
+    - Collect drain state from runtime drain flag, re-evaluating drain progress on every heartbeat
+    - DONE 2026-09-02 (PR #173): heartbeats use the runtime's rich path (`MembershipShardLifecycle::heartbeat_inputs`); proof `heartbeat_reports_the_reservoir_headroom_the_budget_applier_sees`
+    - _Requirements: 2.2.1, 2.2.2, 2.2.3, 2.2.4, 2.2.5, 8.2.10_
 
   - [x] 7.3 Implement two-phase runtime drain protocol
     - Create `crates/tokeira-runtime/src/drain.rs`
     - On receiving `DrainDirective`:
       1. Stop acquiring new bundles
       2. Stop accepting new externally-routed work except for owned in-flight execution work
-      3. Complete or reject in-flight transitions
-      4. Relinquish bundle leases using epoch-checked CAS via `LeaseRepository::relinquish_bundle`
-      5. After each relinquish: mark shard as `Draining` in `ShardOwner`, wait for in-flight work to complete
-    - Report `SAFE_TO_TERMINATE` only when: `owned_bundle_count == 0`, `inflight_transition_count == 0`, `pending_wft_replies == 0`
+      3. Relinquish bundle leases using epoch-checked CAS via `LeaseRepository::relinquish_bundle`, through the runtime's `relinquish_shard` (mark the shard `Draining` in `ShardOwner`, purge its tracking, remove it), without waiting for in-flight transitions
+      4. A transition still in flight for a relinquished bundle is rejected at commit by the epoch fence; the successor's sweep rebuilds it
+    - Report `SAFE_TO_TERMINATE` only when: `owned_bundle_count == 0`, `inflight_transition_count == 0` (queued lane commands), `pending_wft_replies == 0` (`WftTimeoutTrackingState::tracked_count`); re-evaluate on every heartbeat
     - Continue processing in-flight work for bundles still owned during drain
-    - _Requirements: 8.2.1, 8.2.2, 8.2.3, 8.2.4, 8.2.5, 8.2.6, 8.2.8, 8.2.9_
+    - DONE 2026-09-02 (PR #173): proofs `drain_directive_relinquishes_shards_and_next_heartbeat_reports_safe` (runtime) and `drain_stays_draining_until_in_flight_work_clears` (membership)
+    - _Requirements: 8.2.1, 8.2.2, 8.2.3, 8.2.4, 8.2.5, 8.2.6, 8.2.8, 8.2.9, 8.2.10_
 
   - [x] 7.4 Wire membership client into runtime startup
     - Add `MembershipConfig` to runtime configuration (controller endpoint, heartbeat interval, backoff settings)
     - Spawn membership client as a background Tokio task during runtime initialization
-    - Pass `ShardOwner`, drain signal, `TokenBucketRateLimiter`, and `Arc<Reservoir>` to the membership client
+    - Pass the runtime as `MembershipShardLifecycle`, its `ShardOwner` and `RuntimeDrain`, and the stack's `ConnectionBudgetApplier` (the DSQL applier over the shared director; a no-op for the in-memory store) to the membership client
     - Gracefully shut down membership stream on runtime shutdown
     - _Requirements: 2.1.1, 2.1.2_
 
@@ -353,12 +359,13 @@ Key changes from the previous plan:
     - Test registration message includes all required fields (node_id, host, port, zone, version, build_id)
     - Test heartbeat construction includes all required fields
     - Test DesiredPlacementDirective handling: acquire and relinquish bundles
-    - Test ConnectionBudgetDirective: reconfigure rate limiter, call `Reservoir::reconfigure_target` to cap reservoir, call `Reservoir::retire_excess` if oversized, track valid_until, degrade on expiry
-    - Test two-phase drain protocol: stops new acquisition, stops accepting new external work, completes in-flight, relinquishes with epoch-checked CAS, reports SAFE_TO_TERMINATE with all three conditions
+    - Test ConnectionBudgetDirective: the applier receives the directive, the reservoir target is capped and never raised above configuration, valid_until is tracked, a share of one caps the reservoir at the floor
+    - Test two-phase drain protocol: stops new acquisition, stops accepting new external work, relinquishes with epoch-checked CAS, refuses work routed after relinquish, reports SAFE_TO_TERMINATE only when all three conditions hold and re-evaluates them per heartbeat
     - Test reconnection backoff: verify exponential backoff timing
     - Test drain does not interrupt in-flight work
     - Test runtime lease callers pass `incarnation_id.to_string()` as owner and `host:port` as node_endpoint
     - Test lease renewal passes updated node_endpoint on every renewal
+    - DONE 2026-09-02 (PR #173) for the budget and drain cases: `connection_budget_and_drain_directives_update_runtime_state`, `drain_stays_draining_until_in_flight_work_clears`, `heartbeat_reports_the_reservoir_headroom_the_budget_applier_sees` (membership), `drain_directive_relinquishes_shards_and_next_heartbeat_reports_safe` (runtime), and the storage cap proofs
     - _Requirements: 2.1, 2.2, 7.1.8, 3.2a, 8.2, 9.2_
 
 - [x] 8. Checkpoint — Ensure all Phase 4 tests pass

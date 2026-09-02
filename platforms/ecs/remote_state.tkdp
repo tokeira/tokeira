@@ -1,15 +1,22 @@
-# The remote-state bootstrap. Its bucket and key prefix derive from stable
-# deployment coordinates so every operator invocation finds the same state.
+# The state bootstrap is deliberately a resource-free ordering anchor.
+#
+# The shared deployment shell admits exactly one DeploymentStateLocation
+# from authenticated deployment metadata before this definition is
+# evaluated. It validates the local/S3 locator and prepares the envelope,
+# infrastructure, runtime, and operation-lock stores from that one value, so
+# reproducing the locator in ECS configuration would create a second source
+# of truth that could drift from the stores already in use.
+#
+# For S3, the bucket is a primordial, operator-owned prerequisite. Ambient
+# AWS credentials must supply prefix-scoped object access; the recorded
+# locator carries no credentials. Tokeira's state layer supplies encryption
+# and conditional-write/CAS semantics. ECS must not
+# create the bucket or take ownership of its public-access, versioning,
+# policy, lifecycle, or deletion controls. For local state, the shared layer
+# keeps every document under the deployment directory. This empty module
+# remains the graph's unique dependency-free root so all provider work is
+# still ordered after state admission.
 
-from tokeira import RemoteStateBucket
 
-
-def define(d, cfg, cx, remote_state):
-    remote_state.resource(
-        "bucket",
-        RemoteStateBucket(
-            region=cfg.aws.region,
-            bucket=cx.project_name + "-state-" + cfg.aws.region,
-            key_prefix=cx.project_name + "/" + cfg.environment,
-        ),
-    )
+def define(_d, _cfg, _cx, _remote_state):
+    pass

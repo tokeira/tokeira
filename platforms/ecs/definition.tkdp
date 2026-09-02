@@ -187,7 +187,9 @@ def config() -> Ecs:
 def deployment(cfg: Ecs, cx: Context) -> Deployment:
     d = Deployment(["default"])
 
-    # Remote state is the unique dependency-free bootstrap module.
+    # State admission is the ordering root everything else stands on. The
+    # shell already opened the selected local/S3 stores; the module must not
+    # re-author that deployment-level location as ECS desired state.
     remote_state_module = d.module("remote_state")
     remote_state.define(d, cfg, cx, remote_state_module)
 

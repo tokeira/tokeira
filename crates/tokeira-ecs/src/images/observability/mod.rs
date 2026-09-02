@@ -1,17 +1,15 @@
 //! Mirrored third-party observability image declarations.
 //!
 //! Each declaration keeps the upstream image as input while deriving a
-//! deployment-owned ECR repository and an explicit configuration writeback
-//! target.
+//! deployment-owned ECR repository. The generic image contract still exposes
+//! its explicit configuration ownership metadata, but definition-bound image
+//! commands consume only the desired reference and perform no writeback.
 
 use tokeira_deploy_engine::{
     DesiredImageRef, Image, ImageContext, ImageSourceType, RuntimeError, WritebackTarget,
 };
 
-use crate::{
-    config::EcsConfig,
-    images::{image_tag, missing_config_error},
-};
+use crate::images::{EcsImageConfig, image_tag, missing_config_error};
 
 macro_rules! mirror_image {
     ($struct_name:ident, $name:literal, $repo_suffix:literal, $field:ident, $target:literal) => {
@@ -29,9 +27,9 @@ macro_rules! mirror_image {
 
             fn desired_ref(&self, ctx: &ImageContext) -> Result<DesiredImageRef, RuntimeError> {
                 let cfg = ctx
-                    .extension::<EcsConfig>()
-                    .ok_or_else(missing_config_error::<EcsConfig>)?;
-                let upstream = cfg.observability.$field.clone();
+                    .extension::<EcsImageConfig>()
+                    .ok_or_else(missing_config_error::<EcsImageConfig>)?;
+                let upstream = cfg.$field.clone();
                 if upstream.is_empty() {
                     return Err(RuntimeError::Image(format!(
                         "image '{}' has empty upstream_ref in config",
@@ -109,40 +107,31 @@ pub(crate) fn all() -> Vec<Box<dyn Image>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ObservabilityConfig;
-
     #[test]
     fn mirror_stability_matches_default_config() {
         let mut ctx = ImageContext::default();
-        let config = EcsConfig::default();
+        let legacy = crate::config::EcsConfig::default();
+        let config = EcsImageConfig {
+            project_name: legacy.project_name,
+            mimir_image: legacy.observability.mimir_image,
+            loki_image: legacy.observability.loki_image,
+            grafana_image: legacy.observability.grafana_image,
+            alloy_image: legacy.observability.alloy_image,
+            aws_cli_image: legacy.observability.aws_cli_image,
+            busybox_image: legacy.observability.busybox_image,
+        };
         ctx.set_extension(config.clone());
 
-        assert_upstream(MimirImage, &ctx, &config.observability, |obs| {
-            &obs.mimir_image
-        });
-        assert_upstream(LokiImage, &ctx, &config.observability, |obs| {
-            &obs.loki_image
-        });
-        assert_upstream(GrafanaImage, &ctx, &config.observability, |obs| {
-            &obs.grafana_image
-        });
-        assert_upstream(AlloyImage, &ctx, &config.observability, |obs| {
-            &obs.alloy_image
-        });
-        assert_upstream(AwsCliImage, &ctx, &config.observability, |obs| {
-            &obs.aws_cli_image
-        });
-        assert_upstream(BusyBoxImage, &ctx, &config.observability, |obs| {
-            &obs.busybox_image
-        });
+        assert_upstream(MimirImage, &ctx, &config.mimir_image);
+        assert_upstream(LokiImage, &ctx, &config.loki_image);
+        assert_upstream(GrafanaImage, &ctx, &config.grafana_image);
+        assert_upstream(AlloyImage, &ctx, &config.alloy_image);
+        assert_upstream(AwsCliImage, &ctx, &config.aws_cli_image);
+        assert_upstream(BusyBoxImage, &ctx, &config.busybox_image);
     }
 
-    fn assert_upstream<I>(
-        image: I,
-        ctx: &ImageContext,
-        observability: &ObservabilityConfig,
-        expected: fn(&ObservabilityConfig) -> &String,
-    ) where
+    fn assert_upstream<I>(image: I, ctx: &ImageContext, expected: &str)
+    where
         I: Image,
     {
         assert_eq!(
@@ -151,7 +140,7 @@ mod tests {
                 .expect("desired ref")
                 .upstream_ref
                 .expect("upstream ref"),
-            *expected(observability)
+            expected
         );
     }
 }

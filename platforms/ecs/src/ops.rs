@@ -22,7 +22,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokeira_deployment::DeploymentBindingMetadata;
 use tokeira_platform::{
-    author::from_located_value,
+    author::{LocatedValue, from_located_value},
     declaration::DeploymentRef,
     definition::{
         DefinitionSource, DefinitionSourceName, DirectoryPartSources, evaluate_definition,
@@ -88,76 +88,8 @@ impl EcsOperationCoordinates {
     /// admitted, so malformed resources are refused before any AWS client is
     /// selected.
     pub fn read(deployment: &DeploymentRef) -> Result<Self> {
-        let metadata_path = deployment.dir.join(METADATA_JSON);
-        let metadata: DeploymentBindingMetadata = serde_json::from_slice(
-            &fs::read(&metadata_path)
-                .with_context(|| format!("failed to read {}", metadata_path.display()))?,
-        )
-        .with_context(|| format!("failed to decode {}", metadata_path.display()))?;
-        if metadata.name != deployment.name {
-            bail!(
-                "deployment directory records name `{}` but the admitted deployment is `{}`",
-                metadata.name,
-                deployment.name
-            );
-        }
-        if metadata.platform.as_str() != "ecs" {
-            bail!(
-                "deployment `{}` records platform `{}`, not `ecs`",
-                deployment.name,
-                metadata.platform
-            );
-        }
-        let definition = metadata.definition.ok_or_else(|| {
-            anyhow::anyhow!(
-                "deployment `{}` records no definition revision",
-                deployment.name
-            )
-        })?;
-        let definition_path = deployment.dir.join(definition.path.as_path());
-        let source = DefinitionSource {
-            format: definition.format.clone(),
-            source_name: DefinitionSourceName::DeploymentRelative(definition.path),
-            bytes: Arc::from(fs::read(&definition_path).with_context(|| {
-                format!("failed to read definition {}", definition_path.display())
-            })?),
-        };
-        let parts_dir = definition_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(deployment.dir.as_path());
-        let parts = DirectoryPartSources::new(parts_dir, definition.format.as_str());
-        let context = EvaluationContext {
-            project_name: deployment.name.clone(),
-        };
-        let namespaces = crate::namespaces();
-        let evaluated = match definition.format.as_str() {
-            "tkd" => evaluate_definition(
-                &tokeira_platform_definition::tkd::frontend(),
-                source,
-                &context,
-                &namespaces,
-                &parts,
-            ),
-            "tkdp" => evaluate_definition(
-                &tokeira_platform_definition::tkdp::frontend(),
-                source,
-                &context,
-                &namespaces,
-                &parts,
-            ),
-            format => bail!(
-                "deployment `{}` records unsupported ECS definition format `{format}`",
-                deployment.name
-            ),
-        }
-        .with_context(|| {
-            format!(
-                "failed to evaluate admitted ECS definition {}",
-                definition_path.display()
-            )
-        })?;
-        let config: OpsConfiguration = from_located_value(evaluated.config)
+        let configuration = evaluated_configuration(deployment)?;
+        let config: OpsConfiguration = from_located_value(configuration)
             .context("admitted ECS definition has no usable operations configuration")?;
 
         Ok(Self {
@@ -201,6 +133,86 @@ impl EcsOperationCoordinates {
     }
 }
 
+/// Evaluate the admitted ECS definition once and return its authored
+/// configuration value.
+///
+/// Operational capabilities share this entry point so frontend selection,
+/// companion resolution, metadata admission, and full kind validation cannot
+/// drift between logs/exec coordinates and image publication.
+pub(crate) fn evaluated_configuration(deployment: &DeploymentRef) -> Result<LocatedValue> {
+    let metadata_path = deployment.dir.join(METADATA_JSON);
+    let metadata: DeploymentBindingMetadata = serde_json::from_slice(
+        &fs::read(&metadata_path)
+            .with_context(|| format!("failed to read {}", metadata_path.display()))?,
+    )
+    .with_context(|| format!("failed to decode {}", metadata_path.display()))?;
+    if metadata.name != deployment.name {
+        bail!(
+            "deployment directory records name `{}` but the admitted deployment is `{}`",
+            metadata.name,
+            deployment.name
+        );
+    }
+    if metadata.platform.as_str() != "ecs" {
+        bail!(
+            "deployment `{}` records platform `{}`, not `ecs`",
+            deployment.name,
+            metadata.platform
+        );
+    }
+    let definition = metadata.definition.ok_or_else(|| {
+        anyhow::anyhow!(
+            "deployment `{}` records no definition revision",
+            deployment.name
+        )
+    })?;
+    let definition_path = deployment.dir.join(definition.path.as_path());
+    let source =
+        DefinitionSource {
+            format: definition.format.clone(),
+            source_name: DefinitionSourceName::DeploymentRelative(definition.path),
+            bytes: Arc::from(fs::read(&definition_path).with_context(|| {
+                format!("failed to read definition {}", definition_path.display())
+            })?),
+        };
+    let parts_dir = definition_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(deployment.dir.as_path());
+    let parts = DirectoryPartSources::new(parts_dir, definition.format.as_str());
+    let context = EvaluationContext {
+        project_name: deployment.name.clone(),
+    };
+    let namespaces = crate::namespaces();
+    let evaluated = match definition.format.as_str() {
+        "tkd" => evaluate_definition(
+            &tokeira_platform_definition::tkd::frontend(),
+            source,
+            &context,
+            &namespaces,
+            &parts,
+        ),
+        "tkdp" => evaluate_definition(
+            &tokeira_platform_definition::tkdp::frontend(),
+            source,
+            &context,
+            &namespaces,
+            &parts,
+        ),
+        format => bail!(
+            "deployment `{}` records unsupported ECS definition format `{format}`",
+            deployment.name
+        ),
+    }
+    .with_context(|| {
+        format!(
+            "failed to evaluate admitted ECS definition {}",
+            definition_path.display()
+        )
+    })?;
+    Ok(evaluated.config)
+}
+
 fn required(value: String, path: &str) -> Result<String> {
     if value.trim().is_empty() {
         bail!("admitted ECS definition has an empty `{path}`");
@@ -209,7 +221,7 @@ fn required(value: String, path: &str) -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::Path;
 
     use super::*;
@@ -219,7 +231,7 @@ mod tests {
         *source = source.replacen(authored, replacement, 1);
     }
 
-    fn stage_definition(temp: &Path, format: &str) -> DeploymentRef {
+    pub(crate) fn stage_definition(temp: &Path, format: &str) -> DeploymentRef {
         let source_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let root_name = if format == "tkd" {
             "deployment.tkd"

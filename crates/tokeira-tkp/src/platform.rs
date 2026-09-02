@@ -22,8 +22,8 @@ use tokeira_deployment::{
 use tokeira_orchestrator::{DefinitionFormatId, PlatformId, RelativeDefinitionPath};
 use tokeira_platform::{
     declaration::{
-        DeploymentRef, ObservabilityCheck, Ops, PlatformDeclaration, PlatformExecution,
-        PlatformIntegration,
+        DeploymentRef, ImageOperations, ObservabilityCheck, Ops, PlatformDeclaration,
+        PlatformExecution, PlatformIntegration,
     },
     definition::Namespace,
 };
@@ -300,6 +300,11 @@ impl BoundPlatform {
     /// The platform's own observability checks, when declared.
     pub(crate) fn observability(&self) -> Option<&dyn ObservabilityCheck> {
         self.declaration.observability.as_deref()
+    }
+
+    /// The platform-owned image lifecycle, when declared by its integration.
+    pub(crate) fn image_operations(&self) -> Option<&dyn ImageOperations> {
+        self.declaration.implementation.image_operations()
     }
 
     /// The platform implementation delegated to by the described deployment.

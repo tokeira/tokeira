@@ -1,194 +1,212 @@
-//! ECS image-publication gates.
+//! ECS image-repository admission.
 //!
-//! These checks refuse infrastructure or workload use until every image field
-//! that a build or mirror operation owns points at the deployment's ECR
-//! registry. They validate ownership metadata without performing mutations.
+//! Image publication is provider work and never writes deployment state.
+//! Workloads instead resolve their private image coordinates from the ECR
+//! repositories already recorded by infrastructure apply. This keeps the
+//! existing deployment-state engine as the sole persistence owner while
+//! preventing authored public or local references from reaching ECS.
 
-use tokeira_deploy_engine::{Image, ImageContext, ImageSourceType};
+use tokeira_iac::{InfraState, ResourceId, ResourceState};
 
-use crate::EcsConfig;
-
-#[derive(Debug, thiserror::Error)]
+/// Why an ECS workload could not resolve its private image repository.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum EcsError {
-    #[error("image writeback fields are not mirrored into ECR: {fields:?}; {remediation}")]
-    UnmirroredImages {
-        fields: Vec<&'static str>,
-        remediation: String,
-    },
-    #[error("image writeback fields are not pushed into ECR: {fields:?}; {remediation}")]
-    UnpushedImages {
-        fields: Vec<&'static str>,
-        remediation: String,
+    /// One or more required ECR repository records are absent or invalid.
+    #[error("ECS image repositories are not deployable: {repositories:?}; {remediation}")]
+    UnresolvedRepositories {
+        /// Repository suffixes and concise validation evidence.
+        repositories: Vec<String>,
+        /// Operator command that establishes repository infrastructure.
+        remediation: &'static str,
     },
 }
 
-pub fn validate_mirrors(
-    cfg: &EcsConfig,
-    registry: &str,
-    images: &[Box<dyn Image>],
-    ctx: &ImageContext,
-) -> Result<(), EcsError> {
-    validate_writeback_fields(
-        cfg,
-        registry,
-        images,
-        ctx,
-        ImageSourceType::Mirror,
-        |fields| EcsError::UnmirroredImages {
-            fields,
-            remediation: "run `tkr image mirror`".into(),
-        },
-    )
+const BUILD_REPOSITORIES: [&str; 1] = ["tokeirad"];
+const MIRROR_REPOSITORIES: [&str; 6] = ["mimir", "loki", "grafana", "alloy", "aws-cli", "busybox"];
+
+/// Validate the first-party image repository required by ECS workloads.
+pub fn validate_builds(state: &InfraState, project: &str, region: &str) -> Result<(), EcsError> {
+    validate_set(state, project, region, &BUILD_REPOSITORIES)
 }
 
-pub fn validate_builds(
-    cfg: &EcsConfig,
-    registry: &str,
-    images: &[Box<dyn Image>],
-    ctx: &ImageContext,
-) -> Result<(), EcsError> {
-    validate_writeback_fields(
-        cfg,
-        registry,
-        images,
-        ctx,
-        ImageSourceType::Build,
-        |fields| EcsError::UnpushedImages {
-            fields,
-            remediation: "run `tkr image push --tag <version>`".into(),
-        },
-    )
+/// Validate all third-party image repositories required by ECS workloads.
+pub fn validate_mirrors(state: &InfraState, project: &str, region: &str) -> Result<(), EcsError> {
+    validate_set(state, project, region, &MIRROR_REPOSITORIES)
 }
 
-fn validate_writeback_fields<F>(
-    cfg: &EcsConfig,
-    registry: &str,
-    images: &[Box<dyn Image>],
-    ctx: &ImageContext,
-    source_type: ImageSourceType,
-    error: F,
-) -> Result<(), EcsError>
-where
-    F: FnOnce(Vec<&'static str>) -> EcsError,
-{
-    let registry_prefix = format!("{registry}/");
-    let mut invalid = Vec::new();
-    for image in images
+/// Resolve a recorded ECR repository to the tagged reference ECS executes.
+///
+/// Infrastructure state, rather than a reconstructed registry hostname,
+/// supplies the account-qualified repository URI. The caller supplies only
+/// the repository suffix and the tag selected by the authored image policy.
+pub fn resolved_image_ref(
+    state: &InfraState,
+    project: &str,
+    region: &str,
+    repository: &str,
+    tag: &str,
+) -> Result<String, EcsError> {
+    validated_repository(state, project, region, repository)
+        .map(|uri| format!("{uri}:{tag}"))
+        .map_err(|reason| EcsError::UnresolvedRepositories {
+            repositories: vec![format!("{repository} ({reason})")],
+            remediation: "run `tkr infra apply` before deploying ECS workloads",
+        })
+}
+
+fn validate_set(
+    state: &InfraState,
+    project: &str,
+    region: &str,
+    repositories: &[&str],
+) -> Result<(), EcsError> {
+    let invalid = repositories
         .iter()
-        .filter(|image| image.source_type() == source_type)
-    {
-        for target in image.writeback_targets(ctx) {
-            let value = read_dotted_key(cfg, target.field).unwrap_or_default();
-            if value.is_empty() || !value.starts_with(&registry_prefix) {
-                invalid.push(target.field);
-            }
-        }
-    }
+        .filter_map(|repository| {
+            validated_repository(state, project, region, repository)
+                .err()
+                .map(|reason| format!("{repository} ({reason})"))
+        })
+        .collect::<Vec<_>>();
     if invalid.is_empty() {
         Ok(())
     } else {
-        Err(error(invalid))
+        Err(EcsError::UnresolvedRepositories {
+            repositories: invalid,
+            remediation: "run `tkr infra apply` before deploying ECS workloads",
+        })
     }
 }
 
-fn read_dotted_key<'a>(cfg: &'a EcsConfig, field: &str) -> Option<&'a str> {
-    match field {
-        "services.edge_api.image" => Some(&cfg.services.edge_api.image),
-        "services.edge_poll.image" => Some(&cfg.services.edge_poll.image),
-        "services.runtime.image" => Some(&cfg.services.runtime.image),
-        "services.projection.image" => Some(&cfg.services.projection.image),
-        "services.controller.image" => Some(&cfg.services.controller.image),
-        "services.autoscaler.image" => Some(&cfg.services.autoscaler.image),
-        "services.admin.image" => Some(&cfg.services.admin.image),
-        "observability.mimir_image" => Some(&cfg.observability.mimir_image),
-        "observability.loki_image" => Some(&cfg.observability.loki_image),
-        "observability.grafana_image" => Some(&cfg.observability.grafana_image),
-        "observability.alloy_image" => Some(&cfg.observability.alloy_image),
-        "observability.aws_cli_image" => Some(&cfg.observability.aws_cli_image),
-        "observability.busybox_image" => Some(&cfg.observability.busybox_image),
-        _ => None,
+fn validated_repository(
+    state: &InfraState,
+    project: &str,
+    region: &str,
+    repository: &str,
+) -> Result<String, String> {
+    let expected_name = format!("{project}/{repository}");
+    let id = ResourceId(format!("ecr-{expected_name}"));
+    let record = state
+        .resources
+        .get(&id)
+        .ok_or_else(|| format!("missing infrastructure state at `{}`", id.0))?;
+    validate_record(record, &expected_name, region)
+}
+
+fn validate_record(
+    record: &ResourceState,
+    expected_name: &str,
+    region: &str,
+) -> Result<String, String> {
+    if record.resource_type.0 != "EcrRepository" {
+        return Err(format!(
+            "recorded resource type is `{}`, expected `EcrRepository`",
+            record.resource_type.0
+        ));
     }
+    let name = record
+        .properties
+        .get("repository_name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "recorded repository_name is missing".to_string())?;
+    if name != expected_name {
+        return Err(format!(
+            "recorded repository_name is `{name}`, expected `{expected_name}`"
+        ));
+    }
+    let uri = record
+        .properties
+        .get("repository_uri")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "recorded repository_uri is missing".to_string())?;
+    validate_repository_uri(uri, expected_name, region)?;
+    Ok(uri.to_string())
+}
+
+fn validate_repository_uri(uri: &str, expected_name: &str, region: &str) -> Result<(), String> {
+    let (host, name) = uri
+        .split_once('/')
+        .ok_or_else(|| "recorded repository_uri has no registry host".to_string())?;
+    if name != expected_name {
+        return Err(format!(
+            "recorded repository_uri names `{name}`, expected `{expected_name}`"
+        ));
+    }
+    let commercial = format!(".dkr.ecr.{region}.amazonaws.com");
+    let china = format!(".dkr.ecr.{region}.amazonaws.com.cn");
+    let account = host
+        .strip_suffix(&commercial)
+        .or_else(|| host.strip_suffix(&china))
+        .ok_or_else(|| format!("registry host `{host}` is not private ECR in `{region}`"))?;
+    if account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "registry host `{host}` has no 12-digit AWS account"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
-
     use super::*;
-    use crate::images;
+    use tokeira_iac::ResourceType;
 
-    const REGISTRY: &str = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-
-    #[test]
-    fn validate_mirrors_rejects_default_upstream_refs() {
-        let (config, image_ctx, images) = fixtures();
-
-        let err = validate_mirrors(&config, REGISTRY, &images, &image_ctx)
-            .expect_err("defaults are upstream refs");
-
-        assert!(matches!(err, EcsError::UnmirroredImages { .. }));
-    }
+    const REGION: &str = "eu-west-2";
+    const PROJECT: &str = "fixture";
 
     #[test]
-    fn validate_builds_rejects_default_local_refs() {
-        let (config, image_ctx, images) = fixtures();
+    fn missing_state_names_every_repository_and_remediation() {
+        let state = InfraState::default();
 
-        let err = validate_builds(&config, REGISTRY, &images, &image_ctx)
-            .expect_err("defaults are local refs");
+        let builds = validate_builds(&state, PROJECT, REGION)
+            .expect_err("missing build repository")
+            .to_string();
+        assert!(builds.contains("tokeirad"));
+        assert!(builds.contains("tkr infra apply"));
 
-        assert!(matches!(err, EcsError::UnpushedImages { .. }));
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
-
-        #[test]
-        fn mirror_gate_matches_observability_writeback_state(valid in any::<bool>()) {
-            let (mut config, image_ctx, images) = fixtures();
-            set_observability_refs(&mut config, valid);
-
-            let result = validate_mirrors(&config, REGISTRY, &images, &image_ctx);
-
-            prop_assert_eq!(result.is_ok(), valid);
-        }
-
-        #[test]
-        fn build_gate_matches_service_writeback_state(valid in any::<bool>()) {
-            let (mut config, image_ctx, images) = fixtures();
-            set_service_refs(&mut config, valid);
-
-            let result = validate_builds(&config, REGISTRY, &images, &image_ctx);
-
-            prop_assert_eq!(result.is_ok(), valid);
+        let mirrors = validate_mirrors(&state, PROJECT, REGION)
+            .expect_err("missing mirror repositories")
+            .to_string();
+        for name in MIRROR_REPOSITORIES {
+            assert!(mirrors.contains(name), "{mirrors}");
         }
     }
 
-    fn fixtures() -> (EcsConfig, ImageContext, Vec<Box<dyn Image>>) {
-        let config = EcsConfig::default();
-        let mut image_ctx = ImageContext::default();
-        image_ctx.set_extension(config.clone());
-        let images = images::all(&image_ctx).expect("image registry");
-        (config, image_ctx, images)
+    #[test]
+    fn resolved_refs_use_recorded_account_region_and_authored_tag() {
+        let mut state = InfraState::default();
+        insert_repository(&mut state, "tokeirad", REGION);
+
+        assert_eq!(
+            resolved_image_ref(&state, PROJECT, REGION, "tokeirad", "latest")
+                .expect("valid repository"),
+            "123456789012.dkr.ecr.eu-west-2.amazonaws.com/fixture/tokeirad:latest"
+        );
+
+        let error = resolved_image_ref(&state, PROJECT, "us-east-1", "tokeirad", "latest")
+            .expect_err("wrong region")
+            .to_string();
+        assert!(error.contains("not private ECR in `us-east-1`"), "{error}");
     }
 
-    fn set_observability_refs(config: &mut EcsConfig, valid: bool) {
-        let prefix = if valid { REGISTRY } else { "docker.io" };
-        config.observability.mimir_image = format!("{prefix}/tokeira/mimir:3.2.0");
-        config.observability.loki_image = format!("{prefix}/tokeira/loki:3.7.6");
-        config.observability.grafana_image = format!("{prefix}/tokeira/grafana:12.4.9");
-        config.observability.alloy_image = format!("{prefix}/tokeira/alloy:v1.19.0");
-        config.observability.aws_cli_image = format!("{prefix}/tokeira/aws-cli:2.17.0");
-        config.observability.busybox_image = format!("{prefix}/tokeira/busybox:1.36");
-    }
-
-    fn set_service_refs(config: &mut EcsConfig, valid: bool) {
-        let prefix = if valid { REGISTRY } else { "docker.io" };
-        config.services.edge_api.image = format!("{prefix}/tokeira/tokeirad:latest");
-        config.services.edge_poll.image = format!("{prefix}/tokeira/tokeirad:latest");
-        config.services.runtime.image = format!("{prefix}/tokeira/tokeirad:latest");
-        config.services.projection.image = format!("{prefix}/tokeira/tokeirad:latest");
-        config.services.controller.image = format!("{prefix}/tokeira/tokeirad:latest");
-        config.services.autoscaler.image = format!("{prefix}/tokeira/tokeirad:latest");
-        config.services.admin.image = format!("{prefix}/tokeira/tokeirad:latest");
+    fn insert_repository(state: &mut InfraState, repository: &str, region: &str) {
+        let name = format!("{PROJECT}/{repository}");
+        state.resources.insert(
+            ResourceId(format!("ecr-{name}")),
+            ResourceState {
+                resource_type: ResourceType::new("EcrRepository"),
+                physical_id: format!("arn:aws:ecr:{region}:123456789012:repository/{name}"),
+                properties: serde_json::json!({
+                    "repository_name": name,
+                    "repository_uri": format!(
+                        "123456789012.dkr.ecr.{region}.amazonaws.com/{PROJECT}/{repository}"
+                    ),
+                }),
+                dependencies: Vec::new(),
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                module: "images".into(),
+            },
+        );
     }
 }

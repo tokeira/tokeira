@@ -26,7 +26,9 @@ use self::progress::ImageBuildProgress;
 const DAGGER_SESSION_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) async fn run(command: ImageCommand, format: OutputFormat) -> Result<()> {
-    let ImageCommand::Build { arch, tag } = command;
+    let ImageCommand::Build { arch, tag } = command else {
+        bail!("definition-bound image operations must be forwarded to the selected provisioner");
+    };
     run_build(arch.into(), tag, format).await
 }
 
@@ -197,9 +199,27 @@ mod tests {
             Cli::try_parse_from(["tkr", "image", "build", "--arch", "amd64", "--tag", "v1"])
                 .is_ok()
         );
-        assert!(Cli::try_parse_from(["tkr", "image", "push"]).is_err());
-        assert!(Cli::try_parse_from(["tkr", "image", "mirror"]).is_err());
-        assert!(Cli::try_parse_from(["tkr", "image", "list"]).is_err());
+        assert!(Cli::try_parse_from(["tkr", "image", "push"]).is_ok());
+        assert!(Cli::try_parse_from(["tkr", "image", "mirror"]).is_ok());
+        assert!(Cli::try_parse_from(["tkr", "image", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["tkr", "image", "list", "--source-type", "mirror"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "tkr", "image", "push", "--tag", "v1", "--image", "tokeirad", "--yes"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "tkr",
+                "image",
+                "mirror",
+                "--image",
+                "grafana-mimir",
+                "--yes"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

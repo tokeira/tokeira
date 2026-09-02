@@ -1,13 +1,14 @@
 //! First-party `tokeirad` image declaration for ECS.
 //!
-//! One build feeds every Tokeira service image field; writeback records the
-//! resulting deployment-registry reference in each owned field.
+//! One build feeds every Tokeira service. The generic image contract retains
+//! the owned configuration fields, while definition-bound image commands use
+//! only the desired reference and perform no writeback.
 
 use tokeira_deploy_engine::{
     DesiredImageRef, Image, ImageContext, ImageSourceType, RuntimeError, WritebackTarget,
 };
 
-use crate::{config::EcsConfig, images::missing_config_error};
+use crate::images::{EcsImageConfig, missing_config_error};
 
 #[derive(Debug)]
 pub struct TokeiradImage;
@@ -23,8 +24,8 @@ impl Image for TokeiradImage {
 
     fn desired_ref(&self, ctx: &ImageContext) -> Result<DesiredImageRef, RuntimeError> {
         let cfg = ctx
-            .extension::<EcsConfig>()
-            .ok_or_else(missing_config_error::<EcsConfig>)?;
+            .extension::<EcsImageConfig>()
+            .ok_or_else(missing_config_error::<EcsImageConfig>)?;
         Ok(DesiredImageRef {
             repository: format!("{}/tokeirad", cfg.project_name),
             tag: "latest".to_owned(),

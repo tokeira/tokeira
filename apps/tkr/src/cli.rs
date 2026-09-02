@@ -421,12 +421,40 @@ pub(crate) enum CliCiCheck {
 
 #[derive(Subcommand)]
 pub(crate) enum ImageCommand {
+    /// List images declared by the selected definition-bound platform.
+    List {
+        #[arg(long)]
+        source_type: Option<CliImageSource>,
+    },
     Build {
         #[arg(long, default_value = "arm64")]
         arch: CliArch,
         #[arg(long)]
         tag: Option<String>,
     },
+    /// Push a locally built image to the selected platform registry.
+    Push {
+        #[arg(long, default_value = "latest")]
+        tag: String,
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Mirror authored upstream images into the selected platform registry.
+    Mirror {
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum CliImageSource {
+    Build,
+    Mirror,
+    Registry,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

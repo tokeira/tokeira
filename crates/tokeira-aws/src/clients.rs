@@ -74,6 +74,15 @@ impl AwsClients {
         aws_sdk_s3::Client::new(&self.sdk_config_for(region))
     }
 
+    /// Return the managed ECR client from this deployment-scoped bundle.
+    ///
+    /// Image publication uses the same SDK configuration and authored region
+    /// as infrastructure resources; callers never load a second ambient SDK
+    /// configuration with potentially different credentials or region.
+    pub fn ecr_client(&self) -> ecr::DefaultEcrClient {
+        ecr::DefaultEcrClient::new(self.ecr.clone())
+    }
+
     fn sdk_config_for(&self, region: &str) -> aws_config::SdkConfig {
         self.sdk_config
             .to_builder()

@@ -61,6 +61,7 @@ pub(crate) fn resolve_class(verb: &[&str], envelope: &DeploymentStateEnvelope) -
     match verb {
         ["describe"]
         | ["definition", "check"]
+        | ["image", "list"]
         | ["observability", "check"]
         | ["logs"]
         | ["port-mappings"]
@@ -827,6 +828,10 @@ mod tests {
             );
             assert_eq!(
                 resolve_class(&["observability", "check"], envelope),
+                LaunchClass::ReadOnly
+            );
+            assert_eq!(
+                resolve_class(&["image", "list"], envelope),
                 LaunchClass::ReadOnly
             );
         }

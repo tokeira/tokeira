@@ -9315,17 +9315,21 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "dagger-sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokeira-aws",
+ "tokeira-build",
+ "tokeira-deploy-engine",
  "tokeira-deployment",
  "tokeira-ecs",
  "tokeira-iac",
  "tokeira-observability",
  "tokeira-platform",
  "tokeira-platform-definition",
+ "tokio",
 ]
 
 [[package]]

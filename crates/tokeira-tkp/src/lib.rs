@@ -36,6 +36,7 @@ mod described;
 mod destroy;
 pub mod engine;
 mod gate;
+mod image;
 mod observability;
 
 mod plan;
@@ -162,7 +163,8 @@ pub(crate) type DesiredSnapshot =
 /// types live with the definition-boundary library and are re-exported here
 /// as the surface platforms speak.
 pub use tokeira_platform::declaration::{
-    DeploymentRef, Ops, PlatformDeclaration, PlatformExecution, PlatformIntegration,
+    DeclaredImage, DeploymentRef, ImageOperations, Ops, PlatformDeclaration, PlatformExecution,
+    PlatformIntegration, PublishedImage,
 };
 pub use tokeira_platform::{definition::Namespace, kind};
 

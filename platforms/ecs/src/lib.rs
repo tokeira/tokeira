@@ -8,8 +8,12 @@
 
 use std::sync::Arc;
 
-use tokeira_platform::{declaration::PlatformDeclaration, definition::Namespace};
+use tokeira_platform::{
+    declaration::{DeploymentRef, ImageOperations, PlatformDeclaration, PlatformIntegration},
+    definition::Namespace,
+};
 
+mod image_operations;
 pub mod observability;
 pub mod ops;
 
@@ -33,6 +37,61 @@ fn namespaces() -> Vec<Namespace> {
     ]
 }
 
+/// ECS execution integration plus the platform-owned image lifecycle.
+///
+/// The reusable ECS crate realizes manifests and AWS operations. This
+/// package-level adapter additionally owns definition evaluation, which is
+/// required before image operations can select authored upstreams.
+#[derive(Debug)]
+struct EcsIntegration {
+    execution: tokeira_ecs::execution::EcsIntegration,
+    images: image_operations::EcsImageOperations,
+}
+
+#[async_trait::async_trait]
+impl PlatformIntegration for EcsIntegration {
+    fn image_operations(&self) -> Option<&dyn ImageOperations> {
+        Some(&self.images)
+    }
+
+    async fn register_infra_extensions(
+        &self,
+        deployment: &DeploymentRef,
+        ctx: &mut tokeira_iac::ProvisionContext,
+    ) -> anyhow::Result<()> {
+        self.execution
+            .register_infra_extensions(deployment, ctx)
+            .await
+    }
+
+    async fn register_deploy_extensions(
+        &self,
+        deployment: &DeploymentRef,
+        ctx: &mut tokeira_deploy_engine::ServiceContext,
+    ) -> anyhow::Result<()> {
+        self.execution
+            .register_deploy_extensions(deployment, ctx)
+            .await
+    }
+
+    async fn register_image_extensions(
+        &self,
+        deployment: &DeploymentRef,
+        ctx: &mut tokeira_deploy_engine::ImageContext,
+    ) -> anyhow::Result<()> {
+        self.execution
+            .register_image_extensions(deployment, ctx)
+            .await
+    }
+
+    fn service_platform(
+        &self,
+        deployment: &DeploymentRef,
+    ) -> anyhow::Result<Box<dyn tokeira_deploy_engine::Platform>> {
+        self.execution.service_platform(deployment)
+    }
+}
+
 /// The ECS platform declaration.
 ///
 /// Construction is pure — no filesystem access, no AWS configuration
@@ -47,7 +106,10 @@ pub fn platform() -> PlatformDeclaration {
         ops: None,
         observability: None,
         execution: Box::new(tokeira_ecs::execution::EcsExecution),
-        implementation: Arc::new(tokeira_ecs::execution::EcsIntegration),
+        implementation: Arc::new(EcsIntegration {
+            execution: tokeira_ecs::execution::EcsIntegration,
+            images: image_operations::EcsImageOperations,
+        }),
     }
 }
 
@@ -75,6 +137,7 @@ mod declaration_tests {
             ]
         );
         assert!(declaration.ops.is_none());
+        assert!(declaration.implementation.image_operations().is_some());
     }
 
     // Kind names stay collision-free across the declared namespaces — the

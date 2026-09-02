@@ -78,8 +78,8 @@ impl MembershipConfig {
     }
 }
 
-/// Runtime-owned shard takeover and relinquishment unit used by membership
-/// directives.
+/// Runtime-owned shard takeover, relinquishment, and load-reporting unit used
+/// by membership directives and heartbeats.
 ///
 /// Implementations must not report acquisition success until the shard is
 /// ready for admission. In production that means the durable lease is held,
@@ -92,6 +92,15 @@ pub trait MembershipShardLifecycle: Send + Sync + std::fmt::Debug {
 
     /// Relinquish one controller-assigned shard and its durable lease.
     async fn relinquish_shard(&self, shard_id: ShardId) -> Result<()>;
+
+    /// Snapshot this node's load for one heartbeat. Connection headroom is
+    /// supplied by the caller because the connection reservoir is owned
+    /// outside the runtime (see [`ConnectionBudgetApplier`]).
+    fn heartbeat_inputs(
+        &self,
+        available_connections: u32,
+        connection_rate_headroom: f32,
+    ) -> HeartbeatInputs;
 }
 
 /// Client that drives the runtime's placement-controller membership stream.
@@ -253,14 +262,38 @@ impl MembershipClient {
         }
     }
 
-    /// Build a heartbeat from current owned-bundle and drain state. Convenience
-    /// wrapper over [`heartbeat_message_with_inputs`](Self::heartbeat_message_with_inputs)
-    /// that snapshots inputs from the live [`ShardOwner`] and [`RuntimeDrain`].
+    /// Build the next heartbeat from live runtime load and re-evaluate drain
+    /// progress against it.
+    ///
+    /// Drain progress is re-checked on every heartbeat, not only when the
+    /// drain directive arrives, so a node whose queued commands or outstanding
+    /// workflow tasks finish after relinquishment still reaches
+    /// `SafeToTerminate` on a later heartbeat instead of reporting `Draining`
+    /// until it is killed.
     pub fn heartbeat_message(&self) -> RuntimeHeartbeat {
-        self.heartbeat_message_with_inputs(HeartbeatInputs::from_shard_owner(
-            &self.shard_owner.read().expect("shard_owner lock poisoned"),
-            self.drain.state(),
-        ))
+        let mut inputs = self.load_snapshot();
+        self.record_drain_progress(&inputs);
+        inputs.drain_state = self.drain.state();
+        self.heartbeat_message_with_inputs(inputs)
+    }
+
+    fn load_snapshot(&self) -> HeartbeatInputs {
+        self.shard_lifecycle.heartbeat_inputs(
+            self.budget_applier.available_connections(),
+            // There is no per-node creation-rate limiter to measure: the
+            // distributed reservoir draws tokens from the cluster-shared
+            // DynamoDB bucket, so a node cannot know its own share of the
+            // rate. Reported as no headroom rather than a fabricated fraction.
+            0.0,
+        )
+    }
+
+    fn record_drain_progress(&self, inputs: &HeartbeatInputs) {
+        self.drain.record_progress(
+            inputs.owned_bundles.len(),
+            usize::try_from(inputs.runnable_transitions).unwrap_or(usize::MAX),
+            usize::try_from(inputs.pending_wft_replies).unwrap_or(usize::MAX),
+        );
     }
 
     /// Build a heartbeat from explicitly supplied [`HeartbeatInputs`]. Separated
@@ -329,6 +362,9 @@ pub struct HeartbeatInputs {
     pub drain_state: RuntimeDrainState,
     /// Per-lane pressure detail.
     pub lane_pressures: Vec<HeartbeatLanePressure>,
+    /// Workflow tasks handed to workers whose completion has not arrived.
+    /// Not carried on the wire; drain progress consults it (Req 8.2.8).
+    pub pending_wft_replies: u64,
 }
 
 /// Lane pressure data collected for heartbeat reporting.
@@ -358,18 +394,21 @@ impl HeartbeatInputs {
             connection_rate_headroom: 0.0,
             drain_state,
             lane_pressures: Vec::new(),
+            pending_wft_replies: 0,
         }
     }
 
     /// Full inputs: derives per-lane pressure and aggregate runnable/active
-    /// counts from live lane handles, and folds in connection availability and
-    /// rate headroom. Used on the rich heartbeat path.
+    /// counts from live lane handles, and folds in connection availability,
+    /// rate headroom, and outstanding workflow-task replies. Used on the rich
+    /// heartbeat path.
     pub fn from_runtime_components(
         owner: &ShardOwner,
         drain_state: RuntimeDrainState,
         lanes: &[LaneHandle],
         available_connections: u32,
         connection_rate_headroom: f32,
+        pending_wft_replies: u64,
     ) -> Self {
         let lane_pressures = lanes
             .iter()
@@ -396,6 +435,7 @@ impl HeartbeatInputs {
             connection_rate_headroom,
             drain_state,
             lane_pressures,
+            pending_wft_replies,
         }
     }
 }
@@ -411,55 +451,24 @@ impl MembershipClient {
 
         match &directive.directive {
             Some(Directive::DesiredPlacement(desired)) => {
-                for &bundle in desired.acquire_bundles.iter() {
-                    self.shard_lifecycle.acquire_shard(ShardId(bundle)).await?;
-                }
-                for &bundle in desired.relinquish_bundles.iter() {
-                    self.shard_lifecycle
-                        .relinquish_shard(ShardId(bundle))
-                        .await?;
-                }
+                self.apply_desired_placement(
+                    desired.acquire_bundles.iter().copied(),
+                    desired.relinquish_bundles.iter().copied(),
+                )
+                .await
             }
-            Some(Directive::ConnectionBudget(budget)) => {
-                let valid_until = if budget.valid_until.is_set() {
-                    Some(BudgetExpiry {
-                        seconds: budget.valid_until.seconds,
-                    })
-                } else {
-                    None
-                };
-                *self
-                    .last_budget_valid_until
-                    .lock()
-                    .expect("last_budget_valid_until lock poisoned") = valid_until;
-                self.budget_applier.apply_budget(
-                    budget.rate_per_second,
-                    budget.capacity,
-                    budget.max_reservoir_size,
-                )?;
-            }
-            Some(Directive::Drain(_)) => {
-                self.drain.begin();
-                let bundles = self
-                    .shard_owner
-                    .read()
-                    .expect("shard_owner lock poisoned")
-                    .owned_shards()
-                    .collect::<Vec<_>>();
-                for bundle in bundles {
-                    self.shard_lifecycle.relinquish_shard(bundle).await?;
-                }
-                let owned_bundle_count = self
-                    .shard_owner
-                    .read()
-                    .expect("shard_owner lock poisoned")
-                    .owned_shards()
-                    .count();
-                self.drain.record_progress(owned_bundle_count, 0, 0);
-            }
-            Some(Directive::RoutingUpdate(_)) | None => {}
+            Some(Directive::ConnectionBudget(budget)) => self.apply_connection_budget(
+                budget.rate_per_second,
+                budget.capacity,
+                budget.max_reservoir_size,
+                budget
+                    .valid_until
+                    .is_set()
+                    .then_some(budget.valid_until.seconds),
+            ),
+            Some(Directive::Drain(_)) => self.apply_drain().await,
+            Some(Directive::RoutingUpdate(_)) | None => Ok(()),
         }
-        Ok(())
     }
 
     /// Handle a controller directive (buffa-generated owned type).
@@ -467,59 +476,84 @@ impl MembershipClient {
     pub async fn handle_directive(&self, directive: pb::ControllerDirective) -> Result<()> {
         match directive.directive {
             Some(controller_directive::Directive::DesiredPlacement(desired)) => {
-                for bundle in desired.acquire_bundles {
-                    self.shard_lifecycle.acquire_shard(ShardId(bundle)).await?;
-                }
-                for bundle in desired.relinquish_bundles {
-                    self.shard_lifecycle
-                        .relinquish_shard(ShardId(bundle))
-                        .await?;
-                }
+                self.apply_desired_placement(
+                    desired.acquire_bundles.iter().copied(),
+                    desired.relinquish_bundles.iter().copied(),
+                )
+                .await
             }
-            Some(controller_directive::Directive::ConnectionBudget(budget)) => {
-                self.apply_connection_budget(&budget)?;
-            }
-            Some(controller_directive::Directive::Drain(_)) => {
-                self.drain.begin();
-                let bundles = self
-                    .shard_owner
-                    .read()
-                    .expect("shard_owner lock poisoned")
-                    .owned_shards()
-                    .collect::<Vec<_>>();
-                for bundle in bundles {
-                    self.shard_lifecycle.relinquish_shard(bundle).await?;
-                }
-                let owned_bundle_count = self
-                    .shard_owner
-                    .read()
-                    .expect("shard_owner lock poisoned")
-                    .owned_shards()
-                    .count();
-                self.drain.record_progress(owned_bundle_count, 0, 0);
-            }
-            Some(controller_directive::Directive::RoutingUpdate(_)) | None => {}
+            Some(controller_directive::Directive::ConnectionBudget(budget)) => self
+                .apply_connection_budget(
+                    budget.rate_per_second,
+                    budget.capacity,
+                    budget.max_reservoir_size,
+                    budget
+                        .valid_until
+                        .is_set()
+                        .then_some(budget.valid_until.seconds),
+                ),
+            Some(controller_directive::Directive::Drain(_)) => self.apply_drain().await,
+            Some(controller_directive::Directive::RoutingUpdate(_)) | None => Ok(()),
+        }
+    }
+
+    async fn apply_desired_placement(
+        &self,
+        acquire: impl Iterator<Item = u32> + Send,
+        relinquish: impl Iterator<Item = u32> + Send,
+    ) -> Result<()> {
+        for bundle in acquire {
+            self.shard_lifecycle.acquire_shard(ShardId(bundle)).await?;
+        }
+        for bundle in relinquish {
+            self.shard_lifecycle
+                .relinquish_shard(ShardId(bundle))
+                .await?;
         }
         Ok(())
     }
 
-    fn apply_connection_budget(&self, budget: &pb::ConnectionBudgetDirective) -> Result<()> {
-        let valid_until = if budget.valid_until.is_set() {
-            Some(BudgetExpiry {
-                seconds: budget.valid_until.seconds,
-            })
-        } else {
-            None
-        };
+    fn apply_connection_budget(
+        &self,
+        rate_per_second: f64,
+        capacity: u64,
+        max_reservoir_size: u32,
+        valid_until_seconds: Option<i64>,
+    ) -> Result<()> {
         *self
             .last_budget_valid_until
             .lock()
-            .expect("last_budget_valid_until lock poisoned") = valid_until;
-        self.budget_applier.apply_budget(
-            budget.rate_per_second,
-            budget.capacity,
-            budget.max_reservoir_size,
-        )
+            .expect("last_budget_valid_until lock poisoned") =
+            valid_until_seconds.map(|seconds| BudgetExpiry { seconds });
+        self.budget_applier
+            .apply_budget(rate_per_second, capacity, max_reservoir_size)
+    }
+
+    /// Enact a controller-initiated drain (Req 8.2): stop admitting new
+    /// external work, relinquish every owned bundle through the epoch-checked
+    /// lease path, then evaluate whether the node is already safe to terminate.
+    ///
+    /// Ownership moves before in-flight work finishes. That is safe because
+    /// history is authority: a transition still executing for a relinquished
+    /// shard is fenced at commit by the epoch check, and the new owner's
+    /// recovery sweep rebuilds whatever was not committed. The in-flight
+    /// counters therefore refine the report the controller sees (Req 8.2.8);
+    /// they carry no safety weight, and the heartbeat keeps re-evaluating them
+    /// until they clear.
+    async fn apply_drain(&self) -> Result<()> {
+        self.drain.begin();
+        let mut bundles = self
+            .shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .owned_shards()
+            .collect::<Vec<_>>();
+        bundles.sort_by_key(|bundle| bundle.0);
+        for bundle in bundles {
+            self.shard_lifecycle.relinquish_shard(bundle).await?;
+        }
+        self.record_drain_progress(&self.load_snapshot());
+        Ok(())
     }
 
     /// Whether the most recently applied connection budget has passed its
@@ -559,6 +593,11 @@ pub trait ConnectionBudgetApplier: Send + Sync + std::fmt::Debug {
         capacity: u64,
         max_reservoir_size: u32,
     ) -> Result<()>;
+
+    /// Warm connections this node could hand to new work right now, reported
+    /// in heartbeats so the controller's aggregate headroom reflects the
+    /// reservoirs rather than a placeholder zero.
+    fn available_connections(&self) -> u32;
 }
 
 /// Whether a `valid_until` Unix-second deadline lies in the past.
@@ -579,7 +618,10 @@ pub fn budget_valid_until_expired(valid_until_seconds: Option<i64>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use tokeira_storage::{InMemoryStore, LeaseOutcome, LeaseRepository};
 
@@ -588,6 +630,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingBudgetApplier {
         calls: Mutex<Vec<(f64, u64, u32)>>,
+        available: AtomicUsize,
     }
 
     impl ConnectionBudgetApplier for RecordingBudgetApplier {
@@ -604,6 +647,10 @@ mod tests {
             ));
             Ok(())
         }
+
+        fn available_connections(&self) -> u32 {
+            self.available.load(Ordering::Acquire) as u32
+        }
     }
 
     #[derive(Debug)]
@@ -612,10 +659,27 @@ mod tests {
         shard_owner: Arc<RwLock<ShardOwner>>,
         owner_identity: String,
         node_endpoint: String,
+        inflight_transitions: AtomicUsize,
+        pending_wft_replies: AtomicUsize,
     }
 
     #[async_trait]
     impl MembershipShardLifecycle for TestShardLifecycle {
+        fn heartbeat_inputs(
+            &self,
+            available_connections: u32,
+            connection_rate_headroom: f32,
+        ) -> HeartbeatInputs {
+            let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
+            HeartbeatInputs {
+                runnable_transitions: self.inflight_transitions.load(Ordering::Acquire) as u64,
+                pending_wft_replies: self.pending_wft_replies.load(Ordering::Acquire) as u64,
+                available_connections,
+                connection_rate_headroom,
+                ..HeartbeatInputs::from_shard_owner(&owner, RuntimeDrainState::Active)
+            }
+        }
+
         async fn acquire_shard(&self, shard_id: ShardId) -> Result<ShardEpoch> {
             let outcome = self
                 .store
@@ -679,6 +743,13 @@ mod tests {
         store: Arc<InMemoryStore>,
         budget_applier: Arc<RecordingBudgetApplier>,
     ) -> MembershipClient {
+        client_with_lifecycle(store, budget_applier).0
+    }
+
+    fn client_with_lifecycle(
+        store: Arc<InMemoryStore>,
+        budget_applier: Arc<RecordingBudgetApplier>,
+    ) -> (MembershipClient, Arc<TestShardLifecycle>) {
         let config = config();
         let shard_owner = Arc::new(RwLock::new(ShardOwner::new(4)));
         let shard_lifecycle = Arc::new(TestShardLifecycle {
@@ -686,14 +757,17 @@ mod tests {
             shard_owner: Arc::clone(&shard_owner),
             owner_identity: config.owner_identity(),
             node_endpoint: config.node_endpoint.as_authority(),
+            inflight_transitions: AtomicUsize::new(0),
+            pending_wft_replies: AtomicUsize::new(0),
         });
-        MembershipClient::new(
+        let client = MembershipClient::new(
             config,
-            shard_lifecycle,
+            Arc::clone(&shard_lifecycle) as Arc<dyn MembershipShardLifecycle>,
             shard_owner,
             Arc::new(RuntimeDrain::default()),
             budget_applier,
-        )
+        );
+        (client, shard_lifecycle)
     }
 
     #[test]
@@ -886,12 +960,64 @@ mod tests {
             &[],
             12,
             0.75,
+            3,
         );
 
         assert_eq!(inputs.owned_bundles, vec![ShardId(2)]);
         assert_eq!(inputs.available_connections, 12);
         assert_eq!(inputs.connection_rate_headroom, 0.75);
         assert_eq!(inputs.drain_state, RuntimeDrainState::Draining);
+        assert_eq!(inputs.pending_wft_replies, 3);
         assert!(inputs.lane_pressures.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_reports_the_reservoir_headroom_the_budget_applier_sees() {
+        let store = Arc::new(InMemoryStore::default());
+        let budget = Arc::new(RecordingBudgetApplier::default());
+        budget.available.store(12, Ordering::Release);
+        let client = client(store, budget);
+
+        let heartbeat = client.heartbeat_message();
+
+        assert_eq!(heartbeat.available_connections, 12);
+        assert_eq!(heartbeat.connection_rate_headroom, 0.0);
+    }
+
+    #[tokio::test]
+    async fn drain_stays_draining_until_in_flight_work_clears() {
+        let store = Arc::new(InMemoryStore::default());
+        let budget = Arc::new(RecordingBudgetApplier::default());
+        let (client, lifecycle) = client_with_lifecycle(store, budget);
+        lifecycle.pending_wft_replies.store(1, Ordering::Release);
+
+        client
+            .handle_directive(pb::ControllerDirective {
+                directive: Some(controller_directive::Directive::Drain(
+                    pb::DrainDirective::default().into(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(client.drain.state(), RuntimeDrainState::Draining);
+        assert_eq!(
+            client.heartbeat_message().drain_state,
+            buffa::EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_DRAINING)
+        );
+
+        lifecycle.pending_wft_replies.store(0, Ordering::Release);
+        lifecycle.inflight_transitions.store(2, Ordering::Release);
+        assert_eq!(
+            client.heartbeat_message().drain_state,
+            buffa::EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_DRAINING)
+        );
+
+        lifecycle.inflight_transitions.store(0, Ordering::Release);
+        assert_eq!(
+            client.heartbeat_message().drain_state,
+            buffa::EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE)
+        );
+        assert_eq!(client.drain.state(), RuntimeDrainState::SafeToTerminate);
     }
 }

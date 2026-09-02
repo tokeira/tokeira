@@ -404,11 +404,11 @@ pub struct BundleLease {
 
 ### 5. Controller gRPC Service (`tokeira-proto`)
 
-Proto definitions in `proto/tokeira/internal/controller/controller.proto`:
+Proto definitions in `proto/tokeira/internal/controller/v1/controller.proto` (the vendored file is the contract; the sketch below matches it and keeps the rationale comments):
 
 ```protobuf
 syntax = "proto3";
-package tokeira.internal.controller;
+package tokeira.internal.controller.v1;
 
 import "google/protobuf/timestamp.proto";
 
@@ -426,8 +426,13 @@ service PlacementController {
     // Nominate nodes suitable for scale-in retirement.
     rpc NominateScaleInCandidates(NominateRequest) returns (NominateResponse);
 
-    // Mark a node as draining for scale-in.
+    // Mark a node as draining for scale-in; the controller sends the DrainDirective.
     rpc MarkNodeDraining(MarkDrainingRequest) returns (MarkDrainingResponse);
+
+    // Read-only drain progress for one node, as last reported by its heartbeat.
+    // Separate from MarkNodeDraining so a poll loop never re-marks a node and
+    // overwrites a SAFE_TO_TERMINATE verdict with DRAINING.
+    rpc DescribeNodeDrain(DescribeNodeDrainRequest) returns (DescribeNodeDrainResponse);
 }
 
 // Split registration + heartbeat using oneof (not empty-string sentinels)
@@ -447,17 +452,18 @@ message RuntimeRegistration {
     string build_id = 6;
 }
 
+// The node is identified by its stream (the registration frame); heartbeats
+// carry load and drain state only.
 message RuntimeHeartbeat {
-    string node_id = 1;
+    uint32 owned_bundle_count = 1;
     repeated uint32 owned_bundles = 2;
-    uint32 owned_bundle_count = 3;
-    uint64 runnable_transitions = 4;
-    uint64 active_actor_count = 5;
-    uint64 backlog_depth = 6;
-    uint32 available_connections = 7;
-    float connection_rate_headroom = 8;
-    NodeDrainState drain_state = 9;
-    repeated LanePressure lane_pressures = 10;
+    uint64 runnable_transitions = 3;
+    uint64 active_actor_count = 4;
+    uint64 backlog_depth = 5;
+    uint32 available_connections = 6;      // reservoir warm ready count
+    float connection_rate_headroom = 7;    // zero on the distributed path (Req 2.2.4)
+    NodeDrainState drain_state = 8;
+    repeated LanePressure lane_pressures = 9;
 }
 
 message LanePressure {
@@ -468,9 +474,10 @@ message LanePressure {
 }
 
 enum NodeDrainState {
-    NODE_DRAIN_STATE_ACTIVE = 0;
-    NODE_DRAIN_STATE_DRAINING = 1;
-    NODE_DRAIN_STATE_SAFE_TO_TERMINATE = 2;
+    NODE_DRAIN_STATE_UNSPECIFIED = 0;
+    NODE_DRAIN_STATE_ACTIVE = 1;
+    NODE_DRAIN_STATE_DRAINING = 2;
+    NODE_DRAIN_STATE_SAFE_TO_TERMINATE = 3;
 }
 
 message ControllerDirective {
@@ -577,17 +584,22 @@ message RefreshBundleResponse {
 }
 
 message NominateRequest {
-    uint32 max_candidates = 1;
+    uint32 limit = 1;
 }
 
 message NominateResponse {
     repeated ScaleInCandidate candidates = 1;
+    // Aggregate headroom across active nodes (Req 9.4.2).
+    uint32 aggregate_available_connections = 2;
+    float aggregate_connection_rate_headroom = 3;
 }
 
 message ScaleInCandidate {
     string node_id = 1;
     uint32 owned_bundle_count = 2;
     uint64 runnable_transitions = 3;
+    uint64 active_actor_count = 4;
+    uint64 backlog_depth = 5;
 }
 
 message MarkDrainingRequest {
@@ -595,8 +607,20 @@ message MarkDrainingRequest {
 }
 
 message MarkDrainingResponse {
+    // False only when the controller has no membership record of the node.
     bool accepted = 1;
-    string reason = 2;
+}
+
+message DescribeNodeDrainRequest {
+    string node_id = 1;
+}
+
+message DescribeNodeDrainResponse {
+    // False when this controller has no record of the node: it never registered
+    // here and was never marked draining. `state` is UNSPECIFIED in that case;
+    // a registered node that is not draining reports ACTIVE.
+    bool known = 1;
+    NodeDrainState state = 2;
 }
 ```
 
@@ -776,40 +800,67 @@ pub fn compute_connection_budget(
 
 ### 7. Runtime Membership Client (`tokeira-runtime`)
 
-The runtime opens a membership stream to the controller at startup, sending registration first:
+The runtime opens a membership stream to the controller at startup, sending registration first. The client drives the runtime through two boundaries so that membership never reaches into lease, recovery, or connection internals:
 
 ```rust
+/// Runtime boundary the client drives placement and heartbeats through.
+/// Production supplies the `TokeiraRuntime`, whose acquisition unit takes the
+/// lease, starts renewal, sweeps durable history, and only then marks the
+/// shard Active.
+#[async_trait]
+pub trait MembershipShardLifecycle {
+    async fn acquire_shard(&self, shard_id: ShardId) -> Result<ShardEpoch>;
+    async fn relinquish_shard(&self, shard_id: ShardId) -> Result<()>;
+    /// Live load for one heartbeat: owned bundles, per-lane queue pressure,
+    /// started workflow tasks awaiting a reply, plus the caller-supplied
+    /// connection headroom.
+    fn heartbeat_inputs(&self, available_connections: u32, connection_rate_headroom: f32) -> HeartbeatInputs;
+}
+
+/// Boundary to whatever owns the connection reservoir. The engine's DSQL stack
+/// implements it over the `DsqlConnectionDirector` every repository shares;
+/// the in-memory stack supplies a no-op (Req 9.2.6).
+pub trait ConnectionBudgetApplier {
+    fn apply_budget(&self, rate_per_second: f64, capacity: u64, max_reservoir_size: u32) -> Result<()>;
+    /// Warm connections available right now, reported as heartbeat headroom.
+    fn available_connections(&self) -> u32;
+}
+
 pub struct MembershipClient {
-    controller_endpoint: String,
-    node_id: IncarnationId,
-    node_endpoint: NodeEndpoint,
-    registration: RuntimeRegistration,
-    heartbeat_interval: Duration,
-    cancel: CancellationToken,
+    config: MembershipConfig,   // controller endpoint, heartbeat interval, backoff, node identity and endpoint
+    shard_lifecycle: Arc<dyn MembershipShardLifecycle>,
+    shard_owner: Arc<RwLock<ShardOwner>>,
+    drain: Arc<RuntimeDrain>,
+    budget_applier: Arc<dyn ConnectionBudgetApplier>,
+    last_budget_valid_until: Arc<Mutex<Option<BudgetExpiry>>>,
 }
 
 impl MembershipClient {
-    /// Run the membership stream loop.
-    /// Sends registration, then heartbeats. Receives directives.
-    /// Reconnects with backoff on stream drop.
-    pub async fn run(
-        &self,
-        shard_owner: Arc<RwLock<ShardOwner>>,
-        drain_signal: Arc<Notify>,
-        rate_limiter: Arc<TokenBucketRateLimiter>,
-        reservoir: Arc<Reservoir>,
-    ) -> Result<()> {
-        // 1. Connect to controller
-        // 2. Send RuntimeRegistration as first message
-        // 3. Loop: send heartbeats, receive directives
-        // 4. On DesiredPlacementDirective: attempt acquire/relinquish
-        // 5. On ConnectionBudgetDirective: reconfigure rate limiter via
-        //    TokenBucketRateLimiter::reconfigure(rate_per_second, capacity),
-        //    cap reservoir via Reservoir::reconfigure_target(max_reservoir_size),
-        //    retire excess via Reservoir::retire_excess(max_reservoir_size) if oversized,
-        //    track valid_until
-        // 6. On DrainDirective: begin two-phase drain
-        // 7. On disconnect: retain budget until valid_until, then degrade to conservative default
+    /// Run the membership stream loop until shutdown, reconnecting with
+    /// exponential backoff on stream drop.
+    pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
+        // 1. Connect to the controller; send RuntimeRegistration as the first message
+        // 2. Loop: on each heartbeat tick send heartbeat_message(); apply each directive
+        // 3. DesiredPlacementDirective: shard_lifecycle.acquire_shard / relinquish_shard per bundle
+        // 4. ConnectionBudgetDirective: record valid_until, then
+        //    budget_applier.apply_budget(rate_per_second, capacity, max_reservoir_size).
+        //    The DSQL applier caps the reservoir through
+        //    DsqlConnectionDirector::apply_connection_budget(max_reservoir_size):
+        //    min with the configured target, floor one, retire idle excess.
+        //    rate_per_second and capacity are not applied (Req 9.2.1).
+        // 5. DrainDirective: drain.begin(); relinquish every owned bundle through
+        //    shard_lifecycle in sorted order; record drain progress from a fresh
+        //    load snapshot (Req 8.2)
+        // 6. On stream drop: if the last budget has expired, apply_budget(1.0, 1, 1)
+        //    caps the reservoir to one warm connection (Req 9.2.4); back off; reconnect
+    }
+
+    /// One heartbeat: a live load snapshot plus drain re-evaluation (Req 8.2.10).
+    pub fn heartbeat_message(&self) -> RuntimeHeartbeat {
+        // inputs = shard_lifecycle.heartbeat_inputs(budget_applier.available_connections(), 0.0)
+        //   (rate headroom is zero by design on the distributed path, Req 2.2.4)
+        // drain.record_progress(owned, inputs.runnable_transitions, inputs.pending_wft_replies)
+        // inputs.drain_state = drain.state(); encode
     }
 }
 ```
@@ -1088,10 +1139,11 @@ With active-active controllers, connection budget allocation uses a CAS-protecte
 
 The two-phase drain protocol ensures routing moves before ownership is relinquished, but routing does not advertise the new owner until DSQL confirms the new lease:
 
-1. Node marked DRAINING → routing snapshot stops sending new work to it.
-2. Runtime relinquishes bundles with epoch-checked CAS.
+1. Node marked DRAINING → the controller sends the `DrainDirective`, stops placing bundles on the node, and routing stops sending it new work.
+2. Runtime relinquishes bundles with epoch-checked CAS, without waiting for in-flight work: a transition still in flight for a relinquished bundle is rejected at commit by the epoch fence, and the successor's recovery sweep rebuilds anything not committed.
 3. New owner acquires bundle in DSQL with new epoch.
 4. Controller observes new ownership in DSQL → publishes updated snapshot.
+5. The runtime re-evaluates `SAFE_TO_TERMINATE` on every heartbeat from live counters; the autoscaler reads that verdict through `DescribeNodeDrain` and clears scale-in protection only on it.
 
 **Key invariant:** There is no window where the routing snapshot advertises a new owner that hasn't actually acquired the DSQL lease.
 
@@ -1115,7 +1167,7 @@ The previous design had a correctness bug: Start routed by queue partition (prod
 | Start and Signal route to same execution-home | Both use hash(namespace_id, workflow_id) | High | Correctness fix from previous design |
 | Commit fencing matches routing path | commit_transition accepts execution-home BundleId from edge | High | Prevents mismatch between routing hash and fencing hash |
 | Node endpoints are deterministic across controllers | Sourced from shard_lease.node_endpoint in DSQL | High | All controllers reading same lease rows produce same endpoint map |
-| Drain does not lose in-flight work | Two-phase: routing moves before ownership relinquished | High | DSQL confirms new owner before routing advertises it |
+| Drain does not lose in-flight work | Epoch fence rejects commits for relinquished bundles; successor sweep rebuilds; termination gated on the node's own SAFE_TO_TERMINATE via DescribeNodeDrain | High | Routing advertises the successor only after DSQL confirms its lease |
 
 ### Candidates for TLA+ verification
 
@@ -1150,7 +1202,7 @@ The controller binary is a thin process wrapper around the `crates/tokeira-contr
    c. PlacementEngine(placement_config from config)
    d. BudgetAllocator(rate_budget, capacity_budget from config)
 8. Start gRPC server (grpc_listen_addr, default 0.0.0.0:7240):
-   a. PlacementController service (RuntimeMembership, SubscribeRouting, RefreshBundle, NominateScaleInCandidates, MarkNodeDraining)
+   a. PlacementController service (RuntimeMembership, SubscribeRouting, RefreshBundle, NominateScaleInCandidates, MarkNodeDraining, DescribeNodeDrain)
    b. gRPC health service for ECS health checks
 9. Spawn placement loop (tokio::spawn):
    a. Every placement_interval_secs: list_bundle_leases → compute_routing_snapshot → advance_generation (CAS) → publish to subscribers
@@ -1524,8 +1576,8 @@ The controller binary exposes the following Prometheus metrics on the metrics en
 
 ### Connection Budget Expiry
 
-- When a `ConnectionBudgetDirective` expires (past `valid_until`), the runtime degrades to conservative defaults.
-- This prevents a disconnected runtime from consuming more than its fair share indefinitely.
+- When a stream drop or a failed reconnect finds the last `ConnectionBudgetDirective` expired (past `valid_until`), the runtime caps its reservoir to one warm connection until the next directive.
+- This prevents a disconnected runtime from consuming more than its fair share indefinitely while leaving it able to renew and relinquish its own leases.
 
 ## Testing Strategy
 
@@ -1548,9 +1600,9 @@ The controller binary exposes the following Prometheus metrics on the metrics en
 - **Routing snapshot:** Verify full snapshot construction from leases with epoch. Verify delta application with base_generation validation. Verify generation advancement. Verify on-demand queue-home derivation via `resolve_queue_home`.
 - **Routing cache:** Verify ArcSwap-based lookup returns correct endpoint with epoch. Verify execution-home resolution for Start and Signal produces same result. Verify stale cache still serves.
 - **NotShardOwner retry:** Verify hint-based routing. Verify controller refresh fallback. Verify DSQL fallback. Verify max retries.
-- **Two-phase drain:** Verify routing moves before ownership relinquished. Verify SAFE_TO_TERMINATE conditions. Verify epoch-checked CAS relinquish.
+- **Two-phase drain:** Verify the served `MarkNodeDraining` delivers the `DrainDirective` and `DescribeNodeDrain` follows the heartbeat. Verify a reopened stream of a draining node receives the drain again. Verify SAFE_TO_TERMINATE is held until the in-flight counters clear. Verify epoch-checked CAS relinquish and that work routed after relinquish is refused.
 - **Bundle relinquish:** Verify epoch validation. Verify epoch advancement on success.
-- **Connection budget:** Verify zero-node handling. Verify remainder distribution by sorted IncarnationId. Verify valid_until expiry triggers conservative default.
+- **Connection budget:** Verify zero-node handling. Verify remainder distribution by sorted IncarnationId. Verify a directive caps the reservoir target, never raises it above configuration, and floors at one.
 
 ### Integration Tests
 

@@ -15,9 +15,11 @@
 //!   prevents scaling into a connection budget wall.
 //!
 //! - **Loop C (Runtime Retirement):** Drains and terminates individual runtime
-//!   hosts through a multi-phase state machine. Separating retirement from
-//!   scale-in avoids partial-drain races where a host is terminated before its
-//!   workload has fully migrated.
+//!   hosts through a multi-phase state machine. Mimir decides whether there is
+//!   excess capacity; the placement controller nominates which node leaves and
+//!   reports, from the node's own heartbeat, when it is safe to terminate.
+//!   Separating retirement from scale-in avoids partial-drain races where a
+//!   host is terminated before its workload has fully migrated.
 //!
 //! The loops are separated because they operate on different time scales and
 //! failure domains: replica scaling reacts in seconds, scale-out in tens of

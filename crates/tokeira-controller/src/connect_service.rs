@@ -8,9 +8,10 @@ use connectrpc::{RequestContext, Response, ServiceResult, ServiceStream};
 use futures::StreamExt;
 use tokeira_proto::connect::tokeira::internal::controller::v1::{
     self as pb, BundleOwnerMessage, BundleOwnershipEntry,
-    ControllerDirective as WireControllerDirective, FullRoutingSnapshot, MarkDrainingResponse,
-    NodeEndpointEntry, NodeEndpointMessage, NominateResponse, OwnedMarkDrainingRequestView,
-    OwnedNominateRequestView, OwnedRefreshBundleRequestView, OwnedRuntimeMembershipRequestView,
+    ControllerDirective as WireControllerDirective, DescribeNodeDrainResponse, FullRoutingSnapshot,
+    MarkDrainingResponse, NodeEndpointEntry, NodeEndpointMessage, NominateResponse,
+    OwnedDescribeNodeDrainRequestView, OwnedMarkDrainingRequestView, OwnedNominateRequestView,
+    OwnedRefreshBundleRequestView, OwnedRuntimeMembershipRequestView,
     OwnedSubscribeRoutingRequestView, PlacementConfigMessage, PlacementController,
     RefreshBundleResponse, RoutingUpdate, ScaleInCandidate, bundle_ownership_entry,
     node_endpoint_entry, routing_update,
@@ -192,29 +193,53 @@ impl PlacementController for ConnectPlacementController {
         _ctx: RequestContext,
         req: OwnedMarkDrainingRequestView,
     ) -> ServiceResult<MarkDrainingResponse> {
-        let node_id = match req.node_id.parse::<uuid::Uuid>() {
-            Ok(uuid) => IncarnationId(uuid),
-            Err(_) => {
-                return Err(connectrpc::ConnectError::new(
-                    connectrpc::ErrorCode::InvalidArgument,
-                    "invalid node_id UUID",
-                ));
-            }
-        };
-
-        let accepted = self.state.membership.write().await.mark_draining(node_id);
-        if accepted {
-            self.state.drain.write().await.mark_draining(node_id);
-        }
-
+        let node_id = parse_node_id(req.node_id)?;
+        let accepted = self.state.mark_node_draining(node_id).await;
         Response::ok(MarkDrainingResponse {
             accepted,
+            ..Default::default()
+        })
+    }
+
+    async fn describe_node_drain(
+        &self,
+        _ctx: RequestContext,
+        req: OwnedDescribeNodeDrainRequestView,
+    ) -> ServiceResult<DescribeNodeDrainResponse> {
+        let node_id = parse_node_id(req.node_id)?;
+        let state = self.state.describe_node_drain(node_id).await;
+        Response::ok(DescribeNodeDrainResponse {
+            known: state.is_some(),
+            state: buffa::EnumValue::Known(encode_drain_state(state)),
             ..Default::default()
         })
     }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn parse_node_id(node_id: &str) -> Result<IncarnationId, connectrpc::ConnectError> {
+    node_id
+        .parse::<uuid::Uuid>()
+        .map(IncarnationId)
+        .map_err(|_| {
+            connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::InvalidArgument,
+                "invalid node_id UUID",
+            )
+        })
+}
+
+fn encode_drain_state(state: Option<NodeDrainState>) -> pb::NodeDrainState {
+    match state {
+        None => pb::NodeDrainState::NODE_DRAIN_STATE_UNSPECIFIED,
+        Some(NodeDrainState::Active) => pb::NodeDrainState::NODE_DRAIN_STATE_ACTIVE,
+        Some(NodeDrainState::Draining) => pb::NodeDrainState::NODE_DRAIN_STATE_DRAINING,
+        Some(NodeDrainState::SafeToTerminate) => {
+            pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE
+        }
+    }
+}
 
 fn decode_heartbeat(hb: &pb::RuntimeHeartbeat) -> RuntimeHeartbeat {
     use buffa::EnumValue;
@@ -311,6 +336,7 @@ fn encode_controller_directive(directive: ControllerDirective) -> WireController
             valid_until.nanos = budget.valid_until.nanosecond() as i32;
             Directive::ConnectionBudget(encoded.into())
         }
+        ControllerDirective::Drain => Directive::Drain(pb::DrainDirective::default().into()),
     };
     WireControllerDirective {
         directive: Some(directive),
@@ -426,13 +452,19 @@ mod tests {
     use std::sync::Arc;
 
     use futures::{StreamExt, stream};
-    use tokeira_storage::{ControlRepository, InMemoryStore, LeaseRepository};
+    use pb::{controller_directive, runtime_membership_request};
+    use tokeira_storage::{ControlRepository, InMemoryStore, LeaseOutcome, LeaseRepository};
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
     use crate::ControllerConfig;
 
     fn service() -> ConnectPlacementController {
-        let store = Arc::new(InMemoryStore::default());
+        service_with_store(Arc::new(InMemoryStore::default()))
+    }
+
+    fn service_with_store(store: Arc<InMemoryStore>) -> ConnectPlacementController {
         ConnectPlacementController::new(PlacementControllerState::new(
             ControllerConfig {
                 bundle_count: 1,
@@ -446,12 +478,7 @@ mod tests {
         ))
     }
 
-    #[tokio::test]
-    async fn served_membership_stream_delivers_initial_and_loop_directives() {
-        use pb::{controller_directive, runtime_membership_request};
-
-        let service = service();
-        let node_id = IncarnationId::new();
+    fn registration_request(node_id: IncarnationId) -> OwnedRuntimeMembershipRequestView {
         let request = pb::RuntimeMembershipRequest {
             request: Some(runtime_membership_request::Request::Registration(
                 pb::RuntimeRegistration {
@@ -466,7 +493,82 @@ mod tests {
             )),
             ..Default::default()
         };
-        let request = OwnedRuntimeMembershipRequestView::from_owned(&request).unwrap();
+        OwnedRuntimeMembershipRequestView::from_owned(&request).unwrap()
+    }
+
+    fn heartbeat_request(drain_state: pb::NodeDrainState) -> OwnedRuntimeMembershipRequestView {
+        let request = pb::RuntimeMembershipRequest {
+            request: Some(runtime_membership_request::Request::Heartbeat(
+                pb::RuntimeHeartbeat {
+                    drain_state: buffa::EnumValue::Known(drain_state),
+                    ..Default::default()
+                }
+                .into(),
+            )),
+            ..Default::default()
+        };
+        OwnedRuntimeMembershipRequestView::from_owned(&request).unwrap()
+    }
+
+    /// A request stream that stays open and can be fed heartbeats after the
+    /// registration frame, standing in for a live runtime.
+    fn open_requests(
+        node_id: IncarnationId,
+    ) -> (
+        mpsc::Sender<Result<OwnedRuntimeMembershipRequestView, connectrpc::ConnectError>>,
+        ServiceStream<OwnedRuntimeMembershipRequestView>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(Ok(registration_request(node_id)))
+            .expect("fresh channel accepts the registration frame");
+        (tx, Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn mark_request(node_id: IncarnationId) -> OwnedMarkDrainingRequestView {
+        OwnedMarkDrainingRequestView::from_owned(&pb::MarkDrainingRequest {
+            node_id: node_id.to_string(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    async fn describe(
+        service: &ConnectPlacementController,
+        node_id: IncarnationId,
+    ) -> (bool, pb::NodeDrainState) {
+        let request =
+            OwnedDescribeNodeDrainRequestView::from_owned(&pb::DescribeNodeDrainRequest {
+                node_id: node_id.to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let response = service
+            .describe_node_drain(RequestContext::default(), request)
+            .await
+            .unwrap()
+            .body;
+        let buffa::EnumValue::Known(state) = response.state else {
+            panic!("drain state must be a known enum value");
+        };
+        (response.known, state)
+    }
+
+    /// Yield to the served stream's reader task until `condition` holds.
+    async fn wait_until(mut condition: impl AsyncFnMut() -> bool) {
+        for _ in 0..10_000 {
+            if condition().await {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition was not reached");
+    }
+
+    #[tokio::test]
+    async fn served_membership_stream_delivers_initial_and_loop_directives() {
+        let service = service();
+        let node_id = IncarnationId::new();
+        let request = registration_request(node_id);
         // Keep the request side open: closing it represents a disconnected
         // runtime and correctly moves the node out of active placement.
         let requests: ServiceStream<OwnedRuntimeMembershipRequestView> =
@@ -506,5 +608,191 @@ mod tests {
             directives.next().await.unwrap().unwrap().directive,
             Some(controller_directive::Directive::ConnectionBudget(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn served_drain_reaches_the_stream_and_describe_follows_the_heartbeat() {
+        let store = Arc::new(InMemoryStore::default());
+        let service = service_with_store(Arc::clone(&store));
+        let draining = IncarnationId::new();
+        let (requests_tx, requests) = open_requests(draining);
+        let mut directives = service
+            .runtime_membership(RequestContext::default(), requests)
+            .await
+            .unwrap()
+            .body;
+        assert!(matches!(
+            directives.next().await.unwrap().unwrap().directive,
+            Some(controller_directive::Directive::DesiredPlacement(_))
+        ));
+        assert!(matches!(
+            directives.next().await.unwrap().unwrap().directive,
+            Some(controller_directive::Directive::ConnectionBudget(_))
+        ));
+        // The runtime enacted its placement: it holds the durable lease.
+        let epoch = match store
+            .try_acquire_bundle(
+                ShardId(0),
+                draining.to_string(),
+                "127.0.0.1:7233".to_owned(),
+            )
+            .await
+            .unwrap()
+        {
+            LeaseOutcome::Acquired { epoch } => epoch,
+            other => panic!("unexpected lease outcome: {other:?}"),
+        };
+
+        let accepted = service
+            .mark_node_draining(RequestContext::default(), mark_request(draining))
+            .await
+            .unwrap()
+            .body
+            .accepted;
+        assert!(accepted);
+        assert!(matches!(
+            directives.next().await.unwrap().unwrap().directive,
+            Some(controller_directive::Directive::Drain(_))
+        ));
+        assert_eq!(
+            describe(&service, draining).await,
+            (true, pb::NodeDrainState::NODE_DRAIN_STATE_DRAINING)
+        );
+
+        // Progress arrives only through the runtime's heartbeat.
+        requests_tx
+            .send(Ok(heartbeat_request(
+                pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE,
+            )))
+            .await
+            .unwrap();
+        wait_until(async || {
+            describe(&service, draining).await.1
+                == pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE
+        })
+        .await;
+
+        // A repeated mark is accepted and never demotes the verdict.
+        assert!(
+            service
+                .mark_node_draining(RequestContext::default(), mark_request(draining))
+                .await
+                .unwrap()
+                .body
+                .accepted
+        );
+        assert_eq!(
+            describe(&service, draining).await,
+            (true, pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE)
+        );
+
+        // Once the runtime relinquishes, placement hands the bundle to an
+        // active node and never back to the draining one.
+        assert!(matches!(
+            store
+                .relinquish_bundle(ShardId(0), draining.to_string(), epoch)
+                .await
+                .unwrap(),
+            LeaseOutcome::Acquired { .. }
+        ));
+        let successor = IncarnationId::new();
+        let (_successor_tx, successor_requests) = open_requests(successor);
+        let mut successor_directives = service
+            .runtime_membership(RequestContext::default(), successor_requests)
+            .await
+            .unwrap()
+            .body;
+        let Some(controller_directive::Directive::DesiredPlacement(desired)) = successor_directives
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .directive
+        else {
+            panic!("successor's first directive must be desired placement");
+        };
+        assert_eq!(desired.acquire_bundles, vec![0]);
+        assert_eq!(service.state.publish_desired_placements().await.unwrap(), 1);
+        assert!(matches!(
+            successor_directives
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .directive,
+            Some(controller_directive::Directive::ConnectionBudget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reopened_stream_of_a_draining_node_receives_the_drain_again() {
+        let service = service();
+        let node_id = IncarnationId::new();
+        let (first_tx, first_requests) = open_requests(node_id);
+        let mut first = service
+            .runtime_membership(RequestContext::default(), first_requests)
+            .await
+            .unwrap()
+            .body;
+        first.next().await.unwrap().unwrap();
+        first.next().await.unwrap().unwrap();
+        assert!(service.state.mark_node_draining(node_id).await);
+        assert!(matches!(
+            first.next().await.unwrap().unwrap().directive,
+            Some(controller_directive::Directive::Drain(_))
+        ));
+
+        // The stream drops mid-drain and the same incarnation reconnects.
+        drop(first_tx);
+        let (_second_tx, second_requests) = open_requests(node_id);
+        let mut second = service
+            .runtime_membership(RequestContext::default(), second_requests)
+            .await
+            .unwrap()
+            .body;
+
+        assert!(matches!(
+            second.next().await.unwrap().unwrap().directive,
+            Some(controller_directive::Directive::Drain(_))
+        ));
+        assert_eq!(service.state.publish_desired_placements().await.unwrap(), 0);
+        assert_eq!(
+            service
+                .state
+                .allocate_and_publish_connection_budgets(node_id)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_node_drain_distinguishes_unknown_active_and_unmarkable_nodes() {
+        let service = service();
+        let never_seen = IncarnationId::new();
+        assert_eq!(
+            describe(&service, never_seen).await,
+            (false, pb::NodeDrainState::NODE_DRAIN_STATE_UNSPECIFIED)
+        );
+        assert!(
+            !service
+                .mark_node_draining(RequestContext::default(), mark_request(never_seen))
+                .await
+                .unwrap()
+                .body
+                .accepted
+        );
+
+        let active = IncarnationId::new();
+        let (_tx, requests) = open_requests(active);
+        let _directives = service
+            .runtime_membership(RequestContext::default(), requests)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(
+            describe(&service, active).await,
+            (true, pb::NodeDrainState::NODE_DRAIN_STATE_ACTIVE)
+        );
     }
 }

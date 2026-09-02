@@ -1,16 +1,39 @@
 //! Connect-rust client for the placement controller.
 //!
-//! Provides typed access to the controller's autoscaler-facing RPCs:
-//! - `NominateScaleInCandidates` — ask which runtime hosts to retire
-//! - `MarkNodeDraining` — tell the controller to stop assigning bundles
+//! Loop C reaches the controller through [`PlacementControl`], the
+//! counterpart of [`Actuator`](crate::actuator::Actuator) on the platform
+//! side, so the retirement state machine can be proven with recording doubles
+//! while the served client stays a thin transport wrapper over three RPCs:
+//! - `NominateScaleInCandidates` — which runtime nodes are safe to retire
+//! - `MarkNodeDraining` — record the drain on the controller, which sends the
+//!   drain directive to the node
+//! - `DescribeNodeDrain` — the node's drain progress as its heartbeat reports it
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
+use async_trait::async_trait;
+use buffa::EnumValue;
 use connectrpc::client::{ClientConfig, HttpClient};
 use tokeira_proto::connect::tokeira::internal::controller::v1::{
-    MarkDrainingRequest, NominateRequest, PlacementControllerClient,
+    DescribeNodeDrainRequest, MarkDrainingRequest, NodeDrainState, NominateRequest,
+    PlacementControllerClient,
 };
 
 use crate::loop_c::RetirementCandidate;
+
+/// The controller's autoscaler-facing surface.
+#[async_trait]
+pub trait PlacementControl: Send + Sync + std::fmt::Debug {
+    /// Ask the controller which runtime nodes are safe to retire, ranked.
+    async fn nominate_scale_in_candidates(&self, limit: u32) -> Result<NominationResult>;
+
+    /// Ask the controller to drain a node. `false` means the controller does
+    /// not know the node, so nothing was marked and no drain was sent.
+    async fn mark_node_draining(&self, node_id: &str) -> Result<bool>;
+
+    /// The node's drain progress as last reported by its heartbeat, or `None`
+    /// when the controller has no record of the node.
+    async fn describe_node_drain(&self, node_id: &str) -> Result<Option<NodeDrainState>>;
+}
 
 /// Autoscaler's view of the placement controller.
 pub struct ControllerClient {
@@ -45,9 +68,11 @@ impl ControllerClient {
             client: PlacementControllerClient::new(http, config),
         })
     }
+}
 
-    /// Ask the controller which runtime hosts are safe to retire.
-    pub async fn nominate_scale_in_candidates(&self, limit: u32) -> Result<NominationResult> {
+#[async_trait]
+impl PlacementControl for ControllerClient {
+    async fn nominate_scale_in_candidates(&self, limit: u32) -> Result<NominationResult> {
         let response = self
             .client
             .nominate_scale_in_candidates(NominateRequest {
@@ -61,9 +86,7 @@ impl ControllerClient {
         let candidates = owned
             .candidates
             .into_iter()
-            .map(|c| RetirementCandidate {
-                instance_id: c.node_id,
-            })
+            .map(|c| RetirementCandidate { node_id: c.node_id })
             .collect();
 
         Ok(NominationResult {
@@ -73,8 +96,7 @@ impl ControllerClient {
         })
     }
 
-    /// Tell the controller to stop assigning bundles to a node and begin drain.
-    pub async fn mark_node_draining(&self, node_id: &str) -> Result<bool> {
+    async fn mark_node_draining(&self, node_id: &str) -> Result<bool> {
         let response = self
             .client
             .mark_node_draining(MarkDrainingRequest {
@@ -85,5 +107,27 @@ impl ControllerClient {
             .map_err(|e| anyhow!("mark_node_draining failed: {e}"))?;
 
         Ok(response.into_owned().accepted)
+    }
+
+    async fn describe_node_drain(&self, node_id: &str) -> Result<Option<NodeDrainState>> {
+        let response = self
+            .client
+            .describe_node_drain(DescribeNodeDrainRequest {
+                node_id: node_id.to_owned(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow!("describe_node_drain failed: {e}"))?;
+
+        let owned = response.into_owned();
+        if !owned.known {
+            return Ok(None);
+        }
+        match owned.state {
+            EnumValue::Known(state) => Ok(Some(state)),
+            // A newer controller may add states; an unrecognised one must
+            // hold the retirement rather than be mistaken for any known phase.
+            EnumValue::Unknown(raw) => bail!("controller reported an unknown drain state {raw}"),
+        }
     }
 }

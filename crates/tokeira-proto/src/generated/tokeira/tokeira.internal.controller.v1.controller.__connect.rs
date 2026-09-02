@@ -38,6 +38,14 @@ pub type OwnedMarkDrainingRequestView = ::buffa::view::OwnedView<
 pub type OwnedMarkDrainingResponseView = ::buffa::view::OwnedView<
     __buffa::view::MarkDrainingResponseView<'static>,
 >;
+///Shorthand for `OwnedView<DescribeNodeDrainRequestView<'static>>`.
+pub type OwnedDescribeNodeDrainRequestView = ::buffa::view::OwnedView<
+    __buffa::view::DescribeNodeDrainRequestView<'static>,
+>;
+///Shorthand for `OwnedView<DescribeNodeDrainResponseView<'static>>`.
+pub type OwnedDescribeNodeDrainResponseView = ::buffa::view::OwnedView<
+    __buffa::view::DescribeNodeDrainResponseView<'static>,
+>;
 impl ::connectrpc::Encodable<ControllerDirective>
 for __buffa::view::ControllerDirectiveView<'_> {
     fn encode(
@@ -127,6 +135,24 @@ for ::buffa::view::OwnedView<__buffa::view::MarkDrainingResponseView<'static>> {
         ::connectrpc::__codegen::encode_view_body(&**self, codec)
     }
 }
+impl ::connectrpc::Encodable<DescribeNodeDrainResponse>
+for __buffa::view::DescribeNodeDrainResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<DescribeNodeDrainResponse>
+for ::buffa::view::OwnedView<__buffa::view::DescribeNodeDrainResponseView<'static>> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+    }
+}
 /// Full service name for this service.
 pub const PLACEMENT_CONTROLLER_SERVICE_NAME: &str = "tokeira.internal.controller.v1.PlacementController";
 /// Static [`Spec`](::connectrpc::Spec) for the server-side `RuntimeMembership` RPC.
@@ -171,6 +197,15 @@ pub const PLACEMENT_CONTROLLER_NOMINATE_SCALE_IN_CANDIDATES_SPEC: ::connectrpc::
 /// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
 pub const PLACEMENT_CONTROLLER_MARK_NODE_DRAINING_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/tokeira.internal.controller.v1.PlacementController/MarkNodeDraining",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `DescribeNodeDrain` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const PLACEMENT_CONTROLLER_DESCRIBE_NODE_DRAIN_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/tokeira.internal.controller.v1.PlacementController/DescribeNodeDrain",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
@@ -269,6 +304,20 @@ pub trait PlacementController: Send + Sync + 'static {
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<MarkDrainingResponse> + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// Handle the DescribeNodeDrain RPC.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    fn describe_node_drain<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: OwnedDescribeNodeDrainRequestView,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                DescribeNodeDrainResponse,
+            > + Send + use<'a, Self>,
         >,
     > + Send;
 }
@@ -380,6 +429,22 @@ impl<S: PlacementController> PlacementControllerExt for S {
                 },
             )
             .with_spec(PLACEMENT_CONTROLLER_MARK_NODE_DRAINING_SPEC)
+            .route_view(
+                PLACEMENT_CONTROLLER_SERVICE_NAME,
+                "DescribeNodeDrain",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |ctx, req, format| {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            svc.describe_node_drain(ctx, req)
+                                .await?
+                                .encode::<DescribeNodeDrainResponse>(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(PLACEMENT_CONTROLLER_DESCRIBE_NODE_DRAIN_SPEC)
     }
 }
 /// Monomorphic dispatcher for `PlacementController`.
@@ -458,6 +523,12 @@ impl<T: PlacementController> ::connectrpc::Dispatcher for PlacementControllerSer
                         .with_spec(PLACEMENT_CONTROLLER_MARK_NODE_DRAINING_SPEC),
                 )
             }
+            "DescribeNodeDrain" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(PLACEMENT_CONTROLLER_DESCRIBE_NODE_DRAIN_SPEC),
+                )
+            }
             _ => None,
         }
     }
@@ -505,6 +576,17 @@ impl<T: PlacementController> ::connectrpc::Dispatcher for PlacementControllerSer
                     svc.mark_node_draining(ctx, req)
                         .await?
                         .encode::<MarkDrainingResponse>(format)
+                })
+            }
+            "DescribeNodeDrain" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
+                        __buffa::view::DescribeNodeDrainRequestView,
+                    >(request.encoded()?, format)?;
+                    svc.describe_node_drain(ctx, req)
+                        .await?
+                        .encode::<DescribeNodeDrainResponse>(format)
                 })
             }
             _ => ::connectrpc::dispatcher::codegen::unimplemented_unary(path),
@@ -846,6 +928,47 @@ where
                 &self.config,
                 PLACEMENT_CONTROLLER_SERVICE_NAME,
                 "MarkNodeDraining",
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the DescribeNodeDrain RPC. Sends a request to /tokeira.internal.controller.v1.PlacementController/DescribeNodeDrain.
+    pub async fn describe_node_drain(
+        &self,
+        request: DescribeNodeDrainRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                __buffa::view::DescribeNodeDrainResponseView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.describe_node_drain_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the DescribeNodeDrain RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn describe_node_drain_with_options(
+        &self,
+        request: DescribeNodeDrainRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                __buffa::view::DescribeNodeDrainResponseView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                PLACEMENT_CONTROLLER_SERVICE_NAME,
+                "DescribeNodeDrain",
                 request,
                 options,
             )

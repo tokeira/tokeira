@@ -10,6 +10,10 @@ service PlacementController {
   rpc RefreshBundle(RefreshBundleRequest) returns (RefreshBundleResponse);
   rpc NominateScaleInCandidates(NominateRequest) returns (NominateResponse);
   rpc MarkNodeDraining(MarkDrainingRequest) returns (MarkDrainingResponse);
+  // Read-only drain progress for one node, as last reported by its heartbeat.
+  // Separate from MarkNodeDraining so a poll loop never re-marks a node and
+  // overwrites a SAFE_TO_TERMINATE verdict with DRAINING.
+  rpc DescribeNodeDrain(DescribeNodeDrainRequest) returns (DescribeNodeDrainResponse);
 }
 
 message RuntimeMembershipRequest {
@@ -166,4 +170,16 @@ message MarkDrainingRequest {
 
 message MarkDrainingResponse {
   bool accepted = 1;
+}
+
+message DescribeNodeDrainRequest {
+  string node_id = 1;
+}
+
+message DescribeNodeDrainResponse {
+  // False when this controller has no record of the node: it never registered
+  // here and was never marked draining. `state` is UNSPECIFIED in that case;
+  // a registered node that is not draining reports ACTIVE.
+  bool known = 1;
+  NodeDrainState state = 2;
 }

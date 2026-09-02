@@ -16,7 +16,7 @@ use tonic::Status;
 
 use crate::{
     ControllerConfig, DrainCoordinator, GenerationManager, LiveMembership,
-    membership::ControllerDirective,
+    membership::{ControllerDirective, NodeDrainState},
     metrics,
     placement::{
         ConnectionBudgetDirective, DesiredPlacementDirective, compute_connection_budget,
@@ -190,10 +190,31 @@ impl PlacementControllerState {
 
     /// Queue the required placement and connection-budget baseline for a newly
     /// registered runtime before its response stream is returned.
+    ///
+    /// A node the coordinator already holds under drain gets the drain again
+    /// instead of a baseline: drain is level-triggered, so an incarnation that
+    /// reopens its stream mid-drain must neither acquire bundles nor be counted
+    /// in budget allocation. Registration reset its membership state to
+    /// `Active`; it is put back to `Draining` here. The placement loop may run
+    /// in the short window between the two, which is benign: any acquire it
+    /// sends is undone by the drain that follows on the same stream.
     pub(crate) async fn publish_initial_directives(
         &self,
         node_id: IncarnationId,
     ) -> Result<(), Status> {
+        if self.drain.read().await.is_draining(node_id) {
+            let sender = {
+                let mut membership = self.membership.write().await;
+                membership.mark_draining(node_id);
+                membership
+                    .directive_sender(node_id)
+                    .ok_or_else(|| Status::internal("membership directive stream is unavailable"))?
+            };
+            return sender
+                .send(ControllerDirective::Drain)
+                .await
+                .map_err(|_| Status::internal("membership directive stream closed"));
+        }
         let leases = self
             .leases
             .list_bundle_leases()
@@ -229,6 +250,61 @@ impl PlacementControllerState {
             .await
             .map_err(|_| Status::internal("membership directive stream closed"))?;
         Ok(())
+    }
+
+    /// Mark a node draining and deliver the drain directive on its membership
+    /// stream (Req 8.1.1, 8.1.4). Returns `false` for a node this controller
+    /// does not know: there is nothing to tell to drain.
+    ///
+    /// A known node whose stream is down is still accepted: the intent is
+    /// recorded in the coordinator and the directive is re-sent when the
+    /// node's stream reopens (`publish_initial_directives`). The membership and
+    /// coordinator locks are released before awaiting channel capacity, as
+    /// `publish_desired_placements` does, so a slow runtime stream cannot stall
+    /// heartbeat processing for the rest of the controller.
+    pub async fn mark_node_draining(&self, node_id: IncarnationId) -> bool {
+        let sender = {
+            let mut membership = self.membership.write().await;
+            if !membership.mark_draining(node_id) {
+                return false;
+            }
+            membership.directive_sender(node_id)
+        };
+        {
+            let mut drain = self.drain.write().await;
+            drain.mark_draining(node_id);
+            metrics::set_drain_active_nodes(drain.active_count());
+        }
+        match sender {
+            Some(sender) => {
+                if sender.send(ControllerDirective::Drain).await.is_err() {
+                    tracing::warn!(
+                        %node_id,
+                        "drain directive not delivered: membership stream closed; \
+                         it is re-sent when the node reconnects"
+                    );
+                }
+            }
+            None => tracing::warn!(
+                %node_id,
+                "drain directive deferred: node has no live membership stream"
+            ),
+        }
+        true
+    }
+
+    /// Drain progress for one node as this controller knows it: the latest
+    /// heartbeat verdict for a node under drain, `Active` for a registered
+    /// node that is not draining, `None` for a node never seen.
+    pub async fn describe_node_drain(&self, node_id: IncarnationId) -> Option<NodeDrainState> {
+        if let Some(state) = self.drain.read().await.drain_state(node_id) {
+            return Some(state);
+        }
+        self.membership
+            .read()
+            .await
+            .get(node_id)
+            .map(|_| NodeDrainState::Active)
     }
 
     fn placement_config(&self) -> PlacementConfig {
@@ -393,6 +469,36 @@ mod tests {
         assert_eq!(budgets[0].1.capacity, 6);
         assert_eq!(budgets[1].1.capacity, 5);
         assert!(budgets[0].1.valid_until > OffsetDateTime::now_utc());
+    }
+
+    #[tokio::test]
+    async fn marking_a_node_draining_sends_the_directive_and_excludes_it_from_placement() {
+        let state = state();
+        let node_id = IncarnationId::new();
+        let mut rx = register_with_directives(&state, node_id).await;
+
+        assert!(!state.mark_node_draining(IncarnationId::new()).await);
+        assert!(state.mark_node_draining(node_id).await);
+        assert_eq!(rx.recv().await, Some(ControllerDirective::Drain));
+        assert_eq!(
+            state.describe_node_drain(node_id).await,
+            Some(NodeDrainState::Draining)
+        );
+        assert_eq!(state.publish_desired_placements().await.unwrap(), 0);
+        assert_eq!(
+            state
+                .allocate_and_publish_connection_budgets(node_id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // A stream reopened by the draining incarnation gets the drain again,
+        // never a placement or budget baseline.
+        let mut reopened = register_with_directives(&state, node_id).await;
+        state.publish_initial_directives(node_id).await.unwrap();
+        assert_eq!(reopened.recv().await, Some(ControllerDirective::Drain));
+        assert_eq!(state.publish_desired_placements().await.unwrap(), 0);
     }
 
     #[tokio::test]

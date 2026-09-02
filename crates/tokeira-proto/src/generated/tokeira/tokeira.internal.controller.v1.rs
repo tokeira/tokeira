@@ -276,6 +276,23 @@ pub struct MarkDrainingResponse {
     #[prost(bool, tag = "1")]
     pub accepted: bool,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DescribeNodeDrainRequest {
+    #[prost(string, tag = "1")]
+    pub node_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DescribeNodeDrainResponse {
+    /// False when this controller has no record of the node: it never registered
+    /// here and was never marked draining. `state` is UNSPECIFIED in that case;
+    /// a registered node that is not draining reports ACTIVE.
+    #[prost(bool, tag = "1")]
+    pub known: bool,
+    #[prost(enumeration = "NodeDrainState", tag = "2")]
+    pub state: i32,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum NodeDrainState {
@@ -545,6 +562,39 @@ pub mod placement_controller_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Read-only drain progress for one node, as last reported by its heartbeat.
+        /// Separate from MarkNodeDraining so a poll loop never re-marks a node and
+        /// overwrites a SAFE_TO_TERMINATE verdict with DRAINING.
+        pub async fn describe_node_drain(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DescribeNodeDrainRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DescribeNodeDrainResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tokeira.internal.controller.v1.PlacementController/DescribeNodeDrain",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "tokeira.internal.controller.v1.PlacementController",
+                        "DescribeNodeDrain",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -599,6 +649,16 @@ pub mod placement_controller_server {
             request: tonic::Request<super::MarkDrainingRequest>,
         ) -> std::result::Result<
             tonic::Response<super::MarkDrainingResponse>,
+            tonic::Status,
+        >;
+        /// Read-only drain progress for one node, as last reported by its heartbeat.
+        /// Separate from MarkNodeDraining so a poll loop never re-marks a node and
+        /// overwrites a SAFE_TO_TERMINATE verdict with DRAINING.
+        async fn describe_node_drain(
+            &self,
+            request: tonic::Request<super::DescribeNodeDrainRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DescribeNodeDrainResponse>,
             tonic::Status,
         >;
     }
@@ -920,6 +980,56 @@ pub mod placement_controller_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = MarkNodeDrainingSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tokeira.internal.controller.v1.PlacementController/DescribeNodeDrain" => {
+                    #[allow(non_camel_case_types)]
+                    struct DescribeNodeDrainSvc<T: PlacementController>(pub Arc<T>);
+                    impl<
+                        T: PlacementController,
+                    > tonic::server::UnaryService<super::DescribeNodeDrainRequest>
+                    for DescribeNodeDrainSvc<T> {
+                        type Response = super::DescribeNodeDrainResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DescribeNodeDrainRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PlacementController>::describe_node_drain(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = DescribeNodeDrainSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

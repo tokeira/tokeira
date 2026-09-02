@@ -162,10 +162,13 @@ impl ReservoirController {
         }
     }
 
-    fn config(&self) -> &ReservoirConfig {
+    /// Live warm-connection target. Only the distributed reservoir can be
+    /// capped by a controller budget; the embedded pool's target is its
+    /// configuration.
+    fn target_ready(&self) -> usize {
         match self {
-            Self::Distributed(reservoir) => reservoir.config(),
-            Self::Embedded(reservoir) => reservoir.config(),
+            Self::Distributed(reservoir) => reservoir.target_ready(),
+            Self::Embedded(reservoir) => reservoir.config().target_ready,
         }
     }
 }
@@ -258,6 +261,39 @@ impl DsqlConnectionDirector {
         allocations: &HashMap<DbClass, usize>,
     ) -> Result<()> {
         self.class_budgets.reconfigure(allocations).await
+    }
+
+    /// Apply a placement-controller connection budget to the reservoir: cap
+    /// the warm target at `min(configured target_ready, max_reservoir_size)`
+    /// and retire idle connections above it. Returns how many were retired.
+    ///
+    /// A directive can only lower the target, never raise it above the
+    /// operator's configuration; the cluster-wide share is a ceiling on this
+    /// node, not a licence to exceed local limits. Only the distributed
+    /// reservoir is budgeted: the embedded engine never joins a placement
+    /// controller, so a directive reaching an embedded director is a wiring
+    /// error and is reported as one.
+    pub fn apply_connection_budget(&self, max_reservoir_size: u32) -> Result<usize> {
+        let ReservoirController::Distributed(reservoir) = self.reservoir.as_ref() else {
+            bail!("connection budgets apply only to the distributed DSQL reservoir");
+        };
+        let target = usize::try_from(max_reservoir_size)
+            .unwrap_or(usize::MAX)
+            .min(reservoir.config().target_ready)
+            .max(1);
+        reservoir.reconfigure_target(u32::try_from(target).unwrap_or(u32::MAX));
+        Ok(reservoir.retire_excess(u32::try_from(target).unwrap_or(u32::MAX)))
+    }
+
+    /// Warm connections available for immediate checkout, reported to the
+    /// placement controller as this node's connection headroom.
+    pub fn ready_connections(&self) -> usize {
+        self.reservoir.ready_count()
+    }
+
+    /// Live warm-connection target after any controller cap.
+    pub fn reservoir_target(&self) -> usize {
+        self.reservoir.target_ready()
     }
 
     /// Install the singleton-owner gate on an embedded director exactly once.
@@ -756,7 +792,10 @@ fn spawn_periodic_reporter(
             let in_flight = in_flight.load(Ordering::Acquire);
             metrics::record_dsql_pool_connections_total(ready);
             metrics::set_dsql_reservoir_ready_connections(ready);
-            metrics::set_dsql_reservoir_target_connections(reservoir.config().target_ready);
+            // The live target, not the configured one: after a controller
+            // budget cap the two differ, and re-reporting the configured value
+            // every tick would make the gauge flap against the cap.
+            metrics::set_dsql_reservoir_target_connections(reservoir.target_ready());
             metrics::set_dsql_reservoir_in_flight(in_flight);
             metrics::set_dsql_reservoir_utilization_ratio(in_flight, ready);
             let total = ready + in_flight;
@@ -945,6 +984,42 @@ mod tests {
         drop(permit);
         assert_eq!(in_flight.load(Ordering::Acquire), 0);
         assert_eq!(leak_tracker.active_count(), 0);
+    }
+
+    fn distributed_director(target_ready: usize) -> DsqlConnectionDirector {
+        let config = DsqlPoolConfig {
+            reservoir: ReservoirConfig {
+                target_ready,
+                ..ReservoirConfig::default()
+            },
+            ..DsqlPoolConfig::default()
+        };
+        let reservoir = Reservoir::idle_for_tests(config.reservoir.clone());
+        DsqlConnectionDirector::start(config, reservoir).unwrap()
+    }
+
+    #[tokio::test]
+    async fn connection_budget_caps_distributed_reservoir_target() {
+        let director = distributed_director(8);
+        assert_eq!(director.reservoir_target(), 8);
+
+        assert_eq!(director.apply_connection_budget(3).unwrap(), 0);
+        assert_eq!(director.reservoir_target(), 3);
+        assert_eq!(director.ready_connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_budget_never_raises_target_above_configuration() {
+        let director = distributed_director(8);
+
+        director.apply_connection_budget(3).unwrap();
+        director.apply_connection_budget(100).unwrap();
+        assert_eq!(director.reservoir_target(), 8);
+
+        // The expiry reset a runtime applies after a dropped controller
+        // stream: a share of one keeps the node alive at the floor.
+        director.apply_connection_budget(0).unwrap();
+        assert_eq!(director.reservoir_target(), 1);
     }
 
     #[test]

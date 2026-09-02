@@ -205,6 +205,14 @@ where
         }
         Ok(())
     }
+
+    fn heartbeat_inputs(
+        &self,
+        available_connections: u32,
+        connection_rate_headroom: f32,
+    ) -> HeartbeatInputs {
+        TokeiraRuntime::heartbeat_inputs(self, available_connections, connection_rate_headroom)
+    }
 }
 
 impl<R> TokeiraRuntime<R>
@@ -262,18 +270,22 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
+
+        fn available_connections(&self) -> u32 {
+            0
+        }
     }
 
-    #[tokio::test]
-    async fn directive_takeover_activates_shard_and_passes_commit_fence() -> Result<()> {
-        let store = Arc::new(InMemoryStore::default());
+    fn runtime_with_membership_client(
+        store: Arc<InMemoryStore>,
+    ) -> (Arc<TokeiraRuntime<InMemoryStore>>, MembershipClient) {
         let node_id = IncarnationId::new();
         let endpoint = NodeEndpoint {
             host: "127.0.0.1".to_owned(),
             port: 7233,
         };
         let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
-            Arc::clone(&store),
+            store,
             1,
             LaneConfig::default(),
             TimerScannerConfig::default(),
@@ -307,19 +319,28 @@ mod tests {
             Arc::clone(&runtime.runtime_drain),
             Arc::new(NoopBudgetApplier),
         );
+        (runtime, client)
+    }
 
-        client
-            .handle_directive(pb::ControllerDirective {
-                directive: Some(controller_directive::Directive::DesiredPlacement(
-                    pb::DesiredPlacementDirective {
-                        acquire_bundles: vec![0],
-                        ..Default::default()
-                    }
-                    .into(),
-                )),
-                ..Default::default()
-            })
-            .await?;
+    fn desired_placement(acquire_bundles: Vec<u32>) -> pb::ControllerDirective {
+        pb::ControllerDirective {
+            directive: Some(controller_directive::Directive::DesiredPlacement(
+                pb::DesiredPlacementDirective {
+                    acquire_bundles,
+                    ..Default::default()
+                }
+                .into(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn directive_takeover_activates_shard_and_passes_commit_fence() -> Result<()> {
+        let store = Arc::new(InMemoryStore::default());
+        let (runtime, client) = runtime_with_membership_client(Arc::clone(&store));
+
+        client.handle_directive(desired_placement(vec![0])).await?;
 
         let epoch = runtime
             .shard_owner
@@ -332,6 +353,62 @@ mod tests {
         let result = runtime.start_workflow(request).await?;
         assert!(matches!(result, CommitResult::Applied { .. }));
         assert_eq!(runtime.current_shard_epoch(run_key).await?, epoch);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_directive_relinquishes_shards_and_next_heartbeat_reports_safe() -> Result<()> {
+        let store = Arc::new(InMemoryStore::default());
+        let (runtime, client) = runtime_with_membership_client(Arc::clone(&store));
+        client.handle_directive(desired_placement(vec![0])).await?;
+        let epoch = runtime
+            .shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .owns(ShardId(0))
+            .expect("takeover must finish in Active");
+
+        client
+            .handle_directive(pb::ControllerDirective {
+                directive: Some(controller_directive::Directive::Drain(
+                    pb::DrainDirective::default().into(),
+                )),
+                ..Default::default()
+            })
+            .await?;
+
+        // Ownership left this node through the epoch-checked relinquish: the
+        // durable lease row is unowned, so a successor can acquire at a higher
+        // epoch, and the local owner view no longer admits shard 0.
+        let lease = store
+            .list_bundle_leases()
+            .await?
+            .into_iter()
+            .find(|lease| lease.bundle_id == ShardId(0))
+            .expect("lease row for shard 0");
+        assert_eq!(lease.owner_node_id, None);
+        assert!(lease.epoch.0 >= epoch.0);
+        assert_eq!(
+            runtime
+                .shard_owner
+                .read()
+                .expect("shard_owner lock poisoned")
+                .owned_shards()
+                .count(),
+            0
+        );
+
+        let heartbeat = client.heartbeat_message();
+        assert_eq!(heartbeat.owned_bundle_count, 0);
+        assert_eq!(
+            heartbeat.drain_state,
+            buffa::EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE)
+        );
+
+        // Work routed here after the drain is refused rather than committed
+        // under an epoch this node no longer holds.
+        let refused = runtime.start_workflow(start_request()).await;
+        assert!(refused.is_err(), "start after relinquish must be refused");
         Ok(())
     }
 

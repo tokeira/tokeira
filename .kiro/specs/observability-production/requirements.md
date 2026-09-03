@@ -260,8 +260,13 @@ The following guidance applies to all new span and metric instrumentation in thi
 2. THE Storage_Layer SHALL expose `tokeira_dsql_pool_class_in_use` as a gauge with a `class` label reflecting the current number of permits held.
 3. THE Storage_Layer SHALL expose `tokeira_dsql_pool_class_waiters` as a gauge with a `class` label reflecting the number of tasks waiting for a permit.
 4. THE Storage_Layer SHALL record permit acquisition wait time in `tokeira_dsql_class_permit_wait_duration_seconds` histogram with a `class` label.
-5. WHEN a class utilization ratio (`in_use / budget_total`) exceeds the configured warning threshold, defaulting to 0.9, THE Storage_Layer SHALL emit a Structured_Log at WARN level identifying the saturated class.
+5. WHEN a class-budget observation finds a permit acquisition that has remained pending for at least 5 seconds and that class has not emitted a pressure warning in the preceding 60 seconds, THE Storage_Layer SHALL emit a Structured_Log at WARN level identifying the class and the longest current permit wait.
 6. THE Storage_Layer SHALL expose `tokeira_dsql_pool_class_saturation_ratio` as a gauge with a `class` label.
+7. WHILE no permit acquisition has remained pending for at least 5 seconds, THE Storage_Layer SHALL NOT emit a class-budget pressure warning, including when a single-permit class is fully occupied.
+8. THE Storage_Layer SHALL observe pending class permit acquisitions at least on each existing 5-second class-budget reporting tick, including acquisitions that never complete.
+9. WHEN a permit acquisition succeeds, fails, or is cancelled, THE Storage_Layer SHALL remove that acquisition from current pressure accounting.
+10. THE Storage_Layer SHALL preserve the per-class 60-second warning cooldown across recovery and budget reconfiguration within one connection director's lifetime.
+11. THE Storage_Layer SHALL continue recording class-budget utilization independently of warning eligibility and SHALL preserve the embedded connection defaults.
 
 ### Requirement 15: Runtime and Lane Observability
 

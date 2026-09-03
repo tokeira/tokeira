@@ -1,4 +1,4 @@
-//! Regression probes for Temporal Rust SDK 0.7.0 shutdown with an Activity retry pending.
+//! Regression probes for Temporal Rust SDK worker shutdown with an Activity retry pending.
 //!
 //! The ordinary spike remains the clean completed-workflow path. These separate
 //! probes order shutdown after the provider announces an imminent retryable
@@ -6,9 +6,10 @@
 //! drains its event-to-heartbeat pump and records a final heartbeat before
 //! returning the error, matching Odori's race. The probes cover both storage
 //! modes and both same-runtime and Odori-shaped dedicated-thread worker
-//! placement. On unfixed code, the ignored managed-DSQL dedicated-thread test
-//! reproduces SDK Core's slot-permit shutdown panic; the in-memory controls
-//! exit cleanly.
+//! placement. On SDK 0.7.0 the ignored managed-DSQL dedicated-thread test
+//! reproduced SDK Core's slot-permit shutdown panic; 0.8.0 drains in-flight
+//! completions before the permit check, and every probe is expected to exit
+//! cleanly. The in-memory controls are the always-runnable half of that proof.
 
 use std::{
     collections::BTreeMap,
@@ -45,7 +46,8 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(60);
 const IN_MEMORY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_DSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const MANAGED_DSQL_STARTUP_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
-// Odori does not override SDK 0.7.0's default, so its workers retain this cache size.
+// Odori does not override the SDK default (unchanged in 0.8.0), so its workers retain
+// this cache size.
 const ODORI_MAX_CACHED_WORKFLOWS: usize = 1_000;
 
 #[derive(Debug)]

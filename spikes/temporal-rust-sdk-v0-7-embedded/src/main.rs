@@ -1,4 +1,4 @@
-//! Temporal Rust SDK 0.7.0 workflow and activity against embedded Tokeira.
+//! Temporal Rust SDK 0.8.0 workflow and activity against embedded Tokeira.
 
 use std::{net::TcpListener, time::Duration};
 
@@ -79,7 +79,7 @@ async fn run() -> Result<()> {
         .build();
     let connection = Connection::connect(connection_options)
         .await
-        .context("connect Temporal Rust SDK 0.7.0 through service_override")?;
+        .context("connect Temporal Rust SDK 0.8.0 through service_override")?;
     if connection.capabilities().is_none() {
         bail!("embedded GetSystemInfo response omitted server capabilities");
     }
@@ -133,7 +133,7 @@ async fn run() -> Result<()> {
     if result != EXPECTED_RESULT {
         bail!("unexpected workflow result: {result:?}");
     }
-    println!("Temporal Rust SDK: 0.7.0");
+    println!("Temporal Rust SDK: 0.8.0");
     println!("Transport: temporalio-client::service_override (no TCP listener)");
     println!("Workflow run_id: {run_id}");
     println!("Workflow result: {result}");

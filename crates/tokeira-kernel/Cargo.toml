@@ -22,7 +22,7 @@ smallvec.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
-tokeira-types = { path = "../tokeira-types", version = "0.1.1" }
+tokeira-types = { path = "../tokeira-types", version = "0.1.2" }
 
 [dev-dependencies]
 postcard = { version = "1.0", features = ["alloc"] }

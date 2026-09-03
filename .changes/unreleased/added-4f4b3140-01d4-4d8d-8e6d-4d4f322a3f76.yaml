@@ -1,4 +1,0 @@
-kind: added
-body: Add a deterministic, resumable release engineering pipeline.
-custom:
-  Slice: 4f4b3140-01d4-4d8d-8e6d-4d4f322a3f76

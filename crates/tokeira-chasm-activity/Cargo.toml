@@ -23,10 +23,10 @@ serde.workspace = true
 thiserror.workspace = true
 prost = "0.12"
 postcard = { version = "1.0", features = ["alloc"] }
-tokeira-chasm = { path = "../tokeira-chasm", version = "0.1.1" }
-tokeira-chasm-derive = { path = "../tokeira-chasm-derive", version = "0.1.1" }
-tokeira-types = { path = "../tokeira-types", version = "0.1.1" }
-tokeira-proto = { path = "../tokeira-proto", version = "0.1.1" }
+tokeira-chasm = { path = "../tokeira-chasm", version = "0.1.2" }
+tokeira-chasm-derive = { path = "../tokeira-chasm-derive", version = "0.1.2" }
+tokeira-types = { path = "../tokeira-types", version = "0.1.2" }
+tokeira-proto = { path = "../tokeira-proto", version = "0.1.2" }
 
 [dev-dependencies]
 proptest = "1.6"

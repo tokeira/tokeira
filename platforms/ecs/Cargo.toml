@@ -9,7 +9,7 @@ authors.workspace = true
 
 [package.metadata.tokeira.platform]
 id = "ecs"
-engine = "0.1.1"
+engine = "0.1.2"
 default = false
 # The Rust root is seeded when no format is requested; the Python root is a
 # peer projection of the same modular definition and is selected explicitly.

@@ -72,7 +72,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -176,22 +176,22 @@ tokeira-iac = { path = "crates/tokeira-iac" }
 tokeira-report = { path = "crates/tokeira-report" }
 tokeira-explain = { path = "crates/tokeira-explain" }
 tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
-tokeira-config = { path = "crates/tokeira-config", version = "0.1.1" }
-tokeira-managed-dsql = { path = "crates/tokeira-managed-dsql", version = "0.1.1" }
+tokeira-config = { path = "crates/tokeira-config", version = "0.1.2" }
+tokeira-managed-dsql = { path = "crates/tokeira-managed-dsql", version = "0.1.2" }
 tokeira-aws = { path = "crates/tokeira-aws" }
 tokeira-platform = { path = "crates/tokeira-platform" }
 tokeira-platform-definition = { path = "crates/tokeira-platform-definition" }
 tokeira-secrets = { path = "crates/tokeira-secrets" }
 tokeira-k8s = { path = "crates/tokeira-k8s" }
-tokeira-observability = { path = "crates/tokeira-observability", version = "0.1.1" }
-tokeira-build-info = { path = "crates/tokeira-build-info", version = "0.1.1" }
-tokeira-compatibility = { path = "crates/tokeira-compatibility", version = "0.1.1" }
+tokeira-observability = { path = "crates/tokeira-observability", version = "0.1.2" }
+tokeira-build-info = { path = "crates/tokeira-build-info", version = "0.1.2" }
+tokeira-compatibility = { path = "crates/tokeira-compatibility", version = "0.1.2" }
 tokeira-compatibility-proto = { path = "crates/tokeira-compatibility-proto" }
 tokeira-compatibility-service = { path = "crates/tokeira-compatibility-service" }
 tokeira-conformance = { path = "crates/tokeira-conformance" }
 tokeira-conformance-proto = { path = "crates/tokeira-conformance-proto" }
 tokeira-conformance-control = { path = "crates/tokeira-conformance-control" }
-tokeira-auth = { path = "crates/tokeira-auth", version = "0.1.1" }
+tokeira-auth = { path = "crates/tokeira-auth", version = "0.1.2" }
 tokeira-build = { path = "crates/tokeira-build" }
 # Deployment-repository machinery (spec-sanctioned dependency additions):
 # TUF client/authoring, KMS-held role keys, and the timestamp types tough's

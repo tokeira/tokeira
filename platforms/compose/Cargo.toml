@@ -13,7 +13,7 @@ authors.workspace = true
 # its `mod` declarations — the descriptor names roots only.
 [package.metadata.tokeira.platform]
 id = "compose"
-engine = "0.1.1"
+engine = "0.1.2"
 default = false
 # Seeded when `deployment create` names no --format; the package supplies
 # peer roots for both `tkd` and `tkdp`.

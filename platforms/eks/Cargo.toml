@@ -9,7 +9,7 @@ authors.workspace = true
 
 [package.metadata.tokeira.platform]
 id = "eks"
-engine = "0.1.1"
+engine = "0.1.2"
 default = false
 default-format = "tkd"
 definitions = ["deployment.tkd", "definition.tkdp"]

@@ -33,10 +33,10 @@ thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tokeira-kernel = { path = "../tokeira-kernel", version = "0.1.1" }
-tokeira-observability = { path = "../tokeira-observability", version = "0.1.1" }
-tokeira-types = { path = "../tokeira-types", version = "0.1.1" }
-tokeira-chasm = { path = "../tokeira-chasm", version = "0.1.1" }
+tokeira-kernel = { path = "../tokeira-kernel", version = "0.1.2" }
+tokeira-observability = { path = "../tokeira-observability", version = "0.1.2" }
+tokeira-types = { path = "../tokeira-types", version = "0.1.2" }
+tokeira-chasm = { path = "../tokeira-chasm", version = "0.1.2" }
 uuid.workspace = true
 
 [features]

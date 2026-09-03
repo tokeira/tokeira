@@ -52,35 +52,35 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dependencies.tokeira-kernel]
 path = "../tokeira-kernel"
-version = "0.1.1"
+version = "0.1.2"
 
 [dependencies.tokeira-proto]
 path = "../tokeira-proto"
-version = "0.1.1"
+version = "0.1.2"
 
 [dependencies.tokeira-runtime]
 path = "../tokeira-runtime"
-version = "0.1.1"
+version = "0.1.2"
 
 [dependencies.tokeira-chasm]
 path = "../tokeira-chasm"
-version = "0.1.1"
+version = "0.1.2"
 
 [dependencies.tokeira-chasm-activity]
 path = "../tokeira-chasm-activity"
-version = "0.1.1"
+version = "0.1.2"
 
 [dependencies.tokeira-storage]
 path = "../tokeira-storage"
-version = "0.1.1"
+version = "0.1.2"
 
 [dependencies.tokeira-types]
 path = "../tokeira-types"
-version = "0.1.1"
+version = "0.1.2"
 
 [dependencies.tokeira-projection]
 path = "../tokeira-projection"
-version = "0.1.1"
+version = "0.1.2"
 
 [features]
 # Compiles the dynamic-override read seam into the admission sites

@@ -44,13 +44,13 @@ tonic.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 uuid.workspace = true
-tokeira-kernel = { path = "../tokeira-kernel", version = "0.1.1" }
-tokeira-observability = { path = "../tokeira-observability", version = "0.1.1" }
-tokeira-projection = { path = "../tokeira-projection", version = "0.1.1" }
-tokeira-proto = { path = "../tokeira-proto", version = "0.1.1" }
-tokeira-storage = { path = "../tokeira-storage", version = "0.1.1" }
-tokeira-types = { path = "../tokeira-types", version = "0.1.1" }
-tokeira-chasm = { path = "../tokeira-chasm", version = "0.1.1" }
+tokeira-kernel = { path = "../tokeira-kernel", version = "0.1.2" }
+tokeira-observability = { path = "../tokeira-observability", version = "0.1.2" }
+tokeira-projection = { path = "../tokeira-projection", version = "0.1.2" }
+tokeira-proto = { path = "../tokeira-proto", version = "0.1.2" }
+tokeira-storage = { path = "../tokeira-storage", version = "0.1.2" }
+tokeira-types = { path = "../tokeira-types", version = "0.1.2" }
+tokeira-chasm = { path = "../tokeira-chasm", version = "0.1.2" }
 prost = "0.12"
 
 [features]

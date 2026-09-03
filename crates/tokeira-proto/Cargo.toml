@@ -29,7 +29,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 [dependencies.tokeira-types]
 path = "../tokeira-types"
-version = "0.1.1"
+version = "0.1.2"
 
 [dev-dependencies]
 serde_yaml.workspace = true

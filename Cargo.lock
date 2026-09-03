@@ -1938,7 +1938,7 @@ dependencies = [
 
 [[package]]
 name = "compatibility-docs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "proptest",
@@ -8781,7 +8781,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tkr"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8829,7 +8829,7 @@ dependencies = [
 
 [[package]]
 name = "tkw"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -8839,7 +8839,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-auth"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -8863,7 +8863,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-autoscaler"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8888,7 +8888,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-autoscaler-bin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8951,7 +8951,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-bench"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -8975,7 +8975,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-build"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "cargo_metadata",
@@ -8998,7 +8998,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-build-info"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "regex",
  "tempfile",
@@ -9007,7 +9007,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proptest",
  "prost 0.12.6",
@@ -9020,7 +9020,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm-activity"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "postcard",
  "proptest",
@@ -9036,7 +9036,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm-derive"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "prost 0.12.6",
@@ -9048,7 +9048,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-compatibility"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proptest",
  "serde",
@@ -9061,7 +9061,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-compatibility-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "buffa 0.6.0",
  "buffa-types 0.6.0",
@@ -9076,7 +9076,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-compatibility-service"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "buffa 0.6.0",
  "connectrpc 0.6.0",
@@ -9087,7 +9087,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-compose"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9110,7 +9110,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-compose-deployment"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9132,7 +9132,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "clap",
@@ -9149,7 +9149,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-conformance"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proptest",
  "thiserror 2.0.18",
@@ -9157,7 +9157,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-conformance-control"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "connectrpc 0.8.1",
  "tokeira-conformance",
@@ -9166,7 +9166,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-conformance-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "buffa 0.8.1",
  "buffa-types 0.8.1",
@@ -9181,7 +9181,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-controller"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9208,7 +9208,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-controller-bin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -9291,7 +9291,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-ecs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9316,7 +9316,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-ecs-deployment"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9343,7 +9343,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-edge"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -9394,7 +9394,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-eks-deployment"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9417,7 +9417,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9477,7 +9477,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-explain"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proptest",
  "serde",
@@ -9507,7 +9507,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-k8s"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9525,7 +9525,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-kernel"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "postcard",
  "proptest",
@@ -9542,7 +9542,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-local-deployment"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9559,7 +9559,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-managed-dsql"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -9577,7 +9577,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-observability"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "http-body-util",
@@ -9604,7 +9604,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-orchestrator"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9622,7 +9622,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-platform"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9642,7 +9642,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-platform-definition"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "monty",
  "monty-types",
@@ -9664,7 +9664,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-projection"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -9690,7 +9690,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "buffa 0.6.0",
  "buffa-types 0.6.0",
@@ -9710,7 +9710,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-report"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -9719,7 +9719,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-runtime"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9765,7 +9765,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-secrets"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -9798,7 +9798,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-storage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -9830,7 +9830,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-tkp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9858,7 +9858,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "proptest",
@@ -9870,7 +9870,7 @@ dependencies = [
 
 [[package]]
 name = "tokeirad"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",

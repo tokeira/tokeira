@@ -1,5 +1,5 @@
 format_version = 1
-tokeira_release = "0.1.1"
+tokeira_release = "0.1.2"
 minimum_supported_version = 1
 target_version = 67
 maximum_readable_version = 67

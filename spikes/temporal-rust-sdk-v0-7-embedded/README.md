@@ -1,9 +1,10 @@
-# Temporal Rust SDK 0.7 embedded-engine spike
+# Temporal Rust SDK embedded-engine spike
 
-This standalone spike runs the published Temporal Rust SDK `0.7.0` against
+This standalone spike runs the published Temporal Rust SDK `0.8.0` against
 `tokeira-engine` in one process. It starts an SDK worker, executes a workflow
 that calls an activity, waits for the typed result, and shuts both worker and
-engine down cleanly.
+engine down cleanly. The directory keeps its original name from the `0.7.0`
+run so links to it stay valid; the pins are what moved.
 
 The client and worker use `ConnectionOptions::service_override`; no Temporal
 TCP server or DNS lookup is involved. The program keeps the configured gRPC
@@ -19,19 +20,39 @@ cargo run --manifest-path spikes/temporal-rust-sdk-v0-7-embedded/Cargo.toml --lo
 Successful output ends with:
 
 ```text
-Temporal Rust SDK: 0.7.0
+Temporal Rust SDK: 0.8.0
 Transport: temporalio-client::service_override (no TCP listener)
 Workflow run_id: <generated run id>
 Workflow result: Hello, embedded Tokeira!
 ```
 
-The spike is excluded from the main workspace so its exact SDK `0.7.0` pins
-and standalone lockfile do not expand or constrain the product workspace.
+The spike is excluded from the main workspace so its exact SDK `0.8.0` pins
+and standalone lockfile do not expand or constrain the product workspace. The
+client crate must be the same version `tokeira-engine` itself depends on,
+because `Engine::service_override` hands back that crate's callback service
+type; moving the spike therefore moves the engine's `temporalio-client`
+dependency with it.
+
+## Rerun on 0.8.0
+
+Recorded 2026-09-03 against `tokeira-engine` with `temporalio-client 0.8.0`:
+
+- the clean path completed with the expected result;
+- both in-memory shutdown probes exited cleanly (0.56 s and 0.52 s);
+- the two managed-DSQL probes were not run in this rerun: they need a live
+  cluster descriptor and AWS credentials, and remain the acceptance for the
+  race fix described below.
+
+The 0.8.0 release notes state that worker shutdown "no longer loses an
+activity result it was still reporting" and drains in-flight completions
+before the final slot-permit wait, which is exactly the sequence the probes
+below order.
 
 ## Retry-pending shutdown probes
 
-These probes document the observed Temporal Rust SDK `0.7.0` lifecycle failure.
-They do not change Tokeira product behaviour or constitute a Tokeira or DSQL fix.
+These probes document the Temporal Rust SDK `0.7.0` lifecycle failure and now
+serve as the regression check that `0.8.0` keeps it fixed. They do not change
+Tokeira product behaviour or constitute a Tokeira or DSQL fix.
 
 The existing binary above remains the clean completed-workflow path. Separate,
 additive tests use a handshake inside the Activity to order the lifecycle precisely:

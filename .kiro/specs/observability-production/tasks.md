@@ -436,7 +436,7 @@ Ordering rationale: validation and test scaffolding first, then shared crate ext
     - `tokeira_dsql_connection_leak_suspects`
     - `tokeira_dsql_connection_checkout_overdue_seconds`
   - Leak detection MUST use an explicit low-cardinality checkout call-site ID, not a captured stack trace as a metric label.
-  - Emit structured warning logs when reservoir utilization exceeds 0.8 or class utilization exceeds 0.9.
+  - Emit structured warning logs when reservoir utilization exceeds 0.8; class warnings follow the pending-wait pressure policy in task 14.2.
   - _Requirements: Connection Leak Detection, DSQL Reservoir Depth Metrics, Rate-Limiter Token Metrics, Class-Budget Saturation Metrics_
 
   - [x]* 14.1 Reservoir/rate/class/leak tests
@@ -449,6 +449,18 @@ Ordering rationale: validation and test scaffolding first, then shared crate ext
     - Test returning an overdue connection decrements suspects gauge and records overdue duration.
     - Test checkout call-site identifier is bounded and not a raw backtrace label.
     - _Requirements: Connection Leak Detection, DSQL Reservoir Depth Metrics, Rate-Limiter Token Metrics, Class-Budget Saturation Metrics_
+
+  - [x] 14.2 Bound class-budget pressure warnings
+    - Track pending semaphore acquisitions with cancellation-safe registrations and preserve per-class warning history across recovery and reconfiguration.
+    - Warn on an observed pending wait of at least 5 seconds, with at least 60 seconds between warnings per class. Use the existing reporter so blocked acquisitions remain observable.
+    - Preserve utilization reporting and embedded defaults; document the pressure condition at the warning site.
+    - _Requirements: 14.5, 14.7–14.11_
+
+  - [x] 14.3 Verify class-budget pressure policy
+    - Implement the required Property 4 state-machine test with at least 100 generated waiter-lifecycle sequences and an independent reference model.
+    - Test transient contention, exact threshold/cooldown boundaries, sustained blocked acquisitions, bounded repetition, recovery, independent classes, cancellation, semaphore closure, and reconfiguration.
+    - Run the DSQL-enabled storage tests and the root finish bar after implementation.
+    - _Requirements: 14.5, 14.7–14.11_
 
 - [x] 15. Instrument edge and runtime paths
   - Update `crates/tokeira-edge/src/metrics.rs` and gRPC entry points.

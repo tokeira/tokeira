@@ -7,7 +7,7 @@
 //! projection burst cannot starve commits.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc, Mutex, RwLock as StdRwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -38,7 +38,104 @@ use super::{
 const LEAK_SUSPECT_AFTER: StdDuration = StdDuration::from_secs(30);
 const LEAK_SCAN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const EMBEDDED_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const CLASS_BUDGET_PRESSURE_AFTER: StdDuration = StdDuration::from_secs(5);
+const CLASS_BUDGET_WARNING_COOLDOWN: StdDuration = StdDuration::from_secs(60);
 
+#[derive(Debug, Default)]
+struct ClassPressure {
+    // Equal clock readings still represent distinct acquisitions; dropping one
+    // registration must not hide another waiter with the same start time.
+    waiting: BTreeMap<Instant, usize>,
+    // Observations also run on checkout: avoid scanning a saturated queue.
+    waiter_count: usize,
+    last_warning: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct ClassPressureSample {
+    waiters: usize,
+    longest_wait: StdDuration,
+    warn: bool,
+}
+
+impl ClassPressure {
+    fn register(&mut self, started: Instant) {
+        *self.waiting.entry(started).or_default() += 1;
+        self.waiter_count += 1;
+    }
+
+    fn complete(&mut self, started: Instant) {
+        let count = self
+            .waiting
+            .get_mut(&started)
+            .expect("a class waiter must complete its own registration");
+        *count -= 1;
+        if *count == 0 {
+            self.waiting.remove(&started);
+        }
+        self.waiter_count -= 1;
+    }
+
+    fn observe(&mut self, now: Instant) -> ClassPressureSample {
+        let longest_wait = self
+            .waiting
+            .first_key_value()
+            .map_or(StdDuration::ZERO, |(started, _)| {
+                now.saturating_duration_since(*started)
+            });
+        let warn = longest_wait >= CLASS_BUDGET_PRESSURE_AFTER
+            && self.last_warning.is_none_or(|last| {
+                now.saturating_duration_since(last) >= CLASS_BUDGET_WARNING_COOLDOWN
+            });
+        if warn {
+            // Observation and reservation happen under one class mutex. Keep
+            // this history when the queue drains, or flapping bypasses the cap.
+            self.last_warning = Some(now);
+        }
+        ClassPressureSample {
+            waiters: self.waiter_count,
+            longest_wait,
+            warn,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClassWaiter {
+    pressure: Arc<Mutex<ClassPressure>>,
+    started: Instant,
+    label: DbClassLabel,
+}
+
+impl ClassWaiter {
+    fn new(pressure: Arc<Mutex<ClassPressure>>, label: DbClassLabel) -> Self {
+        let started = Instant::now();
+        pressure
+            .lock()
+            .expect("class pressure lock poisoned")
+            .register(started);
+        metrics::increment_dsql_pool_waiting(label);
+        Self {
+            pressure,
+            started,
+            label,
+        }
+    }
+}
+
+impl Drop for ClassWaiter {
+    fn drop(&mut self) {
+        // Acquisition futures can be cancelled without returning through
+        // `acquire`; stale registrations would manufacture permanent pressure.
+        self.pressure
+            .lock()
+            .expect("class pressure lock poisoned")
+            .complete(self.started);
+        metrics::decrement_dsql_pool_waiting(self.label);
+    }
+}
+
+/// Class-local admission permits and cancellation-safe pressure observations.
 #[derive(Debug)]
 pub struct ClassBudgets {
     /// Per-operation-class semaphores.
@@ -49,6 +146,9 @@ pub struct ClassBudgets {
     budgets: RwLock<HashMap<DbClass, Arc<Semaphore>>>,
     /// Configured totals kept separately from semaphore state for metrics.
     totals: RwLock<HashMap<DbClass, usize>>,
+    /// Separate from semaphore generations so reconfiguration cannot reset
+    /// cooldowns or orphan registrations still waiting on an old semaphore.
+    pressure: HashMap<DbClass, Arc<Mutex<ClassPressure>>>,
     /// Fast aggregate used by tests and observability.
     total_budget: AtomicUsize,
 }
@@ -61,35 +161,48 @@ impl ClassBudgets {
         let class_budgets = Self {
             budgets: RwLock::new(budgets),
             totals: RwLock::new(allocations.clone()),
+            pressure: all_classes()
+                .into_iter()
+                .map(|class| (class, Arc::new(Mutex::new(ClassPressure::default()))))
+                .collect(),
             total_budget: AtomicUsize::new(total_budget),
         };
         Ok(class_budgets)
     }
 
+    /// Wait for this class's permit without consuming another class's budget.
+    /// Cancellation removes pressure accounting; a closed semaphore returns an error.
     pub async fn acquire(&self, class: DbClass) -> Result<OwnedSemaphorePermit> {
         let label = db_class_label(class);
-        metrics::increment_dsql_pool_waiting(label);
         let started = Instant::now();
         let semaphore = {
             let budgets = self.budgets.read().await;
             let Some(semaphore) = budgets.get(&class) else {
-                metrics::decrement_dsql_pool_waiting(label);
                 bail!("missing budget for class {class:?}");
             };
             semaphore.clone()
         };
-        self.record_class_metric(class, &semaphore).await;
+        self.record_class_metric(class, &semaphore, Instant::now())
+            .await;
         // Wait time is measured around only the class semaphore. Reservoir
         // empty backpressure is intentionally a separate signal emitted after
         // admission.
-        let result = semaphore.acquire_owned().await.map_err(Into::into);
-        metrics::decrement_dsql_pool_waiting(label);
+        let result = if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+            // Most operations need no wait registration or ordered-map allocation.
+            Ok(permit)
+        } else {
+            let waiter = ClassWaiter::new(Arc::clone(&self.pressure[&class]), label);
+            let result = semaphore.acquire_owned().await.map_err(Into::into);
+            drop(waiter);
+            result
+        };
         if result.is_ok() {
             metrics::record_dsql_class_permit_wait_duration(label, started.elapsed());
         }
         result
     }
 
+    /// Replace allocations while preserving old permits, waiters, and cooldowns.
     pub async fn reconfigure(&self, allocations: &HashMap<DbClass, usize>) -> Result<()> {
         let total_budget = validate_allocations(allocations)?;
         let mut budgets = self.budgets.write().await;
@@ -110,35 +223,59 @@ impl ClassBudgets {
         }
     }
 
+    /// Sum of the current generation's configured class allocations.
     pub fn total_budget(&self) -> usize {
         self.total_budget.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
+    /// Available permits in the current generation for a test observation.
     pub async fn class_available(&self, class: DbClass) -> Option<usize> {
         let budgets = self.budgets.read().await;
         budgets.get(&class).map(|budget| budget.available_permits())
     }
 
     async fn record_metrics(&self) {
+        self.record_metrics_at(Instant::now()).await;
+    }
+
+    async fn record_metrics_at(&self, now: Instant) {
         let budgets = self.budgets.read().await;
         for (class, semaphore) in budgets.iter() {
-            self.record_class_metric(*class, semaphore).await;
+            self.record_class_metric(*class, semaphore, now).await;
         }
     }
 
-    async fn record_class_metric(&self, class: DbClass, semaphore: &Semaphore) {
+    async fn record_class_metric(&self, class: DbClass, semaphore: &Semaphore, now: Instant) {
         let totals = self.totals.read().await;
         let total = totals.get(&class).copied().unwrap_or_default();
         let available = semaphore.available_permits();
         let in_use = total.saturating_sub(available);
-        metrics::record_dsql_pool_class_budget(db_class_label(class), total, in_use, 0);
-        if total > 0 && in_use as f64 / total as f64 > 0.9 {
+        let pressure = self.pressure[&class]
+            .lock()
+            .expect("class pressure lock poisoned")
+            .observe(now);
+        metrics::record_dsql_pool_class_budget(
+            db_class_label(class),
+            total,
+            in_use,
+            pressure.waiters,
+        );
+        // Full utilization is routine for a single-permit class, and idle
+        // partition polls can briefly queue. Only a still-pending wait of at
+        // least five seconds signals pressure. The per-class reservation caps
+        // warnings at one per minute even across recovery/reconfiguration;
+        // periodic reporting also catches acquisitions that never complete.
+        if pressure.warn {
             tracing::warn!(
                 class = db_class_label(class).as_str(),
                 total_permits = total,
                 in_use_permits = in_use,
-                "DSQL class budget utilization is above 90%"
+                waiters = pressure.waiters,
+                longest_wait_seconds = pressure.longest_wait.as_secs_f64(),
+                pressure_after_seconds = CLASS_BUDGET_PRESSURE_AFTER.as_secs(),
+                warning_cooldown_seconds = CLASS_BUDGET_WARNING_COOLDOWN.as_secs(),
+                "DSQL class permit acquisition is under sustained pressure"
             );
         }
     }
@@ -920,6 +1057,11 @@ fn test_allocations(commit: usize) -> HashMap<DbClass, usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::Future,
+        task::{Context, Waker},
+    };
+
     use proptest::prelude::*;
 
     use super::*;
@@ -950,6 +1092,253 @@ mod tests {
         assert_eq!(budgets.class_available(DbClass::Read).await, Some(1));
         let _read = budgets.acquire(DbClass::Read).await.unwrap();
         assert_eq!(budgets.class_available(DbClass::Read).await, Some(0));
+    }
+
+    #[test]
+    fn class_pressure_requires_a_current_five_second_wait() {
+        let start = Instant::now();
+        let mut pressure = ClassPressure::default();
+        for poll in 0..100 {
+            let now = start + StdDuration::from_secs(poll);
+            pressure.register(now);
+            assert!(!pressure.observe(now + StdDuration::from_millis(999)).warn);
+            pressure.complete(now);
+        }
+        let now = start + StdDuration::from_secs(100);
+        assert!(!pressure.observe(now).warn);
+        pressure.register(now);
+        assert!(!pressure.observe(now + StdDuration::from_millis(4_999)).warn);
+        let sample = pressure.observe(now + StdDuration::from_secs(5));
+        assert!(sample.warn);
+        assert_eq!(sample.waiters, 1);
+        assert_eq!(sample.longest_wait, StdDuration::from_secs(5));
+    }
+
+    #[test]
+    fn class_pressure_cooldown_survives_recovery() {
+        let start = Instant::now();
+        let mut pressure = ClassPressure::default();
+        pressure.register(start);
+        assert!(pressure.observe(start + StdDuration::from_secs(5)).warn);
+        pressure.complete(start);
+        let recovered = pressure.observe(start + StdDuration::from_secs(6));
+        assert_eq!(recovered.waiters, 0);
+        assert_eq!(recovered.longest_wait, StdDuration::ZERO);
+        assert!(!recovered.warn);
+
+        let restarted = start + StdDuration::from_secs(7);
+        pressure.register(restarted);
+        for millis in [12_000, 20_000, 40_000, 64_999] {
+            assert!(
+                !pressure
+                    .observe(start + StdDuration::from_millis(millis))
+                    .warn
+            );
+        }
+        assert!(pressure.observe(start + StdDuration::from_secs(65)).warn);
+        assert!(!pressure.observe(start + StdDuration::from_secs(65)).warn);
+        assert!(pressure.observe(start + StdDuration::from_secs(125)).warn);
+    }
+
+    #[test]
+    fn class_pressure_tracks_equal_start_times_and_oldest_waiter_departure() {
+        let start = Instant::now();
+        let later = start + StdDuration::from_secs(4);
+        let mut pressure = ClassPressure::default();
+        pressure.register(start);
+        pressure.register(start);
+        pressure.register(later);
+        pressure.complete(start);
+        assert_eq!(pressure.observe(later).waiters, 2);
+        pressure.complete(start);
+        let sample = pressure.observe(start + StdDuration::from_secs(5));
+        assert_eq!(sample.waiters, 1);
+        assert_eq!(sample.longest_wait, StdDuration::from_secs(1));
+        assert!(!sample.warn);
+        assert!(pressure.observe(start + StdDuration::from_secs(9)).warn);
+    }
+
+    #[tokio::test]
+    async fn class_budget_reports_sustained_waits_and_recovers_after_acquisition() {
+        let budgets = ClassBudgets::new(&test_allocations(1)).unwrap();
+        let holder = budgets.acquire(DbClass::Projection).await.unwrap();
+        budgets
+            .record_metrics_at(Instant::now() + StdDuration::from_secs(120))
+            .await;
+        assert_eq!(
+            budgets.pressure[&DbClass::Projection]
+                .lock()
+                .unwrap()
+                .last_warning,
+            None
+        );
+
+        let mut waiter = Box::pin(budgets.acquire(DbClass::Projection));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let started = *budgets.pressure[&DbClass::Projection]
+            .lock()
+            .unwrap()
+            .waiting
+            .first_key_value()
+            .unwrap()
+            .0;
+        budgets
+            .record_metrics_at(started + StdDuration::from_millis(4_999))
+            .await;
+        assert_eq!(
+            budgets.pressure[&DbClass::Projection]
+                .lock()
+                .unwrap()
+                .last_warning,
+            None
+        );
+        for seconds in [5, 65, 125] {
+            let now = started + StdDuration::from_secs(seconds);
+            budgets.record_metrics_at(now).await;
+            assert_eq!(
+                budgets.pressure[&DbClass::Projection]
+                    .lock()
+                    .unwrap()
+                    .last_warning,
+                Some(now)
+            );
+            budgets
+                .record_metrics_at(now + StdDuration::from_secs(59))
+                .await;
+            assert_eq!(
+                budgets.pressure[&DbClass::Projection]
+                    .lock()
+                    .unwrap()
+                    .last_warning,
+                Some(now)
+            );
+        }
+
+        drop(holder);
+        let _acquired = waiter.await.unwrap();
+        budgets
+            .record_metrics_at(started + StdDuration::from_secs(200))
+            .await;
+        let pressure = budgets.pressure[&DbClass::Projection].lock().unwrap();
+        assert!(pressure.waiting.is_empty());
+        assert_eq!(
+            pressure.last_warning,
+            Some(started + StdDuration::from_secs(125))
+        );
+    }
+
+    #[tokio::test]
+    async fn class_budget_cancelled_and_failed_acquisitions_clear_pressure() {
+        let budgets = ClassBudgets::new(&test_allocations(1)).unwrap();
+        let _holder = budgets.acquire(DbClass::Commit).await.unwrap();
+        let mut cancelled = Box::pin(budgets.acquire(DbClass::Commit));
+        assert!(
+            cancelled
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(
+            budgets.pressure[&DbClass::Commit]
+                .lock()
+                .unwrap()
+                .waiting
+                .len(),
+            1
+        );
+        drop(cancelled);
+        assert!(
+            budgets.pressure[&DbClass::Commit]
+                .lock()
+                .unwrap()
+                .waiting
+                .is_empty()
+        );
+
+        let mut closed = Box::pin(budgets.acquire(DbClass::Commit));
+        assert!(
+            closed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        budgets.close().await;
+        assert!(closed.await.is_err());
+        budgets
+            .record_metrics_at(Instant::now() + StdDuration::from_secs(120))
+            .await;
+        let pressure = budgets.pressure[&DbClass::Commit].lock().unwrap();
+        assert!(pressure.waiting.is_empty());
+        assert_eq!(pressure.last_warning, None);
+    }
+
+    #[tokio::test]
+    async fn class_budget_reconfiguration_preserves_waiters_and_cooldown() {
+        let budgets = ClassBudgets::new(&test_allocations(1)).unwrap();
+        let holder = budgets.acquire(DbClass::Commit).await.unwrap();
+        let mut waiter = Box::pin(budgets.acquire(DbClass::Commit));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let started = *budgets.pressure[&DbClass::Commit]
+            .lock()
+            .unwrap()
+            .waiting
+            .first_key_value()
+            .unwrap()
+            .0;
+        let warned_at = started + StdDuration::from_secs(5);
+        budgets.record_metrics_at(warned_at).await;
+        budgets.reconfigure(&test_allocations(3)).await.unwrap();
+        let _new_generation = budgets.acquire(DbClass::Commit).await.unwrap();
+        budgets
+            .record_metrics_at(warned_at + StdDuration::from_secs(59))
+            .await;
+        {
+            let pressure = budgets.pressure[&DbClass::Commit].lock().unwrap();
+            assert_eq!(pressure.waiting.len(), 1);
+            assert_eq!(pressure.last_warning, Some(warned_at));
+        }
+        drop(holder);
+        let _old_generation = waiter.await.unwrap();
+        assert!(
+            budgets.pressure[&DbClass::Commit]
+                .lock()
+                .unwrap()
+                .waiting
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn class_pressure_warning_reservation_is_atomic_and_class_local() {
+        let budgets = ClassBudgets::new(&test_allocations(1)).unwrap();
+        let start = Instant::now();
+        let now = start + StdDuration::from_secs(5);
+        let commit = &budgets.pressure[&DbClass::Commit];
+        commit.lock().unwrap().register(start);
+        let warnings = std::thread::scope(|scope| {
+            let observers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| commit.lock().unwrap().observe(now).warn))
+                .collect();
+            observers
+                .into_iter()
+                .map(|observer| observer.join().unwrap())
+                .filter(|warn| *warn)
+                .count()
+        });
+        assert_eq!(warnings, 1);
+        let mut read = budgets.pressure[&DbClass::Read].lock().unwrap();
+        read.register(start);
+        assert!(read.observe(now).warn);
     }
 
     #[tokio::test]
@@ -1034,6 +1423,47 @@ mod tests {
         assert_eq!(suspected[0].call_site, "db_class_projection");
         tracker.complete(checkout);
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: observability-production, Property 4: pressure eligibility and cooldown survive waiter lifecycles.
+        #[test]
+        fn class_pressure_matches_waiter_lifecycle_model(
+            events in prop::collection::vec((0u8..3, 0u64..70_000, any::<usize>()), 1..256),
+        ) {
+            let start = Instant::now();
+            let mut pressure = ClassPressure::default();
+            let mut pending = Vec::new();
+            let mut elapsed = 0u64;
+            let mut last_warning = None;
+            for (action, advance_ms, index) in events {
+                elapsed += advance_ms;
+                let now = start + StdDuration::from_millis(elapsed);
+                match action {
+                    0 => {
+                        pressure.register(now);
+                        pending.push(elapsed);
+                    }
+                    1 if !pending.is_empty() => {
+                        let finished = pending.swap_remove(index % pending.len());
+                        pressure.complete(start + StdDuration::from_millis(finished));
+                    }
+                    _ => {}
+                }
+                let expected_wait = pending.iter().map(|started| elapsed - started).max().unwrap_or(0);
+                let expected_warning = expected_wait >= 5_000
+                    && last_warning.is_none_or(|previous| elapsed - previous >= 60_000);
+                let sample = pressure.observe(now);
+                prop_assert_eq!(sample.waiters, pending.len());
+                prop_assert_eq!(sample.longest_wait, StdDuration::from_millis(expected_wait));
+                prop_assert_eq!(sample.warn, expected_warning);
+                if sample.warn {
+                    last_warning = Some(elapsed);
+                }
+            }
+        }
     }
 
     proptest! {

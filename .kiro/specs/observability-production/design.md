@@ -749,7 +749,47 @@ Record:
 - `tokeira_dsql_pool_class_waiters{class}`
 - `tokeira_dsql_class_permit_wait_duration_seconds{class}`
 
-Class saturation warning logs fire when `in_use / budget_total` exceeds the configured warning threshold. Use bounded `class` values only.
+Class pressure warnings use pending permit-wait duration, independently of utilization
+metrics. The internal constants `CLASS_BUDGET_PRESSURE_AFTER = 5 seconds` and
+`CLASS_BUDGET_WARNING_COOLDOWN = 60 seconds` live in
+`crates/tokeira-storage/src/dsql/connection.rs`; they introduce no configuration fields
+and do not change embedded connection allocations.
+
+Ground truth for this correction: `ClassBudgets::acquire` records utilization before
+acquiring a permit, and the engine starts one projection worker per partition
+(`crates/tokeira-engine/src/lib.rs`). Idle projection polls can therefore contend for
+the single projection permit. Warning on every occupied-class observation or every
+queued waiter repeats normal polling traffic in the log.
+
+Each class owns a mutex-protected, ordered multiset of monotonic waiter start times
+and its last warning time. An RAII registration surrounds a contended semaphore acquisition;
+completion, failure, and cancellation remove exactly that registration. Each sample
+records the current waiter count and checks the longest pending wait. At 5 seconds
+or more, a sample may reserve a warning only if the last warning was at least 60
+seconds ago. The check and reservation share the mutex, so simultaneous observers
+cannot both log. Emit after releasing the mutex, with bounded `class`, waiter count,
+longest wait, pressure threshold, and cooldown fields.
+
+The existing 5-second reporter observes acquisitions even when none complete; a new
+acquisition also samples the class before registering itself. With normally scheduled
+reporting, pressure first appears between 5 and 10 seconds after a wait begins. No
+per-waiter timer, polling loop, or background task is added. Immediately available
+permits avoid wait registration and its allocation. Recovery removes pending
+wait state but retains the last warning time. Reconfiguration replaces semaphores
+while retaining class pressure state: outstanding old-generation acquisitions remain
+accounted for, and new allocations cannot reset the cooldown. Utilization alone never
+triggers this log. Persistent idle contention may still produce a bounded warning;
+zero warnings from an idle managed cluster is not a guaranteed acceptance condition.
+
+##### Property 4: Class pressure warning eligibility and frequency
+
+*For any* sequence of waiter registrations, completions, cancellations, observations,
+and class-budget reconfigurations at monotonic times, each pressure warning SHALL
+have a currently pending acquisition aged at least 5 seconds, and successive warnings
+for the same class SHALL be at least 60 seconds apart. Recovery SHALL remove stale
+pressure without erasing cooldown history; other classes SHALL remain independent.
+
+**Validates: Requirements 14.5, 14.7–14.10.**
 
 #### Leak Detection
 
@@ -1049,7 +1089,6 @@ pub struct ObservabilityConfig {
     pub readiness_enabled: bool,
     pub leak_detection_deadline_seconds: u64,
     pub reservoir_warning_threshold: f64,
-    pub class_budget_warning_threshold: f64,
     pub alert_thresholds: AlertThresholdConfig,
 }
 ```
@@ -1066,7 +1105,7 @@ Defaults:
 - error-biased sampling: true
 - leak deadline: 60 seconds
 - reservoir warning threshold: 0.8
-- class budget warning threshold: 0.9
+- class budget warnings: internal 5-second pending-wait threshold and 60-second per-class cooldown (see Class Budgets); no configuration field
 
 All config surfaced through `/config` must use existing redaction mechanisms.
 
@@ -1263,6 +1302,12 @@ The command prints degraded non-critical checks separately.
 1. Metric name generation property tests continue to validate suffix/prefix rules.
 2. Label validation property tests reject non-snake-case and high-cardinality forbidden names.
 3. Dashboard validator property tests reject empty descriptions and missing units.
+4. Class pressure state-machine tests generate waiter lifecycles and observations,
+   comparing eligibility with a reference model and checking the per-class cooldown
+   across recovery (Property 4). Fixed tests cover exact 5/60-second boundaries,
+   repeated contended polls, independent classes, reconfiguration, and cancellation
+   or semaphore closure. Poll real acquisition futures explicitly and pass controlled
+   monotonic timestamps to the one-shot reporter; no sleeps or live DSQL are needed.
 
 ## Implementation Notes
 

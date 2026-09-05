@@ -606,7 +606,7 @@ mod tests {
     }
 
     fn operation(index: u8) -> WorkerOperation {
-        match index % 15 {
+        match index % 16 {
             0 => WorkerOperation::PollWorkflowTaskQueue,
             1 => WorkerOperation::PollActivityTaskQueue,
             2 => WorkerOperation::PollNexusTaskQueue,
@@ -621,7 +621,8 @@ mod tests {
             11 => WorkerOperation::RespondNexusTaskFailed,
             12 => WorkerOperation::RecordWorkerHeartbeat,
             13 => WorkerOperation::ShutdownWorker,
-            _ => WorkerOperation::DescribeTaskQueue,
+            14 => WorkerOperation::DescribeTaskQueue,
+            _ => WorkerOperation::DescribeNamespace,
         }
     }
 
@@ -640,7 +641,9 @@ mod tests {
             | WorkerOperation::RespondNexusTaskFailed => Some(Some(WorkerTaskClass::Nexus)),
             WorkerOperation::RespondQueryTaskCompleted => Some(Some(WorkerTaskClass::Query)),
             WorkerOperation::RecordWorkerHeartbeat => Some(None),
-            WorkerOperation::ShutdownWorker | WorkerOperation::DescribeTaskQueue => None,
+            WorkerOperation::ShutdownWorker
+            | WorkerOperation::DescribeTaskQueue
+            | WorkerOperation::DescribeNamespace => None,
         }
     }
 
@@ -648,8 +651,8 @@ mod tests {
     proptest! {
         #[test]
         fn property_scoped_authorizer_decision_matrix(
-            operation_index in 0u8..15,
-            target_kind in 0u8..3,
+            operation_index in 0u8..16,
+            target_kind in 0u8..4,
             wrong_namespace in any::<bool>(),
             wrong_queue in any::<bool>(),
             wrong_deployment in any::<bool>(),
@@ -678,6 +681,7 @@ mod tests {
             };
             let worker_target = match target_kind {
                 0 => WorkerTarget::Preflight,
+                3 => WorkerTarget::Namespace,
                 1 => WorkerTarget::TaskQueue {
                     normal_task_queue: if wrong_queue { "other" } else { "payments-worker" },
                 },
@@ -709,8 +713,12 @@ mod tests {
             } else {
                 match worker_target {
                     WorkerTarget::Preflight => true,
+                    WorkerTarget::Namespace => operation == WorkerOperation::DescribeNamespace,
                     WorkerTarget::TaskQueue { .. } => {
-                        expected_class(operation).is_none() && !wrong_queue
+                        matches!(
+                            operation,
+                            WorkerOperation::ShutdownWorker | WorkerOperation::DescribeTaskQueue
+                        ) && !wrong_queue
                     }
                     WorkerTarget::VersionedTask { task_class, .. } => {
                         let class_matches = if operation

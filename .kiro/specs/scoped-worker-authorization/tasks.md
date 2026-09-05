@@ -429,36 +429,36 @@ commands, transitions, history, lane routing, projection semantics, or delivery 
     upstream-proto, or dependency-version change was introduced. Limit `Cargo.lock` movement to
     the mechanical addition of the approved internal `tokeira-auth` → `tokeira-types` edge.
 
-- [ ] 17. Admit own-namespace `DescribeNamespace` for scoped identities
-  - [ ] 17.1 Extend the fixed operation matrix in `tokeira-auth`
+- [x] 17. Admit own-namespace `DescribeNamespace` for scoped identities
+  - [x] 17.1 Extend the fixed operation matrix in `tokeira-auth`
     - Add `WorkerOperation::DescribeNamespace` and the `WorkerTarget::Namespace` shape; accept the
       shape only for that operation and only on the exact scope namespace.
     - Keep the matrix code-owned and non-configurable.
     - _Requirements: 4.4-4.5, 13.1, 13.3, 13.5-13.6_
-  - [ ] 17.2 Admit the by-name path and deny the by-ID path in the edge
+  - [x] 17.2 Admit the by-name path and deny the by-ID path in the edge
     - Map `Action::DescribeNamespace` to the Worker operation; run preflight and the `Namespace`
       target before the handler's own lookup; return the existing unfiltered response.
     - Authenticate before ID resolution on the by-ID path and deny a Scoped_Identity there with
       the bounded `namespace` reason; keep the Ordinary_Identity ordering unchanged.
     - _Requirements: 4.1-4.3, 4.6-4.7, 13.1-13.5, 13.7-13.8_
-  - [ ] 17.3 Extend Property 4 and the fixed-deny-surface coverage
+  - [x] 17.3 Extend Property 4 and the fixed-deny-surface coverage
     - Add the new row, the `Namespace` shape, and other-namespace/by-ID denials to the Property 4
       generator and reference model; keep the exhaustive deny-surface test of 12.6 asserting that
       `ListNamespaces` and every namespace mutation stay denied.
     - Tag: `// Feature: scoped-worker-authorization, Property 4: Scoped authorizer decision matrix`
     - _Requirements: 12.4, 12.7, 13.1-13.6_
-  - [ ] 17.4 Prove SDK start-up on the scoped credential alone
+  - [x] 17.4 Prove SDK start-up on the scoped credential alone
     - Start the standard-SDK scoped Worker of 15.2 without a second credential or pre-resolved
       description; assert that start-up `DescribeNamespace` succeeds for the Own_Namespace and
       that another namespace by name, any namespace by ID, and `ListNamespaces` are denied.
     - Remove the admin-credential pre-resolution from the bench scoped-worker test.
     - _Requirements: 12.13, 12.15, 12.17-12.18, 13.1-13.4_
-  - [ ] 17.5 Update the public operator surface
+  - [x] 17.5 Update the public operator surface
     - Add own-namespace `DescribeNamespace` to the fixed RPC surface in the public Tokeira
       configuration guide and keep by-ID description, namespace listing, and namespace mutation
       in the stated exclusions.
     - _Requirements: 11.8, 11.13_
-  - [ ] 17.6 Checkpoint: own-namespace description is green
+  - [x] 17.6 Checkpoint: own-namespace description is green
     - Run the complete AGENTS.md §10.4 bar and the offline Markdown link check.
 
 ## Task Dependency Graph

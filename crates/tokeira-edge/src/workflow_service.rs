@@ -5708,13 +5708,25 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
+                // Two-phase Worker admission so a scoped credential can
+                // describe its own namespace by name, the check its SDK makes
+                // before polling; the namespace is the whole target. Ordinary
+                // identities take the unchanged role decision, for which the
+                // Worker target is inert.
+                let context = self
                     .interceptors
-                    .begin(
+                    .begin_worker_preflight(
                         headers,
                         Some(namespace_name),
                         Action::DescribeNamespace,
                         false,
+                    )
+                    .await?;
+                self.interceptors
+                    .authorize_worker_namespace_target(
+                        &context,
+                        Action::DescribeNamespace,
+                        namespace_name,
                     )
                     .await?;
 
@@ -5743,23 +5755,14 @@ impl WorkflowService {
         namespace_id: &str,
     ) -> EdgeResult<NamespaceDescription> {
         self.observe_edge_call(headers, "describe_namespace", None, None, async move {
-            // Stable-ID resolution precedes auth because the authorizer contract
-            // is name-scoped; this is the same namespace-validator ordering used
-            // for task-token back-fill in v1.31.0.
-            let namespace = self
-                .namespaces
-                .get_by_id(namespace_id)
-                .await
-                .map_err(EdgeError::from)?
-                .ok_or_else(|| EdgeError::NamespaceNotFound(namespace_id.to_owned()))?;
-            let _ctx = self
+            // Ordinary identities keep resolve-then-authorize because their
+            // role decision is name-scoped (the namespace-validator ordering
+            // shared with task-token back-fill in v1.31.0). A scoped credential
+            // is denied before the ID is resolved, so its denial never
+            // discloses whether the ID exists.
+            let (_ctx, namespace) = self
                 .interceptors
-                .begin(
-                    headers,
-                    Some(&namespace.name),
-                    Action::DescribeNamespace,
-                    false,
-                )
+                .begin_describe_namespace_by_id(headers, namespace_id)
                 .await?;
             Ok(namespace_to_description(namespace))
         })

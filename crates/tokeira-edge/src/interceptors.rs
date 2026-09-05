@@ -747,6 +747,10 @@ impl Action {
             Self::RecordWorkerHeartbeat => Some(WorkerOperation::RecordWorkerHeartbeat),
             Self::ShutdownWorker => Some(WorkerOperation::ShutdownWorker),
             Self::DescribeTaskQueue => Some(WorkerOperation::DescribeTaskQueue),
+            // Own-namespace description by name: the one metadata read a stock
+            // SDK Worker makes before it polls (scoped-worker-authorization
+            // Requirement 13).
+            Self::DescribeNamespace => Some(WorkerOperation::DescribeNamespace),
             Self::GetWorkflowExecutionHistory
             | Self::StartWorkflowExecution
             | Self::SignalWorkflowExecution
@@ -775,7 +779,6 @@ impl Action {
             | Self::UpdateWorkflowExecution
             | Self::PollWorkflowExecutionUpdate
             | Self::UpdateWorkflowExecutionOptions
-            | Self::DescribeNamespace
             | Self::ListNamespaces
             | Self::RegisterNamespace
             | Self::UpdateNamespace
@@ -1303,11 +1306,54 @@ impl EdgeInterceptors {
         operation: WorkerOperation,
         target: WorkerTarget<'_>,
     ) -> EdgeResult<()> {
-        let worker = WorkerCallTarget { operation, target };
         let namespace_name = context
             .namespace
             .as_ref()
             .map(|namespace| namespace.name.as_str());
+        self.authorize_worker_target_in_namespace(
+            context,
+            action,
+            operation,
+            namespace_name,
+            target,
+        )
+        .await
+    }
+
+    /// Complete authorization for a Worker RPC whose only resource is the
+    /// namespace the request names.
+    ///
+    /// `DescribeNamespace` contexts carry no resolved namespace because the
+    /// handler performs its own lookup to observe deletion tombstones, so the
+    /// request name is passed explicitly rather than read from the context.
+    pub async fn authorize_worker_namespace_target(
+        &self,
+        context: &EdgeContext,
+        action: Action,
+        namespace_name: &str,
+    ) -> EdgeResult<()> {
+        let operation = action.worker_operation().ok_or_else(|| {
+            EdgeError::Internal("non-Worker API requested Worker target authorization".to_owned())
+        })?;
+        self.authorize_worker_target_in_namespace(
+            context,
+            action,
+            operation,
+            Some(namespace_name),
+            WorkerTarget::Namespace,
+        )
+        .await
+    }
+
+    async fn authorize_worker_target_in_namespace(
+        &self,
+        context: &EdgeContext,
+        action: Action,
+        operation: WorkerOperation,
+        namespace_name: Option<&str>,
+        target: WorkerTarget<'_>,
+    ) -> EdgeResult<()> {
+        let worker = WorkerCallTarget { operation, target };
         let started = Instant::now();
         match self
             .authenticator
@@ -1331,6 +1377,94 @@ impl EdgeInterceptors {
                 Err(error)
             }
         }
+    }
+
+    /// Admit a `DescribeNamespace` request addressed by stable ID.
+    ///
+    /// A by-ID request names no namespace. v1.31.0 takes the authorization
+    /// target namespace from the request's `namespace` field alone and its
+    /// namespace validator deliberately leaves `DescribeNamespace` unresolved
+    /// (`common/authorization/interceptor.go:161`,
+    /// `common/rpc/interceptor/namespace_validator.go:260-266 @ v1.31.0`), so
+    /// a scoped credential has nothing to match. It is therefore decided here,
+    /// before the ID is resolved, and its denial cannot disclose whether the ID
+    /// exists. Ordinary identities keep the resolve-then-authorize ordering
+    /// shared with task-token back-fill, because their role decision is
+    /// name-scoped. Credentials are verified exactly once on either path.
+    pub async fn begin_describe_namespace_by_id(
+        &self,
+        headers: &HeaderMap,
+        namespace_id: &str,
+    ) -> EdgeResult<(EdgeContext, ResolvedNamespace)> {
+        let action = Action::DescribeNamespace;
+        let request_id = extract_or_generate(headers, self.request_ids.as_ref());
+        let started = Instant::now();
+        let claims = match self.authenticator.authenticate(headers).await {
+            Ok(claims) => claims,
+            Err(error) => {
+                record_authorization_error(action.api_name(), "authenticate");
+                record_authorization_duration(action.api_name(), "error", started.elapsed());
+                return Err(error);
+            }
+        };
+        if claims
+            .as_ref()
+            .is_some_and(|claims| claims.worker_scope.is_some())
+        {
+            let worker = WorkerCallTarget {
+                operation: WorkerOperation::DescribeNamespace,
+                target: WorkerTarget::Preflight,
+            };
+            // With no request namespace the scope engine denies by
+            // construction. Routing that through the authorizer keeps the
+            // public denial, metrics, and log event identical to every other
+            // scoped rejection instead of hand-building a second denial path.
+            if let Err(error) = self
+                .authenticator
+                .authorize_worker(claims.as_ref(), action, None, worker)
+                .await
+            {
+                let reason = scoped_worker_deny_reason(claims.as_ref(), None, Some(worker))
+                    .unwrap_or(WorkerScopeDenyReason::Namespace);
+                record_scoped_worker_authorization_denied(action.api_name(), reason.metric_label());
+                log_scoped_worker_authorization_denied(claims.as_ref(), action, reason);
+                record_authorization_duration(action.api_name(), "denied", started.elapsed());
+                return Err(error);
+            }
+        }
+        let namespace = self
+            .namespaces
+            .get_by_id(namespace_id)
+            .await
+            .map_err(EdgeError::from)?
+            .ok_or_else(|| EdgeError::NamespaceNotFound(namespace_id.to_owned()))?;
+        let auth_principal = match self
+            .authenticator
+            .authorize(claims.as_ref(), action, Some(&namespace.name))
+            .await
+        {
+            Ok(principal) => principal,
+            Err(error) => {
+                record_authorization_duration(action.api_name(), "denied", started.elapsed());
+                return Err(error);
+            }
+        }
+        .filter(|_| principal_propagation_enabled(self.principal_attribution));
+        record_authorization_duration(action.api_name(), "allowed", started.elapsed());
+        Ok((
+            EdgeContext {
+                request_id,
+                claims,
+                auth_principal,
+                // Describe observes tombstones through its own lookup, so the
+                // context carries no active-namespace resolution, exactly as
+                // on the by-name path.
+                namespace: None,
+                received_at: OffsetDateTime::now_utc(),
+                is_long_poll: false,
+            },
+            namespace,
+        ))
     }
 
     /// Back-fill an omitted request namespace from a decoded task token, then
@@ -1718,6 +1852,7 @@ mod tests {
                     | Action::RecordWorkerHeartbeat
                     | Action::ShutdownWorker
                     | Action::DescribeTaskQueue
+                    | Action::DescribeNamespace
             );
             assert_eq!(
                 action.worker_operation().is_some(),
@@ -1731,6 +1866,9 @@ mod tests {
             Action::DescribeWorker,
             Action::RespondActivityTaskCompletedById,
             Action::StartActivityExecution,
+            Action::ListNamespaces,
+            Action::UpdateNamespace,
+            Action::DeleteNamespace,
         ] {
             assert_eq!(denied.worker_operation(), None);
         }

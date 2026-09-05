@@ -93,6 +93,10 @@ impl WorkerScope {
             return WorkerScopeDecision::Allow;
         }
         match (operation.target_shape(), target) {
+            // The exact-namespace comparison above is the entire decision for
+            // a namespace-shaped operation; this shape for any other operation,
+            // or any other shape for it, is an operation mismatch below.
+            (WorkerTargetShape::Namespace, WorkerTarget::Namespace) => WorkerScopeDecision::Allow,
             (WorkerTargetShape::TaskQueue, WorkerTarget::TaskQueue { normal_task_queue }) => {
                 self.authorize_queue(normal_task_queue)
             }
@@ -221,6 +225,16 @@ pub enum WorkerOperation {
     ShutdownWorker,
     /// Inspect readiness for one allowed normal task queue.
     DescribeTaskQueue,
+    /// Describe the scope's own namespace by exact name.
+    ///
+    /// Every Core-based Temporal SDK Worker resolves `DescribeNamespace`
+    /// before it polls and refuses to start on any status except
+    /// `UNIMPLEMENTED` (`temporalio-sdk-core 0.9.0`, `src/worker/mod.rs`,
+    /// `Worker::validate`), and the same description gates its heartbeat loop
+    /// on the advertised `worker_heartbeats` capability. Admitting the call
+    /// for the one namespace the scope already works in is what lets a scoped
+    /// credential start a stock Worker without a second, broader credential.
+    DescribeNamespace,
 }
 
 impl WorkerOperation {
@@ -247,12 +261,14 @@ impl WorkerOperation {
             }
             Self::RecordWorkerHeartbeat => WorkerTargetShape::Versioned(None),
             Self::ShutdownWorker | Self::DescribeTaskQueue => WorkerTargetShape::TaskQueue,
+            Self::DescribeNamespace => WorkerTargetShape::Namespace,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerTargetShape {
+    Namespace,
     TaskQueue,
     WorkflowPoll,
     Versioned(Option<WorkerTaskClass>),
@@ -263,6 +279,13 @@ enum WorkerTargetShape {
 pub enum WorkerTarget<'a> {
     /// API and namespace check before a token or resource is decoded.
     Preflight,
+    /// The scope's own namespace, addressed by exact name.
+    ///
+    /// The namespace is the whole target. A by-ID request never produces this
+    /// shape: it names no namespace for the scope to match, exactly as
+    /// v1.31.0 takes the authorization namespace from the request's
+    /// `namespace` field alone (`common/authorization/interceptor.go:161`).
+    Namespace,
     /// One normal task queue, used by readiness and shutdown.
     TaskQueue {
         /// Stable application queue, never a sticky queue alias.
@@ -487,6 +510,62 @@ mod tests {
                 (true, true, false) => prop_assert_eq!(result, Err(ScopeConflict)),
                 _ => prop_assert!(matches!(result, Ok(Some(_)))),
             }
+        }
+    }
+
+    #[test]
+    fn describe_namespace_is_allowed_only_for_the_scope_namespace_by_name() {
+        let scope = scope(vec!["queue-a".to_owned()]).expect("scope");
+        assert_eq!(
+            scope.authorize(
+                WorkerOperation::DescribeNamespace,
+                "payments",
+                WorkerTarget::Namespace
+            ),
+            WorkerScopeDecision::Allow
+        );
+        assert_eq!(
+            scope.authorize(
+                WorkerOperation::DescribeNamespace,
+                "other",
+                WorkerTarget::Namespace
+            ),
+            WorkerScopeDecision::Deny(WorkerScopeDenyReason::Namespace)
+        );
+        // A by-ID request carries no namespace name; the empty name is a
+        // namespace mismatch before anything else is considered.
+        assert_eq!(
+            scope.authorize(
+                WorkerOperation::DescribeNamespace,
+                "",
+                WorkerTarget::Namespace
+            ),
+            WorkerScopeDecision::Deny(WorkerScopeDenyReason::Namespace)
+        );
+    }
+
+    #[test]
+    fn namespace_shape_and_operation_must_agree() {
+        let scope = scope(vec!["queue-a".to_owned()]).expect("scope");
+        assert_eq!(
+            scope.authorize(
+                WorkerOperation::DescribeNamespace,
+                "payments",
+                WorkerTarget::TaskQueue {
+                    normal_task_queue: "queue-a",
+                }
+            ),
+            WorkerScopeDecision::Deny(WorkerScopeDenyReason::Operation)
+        );
+        for operation in [
+            WorkerOperation::DescribeTaskQueue,
+            WorkerOperation::RecordWorkerHeartbeat,
+            WorkerOperation::PollWorkflowTaskQueue,
+        ] {
+            assert_eq!(
+                scope.authorize(operation, "payments", WorkerTarget::Namespace),
+                WorkerScopeDecision::Deny(WorkerScopeDenyReason::Operation)
+            );
         }
     }
 }

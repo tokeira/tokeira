@@ -53,8 +53,8 @@ use temporalio_common::{
             operatorservice::v1::CreateNexusEndpointRequest,
             taskqueue::v1::TaskQueue,
             workflowservice::v1::{
-                DescribeNamespaceRequest, DescribeTaskQueueRequest, PollWorkflowTaskQueueRequest,
-                SetWorkerDeploymentCurrentVersionRequest,
+                DescribeNamespaceRequest, DescribeTaskQueueRequest, ListNamespacesRequest,
+                PollWorkflowTaskQueueRequest, SetWorkerDeploymentCurrentVersionRequest,
             },
         },
     },
@@ -377,31 +377,12 @@ build_id = "{SCOPED_BUILD_ID}"
     )
     .expect("worker client");
 
-    // SDK 1.0.0 workers resolve the namespace description before they poll, and a
-    // scoped credential is denied `DescribeNamespace` by design. Pre-resolve the
-    // scoped connection's description from the admin credential so the worker
-    // starts without widening the scope; the source is shared by reference, so it
-    // must stay alive until the Core worker below has captured it.
-    let namespace_description = WorkflowService::describe_namespace(
-        &mut admin_connection.clone(),
-        DescribeNamespaceRequest {
-            namespace: "default".to_owned(),
-            ..Default::default()
-        }
-        .into_request(),
-    )
-    .await
-    .expect("admin DescribeNamespace")
-    .into_inner();
-    let scoped_namespace_description = worker_connection
-        .workers()
-        .namespace_description_source("default");
-    scoped_namespace_description
-        .resolve(|| async { Ok::<_, Status>(namespace_description) })
-        .await
-        .expect("pre-resolved namespace description");
-
-    let denied = WorkflowService::describe_namespace(
+    // SDK 1.0.0 workers resolve the namespace description before they poll. The
+    // scoped credential may describe its own namespace by name and nothing else
+    // about namespaces: another name, any ID, and listing stay denied, and the
+    // denial for an ID does not depend on whether that ID exists. The Worker
+    // below therefore starts on the scoped credential alone.
+    let own_namespace = WorkflowService::describe_namespace(
         &mut worker_connection.clone(),
         DescribeNamespaceRequest {
             namespace: "default".to_owned(),
@@ -410,8 +391,55 @@ build_id = "{SCOPED_BUILD_ID}"
         .into_request(),
     )
     .await
-    .expect_err("scoped identity must not gain namespace-wide read authority");
-    assert_eq!(denied.code(), Code::PermissionDenied);
+    .expect("scoped identity describes its own namespace by name")
+    .into_inner();
+    let own_namespace_info = own_namespace
+        .namespace_info
+        .expect("own-namespace description carries namespace info");
+    assert_eq!(own_namespace_info.name, "default");
+    assert!(
+        own_namespace_info
+            .capabilities
+            .is_some_and(|capabilities| capabilities.worker_heartbeats),
+        "the scoped Worker's heartbeat loop keys off the advertised capability"
+    );
+
+    let other_namespace = WorkflowService::describe_namespace(
+        &mut worker_connection.clone(),
+        DescribeNamespaceRequest {
+            namespace: "other-namespace".to_owned(),
+            ..Default::default()
+        }
+        .into_request(),
+    )
+    .await
+    .expect_err("scoped identity must not describe another namespace");
+    assert_eq!(other_namespace.code(), Code::PermissionDenied);
+
+    for id in [
+        own_namespace_info.id.clone(),
+        "00000000-0000-0000-0000-000000000000".to_owned(),
+    ] {
+        let by_id = WorkflowService::describe_namespace(
+            &mut worker_connection.clone(),
+            DescribeNamespaceRequest {
+                id,
+                ..Default::default()
+            }
+            .into_request(),
+        )
+        .await
+        .expect_err("scoped identity must not describe a namespace by ID");
+        assert_eq!(by_id.code(), Code::PermissionDenied);
+    }
+
+    let listed = WorkflowService::list_namespaces(
+        &mut worker_connection.clone(),
+        ListNamespacesRequest::default().into_request(),
+    )
+    .await
+    .expect_err("scoped identity must not list namespaces");
+    assert_eq!(listed.code(), Code::PermissionDenied);
 
     OperatorService::create_nexus_endpoint(
         &mut admin_connection.clone(),

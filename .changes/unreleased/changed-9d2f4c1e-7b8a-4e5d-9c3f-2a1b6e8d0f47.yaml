@@ -1,0 +1,4 @@
+kind: changed
+body: Scoped worker credentials may describe their own namespace by exact name, so standard Temporal SDK Workers (Core-based Python, TypeScript, .NET, and Rust) start on the scoped credential alone; describing a namespace by ID, listing namespaces, and every namespace mutation stay denied.
+custom:
+  Slice: 9d2f4c1e-7b8a-4e5d-9c3f-2a1b6e8d0f47

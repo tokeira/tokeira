@@ -4637,6 +4637,181 @@ mod tests {
         (WorkflowServiceGrpc::new(service), broker)
     }
 
+    const DESCRIBE_NAMESPACE_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const UNKNOWN_NAMESPACE_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn scoped_describe_claims() -> Claims {
+        Claims {
+            subject: "scoped-worker".to_owned(),
+            auth_type: "jwt".to_owned(),
+            worker_scope: Some(
+                WorkerScope::try_new(
+                    "default".to_owned(),
+                    vec!["queue".to_owned()],
+                    "deployment-a".to_owned(),
+                    "build-a".to_owned(),
+                )
+                .expect("fixed scoped Worker fixture"),
+            ),
+            ..Claims::default()
+        }
+    }
+
+    /// Minimal service whose authenticator yields `claims` for every request
+    /// (permissive when `None`); `deleted` seeds `default` as a tombstone.
+    async fn describe_namespace_service(
+        claims: Option<Claims>,
+        deleted: bool,
+    ) -> WorkflowServiceGrpc {
+        let cache = Arc::new(InMemoryNamespaceCache::new());
+        let mut namespace = ResolvedNamespace::active("default");
+        namespace.namespace_id = Some(DESCRIBE_NAMESPACE_ID.to_owned());
+        namespace.deleted = deleted;
+        cache
+            .insert(namespace)
+            .await
+            .expect("default namespace should seed");
+        let interceptors = match claims {
+            Some(claims) => EdgeInterceptors::configured(
+                cache.clone(),
+                Arc::new(PolicyAuthenticator::new(
+                    Arc::new(FixedClaimsMapper(claims)),
+                    Arc::new(DefaultAuthorizer),
+                    false,
+                )),
+                false,
+            ),
+            None => EdgeInterceptors::permissive(cache.clone()),
+        };
+        let service = WorkflowService::new(
+            Arc::new(PollNoneRuntime),
+            Arc::new(NoopResolver),
+            Arc::new(EmptyVisibilityApi),
+            Arc::new(tokeira_storage::InMemoryStore::default()),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
+            cache,
+            Arc::new(interceptors),
+            PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
+            LongPollGate::new(LongPollConfig::default()),
+            Arc::new(LocalOnlyRouter),
+        );
+        WorkflowServiceGrpc::new(service)
+    }
+
+    fn describe_by_name(namespace: &str) -> Request<workflowservice::DescribeNamespaceRequest> {
+        Request::new(workflowservice::DescribeNamespaceRequest {
+            namespace: namespace.to_owned(),
+            ..Default::default()
+        })
+    }
+
+    fn describe_by_id(id: &str) -> Request<workflowservice::DescribeNamespaceRequest> {
+        Request::new(workflowservice::DescribeNamespaceRequest {
+            id: id.to_owned(),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn scoped_describe_namespace_by_name_returns_the_ordinary_response() {
+        let scoped = describe_namespace_service(Some(scoped_describe_claims()), false).await;
+        let ordinary = describe_namespace_service(None, false).await;
+
+        let scoped_response = scoped
+            .describe_namespace(describe_by_name("default"))
+            .await
+            .expect("the scope's own namespace by name is within scope")
+            .into_inner();
+        let ordinary_response = ordinary
+            .describe_namespace(describe_by_name("default"))
+            .await
+            .expect("ordinary describe")
+            .into_inner();
+
+        assert_eq!(scoped_response, ordinary_response);
+        let info = scoped_response
+            .namespace_info
+            .expect("namespace info is present");
+        assert_eq!(info.name, "default");
+        assert_eq!(info.id, DESCRIBE_NAMESPACE_ID);
+        assert!(
+            info.capabilities.is_some(),
+            "SDK Workers act on the advertised capabilities, so they are not filtered"
+        );
+        assert!(scoped_response.config.is_some());
+    }
+
+    #[tokio::test]
+    async fn scoped_describe_namespace_observes_its_own_deletion_tombstone() {
+        let scoped = describe_namespace_service(Some(scoped_describe_claims()), true).await;
+        let response = scoped
+            .describe_namespace(describe_by_name("default"))
+            .await
+            .expect("a deletion tombstone stays observable by name")
+            .into_inner();
+        assert_eq!(
+            response.namespace_info.map(|info| info.state),
+            Some(tokeira_proto::enums::NamespaceState::Deleted as i32)
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_describe_namespace_denies_other_names_and_every_id_before_lookup() {
+        let scoped = describe_namespace_service(Some(scoped_describe_claims()), false).await;
+
+        // "other" is not registered at all: a denial rather than NOT_FOUND
+        // proves the scope decision precedes the namespace lookup.
+        let other = scoped
+            .describe_namespace(describe_by_name("other"))
+            .await
+            .expect_err("another namespace is outside the scope");
+        assert_eq!(other.code(), tonic::Code::PermissionDenied);
+
+        // The scope's own ID and an unknown ID must be indistinguishable.
+        let own = scoped
+            .describe_namespace(describe_by_id(DESCRIBE_NAMESPACE_ID))
+            .await
+            .expect_err("a by-ID description is outside the scope");
+        let unknown = scoped
+            .describe_namespace(describe_by_id(UNKNOWN_NAMESPACE_ID))
+            .await
+            .expect_err("an unknown ID is denied identically");
+        assert_eq!(own.code(), tonic::Code::PermissionDenied);
+        assert_eq!(unknown.code(), tonic::Code::PermissionDenied);
+        assert_eq!(own.message(), unknown.message());
+
+        let listed = scoped
+            .list_namespaces(Request::new(
+                workflowservice::ListNamespacesRequest::default(),
+            ))
+            .await
+            .expect_err("listing namespaces is outside the scope");
+        assert_eq!(listed.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn ordinary_describe_namespace_by_id_keeps_resolve_then_authorize() {
+        let ordinary = describe_namespace_service(None, false).await;
+
+        let found = ordinary
+            .describe_namespace(describe_by_id(DESCRIBE_NAMESPACE_ID))
+            .await
+            .expect("ordinary by-ID describe")
+            .into_inner();
+        assert_eq!(
+            found.namespace_info.map(|info| info.name),
+            Some("default".to_owned())
+        );
+
+        let missing = ordinary
+            .describe_namespace(describe_by_id(UNKNOWN_NAMESPACE_ID))
+            .await
+            .expect_err("an unknown ID is not found for an ordinary identity");
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+    }
+
     async fn scoped_worker_test_service() -> (
         WorkflowServiceGrpc,
         tokeira_runtime::InMemoryBroker,

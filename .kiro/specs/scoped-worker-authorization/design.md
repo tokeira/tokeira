@@ -17,6 +17,9 @@ The design is derived from:
 - the approved [`requirements.md`](./requirements.md);
 - `common/authorization/{interceptor.go,default_authorizer.go,roles.go}` and
   `common/api/metadata.go @ v1.31.0` for the existing role and admission behavior;
+- `service/frontend/namespace_handler.go @ v1.31.0` for `DescribeNamespace` name/ID resolution,
+  and `temporalio-sdk-core 0.9.0` (`src/worker/mod.rs`, `src/worker/heartbeat.rs`) for the SDK's
+  start-up namespace check and capability discovery;
 - vendored WorkflowService, Deployment, Worker, and Task Queue protos for request fields;
 - `crates/tokeira-auth`, `crates/tokeira-edge/src/interceptors.rs`,
   `crates/tokeira-edge/src/workflow_service.rs`, and
@@ -72,6 +75,8 @@ continues to reproduce v1.31.0.
 - No unversioned, deprecated-build-only, or standalone-activity task delivery to scoped
   identities.
 - No namespace-wide Worker inventory, Workflow visibility, or Workflow history access.
+- No namespace description by ID, namespace listing, namespace mutation, or response filtering
+  for scoped identities.
 - No kernel command, kernel state field, transition effect, or history event.
 - No new delivery ordering, broker correctness, lane affinity, or projection dependency.
 - No requirement that unscoped Workers create provenance rows.
@@ -91,9 +96,10 @@ Authorization is a two-phase edge operation for resource-bearing Worker calls:
 1. **Preflight** authenticates the bearer and checks that the API operation and request namespace
    are permitted. This preserves deny-before-namespace-existence and deny-before-token-detail
    behavior.
-2. **Resource authorization** checks a normalized queue/version target. Poll, heartbeat,
-   shutdown, and `DescribeTaskQueue` targets come from their request fields. Token responses
-   obtain their target from the storage-owned task-provenance registry.
+2. **Resource authorization** checks a normalized target. Poll, heartbeat, shutdown, and
+   `DescribeTaskQueue` queue/version targets come from their request fields; the
+   `DescribeNamespace` target is the request namespace itself. Token responses obtain their
+   target from the storage-owned task-provenance registry.
 
 An unscoped identity follows the existing single-phase numeric-role decision. A scoped identity
 never falls back to that role decision.
@@ -112,7 +118,7 @@ flowchart LR
         HANDLER["Existing handler"]
         DENY["PERMISSION_DENIED"]
         AUTHN --> PRE --> TARGET
-        TARGET -->|"poll / DQT / heartbeat / shutdown"| REQ --> FINAL
+        TARGET -->|"poll / DQT / heartbeat / shutdown / own-namespace describe"| REQ --> FINAL
         TARGET -->|"task response"| DIGEST
         FINAL -->|"allow"| HANDLER
         FINAL -->|"deny"| DENY
@@ -215,12 +221,15 @@ pub enum WorkerOperation {
     RecordWorkerHeartbeat,
     ShutdownWorker,
     DescribeTaskQueue,
+    DescribeNamespace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerTarget<'a> {
     /// Checks operation and namespace before a token or resource is decoded.
     Preflight,
+    /// Own-namespace metadata read; the exact namespace is the whole target.
+    Namespace,
     /// DQT or the top-level normal queue on shutdown.
     TaskQueue {
         normal_task_queue: &'a str,
@@ -240,9 +249,11 @@ The pure decision procedure is:
 1. deny when the namespace differs;
 2. deny when the operation is not one of `WorkerOperation`;
 3. allow `Preflight` only as a non-terminal admission phase;
-4. require an Allowed_Queue for every resolved target;
+4. require an Allowed_Queue for every resolved queue-bearing target, and accept a `Namespace`
+   target on the exact namespace alone;
 5. require an exact non-empty Deployment-Version for `VersionedTask`;
-6. require the target shape appropriate to the operation; and
+6. require the target shape appropriate to the operation, so that `Namespace` satisfies only
+   `DescribeNamespace`; and
 7. never consult ordinary role bits when `Claims.worker_scope` is present.
 
 `CallTarget` gains `worker: Option<WorkerCallTarget<'a>>`. `DefaultAuthorizer` preserves the
@@ -570,8 +581,9 @@ They retain the v1.31.0 namespace-Write classification for Ordinary_Identities b
 map to no `WorkerOperation`. A Scoped_Identity therefore hits the `worker: None` fail-closed
 branch.
 
-`Action::worker_operation()` is a total explicit mapping over the fixed allowed operations. No
-wildcard action arm exists.
+`Action::worker_operation()` is a total explicit mapping over the fixed allowed operations,
+including `Action::DescribeNamespace` → `WorkerOperation::DescribeNamespace`. No wildcard action
+arm exists.
 
 ### 7. Poll and inline-return admission (`crates/tokeira-edge`)
 
@@ -758,6 +770,32 @@ The Feature Catalog gains `scoped-worker-authorization`, classified as:
 examples, attenuation warning, exact VERSIONED requirement, and standard SDK bearer-supplier
 example. No real token, private key, presigned URL, or tenant identifier is committed.
 
+### 13. DescribeNamespace (own namespace by name)
+
+Every Core-based Temporal SDK Worker resolves `DescribeNamespace` before it polls and fails to
+start on any status except `UNIMPLEMENTED` (`temporalio-sdk-core 0.9.0`, `src/worker/mod.rs`,
+`Worker::validate`). The same description gates the Worker heartbeat loop on the advertised
+`worker_heartbeats` capability (`src/worker/heartbeat.rs`), so a scope that admits
+`RecordWorkerHeartbeat` but denies the description leaves that heartbeat grant unused. The
+matrix therefore admits the call for the scope's own namespace, by name only.
+
+By-name path: preflight proves `WorkerOperation::DescribeNamespace` in the exact namespace, then
+final authorization uses `WorkerTarget::Namespace`; only then does the existing handler run its
+own lookup and return `namespace_to_proto` unchanged. The response is not filtered for a scoped
+caller: capabilities, configuration, replication configuration, and a deletion tombstone are
+observable exactly as for an Ordinary_Identity, because the SDK acts on those fields and
+v1.31.0 promises no reduced shape.
+
+By-ID path: a by-ID request carries no `namespace`, and in v1.31.0 the authorization target
+namespace is taken from that field alone (`common/authorization/interceptor.go:161 @ v1.31.0`),
+so a namespace-scoped claim cannot satisfy it. The edge authenticates before resolving the ID; a
+Scoped_Identity is denied there with `WorkerScopeDenyReason::Namespace`, before `get_by_id`, so
+the denial never discloses whether the ID exists. An Ordinary_Identity keeps the existing
+resolve-then-authorize ordering, preserving Property 12.
+
+No other namespace RPC is admitted: `ListNamespaces`, `RegisterNamespace`, `UpdateNamespace`,
+`DeprecateNamespace`, and `DeleteNamespace` remain in the fail-closed `worker: None` branch.
+
 ## Data Models
 
 ### Normalized Worker scope
@@ -825,11 +863,12 @@ ordinary claims, while any present malformed value rejects instead of falling ba
 *For any* Claims, API action, namespace, and Worker target, the authorizer follows this reference
 model: the exact universal health set allows before claims; ordinary Claims otherwise use the
 existing numeric role decision; scoped Claims ignore roles, deny an absent non-health Worker
-target, allow preflight only for a fixed Worker operation in the exact namespace, and allow a
+target, allow preflight only for a fixed Worker operation in the exact namespace, allow a
+`Namespace` target only for `DescribeNamespace` in the exact namespace, and allow every other
 resolved target only when its shape, queue, and exact version satisfy the Fixed Operation Matrix.
 
 **Validates: Requirements 1.2-1.4, 4.2-4.5, 5.1-5.12, 8.1-8.2, 9.2-9.4, 9.7,
-9.12, 11.1-11.3, 12.4**
+9.12, 11.1-11.3, 12.4, 13.1, 13.3-13.6**
 
 ### Property 5: Poll-target normalization
 
@@ -898,7 +937,7 @@ considered non-empty when it has an ordinary grant or a Worker-Scope rule.
 does not change the DefaultAuthorizer decision or computed principal relative to the
 authorization-foundation reference implementation.
 
-**Validates: Requirements 1.4, 4.7, 11.1-11.3**
+**Validates: Requirements 1.4, 4.7, 11.1-11.3, 13.7**
 
 ### Property 13: Bounded denial classification
 
@@ -907,7 +946,7 @@ label from `operation`, `namespace`, `queue`, `version`, `task_origin`, `heartbe
 or `ambiguous_mapping`; public formatting contains none of the scope coordinates, bearer bytes,
 or task-token bytes.
 
-**Validates: Requirements 11.4-11.6**
+**Validates: Requirements 11.4-11.6, 13.8**
 
 ## Integration and Structural Invariants
 
@@ -943,17 +982,20 @@ fencing remains necessary for every accepted response.
 
 Every Activity By-ID RPC and every WorkflowService/OperatorService operation absent from the
 Fixed Operation Matrix and universal health set denies a Scoped_Identity, including
-`ResetStickyTaskQueue`, `ListWorkers`, and `DescribeWorker`.
+`ResetStickyTaskQueue`, `ListWorkers`, `DescribeWorker`, `ListNamespaces`, and a by-ID
+`DescribeNamespace`.
 
-**Validates: Requirements 6.9, 8.5, 9.12, 10.6, 12.7**
+**Validates: Requirements 6.9, 8.5, 9.12, 10.6, 12.7, 12.18, 13.4, 13.6**
 
 ### Invariant I5: Readiness contract
 
-A standard SDK Worker bearing a valid Worker scope can poll and complete Workflow, Activity, and
-Nexus tasks and can observe its exact version through `DescribeTaskQueue`; the same credential
-cannot poll another queue/version or call namespace-wide read/write APIs.
+A standard SDK Worker bearing a valid Worker scope starts on that credential alone, completing
+its start-up `DescribeNamespace` for the Own_Namespace, can poll and complete Workflow, Activity,
+and Nexus tasks, and can observe its exact version through `DescribeTaskQueue`; the same
+credential cannot poll another queue/version, describe another namespace, or call any other
+namespace read/write API.
 
-**Validates: Requirements 8.1-8.7, 12.13-12.16**
+**Validates: Requirements 8.1-8.7, 12.13-12.18, 13.1-13.2, 13.7**
 
 ### Invariant I6: Kernel and history isolation
 
@@ -1002,6 +1044,7 @@ the exact VERSIONED pair, and cite the relevant compatibility evidence.
 | Heartbeat batch storage failure | `HeartbeatStoreError` | existing `INTERNAL`, no partial insert |
 | Shutdown target mismatch | `WorkerScopeDenyReason::Shutdown` | generic `PERMISSION_DENIED`, no lifecycle effect |
 | DQT queue mismatch | `WorkerScopeDenyReason::Queue` | generic `PERMISSION_DENIED`, no stats/poller read |
+| Scoped `DescribeNamespace` for another namespace or by ID | `WorkerScopeDenyReason::Namespace` | generic `PERMISSION_DENIED` before namespace or ID lookup |
 
 Authorizer implementation-error exposure remains governed by
 `policy.authorization.expose_authorizer_errors`. Resource mismatches are intentional denials, not
@@ -1034,6 +1077,8 @@ Use workspace `proptest`, at least 100 cases, with
 - provenance put conflict and expiry boundary;
 - heartbeat all-or-nothing failure injection;
 - `DescribeTaskQueue` report/version selector non-authority;
+- `DescribeNamespace` own-name allow with the unfiltered response and tombstone, other-name
+  deny, and by-ID deny before resolution;
 - CHASM denial before bridge call; and
 - exact public error codes/messages from the Error Handling table.
 
@@ -1042,10 +1087,12 @@ Use workspace `proptest`, at least 100 cases, with
 - **Auth-stack integration:** locally signed JWT through real `PolicyAuthenticator`, including
   signed claim, subject mapping, AWS IAM mapping fixture, conflict, and ordinary-role
   preservation.
-- **Real gRPC Worker:** standard Temporal SDK auth metadata supplier; exact VERSIONED Workflow,
-  Activity, and Nexus poll/response; heartbeat; shutdown; DQT readiness.
+- **Real gRPC Worker:** standard Temporal SDK auth metadata supplier on the scoped credential
+  alone, with no pre-resolved description; start-up `DescribeNamespace`; exact VERSIONED
+  Workflow, Activity, and Nexus poll/response; heartbeat; shutdown; DQT readiness.
 - **Negative scope matrix:** same credential against wrong namespace, queue, deployment, build,
-  unversioned mode, By-ID response, ListWorkers, DescribeWorker, visibility, and Workflow start.
+  unversioned mode, By-ID response, ListWorkers, DescribeWorker, visibility, Workflow start,
+  another namespace's description, any by-ID description, and ListNamespaces.
 - **Universal health regression:** `Health/Check` and `GetSystemInfo` remain callable with no
   token and with a scoped token, preserving SDK connect behavior.
 - **Provenance lifecycle:** poll→record→heartbeat-retain→terminal-delete; edge-process

@@ -6,7 +6,9 @@ This spec defines a Tokeira-native credential scope for untrusted Temporal worke
 worker credential authorizes one namespace, a non-empty allow-list of normal task queues, and
 one exact Worker Deployment Version `(deployment_name, build_id)`. It permits only the public
 WorkflowService operations required to poll, execute, complete, heartbeat, shut down, and
-describe those queues. It does not grant general namespace read or write access.
+describe those queues, plus a by-name description of its own namespace so that a standard SDK
+Worker can complete its start-up namespace check. It grants no other namespace read or write
+access.
 
 The feature closes the security dependency tracked by
 [`tokeira/tokeira#29`](https://github.com/tokeira/tokeira/issues/29) and by the
@@ -34,6 +36,10 @@ The relevant v1.31.0 ground truth is:
   and cross-namespace commands are separately authorized.
 - `service/frontend/workflow_handler.go @ v1.31.0` — worker poll, response, heartbeat, and
   shutdown request behavior.
+- `service/frontend/namespace_handler.go @ v1.31.0` — `DescribeNamespace` resolves the request's
+  `namespace` name or `id`; `common/authorization/interceptor.go:161 @ v1.31.0` derives the
+  authorization target namespace from the request's `namespace` field alone, so a by-ID request
+  carries no namespace that a namespace-scoped claim could satisfy.
 - Vendored `proto/upstream/temporal/api/workflowservice/v1/request_response.proto` — poll
   deployment options, task tokens, Worker heartbeat requests, shutdown fields, and
   `DescribeTaskQueue`.
@@ -41,6 +47,18 @@ The relevant v1.31.0 ground truth is:
   `WorkerDeploymentOptions` and exact Deployment-Version identity.
 - Vendored `proto/upstream/temporal/api/worker/v1/message.proto` — Worker heartbeat queue and
   Deployment-Version identity.
+
+The Temporal SDK ground truth for the own-namespace description is:
+
+- `temporalio-sdk-core 0.9.0`, `src/worker/mod.rs` (`Worker::validate`) — every Core-based Worker
+  resolves `DescribeNamespace` before it polls and fails to start on any status except
+  `UNIMPLEMENTED`; `src/worker/heartbeat.rs` — the Worker heartbeat loop runs only when the
+  described `worker_heartbeats` capability is `true`.
+- `temporalio-client 1.0.0`, `src/worker.rs` (`NamespaceDescriptionSource::resolve`) — the
+  description is resolved once per namespace, and only `UNIMPLEMENTED` degrades to defaults.
+- The Python (`temporalio/worker/_worker.py`), TypeScript (`packages/worker/src/runtime.ts`), and
+  .NET (`src/Temporalio/Worker/TemporalWorker.cs`) SDKs invoke that Core validation at Worker
+  start, so the need is SDK-wide rather than specific to the Rust SDK.
 
 The implementation must preserve Tokeira's architecture. Authorization belongs to
 `tokeira-auth` and the compatibility edge. Runtime participation is limited to read-only
@@ -61,6 +79,7 @@ delivery-queue correctness claim, or authorization I/O in the kernel.
 - **Deployment_Version:** the exact, case-sensitive pair `(deployment_name, build_id)` from
   `WorkerDeploymentOptions` in `VERSIONED` mode.
 - **Allowed_Queue:** a Normal_Task_Queue named in the Worker_Scope.
+- **Own_Namespace:** the namespace named in the Worker_Scope, addressed by exact name.
 - **Worker_Operation:** one of the fixed RPCs in the operation matrix below.
 - **Task_Origin:** the server-authoritative namespace, Normal_Task_Queue, task kind, and
   Deployment_Version from which a polled task was issued.
@@ -101,9 +120,11 @@ extension is required.
 
 The credential can poll Workflow, Activity, and Nexus tasks for `payments-worker` only when the
 poll declares the exact Deployment_Version. It can answer only tasks actually issued under that
-scope, send scoped Worker heartbeats, shut down its own polls, and use
-`DescribeTaskQueue` for readiness. It cannot start, signal, query, update, describe, list,
-terminate, reset, or otherwise operate Workflow Executions; cannot use activity By-ID response
+scope, send scoped Worker heartbeats, shut down its own polls, use `DescribeTaskQueue` for
+readiness, and describe the `payments` namespace by name so that a standard SDK Worker completes
+its start-up namespace check and capability discovery. It cannot start, signal, query, update,
+describe, list, terminate, reset, or otherwise operate Workflow Executions; cannot describe a
+namespace by ID, list namespaces, or change any namespace; cannot use activity By-ID response
 RPCs; cannot poll an unversioned or different-version queue; and cannot access another
 namespace or task queue.
 
@@ -125,6 +146,16 @@ when the same token also contains ordinary namespace roles.
   namespace Write and `DescribeTaskQueue` as ReadOnly, matching
   `common/api/metadata.go @ v1.31.0`. It authorizes before resolving task-queue or task-token
   targets.
+- `crates/tokeira-edge/src/interceptors.rs` classifies `DescribeNamespace` as namespace ReadOnly,
+  matching `common/api/metadata.go @ v1.31.0`, and maps it to no Worker operation, so a
+  Scoped_Identity is denied the call today.
+- `crates/tokeira-edge/src/workflow_service.rs` serves `DescribeNamespace` by name (authorize,
+  then look up) and by ID (resolve the ID to a name, then authorize that name), and
+  `crates/tokeira-edge/src/grpc/translate.rs::namespace_to_proto` returns the namespace info,
+  advertised capabilities, configuration, and replication configuration unfiltered.
+- `apps/tokeira-bench/tests/v0_4_integration.rs` starts a Core Worker on a scoped credential only
+  by pre-resolving the namespace description from a separate admin credential, which is the
+  broader-credential-in-process pattern this scope exists to remove.
 - `crates/tokeira-edge/src/task_token.rs` wraps runtime fencing tokens and namespace identity.
   Workflow and Activity public task tokens do not currently carry trusted queue or
   Deployment-Version origin.
@@ -207,11 +238,15 @@ The pattern grammar remains the full-string, case-sensitive, `*`-only grammar de
 | `RecordWorkerHeartbeat` | Allow | every heartbeat matches namespace, Allowed_Queue, and Deployment_Version |
 | `ShutdownWorker` | Allow | normal queue, optional heartbeat, and non-empty sticky queue are within scope |
 | `DescribeTaskQueue` | Allow | exact namespace and Allowed_Queue |
+| `DescribeNamespace` | Allow | request `namespace` equals the Own_Namespace; a by-ID request is denied |
 | `Health/Check`, `GetSystemInfo` | Allow | universal v1.31.0 health set; allowed before claims and not granted by Worker_Scope |
 | Every other WorkflowService/OperatorService RPC | Deny | except the universal health set; ordinary roles cannot widen the scope |
 
 The allow-list is fixed in code and documentation. Operators configure resource scope, not
-arbitrary RPC permissions. The universal health set is inherited from
+arbitrary RPC permissions. An RPC enters the matrix only when a standard Temporal SDK Worker
+needs it to start or operate on its Allowed_Queues and its target resolves by exact name to the
+Worker_Scope's own namespace or queues; a read-only classification alone never qualifies an RPC.
+The universal health set is inherited from
 `default_authorizer.go:37-43 @ v1.31.0`; it is not Worker authority and remains callable by
 anonymous clients.
 
@@ -443,7 +478,7 @@ version is polling, so that readiness can be established without namespace-wide 
 4. THE scoped `DescribeTaskQueue` response SHALL preserve PollerInfo deployment name and build ID
    so a provisioner can match the exact Worker_Scope Deployment_Version.
 5. THE scoped `DescribeTaskQueue` response SHALL NOT grant access to `ListWorkers`,
-   `DescribeWorker`, Workflow visibility, Workflow history, or namespace description APIs.
+   `DescribeWorker`, Workflow visibility, Workflow history, or `ListNamespaces`.
 6. WHEN a scoped `DescribeTaskQueue` request uses report or version-selection fields, THE edge
    SHALL treat those fields only as response-shape selectors and not as wider resource authority.
 7. WHEN a scoped `DescribeTaskQueue` request names a disallowed queue, THE edge SHALL deny it
@@ -574,9 +609,42 @@ provider readiness rests on fail-closed behavior rather than a happy-path demons
 14. THE integration tests SHALL demonstrate that the same credential cannot poll a second queue
     or version.
 15. THE integration tests SHALL demonstrate that the same credential can call
-    `DescribeTaskQueue` for readiness and cannot call namespace-wide read or write APIs.
+    `DescribeTaskQueue` for readiness and `DescribeNamespace` for its Own_Namespace, and cannot
+    call any other namespace read or write API.
 16. THE cross-repository contract evidence SHALL record the exact tokeira commit and sibling-provider
     contract revision used for the end-to-end readiness proof.
+17. THE integration tests SHALL demonstrate that a standard Temporal SDK Worker starts on the
+    scoped credential alone, completing its start-up `DescribeNamespace` for the Own_Namespace
+    without a second credential or a pre-resolved description.
+18. THE integration tests SHALL demonstrate that the same credential cannot describe another
+    namespace by name, cannot describe any namespace by ID, and cannot list namespaces.
+
+### Requirement 13: Own-namespace description for SDK Worker start-up
+
+**User Story:** As a worker provisioner, I want a scoped credential to satisfy a standard SDK
+Worker's start-up namespace check, so that Python, TypeScript, .NET, and Rust Workers start
+without a second, broader credential.
+
+#### Acceptance Criteria
+
+1. WHEN a Scoped_Identity calls `DescribeNamespace` with a non-empty `namespace` equal to the
+   Own_Namespace, THE edge SHALL allow the request.
+2. WHEN a scoped `DescribeNamespace` request is allowed, THE edge SHALL return the same response
+   an Ordinary_Identity receives, including advertised namespace capabilities, configuration,
+   replication configuration, and a `NAMESPACE_STATE_DELETED` tombstone, without filtering.
+3. WHEN a Scoped_Identity calls `DescribeNamespace` with a `namespace` that differs from the
+   Own_Namespace, THE edge SHALL return the generic authorization denial before namespace lookup.
+4. WHEN a Scoped_Identity calls `DescribeNamespace` with an empty `namespace`, THE edge SHALL
+   return the generic authorization denial before resolving any `id`, so that the response does
+   not reveal whether that ID exists.
+5. THE scoped `DescribeNamespace` decision SHALL use only the request's `namespace` field as its
+   target; the `id` field SHALL neither widen nor substitute the target.
+6. THE `DescribeNamespace` allowance SHALL NOT authorize `ListNamespaces`, `RegisterNamespace`,
+   `UpdateNamespace`, `DeprecateNamespace`, or `DeleteNamespace` for a Scoped_Identity.
+7. WHEN an Ordinary_Identity calls `DescribeNamespace` by name or by ID, THE edge SHALL preserve
+   the existing decision and error ordering.
+8. WHEN a scoped `DescribeNamespace` request is denied, THE server SHALL classify the denial
+   under the existing bounded `namespace` or `operation` metric labels.
 
 ## Out of Scope
 
@@ -587,6 +655,8 @@ provider readiness rests on fail-closed behavior rather than a happy-path demons
   or arbitrary per-RPC operator grants in one Worker_Scope.
 - Namespace-wide Worker inventory access (`ListWorkers`, `DescribeWorker`).
 - Activity By-ID responses for scoped workers.
+- Describing a namespace by ID, listing namespaces, changing namespaces, or filtering the
+  `DescribeNamespace` response for scoped workers.
 - Unversioned, deprecated-build-ID-only, or standalone-activity polling by scoped workers.
 - Kernel, history, lane-routing, projection, or delivery-order changes.
 - Provider-specific VM, container, Lambda, IAM-role, or Firecracker lifecycle.

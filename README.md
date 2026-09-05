@@ -340,6 +340,10 @@ let engine = tokeira_engine::Engine::embedded().await?;
 // and every SDK worker and client in the process speaks to it directly.
 ```
 
+When workers run in other processes or containers, `engine.listen(addr)`
+serves the same engine over gRPC on an address you choose; nothing is bound
+until you ask.
+
 Embedded deployments can begin in memory — optionally with snapshots — and
 move to Aurora DSQL without changing the execution model: either a managed
 cluster the engine creates and recovers, or an existing cluster you supply.

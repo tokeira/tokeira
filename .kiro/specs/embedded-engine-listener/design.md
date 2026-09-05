@@ -172,16 +172,22 @@ struct ListenerRegistry { slots: Arc<std::sync::Mutex<Vec<ListenerSlot>>> }
 Because the child token is derived from `background_cancel`, no listener can outlive the
 engine's cancellation even if the host forgets both `shutdown` calls.
 
-### 4. Long-poll release on shutdown
+### 4. In-flight reset on stop
 
-The daemon drains by sending its listener oneshot and awaiting the server task
-([lib.rs:2287-2290](../../../crates/tokeira-engine/src/lib.rs)); in-flight long polls end
-through the runtime's shutdown signal and the broker's poller fencing. The embedded
-listener uses the same mechanism: `Engine::shutdown` cancels listener tokens after
-`coordinator.begin_shutdown()` has signalled the runtime, so pollers blocked in the broker
-observe the same release the daemon relies on. Implementation verifies this ordering with
-a test that holds an open long poll over the listener during `Engine::shutdown` and
-asserts completion inside the deadline (Property 5).
+tonic's graceful shutdown closes the accept loop and then waits for every in-flight
+request to finish. A parked long poll finishes only when a task arrives or its 60 s
+timeout elapses (the broker's wait observes no shutdown signal,
+[broker.rs `poll_workflow_inner`](../../../crates/tokeira-runtime/src/broker.rs)), which
+would spend the engine's whole shutdown deadline on one idle worker. The in-process
+endpoint already treats caller cancellation as a server-side reset of the handler
+(`AbortOnDropHandler` in [in_process.rs](../../../crates/tokeira-edge/src/in_process.rs)).
+The listener gives the network path the same semantics on stop: a tower layer mounted
+under the routes races every handler future against the listener's stop token, and on
+stop the handler is dropped, its admission and RAII state are released, and the caller
+receives `UNAVAILABLE`, exactly what an h2 reset produces. Every engine mutation a dropped
+handler started is fenced and deduplicated by the runtime, so the reset is as safe as a
+worker dying mid-call. Property 5 holds an open long poll over the listener during
+`Engine::shutdown` and asserts completion well inside the deadline.
 
 ### 5. Documentation
 

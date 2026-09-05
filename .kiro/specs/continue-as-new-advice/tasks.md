@@ -1,9 +1,11 @@
 # Implementation Plan
 
-- [ ] 0. Approval checkpoint: state-format break
+- [x] 0. Approval checkpoint: state-format break
   - The integration seat approves the postcard-layout change to `WorkflowState`,
     `PendingWorkflowTask`, and `HistoryEventKind::WorkflowTaskStarted`, the envelope
     introduction, and the V068 guard before any task below starts.
+  - DONE 2026-09-05: approved by the integration seat, together with including the
+    `TOO_MANY_UPDATES` reason and reporting the persisted-encoding size from Describe.
   - _Requirements: 10.7_
 
 - [ ] 1. Storage: envelopes, statistic, and stats read

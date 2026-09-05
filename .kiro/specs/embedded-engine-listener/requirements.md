@@ -39,7 +39,10 @@ listener for its transport-independence evidence and otherwise has no dependency
 - **Listener Handle:** The value returned when a listener is attached. It reports the
   bound address and owns the listener's stop and drain.
 - **Bound Address:** The socket address actually bound, including the concrete port when
-  the host requested port `0`.
+  the host requested port `0`. When the host requested the unspecified address
+  (`0.0.0.0` or `[::]`), it is that unspecified address with the concrete port; the host
+  substitutes a reachable interface address when it advertises the listener, because only
+  the host knows which address other processes can reach.
 - **Engine Shutdown:** `Engine::shutdown` or `Drop for Engine`, which closes in-process
   admission, drains, releases leases and ownership, and closes storage.
 - **Listener Stop:** Stopping one listener without shutting the engine down.
@@ -104,7 +107,7 @@ versioning; Docker or ECS knowledge in the engine.
 
 | Input / output | Target policy | Error if invalid | Side-effect impact |
 |---|---|---|---|
-| `addr: SocketAddr` | Bind exactly this address; port `0` requests an ephemeral port. | Bind failure returns `EngineListenError::Bind` carrying the OS error; the engine is unchanged. | A successful bind spawns one server task tied to the engine's cancellation. |
+| `addr: SocketAddr` | Bind exactly this address; port `0` requests an ephemeral port; the unspecified address is bound and reported as given. | Bind failure returns `EngineListenError::Bind` carrying the OS error; the engine is unchanged. | A successful bind spawns one server task tied to the engine's cancellation. |
 | engine already shutting down | Refuse before binding. | `EngineListenError::ShutDown`. | None. |
 | returned `EngineListener` | Reports the Bound Address; owns stop and drain. | n/a | Registered with the engine so Engine Shutdown can stop it. |
 
@@ -146,6 +149,10 @@ descriptor set, as the daemon does.
 
 1.7 THE engine SHALL NOT read `infrastructure.network.grpc_addr` or any other
 configuration field to decide whether or where to listen.
+
+1.8 WHEN the requested address is the unspecified address (`0.0.0.0` or `[::]`), THE
+Listener Handle SHALL report that unspecified address with the concrete bound port and
+SHALL NOT substitute an interface address.
 
 ### Requirement 2: One engine, one service graph
 

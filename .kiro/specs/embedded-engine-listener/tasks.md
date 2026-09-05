@@ -42,8 +42,9 @@
   - _Requirements: 6.4_
 
 - [ ] 4. Example-based tests (`crates/tokeira-engine/tests/embedded_listener.rs`)
-  - [ ] 4.1 Ephemeral bind reports a concrete port; reflection lists the Workflow service
-    - _Requirements: 1.2, 1.3, 1.6_
+  - [ ] 4.1 Ephemeral bind reports a concrete port; an unspecified bind reports
+    `0.0.0.0` or `[::]` with that port; reflection lists the Workflow service
+    - _Requirements: 1.2, 1.3, 1.6, 1.8_
   - [ ] 4.2 Occupied port returns `Bind`; engine still serves in-process afterwards
     - _Requirements: 4.1, 4.2_
   - [ ] 4.3 `listen` after `shutdown` began returns `ShutDown`

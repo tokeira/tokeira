@@ -4,7 +4,7 @@
 
 Temporal tells a workflow when it should continue-as-new soon. The advice travels in the
 `WorkflowTaskStarted` history event as a flag, a list of reasons, and the run's history
-size in bytes. SDKs surface the flag to workflow code; the Rust SDK 0.8.0 exposes it as
+size in bytes. SDKs surface the flag to workflow code; the Rust SDK 1.0.0 exposes it as
 `continue_as_new_suggested()`. Tokeira records the flag as `false` and the size as `0` on
 every workflow task today, so a workflow that relies on the server's advice never
 continues because of growing history.
@@ -120,10 +120,11 @@ warning-level thresholds; envelopes for activity, timer, and other side-table bl
     monotone size, threshold change visible only from the next start),
     `tests/describe_test.go:77` (Describe size positive),
     `tests/update_workflow_test.go:4925-4960` (update reason).
-- **SDK consumption (pinned):** `temporalio-sdk-core-0.8.0/src/worker/workflow/machines/workflow_machines.rs:892-894`
-  copies the three attributes from the started event; `:464-473` puts them on the
-  activation; `temporalio-workflow-0.8.0/src/workflow_context.rs:1591-1597, 2098`
-  exposes `continue_as_new_suggested()`.
+- **SDK consumption (pinned):** `temporalio-sdk-core-0.9.0/src/worker/workflow/machines/workflow_machines.rs:892-894`
+  (the core crate behind Rust SDK 1.0.0) copies the three attributes from the started
+  event; `:464-473` puts them on the activation;
+  `temporalio-workflow-1.0.0/src/workflow_context.rs:1777-1783, 2315-2316` exposes
+  `continue_as_new_suggested()`.
 - **Current handlers / code:** the sites in the Target State table; the kernel request
   shape [command.rs:1137-1167](../../../crates/tokeira-kernel/src/command.rs); the kernel
   emit sites [kernel.rs:1735-1760](../../../crates/tokeira-kernel/src/kernel.rs) (polled

@@ -1,23 +1,24 @@
-//! v0.4 SDK ↔ post-sync `tokeirad` integration test.
+//! Temporal Rust SDK 1.0.0 ↔ `tokeirad` integration tests.
 //!
-//! The test spawns `tokeirad` in-process via [`TokeiradHandle::start_in_memory`],
-//! constructs a v0.4 `temporalio_client::Client`, asserts that `worker_heartbeats`
-//! is advertised `true` on `DescribeNamespace`, then
-//! starts and round-trips an `EchoWorkflow` through a v0.4 `Worker`.
+//! The first test spawns `tokeirad` in-process via [`TokeiradHandle::start_in_memory`],
+//! constructs an SDK `temporalio_client::Client`, asserts that `worker_heartbeats`
+//! is advertised `true` on `DescribeNamespace`, then starts and round-trips an
+//! `EchoWorkflow` through an SDK `Worker`.
 //!
-//! Gated behind `#[ignore]` so it does not run under a plain
-//! `cargo test --workspace`; run it explicitly with:
+//! The second test brings up a scoped Worker credential through the production
+//! authorization bootstrap and proves the scope holds across workflow, activity,
+//! and Nexus polling. The SDK's high-level worker derives its task types from the
+//! definitions registered on it and never polls Nexus tasks, so that test builds
+//! the Core worker itself, hands it to the SDK worker for workflows and activities,
+//! and drives Nexus through the Core worker directly, which is what a Rust host
+//! that handles Nexus operations has to do today.
+//!
+//! Both tests are gated behind `#[ignore]` so they do not run under a plain
+//! `cargo test --workspace`; run them explicitly with:
 //!
 //! ```text
 //! cargo test --package tokeira-bench --test v0_4_integration -- --include-ignored
 //! ```
-//!
-//! This test is the spec's acceptance gate per
-//! `.kiro/specs/temporal-api-v1.62-sync/requirements.md` §7:
-//!   - `NamespaceInfo.Capabilities.worker_heartbeats == true`.
-//!   - `RecordWorkerHeartbeat` returns Ok (no `Status::unimplemented`), keeping
-//!     the v0.4 `SharedNamespaceWorker` alive for the duration of the workflow.
-//!   - An `EchoWorkflow` start→complete round-trip succeeds end-to-end.
 //!
 //! Synchronisation uses `tokio::sync::Notify` and `tokio::time::timeout` —
 //! never `tokio::time::sleep` — per `tokeira/AGENTS.md` Rule 1.
@@ -39,13 +40,12 @@ use temporalio_client::{
 };
 use temporalio_common::{
     protos::{
-        coresdk::{
-            AsJsonPayloadExt,
-            nexus::{NexusTaskCompletion, nexus_operation_result, nexus_task_completion},
+        coresdk::nexus::{
+            NexusTaskCompletion, nexus_operation_result, nexus_task, nexus_task_completion,
         },
         temporal::api::{
             deployment::v1::WorkerDeploymentOptions as ProtoWorkerDeploymentOptions,
-            enums::v1::{TaskQueueType, VersioningBehavior, WorkerVersioningMode},
+            enums::v1::{TaskQueueType, WorkerVersioningMode},
             nexus::v1::{
                 EndpointSpec, EndpointTarget, Response as NexusResponse, StartOperationResponse,
                 endpoint_target, response as nexus_response, start_operation_response,
@@ -58,15 +58,21 @@ use temporalio_common::{
             },
         },
     },
-    telemetry::TelemetryOptions,
-    worker::{WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes},
+    worker::{
+        VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes,
+    },
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, NexusOperationOptions, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
+    ActivityOptions, ApplicationFailure, NexusOperationOptions, Runtime, Worker, WorkerOptions,
+    WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    runtime::WorkerConfig,
 };
-use temporalio_sdk_core::{CoreRuntime, PollError, RuntimeOptions};
+use temporalio_sdk_core::{
+    CoreRuntime, PollError, RuntimeOptions as CoreRuntimeOptions, WorkerVersioningStrategy,
+    init_worker,
+};
 use tokeira_bench::{BENCH_TASK_QUEUE, EchoWorkflow};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -108,7 +114,7 @@ impl ScopedIntegrationActivities {
         context: ActivityContext,
         input: String,
     ) -> Result<String, ActivityError> {
-        context.record_heartbeat(vec![input.as_json_payload().expect("heartbeat payload")]);
+        let _ = context.record_heartbeat(input.clone()).await;
         Ok(input)
     }
 }
@@ -125,48 +131,53 @@ impl ScopedIntegrationWorkflow {
         endpoint: String,
     ) -> WorkflowResult<String> {
         let activity_result = context
-            .start_activity(
+            .execute_activity(
                 ScopedIntegrationActivities::heartbeat_echo,
                 "activity-complete".to_owned(),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(10))
                     .heartbeat_timeout(Duration::from_secs(5))
                     .build(),
             )
-            .await
-            .map_err(|error| anyhow!("scoped Activity failed: {error}"))?;
+            .await?;
         let started = context
-            .start_nexus_operation(NexusOperationOptions {
-                endpoint,
-                service: "integration-service".to_owned(),
-                operation: "integration-operation".to_owned(),
-                schedule_to_close_timeout: Some(Duration::from_secs(10)),
-                ..Default::default()
-            })
+            .start_nexus_operation(
+                NexusOperationOptions::builder()
+                    .endpoint(endpoint)
+                    .service("integration-service")
+                    .operation("integration-operation")
+                    .schedule_to_close_timeout(Duration::from_secs(10))
+                    .build(),
+            )
             .await
-            .map_err(|failure| anyhow!("scoped Nexus start failed: {}", failure.message))?;
+            .map_err(|failure| {
+                ApplicationFailure::new(anyhow!("scoped Nexus start failed: {}", failure.message))
+            })?;
         let result = started.result().await;
         if !matches!(
             result.status,
             Some(nexus_operation_result::Status::Completed(_))
         ) {
-            return Err(anyhow!("scoped Nexus operation did not complete").into());
+            return Err(ApplicationFailure::new(anyhow!(
+                "scoped Nexus operation did not complete"
+            ))
+            .into());
         }
         Ok(activity_result)
     }
 }
 
-#[ignore = "integration test; spawns tokeirad and a v0.4 SDK worker. See temporal-api-v1.62-sync."]
+#[ignore = "integration test; spawns tokeirad and an SDK 1.0.0 worker. See temporal-api-v1.62-sync."]
 #[tokio::test]
-async fn v0_4_sdk_echo_roundtrip_against_post_sync_tokeirad() {
+async fn sdk_echo_roundtrip_against_post_sync_tokeirad() {
     // The whole test runs inside one timeout so a regression never hangs CI.
     // Any step that ought to complete quickly is wrapped in its own tighter
     // timeout below.
-    tokio::time::timeout(TEST_DEADLINE, run_v0_4_integration())
+    tokio::time::timeout(TEST_DEADLINE, run_echo_integration())
         .await
-        .expect("v0.4 integration test exceeded the overall deadline");
+        .expect("SDK integration test exceeded the overall deadline");
 }
 
-async fn run_v0_4_integration() {
+async fn run_echo_integration() {
     // Step 1. Spawn tokeirad in-process on an ephemeral port.
     let handle = TokeiradHandle::start_in_memory("127.0.0.1:0".parse().unwrap())
         .await
@@ -175,7 +186,7 @@ async fn run_v0_4_integration() {
         .parse()
         .expect("bound_addr should produce a parseable URL");
 
-    // Step 2. Connect a v0.4 client. `Connection::connect` performs the
+    // Step 2. Connect an SDK client. `Connection::connect` performs the
     // `GetSystemInfo` handshake internally and caches capabilities on the
     // connection — a side-effect we want to assert against in step 3.
     let conn_opts = ConnectionOptions::new(target_url)
@@ -185,10 +196,10 @@ async fn run_v0_4_integration() {
         .build();
     let mut connection = Connection::connect(conn_opts)
         .await
-        .expect("v0.4 SDK Connection::connect should succeed against post-sync tokeirad");
+        .expect("SDK Connection::connect should succeed against post-sync tokeirad");
 
     // Assertion 1: `DescribeNamespace("default")` carries the worker-heartbeat
-    // capability. The v0.4 SDK's SharedNamespaceWorker checks this namespace
+    // capability. The SDK's SharedNamespaceWorker checks this namespace
     // surface before enabling heartbeats.
     let describe_resp = WorkflowService::describe_namespace(
         &mut connection,
@@ -213,22 +224,18 @@ async fn run_v0_4_integration() {
     let client_opts = ClientOptions::new("default".to_string()).build();
     let client = Client::new(connection, client_opts).expect("Client::new should succeed");
 
-    // Step 3. Bring up a v0.4 worker on the bench task queue with the
+    // Step 3. Bring up an SDK worker on the bench task queue with the
     // shared `EchoWorkflow`. The worker's run loop runs in the background
     // until we cancel it.
-    let runtime = CoreRuntime::new_assume_tokio(
-        RuntimeOptions::builder()
-            .telemetry_options(TelemetryOptions::builder().build())
-            .build()
-            .expect("RuntimeOptions should build"),
-    )
-    .expect("CoreRuntime should start");
+    let runtime = Runtime::from_current_tokio(Default::default()).expect("SDK runtime");
 
     let worker_options = WorkerOptions::new(BENCH_TASK_QUEUE)
         .register_workflow::<EchoWorkflow>()
+        .expect("EchoWorkflow registers")
         .build();
     let mut worker =
         Worker::new(&runtime, client.clone(), worker_options).expect("Worker should construct");
+    let shutdown_worker = worker.shutdown_handle();
 
     tokio::task::LocalSet::new()
         .run_until(async move {
@@ -273,13 +280,16 @@ async fn run_v0_4_integration() {
                 "EchoWorkflow is defined to echo its input verbatim"
             );
 
-            // Step 5. Tear down cleanly. Abort the worker task, then shut down the
-            // server. Both orderings of these two calls are valid; we do worker
-            // first so the SDK does not race the server into shutdown.
-            worker_task.abort();
-            // `JoinHandle::await` on an aborted task returns `Err(JoinError::Cancelled)`;
-            // we do not assert on its result because the abort is the success case.
-            let _ = worker_task.await;
+            // Step 5. Tear down cleanly. A graceful worker shutdown ends its
+            // long polls, so the server's drain below does not wait for a poll
+            // timeout; the worker goes first so the SDK does not race the
+            // server into shutdown.
+            shutdown_worker();
+            tokio::time::timeout(Duration::from_secs(20), worker_task)
+                .await
+                .expect("echo Worker graceful shutdown timed out")
+                .expect("echo Worker task")
+                .expect("echo Worker shutdown");
 
             handle
                 .shutdown()
@@ -291,13 +301,21 @@ async fn run_v0_4_integration() {
 
 #[ignore = "integration test; starts a JWKS endpoint, tokeirad, and an exact-version scoped SDK worker"]
 #[tokio::test]
-async fn v0_4_sdk_scoped_worker_roundtrip_uses_production_authorization_bootstrap() {
+async fn sdk_scoped_worker_roundtrip_uses_production_authorization_bootstrap() {
     tokio::time::timeout(TEST_DEADLINE, run_scoped_worker_integration())
         .await
         .expect("scoped Worker integration test exceeded the overall deadline");
 }
 
 async fn run_scoped_worker_integration() {
+    // Diagnostics: `RUST_LOG` selects engine and SDK Core tracing output.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
     let (jwks_addr, jwks_shutdown, jwks_task) = start_fixture_jwks().await;
     let config = format!(
         r#"
@@ -359,6 +377,30 @@ build_id = "{SCOPED_BUILD_ID}"
     )
     .expect("worker client");
 
+    // SDK 1.0.0 workers resolve the namespace description before they poll, and a
+    // scoped credential is denied `DescribeNamespace` by design. Pre-resolve the
+    // scoped connection's description from the admin credential so the worker
+    // starts without widening the scope; the source is shared by reference, so it
+    // must stay alive until the Core worker below has captured it.
+    let namespace_description = WorkflowService::describe_namespace(
+        &mut admin_connection.clone(),
+        DescribeNamespaceRequest {
+            namespace: "default".to_owned(),
+            ..Default::default()
+        }
+        .into_request(),
+    )
+    .await
+    .expect("admin DescribeNamespace")
+    .into_inner();
+    let scoped_namespace_description = worker_connection
+        .workers()
+        .namespace_description_source("default");
+    scoped_namespace_description
+        .resolve(|| async { Ok::<_, Status>(namespace_description) })
+        .await
+        .expect("pre-resolved namespace description");
+
     let denied = WorkflowService::describe_namespace(
         &mut worker_connection.clone(),
         DescribeNamespaceRequest {
@@ -390,46 +432,72 @@ build_id = "{SCOPED_BUILD_ID}"
     .await
     .expect("admin should create the Worker-backed Nexus endpoint");
 
-    let runtime = CoreRuntime::new_assume_tokio(
-        RuntimeOptions::builder()
-            .telemetry_options(TelemetryOptions::builder().build())
-            .build()
-            .expect("RuntimeOptions should build"),
+    // The SDK's high-level worker derives its task types from what is registered
+    // on it and never enables Nexus polling, so the Core worker is built here with
+    // Nexus enabled and the scoped deployment version, then shared: the SDK worker
+    // wraps it for workflows and activities while this test polls Nexus tasks
+    // from it directly.
+    let deployment_options = WorkerDeploymentOptions::new(
+        WorkerDeploymentVersion::builder()
+            .deployment_name(SCOPED_DEPLOYMENT)
+            .build_id(SCOPED_BUILD_ID)
+            .build(),
     )
-    .expect("CoreRuntime should start");
-    let worker_options = WorkerOptions::new(SCOPED_TASK_QUEUE)
+    .use_worker_versioning(true)
+    .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
+    .build();
+    let core_runtime =
+        CoreRuntime::new_assume_tokio(CoreRuntimeOptions::default()).expect("Core runtime");
+    let core_config = WorkerConfig::builder()
+        .namespace("default")
+        .task_queue(SCOPED_TASK_QUEUE)
         .task_types(WorkerTaskTypes {
             enable_workflows: true,
             enable_local_activities: false,
             enable_remote_activities: true,
             enable_nexus: true,
         })
-        .deployment_options(WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: SCOPED_DEPLOYMENT.to_owned(),
-                build_id: SCOPED_BUILD_ID.to_owned(),
-            },
-            use_worker_versioning: true,
-            default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
-        })
+        .versioning_strategy(WorkerVersioningStrategy::WorkerDeploymentBased(
+            deployment_options.clone(),
+        ))
+        .build()
+        .expect("scoped Core worker config");
+    let core_worker = Arc::new(
+        init_worker(
+            &core_runtime,
+            core_config,
+            worker_client.connection().clone(),
+        )
+        .expect("scoped Core worker"),
+    );
+    let worker_options = WorkerOptions::new(SCOPED_TASK_QUEUE)
+        // The SDK completes workflow tasks with the versioning behaviour from its
+        // own options, so they must agree with the Core worker's poll identity.
+        .deployment_options(deployment_options)
         .register_activities(ScopedIntegrationActivities)
         .register_workflow::<ScopedIntegrationWorkflow>()
+        .expect("ScopedIntegrationWorkflow registers")
         .build();
-    let mut worker =
-        Worker::new(&runtime, worker_client.clone(), worker_options).expect("scoped Worker");
-    let core_worker = worker.core_worker();
-    let nexus_worker = core_worker.clone();
+    let mut worker = Worker::new_from_core_options(
+        Arc::clone(&core_worker),
+        worker_client.options().clone(),
+        worker_options,
+    )
+    .expect("scoped Worker");
+    let nexus_worker = Arc::clone(&core_worker);
     let shutdown_worker = worker.shutdown_handle();
 
     tokio::task::LocalSet::new()
         .run_until(async move {
             let worker_task = tokio::task::spawn_local(async move { worker.run().await });
             let nexus_task = tokio::task::spawn_local(async move {
-                let task = nexus_worker
+                let polled = nexus_worker
                     .poll_nexus_task()
                     .await
-                    .expect("scoped Nexus poll")
-                    .unwrap_task();
+                    .expect("scoped Nexus poll");
+                let Some(nexus_task::Variant::Task(task)) = polled.variant else {
+                    panic!("the first Nexus poll must deliver the scoped task");
+                };
                 nexus_worker
                     .complete_nexus_task(NexusTaskCompletion {
                         task_token: task.task_token,
@@ -563,7 +631,7 @@ build_id = "{SCOPED_BUILD_ID}"
             assert_eq!(result, "activity-complete");
             nexus_task.await.expect("scoped Nexus task");
 
-            // Rust SDK 0.4 does not yet provide a high-level Nexus handler
+            // The Rust SDK's high-level worker does not run a Nexus handler
             // loop. This test's Core bridge must therefore perform the
             // language-SDK responsibility of continuing to poll until Core
             // reports shutdown after the handled task.

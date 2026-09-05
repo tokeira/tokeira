@@ -4570,9 +4570,9 @@ dependencies = [
 
 [[package]]
 name = "temporalio-client"
-version = "0.8.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06a672ea7c8fb963e3da4224c74b4fb2b0d2085dbe55d9b735a24c70af68c68f"
+checksum = "37ca0a58c70ef0339e70ce03c273c5279f563266b48508fd883715bbd2a51396"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4604,9 +4604,9 @@ dependencies = [
 
 [[package]]
 name = "temporalio-common"
-version = "0.8.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49a8ab419d730698e89a027a9c80aaedd8da40f8b4a761ad5bf94abfd62ccbfe"
+checksum = "5a8ed18abe448ad30def8136a2a04ca70a6e17ec234540c72f54da2cc9deadc7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4635,9 +4635,9 @@ dependencies = [
 
 [[package]]
 name = "temporalio-common-wasm"
-version = "0.8.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08156363d4ae71b05dfacf68d3a6ed06f3fc997dca3b115924ab54235ab8e023"
+checksum = "de457a7799583535a50d146fe6ae716932dad60818843b9b56c33b742b4451a8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4662,9 +4662,9 @@ dependencies = [
 
 [[package]]
 name = "temporalio-macros"
-version = "0.8.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43058fe5557a8d122704c136991510703ea3998ff83d5279d0e0924434164413"
+checksum = "acdf4ae71d667c43439431128c6235986ee378224f491ca5b90f1a0b094d5821"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4673,9 +4673,9 @@ dependencies = [
 
 [[package]]
 name = "temporalio-protos"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43bea5d1e495f0c0177849e902d785380102a8fa7b0e1aaaa75307cf300243f6"
+checksum = "eaf10c082ba2adf4073da05eb538146fce35734deb61f99d397ac3bd526c345d"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4684,7 +4684,6 @@ dependencies = [
  "pbjson",
  "pbjson-build",
  "prost 0.14.4",
- "prost-types 0.14.4",
  "prost-wkt-types",
  "serde",
  "serde_json",
@@ -4696,9 +4695,9 @@ dependencies = [
 
 [[package]]
 name = "temporalio-sdk"
-version = "0.8.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "099245859a89a43c9218ab0e3e37fab62a3bcbd2fa962ef409c8c783ed0c8679"
+checksum = "6417808ea862d45f2b14c6aaa73aca8e240ac96371ef55fa199a2e092f67d88a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4725,9 +4724,9 @@ dependencies = [
 
 [[package]]
 name = "temporalio-sdk-core"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a976a260ae17083aaae5852d2c3b05d1cf86332f8edec1e3e1a167fffc498a52"
+checksum = "5785769756f53e970bfe0ae5ebac87a4781d6e4b4323e2b3cc358a9dd971e6fd"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4770,9 +4769,9 @@ dependencies = [
 
 [[package]]
 name = "temporalio-workflow"
-version = "0.8.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa469b8e55b2ad6cc589b5596bd4ec4b2ac498800a38c5f1a69027d3fd751004"
+checksum = "70b41ffbb9ae564fec8b218147b59cab1a890f2dcd3e0225d21a714c58f9ee66"
 dependencies = [
  "anyhow",
  "bon",
@@ -4904,7 +4903,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokeira-auth"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4925,7 +4924,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-build-info"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "regex",
  "toml",
@@ -4933,7 +4932,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "prost 0.12.6",
  "serde",
@@ -4944,7 +4943,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm-activity"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "postcard",
  "prost 0.12.6",
@@ -4958,7 +4957,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm-derive"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4967,7 +4966,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-compatibility"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -4978,7 +4977,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "clap",
@@ -4993,7 +4992,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-edge"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5040,7 +5039,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5095,7 +5094,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-kernel"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5108,7 +5107,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-managed-dsql"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -5124,7 +5123,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-observability"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "http-body-util",
@@ -5149,7 +5148,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-projection"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -5173,7 +5172,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -5192,7 +5191,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-runtime"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5234,7 +5233,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-storage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5279,7 +5278,7 @@ dependencies = [
 
 [[package]]
 name = "tokeira-types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "serde",

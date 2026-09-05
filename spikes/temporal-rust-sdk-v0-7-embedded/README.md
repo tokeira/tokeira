@@ -1,15 +1,18 @@
 # Temporal Rust SDK embedded-engine spike
 
-This standalone spike runs the published Temporal Rust SDK `0.8.0` against
+This standalone spike runs the published Temporal Rust SDK `1.0.0` against
 `tokeira-engine` in one process. It starts an SDK worker, executes a workflow
 that calls an activity, waits for the typed result, and shuts both worker and
 engine down cleanly. The directory keeps its original name from the `0.7.0`
 run so links to it stay valid; the pins are what moved.
 
-The client and worker use `ConnectionOptions::service_override`; no Temporal
-TCP server or DNS lookup is involved. The program keeps the configured gRPC
-and Nexus listener addresses occupied for its entire run, so an accidental
-network-listener fallback fails deterministically.
+The run has two legs. The first client and worker use
+`ConnectionOptions::service_override`; no Temporal TCP server or DNS lookup is
+involved, and the program keeps the configured gRPC and Nexus listener
+addresses occupied for its entire run, so an accidental network-listener
+fallback fails deterministically. The second leg attaches a listener to the
+same running engine with `Engine::listen` and runs a second SDK worker and
+client over plain TCP against it, proving the two transports serve one engine.
 
 Run it from the repository root:
 
@@ -20,18 +23,36 @@ cargo run --manifest-path spikes/temporal-rust-sdk-v0-7-embedded/Cargo.toml --lo
 Successful output ends with:
 
 ```text
-Temporal Rust SDK: 0.8.0
+Temporal Rust SDK: 1.0.0
 Transport: temporalio-client::service_override (no TCP listener)
 Workflow run_id: <generated run id>
 Workflow result: Hello, embedded Tokeira!
+Transport: TCP listener at 127.0.0.1:<port> (Engine::listen)
+Workflow run_id: <generated run id>
+Workflow result: Hello, listener Tokeira!
 ```
 
-The spike is excluded from the main workspace so its exact SDK `0.8.0` pins
+The spike is excluded from the main workspace so its exact SDK `1.0.0` pins
 and standalone lockfile do not expand or constrain the product workspace. The
 client crate must be the same version `tokeira-engine` itself depends on,
 because `Engine::service_override` hands back that crate's callback service
 type; moving the spike therefore moves the engine's `temporalio-client`
 dependency with it.
+
+## Rerun on 1.0.0
+
+Recorded 2026-09-05 against `tokeira-engine` with `temporalio-client 1.0.0`
+(`temporalio-sdk 1.0.0`, `temporalio-sdk-core 0.9.0`):
+
+- both legs of the clean path completed with the expected results;
+- both in-memory shutdown probes exited cleanly (0.67 s combined);
+- the two managed-DSQL probes were not run in this rerun: they need a live
+  cluster descriptor and AWS credentials.
+
+The only source change the move needed was the SDK runtime constructor:
+`Runtime::new_assume_tokio` is deprecated in favour of
+`Runtime::from_current_tokio`. The callback transport the engine's
+`service_override` implements is unchanged between `0.8.0` and `1.0.0`.
 
 ## Rerun on 0.8.0
 

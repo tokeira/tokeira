@@ -23,8 +23,9 @@ change, work must stop and that conflict must be raised for a new product decisi
 ## Glossary
 
 - **Embedded Engine**: A Tokeira engine running inside a host process and reached through
-  the in-process Temporal `service_override`, without a Tokeira-owned TCP listener or
-  daemon.
+  the in-process Temporal `service_override`, without a daemon. Startup binds no
+  Tokeira-owned TCP listener; a host may attach one afterwards through `Engine::listen`
+  ([embedded-engine-listener](../embedded-engine-listener/requirements.md)).
 - **In-memory Mode**: The existing embedded storage mode whose durable state exists only
   in an optional host-provided snapshot.
 - **Managed DSQL Mode**: An explicitly selected embedded mode in which Tokeira creates or
@@ -68,7 +69,7 @@ change, work must stop and that conflict must be raised for a new product decisi
 | Area | Verified current behaviour | Proposed required behaviour |
 |---|---|---|
 | Embedded storage | `Engine::start_with_config` rewrites all embedded storage to in-memory. | The host explicitly selects in-memory, managed DSQL, or existing DSQL; selection never silently falls back. |
-| Embedded transport | The in-process gRPC bridge reaches the same service router without binding configured listeners. | The transport remains in-process; AWS DSQL and host exporter network traffic remain allowed. |
+| Embedded transport | The in-process gRPC bridge reaches the same service router without binding configured listeners. | Startup binds no listener; a host-attached listener ([embedded-engine-listener](../embedded-engine-listener/requirements.md)) serves the same router. AWS DSQL and host exporter network traffic remain allowed. |
 | DSQL coordination | Production `DsqlStore::connect` constructs DynamoDB-backed connection-rate and slot coordination. | Managed embedded DSQL uses bounded process-local coordination and requires no DynamoDB. |
 | Cluster lifecycle | The AWS IaC resource creates DSQL with deletion protection and persists ID, ARN, and endpoint, but does not send an explicit create client token. | Embedded startup persists an explicit token before create, retries with it, and recovers only through canonical identity. |
 | Schema | Embedded migrations have per-migration checksums, but the engine does not apply them during DSQL startup and no release compatibility envelope exists. | Each release declares and enforces the complete schema compatibility contract. |
@@ -239,8 +240,9 @@ Aurora DSQL as the authoritative runtime store.
 1.6 WHEN embedded startup completes, THE embedded engine SHALL expose the selected
 storage mode in its startup report.
 
-1.7 WHILE running in any embedded storage mode, THE embedded engine SHALL avoid binding
-a Tokeira execution listener.
+1.7 WHEN starting in any embedded storage mode, THE embedded engine SHALL bind no
+Tokeira execution listener; a listener exists only when the host attaches one through
+`Engine::listen` ([embedded-engine-listener](../embedded-engine-listener/requirements.md)).
 
 1.8 THE embedded execution transport SHALL remain compatible with the Temporal SDK
 `service_override` path.

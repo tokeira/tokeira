@@ -1022,9 +1022,11 @@ and never select a target by tags or endpoint.
 ### Property 14: Embedded construction is transport- and global-state-neutral
 
 *For any* preinstalled host tracing dispatcher, meter/metrics recorder, propagator, and
-exporter setup, starting any embedded storage mode SHALL bind no Tokeira listener and
-SHALL leave every host-owned global unchanged while still emitting through the installed
-local instrumentation.
+exporter setup, starting any embedded storage mode SHALL bind no Tokeira listener (a
+listener exists only when the host later calls `Engine::listen`, per
+[embedded-engine-listener](../embedded-engine-listener/design.md)) and SHALL leave every
+host-owned global unchanged while still emitting through the installed local
+instrumentation.
 
 **Validates: Requirements 1.7–1.10, 10.1–10.7, 10.11, 13.15**
 

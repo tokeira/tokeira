@@ -252,9 +252,9 @@ listener to stop.
 5.7 WHEN an `EngineListener` is dropped without `shutdown`, THE listener SHALL stop
 accepting connections and release its socket when its task exits.
 
-5.8 WHEN Engine Shutdown begins, THE listener SHALL release in-flight long polls the same
-way the daemon does, so that drain completes within the deadline rather than waiting for
-poll timeouts.
+5.8 WHEN a listener stops, THE listener SHALL reset every in-flight call with
+`UNAVAILABLE`, the outcome a worker sees on a connection reset, so that a parked long poll
+never holds the drain until its poll timeout.
 
 5.9 WHEN a listener has stopped, THE engine SHALL hold no task, socket, or registration
 for it.

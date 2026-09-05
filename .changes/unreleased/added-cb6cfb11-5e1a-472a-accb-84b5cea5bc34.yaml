@@ -1,0 +1,4 @@
+kind: added
+body: Embedded engines can attach a TCP listener after startup (`Engine::listen`) that serves the same Temporal gRPC services as the in-process endpoint.
+custom:
+  Slice: cb6cfb11-5e1a-472a-accb-84b5cea5bc34

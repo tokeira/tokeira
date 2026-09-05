@@ -105,6 +105,28 @@ impl InProcessGrpcService {
         }
     }
 
+    /// A clone of the assembled Workflow, Operator, and Admin routes.
+    ///
+    /// The clone dispatches into the same service instances, interceptors, and
+    /// status mapping as [`Self::call`]; it is the seam a listener-backed server
+    /// uses to serve this engine without constructing a second service graph.
+    /// Calls that enter through the clone are not counted by this service's
+    /// admission: a network server drains its own handlers through its
+    /// transport, exactly as `tokeirad` does.
+    pub async fn routes(&self) -> Routes {
+        self.routes.lock().await.clone()
+    }
+
+    /// The engine-host runtime every handler future is pinned to.
+    ///
+    /// A server built from [`Self::routes`] spawns on this handle so its
+    /// handlers inherit the engine's executor lifetime, per the execution
+    /// contract above, rather than the lifetime of whichever runtime the host
+    /// happened to bind the listener from.
+    pub fn handler_runtime(&self) -> tokio::runtime::Handle {
+        self.handler_runtime.clone()
+    }
+
     /// Synchronously reject every subsequent call while admitted handlers drain.
     ///
     /// This operation is safe from [`Drop`]: it performs no I/O, takes no async

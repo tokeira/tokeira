@@ -57,8 +57,11 @@ pub mod correlation_format;
 #[doc(hidden)]
 pub mod harness;
 mod http_api_transport;
+mod listener;
 mod nexus_http_transport;
 pub mod observability;
+
+pub use listener::{EngineListenError, EngineListener, EngineListenerShutdownError};
 
 use http_api_transport::HttpApiLayer;
 use nexus_http_transport::NexusHttpLayer;
@@ -400,14 +403,16 @@ pub struct BootstrapNexusEndpointConfig {
     pub target: BootstrapNexusEndpointTarget,
 }
 
-/// A running zero-listener Tokeira engine.
+/// A running Tokeira engine that binds no listener at startup.
 ///
-/// The engine owns the in-memory authoritative store, runtime workers, and edge
+/// The engine owns the authoritative store, runtime workers, and edge
 /// services. [`Self::endpoint`] is cloneable and can be adapted directly to the
-/// Temporal Rust SDK's callback transport. Dropping the engine cancels background
-/// work and makes every endpoint clone reject new calls. When snapshot policy is
-/// configured, call [`Self::shutdown`] for the final graceful-shutdown snapshot;
-/// `Drop` cannot perform asynchronous file I/O.
+/// Temporal Rust SDK's callback transport; [`Self::listen`] optionally serves the
+/// same services on a host-chosen TCP address. Dropping the engine cancels
+/// background work, stops every attached listener, and makes every endpoint
+/// clone reject new calls. When snapshot policy is configured, call
+/// [`Self::shutdown`] for the final graceful-shutdown snapshot; `Drop` cannot
+/// perform asynchronous file I/O.
 #[derive(Debug)]
 pub struct Engine {
     endpoint: TemporalEndpoint,
@@ -417,6 +422,7 @@ pub struct Engine {
     recovery_task: Option<JoinHandle<Result<()>>>,
     startup_report: EngineStartupReport,
     shutdown_coordinator: Option<EmbeddedShutdownCoordinator>,
+    listeners: listener::ListenerRegistry,
 }
 
 /// Storage mode selected by the explicit embedded startup boundary.
@@ -597,6 +603,8 @@ pub enum EmbeddedShutdownFailure {
     Storage,
     /// Final in-memory snapshot persistence failed.
     Snapshot,
+    /// An attached listener did not stop and join by the deadline.
+    ListenerDrain,
 }
 
 /// Aggregated explicit-shutdown failure.
@@ -776,6 +784,7 @@ impl Engine {
             recovery_task: stack.recovery_task,
             startup_report: EngineStartupReport::in_memory(),
             shutdown_coordinator: Some(shutdown_coordinator),
+            listeners: listener::ListenerRegistry::default(),
         };
         record_embedded_startup(&engine.startup_report);
         Ok(engine)
@@ -833,6 +842,14 @@ impl Engine {
 
     /// Stop accepting calls, cancel background work, and persist the final snapshot.
     ///
+    /// Attached listeners are stopped and joined first, after in-process
+    /// admission has closed and the runtime has been signalled but before the
+    /// in-process drain: from then on no network handler can be admitted, so
+    /// the coordinator's drain, task join, lease release, ownership release,
+    /// and storage close run in the same world they did before listeners
+    /// existed. A listener that does not join by the deadline is reported as
+    /// [`EmbeddedShutdownFailure::ListenerDrain`] and shutdown continues.
+    ///
     /// When snapshot policy is disabled this retains the previous cancellation-only
     /// behaviour. A configured final snapshot failure is returned to the caller: a
     /// graceful shutdown must not silently claim durability it did not achieve.
@@ -841,8 +858,10 @@ impl Engine {
         let mut failures = Vec::new();
         if let Some(mut coordinator) = self.shutdown_coordinator.take() {
             coordinator.begin_shutdown();
+            self.listeners.stop_all(deadline, &mut failures).await;
             coordinator.shutdown(deadline, &mut failures).await;
         } else {
+            self.listeners.stop_all(deadline, &mut failures).await;
             self.background_cancel.cancel();
         }
         if let Some(task) = self.recovery_task.take()
@@ -1182,6 +1201,7 @@ async fn start_embedded_dsql(
         recovery_task: stack.recovery_task,
         startup_report: report,
         shutdown_coordinator: Some(coordinator),
+        listeners: listener::ListenerRegistry::default(),
     };
     record_embedded_startup(&engine.startup_report);
     Ok(engine)
@@ -4745,6 +4765,23 @@ mod tests {
             prop_assert_eq!(effects.local_emission_attempts, 1);
         }
 
+        // Feature: embedded-engine-listener, Property 6: startup stays zero-listener
+        #[test]
+        fn startup_stays_zero_listener(
+            host in host_instrumentation_strategy(),
+            storage in storage_mode_strategy(),
+            explicit_listens in 0usize..4,
+        ) {
+            // Every start path contributes no bind; only explicit `listen`
+            // calls do, one socket each.
+            let startup = embedded_construction_effects(host, storage);
+            prop_assert_eq!(startup.listener_attempts, 0);
+            prop_assert_eq!(
+                startup.listener_attempts + explicit_listens,
+                explicit_listens
+            );
+        }
+
         // Feature: managed-embedded-dsql, Property 20: telemetry is observational only
         #[test]
         fn telemetry_is_observational_only(
@@ -4756,6 +4793,21 @@ mod tests {
             prop_assert_eq!(observed_sequence_bytes(&operations, first), expected.clone());
             prop_assert_eq!(observed_sequence_bytes(&operations, second), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn listen_after_shutdown_began_is_refused_without_binding() {
+        let engine = Engine::start().await.expect("engine starts");
+        // The only way to observe a shutting-down engine from `listen` is the
+        // engine's own cancellation token: `shutdown` consumes the engine, so a
+        // host cannot race it, but internal cancellation must still be refused.
+        engine.background_cancel.cancel();
+        let error = engine
+            .listen("127.0.0.1:0".parse().expect("static loopback address"))
+            .await
+            .expect_err("a cancelled engine must refuse to bind");
+        assert!(matches!(error, EngineListenError::ShutDown));
+        assert_eq!(engine.listeners.attached(), 0);
     }
 
     #[test]

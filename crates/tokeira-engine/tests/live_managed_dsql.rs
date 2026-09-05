@@ -39,10 +39,17 @@ use tokeira_managed_dsql::{
 };
 use tokeira_proto::{
     common::{WorkflowExecution, WorkflowType},
+    enums::{CommandType, WorkflowExecutionStatus},
+    public::temporal::api::command::v1::{
+        Command, CompleteWorkflowExecutionCommandAttributes,
+        command::Attributes as CommandAttributes,
+    },
     taskqueue::TaskQueue,
     workflowservice::{
         DescribeWorkflowExecutionRequest, DescribeWorkflowExecutionResponse, GetSystemInfoRequest,
+        PollWorkflowTaskQueueRequest, RespondWorkflowTaskCompletedRequest,
         StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
+        workflow_service_client::WorkflowServiceClient,
     },
 };
 use tokeira_storage::dsql::ControlLeaseAcquireOutcome;
@@ -180,7 +187,7 @@ async fn exercise_first_generation(
     config: &EmbeddedEngineConfig,
     cluster_id: &str,
     cluster_arn: &str,
-) -> Result<(String, String, i64)> {
+) -> Result<(String, String, i64, String)> {
     let report = engine.startup_report();
     let cluster = report
         .cluster
@@ -237,29 +244,141 @@ async fn exercise_first_generation(
     .await?;
     ensure!(!started.run_id.is_empty());
 
+    // Listener leg (embedded-engine-listener Property 7): a network worker runs
+    // one execution against the DSQL-backed engine, and the competing start
+    // below is checked with the listener still attached so ownership stays
+    // exclusive regardless of transport.
+    let listener = engine.listen("127.0.0.1:0".parse()?).await?;
+    let network_workflow_id = format!("managed-live-listener-{cluster_prefix}");
+    let network_result = exercise_network_worker(listener.bound_addr(), &network_workflow_id).await;
+
     let mut competing_config = config.clone();
     competing_config.startup_timeout_ms = Duration::from_secs(120).as_millis() as u64;
-    match Engine::start_with_embedded_config(competing_config).await {
+    let competing_result = match Engine::start_with_embedded_config(competing_config).await {
         Ok(competing) => {
             let shutdown = competing.shutdown().await;
             ensure!(
                 shutdown.is_ok(),
                 "an unexpectedly admitted competing engine also failed explicit shutdown"
             );
-            bail!("a live embedded owner unexpectedly admitted a second engine");
+            Err(anyhow::anyhow!(
+                "a live embedded owner unexpectedly admitted a second engine"
+            ))
         }
-        Err(error) => ensure!(
-            matches!(
-                error,
-                EmbeddedEngineStartError::Phase {
-                    phase: EmbeddedStartupPhase::Ownership
-                }
-            ),
-            "the competing engine must fail at ownership without mutating shared state"
-        ),
-    }
+        Err(EmbeddedEngineStartError::Phase {
+            phase: EmbeddedStartupPhase::Ownership,
+        }) => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "the competing engine must fail at ownership without mutating shared state: {error}"
+        )),
+    };
+    let listener_shutdown = listener.shutdown().await;
+    network_result?;
+    competing_result?;
+    listener_shutdown.context("listener-only shutdown must leave the engine serving")?;
+    let _: DescribeWorkflowExecutionResponse = call(
+        &engine.endpoint(),
+        "DescribeWorkflowExecution",
+        HeaderMap::new(),
+        DescribeWorkflowExecutionRequest {
+            namespace: "default".to_owned(),
+            execution: Some(WorkflowExecution {
+                workflow_id: workflow_id.clone(),
+                run_id: String::new(),
+            }),
+        },
+    )
+    .await
+    .context("the in-process endpoint must keep serving after listener shutdown")?;
 
-    Ok((workflow_id, started.run_id, first_fence))
+    Ok((
+        workflow_id,
+        started.run_id,
+        first_fence,
+        network_workflow_id,
+    ))
+}
+
+/// Run one execution end to end over the listener: start, poll the workflow
+/// task, complete it, and observe the closed execution.
+async fn exercise_network_worker(addr: std::net::SocketAddr, workflow_id: &str) -> Result<()> {
+    let mut client = WorkflowServiceClient::connect(format!("http://{addr}")).await?;
+    let _ = client
+        .get_system_info(GetSystemInfoRequest::default())
+        .await?;
+    let queue = "managed-live-listener-queue";
+    let started = client
+        .start_workflow_execution(StartWorkflowExecutionRequest {
+            namespace: "default".to_owned(),
+            workflow_id: workflow_id.to_owned(),
+            workflow_type: Some(WorkflowType {
+                name: "managed-live-listener-workflow".to_owned(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: queue.to_owned(),
+                ..Default::default()
+            }),
+            request_id: format!("start-{workflow_id}"),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    ensure!(!started.run_id.is_empty());
+    let task = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.poll_workflow_task_queue(PollWorkflowTaskQueueRequest {
+            namespace: "default".to_owned(),
+            task_queue: Some(TaskQueue {
+                name: queue.to_owned(),
+                ..Default::default()
+            }),
+            identity: "managed-live-network-worker".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .context("the network worker must receive the workflow task")??
+    .into_inner();
+    ensure!(
+        !task.task_token.is_empty(),
+        "the network poll must deliver the task"
+    );
+    client
+        .respond_workflow_task_completed(RespondWorkflowTaskCompletedRequest {
+            task_token: task.task_token,
+            identity: "managed-live-network-worker".to_owned(),
+            namespace: "default".to_owned(),
+            commands: vec![Command {
+                command_type: CommandType::CompleteWorkflowExecution as i32,
+                user_metadata: None,
+                attributes: Some(
+                    CommandAttributes::CompleteWorkflowExecutionCommandAttributes(
+                        CompleteWorkflowExecutionCommandAttributes { result: None },
+                    ),
+                ),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let described = client
+        .describe_workflow_execution(DescribeWorkflowExecutionRequest {
+            namespace: "default".to_owned(),
+            execution: Some(WorkflowExecution {
+                workflow_id: workflow_id.to_owned(),
+                run_id: started.run_id,
+            }),
+        })
+        .await?
+        .into_inner();
+    let status = described
+        .workflow_execution_info
+        .map(|info| info.status)
+        .context("describe over the listener must carry execution info")?;
+    ensure!(
+        status == WorkflowExecutionStatus::Completed as i32,
+        "the network-completed execution must be closed, got {status}"
+    );
+    Ok(())
 }
 
 async fn exercise_restart_generation(
@@ -269,6 +388,7 @@ async fn exercise_restart_generation(
     workflow_id: &str,
     run_id: &str,
     first_fence: i64,
+    network_workflow_id: &str,
 ) -> Result<()> {
     let restart_report = engine.startup_report();
     let restart_cluster = restart_report
@@ -302,6 +422,27 @@ async fn exercise_restart_generation(
         .context("restarted engine must preserve the workflow execution")?;
     ensure!(execution.workflow_id == workflow_id);
     ensure!(execution.run_id == run_id);
+
+    // The execution a network worker completed in the first generation is part
+    // of the same durable history the restarted owner recovers.
+    let network_described: DescribeWorkflowExecutionResponse = call(
+        &engine.endpoint(),
+        "DescribeWorkflowExecution",
+        HeaderMap::new(),
+        DescribeWorkflowExecutionRequest {
+            namespace: "default".to_owned(),
+            execution: Some(WorkflowExecution {
+                workflow_id: network_workflow_id.to_owned(),
+                run_id: String::new(),
+            }),
+        },
+    )
+    .await?;
+    let network_status = network_described
+        .workflow_execution_info
+        .map(|info| info.status)
+        .context("restarted engine must preserve the network-completed execution")?;
+    ensure!(network_status == WorkflowExecutionStatus::Completed as i32);
     Ok(())
 }
 
@@ -329,7 +470,7 @@ async fn exercise_ready_cluster(
     let old_endpoint = engine.endpoint();
     let first_result = exercise_first_generation(&engine, &config, cluster_id, cluster_arn).await;
     let first_shutdown = engine.shutdown().await;
-    let (workflow_id, run_id, first_fence) =
+    let (workflow_id, run_id, first_fence, network_workflow_id) =
         combine_generation_result(first_result, first_shutdown, "first")?;
 
     let old_status = old_endpoint
@@ -351,6 +492,7 @@ async fn exercise_ready_cluster(
         &workflow_id,
         &run_id,
         first_fence,
+        &network_workflow_id,
     )
     .await;
     let restart_shutdown = restarted.shutdown().await;

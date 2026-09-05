@@ -31,14 +31,20 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# Temporal Rust SDK (v0.4.x). The worker binary needs the full SDK stack;
-# the starter binary only strictly needs the client + common crates but
-# depending on the whole set keeps the build graph consistent.
-temporalio-client = "0.4"
-temporalio-common = "0.4"
-temporalio-macros = "0.4"
-temporalio-sdk = "0.4"
-temporalio-sdk-core = "0.4"
+# Temporal Rust SDK 1.0.0, the same client generation `tokeira-engine` builds
+# its callback seam against. The worker binary needs the full SDK stack; the
+# starter binary only strictly needs the client crate, but depending on the
+# whole set keeps the build graph consistent. The SDK's `experimental` feature
+# is what exposes Nexus operations and the raw Core worker the scoped-worker
+# integration test drives; `temporalio-sdk-core` is pinned to the exact core
+# generation `temporalio-sdk 1.0.0` uses so the lockfile carries one copy.
+temporalio-client = "1.0.0"
+temporalio-common = "1.0.0"
+temporalio-macros = "1.0.0"
+temporalio-sdk = { version = "1.0.0", default-features = false, features = ["experimental"] }
+temporalio-sdk-core = "0.9.0"
+# The 1.0.0 workflow macros expand to paths in this crate.
+temporalio-workflow = "1.0.0"
 
 [dev-dependencies]
 # The v0_4_integration test imports TokeiradHandle from the tokeirad library

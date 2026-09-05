@@ -1,0 +1,4 @@
+kind: changed
+body: The embedded engine's client seam moves to Temporal Rust SDK 1.0.0; embedding hosts should upgrade their SDK pins to match.
+custom:
+  Slice: 63976daa-0f28-4909-9896-019aaa197334

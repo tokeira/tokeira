@@ -12,11 +12,11 @@ publish = false
 [dependencies]
 anyhow = "1.0.103"
 futures = "0.3"
-temporalio-client = { version = "=0.8.0", default-features = false }
-temporalio-common = { version = "=0.8.0", default-features = false }
-temporalio-macros = "=0.8.0"
-temporalio-sdk = { version = "=0.8.0", default-features = false }
-temporalio-workflow = "=0.8.0"
+temporalio-client = { version = "=1.0.0", default-features = false }
+temporalio-common = { version = "=1.0.0", default-features = false }
+temporalio-macros = "=1.0.0"
+temporalio-sdk = { version = "=1.0.0", default-features = false }
+temporalio-workflow = "=1.0.0"
 tokeira-config = { path = "../../crates/tokeira-config" }
 tokeira-engine = { path = "../../crates/tokeira-engine" }
 tokio = { version = "1.50", features = ["macros", "rt-multi-thread", "time"] }

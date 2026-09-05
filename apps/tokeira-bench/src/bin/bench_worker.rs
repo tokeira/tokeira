@@ -11,9 +11,7 @@ use clap::Parser;
 use temporalio_client::{
     Client, ClientOptions, Connection, envconfig::LoadClientConfigProfileOptions,
 };
-use temporalio_common::telemetry::TelemetryOptions;
-use temporalio_sdk::{Worker, WorkerOptions};
-use temporalio_sdk_core::{CoreRuntime, PollerBehavior, RuntimeOptions};
+use temporalio_sdk::{Runtime, Worker, WorkerOptions, runtime::PollerBehavior};
 use tokeira_bench::{BENCH_TASK_QUEUE, EchoWorkflow};
 
 #[derive(Parser)]
@@ -41,15 +39,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // CoreRuntime owns the tokio runtime used by the SDK's I/O threads.
-    // `new_assume_tokio` reuses the ambient tokio runtime that `#[tokio::main]`
-    // set up, which is what every SDK example in sdk-core does for simple
-    // workers.
-    let runtime = CoreRuntime::new_assume_tokio(
-        RuntimeOptions::builder()
-            .telemetry_options(TelemetryOptions::builder().build())
-            .build()?,
-    )?;
+    // The SDK runtime owns the I/O threads behind the worker. Building it from
+    // the ambient Tokio runtime reuses what `#[tokio::main]` set up, which is
+    // what every SDK example does for a simple worker.
+    let runtime = Runtime::from_current_tokio(Default::default())?;
 
     let (conn_opts, client_opts) =
         ClientOptions::load_from_config(LoadClientConfigProfileOptions::default())?;
@@ -57,10 +50,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_opts)?;
 
     let worker_options = WorkerOptions::new(&args.task_queue)
-        .register_workflow::<EchoWorkflow>()
         .max_cached_workflows(2000)
         .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(50))
         .nonsticky_to_sticky_poll_ratio(0.1)
+        .register_workflow::<EchoWorkflow>()?
         .build();
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;

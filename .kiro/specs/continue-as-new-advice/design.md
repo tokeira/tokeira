@@ -32,8 +32,9 @@ adopts the observable contract, not Temporal's structures.
 - Wire: `proto/upstream/temporal/api/history/v1/message.proto:297-327`;
   `proto/upstream/temporal/api/enums/v1/workflow.proto:208-226`;
   `proto/upstream/temporal/api/workflow/v1/message.proto:45`.
-- SDK: `temporalio-sdk-core-0.8.0/src/worker/workflow/machines/workflow_machines.rs:464-473, 892-894`;
-  `temporalio-workflow-0.8.0/src/workflow_context.rs:1591-1597, 2098`.
+- SDK: `temporalio-sdk-core-0.9.0/src/worker/workflow/machines/workflow_machines.rs:464-473, 892-894`
+  (the core crate behind Rust SDK 1.0.0);
+  `temporalio-workflow-1.0.0/src/workflow_context.rs:1777-1783, 2315-2316`.
 
 ## Dependencies and Non-Goals
 

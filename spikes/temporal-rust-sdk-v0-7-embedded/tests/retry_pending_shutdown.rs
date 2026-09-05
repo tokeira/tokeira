@@ -7,9 +7,10 @@
 //! returning the error, matching Odori's race. The probes cover both storage
 //! modes and both same-runtime and Odori-shaped dedicated-thread worker
 //! placement. On SDK 0.7.0 the ignored managed-DSQL dedicated-thread test
-//! reproduced SDK Core's slot-permit shutdown panic; 0.8.0 drains in-flight
-//! completions before the permit check, and every probe is expected to exit
-//! cleanly. The in-memory controls are the always-runnable half of that proof.
+//! reproduced SDK Core's slot-permit shutdown panic; 0.8.0 and later drain
+//! in-flight completions before the permit check, and every probe is expected
+//! to exit cleanly on 1.0.0. The in-memory controls are the always-runnable
+//! half of that proof.
 
 use std::{
     collections::BTreeMap,
@@ -46,8 +47,8 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(60);
 const IN_MEMORY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_DSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const MANAGED_DSQL_STARTUP_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
-// Odori does not override the SDK default (unchanged in 0.8.0), so its workers retain
-// this cache size.
+// Odori does not override the SDK default (unchanged through 1.0.0), so its workers
+// retain this cache size.
 const ODORI_MAX_CACHED_WORKFLOWS: usize = 1_000;
 
 #[derive(Debug)]
@@ -352,7 +353,7 @@ async fn run_probe(storage: ProbeStorage, worker_placement: WorkerPlacement) -> 
             .build(),
     )
     .await
-    .context("connect Temporal Rust SDK 0.7.0 through service_override")?;
+    .context("connect Temporal Rust SDK 1.0.0 through service_override")?;
     let client = Client::new(connection, ClientOptions::new("default".to_owned()).build())?;
 
     let failure_announced = Arc::new(Notify::new());
@@ -432,7 +433,7 @@ async fn run_on_host_runtime(
     failure_announced: Arc<Notify>,
     release_provider_failure: Arc<Notify>,
 ) -> Result<()> {
-    let runtime = Runtime::new_assume_tokio(Default::default())?;
+    let runtime = Runtime::from_current_tokio(Default::default())?;
     let worker_options = worker_options(
         task_queue.clone(),
         Arc::clone(&failure_announced),
@@ -497,7 +498,7 @@ async fn run_on_dedicated_current_thread(
                 .build()
                 .context("build the dedicated worker thread's Tokio runtime")?;
             local.block_on(async move {
-                let runtime = Runtime::new_assume_tokio(Default::default())
+                let runtime = Runtime::from_current_tokio(Default::default())
                     .context("assemble SDK runtime on the dedicated worker thread")?;
                 let options = worker_options(
                     worker_queue,

@@ -5,6 +5,7 @@
 use std::{collections::BTreeMap, net::SocketAddr, str::FromStr as _, time::Duration};
 
 use anyhow::{Context as _, Result};
+use bytes::{Buf as _, BufMut as _, Bytes};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use prost::Message;
 use tokeira_engine::{Engine, EngineListener, InProcessGrpcRequest, TemporalEndpoint};
@@ -160,6 +161,148 @@ pub(crate) async fn wait_until_refused(addr: SocketAddr) -> Result<()> {
     })
     .await
     .with_context(|| format!("listener on {addr} kept serving after it was stopped"))
+}
+
+/// A codec that passes message bytes through untouched, so a test can send a
+/// frame of an exact size or a deliberately malformed body over the network
+/// and read the server's answer without a typed message in between.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RawCodec;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RawEncoder;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RawDecoder;
+
+impl tonic::codec::Codec for RawCodec {
+    type Encode = Bytes;
+    type Decode = Bytes;
+    type Encoder = RawEncoder;
+    type Decoder = RawDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        RawEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        RawDecoder
+    }
+}
+
+impl tonic::codec::Encoder for RawEncoder {
+    type Item = Bytes;
+    type Error = Status;
+
+    fn encode(&mut self, item: Bytes, dst: &mut tonic::codec::EncodeBuf<'_>) -> Result<(), Status> {
+        dst.put_slice(&item);
+        Ok(())
+    }
+}
+
+impl tonic::codec::Decoder for RawDecoder {
+    type Item = Bytes;
+    type Error = Status;
+
+    fn decode(&mut self, src: &mut tonic::codec::DecodeBuf<'_>) -> Result<Option<Bytes>, Status> {
+        let len = src.remaining();
+        Ok(Some(src.copy_to_bytes(len)))
+    }
+}
+
+/// One raw unary call: the encoded message bytes, request headers, and the
+/// client-side compression settings (network transport only).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RawCall {
+    pub(crate) body: Bytes,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) send_gzip: bool,
+    pub(crate) accept_gzip: bool,
+}
+
+/// What a raw unary call returned: the message bytes and the response headers
+/// in wire form (binary metadata stays base64 text), keyed by lowercase name.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RawResponse {
+    pub(crate) body: Bytes,
+    pub(crate) headers: BTreeMap<String, String>,
+}
+
+impl Transport {
+    /// One unary WorkflowService call with raw message bytes.
+    pub(crate) async fn unary_raw(&self, rpc: &str, call: RawCall) -> Result<RawResponse, Status> {
+        match self {
+            Self::InProcess(endpoint) => {
+                let mut map = HeaderMap::new();
+                for (name, value) in &call.headers {
+                    map.insert(
+                        HeaderName::from_bytes(name.as_bytes())
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                        HeaderValue::from_str(value)
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                    );
+                }
+                let response = endpoint
+                    .call(InProcessGrpcRequest {
+                        service: WORKFLOW_SERVICE.to_owned(),
+                        rpc: rpc.to_owned(),
+                        headers: map,
+                        proto: call.body,
+                    })
+                    .await?;
+                let headers = response
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_owned(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect();
+                Ok(RawResponse {
+                    body: Bytes::from(response.proto),
+                    headers,
+                })
+            }
+            Self::Network(channel) => {
+                let mut grpc = Grpc::new(channel.clone());
+                if call.send_gzip {
+                    grpc = grpc.send_compressed(tonic::codec::CompressionEncoding::Gzip);
+                }
+                if call.accept_gzip {
+                    grpc = grpc.accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+                }
+                grpc.ready()
+                    .await
+                    .map_err(|error| Status::unavailable(error.to_string()))?;
+                let path = PathAndQuery::from_str(&format!("/{WORKFLOW_SERVICE}/{rpc}"))
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                let mut request = tonic::Request::new(call.body);
+                for (name, value) in &call.headers {
+                    request.metadata_mut().insert(
+                        tonic::metadata::MetadataKey::from_str(name)
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                        tonic::metadata::MetadataValue::from_str(value)
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                    );
+                }
+                let response = grpc.unary(request, path, RawCodec).await?;
+                let (metadata, body, _) = response.into_parts();
+                let headers = metadata
+                    .into_headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_owned(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect();
+                Ok(RawResponse { body, headers })
+            }
+        }
+    }
 }
 
 pub(crate) fn runtime() -> tokio::runtime::Runtime {

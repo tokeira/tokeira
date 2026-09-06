@@ -1,32 +1,41 @@
 # Implementation Plan
 
-- [ ] 0. Approval checkpoint: dependency change and breaking release
+- [x] 0. Approval checkpoint: dependency change and breaking release
   - The integration seat approves the move to the Target Stack, the adoption of `protox`
     in place of `protoc`, the regeneration of the checked-in bindings, and the 0.3.0
     release before any task below starts.
+  - DONE 2026-09-06: approved by the integration seat with the spec.
   - _Requirements: 1.1, 2.1, 8.1_
 
-- [ ] 1. Goldens on the Legacy Stack (lands before any dependency moves)
-  - [ ] 1.1 Wire-parity harness with capture mode
+- [x] 1. Goldens on the Legacy Stack (lands before any dependency moves)
+  - DONE 2026-09-06: captured on tonic 0.11 / prost 0.12 / hyper 0.14 at the spec's merge
+    commit, over three surfaces (in-process endpoint, host listener, public listener).
+    Notable answers now pinned: an over-limit message is refused with `OUT_OF_RANGE`
+    and the stack's own message; an unknown method over gRPC-Web is a trailers-only
+    reply with `grpc-status: 12` in the HTTP headers; the legacy stack does not escape
+    a literal percent sign in a status message, so the type-level property leaves
+    that character out.
+  - [x] 1.1 Wire-parity harness with capture mode
     - `crates/tokeira-engine/tests/wire_parity.rs` over the In-Process Endpoint and a Host
       Listener; `WIRE_PARITY_CAPTURE=1` writes fixtures, otherwise compares.
     - _Requirements: 6.2_
-  - [ ] 1.2 Status catalogue fixture and Property 2 (Legacy leg)
+  - [x] 1.2 Status catalogue fixture and Property 2 (Legacy leg)
     - Fixed list of edge error values; capture code, message, details bytes, metadata per
       transport; the generated cross-transport equality property.
     - Tag: `// Feature: tonic-0-14-grpc-stack, Property 2: status parity across transports`
     - _Requirements: 6.2_
-  - [ ] 1.3 Decode-limit, compression, reflection, and gRPC-Web fixtures
+  - [x] 1.3 Decode-limit, compression, reflection, and gRPC-Web fixtures
     - Probes at 4 MiB minus one, 4 MiB, 4 MiB plus one; the encoding matrix; the
       `v1alpha` service listing; unary gRPC-Web samples.
     - _Requirements: 6.2_
-  - [ ] 1.4 Binding Inventory extractor and fixture
+  - [x] 1.4 Binding Inventory extractor and fixture
     - `crates/tokeira-proto/tests/binding_inventory.rs` derives the inventory from the
       Descriptor Sets with prost-reflect and writes
       `tests/fixtures/binding-inventory.json` in capture mode.
+    - DONE 2026-09-06: derived with `prost-types` alone (no prost-reflect needed).
     - _Requirements: 2.3, 6.2_
 
-- [ ] 2. Checkpoint: fixtures captured and committed, all suites green on the Legacy Stack
+- [x] 2. Checkpoint: fixtures captured and committed, all suites green on the Legacy Stack
 
 - [ ] 3. Codegen Tool and Generated Bindings
   - [ ] 3.1 `proto-sync` on `protox` and `tonic-prost-build` 0.14

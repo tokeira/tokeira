@@ -10,7 +10,7 @@
 > Mandate; tracker for the RPC→spec index.
 
 **Target:** `TEMPORAL_SERVER_COMPAT = 1.31.0`, proto `v1.62.11` (`crates/tokeira-build-info/src/pinned.rs`).
-**Last updated:** 2026-08-24 · **Contributors for status:** Kiro, Claude, Codex.
+**Last updated:** 2026-09-06 · **Contributors for status:** Kiro, Claude, Codex.
 
 ## How to read this
 
@@ -60,6 +60,126 @@ audit priority.
 **Order of attack:** C1 → C3 (cheap re-run) → C9 (panic fix, reclassifies 267) → C7 (re-triage).
 Done: C2, C4a, C4b, C5a, C5b, C6.
 
+## 2026-09-06 migration verification
+
+**Result: 44 of the 45 previously CLEAN tiers have no failing active leaves. Tier 9.43
+has four pre-existing HTTP failures. The unmodified-corpus rerun is not all green.**
+This records the rerun required by `tonic-0-14-grpc-stack` requirement 6.4; acceptance
+remains open until the HTTP compatibility gap below is resolved.
+
+The migrated engine was `632b46a87c702e69ff76ef41ec9cfe420ce36b91`, built with
+`cargo build -p tokeirad --features conformance --locked`. The Temporal harness was
+`c2a761b5c59acb2b2e8f4b9ad34fc912150d9d8f` with `GOTOOLCHAIN=go1.26.2` and
+`GOFLAGS=-mod=readonly`. Its existing top-level corpus test files match `v1.31.0`.
+All 66 entrypoints named by the 45 CLEAN ledger tiers were invoked once, in tier order,
+using the single-suite runner with an anchored `^TestSuite$` expression and `-timeout 20m`.
+Each invocation booted a fresh conformance-enabled engine with in-memory storage.
+Both Nexus failure modes and both advanced-visibility converter modes ran independently.
+This measures the previously CLEAN tiers, not the entire compatibility denominator or
+durable-storage behavior. No corpus body, exclusion entry, or dependency file changed.
+
+The sweep completed with **1,065 passing active leaves, 4 failing active leaves,
+23 corpus-native skips, and 0 unfinished leaves**. The unchanged registry contributed
+118 matching exclusion entries; those are reported separately from observed test outcomes
+and are not counted as executed passes. In particular, `TestCallbacksSuiteCHASM` is
+wholly excluded, and `TestRawHistorySuite` and `TestSizeLimitFunctionalSuite` ran no active
+leaves. Including suite and intermediate subtest parents, Go reported 1,277 pass / 5 fail /
+23 skip outcomes; the failed HTTP suite parent accounts for the fifth failure.
+
+The table counts terminal tests only, excluding suite and intermediate subtest parents.
+Historical rows below use their original counting conventions and source revisions.
+
+| Tier | Entrypoints | Leaf pass | Leaf fail | Native skip | Registry entries |
+|------|------------:|----------:|----------:|------------:|-----------------:|
+| 1.1 | 1 | 28 | 0 | 0 | 0 |
+| 1.2 | 1 | 8 | 0 | 0 | 1 |
+| 1.3 | 2 | 14 | 0 | 0 | 0 |
+| 1.4 | 1 | 2 | 0 | 0 | 0 |
+| 1.5 | 2 | 3 | 0 | 0 | 0 |
+| 1.6 | 1 | 2 | 0 | 0 | 1 |
+| 1.7 | 1 | 3 | 0 | 0 | 0 |
+| 1.8 | 3 | 8 | 0 | 0 | 1 |
+| 2.9 | 1 | 11 | 0 | 0 | 0 |
+| 2.10 | 1 | 8 | 0 | 0 | 1 |
+| 2.11 | 1 | 5 | 0 | 0 | 0 |
+| 2.12 | 3 | 87 | 0 | 0 | 13 |
+| 2.13 | 2 | 4 | 0 | 0 | 1 |
+| 3.14 | 1 | 7 | 0 | 0 | 0 |
+| 3.15 | 1 | 7 | 0 | 0 | 0 |
+| 3.16 | 2 | 3 | 0 | 0 | 0 |
+| 3.17 | 3 | 28 | 0 | 6 | 2 |
+| 3.18 | 1 | 5 | 0 | 0 | 1 |
+| 3.19 | 1 | 3 | 0 | 0 | 0 |
+| 3.20 | 1 | 0 | 0 | 0 | 4 |
+| 3.21 | 1 | 2 | 0 | 0 | 0 |
+| 3.22 | 1 | 4 | 0 | 0 | 0 |
+| 4.23 | 1 | 1 | 0 | 0 | 0 |
+| 4.24 | 2 | 40 | 0 | 2 | 22 |
+| 4.25 | 1 | 2 | 0 | 0 | 0 |
+| 4.26 | 1 | 2 | 0 | 0 | 0 |
+| 4.27 | 1 | 3 | 0 | 0 | 0 |
+| 4.28 | 2 | 7 | 0 | 0 | 2 |
+| 4.29 | 2 | 9 | 0 | 4 | 4 |
+| 5.30 | 1 | 16 | 0 | 0 | 4 |
+| 5.31 | 1 | 4 | 0 | 0 | 0 |
+| 5.32 | 2 | 11 | 0 | 0 | 1 |
+| 6.33 | 1 | 145 | 0 | 0 | 3 |
+| 6.34 | 4 | 15 | 0 | 0 | 0 |
+| 7.35 | 1 | 42 | 0 | 0 | 0 |
+| 7.36 | 1 | 16 | 0 | 0 | 0 |
+| 7.37 | 1 | 19 | 0 | 0 | 11 |
+| 7.38 | 2 | 46 | 0 | 0 | 2 |
+| 8.39 | 1 | 54 | 0 | 3 | 2 |
+| 8.40 | 1 | 68 | 0 | 0 | 1 |
+| 8.41 | 1 | 286 | 0 | 4 | 33 |
+| 8.42 | 1 | 6 | 0 | 0 | 0 |
+| 9.43 | 1 | 6 | 4 | 0 | 0 |
+| 9.44 | 2 | 21 | 0 | 3 | 0 |
+| 10.45 | 3 | 4 | 0 | 1 | 8 |
+| **Total** | **66** | **1,065** | **4** | **23** | **118** |
+
+### HTTP failures and control runs
+
+The four failures are `TestHttpApiTestSuite/TestHTTPAPIBasics_Protojson`,
+`TestHTTPAPIBasics_ProtojsonPretty`, `TestHTTPAPIBasics_Shorthand`, and
+`TestHTTPAPIBasics_ShorthandPretty` (all under the same suite). Each issues an immediate
+close-only history read after signaling the workflow, without `waitNewEvent=true`.
+The ProtoJSON cases assert one event but receive an empty history at
+`tests/http_api_test.go:220`; the shorthand cases index the empty events array at line 278.
+
+| Comparison | Engine revision | Harness revision | Active leaf pass / fail / skip |
+|------------|-----------------|------------------|--------------------------------|
+| Unmodified HTTP corpus, before migration | `042f255739c7d543c09d300071b0594aaeaeef09` | `c2a761b5c59acb2b2e8f4b9ad34fc912150d9d8f` | 6 / 4 / 0 |
+| Unmodified HTTP corpus, migrated engine | `632b46a87c702e69ff76ef41ec9cfe420ce36b91` | `c2a761b5c59acb2b2e8f4b9ad34fc912150d9d8f` | 6 / 4 / 0 |
+| Maintained HTTP corpus, migrated engine | `632b46a87c702e69ff76ef41ec9cfe420ce36b91` | `5558d9422d33203d8aff9d42fe6b5663b4b1b1bc` | 10 / 0 / 0 |
+
+The pre-migration control reproduced the same four failing leaves and empty-history
+failure modes. This is evidence that the HTTP compatibility gap predates the migration.
+Engine commit `337de091096fb16049ed35c6cf8b20d459d7ca02` had already removed the
+conformance-only post-signal delay on 2026-08-27. The paired harness commit
+`5558d9422d33203d8aff9d42fe6b5663b4b1b1bc` adds `waitNewEvent=true` to this corpus request;
+it is the sole difference from the audited harness parent. Its passing HTTP comparison is
+supplementary evidence, not an unmodified-corpus pass.
+
+The pinned source establishes a pre-existing behavior gap. On an initial close-only
+history request with no continuation token, Temporal retains `common.EndEventID` as the
+mutable-state query's expected next event ID, regardless of `WaitNewEvent`
+(`service/history/api/getworkflowexecutionhistory/api.go`, `Invoke`, @ v1.31.0).
+`GetOrPollWorkflowMutableState` then waits while the execution is running, bounded by
+the long-poll deadline (`service/history/api/get_workflow_util.go @ v1.31.0`). The
+`isLongPoll` flag separately controls continuation behavior. Tokeira instead returns
+immediately when `wait_new_event` is false
+(`crates/tokeira-edge/src/workflow_service.rs`, `get_workflow_execution_history`).
+The earlier commit's rationale that this initial close-only read waits only with
+`wait_new_event=true` is therefore incomplete; adding the flag in the fork hides the gap.
+
+The next correction is to match the pinned initial close-only history behavior and
+rerun the original HTTP suite. The maintained fork's test-body edit also needs correction
+under the unmodified-corpus contract in [`AGENTS.md`](../../AGENTS.md) and the
+[functional conformance runbook](../testing/functional-conformance-harness.md).
+This evidence update changes neither engine behavior nor the fork, and does not declare
+requirement 6.4 satisfied.
+
 ## Drive-to-green ledger (suite-by-suite, per `functional-test-order.md`)
 
 Fix-to-green campaign (`docs/HANDOVER-functional-conformance.md`, retired to git history): a suite is **clean** when every
@@ -69,7 +189,7 @@ test is green or a classified skip with a cited registry reason — zero unclass
 |------|-------|--------|------|-------|
 | 10.45 | `TestPrioritySuite` + `TestFairnessSuite` + `TestFairnessAutoEnableSuite` | ✅ **CLEAN — 4 active leaves pass / 0 fail + 1 corpus-native skip + 8 exact classified leaves** (2× consecutive fresh-process runs; sticky leaf also passes in isolation) | 2026-07-26 | Ground truth from `common/dynamicconfig/constants.go`, `service/matching/task_queue_partition_manager.go`, `service/matching/fair_backlog_manager.go`, `service/matching/fair_level.go`, `service/matching/fairness_util.go`, `service/matching/fairness.md`, `service/frontend/workflow_handler.go`, and `tests/priority_fairness_test.go @ v1.31.0` established the public behavior and stock defaults: priority-aware delivery on, five bands/default key 3, User Fairness and auto-enable off, sticky excluded from fairness, and default workflow-ID conflict policy FAIL. Tokeira implements that behavior in its delivery plane rather than introducing Temporal matching/history service objects. The pure stateless kernel only copies captured Priority metadata into deterministic dispatch intent and retains no scheduler state; runtime owns effective ordering, weighted stride, sticky/normal arbitration, stale-offer fencing, live config, and queue/per-key rate shaping; storage persists an explicit `(priority_key, fair_pass, insertion_seq)` delivery order; the edge validates and projects inheritance, updates, config, and real `stats_by_priority_key`. The configuration-policy follow-on replaced the campaign's volatile `TaskQueueConfigStore` with a dedicated kind-isolated CAS repository: updates commit before success, server caches hydrate before traffic, and process replacement recovers the last committed rates and weight overrides. The Shape-2 fork adds a read-only Admin observation adapter backed by public `DescribeTaskQueue`, never edits `test_env.go` or a corpus test body, and uses a 100-case mapping/classification property. Exact classifications: six leaves assert Temporal's classic/priority/fair matcher migration topology, one non-auto pending-task invalidation leaf asserts unavailable in-process matching-client metrics, and the sticky leaf deterministically reuses live workflow IDs left by its predecessor under default FAIL; the unmodified sticky leaf passes alone on a fresh process and is also pinned by delivery properties. The auto-enable pending-task leaf self-skips in upstream v1.31.0 as flaky. Each final pass invoked the runner separately with the exact suite patterns `'^TestPrioritySuite$'`, `'^TestFairnessSuite$'`, and `'^TestFairnessAutoEnableSuite$'`: tallies were respectively 3/0/0, 2/0/0, and 2/0/1 on both passes; wrongorderness was 0 and unfairness 0.45. The durable configuration-policy follow-on repeated those three exact invocations twice on 2026-07-26 with the same tallies and measurements. It also repeated the exact `TestUpdateAndDescribeTaskQueueConfig`, `TestUpdateUnsetAndDescribeTaskQueueConfig`, and `TestTaskQueueRateLimit_UpdateFromWorkerConfigAndAPI` leaves twice over the real wire; each runner tally was 2/0/0 on both passes. The original priority validation used Tokeira `3a4b7563` and Temporal `3fa03f7a`; the durability follow-on used working trees based on Tokeira `ff372a2e` and Temporal `423ae614`. The complete fork package compiles with `go test -tags test_dep ./tests -run '^$'`. |
 | 9.44 | `TestClientMiscTestSuite` + `TestClientDataConverterTestSuite` | ✅ **CLEAN — 26 pass / 0 fail / 3 corpus-native skips** (2× consecutive fresh-process runs) | 2026-07-23 | Ground truth from `common/dynamicconfig/constants.go`, `service/history/api/respondworkflowtaskcompleted/workflow_size_checker.go`, `service/history/api/command_attr_validator.go`, `service/history/api/recordworkflowtaskstarted/api.go`, `service/history/workflow/workflow_task_state_machine.go`, `service/history/workflow/mutable_state_impl.go`, `service/history/transfer_queue_active_task_executor.go`, `service/matching/matching_engine.go`, and `service/worker/batcher/activities.go @ v1.31.0` established five distinct fixes. WFT completion now receives live, explicit limits for pending child workflows, activities, external signals, and cancellation requests; the pure stateless kernel checks provisional transition-builder state, rejects atomically at the exact boundary, and authors the four exact failure causes through the existing runtime invalid-command seam. ScheduleActivity timeout and task-queue normalization moved from the edge into the pure kernel so history, state, dispatch, and timeout tracking share one deterministic decision. Sticky affinity no longer expires from elapsed wall time or mutating storage reads: storage derives both destinations, the volatile broker uses recent/active poller observations for immediate normal fallback, and affinity clears only when a fallback task actually starts on another queue; query deadlines are freshly derived at enqueue. Successful WFT completions durably evolve the current run's first-observation auto-reset points on both hot apply and replay, Describe exposes every field in order, and batch reset resolves the requested current-run build point rather than substituting the current build or first WFT; cross-run point rollover remains separately classified. Retry-policy activity starts remain transient until a terminal result materializes start then result, while retryable failures persist neither event. The Shape-2 harness forwards only the four suite-global limit keys and supplies one read-only `GetWorkflowExecution` view through `DescribeMutableState`; no corpus test body changed. Ten ≥100-case properties, fixed regressions, focused crate suites, and both corpus runs pass. The three `TestClientDataConverterTestSuite` methods remain skips authored by the upstream v1.31.0 corpus, with no Tokeira skip-registry entries. |
-| 9.43 | `TestHttpApiTestSuite` | ✅ **CLEAN — 11 pass / 0 fail / 0 skip** (2× consecutive fresh-process runs) | 2026-07-22 | Tokeira now serves the descriptor-annotated WorkflowService and OperatorService HTTP/JSON surface on the existing listener and invokes the ordinary Tonic router exactly once in-process—no copied Temporal frontend topology and no kernel, runtime, storage, history, or projection change. The immutable descriptor catalog covers primary/additional bindings, legacy path-template matching, body→path→query precedence, form POST→GET fallback, and the observed wrong-method `UNIMPLEMENTED`/HTTP 501 behavior. Descriptor-aware ProtoJSON implements all four compact/pretty and payload-shorthand modes, canonical/ineligible fallback, typed status details, and the 4 MiB consumed-body limit. Host globs and header forwarding include live conformance delivery of `frontend.httpAllowedHosts`; HTTP metadata reaches the existing auth stack, with the Shape-2 callback preserving the corpus's exact authorization closure. Official API v1.62.11 OpenAPI v2/v3 assets are vendored with provenance and served as immutable prefix routes. Genuine admitted-call metrics are mapped through the harness without fabricated samples. The obsolete `/api/v1/{service}/{method}` placeholder is removed. A conformance-only post-signal scheduling grace recreates the opportunity supplied by v1.31.0's separate HTTP listener/service boundary before the corpus's immediate non-long-poll close-history read; it runs only after authoritative signal success and does not affect production or change history semantics. Eleven ≥100-case properties, body/layer/cancellation tests, OpenAPI route closure, focused Shape-2 seam tests, and both final corpus runs pass. |
+| 9.43 | `TestHttpApiTestSuite` | 🟡 **6 active leaves pass / 4 fail on the unmodified corpus; pre-existing** | 2026-09-06 | The migration verification above reproduces the same four failures before the migration; the maintained fork passes 10 active leaves with its explicit long-poll request, which changes the corpus body. The original 2026-07-22 evidence was 11 passing Go outcomes twice with a conformance-only scheduling delay. That delay was removed on 2026-08-27. Historical implementation notes: Tokeira serves the descriptor-annotated WorkflowService and OperatorService HTTP/JSON surface on the existing listener and invokes the ordinary Tonic router exactly once in-process—no copied Temporal frontend topology and no kernel, runtime, storage, history, or projection change. The immutable descriptor catalog covers primary/additional bindings, legacy path-template matching, body→path→query precedence, form POST→GET fallback, and the observed wrong-method `UNIMPLEMENTED`/HTTP 501 behavior. Descriptor-aware ProtoJSON implements all four compact/pretty and payload-shorthand modes, canonical/ineligible fallback, typed status details, and the 4 MiB consumed-body limit. Host globs and header forwarding include live conformance delivery of `frontend.httpAllowedHosts`; HTTP metadata reaches the existing auth stack, with the Shape-2 callback preserving the corpus's exact authorization closure. Official API v1.62.11 OpenAPI v2/v3 assets are vendored with provenance and served as immutable prefix routes. Genuine admitted-call metrics are mapped through the harness without fabricated samples. The obsolete `/api/v1/{service}/{method}` placeholder is removed. The July baseline included the subsequently removed conformance-only post-signal scheduling grace. Eleven ≥100-case properties, body/layer/cancellation tests, OpenAPI route closure, focused Shape-2 seam tests, and both July corpus runs passed. |
 | 8.42 | `TestWorkerRegistryTestSuite` | ✅ **CLEAN — 7 pass / 0 fail / 0 skip** (2× consecutive fresh-process runs) | 2026-07-21 | Baseline was 0 pass / 7 fail because `DescribeWorker` and `ListWorkers` were deferred and the Nexus poll translator discarded its piggyback heartbeat batch. Ground truth from `service/frontend/workflow_handler.go`, `service/matching/handler.go`, `service/matching/workers/registry_impl.go`, `service/matching/workers/worker_query_engine.go`, and `common/dynamicconfig/constants.go @ v1.31.0` established a volatile per-process registry: lossless latest heartbeat per namespace/key, five-minute TTL, immediate shutdown-status removal, dual full/summary list fields, worker-query filtering, and key-cursor pagination. Tokeira now preserves the complete heartbeat protobuf as an edge-owned opaque image while runtime retains compact liveness/query fields; no Temporal proto enters runtime. All four registry RPCs pass the authorization seam with v1.31.0 namespace/read-write classification. `DescribeWorker` and `ListWorkers` read the live store, return complete counters/nested data, evaluate the bounded query grammar without a SQL dependency, and paginate compatibly. Nexus-piggybacked observations are inserted after namespace admission and before blocking; failure is best effort. Compatibility ownership moves inventory from unsupported worker configuration to implemented worker heartbeats. The suite-level `WorkerHeartbeatsEnabled=true` override is intentionally unwired because v1.31.0 and Tokeira both pin the stock default true. Lossless/property, shutdown, query, pagination, Nexus-failure, surface-audit, and focused crate tests pass. No kernel, storage, projection, dependency, or Temporal-fork change. |
 | 8.41 | `TestVersioning3FunctionalSuite` | ✅ **CLEAN — 319 pass / 0 fail / 4 corpus-native skips, plus 33 exact internal-topology exclusions** (2× consecutive fresh-process runs) | 2026-08-24 | Deployment routing now follows v1.31.0's observable V3 contract across target-change notification, Continue-as-New, retry and child inheritance, pinned/AutoUpgrade transitions, revision no-bounce rules, speculative/transient WFTs, activity-triggered transitions, and stale sticky migration. The kernel remains a stateless pure transition evaluator: runtime resolves mutable routing/policy/membership operands, kernel persists only deterministic per-run state/events and emits declarative dispatch effects, and replay reproduces the decision without registry or I/O access. A transition that finds an unstarted non-speculative WFT fences its disposable offer and emits a history-free replacement; speculative tasks remain timeout-driven. Sticky envelopes with missing coordinates hydrate from committed run state before comparison, and stale targets move to the normal physical Version queue. Poll admission rejects an empty sticky `normal_name` with v1.31.0's exact error. Drained-query liveness is recorded before durable Version registration and retained per physical Deployment Version, so one SDK identity polling v1 and v2 cannot overwrite v1's still-live history; absent-poller blackhole protection remains green. Public history preserves inherited Version information, target-change notification, and unknown Continue-as-New behavior values. The fork supplies scoped read-only `GetMutableState` and task-queue user-data projections through public Tokeira APIs; the 33 excluded methods directly mutate or assert Temporal's private matching topology and carry exact cited registry reasons. Properties 22–25 and focused kernel/runtime/edge tests are green. The 2026-08-24 EV1 audit exposed a namespace-wide scan in the fork adapter and two engine regressions hidden behind its timeout: drained priority bands disappeared after activity migration, and modern versioned sticky polls did not satisfy the unversioned physical sticky queue's availability check. The adapter now projects one task queue through `DescribeTaskQueue`; the runtime retains zero-count observed priority bands through drain/migration and keys sticky availability to the physical queue plus worker, matching `matching_engine.go`, `physical_task_queue_manager.go`, and `task_queue_partition_manager.go @ v1.31.0`. The exact suite is clean twice again with the unchanged 319/0/4 tally. |
 | 8.40 | `TestDeploymentVersionSuite` | ✅ **CLEAN — 64 active methods / 0 fail / 1 exact classified exclusion** (2× consecutive fresh-process runs) | 2026-07-20 | Workflow-option updates now carry unresolved implied-pinned intent into the pure lane-ordered kernel transition, resolve it from authoritative run state, persist only concrete overrides, and treat equivalent writes as event-free no-ops. Direct, batch, reset, start, and signal-with-start paths share explicit membership validation, committed-state responses, and post-commit best-effort Version reactivation. The runtime owns shared one-second membership and ten-second reactivation caches, pinned physical routing, and late-poller backlog re-keying; the kernel remains limited to deterministic serializable state, replay, and transition decisions. Drainage now reaches the authoritative open-pinned-workflow read through the history-notifying repository wrapper. Missing historical task queues reject Current/Ramping changes only while still owned and carrying durable backlog or recent add pressure, with v1.31.0's exact errors; idle or moved queues pass. The Temporal fork projects the suite's private task-queue user-data read from public Worker Deployment APIs. `TestForceCAN_WithOverrideState` is the sole exact exclusion because it requires the unavailable in-process override-state hook. Workflow-option Properties 4/5 and Worker Deployment Properties 20/21 run at least 100 cases, including concurrent reactivation deduplication; formatting, workspace lint, test-target lint, touched-crate tests, focused harness tests, and both corpus passes are green. |

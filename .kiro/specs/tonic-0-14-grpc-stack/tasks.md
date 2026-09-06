@@ -169,11 +169,16 @@
     into the test binary and changes the text the entries were sorted by); the probe now
     orders both sides by a key-sorted canonical rendering.
 
-- [ ] 12. Evidence
-  - [ ] 12.1 Functional conformance corpus: rerun every tier recorded CLEAN against the
+- [x] 12. Evidence
+  - [x] 12.1 Functional conformance corpus: rerun every tier recorded CLEAN against the
     migrated `tokeirad`; record the rerun in `docs/readiness/conformance.md`
-    - Not run in the landing slice: the corpus runs on the operator's build host per the
-      conformance runbook; it stays owed before the 0.3.0 train.
+    - DONE 2026-09-06: All 45 previously CLEAN tiers were exercised. Against the documented
+      v0.1.0 release baseline, all 64 test-bearing entrypoints match their recorded totals:
+      1,261 pass outcomes, 22 native skips, 106 existing registry exclusions, and zero fail
+      or unfinished outcomes. The comparison retains the release's disclosed HTTP request
+      adjustment; the four original-request failures reproduce before the migration and
+      remain a separate timing investigation. Evidence and source revisions are recorded in
+      [the readiness ledger](../../../docs/readiness/conformance.md#2026-09-06-migration-verification).
     - _Requirements: 6.4_
   - [x] 12.2 SDK 1.0.0 probes and the bench over both transports
     - DONE 2026-09-06: `spikes/temporal-rust-sdk-v0-7-embedded` green on the migrated

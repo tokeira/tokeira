@@ -27,7 +27,7 @@ proc-macro2 = "1.0"
 # surface so the accept fixtures prove the generated impl against the framework.
 trybuild = "1.0"
 tokeira-chasm = { path = "../tokeira-chasm", version = "0.2.0" }
-prost = "0.12"
+prost = "0.14"
 
 [lints]
 workspace = true

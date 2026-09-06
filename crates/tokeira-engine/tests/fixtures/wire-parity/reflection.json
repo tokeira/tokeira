@@ -1,0 +1,13 @@
+{
+  "v1alpha": {
+    "services": [
+      "grpc.reflection.v1alpha.ServerReflection",
+      "temporal.api.operatorservice.v1.OperatorService",
+      "temporal.api.workflowservice.v1.WorkflowService",
+      "temporal.server.api.adminservice.v1.AdminService"
+    ],
+    "workflow_service_files": [
+      "temporal/api/workflowservice/v1/service.proto"
+    ]
+  }
+}

@@ -16,11 +16,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue};
-use http_body_legacy::Body as _;
-use hyper_legacy::{Body, Request, Version};
-use tokio::sync::{Mutex, Notify};
-use tonic::{Code, Status, transport::server::Routes};
+use http::{HeaderMap, Request, Version, header};
+use http_body_util::{BodyExt as _, Full};
+use tokio::sync::Notify;
+use tonic::{Code, Status, body::Body, service::Routes};
 use tower::ServiceExt as _;
 
 use crate::grpc::{
@@ -35,7 +34,7 @@ pub struct InProcessGrpcRequest {
     pub service: String,
     /// RPC method name.
     pub rpc: String,
-    /// Request metadata in the SDK's `http` 1.x representation.
+    /// Request metadata, in the same `http` representation the router reads.
     pub headers: HeaderMap,
     /// Unframed protobuf request bytes.
     pub proto: Bytes,
@@ -71,10 +70,10 @@ pub struct InProcessGrpcResponse {
 /// admission permits and other RAII resources promptly.
 #[derive(Clone, Debug)]
 pub struct InProcessGrpcService {
-    // Tonic 0.11's Axum router is Send but not Sync. The mutex exists only to
-    // clone its cheap service handles; it is released before any RPC future is
-    // polled, so concurrent long polls do not serialize behind one another.
-    routes: Arc<Mutex<Routes>>,
+    /// The assembled router. Cloning it is cheap (the services inside are
+    /// shared handles) and each call dispatches through its own clone, so
+    /// concurrent long polls never serialize behind one another.
+    routes: Routes,
     /// The engine-host runtime handle captured at construction. The embedded
     /// engine does not construct a Tokio runtime of its own — it borrows the
     /// runtime its host initialized it on, and this handle pins all handler
@@ -99,7 +98,7 @@ impl InProcessGrpcService {
             .add_service(operator.into_service())
             .add_service(admin.into_service());
         Self {
-            routes: Arc::new(Mutex::new(routes)),
+            routes,
             handler_runtime: tokio::runtime::Handle::current(),
             admission: InProcessAdmission::new(),
         }
@@ -114,7 +113,7 @@ impl InProcessGrpcService {
     /// admission: a network server drains its own handlers through its
     /// transport, exactly as `tokeirad` does.
     pub async fn routes(&self) -> Routes {
-        self.routes.lock().await.clone()
+        self.routes.clone()
     }
 
     /// The engine-host runtime every handler future is pinned to.
@@ -173,24 +172,27 @@ impl InProcessGrpcService {
             .method("POST")
             .uri(path)
             .version(Version::HTTP_2)
-            .body(Body::from(frame))
+            .body(Body::new(Full::new(Bytes::from(frame))))
             .map_err(|error| Status::invalid_argument(format!("invalid gRPC method: {error}")))?;
-        copy_request_headers(&request.headers, grpc_request.headers_mut());
+        for (name, value) in &request.headers {
+            grpc_request
+                .headers_mut()
+                .append(name.clone(), value.clone());
+        }
         // The SDK callback boundary explicitly does not support compression. Force
-        // identity after metadata copying so a caller cannot accidentally make the
-        // generated server return a compressed frame the callback cannot decode.
+        // identity after the caller's metadata so a caller cannot accidentally make
+        // the generated server return a compressed frame the callback cannot decode.
         grpc_request.headers_mut().insert(
-            hyper_legacy::header::CONTENT_TYPE,
-            hyper_legacy::header::HeaderValue::from_static("application/grpc"),
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/grpc"),
         );
-        grpc_request.headers_mut().insert(
-            hyper_legacy::header::TE,
-            hyper_legacy::header::HeaderValue::from_static("trailers"),
-        );
+        grpc_request
+            .headers_mut()
+            .insert(header::TE, header::HeaderValue::from_static("trailers"));
         grpc_request.headers_mut().remove("grpc-encoding");
         grpc_request.headers_mut().remove("grpc-accept-encoding");
 
-        let routes = self.routes.lock().await.clone();
+        let routes = self.routes.clone();
         // Poll the handler on the engine-host runtime, never inline on the
         // caller's executor (see the struct-level execution contract). The
         // guard aborts the handler when the caller's future is dropped, so a
@@ -204,22 +206,15 @@ impl InProcessGrpcService {
             let response = routes.oneshot(grpc_request).await.map_err(|error| {
                 Status::internal(format!("in-process gRPC dispatch failed: {error}"))
             })?;
-            let (parts, mut body) = response.into_parts();
-            let mut framed = Vec::new();
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk.map_err(|error| {
-                    Status::internal(format!("failed reading in-process gRPC response: {error}"))
-                })?;
-                framed.extend_from_slice(&chunk);
-            }
-            let trailers = body
-                .trailers()
-                .await
-                .map_err(|error| {
-                    Status::internal(format!("failed reading in-process gRPC trailers: {error}"))
-                })?
-                .unwrap_or_default();
+            let (parts, body) = response.into_parts();
+            let collected = body.collect().await.map_err(|error| {
+                Status::internal(format!("failed reading in-process gRPC response: {error}"))
+            })?;
+            let trailers = collected.trailers().cloned().unwrap_or_default();
+            let framed = collected.to_bytes();
 
+            // A gRPC status arrives in the trailers of a normal reply and in the
+            // headers of a trailers-only reply; reading both catches either.
             let mut status_headers = parts.headers.clone();
             for (name, value) in &trailers {
                 status_headers.append(name, value.clone());
@@ -412,20 +407,10 @@ fn validate_method_name(value: &str, field: &str) -> Result<(), Status> {
     Ok(())
 }
 
-fn copy_request_headers(source: &HeaderMap, target: &mut hyper_legacy::HeaderMap) {
-    for (name, value) in source {
-        let Ok(name) = hyper_legacy::header::HeaderName::from_bytes(name.as_str().as_bytes())
-        else {
-            continue;
-        };
-        let Ok(value) = hyper_legacy::header::HeaderValue::from_bytes(value.as_bytes()) else {
-            continue;
-        };
-        target.append(name, value);
-    }
-}
-
-fn copy_response_headers(source: &hyper_legacy::HeaderMap, target: &mut HeaderMap) {
+/// Append every caller-visible response header: the transport-owned keys
+/// (the content type and the three gRPC status fields) are withheld, since
+/// the status is delivered through the call's result instead.
+fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
     for (name, value) in source {
         if matches!(
             name.as_str(),
@@ -433,13 +418,7 @@ fn copy_response_headers(source: &hyper_legacy::HeaderMap, target: &mut HeaderMa
         ) {
             continue;
         }
-        let Ok(name) = HeaderName::from_bytes(name.as_str().as_bytes()) else {
-            continue;
-        };
-        let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) else {
-            continue;
-        };
-        target.append(name, value);
+        target.append(name.clone(), value.clone());
     }
 }
 
@@ -466,20 +445,20 @@ fn parse_unary_frame(bytes: &[u8]) -> Result<Vec<u8>, Status> {
 
 #[cfg(test)]
 mod tests {
+    use http::HeaderValue;
+
     use super::*;
 
     #[test]
-    fn metadata_survives_http_version_bridge() {
-        let mut modern = HeaderMap::new();
-        modern.append("x-request-id", HeaderValue::from_static("request-1"));
-        modern.append("x-request-id", HeaderValue::from_static("request-2"));
+    fn response_headers_keep_repeated_values_in_order() {
+        let mut emitted = HeaderMap::new();
+        emitted.append("x-request-id", HeaderValue::from_static("request-1"));
+        emitted.append("x-request-id", HeaderValue::from_static("request-2"));
 
-        let mut legacy = hyper_legacy::HeaderMap::new();
-        copy_request_headers(&modern, &mut legacy);
-        let mut round_trip = HeaderMap::new();
-        copy_response_headers(&legacy, &mut round_trip);
+        let mut visible = HeaderMap::new();
+        copy_response_headers(&emitted, &mut visible);
 
-        let values = round_trip
+        let values = visible
             .get_all("x-request-id")
             .iter()
             .map(|value| value.to_str().expect("test metadata is ASCII"))
@@ -489,23 +468,23 @@ mod tests {
 
     #[test]
     fn response_bridge_removes_transport_owned_headers() {
-        let mut legacy = hyper_legacy::HeaderMap::new();
-        legacy.insert(
+        let mut emitted = HeaderMap::new();
+        emitted.insert(
             "content-type",
             "application/grpc".parse().expect("static value"),
         );
-        legacy.insert("grpc-status", "0".parse().expect("static value"));
-        legacy.insert("x-engine", "embedded".parse().expect("static value"));
+        emitted.insert("grpc-status", "0".parse().expect("static value"));
+        emitted.insert("x-engine", "embedded".parse().expect("static value"));
 
-        let mut modern = HeaderMap::new();
-        copy_response_headers(&legacy, &mut modern);
+        let mut visible = HeaderMap::new();
+        copy_response_headers(&emitted, &mut visible);
 
         assert_eq!(
-            modern.get("x-engine").expect("metadata retained"),
+            visible.get("x-engine").expect("metadata retained"),
             "embedded"
         );
-        assert!(!modern.contains_key("content-type"));
-        assert!(!modern.contains_key("grpc-status"));
+        assert!(!visible.contains_key("content-type"));
+        assert!(!visible.contains_key("grpc-status"));
     }
 
     #[tokio::test]

@@ -7,8 +7,11 @@
 
 use std::time::Duration;
 
-use hyper_legacy::{Body, Client, Request, StatusCode, body::to_bytes};
-use tokio::{net::TcpStream, sync::Notify};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::TcpStream,
+    sync::Notify,
+};
 
 use tokeirad::TokeiradHandle;
 
@@ -54,33 +57,50 @@ async fn grpc_web_remains_reachable_through_the_shared_listener() {
         .await
         .expect("start_in_memory should succeed on an ephemeral port");
 
-    let request = Request::post(format!(
-        "http://{}/temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo",
-        handle.bound_addr()
-    ))
-    .header("content-type", "application/grpc-web+proto")
-    .header("x-grpc-web", "1")
-    .header("te", "trailers")
-    .body(Body::from(vec![0, 0, 0, 0, 0]))
-    .expect("the static gRPC-Web request should be valid");
+    // One HTTP/1.1 request written by hand, exactly as a browser client
+    // frames it, so the probe depends on no HTTP client library of its own.
+    let addr = handle.bound_addr();
+    let frame = [0u8, 0, 0, 0, 0];
+    let head = format!(
+        "POST /temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo HTTP/1.1\r\n\
+         host: {addr}\r\n\
+         content-type: application/grpc-web+proto\r\n\
+         x-grpc-web: 1\r\n\
+         te: trailers\r\n\
+         content-length: {}\r\n\
+         connection: close\r\n\r\n",
+        frame.len()
+    );
+    let reply = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = TcpStream::connect(addr).await?;
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(&frame).await?;
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await?;
+        Ok::<_, std::io::Error>(reply)
+    })
+    .await
+    .expect("gRPC-Web request should complete within the test budget")
+    .expect("shared listener should accept the gRPC-Web request");
 
-    let response = tokio::time::timeout(Duration::from_secs(5), Client::new().request(request))
-        .await
-        .expect("gRPC-Web request should complete within the test budget")
-        .expect("shared listener should accept the gRPC-Web request");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("application/grpc-web+proto")
+    let split = reply
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("the reply carries a header block");
+    let headers = String::from_utf8_lossy(&reply[..split]);
+    assert!(
+        headers.starts_with("HTTP/1.1 200"),
+        "unexpected status line: {}",
+        headers.lines().next().unwrap_or_default()
+    );
+    assert!(
+        headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("content-type: application/grpc-web+proto")),
+        "unexpected headers:\n{headers}"
     );
 
-    let body = to_bytes(response.into_body())
-        .await
-        .expect("gRPC-Web response body should be readable");
+    let body = &reply[split + 4..];
     assert!(
         body.windows(b"grpc-status:0".len())
             .any(|window| window == b"grpc-status:0"),

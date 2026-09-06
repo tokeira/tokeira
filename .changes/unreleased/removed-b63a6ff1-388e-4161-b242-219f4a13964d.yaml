@@ -1,0 +1,4 @@
+kind: removed
+body: Regenerating the protobuf bindings no longer needs a system `protoc`; `proto-sync` compiles the vendored protos in pure Rust.
+custom:
+  Slice: b63a6ff1-388e-4161-b242-219f4a13964d

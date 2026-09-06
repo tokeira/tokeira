@@ -2,11 +2,11 @@
 /// CalendarSpec describes an event specification relative to the calendar,
 /// similar to a traditional cron specification, but with labeled fields. Each
 /// field can be one of:
-///    *: matches always
-///    x: matches when the field equals x
-///    x/y : matches when the field equals x+n*y where n is an integer
-///    x-z: matches when the field is between x and z inclusive
-///    w,x,y,...: matches when the field is one of the listed values
+/// *: matches always
+/// x: matches when the field equals x
+/// x/y : matches when the field equals x+n*y where n is an integer
+/// x-z: matches when the field is between x and z inclusive
+/// w,x,y,...: matches when the field is one of the listed values
 /// Each x, y, z, ... is either a decimal integer, or a month or day of week name
 /// or abbreviation (in the appropriate fields).
 /// A timestamp matches if all fields match.
@@ -17,8 +17,7 @@
 /// day_of_week can accept 0 or 7 as Sunday
 /// CalendarSpec gets compiled into StructuredCalendarSpec, which is what will be
 /// returned if you describe the schedule.
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CalendarSpec {
     /// Expression to match seconds. Default: 0
     #[prost(string, tag = "1")]
@@ -31,7 +30,7 @@ pub struct CalendarSpec {
     pub hour: ::prost::alloc::string::String,
     /// Expression to match days of the month. Default: *
     /// (-- api-linter: core::0140::prepositions=disabled
-    ///      aip.dev/not-precedent: standard name of field --)
+    /// aip.dev/not-precedent: standard name of field --)
     #[prost(string, tag = "4")]
     pub day_of_month: ::prost::alloc::string::String,
     /// Expression to match months. Default: *
@@ -48,11 +47,10 @@ pub struct CalendarSpec {
     pub comment: ::prost::alloc::string::String,
 }
 /// Range represents a set of integer values, used to match fields of a calendar
-/// time in StructuredCalendarSpec. If end < start, then end is interpreted as
+/// time in StructuredCalendarSpec. If end \< start, then end is interpreted as
 /// equal to start. This means you can use a Range with start set to a value, and
 /// end and step unset (defaulting to 0) to represent a single value.
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Range {
     /// Start of range (inclusive).
     #[prost(int32, tag = "1")]
@@ -73,7 +71,6 @@ pub struct Range {
 /// must be present to match anything.
 /// Relative expressions such as "last day of the month" or "third Monday" are not currently
 /// representable; callers must enumerate the concrete days they require.
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StructuredCalendarSpec {
     /// Match seconds (0-59)
@@ -87,7 +84,7 @@ pub struct StructuredCalendarSpec {
     pub hour: ::prost::alloc::vec::Vec<Range>,
     /// Match days of the month (1-31)
     /// (-- api-linter: core::0140::prepositions=disabled
-    ///      aip.dev/not-precedent: standard name of field --)
+    /// aip.dev/not-precedent: standard name of field --)
     #[prost(message, repeated, tag = "4")]
     pub day_of_month: ::prost::alloc::vec::Vec<Range>,
     /// Match months (1-12)
@@ -114,8 +111,7 @@ pub struct StructuredCalendarSpec {
 /// xx:19:00. An interval of 28 days with phase zero would match
 /// 2022-02-17T00:00:00Z (among other times). The same interval with a phase of 3
 /// days, 5 hours, and 23 minutes would match 2022-02-20T05:23:00Z instead.
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct IntervalSpec {
     #[prost(message, optional, tag = "1")]
     pub interval: ::core::option::Option<::prost_types::Duration>,
@@ -140,7 +136,6 @@ pub struct IntervalSpec {
 ///
 /// If a spec has no matching times after the current time, then the schedule
 /// will be subject to automatic deletion (after several days).
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScheduleSpec {
     /// Calendar-based specifications of times.
@@ -152,7 +147,7 @@ pub struct ScheduleSpec {
     /// 5 fields:         minute, hour, day_of_month, month, day_of_week
     /// 6 fields:         minute, hour, day_of_month, month, day_of_week, year
     /// 7 fields: second, minute, hour, day_of_month, month, day_of_week, year
-    /// If year is not given, it defaults to *. If second is not given, it
+    /// If year is not given, it defaults to \*. If second is not given, it
     /// defaults to 0.
     /// Shorthands @yearly, @monthly, @weekly, @daily, and @hourly are also
     /// accepted instead of the 5-7 time fields.
@@ -174,7 +169,7 @@ pub struct ScheduleSpec {
     /// Interval-based specifications of times.
     #[prost(message, repeated, tag = "2")]
     pub interval: ::prost::alloc::vec::Vec<IntervalSpec>,
-    /// Any timestamps matching any of exclude_* will be skipped.
+    /// Any timestamps matching any of exclude\_\* will be skipped.
     /// Deprecated. Use exclude_structured_calendar.
     #[deprecated]
     #[prost(message, repeated, tag = "3")]
@@ -219,8 +214,7 @@ pub struct ScheduleSpec {
     #[prost(bytes = "vec", tag = "11")]
     pub timezone_data: ::prost::alloc::vec::Vec<u8>,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SchedulePolicies {
     /// Policy for overlaps.
     /// Note that this can be changed after a schedule has taken some actions,
@@ -245,7 +239,6 @@ pub struct SchedulePolicies {
     #[prost(bool, tag = "4")]
     pub keep_original_workflow_id: bool,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScheduleAction {
     #[prost(oneof = "schedule_action::Action", tags = "1")]
@@ -253,20 +246,19 @@ pub struct ScheduleAction {
 }
 /// Nested message and enum types in `ScheduleAction`.
 pub mod schedule_action {
-    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Action {
         /// All fields of NewWorkflowExecutionInfo are valid except for:
-        /// - workflow_id_reuse_policy
-        /// - cron_schedule
-        /// The workflow id of the started workflow may not match this exactly,
-        /// it may have a timestamp appended for uniqueness.
+        ///
+        /// * workflow_id_reuse_policy
+        /// * cron_schedule
+        ///   The workflow id of the started workflow may not match this exactly,
+        ///   it may have a timestamp appended for uniqueness.
         #[prost(message, tag = "1")]
         StartWorkflow(super::super::super::workflow::v1::NewWorkflowExecutionInfo),
     }
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScheduleActionResult {
     /// Time that the action was taken (according to the schedule, including jitter).
     #[prost(message, optional, tag = "1")]
@@ -287,8 +279,7 @@ pub struct ScheduleActionResult {
     )]
     pub start_workflow_status: i32,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScheduleState {
     /// Informative human-readable message with contextual notes, e.g. the reason
     /// a schedule is paused. The system may overwrite this message on certain
@@ -310,8 +301,7 @@ pub struct ScheduleState {
     #[prost(int64, tag = "4")]
     pub remaining_actions: i64,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TriggerImmediatelyRequest {
     /// If set, override overlap policy for this one request.
     #[prost(enumeration = "super::super::enums::v1::ScheduleOverlapPolicy", tag = "1")]
@@ -321,8 +311,7 @@ pub struct TriggerImmediatelyRequest {
     #[prost(message, optional, tag = "2")]
     pub scheduled_time: ::core::option::Option<::prost_types::Timestamp>,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackfillRequest {
     /// Time range to evaluate schedule in. Currently, this time range is
     /// exclusive on start_time and inclusive on end_time. (This is admittedly
@@ -338,7 +327,6 @@ pub struct BackfillRequest {
     #[prost(enumeration = "super::super::enums::v1::ScheduleOverlapPolicy", tag = "3")]
     pub overlap_policy: i32,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SchedulePatch {
     /// If set, trigger one action immediately.
@@ -356,7 +344,6 @@ pub struct SchedulePatch {
     #[prost(string, tag = "4")]
     pub unpause: ::prost::alloc::string::String,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScheduleInfo {
     /// Number of actions taken so far.
@@ -401,7 +388,6 @@ pub struct ScheduleInfo {
     #[prost(string, tag = "8")]
     pub invalid_schedule_error: ::prost::alloc::string::String,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Schedule {
     #[prost(message, optional, tag = "1")]
@@ -415,7 +401,6 @@ pub struct Schedule {
 }
 /// ScheduleListInfo is an abbreviated set of values from Schedule and ScheduleInfo
 /// that's returned in ListSchedules.
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScheduleListInfo {
     /// From spec:
@@ -439,7 +424,6 @@ pub struct ScheduleListInfo {
     pub future_action_times: ::prost::alloc::vec::Vec<::prost_types::Timestamp>,
 }
 /// ScheduleListEntry is returned by ListSchedules.
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScheduleListEntry {
     #[prost(string, tag = "1")]

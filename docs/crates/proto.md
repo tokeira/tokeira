@@ -23,8 +23,13 @@ transport-neutral values.
 ## Generation contract
 
 Bindings are checked in under `src/generated/`. A normal crate build does not
-run `protoc` or require the vendored proto tree. `tools/proto-sync` regenerates
-the checked-in output after an intentional proto or code-generator change.
+compile protos or require the vendored proto tree. `tools/proto-sync` regenerates
+the checked-in output after an intentional proto or code-generator change: it
+compiles the vendored protos with `protox` (pure Rust, no `protoc` on the
+machine), writes the descriptor sets with their extension options intact, and
+runs `tonic-prost-build` over the result. `cargo run -p proto-sync -- check`
+regenerates into a scratch directory and fails if the checked-in tree would
+change; the tool's own test suite runs that check.
 
 The vendored files under `proto/upstream/`, not generated build output, are the
 authority for Temporal wire shape. The compatibility target for observable

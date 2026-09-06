@@ -67,19 +67,27 @@ service implementations. Only the HTTP types those layers are written against ch
 - `generate.rs`: each of the three tonic passes becomes
 
   ```rust
-  let fds = protox::compile(&protos, &includes)?;              // no protoc
-  fs::write(&descriptor_path, fds.encode_to_vec())?;           // Requirement 2.2
+  let mut compiler = protox::Compiler::new(&includes)?;        // no protoc
+  compiler.include_source_info(true).include_imports(true).open_files(&protos)?;
+  let encoded = compiler.encode_file_descriptor_set();         // keeps extension options
+  fs::write(&descriptor_path, &encoded)?;                      // Requirement 2.2
+  let fds = prost_types::FileDescriptorSet::decode(&*encoded)?;
   tonic_prost_build::configure()
       .build_client(...)
       .build_server(...)
-      .btree_map(["."])
+      .btree_map(".")
       .out_dir(&out)
       .extern_path(...)                                        // compute pass only
       .compile_fds(fds)?;
   ```
 
-  The internal-package guard (no `temporal.*` file may appear in the Tokeira output) and
-  the connect-rust pass are unchanged.
+  The descriptor bytes come from `encode_file_descriptor_set`, not from a
+  `prost_types` value: `prost_types` cannot represent extension fields, so a set
+  produced through it loses the `google.api.http` options the HTTP API catalog reads at
+  runtime (the convenience `protox::compile` returns exactly such a set). Code generation
+  needs no custom options and consumes the decoded view. The internal-package guard (no
+  `temporal.*` file may appear in the Tokeira output) and the connect-rust pass are
+  unchanged.
 - The tool's `check` mode, if absent, is added as "regenerate into a temporary directory
   and diff against the checked-in tree", so Requirement 2.4 is a command rather than a
   convention.
@@ -194,10 +202,10 @@ service implementations. Only the HTTP types those layers are written against ch
 ### Property 1: One stack in the lock
 
 *For any* workspace lock produced by this feature, each of `tonic`, `prost`, `prost-types`,
-`http`, `http-body`, `hyper-util`, and `tower-http` SHALL appear at exactly one version on
-the Target Stack line, none of the Legacy Stack versions in Requirement 1.2 SHALL appear,
-and `hyper 0.14`, `h2 0.3`, `hyper-rustls 0.24`, and `rustls 0.21` SHALL appear only while
-`aurora-dsql-sqlx-connector` is below 0.2.
+`hyper-util`, and `tower-http` SHALL appear at exactly one version on the Target Stack
+line, none of the Legacy Stack versions in Requirement 1.2 SHALL appear, and `hyper 0.14`,
+`http 0.2`, `http-body 0.4`, `h2 0.3`, `hyper-rustls 0.24`, and `rustls 0.21` SHALL appear
+only while `aurora-dsql-sqlx-connector` is below 0.2.
 
 **Validates: Requirements 1.1, 1.2, 1.3**
 
@@ -244,17 +252,19 @@ encodings (none, gzip), the response encoding and status SHALL equal the Golden.
 
 ### Property 7: Reflection inventory
 
-*For any* service in the Descriptor Sets, both reflection protocols SHALL list it, and the
-`v1alpha` listing SHALL equal the Golden while the `v1` listing SHALL equal the Golden plus
-the `v1` reflection service.
+*For any* service in the Descriptor Sets, both reflection protocols SHALL list it, the
+`v1alpha` listing SHALL equal the Golden, and the `v1` listing SHALL equal the Golden with
+the `v1` reflection service's own name in place of the `v1alpha` one, resolving the same
+descriptor files.
 
 **Validates: Requirements 3.5, 6.3**
 
 ### Property 8: Binding Inventory parity
 
-*For any* entry in the Legacy Stack's Binding Inventory fixture, the regenerated
-Descriptor Sets SHALL contain an equal entry, and SHALL contain no entry absent from the
-fixture.
+*For any* entry in the Legacy Stack's Binding Inventory fixture outside the
+`google.protobuf` package, the regenerated Descriptor Sets SHALL contain an equal entry,
+and SHALL contain no entry outside that package absent from the fixture. The fixture is
+kept as captured; the comparison sets the compiler-bundled package aside on both sides.
 
 **Validates: Requirements 2.3, 2.6**
 

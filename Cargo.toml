@@ -110,7 +110,7 @@ mimalloc = { version = "0.1.48", default-features = false }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-rustls"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-prost-reflect = { version = "0.12", features = ["serde"] }
+prost-reflect = { version = "0.16", features = ["serde"] }
 proptest = "1"
 # default-features OFF is load-bearing: reqwest's `default-tls` drags
 # hyper-tls → native-tls, which is invisible on macOS (Security.framework)
@@ -145,10 +145,10 @@ tokio-stream = "0.1"
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
-tonic = { version = "0.11", features = ["transport", "gzip"] }
-tonic-reflection = "0.11"
-tonic-web = "0.11"
-tower-http = { version = "0.4", features = ["cors"] }
+tonic = { version = "0.14", features = ["transport", "gzip"] }
+tonic-reflection = "0.14"
+tonic-web = "0.14"
+tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
 uuid = { version = "1.10", features = ["serde", "v4"] }
 serde_yaml = "0.9"

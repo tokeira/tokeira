@@ -894,7 +894,7 @@ async fn ephemeral_and_unspecified_binds_report_the_concrete_port() -> Result<()
 
 #[tokio::test]
 async fn listener_mounts_the_reflection_service() -> Result<()> {
-    use tonic_reflection::pb::{
+    use tonic_reflection::pb::v1alpha::{
         ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
         server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
     };

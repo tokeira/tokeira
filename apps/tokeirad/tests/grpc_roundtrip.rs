@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, codec::CompressionEncoding, transport::Server};
-use tonic_reflection::pb::{
+use tonic_reflection::pb::v1alpha::{
     ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
     server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
 };
@@ -881,7 +881,7 @@ async fn spawn_test_server() -> Result<(
     let operator_grpc = OperatorServiceGrpc::new(operator_service);
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(tokeira_proto::public::FILE_DESCRIPTOR_SET)
-        .build()?;
+        .build_v1alpha()?;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

@@ -1,0 +1,348 @@
+{
+  "cases": {
+    "deprecate_namespace_unimplemented": {
+      "host-listener": {
+        "code": 12,
+        "details_base64": "",
+        "message": "deprecate_namespace",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 12,
+        "details_base64": "",
+        "message": "deprecate_namespace",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 12,
+        "details_base64": "",
+        "message": "deprecate_namespace",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "describe_missing_execution": {
+      "host-listener": {
+        "code": 5,
+        "details_base64": "",
+        "message": "workflow not found for ID: wire-parity-missing",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 5,
+        "details_base64": "",
+        "message": "workflow not found for ID: wire-parity-missing",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 5,
+        "details_base64": "",
+        "message": "workflow not found for ID: wire-parity-missing",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "describe_missing_namespace": {
+      "host-listener": {
+        "code": 5,
+        "details_base64": "CAUSNU5hbWVzcGFjZSB3aXJlLXBhcml0eS1uby1zdWNoLW5hbWVzcGFjZSBpcyBub3QgZm91bmQuGmwKSXR5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5OYW1lc3BhY2VOb3RGb3VuZEZhaWx1cmUSHwodd2lyZS1wYXJpdHktbm8tc3VjaC1uYW1lc3BhY2U=",
+        "message": "Namespace wire-parity-no-such-namespace is not found.",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 5,
+        "details_base64": "CAUSNU5hbWVzcGFjZSB3aXJlLXBhcml0eS1uby1zdWNoLW5hbWVzcGFjZSBpcyBub3QgZm91bmQuGmwKSXR5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5OYW1lc3BhY2VOb3RGb3VuZEZhaWx1cmUSHwodd2lyZS1wYXJpdHktbm8tc3VjaC1uYW1lc3BhY2U=",
+        "message": "Namespace wire-parity-no-such-namespace is not found.",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 5,
+        "details_base64": "CAUSNU5hbWVzcGFjZSB3aXJlLXBhcml0eS1uby1zdWNoLW5hbWVzcGFjZSBpcyBub3QgZm91bmQuGmwKSXR5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5OYW1lc3BhY2VOb3RGb3VuZEZhaWx1cmUSHwodd2lyZS1wYXJpdHktbm8tc3VjaC1uYW1lc3BhY2U=",
+        "message": "Namespace wire-parity-no-such-namespace is not found.",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "malformed_request_body": {
+      "host-listener": {
+        "code": 13,
+        "details_base64": "",
+        "message": "failed to decode Protobuf message: invalid varint",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 13,
+        "details_base64": "",
+        "message": "failed to decode Protobuf message: invalid varint",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 13,
+        "details_base64": "",
+        "message": "failed to decode Protobuf message: invalid varint",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "poll_empty_namespace": {
+      "host-listener": {
+        "code": 5,
+        "details_base64": "CAUSGE5hbWVzcGFjZSAgaXMgbm90IGZvdW5kLhpLCkl0eXBlLmdvb2dsZWFwaXMuY29tL3RlbXBvcmFsLmFwaS5lcnJvcmRldGFpbHMudjEuTmFtZXNwYWNlTm90Rm91bmRGYWlsdXJl",
+        "message": "Namespace  is not found.",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 5,
+        "details_base64": "CAUSGE5hbWVzcGFjZSAgaXMgbm90IGZvdW5kLhpLCkl0eXBlLmdvb2dsZWFwaXMuY29tL3RlbXBvcmFsLmFwaS5lcnJvcmRldGFpbHMudjEuTmFtZXNwYWNlTm90Rm91bmRGYWlsdXJl",
+        "message": "Namespace  is not found.",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 5,
+        "details_base64": "CAUSGE5hbWVzcGFjZSAgaXMgbm90IGZvdW5kLhpLCkl0eXBlLmdvb2dsZWFwaXMuY29tL3RlbXBvcmFsLmFwaS5lcnJvcmRldGFpbHMudjEuTmFtZXNwYWNlTm90Rm91bmRGYWlsdXJl",
+        "message": "Namespace  is not found.",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "query_missing_execution": {
+      "host-listener": {
+        "code": 3,
+        "details_base64": "",
+        "message": "missing required field: QueryWorkflowRequest.query",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 3,
+        "details_base64": "",
+        "message": "missing required field: QueryWorkflowRequest.query",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 3,
+        "details_base64": "",
+        "message": "missing required field: QueryWorkflowRequest.query",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "register_namespace_duplicate": {
+      "host-listener": {
+        "code": 6,
+        "details_base64": "",
+        "message": "default",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 6,
+        "details_base64": "",
+        "message": "default",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 6,
+        "details_base64": "",
+        "message": "default",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "respond_workflow_task_bad_token": {
+      "host-listener": {
+        "code": 3,
+        "details_base64": "",
+        "message": "invalid task token: expected ident at line 1 column 2",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 3,
+        "details_base64": "",
+        "message": "invalid task token: expected ident at line 1 column 2",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 3,
+        "details_base64": "",
+        "message": "invalid task token: expected ident at line 1 column 2",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "signal_missing_execution": {
+      "host-listener": {
+        "code": 5,
+        "details_base64": "",
+        "message": "workflow not found for ID: wire-parity-missing",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 5,
+        "details_base64": "",
+        "message": "workflow not found for ID: wire-parity-missing",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 5,
+        "details_base64": "",
+        "message": "workflow not found for ID: wire-parity-missing",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "start_duplicate_rejected": {
+      "host-listener": {
+        "code": 6,
+        "details_base64": "CAYSdldvcmtmbG93IGV4ZWN1dGlvbiBpcyBhbHJlYWR5IHJ1bm5pbmcuIFdvcmtmbG93SWQ6IHdpcmUtcGFyaXR5LWR1cGxpY2F0ZSwgUnVuSWQ6IDAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMC4agQEKV3R5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5Xb3JrZmxvd0V4ZWN1dGlvbkFscmVhZHlTdGFydGVkRmFpbHVyZRImEiQwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDA=",
+        "message": "Workflow execution is already running. WorkflowId: wire-parity-duplicate, RunId: 00000000-0000-0000-0000-000000000000.",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 6,
+        "details_base64": "CAYSdldvcmtmbG93IGV4ZWN1dGlvbiBpcyBhbHJlYWR5IHJ1bm5pbmcuIFdvcmtmbG93SWQ6IHdpcmUtcGFyaXR5LWR1cGxpY2F0ZSwgUnVuSWQ6IDAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMC4agQEKV3R5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5Xb3JrZmxvd0V4ZWN1dGlvbkFscmVhZHlTdGFydGVkRmFpbHVyZRImEiQwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDA=",
+        "message": "Workflow execution is already running. WorkflowId: wire-parity-duplicate, RunId: 00000000-0000-0000-0000-000000000000.",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 6,
+        "details_base64": "CAYSdldvcmtmbG93IGV4ZWN1dGlvbiBpcyBhbHJlYWR5IHJ1bm5pbmcuIFdvcmtmbG93SWQ6IHdpcmUtcGFyaXR5LWR1cGxpY2F0ZSwgUnVuSWQ6IDAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMC4agQEKV3R5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5Xb3JrZmxvd0V4ZWN1dGlvbkFscmVhZHlTdGFydGVkRmFpbHVyZRImEiQwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDA=",
+        "message": "Workflow execution is already running. WorkflowId: wire-parity-duplicate, RunId: 00000000-0000-0000-0000-000000000000.",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "start_missing_workflow_type": {
+      "host-listener": {
+        "code": 0,
+        "details_base64": "",
+        "message": "",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 0,
+        "details_base64": "",
+        "message": "",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 0,
+        "details_base64": "",
+        "message": "",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "terminate_missing_execution": {
+      "host-listener": {
+        "code": 5,
+        "details_base64": "",
+        "message": "workflow not found for ID: wire-parity-missing",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 5,
+        "details_base64": "",
+        "message": "workflow not found for ID: wire-parity-missing",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 5,
+        "details_base64": "",
+        "message": "workflow not found for ID: wire-parity-missing",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "unknown_method": {
+      "host-listener": {
+        "code": 12,
+        "details_base64": "",
+        "message": "",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 12,
+        "details_base64": "",
+        "message": "",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 12,
+        "details_base64": "",
+        "message": "",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    },
+    "unsupported_request_encoding": {
+      "in-process": {
+        "code": 0,
+        "details_base64": "",
+        "message": "",
+        "metadata": {}
+      }
+    },
+    "update_missing_execution": {
+      "host-listener": {
+        "code": 3,
+        "details_base64": "",
+        "message": "missing required field: UpdateWorkflowExecutionRequest.request",
+        "metadata": {}
+      },
+      "in-process": {
+        "code": 3,
+        "details_base64": "",
+        "message": "missing required field: UpdateWorkflowExecutionRequest.request",
+        "metadata": {}
+      },
+      "public-listener": {
+        "code": 3,
+        "details_base64": "",
+        "message": "missing required field: UpdateWorkflowExecutionRequest.request",
+        "metadata": {
+          "access-control-allow-origin": "*",
+          "access-control-expose-headers": "*",
+          "vary": "origin, access-control-request-method, access-control-request-headers"
+        }
+      }
+    }
+  }
+}

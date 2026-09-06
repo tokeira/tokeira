@@ -1,0 +1,4 @@
+kind: changed
+body: The gRPC edge, in-process endpoint, listeners, and generated bindings move to tonic 0.14, prost 0.14, and hyper 1; public message and status types change accordingly.
+custom:
+  Slice: d1f4ad89-2150-41ec-b985-aeee1a29b753

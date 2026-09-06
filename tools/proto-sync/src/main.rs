@@ -1,5 +1,6 @@
 // CLI: stdout/stderr are the user interface.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -23,11 +24,9 @@ fn run() -> Result<()> {
         Mode::Sync(version) => {
             let upstream_dir = workspace_root.join("proto/upstream");
             let version_file = workspace_root.join("proto/UPSTREAM_VERSION");
-
             clean_upstream_dir(&upstream_dir)?;
             buf_export(&version, &upstream_dir)?;
             write_version_file(&version_file, &version)?;
-
             println!(
                 "synced Temporal API protos {version} into {}",
                 upstream_dir.display()
@@ -35,6 +34,10 @@ fn run() -> Result<()> {
             generate::run(&workspace_root)?;
         }
         Mode::Generate => generate::run(&workspace_root)?,
+        Mode::Check => {
+            generate::check(&workspace_root)?;
+            println!("tokeira-proto bindings are current");
+        }
     }
     Ok(())
 }
@@ -44,21 +47,24 @@ enum Mode {
     Sync(String),
     /// Regenerate `tokeira-proto`'s checked-in bindings from the vendored protos.
     Generate,
+    /// Regenerate into a scratch directory and fail if the checked-in tree differs.
+    Check,
 }
 
 fn parse_mode_arg() -> Result<Mode> {
     let mut args = env::args();
     let program = args.next().unwrap_or_else(|| "proto-sync".to_string());
     let Some(argument) = args.next() else {
-        bail!("usage: {program} <version> | generate");
+        bail!("usage: {program} <version> | generate | check");
     };
     if args.next().is_some() {
-        bail!("usage: {program} <version> | generate");
+        bail!("usage: {program} <version> | generate | check");
     }
-    if argument == "generate" {
-        return Ok(Mode::Generate);
+    match argument.as_str() {
+        "generate" => Ok(Mode::Generate),
+        "check" => Ok(Mode::Check),
+        _ => Ok(Mode::Sync(argument)),
     }
-    Ok(Mode::Sync(argument))
 }
 
 fn find_workspace_root() -> Result<PathBuf> {
@@ -96,7 +102,6 @@ fn buf_export(version: &str, output: &Path) -> Result<()> {
         .arg(output)
         .status()
         .context("failed to invoke buf; ensure `buf` is installed and on PATH")?;
-
     if !status.success() {
         bail!("buf export failed for version {version} with status {status}");
     }

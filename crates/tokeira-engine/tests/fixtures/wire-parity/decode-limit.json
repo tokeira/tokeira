@@ -1,0 +1,17 @@
+{
+  "limit": 4194304,
+  "sizes": {
+    "4194303": {
+      "code": 0,
+      "message": ""
+    },
+    "4194304": {
+      "code": 0,
+      "message": ""
+    },
+    "4194305": {
+      "code": 11,
+      "message": "Error, decoded message length too large: found 4194305 bytes, the limit is: 4194304 bytes"
+    }
+  }
+}

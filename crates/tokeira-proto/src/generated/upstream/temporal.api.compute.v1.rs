@@ -4,7 +4,6 @@
 /// on a TaskQueue that has no active pollers, a serverless worker lifecycle
 /// controller might need to invoke an AWS Lambda Function that itself ends up
 /// calling the SDK's worker.New() function.
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComputeProvider {
     /// Type of the compute provider. This string is implementation-specific and
@@ -26,7 +25,6 @@ pub struct ComputeProvider {
 }
 /// ComputeScaler instructs the Temporal Service when to scale up or down the number of
 /// Workers that comprise a WorkerDeployment.
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComputeScaler {
     /// Type of the compute scaler. this string is implementation-specific and
@@ -42,7 +40,6 @@ pub struct ComputeScaler {
     #[prost(message, optional, tag = "2")]
     pub details: ::core::option::Option<super::super::common::v1::Payload>,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComputeConfigScalingGroup {
     /// Optional. The set of task queue types this scaling group serves.
@@ -62,7 +59,6 @@ pub struct ComputeConfigScalingGroup {
 /// ComputeConfig stores configuration that helps a worker control plane
 /// controller understand *when* and *how* to respond to worker lifecycle
 /// events.
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComputeConfig {
     /// Each scaling group describes a compute config for a specific subset of the worker
@@ -78,23 +74,22 @@ pub struct ComputeConfig {
         ComputeConfigScalingGroup,
     >,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComputeConfigScalingGroupUpdate {
     #[prost(message, optional, tag = "1")]
     pub scaling_group: ::core::option::Option<ComputeConfigScalingGroup>,
     /// Controls which fields from `scaling_group` will be applied. Semantics:
-    /// - Mask is ignored for new scaling groups (only applicable when scaling group already exists).
-    /// - Empty mask for an existing scaling group is no-op: no change.
-    /// - Non-empty mask for an existing scaling group will update/unset only to the fields
-    ///    mentioned in the mask.
-    /// - Accepted paths: "task_queue_types", "provider", "provider.type", "provider.details",
-    ///    "provider.nexus_endpoint", "scaler", "scaler.type", "scaler.details"
+    ///
+    /// * Mask is ignored for new scaling groups (only applicable when scaling group already exists).
+    /// * Empty mask for an existing scaling group is no-op: no change.
+    /// * Non-empty mask for an existing scaling group will update/unset only to the fields
+    ///   mentioned in the mask.
+    /// * Accepted paths: "task_queue_types", "provider", "provider.type", "provider.details",
+    ///   "provider.nexus_endpoint", "scaler", "scaler.type", "scaler.details"
     #[prost(message, optional, tag = "2")]
     pub update_mask: ::core::option::Option<::prost_types::FieldMask>,
 }
 /// A subset of information in ComputeConfig optimized for list views.
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComputeConfigSummary {
     #[prost(btree_map = "string, message", tag = "1")]
@@ -103,8 +98,7 @@ pub struct ComputeConfigSummary {
         ComputeConfigScalingGroupSummary,
     >,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComputeConfigScalingGroupSummary {
     #[prost(enumeration = "super::super::enums::v1::TaskQueueType", repeated, tag = "1")]
     pub task_queue_types: ::prost::alloc::vec::Vec<i32>,

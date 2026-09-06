@@ -1,0 +1,28 @@
+{
+  "cases": {
+    "send_gzip_accept_gzip": {
+      "accept_encoding": null,
+      "code": 0,
+      "message": "",
+      "response_encoding": "gzip"
+    },
+    "send_gzip_accept_none": {
+      "accept_encoding": null,
+      "code": 0,
+      "message": "",
+      "response_encoding": null
+    },
+    "send_identity_accept_gzip": {
+      "accept_encoding": null,
+      "code": 0,
+      "message": "",
+      "response_encoding": "gzip"
+    },
+    "send_identity_accept_none": {
+      "accept_encoding": null,
+      "code": 0,
+      "message": "",
+      "response_encoding": null
+    }
+  }
+}

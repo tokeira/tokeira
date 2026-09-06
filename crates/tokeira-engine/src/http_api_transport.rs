@@ -1,7 +1,7 @@
 //! Optional listener transport adapter for Temporal's public HTTP/JSON API.
 //!
 //! Descriptor and protobuf semantics live in `tokeira-edge::http_api`. This
-//! layer owns only Hyper body collection and standard unary gRPC framing around
+//! layer owns only body collection and standard unary gRPC framing around
 //! the existing inner Tonic router. No loopback socket or second service is
 //! created.
 
@@ -14,8 +14,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use http_body_legacy::Body as _;
-use hyper_legacy::{Body, Request, Response};
+use http::{HeaderMap, Method, Request, Response, Version, header};
+use http_body_util::{BodyExt as _, Full};
 use percent_encoding::percent_decode_str;
 use tokeira_edge::{
     http_api::{
@@ -26,11 +26,10 @@ use tokeira_edge::{
     metrics::record_http_service_request,
 };
 use tokeira_proto::public::{OPENAPI_V2_JSON, OPENAPI_V3_YAML};
-use tonic::{body::BoxBody, transport::server::TcpConnectInfo};
+use tonic::{body::Body, transport::server::TcpConnectInfo};
 use tower::{Layer, Service};
 
-type HttpApiFuture<E> =
-    Pin<Box<dyn Future<Output = Result<Response<BoxBody>, E>> + Send + 'static>>;
+type HttpApiFuture<E> = Pin<Box<dyn Future<Output = Result<Response<Body>, E>> + Send + 'static>>;
 
 /// Tower layer recognizing annotated HTTP bindings before native Tonic routing.
 #[derive(Clone, Debug)]
@@ -71,11 +70,11 @@ pub(crate) struct HttpApiService<S> {
 
 impl<S> Service<Request<Body>> for HttpApiService<S>
 where
-    S: Service<Request<Body>, Response = Response<BoxBody>> + Clone + Send + 'static,
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
 {
-    type Response = Response<BoxBody>;
+    type Response = Response<Body>;
     type Error = S::Error;
     type Future = HttpApiFuture<Self::Error>;
 
@@ -89,7 +88,7 @@ where
         // content-type argument into the closure but never writes the header, so
         // net/http sniffs both textual documents as `text/plain; charset=utf-8`
         // (service/frontend/openapi_http_handler.go @ v1.31.0).
-        if request.method() == hyper_legacy::Method::GET {
+        if request.method() == Method::GET {
             let document = if path.starts_with("/swagger.json") {
                 Some(OPENAPI_V2_JSON)
             } else if path.starts_with("/openapi.yaml") {
@@ -111,7 +110,7 @@ where
         // grpc-gateway v2.27.1 allows HTML forms to avoid long GET URLs by
         // routing POST to GET. An explicit override is applied first; without
         // one, GET is tried only after an ordinary POST miss (`runtime/mux.go`).
-        let is_form_post = request.method() == hyper_legacy::Method::POST
+        let is_form_post = request.method() == Method::POST
             && request
                 .headers()
                 .get("content-type")
@@ -219,15 +218,20 @@ where
             let (mut parts, mut body) = request.into_parts();
             let mut collected = Vec::new();
             if reads_body {
-                while let Some(chunk) = body.data().await {
-                    let chunk = match chunk {
-                        Ok(chunk) => chunk,
+                // Frames are read one at a time so the bound applies before a
+                // chunk is copied, exactly as the previous body API allowed.
+                while let Some(frame) = body.frame().await {
+                    let frame = match frame {
+                        Ok(frame) => frame,
                         Err(error) => {
                             return Ok(invalid_request_response_parts(
                                 &parts,
                                 HttpApiError::InvalidRequest(error.to_string()),
                             ));
                         }
+                    };
+                    let Ok(chunk) = frame.into_data() else {
+                        continue;
                     };
                     if collected.len().saturating_add(chunk.len()) > MAX_HTTP_API_REQUEST_BYTES {
                         return Ok(invalid_request_response_parts(
@@ -279,7 +283,7 @@ fn route_miss<S>(
     path: String,
 ) -> HttpApiFuture<S::Error>
 where
-    S: Service<Request<Body>, Response = Response<BoxBody>> + Clone + Send + 'static,
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
 {
@@ -306,7 +310,7 @@ where
 }
 
 fn synthetic_grpc_request(
-    original: &mut hyper_legacy::http::request::Parts,
+    original: &mut http::request::Parts,
     metadata: Vec<tokeira_edge::http_api::HttpApiMetadata>,
     dispatch: &HttpApiDispatch,
 ) -> Request<Body> {
@@ -317,16 +321,16 @@ fn synthetic_grpc_request(
     let mut request = Request::builder()
         .method("POST")
         .uri(&dispatch.grpc_path)
-        .version(hyper_legacy::Version::HTTP_2)
+        .version(Version::HTTP_2)
         .header("content-type", "application/grpc")
         .header("te", "trailers")
-        .body(Body::from(frame))
+        .body(Body::new(Full::new(Bytes::from(frame))))
         .expect("descriptor-derived gRPC URI and static headers are valid");
     for entry in metadata {
-        let Ok(name) = hyper_legacy::header::HeaderName::from_bytes(entry.name.as_bytes()) else {
+        let Ok(name) = header::HeaderName::from_bytes(entry.name.as_bytes()) else {
             continue;
         };
-        let Ok(value) = hyper_legacy::header::HeaderValue::from_bytes(&entry.value) else {
+        let Ok(value) = header::HeaderValue::from_bytes(&entry.value) else {
             continue;
         };
         request.headers_mut().append(name, value);
@@ -336,25 +340,18 @@ fn synthetic_grpc_request(
 }
 
 async fn render_grpc_response(
-    response: Response<BoxBody>,
+    response: Response<Body>,
     dispatch: &HttpApiDispatch,
-) -> Response<BoxBody> {
-    let (parts, mut body) = response.into_parts();
-    let mut data = Vec::new();
-    while let Some(chunk) = body.data().await {
-        match chunk {
-            Ok(chunk) => data.extend_from_slice(&chunk),
-            Err(error) => {
-                return internal_response(dispatch, &format!("failed reading gRPC body: {error}"));
-            }
-        }
-    }
-    let trailers = match body.trailers().await {
-        Ok(trailers) => trailers.unwrap_or_default(),
+) -> Response<Body> {
+    let (parts, body) = response.into_parts();
+    let collected = match body.collect().await {
+        Ok(collected) => collected,
         Err(error) => {
-            return internal_response(dispatch, &format!("failed reading gRPC trailers: {error}"));
+            return internal_response(dispatch, &format!("failed reading gRPC body: {error}"));
         }
     };
+    let trailers = collected.trailers().cloned().unwrap_or_default();
+    let data = collected.to_bytes();
     let status = header(&trailers, &parts.headers, "grpc-status")
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(0);
@@ -407,18 +404,14 @@ fn parse_unary_frame(bytes: &[u8]) -> Result<&[u8], HttpApiError> {
     Ok(&bytes[5..])
 }
 
-fn header<'a>(
-    trailers: &'a hyper_legacy::HeaderMap,
-    headers: &'a hyper_legacy::HeaderMap,
-    name: &str,
-) -> Option<&'a str> {
+fn header<'a>(trailers: &'a HeaderMap, headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     trailers
         .get(name)
         .or_else(|| headers.get(name))
         .and_then(|value| value.to_str().ok())
 }
 
-fn rendered_response(rendered: HttpApiRenderedResponse) -> Response<BoxBody> {
+fn rendered_response(rendered: HttpApiRenderedResponse) -> Response<Body> {
     response(
         rendered.status,
         Some(rendered.content_type),
@@ -427,7 +420,7 @@ fn rendered_response(rendered: HttpApiRenderedResponse) -> Response<BoxBody> {
     )
 }
 
-fn invalid_request_response(request: &Request<Body>, error: HttpApiError) -> Response<BoxBody> {
+fn invalid_request_response(request: &Request<Body>, error: HttpApiError) -> Response<Body> {
     let representation = JsonRepresentation::outbound(
         request
             .headers()
@@ -439,9 +432,9 @@ fn invalid_request_response(request: &Request<Body>, error: HttpApiError) -> Res
 }
 
 fn invalid_request_response_parts(
-    parts: &hyper_legacy::http::request::Parts,
+    parts: &http::request::Parts,
     error: HttpApiError,
-) -> Response<BoxBody> {
+) -> Response<Body> {
     let representation = JsonRepresentation::outbound(
         parts
             .headers
@@ -463,7 +456,7 @@ fn render_edge_error(
     representation: JsonRepresentation,
     code: i32,
     message: &str,
-) -> Response<BoxBody> {
+) -> Response<Body> {
     let body = if representation.pretty {
         serde_json::to_vec_pretty(&serde_json::json!({"code": code, "message": message}))
     } else {
@@ -474,7 +467,7 @@ fn render_edge_error(
     response(status, Some(representation.content_type()), body, None)
 }
 
-fn internal_response(dispatch: &HttpApiDispatch, message: &str) -> Response<BoxBody> {
+fn internal_response(dispatch: &HttpApiDispatch, message: &str) -> Response<Body> {
     match render_error(&dispatch.output, dispatch.representation, 13, message, None) {
         Ok(rendered) => rendered_response(rendered),
         Err(_) => response(
@@ -491,7 +484,7 @@ fn response(
     content_type: Option<&str>,
     body: Vec<u8>,
     authenticate: Option<&str>,
-) -> Response<BoxBody> {
+) -> Response<Body> {
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header("content-type", content_type);
@@ -499,15 +492,14 @@ fn response(
     if let Some(authenticate) = authenticate {
         builder = builder.header("www-authenticate", authenticate);
     }
-    let body = http_body_legacy::Full::new(Bytes::from(body))
-        .map_err(|never| match never {})
-        .boxed_unsync();
-    builder.body(body).unwrap_or_else(|_| {
-        Response::builder()
-            .status(500)
-            .body(tonic::body::empty_body())
-            .expect("static fallback response")
-    })
+    builder
+        .body(Body::new(Full::new(Bytes::from(body))))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(500)
+                .body(Body::default())
+                .expect("static fallback response")
+        })
 }
 
 #[cfg(test)]
@@ -521,7 +513,10 @@ mod tests {
         },
     };
 
+    use http_body::Frame;
+    use http_body_util::StreamBody;
     use proptest::prelude::*;
+    use tokio_stream::StreamExt as _;
 
     use super::*;
 
@@ -550,7 +545,7 @@ mod tests {
     }
 
     impl Service<Request<Body>> for MockInner {
-        type Response = Response<BoxBody>;
+        type Response = Response<Body>;
         type Error = Infallible;
         type Future = Ready<Result<Self::Response, Self::Error>>;
 
@@ -573,14 +568,11 @@ mod tests {
                     authorization,
                     marker: request.extensions().get::<Marker>().is_some(),
                 });
-            let body = http_body_legacy::Full::new(Bytes::from_static(&[0, 0, 0, 0, 0]))
-                .map_err(|never| match never {})
-                .boxed_unsync();
             ready(Ok(Response::builder()
                 .status(200)
                 .header("content-type", "application/grpc")
                 .header("grpc-status", "0")
-                .body(body)
+                .body(Body::new(Full::new(Bytes::from_static(&[0, 0, 0, 0, 0]))))
                 .expect("response")))
         }
     }
@@ -597,7 +589,7 @@ mod tests {
     }
 
     impl Future for PendingResponse {
-        type Output = Result<Response<BoxBody>, Infallible>;
+        type Output = Result<Response<Body>, Infallible>;
 
         fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
             Poll::Pending
@@ -611,7 +603,7 @@ mod tests {
     }
 
     impl Service<Request<Body>> for PendingInner {
-        type Response = Response<BoxBody>;
+        type Response = Response<Body>;
         type Error = Infallible;
         type Future = PendingResponse;
 
@@ -640,7 +632,7 @@ mod tests {
             .method(method)
             .uri(path)
             .header("host", "localhost")
-            .body(Body::from(body))
+            .body(Body::new(Full::new(Bytes::from(body))))
             .expect("request")
     }
 
@@ -734,12 +726,13 @@ mod tests {
         let chunks = tokio_stream::iter([
             Ok::<_, Infallible>(Bytes::from(vec![b' '; MAX_HTTP_API_REQUEST_BYTES])),
             Ok::<_, Infallible>(Bytes::from_static(b"x")),
-        ]);
+        ])
+        .map(|chunk| chunk.map(Frame::data));
         let mut oversized = Request::builder()
             .method("POST")
             .uri("/namespaces/ns/workflows/wf")
             .header("host", "localhost")
-            .body(Body::wrap_stream(chunks))
+            .body(Body::new(StreamBody::new(chunks)))
             .expect("request");
         oversized
             .headers_mut()

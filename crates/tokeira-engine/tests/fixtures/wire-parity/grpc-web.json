@@ -1,0 +1,15 @@
+{
+  "get_system_info": {
+    "content_type": "application/grpc-web+proto",
+    "http_status": 200,
+    "trailers": "grpc-status:0\r\n"
+  },
+  "unknown_method": {
+    "content_type": "application/grpc-web+proto",
+    "data_bytes": 0,
+    "grpc_message_header": null,
+    "grpc_status_header": "12",
+    "http_status": 200,
+    "trailers": ""
+  }
+}

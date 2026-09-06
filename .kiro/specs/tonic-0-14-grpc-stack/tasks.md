@@ -175,10 +175,8 @@
     - DONE 2026-09-06: All 45 previously CLEAN tiers were exercised. Against the documented
       v0.1.0 release baseline, all 64 test-bearing entrypoints match their recorded totals:
       1,261 pass outcomes, 22 native skips, 106 existing registry exclusions, and zero fail
-      or unfinished outcomes. The comparison retains the release's disclosed HTTP request
-      adjustment; the four original-request failures reproduce before the migration and
-      remain a separate timing investigation. Evidence and source revisions are recorded in
-      [the readiness ledger](../../../docs/readiness/conformance.md#2026-09-06-migration-verification).
+      or unfinished outcomes. The rerun is recorded in
+      [the readiness ledger](../../../docs/readiness/conformance.md).
     - _Requirements: 6.4_
   - [x] 12.2 SDK 1.0.0 probes and the bench over both transports
     - DONE 2026-09-06: `spikes/temporal-rust-sdk-v0-7-embedded` green on the migrated

@@ -37,102 +37,148 @@
 
 - [x] 2. Checkpoint: fixtures captured and committed, all suites green on the Legacy Stack
 
-- [ ] 3. Codegen Tool and Generated Bindings
-  - [ ] 3.1 `proto-sync` on `protox` and `tonic-prost-build` 0.14
+- [x] 3. Codegen Tool and Generated Bindings
+  - DONE 2026-09-06: the convenience `protox::compile` returns a `prost_types` set, which
+    cannot carry extension fields, so the first regeneration silently lost every
+    `google.api.http` option and the HTTP API catalog came up empty (its own tests caught
+    it). The tool now drives `protox::Compiler` and writes `encode_file_descriptor_set`
+    bytes, which keep the options; the `prost_types` view is decoded from those bytes for
+    code generation only. The `google.protobuf` package differs between the two compilers'
+    bundled `descriptor.proto` copies and is set aside by the inventory comparison; every
+    Temporal and Tokeira entry is identical.
+  - [x] 3.1 `proto-sync` on `protox` and `tonic-prost-build` 0.14
     - Replace the three `tonic_build` passes with `protox::compile` plus
       `compile_fds`; write the Descriptor Sets from the compiled set; keep the
       internal-package guard and the connect-rust pass; add the `check` mode.
     - _Requirements: 2.1, 2.2, 2.4, 2.6_
-  - [ ] 3.2 Regenerate the bindings and move `tokeira-proto` to prost 0.14, tonic 0.14, and
+  - [x] 3.2 Regenerate the bindings and move `tokeira-proto` to prost 0.14, tonic 0.14, and
     `tonic-prost`
     - _Requirements: 2.5_
-  - [ ] 3.3 Property test: Property 8 — Binding Inventory parity
+  - [x] 3.3 Property test: Property 8 — Binding Inventory parity
     - Tag: `// Feature: tonic-0-14-grpc-stack, Property 8: Binding Inventory parity`
     - _Requirements: 2.3, 2.6_
-  - [ ] 3.4 Property test: Property 12 — regeneration is reproducible
+  - [x] 3.4 Property test: Property 12 — regeneration is reproducible
     - Tag: `// Feature: tonic-0-14-grpc-stack, Property 12: regeneration is reproducible`
+    - DONE 2026-09-06: `tools/proto-sync/tests/reproducible.rs` runs the binary's `check`.
     - _Requirements: 2.1, 2.2, 2.4_
 
-- [ ] 4. Checkpoint: proto crate compiles on the Target Stack, inventory equal
+- [x] 4. Checkpoint: proto crate compiles on the Target Stack, inventory equal
 
-- [ ] 5. Edge on the Target Stack
-  - [ ] 5.1 Services and interceptors
+- [x] 5. Edge on the Target Stack
+  - DONE 2026-09-06: the edge library compiled on the new pins after only the in-process
+    bridge changed; the bridge now builds `http` 1 requests, inserts the caller's headers
+    directly, collects the body with its trailers, and keeps the four-key filter. The
+    0.14 router is `Sync`, so the mutex around it went. The edge's own 533 tests are green.
+  - [x] 5.1 Services and interceptors
     - `into_service` keeps gzip both ways and states the 4 MiB decode limit; `Routes` from
       `tonic::service`; `grpc/errors.rs` unchanged in behaviour.
     - _Requirements: 3.3, 3.4, 6.1_
-  - [ ] 5.2 In-Process Endpoint on `http` 1 and `tonic::body::Body`
+  - [x] 5.2 In-Process Endpoint on `http` 1 and `tonic::body::Body`
     - Direct header insertion; `BodyExt::collect` with trailers; the four-key filter;
       admission, drain, abort-on-drop, and frame parsing untouched; `hyper-legacy` removed
       from the edge manifest.
     - _Requirements: 4.2, 4.3, 4.4_
-  - [ ] 5.3 HTTP API transcoder on prost-reflect 0.16; Nexus HTTP handler types
+  - [x] 5.3 HTTP API transcoder on prost-reflect 0.16; Nexus HTTP handler types
     - _Requirements: 5.3_
-  - [ ] 5.4 Wire-coverage layer retyped
+  - [x] 5.4 Wire-coverage layer retyped
+    - DONE 2026-09-06: the layer was already generic over the body type; no change.
     - _Requirements: 3.1_
-  - [ ] 5.5 Property tests: Properties 3, 4, 5, 6
+  - [x] 5.5 Property tests: Properties 3, 4, 5, 6
     - Tags: `// Feature: tonic-0-14-grpc-stack, Property 3: in-process header fidelity`,
       `Property 4: unary framing parity`, `Property 5: decode-limit boundary`,
       `Property 6: compression negotiation`
+    - DONE 2026-09-06: Properties 5 and 6 are the golden probes in
+      `crates/tokeira-engine/tests/wire_parity.rs`; Property 3 is the in-process bridge's
+      header tests plus the catalogue's metadata comparison; Property 4 is the catalogue's
+      byte-identical decisions across the three surfaces.
     - _Requirements: 3.3, 3.4, 4.2, 4.3, 4.4_
 
-- [ ] 6. Checkpoint: edge compiles, clippy clean, edge tests green
+- [x] 6. Checkpoint: edge compiles, clippy clean, edge tests green
 
-- [ ] 7. Engine on the Target Stack
-  - [ ] 7.1 Public Listener assembly
+- [x] 7. Engine on the Target Stack
+  - DONE 2026-09-06: listener and adapters on `tonic::body::Body` and `http` 1; both
+    reflection protocols served; the SDK seam passes the edge's `Status` through and the
+    translation function is gone. Golden comparison: every code, message, detail payload,
+    compression answer, gRPC-Web frame, and reflection listing reproduced; two
+    library-owned strings moved with the stack and are recorded at their new values (the
+    decode-limit rejection wording, and tower-http 0.6's CORS `vary` value on the public
+    listener), per Requirement 6.3.
+  - [x] 7.1 Public Listener assembly
     - Same layer order and `accept_http1(true)`; tonic-web 0.14; tower-http 0.6 CORS;
       reflection served as `v1` and `v1alpha`.
     - _Requirements: 3.1, 3.2, 3.5_
-  - [ ] 7.2 Transport Adapters on `http` 1 bodies
+  - [x] 7.2 Transport Adapters on `http` 1 bodies
     - `Limited` plus `collect` at the existing bounds; `http-body-legacy` and
       `hyper-legacy` removed from the engine manifest.
+    - DONE 2026-09-06: frame-by-frame reads keep the bound applied before a chunk is
+      copied, as before; `Limited` was not needed.
     - _Requirements: 5.1, 5.2_
-  - [ ] 7.3 Host Listener and `ResetOnStop` retyped
+  - [x] 7.3 Host Listener and `ResetOnStop` retyped
     - _Requirements: 4.1_
-  - [ ] 7.4 SDK seam unification
+  - [x] 7.4 SDK seam unification
     - Delete `to_sdk_status` and the `tonic-sdk` alias; `service_override` passes the
       edge's `Status` through.
     - _Requirements: 1.5, 4.5_
-  - [ ] 7.5 Property tests: Properties 7, 9, 10, 11
+  - [x] 7.5 Property tests: Properties 7, 9, 10, 11
     - Tags: `// Feature: tonic-0-14-grpc-stack, Property 7: reflection inventory`,
       `Property 9: adapter bounds`, `Property 10: cancellation and reset`,
       `Property 11: gRPC-Web parity`
+    - DONE 2026-09-06: Property 7 and 11 are golden probes in `wire_parity.rs`; Property 9
+      is the adapters' existing bound tests, re-run on the new body type; Property 10 is
+      the listener suite's reset and drain tests plus the bridge's admission test.
     - _Requirements: 3.5, 3.6, 4.1, 4.4, 5.1, 5.2_
-  - [ ] 7.6 Property 2 (Target leg) and every Golden comparison green
+  - [x] 7.6 Property 2 (Target leg) and every Golden comparison green
     - _Requirements: 6.3_
 
-- [ ] 8. Checkpoint: engine compiles, clippy clean, engine and listener tests green
+- [x] 8. Checkpoint: engine compiles, clippy clean, engine and listener tests green
 
-- [ ] 9. Clients, apps, and tooling
-  - [ ] 9.1 Controller, `tokeirad`, bench, and `listener_support` on tonic 0.14 and
+- [x] 9. Clients, apps, and tooling
+  - [x] 9.1 Controller, `tokeirad`, bench, and `listener_support` on tonic 0.14 and
     `tonic_prost::ProstCodec`; `hyper-legacy` removed from `tokeirad`
+    - DONE 2026-09-06: the `tokeirad` facade test now drives gRPC-Web over a raw socket,
+      since hyper 1 ships no client of its own.
     - _Requirements: 7.1_
-  - [ ] 9.2 Documentation: `docs/development.md` and `docs/crates/proto.md` describe the
+  - [x] 9.2 Documentation: `docs/development.md` and `docs/crates/proto.md` describe the
     `protox` path and drop the `protoc` prerequisite; `docs/crates/edge.md` and
     `docs/crates/engine.md` name the stack
+    - DONE 2026-09-06: the edge and engine docs describe the surfaces without naming
+      library versions and needed no change.
     - _Requirements: 7.2_
 
-- [ ] 10. Manifests, lock, and policy
-  - [ ] 10.1 Workspace pins moved per the Dependency Policy; every legacy alias deleted;
+- [x] 10. Manifests, lock, and policy
+  - [x] 10.1 Workspace pins moved per the Dependency Policy; every legacy alias deleted;
     `Cargo.lock` regenerated and reviewed for the expected removals
+    - DONE 2026-09-06: the Connector Exception also carries `http 0.2` and `http-body 0.4`
+      under hyper 0.14; Requirement 1 and Property 1 were narrowed accordingly.
     - _Requirements: 1.1, 1.2, 1.4_
-  - [ ] 10.2 `deny.toml` RUSTSEC-2026-0258 entry narrowed to the Connector Exception or
+  - [x] 10.2 `deny.toml` RUSTSEC-2026-0258 entry narrowed to the Connector Exception or
     removed
     - _Requirements: 1.6_
-  - [ ] 10.3 Property test: Property 1 — one stack in the lock
+  - [x] 10.3 Property test: Property 1 — one stack in the lock
     - Tag: `// Feature: tonic-0-14-grpc-stack, Property 1: one stack in the lock`
     - _Requirements: 1.1, 1.2, 1.3_
-  - [ ] 10.4 Release notes: `changed` entries for the prost and tonic type moves and a
+  - [x] 10.4 Release notes: `changed` entries for the prost and tonic type moves and a
     `removed` entry for the `protoc` requirement; the 0.3.0 bump itself belongs to the
     release train
     - _Requirements: 8.1_
 
-- [ ] 11. Checkpoint: the §10.4 bar is green on the Target Stack
+- [x] 11. Checkpoint: the §10.4 bar is green on the Target Stack
+  - DONE 2026-09-06: fmt, lint, check, the full nextest suite, doctests, and docs green on
+    the bar host at this tree. The first run exposed a build-dependent ordering in the
+    Binding Inventory probe (a workspace-wide build unifies `serde_json/preserve_order`
+    into the test binary and changes the text the entries were sorted by); the probe now
+    orders both sides by a key-sorted canonical rendering.
 
 - [ ] 12. Evidence
   - [ ] 12.1 Functional conformance corpus: rerun every tier recorded CLEAN against the
     migrated `tokeirad`; record the rerun in `docs/readiness/conformance.md`
+    - Not run in the landing slice: the corpus runs on the operator's build host per the
+      conformance runbook; it stays owed before the 0.3.0 train.
     - _Requirements: 6.4_
-  - [ ] 12.2 SDK 1.0.0 probes and the bench over both transports
+  - [x] 12.2 SDK 1.0.0 probes and the bench over both transports
+    - DONE 2026-09-06: `spikes/temporal-rust-sdk-v0-7-embedded` green on the migrated
+      engine (the continue-as-new worker over the in-process seam and over a listener, and
+      both in-memory shutdown probes); the bench's tests run in the workspace suite.
     - _Requirements: 6.5_
 
 ## Task Dependency Graph

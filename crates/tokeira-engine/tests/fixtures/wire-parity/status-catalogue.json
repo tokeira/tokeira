@@ -20,7 +20,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -44,7 +44,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -68,7 +68,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -92,7 +92,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -116,7 +116,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -140,7 +140,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -164,7 +164,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -188,7 +188,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -212,7 +212,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -236,7 +236,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -260,7 +260,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -284,7 +284,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -308,7 +308,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     },
@@ -340,7 +340,7 @@
         "metadata": {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "*",
-          "vary": "access-control-request-headers"
+          "vary": "origin, access-control-request-method, access-control-request-headers"
         }
       }
     }

@@ -5,11 +5,10 @@
 /// The value field supports template interpolation where field paths enclosed
 /// in braces will be replaced with the actual field values from the request.
 /// For example:
-///    value: "{workflow_execution.workflow_id}"
-///    value: "workflow-{workflow_execution.workflow_id}"
-///    value: "{namespace}/{workflow_execution.workflow_id}"
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+/// value: "{workflow_execution.workflow_id}"
+/// value: "workflow-{workflow_execution.workflow_id}"
+/// value: "{namespace}/{workflow_execution.workflow_id}"
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RequestHeaderAnnotation {
     /// The name of the header to set (e.g., "temporal-resource-id")
     #[prost(string, tag = "1")]

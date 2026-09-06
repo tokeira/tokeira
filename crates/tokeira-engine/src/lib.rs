@@ -1850,57 +1850,19 @@ impl TemporalEndpoint {
                             proto: request.proto,
                         })
                         .await
+                        // The edge and the SDK share one tonic, so the status
+                        // crosses the seam untouched: code, message, details,
+                        // and metadata exactly as the edge produced them.
                         .map(
                             |response| temporalio_client::callback_based::GrpcSuccessResponse {
                                 headers: response.headers,
                                 proto: response.proto,
                             },
                         )
-                        .map_err(to_sdk_status)
                 })
             }),
         }
     }
-}
-
-#[cfg(feature = "temporalio-client")]
-fn to_sdk_status(status: tonic::Status) -> tonic_sdk::Status {
-    let code = match status.code() {
-        tonic::Code::Ok => tonic_sdk::Code::Ok,
-        tonic::Code::Cancelled => tonic_sdk::Code::Cancelled,
-        tonic::Code::Unknown => tonic_sdk::Code::Unknown,
-        tonic::Code::InvalidArgument => tonic_sdk::Code::InvalidArgument,
-        tonic::Code::DeadlineExceeded => tonic_sdk::Code::DeadlineExceeded,
-        tonic::Code::NotFound => tonic_sdk::Code::NotFound,
-        tonic::Code::AlreadyExists => tonic_sdk::Code::AlreadyExists,
-        tonic::Code::PermissionDenied => tonic_sdk::Code::PermissionDenied,
-        tonic::Code::ResourceExhausted => tonic_sdk::Code::ResourceExhausted,
-        tonic::Code::FailedPrecondition => tonic_sdk::Code::FailedPrecondition,
-        tonic::Code::Aborted => tonic_sdk::Code::Aborted,
-        tonic::Code::OutOfRange => tonic_sdk::Code::OutOfRange,
-        tonic::Code::Unimplemented => tonic_sdk::Code::Unimplemented,
-        tonic::Code::Internal => tonic_sdk::Code::Internal,
-        tonic::Code::Unavailable => tonic_sdk::Code::Unavailable,
-        tonic::Code::DataLoss => tonic_sdk::Code::DataLoss,
-        tonic::Code::Unauthenticated => tonic_sdk::Code::Unauthenticated,
-    };
-    let legacy_metadata = status.metadata().clone().into_headers();
-    let mut metadata_headers = http::HeaderMap::new();
-    for (name, value) in &legacy_metadata {
-        let Ok(name) = http::header::HeaderName::from_bytes(name.as_str().as_bytes()) else {
-            continue;
-        };
-        let Ok(value) = http::header::HeaderValue::from_bytes(value.as_bytes()) else {
-            continue;
-        };
-        metadata_headers.append(name, value);
-    }
-    tonic_sdk::Status::with_details_and_metadata(
-        code,
-        status.message().to_owned(),
-        Bytes::copy_from_slice(status.details()),
-        tonic_sdk::metadata::MetadataMap::from_headers(metadata_headers),
-    )
 }
 
 const EMBEDDED_NEXUS_CALLBACK_BASE: &str = "http://tokeira-engine.invalid";
@@ -3508,9 +3470,16 @@ where
         StackTransport::Network(addr) => addr,
     };
 
-    let reflection = tonic_reflection::server::Builder::configure()
+    // Both reflection protocols are served: `v1alpha` is what the previous
+    // stack offered and older tooling still asks for, `v1` is the current
+    // protocol newer tooling tries first.
+    let reflection_v1 = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(tokeira_proto::public::FILE_DESCRIPTOR_SET)
-        .build()
+        .build_v1()
+        .context("failed to build gRPC reflection service")?;
+    let reflection_v1alpha = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(tokeira_proto::public::FILE_DESCRIPTOR_SET)
+        .build_v1alpha()
         .context("failed to build gRPC reflection service")?;
 
     let listener = TcpListener::bind(addr)
@@ -3560,7 +3529,8 @@ where
                     .add_service(workflow_grpc.into_service())
                     .add_service(operator_grpc.into_service())
                     .add_service(admin_grpc.into_service())
-                    .add_service(reflection)
+                    .add_service(reflection_v1)
+                    .add_service(reflection_v1alpha)
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
                     .await
             }
@@ -3574,7 +3544,8 @@ where
                     .add_service(workflow_grpc.into_service())
                     .add_service(operator_grpc.into_service())
                     .add_service(admin_grpc.into_service())
-                    .add_service(reflection)
+                    .add_service(reflection_v1)
+                    .add_service(reflection_v1alpha)
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
                     .await
             }
@@ -5113,32 +5084,6 @@ mod tests {
         );
         restored.shutdown().await.expect("clean restart shutdown");
         let _ = std::fs::remove_dir_all(&scratch);
-    }
-
-    #[cfg(feature = "temporalio-client")]
-    #[test]
-    fn sdk_status_bridge_preserves_details_and_metadata() {
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert("x-retry-class", "busy".parse().expect("static metadata"));
-        let status = tonic::Status::with_details_and_metadata(
-            tonic::Code::ResourceExhausted,
-            "try later",
-            Bytes::from_static(b"typed-detail"),
-            metadata,
-        );
-
-        let bridged = to_sdk_status(status);
-
-        assert_eq!(bridged.code(), tonic_sdk::Code::ResourceExhausted);
-        assert_eq!(bridged.message(), "try later");
-        assert_eq!(bridged.details(), b"typed-detail");
-        assert_eq!(
-            bridged
-                .metadata()
-                .get("x-retry-class")
-                .expect("metadata retained"),
-            "busy"
-        );
     }
 
     #[test]

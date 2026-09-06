@@ -11,7 +11,7 @@
     },
     "4194305": {
       "code": 11,
-      "message": "Error, message length too large: found 4194305 bytes, the limit is: 4194304 bytes"
+      "message": "Error, decoded message length too large: found 4194305 bytes, the limit is: 4194304 bytes"
     }
   }
 }

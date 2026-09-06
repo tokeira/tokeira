@@ -13,9 +13,9 @@ impl EncodingType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            EncodingType::Unspecified => "ENCODING_TYPE_UNSPECIFIED",
-            EncodingType::Proto3 => "ENCODING_TYPE_PROTO3",
-            EncodingType::Json => "ENCODING_TYPE_JSON",
+            Self::Unspecified => "ENCODING_TYPE_UNSPECIFIED",
+            Self::Proto3 => "ENCODING_TYPE_PROTO3",
+            Self::Json => "ENCODING_TYPE_JSON",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -47,14 +47,14 @@ impl IndexedValueType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            IndexedValueType::Unspecified => "INDEXED_VALUE_TYPE_UNSPECIFIED",
-            IndexedValueType::Text => "INDEXED_VALUE_TYPE_TEXT",
-            IndexedValueType::Keyword => "INDEXED_VALUE_TYPE_KEYWORD",
-            IndexedValueType::Int => "INDEXED_VALUE_TYPE_INT",
-            IndexedValueType::Double => "INDEXED_VALUE_TYPE_DOUBLE",
-            IndexedValueType::Bool => "INDEXED_VALUE_TYPE_BOOL",
-            IndexedValueType::Datetime => "INDEXED_VALUE_TYPE_DATETIME",
-            IndexedValueType::KeywordList => "INDEXED_VALUE_TYPE_KEYWORD_LIST",
+            Self::Unspecified => "INDEXED_VALUE_TYPE_UNSPECIFIED",
+            Self::Text => "INDEXED_VALUE_TYPE_TEXT",
+            Self::Keyword => "INDEXED_VALUE_TYPE_KEYWORD",
+            Self::Int => "INDEXED_VALUE_TYPE_INT",
+            Self::Double => "INDEXED_VALUE_TYPE_DOUBLE",
+            Self::Bool => "INDEXED_VALUE_TYPE_BOOL",
+            Self::Datetime => "INDEXED_VALUE_TYPE_DATETIME",
+            Self::KeywordList => "INDEXED_VALUE_TYPE_KEYWORD_LIST",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -87,10 +87,10 @@ impl Severity {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            Severity::Unspecified => "SEVERITY_UNSPECIFIED",
-            Severity::High => "SEVERITY_HIGH",
-            Severity::Medium => "SEVERITY_MEDIUM",
-            Severity::Low => "SEVERITY_LOW",
+            Self::Unspecified => "SEVERITY_UNSPECIFIED",
+            Self::High => "SEVERITY_HIGH",
+            Self::Medium => "SEVERITY_MEDIUM",
+            Self::Low => "SEVERITY_LOW",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -130,13 +130,13 @@ impl CallbackState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            CallbackState::Unspecified => "CALLBACK_STATE_UNSPECIFIED",
-            CallbackState::Standby => "CALLBACK_STATE_STANDBY",
-            CallbackState::Scheduled => "CALLBACK_STATE_SCHEDULED",
-            CallbackState::BackingOff => "CALLBACK_STATE_BACKING_OFF",
-            CallbackState::Failed => "CALLBACK_STATE_FAILED",
-            CallbackState::Succeeded => "CALLBACK_STATE_SUCCEEDED",
-            CallbackState::Blocked => "CALLBACK_STATE_BLOCKED",
+            Self::Unspecified => "CALLBACK_STATE_UNSPECIFIED",
+            Self::Standby => "CALLBACK_STATE_STANDBY",
+            Self::Scheduled => "CALLBACK_STATE_SCHEDULED",
+            Self::BackingOff => "CALLBACK_STATE_BACKING_OFF",
+            Self::Failed => "CALLBACK_STATE_FAILED",
+            Self::Succeeded => "CALLBACK_STATE_SUCCEEDED",
+            Self::Blocked => "CALLBACK_STATE_BLOCKED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -175,21 +175,11 @@ impl PendingNexusOperationState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            PendingNexusOperationState::Unspecified => {
-                "PENDING_NEXUS_OPERATION_STATE_UNSPECIFIED"
-            }
-            PendingNexusOperationState::Scheduled => {
-                "PENDING_NEXUS_OPERATION_STATE_SCHEDULED"
-            }
-            PendingNexusOperationState::BackingOff => {
-                "PENDING_NEXUS_OPERATION_STATE_BACKING_OFF"
-            }
-            PendingNexusOperationState::Started => {
-                "PENDING_NEXUS_OPERATION_STATE_STARTED"
-            }
-            PendingNexusOperationState::Blocked => {
-                "PENDING_NEXUS_OPERATION_STATE_BLOCKED"
-            }
+            Self::Unspecified => "PENDING_NEXUS_OPERATION_STATE_UNSPECIFIED",
+            Self::Scheduled => "PENDING_NEXUS_OPERATION_STATE_SCHEDULED",
+            Self::BackingOff => "PENDING_NEXUS_OPERATION_STATE_BACKING_OFF",
+            Self::Started => "PENDING_NEXUS_OPERATION_STATE_STARTED",
+            Self::Blocked => "PENDING_NEXUS_OPERATION_STATE_BLOCKED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -230,27 +220,13 @@ impl NexusOperationCancellationState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            NexusOperationCancellationState::Unspecified => {
-                "NEXUS_OPERATION_CANCELLATION_STATE_UNSPECIFIED"
-            }
-            NexusOperationCancellationState::Scheduled => {
-                "NEXUS_OPERATION_CANCELLATION_STATE_SCHEDULED"
-            }
-            NexusOperationCancellationState::BackingOff => {
-                "NEXUS_OPERATION_CANCELLATION_STATE_BACKING_OFF"
-            }
-            NexusOperationCancellationState::Succeeded => {
-                "NEXUS_OPERATION_CANCELLATION_STATE_SUCCEEDED"
-            }
-            NexusOperationCancellationState::Failed => {
-                "NEXUS_OPERATION_CANCELLATION_STATE_FAILED"
-            }
-            NexusOperationCancellationState::TimedOut => {
-                "NEXUS_OPERATION_CANCELLATION_STATE_TIMED_OUT"
-            }
-            NexusOperationCancellationState::Blocked => {
-                "NEXUS_OPERATION_CANCELLATION_STATE_BLOCKED"
-            }
+            Self::Unspecified => "NEXUS_OPERATION_CANCELLATION_STATE_UNSPECIFIED",
+            Self::Scheduled => "NEXUS_OPERATION_CANCELLATION_STATE_SCHEDULED",
+            Self::BackingOff => "NEXUS_OPERATION_CANCELLATION_STATE_BACKING_OFF",
+            Self::Succeeded => "NEXUS_OPERATION_CANCELLATION_STATE_SUCCEEDED",
+            Self::Failed => "NEXUS_OPERATION_CANCELLATION_STATE_FAILED",
+            Self::TimedOut => "NEXUS_OPERATION_CANCELLATION_STATE_TIMED_OUT",
+            Self::Blocked => "NEXUS_OPERATION_CANCELLATION_STATE_BLOCKED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -284,11 +260,9 @@ impl WorkflowRuleActionScope {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            WorkflowRuleActionScope::Unspecified => {
-                "WORKFLOW_RULE_ACTION_SCOPE_UNSPECIFIED"
-            }
-            WorkflowRuleActionScope::Workflow => "WORKFLOW_RULE_ACTION_SCOPE_WORKFLOW",
-            WorkflowRuleActionScope::Activity => "WORKFLOW_RULE_ACTION_SCOPE_ACTIVITY",
+            Self::Unspecified => "WORKFLOW_RULE_ACTION_SCOPE_UNSPECIFIED",
+            Self::Workflow => "WORKFLOW_RULE_ACTION_SCOPE_WORKFLOW",
+            Self::Activity => "WORKFLOW_RULE_ACTION_SCOPE_ACTIVITY",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -315,10 +289,8 @@ impl ApplicationErrorCategory {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ApplicationErrorCategory::Unspecified => {
-                "APPLICATION_ERROR_CATEGORY_UNSPECIFIED"
-            }
-            ApplicationErrorCategory::Benign => "APPLICATION_ERROR_CATEGORY_BENIGN",
+            Self::Unspecified => "APPLICATION_ERROR_CATEGORY_UNSPECIFIED",
+            Self::Benign => "APPLICATION_ERROR_CATEGORY_BENIGN",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -331,7 +303,7 @@ impl ApplicationErrorCategory {
     }
 }
 /// (-- api-linter: core::0216::synonyms=disabled
-///      aip.dev/not-precedent: It seems we have both state and status, and status is a better fit for workers. --)
+/// aip.dev/not-precedent: It seems we have both state and status, and status is a better fit for workers. --)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum WorkerStatus {
@@ -347,10 +319,10 @@ impl WorkerStatus {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            WorkerStatus::Unspecified => "WORKER_STATUS_UNSPECIFIED",
-            WorkerStatus::Running => "WORKER_STATUS_RUNNING",
-            WorkerStatus::ShuttingDown => "WORKER_STATUS_SHUTTING_DOWN",
-            WorkerStatus::Shutdown => "WORKER_STATUS_SHUTDOWN",
+            Self::Unspecified => "WORKER_STATUS_UNSPECIFIED",
+            Self::Running => "WORKER_STATUS_RUNNING",
+            Self::ShuttingDown => "WORKER_STATUS_SHUTTING_DOWN",
+            Self::Shutdown => "WORKER_STATUS_SHUTDOWN",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -540,139 +512,125 @@ impl EventType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            EventType::Unspecified => "EVENT_TYPE_UNSPECIFIED",
-            EventType::WorkflowExecutionStarted => {
-                "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED"
-            }
-            EventType::WorkflowExecutionCompleted => {
-                "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED"
-            }
-            EventType::WorkflowExecutionFailed => "EVENT_TYPE_WORKFLOW_EXECUTION_FAILED",
-            EventType::WorkflowExecutionTimedOut => {
-                "EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT"
-            }
-            EventType::WorkflowTaskScheduled => "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-            EventType::WorkflowTaskStarted => "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-            EventType::WorkflowTaskCompleted => "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-            EventType::WorkflowTaskTimedOut => "EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT",
-            EventType::WorkflowTaskFailed => "EVENT_TYPE_WORKFLOW_TASK_FAILED",
-            EventType::ActivityTaskScheduled => "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-            EventType::ActivityTaskStarted => "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-            EventType::ActivityTaskCompleted => "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-            EventType::ActivityTaskFailed => "EVENT_TYPE_ACTIVITY_TASK_FAILED",
-            EventType::ActivityTaskTimedOut => "EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT",
-            EventType::ActivityTaskCancelRequested => {
+            Self::Unspecified => "EVENT_TYPE_UNSPECIFIED",
+            Self::WorkflowExecutionStarted => "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+            Self::WorkflowExecutionCompleted => "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+            Self::WorkflowExecutionFailed => "EVENT_TYPE_WORKFLOW_EXECUTION_FAILED",
+            Self::WorkflowExecutionTimedOut => "EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT",
+            Self::WorkflowTaskScheduled => "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+            Self::WorkflowTaskStarted => "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+            Self::WorkflowTaskCompleted => "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+            Self::WorkflowTaskTimedOut => "EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT",
+            Self::WorkflowTaskFailed => "EVENT_TYPE_WORKFLOW_TASK_FAILED",
+            Self::ActivityTaskScheduled => "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+            Self::ActivityTaskStarted => "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+            Self::ActivityTaskCompleted => "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+            Self::ActivityTaskFailed => "EVENT_TYPE_ACTIVITY_TASK_FAILED",
+            Self::ActivityTaskTimedOut => "EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT",
+            Self::ActivityTaskCancelRequested => {
                 "EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED"
             }
-            EventType::ActivityTaskCanceled => "EVENT_TYPE_ACTIVITY_TASK_CANCELED",
-            EventType::TimerStarted => "EVENT_TYPE_TIMER_STARTED",
-            EventType::TimerFired => "EVENT_TYPE_TIMER_FIRED",
-            EventType::TimerCanceled => "EVENT_TYPE_TIMER_CANCELED",
-            EventType::WorkflowExecutionCancelRequested => {
+            Self::ActivityTaskCanceled => "EVENT_TYPE_ACTIVITY_TASK_CANCELED",
+            Self::TimerStarted => "EVENT_TYPE_TIMER_STARTED",
+            Self::TimerFired => "EVENT_TYPE_TIMER_FIRED",
+            Self::TimerCanceled => "EVENT_TYPE_TIMER_CANCELED",
+            Self::WorkflowExecutionCancelRequested => {
                 "EVENT_TYPE_WORKFLOW_EXECUTION_CANCEL_REQUESTED"
             }
-            EventType::WorkflowExecutionCanceled => {
-                "EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED"
-            }
-            EventType::RequestCancelExternalWorkflowExecutionInitiated => {
+            Self::WorkflowExecutionCanceled => "EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED",
+            Self::RequestCancelExternalWorkflowExecutionInitiated => {
                 "EVENT_TYPE_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED"
             }
-            EventType::RequestCancelExternalWorkflowExecutionFailed => {
+            Self::RequestCancelExternalWorkflowExecutionFailed => {
                 "EVENT_TYPE_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED"
             }
-            EventType::ExternalWorkflowExecutionCancelRequested => {
+            Self::ExternalWorkflowExecutionCancelRequested => {
                 "EVENT_TYPE_EXTERNAL_WORKFLOW_EXECUTION_CANCEL_REQUESTED"
             }
-            EventType::MarkerRecorded => "EVENT_TYPE_MARKER_RECORDED",
-            EventType::WorkflowExecutionSignaled => {
-                "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED"
-            }
-            EventType::WorkflowExecutionTerminated => {
+            Self::MarkerRecorded => "EVENT_TYPE_MARKER_RECORDED",
+            Self::WorkflowExecutionSignaled => "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED",
+            Self::WorkflowExecutionTerminated => {
                 "EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED"
             }
-            EventType::WorkflowExecutionContinuedAsNew => {
+            Self::WorkflowExecutionContinuedAsNew => {
                 "EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW"
             }
-            EventType::StartChildWorkflowExecutionInitiated => {
+            Self::StartChildWorkflowExecutionInitiated => {
                 "EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED"
             }
-            EventType::StartChildWorkflowExecutionFailed => {
+            Self::StartChildWorkflowExecutionFailed => {
                 "EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_FAILED"
             }
-            EventType::ChildWorkflowExecutionStarted => {
+            Self::ChildWorkflowExecutionStarted => {
                 "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_STARTED"
             }
-            EventType::ChildWorkflowExecutionCompleted => {
+            Self::ChildWorkflowExecutionCompleted => {
                 "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_COMPLETED"
             }
-            EventType::ChildWorkflowExecutionFailed => {
+            Self::ChildWorkflowExecutionFailed => {
                 "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_FAILED"
             }
-            EventType::ChildWorkflowExecutionCanceled => {
+            Self::ChildWorkflowExecutionCanceled => {
                 "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_CANCELED"
             }
-            EventType::ChildWorkflowExecutionTimedOut => {
+            Self::ChildWorkflowExecutionTimedOut => {
                 "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_TIMED_OUT"
             }
-            EventType::ChildWorkflowExecutionTerminated => {
+            Self::ChildWorkflowExecutionTerminated => {
                 "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_TERMINATED"
             }
-            EventType::SignalExternalWorkflowExecutionInitiated => {
+            Self::SignalExternalWorkflowExecutionInitiated => {
                 "EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED"
             }
-            EventType::SignalExternalWorkflowExecutionFailed => {
+            Self::SignalExternalWorkflowExecutionFailed => {
                 "EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED"
             }
-            EventType::ExternalWorkflowExecutionSignaled => {
+            Self::ExternalWorkflowExecutionSignaled => {
                 "EVENT_TYPE_EXTERNAL_WORKFLOW_EXECUTION_SIGNALED"
             }
-            EventType::UpsertWorkflowSearchAttributes => {
+            Self::UpsertWorkflowSearchAttributes => {
                 "EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES"
             }
-            EventType::WorkflowExecutionUpdateAdmitted => {
+            Self::WorkflowExecutionUpdateAdmitted => {
                 "EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ADMITTED"
             }
-            EventType::WorkflowExecutionUpdateAccepted => {
+            Self::WorkflowExecutionUpdateAccepted => {
                 "EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED"
             }
-            EventType::WorkflowExecutionUpdateRejected => {
+            Self::WorkflowExecutionUpdateRejected => {
                 "EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_REJECTED"
             }
-            EventType::WorkflowExecutionUpdateCompleted => {
+            Self::WorkflowExecutionUpdateCompleted => {
                 "EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_COMPLETED"
             }
-            EventType::WorkflowPropertiesModifiedExternally => {
+            Self::WorkflowPropertiesModifiedExternally => {
                 "EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED_EXTERNALLY"
             }
-            EventType::ActivityPropertiesModifiedExternally => {
+            Self::ActivityPropertiesModifiedExternally => {
                 "EVENT_TYPE_ACTIVITY_PROPERTIES_MODIFIED_EXTERNALLY"
             }
-            EventType::WorkflowPropertiesModified => {
-                "EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED"
-            }
-            EventType::NexusOperationScheduled => "EVENT_TYPE_NEXUS_OPERATION_SCHEDULED",
-            EventType::NexusOperationStarted => "EVENT_TYPE_NEXUS_OPERATION_STARTED",
-            EventType::NexusOperationCompleted => "EVENT_TYPE_NEXUS_OPERATION_COMPLETED",
-            EventType::NexusOperationFailed => "EVENT_TYPE_NEXUS_OPERATION_FAILED",
-            EventType::NexusOperationCanceled => "EVENT_TYPE_NEXUS_OPERATION_CANCELED",
-            EventType::NexusOperationTimedOut => "EVENT_TYPE_NEXUS_OPERATION_TIMED_OUT",
-            EventType::NexusOperationCancelRequested => {
+            Self::WorkflowPropertiesModified => "EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED",
+            Self::NexusOperationScheduled => "EVENT_TYPE_NEXUS_OPERATION_SCHEDULED",
+            Self::NexusOperationStarted => "EVENT_TYPE_NEXUS_OPERATION_STARTED",
+            Self::NexusOperationCompleted => "EVENT_TYPE_NEXUS_OPERATION_COMPLETED",
+            Self::NexusOperationFailed => "EVENT_TYPE_NEXUS_OPERATION_FAILED",
+            Self::NexusOperationCanceled => "EVENT_TYPE_NEXUS_OPERATION_CANCELED",
+            Self::NexusOperationTimedOut => "EVENT_TYPE_NEXUS_OPERATION_TIMED_OUT",
+            Self::NexusOperationCancelRequested => {
                 "EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUESTED"
             }
-            EventType::WorkflowExecutionOptionsUpdated => {
+            Self::WorkflowExecutionOptionsUpdated => {
                 "EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED"
             }
-            EventType::NexusOperationCancelRequestCompleted => {
+            Self::NexusOperationCancelRequestCompleted => {
                 "EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUEST_COMPLETED"
             }
-            EventType::NexusOperationCancelRequestFailed => {
+            Self::NexusOperationCancelRequestFailed => {
                 "EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUEST_FAILED"
             }
-            EventType::WorkflowExecutionPaused => "EVENT_TYPE_WORKFLOW_EXECUTION_PAUSED",
-            EventType::WorkflowExecutionUnpaused => {
-                "EVENT_TYPE_WORKFLOW_EXECUTION_UNPAUSED"
-            }
-            EventType::WorkflowExecutionTimeSkippingTransitioned => {
+            Self::WorkflowExecutionPaused => "EVENT_TYPE_WORKFLOW_EXECUTION_PAUSED",
+            Self::WorkflowExecutionUnpaused => "EVENT_TYPE_WORKFLOW_EXECUTION_UNPAUSED",
+            Self::WorkflowExecutionTimeSkippingTransitioned => {
                 "EVENT_TYPE_WORKFLOW_EXECUTION_TIME_SKIPPING_TRANSITIONED"
             }
         }
@@ -831,6 +789,7 @@ pub enum ResetReapplyExcludeType {
     /// Exclude nexus events when reapplying events beyond the reset point.
     Nexus = 3,
     /// Deprecated, unimplemented option.
+    #[deprecated]
     CancelRequest = 4,
 }
 impl ResetReapplyExcludeType {
@@ -840,15 +799,12 @@ impl ResetReapplyExcludeType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ResetReapplyExcludeType::Unspecified => {
-                "RESET_REAPPLY_EXCLUDE_TYPE_UNSPECIFIED"
-            }
-            ResetReapplyExcludeType::Signal => "RESET_REAPPLY_EXCLUDE_TYPE_SIGNAL",
-            ResetReapplyExcludeType::Update => "RESET_REAPPLY_EXCLUDE_TYPE_UPDATE",
-            ResetReapplyExcludeType::Nexus => "RESET_REAPPLY_EXCLUDE_TYPE_NEXUS",
-            ResetReapplyExcludeType::CancelRequest => {
-                "RESET_REAPPLY_EXCLUDE_TYPE_CANCEL_REQUEST"
-            }
+            Self::Unspecified => "RESET_REAPPLY_EXCLUDE_TYPE_UNSPECIFIED",
+            Self::Signal => "RESET_REAPPLY_EXCLUDE_TYPE_SIGNAL",
+            Self::Update => "RESET_REAPPLY_EXCLUDE_TYPE_UPDATE",
+            Self::Nexus => "RESET_REAPPLY_EXCLUDE_TYPE_NEXUS",
+            #[allow(deprecated)]
+            Self::CancelRequest => "RESET_REAPPLY_EXCLUDE_TYPE_CANCEL_REQUEST",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -858,7 +814,9 @@ impl ResetReapplyExcludeType {
             "RESET_REAPPLY_EXCLUDE_TYPE_SIGNAL" => Some(Self::Signal),
             "RESET_REAPPLY_EXCLUDE_TYPE_UPDATE" => Some(Self::Update),
             "RESET_REAPPLY_EXCLUDE_TYPE_NEXUS" => Some(Self::Nexus),
-            "RESET_REAPPLY_EXCLUDE_TYPE_CANCEL_REQUEST" => Some(Self::CancelRequest),
+            "RESET_REAPPLY_EXCLUDE_TYPE_CANCEL_REQUEST" => {
+                Some(#[allow(deprecated)] Self::CancelRequest)
+            }
             _ => None,
         }
     }
@@ -884,10 +842,10 @@ impl ResetReapplyType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ResetReapplyType::Unspecified => "RESET_REAPPLY_TYPE_UNSPECIFIED",
-            ResetReapplyType::Signal => "RESET_REAPPLY_TYPE_SIGNAL",
-            ResetReapplyType::None => "RESET_REAPPLY_TYPE_NONE",
-            ResetReapplyType::AllEligible => "RESET_REAPPLY_TYPE_ALL_ELIGIBLE",
+            Self::Unspecified => "RESET_REAPPLY_TYPE_UNSPECIFIED",
+            Self::Signal => "RESET_REAPPLY_TYPE_SIGNAL",
+            Self::None => "RESET_REAPPLY_TYPE_NONE",
+            Self::AllEligible => "RESET_REAPPLY_TYPE_ALL_ELIGIBLE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -918,9 +876,9 @@ impl ResetType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ResetType::Unspecified => "RESET_TYPE_UNSPECIFIED",
-            ResetType::FirstWorkflowTask => "RESET_TYPE_FIRST_WORKFLOW_TASK",
-            ResetType::LastWorkflowTask => "RESET_TYPE_LAST_WORKFLOW_TASK",
+            Self::Unspecified => "RESET_TYPE_UNSPECIFIED",
+            Self::FirstWorkflowTask => "RESET_TYPE_FIRST_WORKFLOW_TASK",
+            Self::LastWorkflowTask => "RESET_TYPE_LAST_WORKFLOW_TASK",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -955,6 +913,7 @@ pub enum WorkflowIdReusePolicy {
     /// Deprecated. Instead, set `WorkflowIdReusePolicy` to `ALLOW_DUPLICATE` and
     /// `WorkflowIdConflictPolicy` to `TERMINATE_EXISTING`. Note that `WorkflowIdConflictPolicy`
     /// requires Temporal Server v1.24.0 or later.
+    #[deprecated]
     TerminateIfRunning = 4,
 }
 impl WorkflowIdReusePolicy {
@@ -964,19 +923,14 @@ impl WorkflowIdReusePolicy {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            WorkflowIdReusePolicy::Unspecified => "WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED",
-            WorkflowIdReusePolicy::AllowDuplicate => {
-                "WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE"
-            }
-            WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
+            Self::Unspecified => "WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED",
+            Self::AllowDuplicate => "WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE",
+            Self::AllowDuplicateFailedOnly => {
                 "WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY"
             }
-            WorkflowIdReusePolicy::RejectDuplicate => {
-                "WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE"
-            }
-            WorkflowIdReusePolicy::TerminateIfRunning => {
-                "WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING"
-            }
+            Self::RejectDuplicate => "WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE",
+            #[allow(deprecated)]
+            Self::TerminateIfRunning => "WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -989,7 +943,7 @@ impl WorkflowIdReusePolicy {
             }
             "WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE" => Some(Self::RejectDuplicate),
             "WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING" => {
-                Some(Self::TerminateIfRunning)
+                Some(#[allow(deprecated)] Self::TerminateIfRunning)
             }
             _ => None,
         }
@@ -1017,16 +971,10 @@ impl WorkflowIdConflictPolicy {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            WorkflowIdConflictPolicy::Unspecified => {
-                "WORKFLOW_ID_CONFLICT_POLICY_UNSPECIFIED"
-            }
-            WorkflowIdConflictPolicy::Fail => "WORKFLOW_ID_CONFLICT_POLICY_FAIL",
-            WorkflowIdConflictPolicy::UseExisting => {
-                "WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING"
-            }
-            WorkflowIdConflictPolicy::TerminateExisting => {
-                "WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING"
-            }
+            Self::Unspecified => "WORKFLOW_ID_CONFLICT_POLICY_UNSPECIFIED",
+            Self::Fail => "WORKFLOW_ID_CONFLICT_POLICY_FAIL",
+            Self::UseExisting => "WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING",
+            Self::TerminateExisting => "WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1061,10 +1009,10 @@ impl ParentClosePolicy {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ParentClosePolicy::Unspecified => "PARENT_CLOSE_POLICY_UNSPECIFIED",
-            ParentClosePolicy::Terminate => "PARENT_CLOSE_POLICY_TERMINATE",
-            ParentClosePolicy::Abandon => "PARENT_CLOSE_POLICY_ABANDON",
-            ParentClosePolicy::RequestCancel => "PARENT_CLOSE_POLICY_REQUEST_CANCEL",
+            Self::Unspecified => "PARENT_CLOSE_POLICY_UNSPECIFIED",
+            Self::Terminate => "PARENT_CLOSE_POLICY_TERMINATE",
+            Self::Abandon => "PARENT_CLOSE_POLICY_ABANDON",
+            Self::RequestCancel => "PARENT_CLOSE_POLICY_REQUEST_CANCEL",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1096,14 +1044,10 @@ impl ContinueAsNewInitiator {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ContinueAsNewInitiator::Unspecified => {
-                "CONTINUE_AS_NEW_INITIATOR_UNSPECIFIED"
-            }
-            ContinueAsNewInitiator::Workflow => "CONTINUE_AS_NEW_INITIATOR_WORKFLOW",
-            ContinueAsNewInitiator::Retry => "CONTINUE_AS_NEW_INITIATOR_RETRY",
-            ContinueAsNewInitiator::CronSchedule => {
-                "CONTINUE_AS_NEW_INITIATOR_CRON_SCHEDULE"
-            }
+            Self::Unspecified => "CONTINUE_AS_NEW_INITIATOR_UNSPECIFIED",
+            Self::Workflow => "CONTINUE_AS_NEW_INITIATOR_WORKFLOW",
+            Self::Retry => "CONTINUE_AS_NEW_INITIATOR_RETRY",
+            Self::CronSchedule => "CONTINUE_AS_NEW_INITIATOR_CRON_SCHEDULE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1118,7 +1062,7 @@ impl ContinueAsNewInitiator {
     }
 }
 /// (-- api-linter: core::0216::synonyms=disabled
-///      aip.dev/not-precedent: There is WorkflowExecutionState already in another package. --)
+/// aip.dev/not-precedent: There is WorkflowExecutionState already in another package. --)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum WorkflowExecutionStatus {
@@ -1140,19 +1084,15 @@ impl WorkflowExecutionStatus {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            WorkflowExecutionStatus::Unspecified => {
-                "WORKFLOW_EXECUTION_STATUS_UNSPECIFIED"
-            }
-            WorkflowExecutionStatus::Running => "WORKFLOW_EXECUTION_STATUS_RUNNING",
-            WorkflowExecutionStatus::Completed => "WORKFLOW_EXECUTION_STATUS_COMPLETED",
-            WorkflowExecutionStatus::Failed => "WORKFLOW_EXECUTION_STATUS_FAILED",
-            WorkflowExecutionStatus::Canceled => "WORKFLOW_EXECUTION_STATUS_CANCELED",
-            WorkflowExecutionStatus::Terminated => "WORKFLOW_EXECUTION_STATUS_TERMINATED",
-            WorkflowExecutionStatus::ContinuedAsNew => {
-                "WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW"
-            }
-            WorkflowExecutionStatus::TimedOut => "WORKFLOW_EXECUTION_STATUS_TIMED_OUT",
-            WorkflowExecutionStatus::Paused => "WORKFLOW_EXECUTION_STATUS_PAUSED",
+            Self::Unspecified => "WORKFLOW_EXECUTION_STATUS_UNSPECIFIED",
+            Self::Running => "WORKFLOW_EXECUTION_STATUS_RUNNING",
+            Self::Completed => "WORKFLOW_EXECUTION_STATUS_COMPLETED",
+            Self::Failed => "WORKFLOW_EXECUTION_STATUS_FAILED",
+            Self::Canceled => "WORKFLOW_EXECUTION_STATUS_CANCELED",
+            Self::Terminated => "WORKFLOW_EXECUTION_STATUS_TERMINATED",
+            Self::ContinuedAsNew => "WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW",
+            Self::TimedOut => "WORKFLOW_EXECUTION_STATUS_TIMED_OUT",
+            Self::Paused => "WORKFLOW_EXECUTION_STATUS_PAUSED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1190,16 +1130,12 @@ impl PendingActivityState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            PendingActivityState::Unspecified => "PENDING_ACTIVITY_STATE_UNSPECIFIED",
-            PendingActivityState::Scheduled => "PENDING_ACTIVITY_STATE_SCHEDULED",
-            PendingActivityState::Started => "PENDING_ACTIVITY_STATE_STARTED",
-            PendingActivityState::CancelRequested => {
-                "PENDING_ACTIVITY_STATE_CANCEL_REQUESTED"
-            }
-            PendingActivityState::Paused => "PENDING_ACTIVITY_STATE_PAUSED",
-            PendingActivityState::PauseRequested => {
-                "PENDING_ACTIVITY_STATE_PAUSE_REQUESTED"
-            }
+            Self::Unspecified => "PENDING_ACTIVITY_STATE_UNSPECIFIED",
+            Self::Scheduled => "PENDING_ACTIVITY_STATE_SCHEDULED",
+            Self::Started => "PENDING_ACTIVITY_STATE_STARTED",
+            Self::CancelRequested => "PENDING_ACTIVITY_STATE_CANCEL_REQUESTED",
+            Self::Paused => "PENDING_ACTIVITY_STATE_PAUSED",
+            Self::PauseRequested => "PENDING_ACTIVITY_STATE_PAUSE_REQUESTED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1229,13 +1165,9 @@ impl PendingWorkflowTaskState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            PendingWorkflowTaskState::Unspecified => {
-                "PENDING_WORKFLOW_TASK_STATE_UNSPECIFIED"
-            }
-            PendingWorkflowTaskState::Scheduled => {
-                "PENDING_WORKFLOW_TASK_STATE_SCHEDULED"
-            }
-            PendingWorkflowTaskState::Started => "PENDING_WORKFLOW_TASK_STATE_STARTED",
+            Self::Unspecified => "PENDING_WORKFLOW_TASK_STATE_UNSPECIFIED",
+            Self::Scheduled => "PENDING_WORKFLOW_TASK_STATE_SCHEDULED",
+            Self::Started => "PENDING_WORKFLOW_TASK_STATE_STARTED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1262,11 +1194,9 @@ impl HistoryEventFilterType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            HistoryEventFilterType::Unspecified => {
-                "HISTORY_EVENT_FILTER_TYPE_UNSPECIFIED"
-            }
-            HistoryEventFilterType::AllEvent => "HISTORY_EVENT_FILTER_TYPE_ALL_EVENT",
-            HistoryEventFilterType::CloseEvent => "HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT",
+            Self::Unspecified => "HISTORY_EVENT_FILTER_TYPE_UNSPECIFIED",
+            Self::AllEvent => "HISTORY_EVENT_FILTER_TYPE_ALL_EVENT",
+            Self::CloseEvent => "HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1298,14 +1228,14 @@ impl RetryState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            RetryState::Unspecified => "RETRY_STATE_UNSPECIFIED",
-            RetryState::InProgress => "RETRY_STATE_IN_PROGRESS",
-            RetryState::NonRetryableFailure => "RETRY_STATE_NON_RETRYABLE_FAILURE",
-            RetryState::Timeout => "RETRY_STATE_TIMEOUT",
-            RetryState::MaximumAttemptsReached => "RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED",
-            RetryState::RetryPolicyNotSet => "RETRY_STATE_RETRY_POLICY_NOT_SET",
-            RetryState::InternalServerError => "RETRY_STATE_INTERNAL_SERVER_ERROR",
-            RetryState::CancelRequested => "RETRY_STATE_CANCEL_REQUESTED",
+            Self::Unspecified => "RETRY_STATE_UNSPECIFIED",
+            Self::InProgress => "RETRY_STATE_IN_PROGRESS",
+            Self::NonRetryableFailure => "RETRY_STATE_NON_RETRYABLE_FAILURE",
+            Self::Timeout => "RETRY_STATE_TIMEOUT",
+            Self::MaximumAttemptsReached => "RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED",
+            Self::RetryPolicyNotSet => "RETRY_STATE_RETRY_POLICY_NOT_SET",
+            Self::InternalServerError => "RETRY_STATE_INTERNAL_SERVER_ERROR",
+            Self::CancelRequested => "RETRY_STATE_CANCEL_REQUESTED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1339,11 +1269,11 @@ impl TimeoutType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            TimeoutType::Unspecified => "TIMEOUT_TYPE_UNSPECIFIED",
-            TimeoutType::StartToClose => "TIMEOUT_TYPE_START_TO_CLOSE",
-            TimeoutType::ScheduleToStart => "TIMEOUT_TYPE_SCHEDULE_TO_START",
-            TimeoutType::ScheduleToClose => "TIMEOUT_TYPE_SCHEDULE_TO_CLOSE",
-            TimeoutType::Heartbeat => "TIMEOUT_TYPE_HEARTBEAT",
+            Self::Unspecified => "TIMEOUT_TYPE_UNSPECIFIED",
+            Self::StartToClose => "TIMEOUT_TYPE_START_TO_CLOSE",
+            Self::ScheduleToStart => "TIMEOUT_TYPE_SCHEDULE_TO_START",
+            Self::ScheduleToClose => "TIMEOUT_TYPE_SCHEDULE_TO_CLOSE",
+            Self::Heartbeat => "TIMEOUT_TYPE_HEARTBEAT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1416,9 +1346,9 @@ impl VersioningBehavior {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            VersioningBehavior::Unspecified => "VERSIONING_BEHAVIOR_UNSPECIFIED",
-            VersioningBehavior::Pinned => "VERSIONING_BEHAVIOR_PINNED",
-            VersioningBehavior::AutoUpgrade => "VERSIONING_BEHAVIOR_AUTO_UPGRADE",
+            Self::Unspecified => "VERSIONING_BEHAVIOR_UNSPECIFIED",
+            Self::Pinned => "VERSIONING_BEHAVIOR_PINNED",
+            Self::AutoUpgrade => "VERSIONING_BEHAVIOR_AUTO_UPGRADE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1468,13 +1398,9 @@ impl ContinueAsNewVersioningBehavior {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ContinueAsNewVersioningBehavior::Unspecified => {
-                "CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED"
-            }
-            ContinueAsNewVersioningBehavior::AutoUpgrade => {
-                "CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_AUTO_UPGRADE"
-            }
-            ContinueAsNewVersioningBehavior::UseRampingVersion => {
+            Self::Unspecified => "CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED",
+            Self::AutoUpgrade => "CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_AUTO_UPGRADE",
+            Self::UseRampingVersion => {
                 "CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_USE_RAMPING_VERSION"
             }
         }
@@ -1510,18 +1436,14 @@ impl SuggestContinueAsNewReason {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            SuggestContinueAsNewReason::Unspecified => {
-                "SUGGEST_CONTINUE_AS_NEW_REASON_UNSPECIFIED"
-            }
-            SuggestContinueAsNewReason::HistorySizeTooLarge => {
+            Self::Unspecified => "SUGGEST_CONTINUE_AS_NEW_REASON_UNSPECIFIED",
+            Self::HistorySizeTooLarge => {
                 "SUGGEST_CONTINUE_AS_NEW_REASON_HISTORY_SIZE_TOO_LARGE"
             }
-            SuggestContinueAsNewReason::TooManyHistoryEvents => {
+            Self::TooManyHistoryEvents => {
                 "SUGGEST_CONTINUE_AS_NEW_REASON_TOO_MANY_HISTORY_EVENTS"
             }
-            SuggestContinueAsNewReason::TooManyUpdates => {
-                "SUGGEST_CONTINUE_AS_NEW_REASON_TOO_MANY_UPDATES"
-            }
+            Self::TooManyUpdates => "SUGGEST_CONTINUE_AS_NEW_REASON_TOO_MANY_UPDATES",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1566,12 +1488,10 @@ impl DeploymentReachability {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            DeploymentReachability::Unspecified => "DEPLOYMENT_REACHABILITY_UNSPECIFIED",
-            DeploymentReachability::Reachable => "DEPLOYMENT_REACHABILITY_REACHABLE",
-            DeploymentReachability::ClosedWorkflowsOnly => {
-                "DEPLOYMENT_REACHABILITY_CLOSED_WORKFLOWS_ONLY"
-            }
-            DeploymentReachability::Unreachable => "DEPLOYMENT_REACHABILITY_UNREACHABLE",
+            Self::Unspecified => "DEPLOYMENT_REACHABILITY_UNSPECIFIED",
+            Self::Reachable => "DEPLOYMENT_REACHABILITY_REACHABLE",
+            Self::ClosedWorkflowsOnly => "DEPLOYMENT_REACHABILITY_CLOSED_WORKFLOWS_ONLY",
+            Self::Unreachable => "DEPLOYMENT_REACHABILITY_UNREACHABLE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1588,7 +1508,7 @@ impl DeploymentReachability {
     }
 }
 /// (-- api-linter: core::0216::synonyms=disabled
-///      aip.dev/not-precedent: Call this status because it is . --)
+/// aip.dev/not-precedent: Call this status because it is . --)
 /// Specify the drainage status for a Worker Deployment Version so users can decide whether they
 /// can safely decommission the version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -1612,9 +1532,9 @@ impl VersionDrainageStatus {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            VersionDrainageStatus::Unspecified => "VERSION_DRAINAGE_STATUS_UNSPECIFIED",
-            VersionDrainageStatus::Draining => "VERSION_DRAINAGE_STATUS_DRAINING",
-            VersionDrainageStatus::Drained => "VERSION_DRAINAGE_STATUS_DRAINED",
+            Self::Unspecified => "VERSION_DRAINAGE_STATUS_UNSPECIFIED",
+            Self::Draining => "VERSION_DRAINAGE_STATUS_DRAINING",
+            Self::Drained => "VERSION_DRAINAGE_STATUS_DRAINED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1629,9 +1549,10 @@ impl VersionDrainageStatus {
 }
 /// Versioning Mode of a worker is set by the app developer in the worker code, and specifies the
 /// behavior of the system in the following related aspects:
-/// - Whether or not Temporal Server considers this worker's version (Build ID) when dispatching
-///    tasks to it.
-/// - Whether or not the workflows processed by this worker are versioned using the worker's version.
+///
+/// * Whether or not Temporal Server considers this worker's version (Build ID) when dispatching
+///   tasks to it.
+/// * Whether or not the workflows processed by this worker are versioned using the worker's version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum WorkerVersioningMode {
@@ -1644,7 +1565,7 @@ pub enum WorkerVersioningMode {
     /// Workers with this mode are represented by the special string `__unversioned__` in the APIs.
     Unversioned = 1,
     /// Workers with this mode are part of a Worker Deployment Version which is identified as
-    /// "<deployment_name>.<build_id>". Such workers are called "versioned" as opposed to
+    /// "\<deployment_name>.\<build_id>". Such workers are called "versioned" as opposed to
     /// "unversioned".
     /// Each Deployment Version is distinguished from other Versions for task routing and users can
     /// configure Temporal Server to send tasks to a particular Version (see
@@ -1663,9 +1584,9 @@ impl WorkerVersioningMode {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            WorkerVersioningMode::Unspecified => "WORKER_VERSIONING_MODE_UNSPECIFIED",
-            WorkerVersioningMode::Unversioned => "WORKER_VERSIONING_MODE_UNVERSIONED",
-            WorkerVersioningMode::Versioned => "WORKER_VERSIONING_MODE_VERSIONED",
+            Self::Unspecified => "WORKER_VERSIONING_MODE_UNSPECIFIED",
+            Self::Unversioned => "WORKER_VERSIONING_MODE_UNVERSIONED",
+            Self::Versioned => "WORKER_VERSIONING_MODE_VERSIONED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1679,7 +1600,7 @@ impl WorkerVersioningMode {
     }
 }
 /// (-- api-linter: core::0216::synonyms=disabled
-///      aip.dev/not-precedent: Call this status because it is . --)
+/// aip.dev/not-precedent: Call this status because it is . --)
 /// Specify the status of a Worker Deployment Version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -1714,27 +1635,13 @@ impl WorkerDeploymentVersionStatus {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            WorkerDeploymentVersionStatus::Unspecified => {
-                "WORKER_DEPLOYMENT_VERSION_STATUS_UNSPECIFIED"
-            }
-            WorkerDeploymentVersionStatus::Inactive => {
-                "WORKER_DEPLOYMENT_VERSION_STATUS_INACTIVE"
-            }
-            WorkerDeploymentVersionStatus::Current => {
-                "WORKER_DEPLOYMENT_VERSION_STATUS_CURRENT"
-            }
-            WorkerDeploymentVersionStatus::Ramping => {
-                "WORKER_DEPLOYMENT_VERSION_STATUS_RAMPING"
-            }
-            WorkerDeploymentVersionStatus::Draining => {
-                "WORKER_DEPLOYMENT_VERSION_STATUS_DRAINING"
-            }
-            WorkerDeploymentVersionStatus::Drained => {
-                "WORKER_DEPLOYMENT_VERSION_STATUS_DRAINED"
-            }
-            WorkerDeploymentVersionStatus::Created => {
-                "WORKER_DEPLOYMENT_VERSION_STATUS_CREATED"
-            }
+            Self::Unspecified => "WORKER_DEPLOYMENT_VERSION_STATUS_UNSPECIFIED",
+            Self::Inactive => "WORKER_DEPLOYMENT_VERSION_STATUS_INACTIVE",
+            Self::Current => "WORKER_DEPLOYMENT_VERSION_STATUS_CURRENT",
+            Self::Ramping => "WORKER_DEPLOYMENT_VERSION_STATUS_RAMPING",
+            Self::Draining => "WORKER_DEPLOYMENT_VERSION_STATUS_DRAINING",
+            Self::Drained => "WORKER_DEPLOYMENT_VERSION_STATUS_DRAINED",
+            Self::Created => "WORKER_DEPLOYMENT_VERSION_STATUS_CREATED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1788,10 +1695,10 @@ impl TaskQueueKind {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            TaskQueueKind::Unspecified => "TASK_QUEUE_KIND_UNSPECIFIED",
-            TaskQueueKind::Normal => "TASK_QUEUE_KIND_NORMAL",
-            TaskQueueKind::Sticky => "TASK_QUEUE_KIND_STICKY",
-            TaskQueueKind::WorkerCommands => "TASK_QUEUE_KIND_WORKER_COMMANDS",
+            Self::Unspecified => "TASK_QUEUE_KIND_UNSPECIFIED",
+            Self::Normal => "TASK_QUEUE_KIND_NORMAL",
+            Self::Sticky => "TASK_QUEUE_KIND_STICKY",
+            Self::WorkerCommands => "TASK_QUEUE_KIND_WORKER_COMMANDS",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1823,10 +1730,10 @@ impl TaskQueueType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            TaskQueueType::Unspecified => "TASK_QUEUE_TYPE_UNSPECIFIED",
-            TaskQueueType::Workflow => "TASK_QUEUE_TYPE_WORKFLOW",
-            TaskQueueType::Activity => "TASK_QUEUE_TYPE_ACTIVITY",
-            TaskQueueType::Nexus => "TASK_QUEUE_TYPE_NEXUS",
+            Self::Unspecified => "TASK_QUEUE_TYPE_UNSPECIFIED",
+            Self::Workflow => "TASK_QUEUE_TYPE_WORKFLOW",
+            Self::Activity => "TASK_QUEUE_TYPE_ACTIVITY",
+            Self::Nexus => "TASK_QUEUE_TYPE_NEXUS",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1867,11 +1774,11 @@ impl TaskReachability {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            TaskReachability::Unspecified => "TASK_REACHABILITY_UNSPECIFIED",
-            TaskReachability::NewWorkflows => "TASK_REACHABILITY_NEW_WORKFLOWS",
-            TaskReachability::ExistingWorkflows => "TASK_REACHABILITY_EXISTING_WORKFLOWS",
-            TaskReachability::OpenWorkflows => "TASK_REACHABILITY_OPEN_WORKFLOWS",
-            TaskReachability::ClosedWorkflows => "TASK_REACHABILITY_CLOSED_WORKFLOWS",
+            Self::Unspecified => "TASK_REACHABILITY_UNSPECIFIED",
+            Self::NewWorkflows => "TASK_REACHABILITY_NEW_WORKFLOWS",
+            Self::ExistingWorkflows => "TASK_REACHABILITY_EXISTING_WORKFLOWS",
+            Self::OpenWorkflows => "TASK_REACHABILITY_OPEN_WORKFLOWS",
+            Self::ClosedWorkflows => "TASK_REACHABILITY_CLOSED_WORKFLOWS",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1920,16 +1827,12 @@ impl BuildIdTaskReachability {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            BuildIdTaskReachability::Unspecified => {
-                "BUILD_ID_TASK_REACHABILITY_UNSPECIFIED"
-            }
-            BuildIdTaskReachability::Reachable => "BUILD_ID_TASK_REACHABILITY_REACHABLE",
-            BuildIdTaskReachability::ClosedWorkflowsOnly => {
+            Self::Unspecified => "BUILD_ID_TASK_REACHABILITY_UNSPECIFIED",
+            Self::Reachable => "BUILD_ID_TASK_REACHABILITY_REACHABLE",
+            Self::ClosedWorkflowsOnly => {
                 "BUILD_ID_TASK_REACHABILITY_CLOSED_WORKFLOWS_ONLY"
             }
-            BuildIdTaskReachability::Unreachable => {
-                "BUILD_ID_TASK_REACHABILITY_UNREACHABLE"
-            }
+            Self::Unreachable => "BUILD_ID_TASK_REACHABILITY_UNREACHABLE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1960,8 +1863,8 @@ impl DescribeTaskQueueMode {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            DescribeTaskQueueMode::Unspecified => "DESCRIBE_TASK_QUEUE_MODE_UNSPECIFIED",
-            DescribeTaskQueueMode::Enhanced => "DESCRIBE_TASK_QUEUE_MODE_ENHANCED",
+            Self::Unspecified => "DESCRIBE_TASK_QUEUE_MODE_UNSPECIFIED",
+            Self::Enhanced => "DESCRIBE_TASK_QUEUE_MODE_ENHANCED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1992,10 +1895,10 @@ impl RateLimitSource {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            RateLimitSource::Unspecified => "RATE_LIMIT_SOURCE_UNSPECIFIED",
-            RateLimitSource::Api => "RATE_LIMIT_SOURCE_API",
-            RateLimitSource::Worker => "RATE_LIMIT_SOURCE_WORKER",
-            RateLimitSource::System => "RATE_LIMIT_SOURCE_SYSTEM",
+            Self::Unspecified => "RATE_LIMIT_SOURCE_UNSPECIFIED",
+            Self::Api => "RATE_LIMIT_SOURCE_API",
+            Self::Worker => "RATE_LIMIT_SOURCE_WORKER",
+            Self::System => "RATE_LIMIT_SOURCE_SYSTEM",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2027,15 +1930,9 @@ impl RoutingConfigUpdateState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            RoutingConfigUpdateState::Unspecified => {
-                "ROUTING_CONFIG_UPDATE_STATE_UNSPECIFIED"
-            }
-            RoutingConfigUpdateState::InProgress => {
-                "ROUTING_CONFIG_UPDATE_STATE_IN_PROGRESS"
-            }
-            RoutingConfigUpdateState::Completed => {
-                "ROUTING_CONFIG_UPDATE_STATE_COMPLETED"
-            }
+            Self::Unspecified => "ROUTING_CONFIG_UPDATE_STATE_UNSPECIFIED",
+            Self::InProgress => "ROUTING_CONFIG_UPDATE_STATE_IN_PROGRESS",
+            Self::Completed => "ROUTING_CONFIG_UPDATE_STATE_COMPLETED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2052,7 +1949,7 @@ impl RoutingConfigUpdateState {
 /// The status is updated once, when the activity is originally scheduled, and again when the activity reaches a terminal
 /// status.
 /// (-- api-linter: core::0216::synonyms=disabled
-///      aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
+/// aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ActivityExecutionStatus {
@@ -2064,13 +1961,15 @@ pub enum ActivityExecutionStatus {
     /// requested if the worker calls RespondActivityTaskCompleted before acknowledging cancellation.
     Completed = 2,
     /// The activity failed. Causes:
-    /// - Worker returned a non-retryable failure
-    /// - RetryPolicy.maximum_attempts exhausted
-    /// - Attempt failed after cancellation was requested (retries blocked)
+    ///
+    /// * Worker returned a non-retryable failure
+    /// * RetryPolicy.maximum_attempts exhausted
+    /// * Attempt failed after cancellation was requested (retries blocked)
     Failed = 3,
     /// The activity was canceled. Reached when:
-    /// - Cancellation requested while SCHEDULED (immediate), or
-    /// - Cancellation requested while STARTED and worker called RespondActivityTaskCanceled.
+    ///
+    /// * Cancellation requested while SCHEDULED (immediate), or
+    /// * Cancellation requested while STARTED and worker called RespondActivityTaskCanceled.
     ///
     /// Workers discover cancellation requests via heartbeat responses (cancel_requested=true).
     /// Activities that do not heartbeat will not learn of cancellation and may complete, fail, or
@@ -2080,10 +1979,11 @@ pub enum ActivityExecutionStatus {
     /// The activity was terminated. Immediate; does not wait for worker acknowledgment.
     Terminated = 5,
     /// The activity timed out. See TimeoutType for the specific timeout.
-    /// - SCHEDULE_TO_START and SCHEDULE_TO_CLOSE timeouts always result in TIMED_OUT.
-    /// - START_TO_CLOSE and HEARTBEAT may retry if RetryPolicy permits; TIMED_OUT is
-    ///    reached when retry is blocked (RetryPolicy.maximum_attempts exhausted,
-    ///    SCHEDULE_TO_CLOSE would be exceeded, or cancellation has been requested).
+    ///
+    /// * SCHEDULE_TO_START and SCHEDULE_TO_CLOSE timeouts always result in TIMED_OUT.
+    /// * START_TO_CLOSE and HEARTBEAT may retry if RetryPolicy permits; TIMED_OUT is
+    ///   reached when retry is blocked (RetryPolicy.maximum_attempts exhausted,
+    ///   SCHEDULE_TO_CLOSE would be exceeded, or cancellation has been requested).
     TimedOut = 6,
 }
 impl ActivityExecutionStatus {
@@ -2093,15 +1993,13 @@ impl ActivityExecutionStatus {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ActivityExecutionStatus::Unspecified => {
-                "ACTIVITY_EXECUTION_STATUS_UNSPECIFIED"
-            }
-            ActivityExecutionStatus::Running => "ACTIVITY_EXECUTION_STATUS_RUNNING",
-            ActivityExecutionStatus::Completed => "ACTIVITY_EXECUTION_STATUS_COMPLETED",
-            ActivityExecutionStatus::Failed => "ACTIVITY_EXECUTION_STATUS_FAILED",
-            ActivityExecutionStatus::Canceled => "ACTIVITY_EXECUTION_STATUS_CANCELED",
-            ActivityExecutionStatus::Terminated => "ACTIVITY_EXECUTION_STATUS_TERMINATED",
-            ActivityExecutionStatus::TimedOut => "ACTIVITY_EXECUTION_STATUS_TIMED_OUT",
+            Self::Unspecified => "ACTIVITY_EXECUTION_STATUS_UNSPECIFIED",
+            Self::Running => "ACTIVITY_EXECUTION_STATUS_RUNNING",
+            Self::Completed => "ACTIVITY_EXECUTION_STATUS_COMPLETED",
+            Self::Failed => "ACTIVITY_EXECUTION_STATUS_FAILED",
+            Self::Canceled => "ACTIVITY_EXECUTION_STATUS_CANCELED",
+            Self::Terminated => "ACTIVITY_EXECUTION_STATUS_TERMINATED",
+            Self::TimedOut => "ACTIVITY_EXECUTION_STATUS_TIMED_OUT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2142,16 +2040,12 @@ impl ActivityIdReusePolicy {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ActivityIdReusePolicy::Unspecified => "ACTIVITY_ID_REUSE_POLICY_UNSPECIFIED",
-            ActivityIdReusePolicy::AllowDuplicate => {
-                "ACTIVITY_ID_REUSE_POLICY_ALLOW_DUPLICATE"
-            }
-            ActivityIdReusePolicy::AllowDuplicateFailedOnly => {
+            Self::Unspecified => "ACTIVITY_ID_REUSE_POLICY_UNSPECIFIED",
+            Self::AllowDuplicate => "ACTIVITY_ID_REUSE_POLICY_ALLOW_DUPLICATE",
+            Self::AllowDuplicateFailedOnly => {
                 "ACTIVITY_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY"
             }
-            ActivityIdReusePolicy::RejectDuplicate => {
-                "ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE"
-            }
+            Self::RejectDuplicate => "ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2187,13 +2081,9 @@ impl ActivityIdConflictPolicy {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ActivityIdConflictPolicy::Unspecified => {
-                "ACTIVITY_ID_CONFLICT_POLICY_UNSPECIFIED"
-            }
-            ActivityIdConflictPolicy::Fail => "ACTIVITY_ID_CONFLICT_POLICY_FAIL",
-            ActivityIdConflictPolicy::UseExisting => {
-                "ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING"
-            }
+            Self::Unspecified => "ACTIVITY_ID_CONFLICT_POLICY_UNSPECIFIED",
+            Self::Fail => "ACTIVITY_ID_CONFLICT_POLICY_FAIL",
+            Self::UseExisting => "ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2225,15 +2115,9 @@ impl NexusHandlerErrorRetryBehavior {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            NexusHandlerErrorRetryBehavior::Unspecified => {
-                "NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_UNSPECIFIED"
-            }
-            NexusHandlerErrorRetryBehavior::Retryable => {
-                "NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE"
-            }
-            NexusHandlerErrorRetryBehavior::NonRetryable => {
-                "NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_NON_RETRYABLE"
-            }
+            Self::Unspecified => "NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_UNSPECIFIED",
+            Self::Retryable => "NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE",
+            Self::NonRetryable => "NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_NON_RETRYABLE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2252,7 +2136,7 @@ impl NexusHandlerErrorRetryBehavior {
 /// The status is updated once, when the operation is originally scheduled, and again when the
 /// operation reaches a terminal status.
 /// (-- api-linter: core::0216::synonyms=disabled
-///      aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
+/// aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum NexusOperationExecutionStatus {
@@ -2280,27 +2164,13 @@ impl NexusOperationExecutionStatus {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            NexusOperationExecutionStatus::Unspecified => {
-                "NEXUS_OPERATION_EXECUTION_STATUS_UNSPECIFIED"
-            }
-            NexusOperationExecutionStatus::Running => {
-                "NEXUS_OPERATION_EXECUTION_STATUS_RUNNING"
-            }
-            NexusOperationExecutionStatus::Completed => {
-                "NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED"
-            }
-            NexusOperationExecutionStatus::Failed => {
-                "NEXUS_OPERATION_EXECUTION_STATUS_FAILED"
-            }
-            NexusOperationExecutionStatus::Canceled => {
-                "NEXUS_OPERATION_EXECUTION_STATUS_CANCELED"
-            }
-            NexusOperationExecutionStatus::Terminated => {
-                "NEXUS_OPERATION_EXECUTION_STATUS_TERMINATED"
-            }
-            NexusOperationExecutionStatus::TimedOut => {
-                "NEXUS_OPERATION_EXECUTION_STATUS_TIMED_OUT"
-            }
+            Self::Unspecified => "NEXUS_OPERATION_EXECUTION_STATUS_UNSPECIFIED",
+            Self::Running => "NEXUS_OPERATION_EXECUTION_STATUS_RUNNING",
+            Self::Completed => "NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED",
+            Self::Failed => "NEXUS_OPERATION_EXECUTION_STATUS_FAILED",
+            Self::Canceled => "NEXUS_OPERATION_EXECUTION_STATUS_CANCELED",
+            Self::Terminated => "NEXUS_OPERATION_EXECUTION_STATUS_TERMINATED",
+            Self::TimedOut => "NEXUS_OPERATION_EXECUTION_STATUS_TIMED_OUT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2334,11 +2204,9 @@ impl NexusOperationWaitStage {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            NexusOperationWaitStage::Unspecified => {
-                "NEXUS_OPERATION_WAIT_STAGE_UNSPECIFIED"
-            }
-            NexusOperationWaitStage::Started => "NEXUS_OPERATION_WAIT_STAGE_STARTED",
-            NexusOperationWaitStage::Closed => "NEXUS_OPERATION_WAIT_STAGE_CLOSED",
+            Self::Unspecified => "NEXUS_OPERATION_WAIT_STAGE_UNSPECIFIED",
+            Self::Started => "NEXUS_OPERATION_WAIT_STAGE_STARTED",
+            Self::Closed => "NEXUS_OPERATION_WAIT_STAGE_CLOSED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2375,18 +2243,12 @@ impl NexusOperationIdReusePolicy {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            NexusOperationIdReusePolicy::Unspecified => {
-                "NEXUS_OPERATION_ID_REUSE_POLICY_UNSPECIFIED"
-            }
-            NexusOperationIdReusePolicy::AllowDuplicate => {
-                "NEXUS_OPERATION_ID_REUSE_POLICY_ALLOW_DUPLICATE"
-            }
-            NexusOperationIdReusePolicy::AllowDuplicateFailedOnly => {
+            Self::Unspecified => "NEXUS_OPERATION_ID_REUSE_POLICY_UNSPECIFIED",
+            Self::AllowDuplicate => "NEXUS_OPERATION_ID_REUSE_POLICY_ALLOW_DUPLICATE",
+            Self::AllowDuplicateFailedOnly => {
                 "NEXUS_OPERATION_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY"
             }
-            NexusOperationIdReusePolicy::RejectDuplicate => {
-                "NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE"
-            }
+            Self::RejectDuplicate => "NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2426,15 +2288,9 @@ impl NexusOperationIdConflictPolicy {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            NexusOperationIdConflictPolicy::Unspecified => {
-                "NEXUS_OPERATION_ID_CONFLICT_POLICY_UNSPECIFIED"
-            }
-            NexusOperationIdConflictPolicy::Fail => {
-                "NEXUS_OPERATION_ID_CONFLICT_POLICY_FAIL"
-            }
-            NexusOperationIdConflictPolicy::UseExisting => {
-                "NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING"
-            }
+            Self::Unspecified => "NEXUS_OPERATION_ID_CONFLICT_POLICY_UNSPECIFIED",
+            Self::Fail => "NEXUS_OPERATION_ID_CONFLICT_POLICY_FAIL",
+            Self::UseExisting => "NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2468,22 +2324,18 @@ impl BatchOperationType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            BatchOperationType::Unspecified => "BATCH_OPERATION_TYPE_UNSPECIFIED",
-            BatchOperationType::Terminate => "BATCH_OPERATION_TYPE_TERMINATE",
-            BatchOperationType::Cancel => "BATCH_OPERATION_TYPE_CANCEL",
-            BatchOperationType::Signal => "BATCH_OPERATION_TYPE_SIGNAL",
-            BatchOperationType::Delete => "BATCH_OPERATION_TYPE_DELETE",
-            BatchOperationType::Reset => "BATCH_OPERATION_TYPE_RESET",
-            BatchOperationType::UpdateExecutionOptions => {
+            Self::Unspecified => "BATCH_OPERATION_TYPE_UNSPECIFIED",
+            Self::Terminate => "BATCH_OPERATION_TYPE_TERMINATE",
+            Self::Cancel => "BATCH_OPERATION_TYPE_CANCEL",
+            Self::Signal => "BATCH_OPERATION_TYPE_SIGNAL",
+            Self::Delete => "BATCH_OPERATION_TYPE_DELETE",
+            Self::Reset => "BATCH_OPERATION_TYPE_RESET",
+            Self::UpdateExecutionOptions => {
                 "BATCH_OPERATION_TYPE_UPDATE_EXECUTION_OPTIONS"
             }
-            BatchOperationType::UnpauseActivity => {
-                "BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY"
-            }
-            BatchOperationType::UpdateActivityOptions => {
-                "BATCH_OPERATION_TYPE_UPDATE_ACTIVITY_OPTIONS"
-            }
-            BatchOperationType::ResetActivity => "BATCH_OPERATION_TYPE_RESET_ACTIVITY",
+            Self::UnpauseActivity => "BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY",
+            Self::UpdateActivityOptions => "BATCH_OPERATION_TYPE_UPDATE_ACTIVITY_OPTIONS",
+            Self::ResetActivity => "BATCH_OPERATION_TYPE_RESET_ACTIVITY",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2522,10 +2374,10 @@ impl BatchOperationState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            BatchOperationState::Unspecified => "BATCH_OPERATION_STATE_UNSPECIFIED",
-            BatchOperationState::Running => "BATCH_OPERATION_STATE_RUNNING",
-            BatchOperationState::Completed => "BATCH_OPERATION_STATE_COMPLETED",
-            BatchOperationState::Failed => "BATCH_OPERATION_STATE_FAILED",
+            Self::Unspecified => "BATCH_OPERATION_STATE_UNSPECIFIED",
+            Self::Running => "BATCH_OPERATION_STATE_RUNNING",
+            Self::Completed => "BATCH_OPERATION_STATE_COMPLETED",
+            Self::Failed => "BATCH_OPERATION_STATE_FAILED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2569,44 +2421,36 @@ impl CommandType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            CommandType::Unspecified => "COMMAND_TYPE_UNSPECIFIED",
-            CommandType::ScheduleActivityTask => "COMMAND_TYPE_SCHEDULE_ACTIVITY_TASK",
-            CommandType::RequestCancelActivityTask => {
+            Self::Unspecified => "COMMAND_TYPE_UNSPECIFIED",
+            Self::ScheduleActivityTask => "COMMAND_TYPE_SCHEDULE_ACTIVITY_TASK",
+            Self::RequestCancelActivityTask => {
                 "COMMAND_TYPE_REQUEST_CANCEL_ACTIVITY_TASK"
             }
-            CommandType::StartTimer => "COMMAND_TYPE_START_TIMER",
-            CommandType::CompleteWorkflowExecution => {
-                "COMMAND_TYPE_COMPLETE_WORKFLOW_EXECUTION"
-            }
-            CommandType::FailWorkflowExecution => "COMMAND_TYPE_FAIL_WORKFLOW_EXECUTION",
-            CommandType::CancelTimer => "COMMAND_TYPE_CANCEL_TIMER",
-            CommandType::CancelWorkflowExecution => {
-                "COMMAND_TYPE_CANCEL_WORKFLOW_EXECUTION"
-            }
-            CommandType::RequestCancelExternalWorkflowExecution => {
+            Self::StartTimer => "COMMAND_TYPE_START_TIMER",
+            Self::CompleteWorkflowExecution => "COMMAND_TYPE_COMPLETE_WORKFLOW_EXECUTION",
+            Self::FailWorkflowExecution => "COMMAND_TYPE_FAIL_WORKFLOW_EXECUTION",
+            Self::CancelTimer => "COMMAND_TYPE_CANCEL_TIMER",
+            Self::CancelWorkflowExecution => "COMMAND_TYPE_CANCEL_WORKFLOW_EXECUTION",
+            Self::RequestCancelExternalWorkflowExecution => {
                 "COMMAND_TYPE_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION"
             }
-            CommandType::RecordMarker => "COMMAND_TYPE_RECORD_MARKER",
-            CommandType::ContinueAsNewWorkflowExecution => {
+            Self::RecordMarker => "COMMAND_TYPE_RECORD_MARKER",
+            Self::ContinueAsNewWorkflowExecution => {
                 "COMMAND_TYPE_CONTINUE_AS_NEW_WORKFLOW_EXECUTION"
             }
-            CommandType::StartChildWorkflowExecution => {
+            Self::StartChildWorkflowExecution => {
                 "COMMAND_TYPE_START_CHILD_WORKFLOW_EXECUTION"
             }
-            CommandType::SignalExternalWorkflowExecution => {
+            Self::SignalExternalWorkflowExecution => {
                 "COMMAND_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION"
             }
-            CommandType::UpsertWorkflowSearchAttributes => {
+            Self::UpsertWorkflowSearchAttributes => {
                 "COMMAND_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES"
             }
-            CommandType::ProtocolMessage => "COMMAND_TYPE_PROTOCOL_MESSAGE",
-            CommandType::ModifyWorkflowProperties => {
-                "COMMAND_TYPE_MODIFY_WORKFLOW_PROPERTIES"
-            }
-            CommandType::ScheduleNexusOperation => {
-                "COMMAND_TYPE_SCHEDULE_NEXUS_OPERATION"
-            }
-            CommandType::RequestCancelNexusOperation => {
+            Self::ProtocolMessage => "COMMAND_TYPE_PROTOCOL_MESSAGE",
+            Self::ModifyWorkflowProperties => "COMMAND_TYPE_MODIFY_WORKFLOW_PROPERTIES",
+            Self::ScheduleNexusOperation => "COMMAND_TYPE_SCHEDULE_NEXUS_OPERATION",
+            Self::RequestCancelNexusOperation => {
                 "COMMAND_TYPE_REQUEST_CANCEL_NEXUS_OPERATION"
             }
         }
@@ -2738,118 +2582,104 @@ impl WorkflowTaskFailedCause {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            WorkflowTaskFailedCause::Unspecified => {
-                "WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED"
-            }
-            WorkflowTaskFailedCause::UnhandledCommand => {
-                "WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND"
-            }
-            WorkflowTaskFailedCause::BadScheduleActivityAttributes => {
+            Self::Unspecified => "WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED",
+            Self::UnhandledCommand => "WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND",
+            Self::BadScheduleActivityAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_ACTIVITY_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::BadRequestCancelActivityAttributes => {
+            Self::BadRequestCancelActivityAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_REQUEST_CANCEL_ACTIVITY_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::BadStartTimerAttributes => {
+            Self::BadStartTimerAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_START_TIMER_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::BadCancelTimerAttributes => {
+            Self::BadCancelTimerAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_CANCEL_TIMER_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::BadRecordMarkerAttributes => {
+            Self::BadRecordMarkerAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_RECORD_MARKER_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::BadCompleteWorkflowExecutionAttributes => {
+            Self::BadCompleteWorkflowExecutionAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_COMPLETE_WORKFLOW_EXECUTION_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::BadFailWorkflowExecutionAttributes => {
+            Self::BadFailWorkflowExecutionAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_FAIL_WORKFLOW_EXECUTION_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::BadCancelWorkflowExecutionAttributes => {
+            Self::BadCancelWorkflowExecutionAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_CANCEL_WORKFLOW_EXECUTION_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::BadRequestCancelExternalWorkflowExecutionAttributes => {
+            Self::BadRequestCancelExternalWorkflowExecutionAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::BadContinueAsNewAttributes => {
+            Self::BadContinueAsNewAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_CONTINUE_AS_NEW_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::StartTimerDuplicateId => {
+            Self::StartTimerDuplicateId => {
                 "WORKFLOW_TASK_FAILED_CAUSE_START_TIMER_DUPLICATE_ID"
             }
-            WorkflowTaskFailedCause::ResetStickyTaskQueue => {
+            Self::ResetStickyTaskQueue => {
                 "WORKFLOW_TASK_FAILED_CAUSE_RESET_STICKY_TASK_QUEUE"
             }
-            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure => {
+            Self::WorkflowWorkerUnhandledFailure => {
                 "WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_WORKER_UNHANDLED_FAILURE"
             }
-            WorkflowTaskFailedCause::BadSignalWorkflowExecutionAttributes => {
+            Self::BadSignalWorkflowExecutionAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_SIGNAL_WORKFLOW_EXECUTION_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::BadStartChildExecutionAttributes => {
+            Self::BadStartChildExecutionAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_START_CHILD_EXECUTION_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::ForceCloseCommand => {
-                "WORKFLOW_TASK_FAILED_CAUSE_FORCE_CLOSE_COMMAND"
-            }
-            WorkflowTaskFailedCause::FailoverCloseCommand => {
+            Self::ForceCloseCommand => "WORKFLOW_TASK_FAILED_CAUSE_FORCE_CLOSE_COMMAND",
+            Self::FailoverCloseCommand => {
                 "WORKFLOW_TASK_FAILED_CAUSE_FAILOVER_CLOSE_COMMAND"
             }
-            WorkflowTaskFailedCause::BadSignalInputSize => {
+            Self::BadSignalInputSize => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_SIGNAL_INPUT_SIZE"
             }
-            WorkflowTaskFailedCause::ResetWorkflow => {
-                "WORKFLOW_TASK_FAILED_CAUSE_RESET_WORKFLOW"
-            }
-            WorkflowTaskFailedCause::BadBinary => "WORKFLOW_TASK_FAILED_CAUSE_BAD_BINARY",
-            WorkflowTaskFailedCause::ScheduleActivityDuplicateId => {
+            Self::ResetWorkflow => "WORKFLOW_TASK_FAILED_CAUSE_RESET_WORKFLOW",
+            Self::BadBinary => "WORKFLOW_TASK_FAILED_CAUSE_BAD_BINARY",
+            Self::ScheduleActivityDuplicateId => {
                 "WORKFLOW_TASK_FAILED_CAUSE_SCHEDULE_ACTIVITY_DUPLICATE_ID"
             }
-            WorkflowTaskFailedCause::BadSearchAttributes => {
+            Self::BadSearchAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_SEARCH_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::NonDeterministicError => {
+            Self::NonDeterministicError => {
                 "WORKFLOW_TASK_FAILED_CAUSE_NON_DETERMINISTIC_ERROR"
             }
-            WorkflowTaskFailedCause::BadModifyWorkflowPropertiesAttributes => {
+            Self::BadModifyWorkflowPropertiesAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_MODIFY_WORKFLOW_PROPERTIES_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::PendingChildWorkflowsLimitExceeded => {
+            Self::PendingChildWorkflowsLimitExceeded => {
                 "WORKFLOW_TASK_FAILED_CAUSE_PENDING_CHILD_WORKFLOWS_LIMIT_EXCEEDED"
             }
-            WorkflowTaskFailedCause::PendingActivitiesLimitExceeded => {
+            Self::PendingActivitiesLimitExceeded => {
                 "WORKFLOW_TASK_FAILED_CAUSE_PENDING_ACTIVITIES_LIMIT_EXCEEDED"
             }
-            WorkflowTaskFailedCause::PendingSignalsLimitExceeded => {
+            Self::PendingSignalsLimitExceeded => {
                 "WORKFLOW_TASK_FAILED_CAUSE_PENDING_SIGNALS_LIMIT_EXCEEDED"
             }
-            WorkflowTaskFailedCause::PendingRequestCancelLimitExceeded => {
+            Self::PendingRequestCancelLimitExceeded => {
                 "WORKFLOW_TASK_FAILED_CAUSE_PENDING_REQUEST_CANCEL_LIMIT_EXCEEDED"
             }
-            WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage => {
+            Self::BadUpdateWorkflowExecutionMessage => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE"
             }
-            WorkflowTaskFailedCause::UnhandledUpdate => {
-                "WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_UPDATE"
-            }
-            WorkflowTaskFailedCause::BadScheduleNexusOperationAttributes => {
+            Self::UnhandledUpdate => "WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_UPDATE",
+            Self::BadScheduleNexusOperationAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::PendingNexusOperationsLimitExceeded => {
+            Self::PendingNexusOperationsLimitExceeded => {
                 "WORKFLOW_TASK_FAILED_CAUSE_PENDING_NEXUS_OPERATIONS_LIMIT_EXCEEDED"
             }
-            WorkflowTaskFailedCause::BadRequestCancelNexusOperationAttributes => {
+            Self::BadRequestCancelNexusOperationAttributes => {
                 "WORKFLOW_TASK_FAILED_CAUSE_BAD_REQUEST_CANCEL_NEXUS_OPERATION_ATTRIBUTES"
             }
-            WorkflowTaskFailedCause::FeatureDisabled => {
-                "WORKFLOW_TASK_FAILED_CAUSE_FEATURE_DISABLED"
-            }
-            WorkflowTaskFailedCause::GrpcMessageTooLarge => {
+            Self::FeatureDisabled => "WORKFLOW_TASK_FAILED_CAUSE_FEATURE_DISABLED",
+            Self::GrpcMessageTooLarge => {
                 "WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE"
             }
-            WorkflowTaskFailedCause::PayloadsTooLarge => {
-                "WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE"
-            }
+            Self::PayloadsTooLarge => "WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2977,13 +2807,13 @@ impl StartChildWorkflowExecutionFailedCause {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            StartChildWorkflowExecutionFailedCause::Unspecified => {
+            Self::Unspecified => {
                 "START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED"
             }
-            StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists => {
+            Self::WorkflowAlreadyExists => {
                 "START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS"
             }
-            StartChildWorkflowExecutionFailedCause::NamespaceNotFound => {
+            Self::NamespaceNotFound => {
                 "START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND"
             }
         }
@@ -3018,13 +2848,13 @@ impl CancelExternalWorkflowExecutionFailedCause {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            CancelExternalWorkflowExecutionFailedCause::Unspecified => {
+            Self::Unspecified => {
                 "CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED"
             }
-            CancelExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound => {
+            Self::ExternalWorkflowExecutionNotFound => {
                 "CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND"
             }
-            CancelExternalWorkflowExecutionFailedCause::NamespaceNotFound => {
+            Self::NamespaceNotFound => {
                 "CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND"
             }
         }
@@ -3061,16 +2891,16 @@ impl SignalExternalWorkflowExecutionFailedCause {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            SignalExternalWorkflowExecutionFailedCause::Unspecified => {
+            Self::Unspecified => {
                 "SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED"
             }
-            SignalExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound => {
+            Self::ExternalWorkflowExecutionNotFound => {
                 "SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND"
             }
-            SignalExternalWorkflowExecutionFailedCause::NamespaceNotFound => {
+            Self::NamespaceNotFound => {
                 "SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND"
             }
-            SignalExternalWorkflowExecutionFailedCause::SignalCountLimitExceeded => {
+            Self::SignalCountLimitExceeded => {
                 "SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_SIGNAL_COUNT_LIMIT_EXCEEDED"
             }
         }
@@ -3126,29 +2956,19 @@ impl ResourceExhaustedCause {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ResourceExhaustedCause::Unspecified => "RESOURCE_EXHAUSTED_CAUSE_UNSPECIFIED",
-            ResourceExhaustedCause::RpsLimit => "RESOURCE_EXHAUSTED_CAUSE_RPS_LIMIT",
-            ResourceExhaustedCause::ConcurrentLimit => {
-                "RESOURCE_EXHAUSTED_CAUSE_CONCURRENT_LIMIT"
-            }
-            ResourceExhaustedCause::SystemOverloaded => {
-                "RESOURCE_EXHAUSTED_CAUSE_SYSTEM_OVERLOADED"
-            }
-            ResourceExhaustedCause::PersistenceLimit => {
-                "RESOURCE_EXHAUSTED_CAUSE_PERSISTENCE_LIMIT"
-            }
-            ResourceExhaustedCause::BusyWorkflow => {
-                "RESOURCE_EXHAUSTED_CAUSE_BUSY_WORKFLOW"
-            }
-            ResourceExhaustedCause::ApsLimit => "RESOURCE_EXHAUSTED_CAUSE_APS_LIMIT",
-            ResourceExhaustedCause::PersistenceStorageLimit => {
+            Self::Unspecified => "RESOURCE_EXHAUSTED_CAUSE_UNSPECIFIED",
+            Self::RpsLimit => "RESOURCE_EXHAUSTED_CAUSE_RPS_LIMIT",
+            Self::ConcurrentLimit => "RESOURCE_EXHAUSTED_CAUSE_CONCURRENT_LIMIT",
+            Self::SystemOverloaded => "RESOURCE_EXHAUSTED_CAUSE_SYSTEM_OVERLOADED",
+            Self::PersistenceLimit => "RESOURCE_EXHAUSTED_CAUSE_PERSISTENCE_LIMIT",
+            Self::BusyWorkflow => "RESOURCE_EXHAUSTED_CAUSE_BUSY_WORKFLOW",
+            Self::ApsLimit => "RESOURCE_EXHAUSTED_CAUSE_APS_LIMIT",
+            Self::PersistenceStorageLimit => {
                 "RESOURCE_EXHAUSTED_CAUSE_PERSISTENCE_STORAGE_LIMIT"
             }
-            ResourceExhaustedCause::CircuitBreakerOpen => {
-                "RESOURCE_EXHAUSTED_CAUSE_CIRCUIT_BREAKER_OPEN"
-            }
-            ResourceExhaustedCause::OpsLimit => "RESOURCE_EXHAUSTED_CAUSE_OPS_LIMIT",
-            ResourceExhaustedCause::WorkerDeploymentLimits => {
+            Self::CircuitBreakerOpen => "RESOURCE_EXHAUSTED_CAUSE_CIRCUIT_BREAKER_OPEN",
+            Self::OpsLimit => "RESOURCE_EXHAUSTED_CAUSE_OPS_LIMIT",
+            Self::WorkerDeploymentLimits => {
                 "RESOURCE_EXHAUSTED_CAUSE_WORKER_DEPLOYMENT_LIMITS"
             }
         }
@@ -3193,9 +3013,9 @@ impl ResourceExhaustedScope {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ResourceExhaustedScope::Unspecified => "RESOURCE_EXHAUSTED_SCOPE_UNSPECIFIED",
-            ResourceExhaustedScope::Namespace => "RESOURCE_EXHAUSTED_SCOPE_NAMESPACE",
-            ResourceExhaustedScope::System => "RESOURCE_EXHAUSTED_SCOPE_SYSTEM",
+            Self::Unspecified => "RESOURCE_EXHAUSTED_SCOPE_UNSPECIFIED",
+            Self::Namespace => "RESOURCE_EXHAUSTED_SCOPE_NAMESPACE",
+            Self::System => "RESOURCE_EXHAUSTED_SCOPE_SYSTEM",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3223,10 +3043,10 @@ impl NamespaceState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            NamespaceState::Unspecified => "NAMESPACE_STATE_UNSPECIFIED",
-            NamespaceState::Registered => "NAMESPACE_STATE_REGISTERED",
-            NamespaceState::Deprecated => "NAMESPACE_STATE_DEPRECATED",
-            NamespaceState::Deleted => "NAMESPACE_STATE_DELETED",
+            Self::Unspecified => "NAMESPACE_STATE_UNSPECIFIED",
+            Self::Registered => "NAMESPACE_STATE_REGISTERED",
+            Self::Deprecated => "NAMESPACE_STATE_DEPRECATED",
+            Self::Deleted => "NAMESPACE_STATE_DELETED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3254,9 +3074,9 @@ impl ArchivalState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ArchivalState::Unspecified => "ARCHIVAL_STATE_UNSPECIFIED",
-            ArchivalState::Disabled => "ARCHIVAL_STATE_DISABLED",
-            ArchivalState::Enabled => "ARCHIVAL_STATE_ENABLED",
+            Self::Unspecified => "ARCHIVAL_STATE_UNSPECIFIED",
+            Self::Disabled => "ARCHIVAL_STATE_DISABLED",
+            Self::Enabled => "ARCHIVAL_STATE_ENABLED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3283,9 +3103,9 @@ impl ReplicationState {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ReplicationState::Unspecified => "REPLICATION_STATE_UNSPECIFIED",
-            ReplicationState::Normal => "REPLICATION_STATE_NORMAL",
-            ReplicationState::Handover => "REPLICATION_STATE_HANDOVER",
+            Self::Unspecified => "REPLICATION_STATE_UNSPECIFIED",
+            Self::Normal => "REPLICATION_STATE_NORMAL",
+            Self::Handover => "REPLICATION_STATE_HANDOVER",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3312,9 +3132,9 @@ impl QueryResultType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            QueryResultType::Unspecified => "QUERY_RESULT_TYPE_UNSPECIFIED",
-            QueryResultType::Answered => "QUERY_RESULT_TYPE_ANSWERED",
-            QueryResultType::Failed => "QUERY_RESULT_TYPE_FAILED",
+            Self::Unspecified => "QUERY_RESULT_TYPE_UNSPECIFIED",
+            Self::Answered => "QUERY_RESULT_TYPE_ANSWERED",
+            Self::Failed => "QUERY_RESULT_TYPE_FAILED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3345,12 +3165,10 @@ impl QueryRejectCondition {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            QueryRejectCondition::Unspecified => "QUERY_REJECT_CONDITION_UNSPECIFIED",
-            QueryRejectCondition::None => "QUERY_REJECT_CONDITION_NONE",
-            QueryRejectCondition::NotOpen => "QUERY_REJECT_CONDITION_NOT_OPEN",
-            QueryRejectCondition::NotCompletedCleanly => {
-                "QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY"
-            }
+            Self::Unspecified => "QUERY_REJECT_CONDITION_UNSPECIFIED",
+            Self::None => "QUERY_REJECT_CONDITION_NONE",
+            Self::NotOpen => "QUERY_REJECT_CONDITION_NOT_OPEN",
+            Self::NotCompletedCleanly => "QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3401,15 +3219,13 @@ impl ScheduleOverlapPolicy {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            ScheduleOverlapPolicy::Unspecified => "SCHEDULE_OVERLAP_POLICY_UNSPECIFIED",
-            ScheduleOverlapPolicy::Skip => "SCHEDULE_OVERLAP_POLICY_SKIP",
-            ScheduleOverlapPolicy::BufferOne => "SCHEDULE_OVERLAP_POLICY_BUFFER_ONE",
-            ScheduleOverlapPolicy::BufferAll => "SCHEDULE_OVERLAP_POLICY_BUFFER_ALL",
-            ScheduleOverlapPolicy::CancelOther => "SCHEDULE_OVERLAP_POLICY_CANCEL_OTHER",
-            ScheduleOverlapPolicy::TerminateOther => {
-                "SCHEDULE_OVERLAP_POLICY_TERMINATE_OTHER"
-            }
-            ScheduleOverlapPolicy::AllowAll => "SCHEDULE_OVERLAP_POLICY_ALLOW_ALL",
+            Self::Unspecified => "SCHEDULE_OVERLAP_POLICY_UNSPECIFIED",
+            Self::Skip => "SCHEDULE_OVERLAP_POLICY_SKIP",
+            Self::BufferOne => "SCHEDULE_OVERLAP_POLICY_BUFFER_ONE",
+            Self::BufferAll => "SCHEDULE_OVERLAP_POLICY_BUFFER_ALL",
+            Self::CancelOther => "SCHEDULE_OVERLAP_POLICY_CANCEL_OTHER",
+            Self::TerminateOther => "SCHEDULE_OVERLAP_POLICY_TERMINATE_OTHER",
+            Self::AllowAll => "SCHEDULE_OVERLAP_POLICY_ALLOW_ALL",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3459,18 +3275,10 @@ impl UpdateWorkflowExecutionLifecycleStage {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            UpdateWorkflowExecutionLifecycleStage::Unspecified => {
-                "UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_UNSPECIFIED"
-            }
-            UpdateWorkflowExecutionLifecycleStage::Admitted => {
-                "UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ADMITTED"
-            }
-            UpdateWorkflowExecutionLifecycleStage::Accepted => {
-                "UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED"
-            }
-            UpdateWorkflowExecutionLifecycleStage::Completed => {
-                "UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED"
-            }
+            Self::Unspecified => "UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_UNSPECIFIED",
+            Self::Admitted => "UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ADMITTED",
+            Self::Accepted => "UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED",
+            Self::Completed => "UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3506,10 +3314,8 @@ impl UpdateAdmittedEventOrigin {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            UpdateAdmittedEventOrigin::Unspecified => {
-                "UPDATE_ADMITTED_EVENT_ORIGIN_UNSPECIFIED"
-            }
-            UpdateAdmittedEventOrigin::Reapply => "UPDATE_ADMITTED_EVENT_ORIGIN_REAPPLY",
+            Self::Unspecified => "UPDATE_ADMITTED_EVENT_ORIGIN_UNSPECIFIED",
+            Self::Reapply => "UPDATE_ADMITTED_EVENT_ORIGIN_REAPPLY",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.

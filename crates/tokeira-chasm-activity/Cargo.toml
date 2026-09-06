@@ -21,7 +21,7 @@ publish = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
-prost = "0.12"
+prost = "0.14"
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 tokeira-chasm = { path = "../tokeira-chasm", version = "0.2.0" }
 tokeira-chasm-derive = { path = "../tokeira-chasm-derive", version = "0.2.0" }

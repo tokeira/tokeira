@@ -633,80 +633,122 @@ async fn compression_matrix_matches_the_golden() -> Result<()> {
 // Reflection inventory (network surfaces)
 // ---------------------------------------------------------------------------
 
-async fn reflection_inventory(addr: SocketAddr) -> Result<Value> {
-    use tonic_reflection::pb::{
-        ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
-        server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
-    };
+/// One probe per reflection protocol; the generated client types differ only
+/// by module, so the body is written once.
+macro_rules! reflection_probe {
+    ($name:ident, $version:ident) => {
+        async fn $name(addr: SocketAddr) -> Result<Value> {
+            use tonic_reflection::pb::$version::{
+                ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+                server_reflection_request::MessageRequest,
+                server_reflection_response::MessageResponse,
+            };
 
-    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
-    let mut client = ServerReflectionClient::new(channel);
+            let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+                .connect()
+                .await?;
+            let mut client = ServerReflectionClient::new(channel);
 
-    let list = ServerReflectionRequest {
-        host: String::new(),
-        message_request: Some(MessageRequest::ListServices(String::new())),
-    };
-    let mut responses = client
-        .server_reflection_info(tokio_stream::once(list))
-        .await?
-        .into_inner();
-    let response = tokio::time::timeout(STEP, responses.message())
-        .await
-        .context("reflection did not list services")??
-        .context("reflection stream ended")?;
-    let Some(MessageResponse::ListServicesResponse(listed)) = response.message_response else {
-        bail!("reflection must answer ListServices with a service list");
-    };
-    let mut services: Vec<String> = listed
-        .service
-        .into_iter()
-        .map(|service| service.name)
-        .collect();
-    services.sort();
+            let list = ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::ListServices(String::new())),
+            };
+            let mut responses = client
+                .server_reflection_info(tokio_stream::once(list))
+                .await?
+                .into_inner();
+            let response = tokio::time::timeout(STEP, responses.message())
+                .await
+                .context("reflection did not list services")??
+                .context("reflection stream ended")?;
+            let Some(MessageResponse::ListServicesResponse(listed)) = response.message_response
+            else {
+                bail!("reflection must answer ListServices with a service list");
+            };
+            let mut services: Vec<String> = listed
+                .service
+                .into_iter()
+                .map(|service| service.name)
+                .collect();
+            services.sort();
 
-    let symbol = ServerReflectionRequest {
-        host: String::new(),
-        message_request: Some(MessageRequest::FileContainingSymbol(
-            WORKFLOW_SERVICE.to_owned(),
-        )),
-    };
-    let mut responses = client
-        .server_reflection_info(tokio_stream::once(symbol))
-        .await?
-        .into_inner();
-    let response = tokio::time::timeout(STEP, responses.message())
-        .await
-        .context("reflection did not resolve the symbol")??
-        .context("reflection stream ended")?;
-    let Some(MessageResponse::FileDescriptorResponse(files)) = response.message_response else {
-        bail!("reflection must answer FileContainingSymbol with descriptors");
-    };
-    let mut names: Vec<String> = files
-        .file_descriptor_proto
-        .iter()
-        .map(|bytes| prost_types::FileDescriptorProto::decode(bytes.as_slice()))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|file| file.name.unwrap_or_default())
-        .collect();
-    names.sort();
+            let symbol = ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingSymbol(
+                    WORKFLOW_SERVICE.to_owned(),
+                )),
+            };
+            let mut responses = client
+                .server_reflection_info(tokio_stream::once(symbol))
+                .await?
+                .into_inner();
+            let response = tokio::time::timeout(STEP, responses.message())
+                .await
+                .context("reflection did not resolve the symbol")??
+                .context("reflection stream ended")?;
+            let Some(MessageResponse::FileDescriptorResponse(files)) = response.message_response
+            else {
+                bail!("reflection must answer FileContainingSymbol with descriptors");
+            };
+            let mut names: Vec<String> = files
+                .file_descriptor_proto
+                .iter()
+                .map(|bytes| prost_types::FileDescriptorProto::decode(bytes.as_slice()))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|file| file.name.unwrap_or_default())
+                .collect();
+            names.sort();
 
-    Ok(json!({ "services": services, "workflow_service_files": names }))
+            Ok(json!({ "services": services, "workflow_service_files": names }))
+        }
+    };
 }
+
+reflection_probe!(reflection_inventory_v1alpha, v1alpha);
+reflection_probe!(reflection_inventory_v1, v1);
 
 // Feature: tonic-0-14-grpc-stack, Property 7: reflection inventory
 #[tokio::test]
 async fn reflection_listing_matches_the_golden() -> Result<()> {
     let surfaces = Surfaces::start().await?;
-    let host = reflection_inventory(surfaces.listener.bound_addr()).await?;
-    let public = reflection_inventory(surfaces.public_addr()).await?;
+    let host_addr = surfaces.listener.bound_addr();
+    let public_addr = surfaces.public_addr();
+
+    // `v1alpha` is the protocol the golden was captured with; it must answer
+    // exactly as before on both listeners.
+    let host_v1alpha = reflection_inventory_v1alpha(host_addr).await?;
+    let public_v1alpha = reflection_inventory_v1alpha(public_addr).await?;
     ensure!(
-        host == public,
-        "reflection differs between the host and public listeners"
+        host_v1alpha == public_v1alpha,
+        "v1alpha reflection differs between the host and public listeners"
     );
-    check_fixture("reflection", &json!({ "v1alpha": host }))?;
+
+    // `v1` is served next to it and lists the same services, with its own
+    // name in place of the v1alpha service's, over the same descriptors.
+    let host_v1 = reflection_inventory_v1(host_addr).await?;
+    let public_v1 = reflection_inventory_v1(public_addr).await?;
+    ensure!(
+        host_v1 == public_v1,
+        "v1 reflection differs between the host and public listeners"
+    );
+    let mut expected_v1 = host_v1alpha.clone();
+    if let Some(Value::Array(services)) = expected_v1.get_mut("services") {
+        for service in services.iter_mut() {
+            if service == "grpc.reflection.v1alpha.ServerReflection" {
+                *service = json!("grpc.reflection.v1.ServerReflection");
+            }
+        }
+        services.sort_by_key(|service| service.to_string());
+    }
+    ensure!(
+        host_v1 == expected_v1,
+        "v1 reflection must mirror v1alpha:\n{}\nvs\n{}",
+        serde_json::to_string_pretty(&host_v1)?,
+        serde_json::to_string_pretty(&expected_v1)?
+    );
+
+    check_fixture("reflection", &json!({ "v1alpha": host_v1alpha }))?;
     surfaces.shutdown().await
 }
 
@@ -921,7 +963,7 @@ proptest! {
             Bytes::from(details.clone()),
             metadata,
         );
-        let response = status.to_http();
+        let response = status.into_http::<tonic::body::Body>();
         let decoded = Status::from_header_map(response.headers()).expect("a status is present");
         prop_assert_eq!(decoded.code(), Code::from_i32(code));
         prop_assert_eq!(decoded.message(), message.as_str());

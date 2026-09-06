@@ -13,12 +13,12 @@ use std::{
 };
 
 use bytes::Bytes;
-use http_body_legacy::Body as _;
-use hyper_legacy::{Body, Request, Response};
+use http::{Request, Response};
+use http_body_util::{BodyExt as _, Full};
 use tokeira_edge::nexus_http::{
     MAX_NEXUS_PAYLOAD_BYTES, NexusHttpHandler, NexusHttpRequest, NexusHttpResponse,
 };
-use tonic::body::BoxBody;
+use tonic::body::Body;
 use tower::{Layer, Service};
 
 /// Tower layer routing caller-facing Nexus HTTP requests to the edge handler.
@@ -54,11 +54,11 @@ pub(crate) struct NexusHttpService<S> {
 
 impl<S> Service<Request<Body>> for NexusHttpService<S>
 where
-    S: Service<Request<Body>, Response = Response<BoxBody>> + Clone + Send + 'static,
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
 {
-    type Response = Response<BoxBody>;
+    type Response = Response<Body>;
     type Error = S::Error;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
@@ -78,9 +78,14 @@ where
             let mut collected = Vec::new();
             let mut body_too_large = false;
             let mut body_read_failed = false;
-            while let Some(chunk) = body.data().await {
-                match chunk {
-                    Ok(chunk) => {
+            // Frames are read one at a time so the bound applies before a
+            // chunk is copied, exactly as the previous body API allowed.
+            while let Some(frame) = body.frame().await {
+                match frame {
+                    Ok(frame) => {
+                        let Ok(chunk) = frame.into_data() else {
+                            continue;
+                        };
                         if collected.len().saturating_add(chunk.len()) > MAX_NEXUS_PAYLOAD_BYTES {
                             body_too_large = true;
                             break;
@@ -119,20 +124,19 @@ where
     }
 }
 
-fn to_http_response(response: NexusHttpResponse) -> Response<BoxBody> {
+fn to_http_response(response: NexusHttpResponse) -> Response<Body> {
     let mut builder = Response::builder().status(response.status);
     for (name, value) in response.headers {
         builder = builder.header(name, value);
     }
-    let body = http_body_legacy::Full::new(Bytes::from(response.body))
-        .map_err(|never| match never {})
-        .boxed_unsync();
-    builder.body(body).unwrap_or_else(|_| {
-        Response::builder()
-            .status(500)
-            .body(tonic::body::empty_body())
-            .expect("static fallback response is valid")
-    })
+    builder
+        .body(Body::new(Full::new(Bytes::from(response.body))))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(500)
+                .body(Body::default())
+                .expect("static fallback response is valid")
+        })
 }
 
 #[cfg(test)]
@@ -160,7 +164,7 @@ mod tests {
     }
 
     impl Service<Request<Body>> for CountingService {
-        type Response = Response<BoxBody>;
+        type Response = Response<Body>;
         type Error = Infallible;
         type Future = Ready<Result<Self::Response, Self::Error>>;
 
@@ -172,7 +176,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             ready(Ok(Response::builder()
                 .status(204)
-                .body(tonic::body::empty_body())
+                .body(Body::default())
                 .expect("static response")))
         }
     }
@@ -201,7 +205,7 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo")
-            .body(Body::empty())
+            .body(Body::default())
             .expect("request");
 
         let response = service.call(request).await.expect("infallible");
@@ -219,7 +223,11 @@ mod tests {
             .method("POST")
             .uri("/namespaces/default/task-queues/queue/nexus-services/service/operation")
             .header("content-type", "application/json")
-            .body(Body::from(vec![b'a'; MAX_NEXUS_PAYLOAD_BYTES + 1]))
+            .body(Body::new(Full::new(Bytes::from(vec![
+                b'a';
+                MAX_NEXUS_PAYLOAD_BYTES
+                    + 1
+            ]))))
             .expect("request");
 
         let response = service.call(request).await.expect("infallible");

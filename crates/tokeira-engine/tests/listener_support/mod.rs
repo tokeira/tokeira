@@ -14,7 +14,8 @@ use tokeira_proto::{
     taskqueue::TaskQueue,
     workflowservice::{GetSystemInfoRequest, GetSystemInfoResponse},
 };
-use tonic::{Status, client::Grpc, codec::ProstCodec, codegen::http::uri::PathAndQuery};
+use tonic::{Status, client::Grpc, codegen::http::uri::PathAndQuery};
+use tonic_prost::ProstCodec;
 
 pub(crate) const WORKFLOW_SERVICE: &str = "temporal.api.workflowservice.v1.WorkflowService";
 /// Every step is bounded well below the 60 s server long poll so a wrong

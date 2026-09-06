@@ -33,12 +33,12 @@ ignore = [
     "RUSTSEC-2026-0099", # rustls-webpki: name constraints for wildcard certs
     "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
     # h2 0.3.27 is the final release of the EOL 0.3 line; the fix ships only in
-    # 0.4.16+. Two parents keep the 0.3 copy: the legacy AWS client stack above
-    # (client-only, peer is AWS) and tonic 0.11, which serves the public gRPC
-    # port on hyper 0.14, so the unbounded empty-DATA-frame flaw is reachable
-    # by any peer of that listener. This entry is a stop-gap, not an assessment
-    # of non-exposure; it goes when the edge moves to tonic 0.14 / hyper 1.
-    "RUSTSEC-2026-0258", # h2 0.3: unbounded empty DATA frames (tonic 0.11 server + legacy AWS client)
+    # 0.4.16+. The one remaining parent is the legacy AWS client stack above,
+    # which acts only as an HTTPS client to AWS service endpoints, so the
+    # unbounded empty-DATA-frame flaw has no untrusted peer; every server
+    # surface runs h2 0.4 (tonic 0.14 / hyper 1). Drop this entry with the
+    # rustls-webpki ones when the connector pin moves.
+    "RUSTSEC-2026-0258", # h2 0.3: unbounded empty DATA frames (client-only legacy AWS stack)
 ]
 
 [licenses]

@@ -11,8 +11,6 @@ engineering rules (lint wall, kernel purity, documentation standards), see
   `rust-toolchain.toml` and picked up automatically. Formatting uses
   nightly-only rustfmt options, so also install a nightly toolchain
   (`rustup toolchain install nightly`).
-- **protoc** — `tokeira-proto` compiles the vendored Temporal protos at build
-  time (`apt install protobuf-compiler` / `brew install protobuf`).
 - **Docker** — only for the compose platform and container image work; the
   default test suite does not need it.
 - **Dagger 0.20+** — only for `tkr image build`.

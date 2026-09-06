@@ -29,7 +29,7 @@ metrics.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 percent-encoding = "2"
-prost-types = "0.12"
+prost-types = "0.14"
 reqwest.workspace = true
 url = "2"
 serde.workspace = true
@@ -51,7 +51,7 @@ tokeira-proto = { path = "../tokeira-proto", version = "0.2.0" }
 tokeira-storage = { path = "../tokeira-storage", version = "0.2.0" }
 tokeira-types = { path = "../tokeira-types", version = "0.2.0" }
 tokeira-chasm = { path = "../tokeira-chasm", version = "0.2.0" }
-prost = "0.12"
+prost = "0.14"
 
 [features]
 # Compiles the dynamic-override read seam (`conformance`) into the wired
@@ -66,7 +66,7 @@ conformance = []
 tokeira-conformance = { path = "../tokeira-conformance" }
 metrics-util.workspace = true
 proptest = "1"
-prost = "0.12"
+prost = "0.14"
 tokio-util = { version = "0.7", features = ["rt"] }
 tokeira-proto = { path = "../tokeira-proto" }
 tokeira-types = { path = "../tokeira-types", features = ["test-support"] }

@@ -23,9 +23,7 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 clap.workspace = true
 http-body-util.workspace = true
-http-body-legacy = { package = "http-body", version = "0.4" }
 hyper.workspace = true
-hyper-legacy = { package = "hyper", version = "0.14" }
 hyper-util.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
@@ -41,7 +39,7 @@ tonic.workspace = true
 tonic-reflection.workspace = true
 tonic-web.workspace = true
 tower-http.workspace = true
-tower = "0.4"
+tower = "0.5"
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
@@ -62,11 +60,10 @@ tokeira-storage = { path = "../tokeira-storage", version = "0.2.0", features = [
 tokeira-types = { path = "../tokeira-types", version = "0.2.0" }
 http = "1"
 temporalio-client = { version = "1.0.0", default-features = false, optional = true }
-tonic-sdk = { package = "tonic", version = "0.14", default-features = false, optional = true }
 
 [features]
 default = ["temporalio-client"]
-temporalio-client = ["dep:temporalio-client", "dep:tonic-sdk"]
+temporalio-client = ["dep:temporalio-client"]
 # Opt-in SQL integration boundary shared with storage and projection. The live
 # managed-cluster test adds a second explicit acknowledgement before AWS mutation.
 dsql-integration = [
@@ -75,10 +72,12 @@ dsql-integration = [
 ]
 
 [dev-dependencies]
+http-body = "1"
 metrics-util.workspace = true
-prost = "0.12"
-prost-types = "0.12"
+prost = "0.14"
+prost-types = "0.14"
 proptest.workspace = true
+tonic-prost = "0.14"
 url.workspace = true
 
 [lints]

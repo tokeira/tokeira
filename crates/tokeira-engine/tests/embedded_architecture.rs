@@ -87,3 +87,109 @@ fn collect_rust_sources(directory: &Path, sources: &mut Vec<std::path::PathBuf>)
         }
     }
 }
+
+/// Every `(name, version)` pair the workspace lock resolves.
+fn locked_packages() -> Vec<(String, String)> {
+    let lock = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Cargo.lock")
+            .canonicalize()
+            .expect("workspace lock path resolves"),
+    )
+    .expect("read the workspace lock");
+    let mut packages = Vec::new();
+    let mut name = None;
+    for line in lock.lines() {
+        if line == "[[package]]" {
+            name = None;
+        } else if let Some(value) = line.strip_prefix("name = ") {
+            name = Some(value.trim_matches('"').to_owned());
+        } else if let Some(value) = line.strip_prefix("version = ")
+            && let Some(name) = name.take()
+        {
+            packages.push((name, value.trim_matches('"').to_owned()));
+        }
+    }
+    packages
+}
+
+fn versions_of<'a>(packages: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+    packages
+        .iter()
+        .filter(|(candidate, _)| candidate == name)
+        .map(|(_, version)| version.as_str())
+        .collect()
+}
+
+// Feature: tonic-0-14-grpc-stack, Property 1: one stack in the lock
+#[test]
+fn workspace_resolves_one_grpc_and_http_stack() {
+    let packages = locked_packages();
+
+    // Exactly one version each, on the target line.
+    for (name, line) in [
+        ("tonic", "0.14."),
+        ("prost", "0.14."),
+        ("prost-types", "0.14."),
+        ("hyper-util", "0.1."),
+        ("tower-http", "0.6."),
+    ] {
+        let versions = versions_of(&packages, name);
+        assert_eq!(
+            versions.len(),
+            1,
+            "{name} must resolve to exactly one version, found {versions:?}"
+        );
+        assert!(
+            versions[0].starts_with(line),
+            "{name} must be on the {line}x line, found {}",
+            versions[0]
+        );
+    }
+
+    // Nothing from the legacy stack remains.
+    for (name, legacy_line) in [
+        ("tonic", "0.11."),
+        ("tonic-web", "0.11."),
+        ("tonic-reflection", "0.11."),
+        ("tonic-build", "0.11."),
+        ("prost", "0.12."),
+        ("prost-types", "0.12."),
+        ("prost-reflect", "0.12."),
+        ("axum", "0.6."),
+        ("tower-http", "0.4."),
+        ("hyper-timeout", "0.4."),
+    ] {
+        assert!(
+            !versions_of(&packages, name)
+                .iter()
+                .any(|version| version.starts_with(legacy_line)),
+            "{name} {legacy_line}x must not be in the lock"
+        );
+    }
+
+    // The AWS SDK's legacy HTTPS client keeps hyper 0.14 (with its http 0.2
+    // and http-body 0.4), h2 0.3, hyper-rustls 0.24, and rustls 0.21 alive
+    // only while the DSQL connector is pinned below 0.2, because that
+    // connector takes `aws-sdk-dsql`'s default features. Once the connector
+    // moves, this exception ends and all six must be gone.
+    let connector_below_0_2 = versions_of(&packages, "aurora-dsql-sqlx-connector")
+        .iter()
+        .any(|version| version.starts_with("0.1."));
+    for (name, legacy_line) in [
+        ("hyper", "0.14."),
+        ("http", "0.2."),
+        ("http-body", "0.4."),
+        ("h2", "0.3."),
+        ("hyper-rustls", "0.24."),
+        ("rustls", "0.21."),
+    ] {
+        let present = versions_of(&packages, name)
+            .iter()
+            .any(|version| version.starts_with(legacy_line));
+        assert!(
+            !present || connector_below_0_2,
+            "{name} {legacy_line}x is in the lock without the DSQL connector exception"
+        );
+    }
+}

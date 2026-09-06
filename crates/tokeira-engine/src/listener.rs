@@ -29,11 +29,11 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use hyper_legacy::{Body, Request, Response};
+use http::{Request, Response};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
-use tonic::{Status, body::BoxBody, transport::Server};
+use tonic::{Status, body::Body, transport::Server};
 use tower::{Layer, Service};
 
 use crate::{EmbeddedShutdownFailure, Engine};
@@ -288,9 +288,16 @@ impl Engine {
         let bound_addr = listener
             .local_addr()
             .map_err(|source| EngineListenError::Bind { addr, source })?;
-        let reflection = tonic_reflection::server::Builder::configure()
+        // Both reflection protocols are served: `v1alpha` is what the previous
+        // stack offered and older tooling still asks for, `v1` is the current
+        // protocol newer tooling tries first.
+        let reflection_v1 = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(tokeira_proto::public::FILE_DESCRIPTOR_SET)
-            .build()
+            .build_v1()
+            .expect("the pinned Temporal file descriptor set builds a reflection service");
+        let reflection_v1alpha = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(tokeira_proto::public::FILE_DESCRIPTOR_SET)
+            .build_v1alpha()
             .expect("the pinned Temporal file descriptor set builds a reflection service");
 
         let service = &self.endpoint.service;
@@ -304,7 +311,8 @@ impl Engine {
             Server::builder()
                 .layer(ResetOnStopLayer { stop: reset })
                 .add_routes(routes)
-                .add_service(reflection)
+                .add_service(reflection_v1)
+                .add_service(reflection_v1alpha)
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(listener),
                     signal.cancelled_owned(),
@@ -366,7 +374,7 @@ struct ResetOnStop<S> {
 
 impl<S> Service<Request<Body>> for ResetOnStop<S>
 where
-    S: Service<Request<Body>, Response = Response<BoxBody>>,
+    S: Service<Request<Body>, Response = Response<Body>>,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
 {
@@ -387,7 +395,7 @@ where
                 _ = stop.cancelled() => Ok(Status::unavailable(
                     "embedded Tokeira engine listener is stopping",
                 )
-                .to_http()),
+                .into_http::<Body>()),
                 response = future => response,
             }
         })
@@ -407,7 +415,7 @@ mod tests {
     struct ParkedService;
 
     impl Service<Request<Body>> for ParkedService {
-        type Response = Response<BoxBody>;
+        type Response = Response<Body>;
         type Error = Infallible;
         type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Infallible>> + Send>>;
 

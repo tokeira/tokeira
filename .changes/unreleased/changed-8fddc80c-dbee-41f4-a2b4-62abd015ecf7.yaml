@@ -1,4 +1,0 @@
-kind: changed
-body: AWS SDK clients in the published crates no longer enable the legacy rustls connector, and Postcard drops its unused heapless default; formats and behaviour are unchanged.
-custom:
-  Slice: 8fddc80c-dbee-41f4-a2b4-62abd015ecf7

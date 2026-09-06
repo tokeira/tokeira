@@ -1,4 +1,0 @@
-kind: added
-body: Workflow-task started events and poll responses carry Temporal's continue-as-new advice (`suggest_continue_as_new`, its reasons, and the persisted history size).
-custom:
-  Slice: 0a910934-c1e7-4845-888d-ed862a90c5b8

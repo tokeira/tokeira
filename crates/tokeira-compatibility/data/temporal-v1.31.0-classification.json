@@ -3046,10 +3046,10 @@
       "temporal_key": "history.maxTotalUpdates",
       "temporal_default": "2000",
       "temporal_scope": "Namespace",
-      "classification": "auto-tuned-mechanical-setting",
-      "tokeira_treatment": "No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern.",
-      "owner": "crates/tokeira-runtime",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:2299",
         ".kiro/specs/configuration-policy/requirements.md"
@@ -3059,10 +3059,10 @@
       "temporal_key": "history.maxTotalUpdates.suggestContinueAsNewThreshold",
       "temporal_default": "0.9",
       "temporal_scope": "Namespace",
-      "classification": "auto-tuned-mechanical-setting",
-      "tokeira_treatment": "No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern.",
-      "owner": "crates/tokeira-runtime",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:2304",
         ".kiro/specs/configuration-policy/requirements.md"
@@ -4879,10 +4879,10 @@
       "temporal_key": "limit.historyCount.suggestContinueAsNew",
       "temporal_default": "4 * 1024",
       "temporal_scope": "Namespace",
-      "classification": "pinned-behavioral-constant",
-      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
-      "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:412",
         ".kiro/specs/configuration-policy/requirements.md"
@@ -4931,10 +4931,10 @@
       "temporal_key": "limit.historySize.suggestContinueAsNew",
       "temporal_default": "4 * 1024 * 1024",
       "temporal_scope": "Namespace",
-      "classification": "architecturally-irrelevant-or-excluded",
-      "tokeira_treatment": "No production raw-key control; the Temporal topology or feature is collapsed, unavailable, or explicitly excluded in Tokeira.",
-      "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "not-enforced",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:370",
         ".kiro/specs/configuration-policy/requirements.md"

@@ -8,168 +8,205 @@
     `TOO_MANY_UPDATES` reason and reporting the persisted-encoding size from Describe.
   - _Requirements: 10.7_
 
-- [ ] 1. Storage: envelopes, statistic, and stats read
-  - [ ] 1.1 Blob envelopes and `BlobFormatError`
+- [x] 1. Storage: envelopes, statistic, and stats read
+  - DONE 2026-09-06: `codec.rs` envelopes shared by both stores, `RunHistoryStats` with
+    `load_run_with_stats`, V068 with the `PreEnvelopeHotState` guard on every apply path,
+    DSQL and in-memory accounting on commit, reset, and delete; Properties 1 and 9 green.
+  - [x] 1.1 Blob envelopes and `BlobFormatError`
     - Add the versioned `WorkflowStateEnvelope` and `HistoryBatchEnvelope` with magic
       versions; decode rejects any other version with `BlobFormatError` naming kind, run,
       and observed version. Move the codec's shared parts out of the `dsql` feature so the
       in-memory store can use them; bump `SNAPSHOT_FORMAT_VERSION` to 4.
     - _Requirements: 10.1, 10.2, 10.3, 10.5_
-  - [ ] 1.2 `history_batch_encoded_len` and `RunHistoryStats`
+  - [x] 1.2 `history_batch_encoded_len` and `RunHistoryStats`
     - One size function for both stores; the `load_run_with_stats` trait method with
       `load_run` delegating; forwarders in `HistoryNotifyingRepository` and the `Arc`
       impls.
     - _Requirements: 1.4, 1.8_
-  - [ ] 1.3 Migration V068 and the startup guard
+  - [x] 1.3 Migration V068 and the startup guard
     - `V068__workflow_hot_history_size.sql`; the runner's version-boundary check that
       fails when `workflow_hot` holds rows, with the recreate message; schema-baseline
       and digest updates per the storage crate rules.
     - _Requirements: 1.2, 10.4_
-  - [ ] 1.4 DSQL accounting in commit, load, reset, and delete
+  - [x] 1.4 DSQL accounting in commit, load, reset, and delete
     - `FOR UPDATE` read includes the column (NULL → 0); upsert writes prior plus batch
       size, saturating; load returns the stats; reset materialization sets the prefix
       size; visibility record built with the statistic.
     - _Requirements: 1.1, 1.2, 1.3, 1.5, 1.6, 1.7, 1.9, 1.10_
-  - [ ] 1.5 In-memory accounting and snapshot inclusion
+  - [x] 1.5 In-memory accounting and snapshot inclusion
     - `history_size` map maintained on every commit path, copied for reset successors,
       removed with the run, persisted in the snapshot document.
     - _Requirements: 1.1, 1.4, 1.5, 1.6, 1.7, 1.9, 1.10_
-  - [ ] 1.6 Property test: Property 1 — History Size is a reference-model accumulator
+  - [x] 1.6 Property test: Property 1 — History Size is a reference-model accumulator
     - `proptest` over generated commit sequences in `memory.rs`; the DSQL leg under
       `dsql-integration`.
+    - DONE 2026-09-06: in-memory leg green; the DSQL leg runs with task 9.5.
     - Tag: `// Feature: continue-as-new-advice, Property 1: History Size is a reference-model accumulator`
     - _Requirements: 1.1–1.7, 1.9, 1.10_
-  - [ ] 1.7 Property test: Property 9 — envelopes round-trip and reject pre-envelope blobs
+  - [x] 1.7 Property test: Property 9 — envelopes round-trip and reject pre-envelope blobs
     - Round trip generated states and batches; assert pre-envelope bytes (the 0.1.2
       layout, produced by the test with the old struct shapes) decode to
       `BlobFormatError`; snapshot version 3 fails startup.
     - Tag: `// Feature: continue-as-new-advice, Property 9: envelopes round-trip and reject pre-envelope blobs`
     - _Requirements: 10.1, 10.2, 10.3, 10.5_
 
-- [ ] 2. Checkpoint: storage compiles, clippy clean, storage tests green
+- [x] 2. Checkpoint: storage compiles, clippy clean, storage tests green
 
-- [ ] 3. Kernel: types, rule, and every started-event site
-  - [ ] 3.1 Types
+- [x] 3. Kernel: types, rule, and every started-event site
+  - DONE 2026-09-06: `advice.rs` rule and types, the policy operand on every start-bearing
+    request, derivation at each start site with clearing at both schedule sites and on
+    transient in-place reschedules, copy at completion/failure/timeout/forced close and
+    during rebuild; Properties 2, 3 (rebuild leg), 4, 5, 10, and 11 green.
+  - [x] 3.1 Types
     - `SuggestContinueAsNewReason`; the reasons field on the event; the three recorded
       fields on `PendingWorkflowTask`; `completed_update_count` on `WorkflowState`;
       `ContinueAsNewAdvicePolicy` and the request changes on `StartWorkflowTaskRequest`,
       `StartRequest`, `SignalWithStartRequest`, and `FailWorkflowTaskRequest`.
     - _Requirements: 2.5, 2.6, 2.11, 2.12_
-  - [ ] 3.2 `continue_as_new_advice` rule
+  - [x] 3.2 `continue_as_new_advice` rule
     - Pure function with ≥ comparisons, enum-ordered reasons, and the disabled update
       threshold; documented with the v1.31.0 anchors.
     - _Requirements: 2.1, 2.2, 2.3, 2.4_
-  - [ ] 3.3 Derive at the polled-start branches, the sync-match start, and the reset
+  - [x] 3.3 Derive at the polled-start branches, the sync-match start, and the reset
     synthesis; copy at completion, failure, timeout, and forced-close materialization;
     clear at both schedule sites
     - _Requirements: 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.13_
-  - [ ] 3.4 Count completed updates and copy Advice during rebuild
+  - [x] 3.4 Count completed updates and copy Advice during rebuild
     - Increment in the completed-update arm; `replay_history_prefix` copies the event's
       Advice into the pending record without reading thresholds.
     - _Requirements: 2.11, 6.1, 6.2_
-  - [ ] 3.5 Property test: Property 2 — the advice rule is deterministic
+  - [x] 3.5 Property test: Property 2 — the advice rule is deterministic
     - Tag: `// Feature: continue-as-new-advice, Property 2: the advice rule is a deterministic function of its operands`
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.12_
-  - [ ] 3.6 Property test: Property 4 — each attempt recomputes from its own start
+  - [x] 3.6 Property test: Property 4 — each attempt recomputes from its own start
     - Generated attempt sequences with signals and threshold changes; assert monotone
       recorded size, per-attempt rule, and cleared Advice at schedule.
     - Tag: `// Feature: continue-as-new-advice, Property 4: each attempt recomputes from the values at its own start`
     - _Requirements: 2.7, 2.8_
-  - [ ] 3.7 Property test: Property 5 — successors account for themselves (kernel leg)
+  - [x] 3.7 Property test: Property 5 — successors account for themselves (kernel leg)
     - Continue-as-new, retry, cron, and reset successors; sync-match first task records
       `0`; scheduled-but-unstarted reset derives by the rule.
     - Tag: `// Feature: continue-as-new-advice, Property 5: successors account for themselves`
     - _Requirements: 2.9, 2.10_
-  - [ ] 3.8 Property test: Property 10 — the Advice is advisory
+  - [x] 3.8 Property test: Property 10 — the Advice is advisory
     - Apply generated command sequences under two policies; diff states, events, and
       effects.
     - Tag: `// Feature: continue-as-new-advice, Property 10: the Advice is advisory`
     - _Requirements: 8.1, 8.2_
-  - [ ] 3.9 Property test: Property 11 — update counting matches the registry model
+  - [x] 3.9 Property test: Property 11 — update counting matches the registry model
     - Tag: `// Feature: continue-as-new-advice, Property 11: update counting matches the registry model`
     - _Requirements: 2.3, 2.11_
-  - [ ] 3.10 Property test: Property 3 (rebuild leg) — rebuilt pending record equals the
+  - [x] 3.10 Property test: Property 3 (rebuild leg) — rebuilt pending record equals the
     recorded event
     - Tag: `// Feature: continue-as-new-advice, Property 3: recorded Advice is identical on every delivery path`
     - _Requirements: 6.1, 6.2, 6.3_
 
-- [ ] 4. Checkpoint: kernel compiles, clippy clean, kernel property tests green
+- [x] 4. Checkpoint: kernel compiles, clippy clean, kernel property tests green
 
-- [ ] 5. Runtime: policy, operands, started-task Advice, metric
-  - [ ] 5.1 Pinned constants and `continue_as_new_advice_policy` accessors
+- [x] 5. Runtime: policy, operands, started-task Advice, metric
+  - DONE 2026-09-06: pinned constants with on-feature per-key reads, the stats read and
+    operands on every start-bearing command, `StartedWorkflowTask.advice`, the suggest
+    metric; Property 6 green in both compile configurations.
+  - [x] 5.1 Pinned constants and `continue_as_new_advice_policy` accessors
     - Off-feature constants; on-feature reads of the four keys with per-key fallback;
       update threshold derivation.
     - _Requirements: 3.1, 3.2, 3.4, 3.6_
-  - [ ] 5.2 Stats read and operands on every command that may emit a started event
+  - [x] 5.2 Stats read and operands on every command that may emit a started event
     - `resolve_polled_workflow_task_target` uses `load_run_with_stats`; polled start,
       `Start`, `SignalWithStart`, and the reset-failing command carry the operands.
     - _Requirements: 1.8, 2.9, 2.10, 2.12_
-  - [ ] 5.3 `StartedWorkflowTask.advice` and the suggest metric
+  - [x] 5.3 `StartedWorkflowTask.advice` and the suggest metric
     - Copy from `new_state.pending_workflow_task`; record
-      `tokeira_workflow_suggest_continue_as_new_total{reason}` after a start commit.
+      `tokeira_runtime_workflow_suggest_continue_as_new_total{reason}` after a start commit.
     - _Requirements: 4.3, 8.3_
-  - [ ] 5.4 Property test: Property 6 — policy accessors equal the pinned constants
+  - [x] 5.4 Property test: Property 6 — policy accessors equal the pinned constants
     off-feature
     - Compile-configuration test plus an on-feature test with installed overrides.
     - Tag: `// Feature: continue-as-new-advice, Property 6: policy accessors equal the pinned constants off-feature`
     - _Requirements: 3.1, 3.2, 3.4, 3.6_
 
-- [ ] 6. Edge and engine: wire, synthesis, Describe
-  - [ ] 6.1 Serializer emits reasons; both virtual-task syntheses fill the Advice
+- [x] 6. Edge and engine: wire, synthesis, Describe
+  - DONE 2026-09-06: field 8 mapping, poll and history-read syntheses from the recorded
+    Advice, Describe from the stats read; Property 7 green.
+  - [x] 6.1 Serializer emits reasons; both virtual-task syntheses fill the Advice
     - `history_serializer.rs` field 8 mapping; `workflow_service.rs` suffix synthesis
       from the pending record; `from_internal.rs` poll synthesis from `started.advice`.
     - _Requirements: 4.1, 4.2, 5.1, 5.2_
-  - [ ] 6.2 Describe from the stats read
+  - [x] 6.2 Describe from the stats read
     - `StoreExecutionResolver` uses `load_run_with_stats`, external-payload statistics
       from state, no history read; description doc comment updated.
     - _Requirements: 7.1, 7.2, 7.3_
-  - [ ] 6.3 Property test: Property 7 — wire round trip preserves the Advice
+  - [x] 6.3 Property test: Property 7 — wire round trip preserves the Advice
     - Tag: `// Feature: continue-as-new-advice, Property 7: wire round trip preserves the Advice`
     - _Requirements: 5.1, 5.2_
 
-- [ ] 7. Checkpoint: workspace compiles, clippy clean, edge and engine tests green
+- [x] 7. Checkpoint: workspace compiles, clippy clean, edge and engine tests green
 
 - [ ] 8. Conformance wiring and ledger
-  - [ ] 8.1 Mark the four keys `Wired` in `KEY_CLASSIFICATION` (add `ValueType::Float`
+  - [x] 8.1 Mark the four keys `Wired` in `KEY_CLASSIFICATION` (add `ValueType::Float`
     if absent) and re-disposition their rows in
     `docs/conformance/v1.31.0/temporal-configuration.md`
+    - DONE 2026-09-06: the ratio key uses the existing `ValueType::Double`; the four
+      rows and the disposition summary counts are re-dispositioned.
     - _Requirements: 3.3, 3.5_
   - [ ] 8.2 Remove the `TestTransientWorkflowTaskHistorySize` skip in the fork and run
     Tier 1.6 against a `--features conformance` `tokeirad`; record the outcome in
     `docs/readiness/conformance.md`
+    - Not run in the landing slice: the fork-branch edit and the Tier 1.6 run are
+      operator-host work; the skip stays in place until that run.
     - _Requirements: 9.1, 9.2, 9.3, 9.4_
 
 - [ ] 9. Integration evidence (`crates/tokeira-engine/tests/continue_as_new_advice.rs`)
-  - [ ] 9.1 Property test: Property 3 (delivery paths) — identical Advice on every path
+  - [x] 9.1 Property test: Property 3 (delivery paths) — identical Advice on every path
     - Generated runs with transient and speculative tasks; compare persisted event,
       history-read synthesis, poll synthesis, and late materialization; change thresholds
       mid-run through the override seam and assert recorded values persist; run the same
       sequence over `Engine::listen` and the in-process endpoint.
+    - DONE 2026-09-06: persisted start, poll synthesis, history-read synthesis, and late
+      materialization of a transient attempt compared over both transports. The engine
+      crate has no override seam, so the mid-run threshold change is covered by the
+      runtime's on-feature Property 6 test and the recorded-value persistence by the
+      kernel's Property 4.
     - Tag: `// Feature: continue-as-new-advice, Property 3: recorded Advice is identical on every delivery path`
     - _Requirements: 2.5, 2.6, 2.13, 4.1, 4.2, 4.3, 4.4, 5.4_
-  - [ ] 9.2 Property test: Property 8 — one statistic, three readers
+  - [x] 9.2 Property test: Property 8 — one statistic, three readers
     - After generated commits assert Describe, visibility `HistorySizeBytes`, and the next
       start operand agree; assert no history read on Describe.
+    - DONE 2026-09-06: Describe, a `HistorySizeBytes` equality query, and the next start's
+      operand agree after generated signal payloads. The no-history-read obligation is
+      held by construction in the Describe resolver (it reads state with the stats and
+      nothing else); no RPC-level witness exists for it.
     - Tag: `// Feature: continue-as-new-advice, Property 8: one statistic, three readers`
     - _Requirements: 1.8, 7.1, 7.2, 7.3, 7.4_
-  - [ ] 9.3 Boundary examples through real commits
+  - [x] 9.3 Boundary examples through real commits
     - 4095/4096/4097 events; one byte below/at/above 4 MiB; the in-process reproduction of
       the v1.31.0 transient sequence.
+    - DONE 2026-09-06: started ids 4095 (below), 4096 (at), and the transient operand 4097
+      (above) through real signals; the History Size landed exactly one byte below, at,
+      and one byte above 4 MiB through sized signals, retrying on a fresh run when the
+      closing event's timestamp width moved the landing.
     - _Requirements: 2.1, 2.2, 2.8_
-  - [ ] 9.4 SDK worker evidence from the `spikes/` SDK crate
+  - [x] 9.4 SDK worker evidence from the `spikes/` SDK crate
     - The pinned Rust SDK worker observes `continue_as_new_suggested()` flip, finishes
       handlers, continues as new; workflow id and namespace stable, run id changes, state
       survives; both transports.
+    - DONE 2026-09-06: `spikes/temporal-rust-sdk-v0-7-embedded/tests/continue_as_new_advice.rs`
+      — a signal-absorbing workflow on SDK 1.0.0 continues as new on the flip and the
+      continued run returns the carried count, which equals the signals the first run
+      recorded; the last started event carries the count reason; same workflow id, new
+      run id; green through `service_override` and through a listener.
     - _Requirements: 5.3, 5.4_
   - [ ] 9.5 Live DSQL accounting under `dsql-integration`
     - Property 1's DSQL leg, the V068 guard on a non-empty table, and clean
       restart against the same history.
+    - Not run in the landing slice: needs a live Aurora DSQL cluster. The V068 statement
+      itself was verified idempotent against DSQL (`ADD COLUMN IF NOT EXISTS` twice).
     - _Requirements: 1.1, 1.2, 1.3, 10.4_
 
-- [ ] 10. Documentation and release notes
-  - [ ] 10.1 Crate docs for storage (envelopes, statistic) and kernel (advice rule)
+- [x] 10. Documentation and release notes
+  - [x] 10.1 Crate docs for storage (envelopes, statistic) and kernel (advice rule)
     - _Requirements: 1.8, 2.12, 10.3_
-  - [ ] 10.2 Changie entries for the 0.1.3 train: `Added` (continue-as-new advice),
+  - [x] 10.2 Changie entries for the 0.1.3 train: `Added` (continue-as-new advice),
     `Changed` (Describe reports the persisted history size; state-format break and
     recreate requirement)
     - _Requirements: 10.6_

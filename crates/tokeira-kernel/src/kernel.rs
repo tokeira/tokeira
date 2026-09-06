@@ -45,8 +45,9 @@ use crate::{
         EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, Link, LoadedRun, NexusOperationCancellation,
         NexusOperationCancellationState, ParentClosePolicy, PauseInfo, PendingExternalCancel,
         PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask,
-        RequestIdInfo, TimerState, VersioningBehavior, VersioningOverride, WorkflowState,
-        WorkflowTaskProblem, WorkflowTaskType, WorkflowVersioningInfo, merge_priority,
+        RecordedAdvice, RequestIdInfo, TimerState, VersioningBehavior, VersioningOverride,
+        WorkflowState, WorkflowTaskProblem, WorkflowTaskType, WorkflowVersioningInfo,
+        merge_priority,
     },
     transition::{
         ActivityOp, CallbackCompletionOutcome, DispatchOp, RequestDedupeOp, TimerOp, Transition,
@@ -356,6 +357,7 @@ impl BasicKernel {
             .unwrap_or_else(|| ctx.workflow_id.clone());
         let canonical_root_run_id = root_run_id.unwrap_or(ctx.run_id);
         let mut state = WorkflowState {
+            completed_update_count: 0,
             run_key: ctx.run_key,
             namespace_id: ctx.namespace_id,
             workflow_id: ctx.workflow_id,
@@ -487,6 +489,7 @@ impl BasicKernel {
         let mut completion_callbacks = req.completion_callbacks.clone();
         stamp_callback_registration_times(&mut completion_callbacks, req.now);
         let initial = WorkflowState {
+            completed_update_count: 0,
             run_key: req.run_key,
             namespace_id: req.namespace_id,
             workflow_id: req.workflow_id,
@@ -623,7 +626,7 @@ impl BasicKernel {
         } else {
             builder.schedule_workflow_task();
             if let Some(identity) = req.reserved_poller_identity {
-                builder.start_pending_workflow_task(identity);
+                builder.start_pending_workflow_task(identity, req.advice_policy);
             }
         }
         Ok(builder.finish())
@@ -651,6 +654,7 @@ impl BasicKernel {
         let initial_worker_deployment_name =
             initial_worker_deployment_name(req.versioning_override.as_ref());
         let initial = WorkflowState {
+            completed_update_count: 0,
             run_key: req.run_key,
             namespace_id: req.namespace_id,
             workflow_id: req.workflow_id,
@@ -1706,6 +1710,23 @@ impl BasicKernel {
                 target_deployment_version.clone(),
             );
         let attempt = pending.attempt.max(1);
+        // The count operand is the id the next event would receive at this
+        // moment (`GetNextEventID()`, workflow_task_state_machine.go:1452 @
+        // v1.31.0): the started id for a persisted start and the virtual
+        // scheduled id for a suppressed one. It is fixed before anything is
+        // emitted so the conversion branch below matches v1.31.0, which decides
+        // before adding its events. In-flight updates are the admitted set plus
+        // the accepted set; acceptance moves an id from one to the other, so
+        // the sum never double-counts.
+        let in_flight_updates =
+            builder.state.admitted_updates.len() + builder.state.pending_updates.len();
+        let advice = crate::advice::continue_as_new_advice(
+            req.history_size_bytes,
+            builder.state.last_event_id + 1,
+            in_flight_updates,
+            builder.state.completed_update_count,
+            req.advice_policy,
+        );
         // Transient (attempt>1) and SPECULATIVE starts persist no
         // WorkflowTaskStarted event: the started id is virtual
         // (scheduled_event_id + 1) and last_event_id is unchanged — v1.31.0
@@ -1738,8 +1759,9 @@ impl BasicKernel {
                 attempt: 1,
                 identity: req.worker_identity.clone(),
                 request_id: req.request_id,
-                history_size_bytes: req.history_size_bytes,
-                suggest_continue_as_new: req.suggest_continue_as_new,
+                history_size_bytes: advice.history_size_bytes,
+                suggest_continue_as_new: advice.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
                 target_worker_deployment_version_changed,
                 target_version_changed_enabled,
                 target_deployment_version: target_deployment_version.clone(),
@@ -1752,8 +1774,9 @@ impl BasicKernel {
                 attempt,
                 identity: req.worker_identity.clone(),
                 request_id: req.request_id,
-                history_size_bytes: req.history_size_bytes,
-                suggest_continue_as_new: req.suggest_continue_as_new,
+                history_size_bytes: advice.history_size_bytes,
+                suggest_continue_as_new: advice.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
                 target_worker_deployment_version_changed,
                 target_version_changed_enabled,
                 target_deployment_version: target_deployment_version.clone(),
@@ -1773,6 +1796,9 @@ impl BasicKernel {
         current.target_worker_deployment_version_changed = target_worker_deployment_version_changed;
         current.target_version_changed_enabled = target_version_changed_enabled;
         current.target_deployment_version = target_deployment_version;
+        // Recorded so a suppressed start's later materialization or synthesis
+        // carries exactly this decision (Requirement 2.6).
+        current.advice = advice;
         if new_events_since_schedule {
             // The conversion branch persisted real Scheduled/Started — the
             // task is normal from here on (`workflowTask.Type = NORMAL`,
@@ -2027,8 +2053,17 @@ impl BasicKernel {
                         attempt: pending.attempt,
                         identity: req.identity.clone(),
                         request_id: format!("transient-materialize-{}", pending.logical_seq.0),
-                        history_size_bytes: 0,
-                        suggest_continue_as_new: false,
+                        // Materialization copies the Advice decided at the
+                        // attempt's start; it never recomputes it against the
+                        // thresholds in force now (stored task info,
+                        // workflow_task_state_machine.go:790-794, 881-885, 954-958
+                        // @ v1.31.0).
+                        history_size_bytes: pending.advice.history_size_bytes,
+                        suggest_continue_as_new: pending.advice.suggest_continue_as_new,
+                        suggest_continue_as_new_reasons: pending
+                            .advice
+                            .suggest_continue_as_new_reasons
+                            .clone(),
                         target_worker_deployment_version_changed: pending
                             .target_worker_deployment_version_changed,
                         target_version_changed_enabled: pending.target_version_changed_enabled,
@@ -3118,71 +3153,95 @@ impl BasicKernel {
         // @ v1.31.0; spec speculative-wft K4/K5 — the bad-update-message
         // seam fails exactly these tasks). The retry below is then an
         // ordinary transient attempt-2.
-        let (scheduled_event_id, started_event_id) =
-            if pending.task_type == WorkflowTaskType::Speculative {
-                let scheduled = builder.emit_at(
-                    pending.scheduled_at,
-                    HistoryEventKind::WorkflowTaskScheduled {
-                        logical_seq: pending.logical_seq,
-                        task_queue: builder.state.task_queue.clone(),
-                        workflow_task_timeout: builder.state.workflow_task_timeout,
-                        attempt: pending.attempt,
-                    },
-                );
-                let started = builder.emit_at(
-                    pending.started_at.unwrap_or(req.now),
-                    HistoryEventKind::WorkflowTaskStarted {
-                        logical_seq: pending.logical_seq,
-                        scheduled_event_id: scheduled,
-                        attempt: pending.attempt,
-                        identity: req.worker_identity.clone(),
-                        request_id: format!("transient-materialize-{}", pending.logical_seq.0),
-                        history_size_bytes: 0,
-                        suggest_continue_as_new: false,
-                        target_worker_deployment_version_changed: pending
-                            .target_worker_deployment_version_changed,
-                        target_version_changed_enabled: pending.target_version_changed_enabled,
-                        target_deployment_version: pending.target_deployment_version.clone(),
-                    },
-                );
-                let current = builder
-                    .state
-                    .pending_workflow_task
-                    .as_mut()
-                    .expect("validated pending workflow task must still exist");
-                current.task_type = WorkflowTaskType::Normal;
-                current.scheduled_event_id = scheduled;
-                current.started_event_id = Some(started);
-                (scheduled, started)
-            } else if reset_synthesize_started {
-                // The fork-point WFT's Scheduled event lives in the replayed prefix;
-                // synthesize only its Started, then the failed event below fails it.
-                let started = builder.emit_at(
-                    req.now,
-                    HistoryEventKind::WorkflowTaskStarted {
-                        logical_seq: pending.logical_seq,
-                        scheduled_event_id: pending.scheduled_event_id,
-                        attempt: pending.attempt,
-                        identity: req.worker_identity.clone(),
-                        request_id: format!("reset-materialize-{}", pending.logical_seq.0),
-                        history_size_bytes: 0,
-                        suggest_continue_as_new: false,
-                        target_worker_deployment_version_changed: pending
-                            .target_worker_deployment_version_changed,
-                        target_version_changed_enabled: pending.target_version_changed_enabled,
-                        target_deployment_version: pending.target_deployment_version.clone(),
-                    },
-                );
-                let current = builder
-                    .state
-                    .pending_workflow_task
-                    .as_mut()
-                    .expect("validated pending workflow task must still exist");
-                current.started_event_id = Some(started);
-                (pending.scheduled_event_id, started)
-            } else {
-                (pending.scheduled_event_id, started_event_id)
-            };
+        let (scheduled_event_id, started_event_id) = if pending.task_type
+            == WorkflowTaskType::Speculative
+        {
+            let scheduled = builder.emit_at(
+                pending.scheduled_at,
+                HistoryEventKind::WorkflowTaskScheduled {
+                    logical_seq: pending.logical_seq,
+                    task_queue: builder.state.task_queue.clone(),
+                    workflow_task_timeout: builder.state.workflow_task_timeout,
+                    attempt: pending.attempt,
+                },
+            );
+            let started = builder.emit_at(
+                pending.started_at.unwrap_or(req.now),
+                HistoryEventKind::WorkflowTaskStarted {
+                    logical_seq: pending.logical_seq,
+                    scheduled_event_id: scheduled,
+                    attempt: pending.attempt,
+                    identity: req.worker_identity.clone(),
+                    request_id: format!("transient-materialize-{}", pending.logical_seq.0),
+                    // Materialization copies the Advice decided at the
+                    // attempt's start; it never recomputes it against the
+                    // thresholds in force now (stored task info,
+                    // workflow_task_state_machine.go:790-794, 881-885, 954-958
+                    // @ v1.31.0).
+                    history_size_bytes: pending.advice.history_size_bytes,
+                    suggest_continue_as_new: pending.advice.suggest_continue_as_new,
+                    suggest_continue_as_new_reasons: pending
+                        .advice
+                        .suggest_continue_as_new_reasons
+                        .clone(),
+                    target_worker_deployment_version_changed: pending
+                        .target_worker_deployment_version_changed,
+                    target_version_changed_enabled: pending.target_version_changed_enabled,
+                    target_deployment_version: pending.target_deployment_version.clone(),
+                },
+            );
+            let current = builder
+                .state
+                .pending_workflow_task
+                .as_mut()
+                .expect("validated pending workflow task must still exist");
+            current.task_type = WorkflowTaskType::Normal;
+            current.scheduled_event_id = scheduled;
+            current.started_event_id = Some(started);
+            (scheduled, started)
+        } else if reset_synthesize_started {
+            // The fork-point WFT's Scheduled event lives in the replayed prefix;
+            // synthesize only its Started, then the failed event below fails it.
+            // This start is real, not a materialization, so its Advice is
+            // derived afresh from the successor's History Size and the
+            // thresholds in force (`workflow_resetter.go:533-550 @ v1.31.0`).
+            let in_flight_updates =
+                builder.state.admitted_updates.len() + builder.state.pending_updates.len();
+            let advice = crate::advice::continue_as_new_advice(
+                req.history_size_bytes,
+                builder.state.last_event_id + 1,
+                in_flight_updates,
+                builder.state.completed_update_count,
+                req.advice_policy,
+            );
+            let started = builder.emit_at(
+                req.now,
+                HistoryEventKind::WorkflowTaskStarted {
+                    logical_seq: pending.logical_seq,
+                    scheduled_event_id: pending.scheduled_event_id,
+                    attempt: pending.attempt,
+                    identity: req.worker_identity.clone(),
+                    request_id: format!("reset-materialize-{}", pending.logical_seq.0),
+                    history_size_bytes: advice.history_size_bytes,
+                    suggest_continue_as_new: advice.suggest_continue_as_new,
+                    suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
+                    target_worker_deployment_version_changed: pending
+                        .target_worker_deployment_version_changed,
+                    target_version_changed_enabled: pending.target_version_changed_enabled,
+                    target_deployment_version: pending.target_deployment_version.clone(),
+                },
+            );
+            let current = builder
+                .state
+                .pending_workflow_task
+                .as_mut()
+                .expect("validated pending workflow task must still exist");
+            current.started_event_id = Some(started);
+            current.advice = advice;
+            (pending.scheduled_event_id, started)
+        } else {
+            (pending.scheduled_event_id, started_event_id)
+        };
         // Only the attempt-1 failure persists a WorkflowTaskFailed event; a
         // transient (attempt>1) failure writes nothing — the retry chain lives
         // off-history ("Only emit WorkflowTaskFailedEvent if workflow task is
@@ -3454,6 +3513,10 @@ impl BasicKernel {
                 .expect("validated pending workflow task must still exist");
             current.started_event_id = None;
             current.started_at = None;
+            // A retained transient retry is a fresh schedule for advice
+            // purposes: the next start recomputes it (Requirement 2.7;
+            // workflow_task_state_machine.go:98-99, 158-159 @ v1.31.0).
+            current.advice = RecordedAdvice::default();
             // Paused-with-sticky corner (the only way sticky_was_set reaches
             // this branch): keep the retained task in the TRANSIENT
             // (attempt>1, virtual-id) shape the resume/start path expects —
@@ -3657,8 +3720,17 @@ impl BasicKernel {
                         attempt: pending.attempt,
                         identity: WorkerIdentity(String::new()),
                         request_id: format!("transient-materialize-{}", pending.logical_seq.0),
-                        history_size_bytes: 0,
-                        suggest_continue_as_new: false,
+                        // Materialization copies the Advice decided at the
+                        // attempt's start; it never recomputes it against the
+                        // thresholds in force now (stored task info,
+                        // workflow_task_state_machine.go:790-794, 881-885, 954-958
+                        // @ v1.31.0).
+                        history_size_bytes: pending.advice.history_size_bytes,
+                        suggest_continue_as_new: pending.advice.suggest_continue_as_new,
+                        suggest_continue_as_new_reasons: pending
+                            .advice
+                            .suggest_continue_as_new_reasons
+                            .clone(),
                         target_worker_deployment_version_changed: pending
                             .target_worker_deployment_version_changed,
                         target_version_changed_enabled: pending.target_version_changed_enabled,
@@ -3739,6 +3811,9 @@ impl BasicKernel {
             current.started_event_id = None;
             current.started_at = None;
             current.attempt = builder.state.workflow_task_attempt;
+            // Cleared like any other schedule so the resumed start recomputes
+            // the advice (Requirement 2.7).
+            current.advice = RecordedAdvice::default();
         } else {
             // Active workflows get a fresh WorkflowTaskScheduled event so the
             // SDK state machine sees the correct Scheduled→Started sequence.
@@ -3961,6 +4036,7 @@ impl BasicKernel {
                     target_worker_deployment_version_changed: false,
                     target_version_changed_enabled: false,
                     target_deployment_version: None,
+                    advice: RecordedAdvice::default(),
                     logical_seq: *logical_seq,
                     scheduled_event_id: event.event_id,
                     scheduled_at: event.happened_at,
@@ -3977,6 +4053,9 @@ impl BasicKernel {
                 logical_seq,
                 scheduled_event_id,
                 attempt,
+                history_size_bytes,
+                suggest_continue_as_new,
+                suggest_continue_as_new_reasons,
                 target_worker_deployment_version_changed,
                 target_version_changed_enabled,
                 target_deployment_version,
@@ -3997,6 +4076,14 @@ impl BasicKernel {
                         *target_worker_deployment_version_changed,
                     target_version_changed_enabled: *target_version_changed_enabled,
                     target_deployment_version: target_deployment_version.clone(),
+                    // Rebuild copies the recorded Advice; it never recomputes it
+                    // and reads no thresholds (`mutable_state_rebuilder.go:235-239
+                    // @ v1.31.0`; Requirements 6.1, 6.2).
+                    advice: RecordedAdvice {
+                        history_size_bytes: *history_size_bytes,
+                        suggest_continue_as_new: *suggest_continue_as_new,
+                        suggest_continue_as_new_reasons: suggest_continue_as_new_reasons.clone(),
+                    },
                     logical_seq: *logical_seq,
                     scheduled_event_id: *scheduled_event_id,
                     scheduled_at: state
@@ -4070,6 +4157,7 @@ impl BasicKernel {
                         .map(|pending| pending.attempt)
                         .unwrap_or(0);
                     state.pending_workflow_task = Some(PendingWorkflowTask {
+                        advice: Default::default(),
                         task_type: WorkflowTaskType::Normal,
                         schedule_to_start_deadline: None,
                         target_worker_deployment_version_changed: false,
@@ -4116,6 +4204,7 @@ impl BasicKernel {
                     .map(|pending| pending.attempt)
                     .unwrap_or(0);
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    advice: Default::default(),
                     task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
                     target_worker_deployment_version_changed: false,
@@ -6132,6 +6221,11 @@ fn apply_workflow_command(
                         outcome,
                     });
                     builder.state.pending_updates.remove(&update_id);
+                    // Both success and failure outcomes are completions for the
+                    // `TOO_MANY_UPDATES` operand; a rejection above never is
+                    // (`registry.go:220, 382, 496-505 @ v1.31.0`).
+                    builder.state.completed_update_count =
+                        builder.state.completed_update_count.saturating_add(1);
                 }
                 UpdateProtocolBody::Rejected { update_id, failure } => {
                     // A rejection leaves NO durable trace: v1.31.0 writes no
@@ -6678,8 +6772,17 @@ impl TransitionBuilder {
                         attempt: pending.attempt,
                         identity: WorkerIdentity(String::new()),
                         request_id: format!("transient-materialize-{}", pending.logical_seq.0),
-                        history_size_bytes: 0,
-                        suggest_continue_as_new: false,
+                        // Materialization copies the Advice decided at the
+                        // attempt's start; it never recomputes it against the
+                        // thresholds in force now (stored task info,
+                        // workflow_task_state_machine.go:790-794, 881-885, 954-958
+                        // @ v1.31.0).
+                        history_size_bytes: pending.advice.history_size_bytes,
+                        suggest_continue_as_new: pending.advice.suggest_continue_as_new,
+                        suggest_continue_as_new_reasons: pending
+                            .advice
+                            .suggest_continue_as_new_reasons
+                            .clone(),
                         target_worker_deployment_version_changed: pending
                             .target_worker_deployment_version_changed,
                         target_version_changed_enabled: pending.target_version_changed_enabled,
@@ -6923,6 +7026,9 @@ impl TransitionBuilder {
             target_worker_deployment_version_changed: false,
             target_version_changed_enabled: false,
             target_deployment_version: None,
+            // Cleared at schedule so the next start recomputes it
+            // (workflow_task_state_machine.go:98-99, 158-159 @ v1.31.0).
+            advice: RecordedAdvice::default(),
         });
         self.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
             queue: QueueKey {
@@ -6947,7 +7053,11 @@ impl TransitionBuilder {
     /// Start the just-scheduled WFT in the same transition for runtime-owned
     /// sync-match. The runtime strips the enqueue op and delivers directly to
     /// the reserved poller after the commit succeeds.
-    fn start_pending_workflow_task(&mut self, identity: WorkerIdentity) {
+    fn start_pending_workflow_task(
+        &mut self,
+        identity: WorkerIdentity,
+        advice_policy: crate::command::ContinueAsNewAdvicePolicy,
+    ) {
         let Some(pending) = self.state.pending_workflow_task.clone() else {
             return;
         };
@@ -6955,14 +7065,27 @@ impl TransitionBuilder {
             return;
         }
         let attempt = pending.attempt.max(1);
+        // A fresh run has committed no history batch yet, so v1.31.0 records a
+        // zero size on an eager first task (`create_workflow_util.go:106`); the
+        // count and update reasons still follow the common rule.
+        let in_flight_updates =
+            self.state.admitted_updates.len() + self.state.pending_updates.len();
+        let advice = crate::advice::continue_as_new_advice(
+            0,
+            self.state.last_event_id + 1,
+            in_flight_updates,
+            self.state.completed_update_count,
+            advice_policy,
+        );
         let started_event_id = self.emit(HistoryEventKind::WorkflowTaskStarted {
             logical_seq: pending.logical_seq,
             scheduled_event_id: pending.scheduled_event_id,
             attempt,
             identity,
             request_id: format!("sync-match-{}", pending.logical_seq.0),
-            history_size_bytes: self.state.last_event_id,
-            suggest_continue_as_new: false,
+            history_size_bytes: advice.history_size_bytes,
+            suggest_continue_as_new: advice.suggest_continue_as_new,
+            suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: false,
             target_version_changed_enabled: false,
             target_deployment_version: None,
@@ -6975,6 +7098,7 @@ impl TransitionBuilder {
         current.started_event_id = Some(started_event_id);
         current.started_at = Some(self.now);
         current.attempt = attempt;
+        current.advice = advice;
     }
 
     /// Transition the run to a terminal status.

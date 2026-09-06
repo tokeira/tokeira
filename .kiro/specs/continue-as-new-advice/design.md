@@ -237,9 +237,12 @@ Sites:
   [kernel.rs:1735-1760](../../../crates/tokeira-kernel/src/kernel.rs), the sync-match
   start at [kernel.rs:6958](../../../crates/tokeira-kernel/src/kernel.rs) (bytes `0`),
   and the reset-synthesized started event at
-  [kernel.rs:3162](../../../crates/tokeira-kernel/src/kernel.rs). `started_event_id` is
-  the id the builder is about to assign. In-flight updates are
-  `admitted_updates ∪ pending_updates` by id.
+  [kernel.rs:3162](../../../crates/tokeira-kernel/src/kernel.rs). The count operand is
+  `last_event_id + 1`, fixed before any event is emitted: the started event's own id for
+  a persisted start and the virtual scheduled id for a suppressed one, which is what
+  `GetNextEventID()` yields when v1.31.0 decides before adding its events. In-flight
+  updates are `admitted_updates.len() + pending_updates.len()`; acceptance moves an id
+  from the first set to the second, so the sum never double-counts.
 - **Copy** from the pending record: late materialization in
   `apply_workflow_task_completed` (2024), `apply_workflow_task_failed` (3134),
   `apply_workflow_task_timed_out` (3654), and `force_close_started_workflow_task` (6675).
@@ -275,8 +278,9 @@ fn continue_as_new_advice_policy() -> ContinueAsNewAdvicePolicy;
 - `StartedWorkflowTask` gains `advice: RecordedAdvice { history_size_bytes, suggest,
   reasons }` copied from `new_state.pending_workflow_task`.
 - After a start commit that recorded `suggest = true`, the runtime records
-  `tokeira_workflow_suggest_continue_as_new_total{reason}` once per reason, in
-  `runtime_metrics` next to `record_workflow_task_started`.
+  `tokeira_runtime_workflow_suggest_continue_as_new_total{reason}` once per reason (the
+  runtime's `tokeira_runtime_` metric prefix), in `runtime_metrics` next to
+  `record_workflow_task_started`.
 
 ### 4. Edge and engine (`crates/tokeira-edge`, `crates/tokeira-engine`)
 

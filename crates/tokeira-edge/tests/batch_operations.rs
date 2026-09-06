@@ -508,6 +508,7 @@ async fn seed_workflow(
     let queue = TaskQueueName("queue".to_string());
     runtime
         .start_workflow_with_policy(StartRequest {
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
             initiator: None,
             run_key,
             namespace_id,

@@ -69,8 +69,13 @@ impl DsqlRunRepository {
                 }
 
                 let started = Instant::now();
-                let row = sqlx::query_as::<_, (i64,)>(
-                    "SELECT transition_seq FROM workflow_hot WHERE run_key = $1 FOR UPDATE",
+                // The History Size is read under the same FOR UPDATE lock as the
+                // OCC fence, so the value added to in this transaction is the one
+                // the previous committed transition wrote (Requirement 1.2). A
+                // NULL column is a row written before V068 and reads as zero.
+                let row = sqlx::query_as::<_, (i64, Option<i64>)>(
+                    "SELECT transition_seq, history_size_bytes FROM workflow_hot \
+                     WHERE run_key = $1 FOR UPDATE",
                 )
                 .bind(run_key.0)
                 .fetch_optional(&mut *tx)
@@ -80,11 +85,12 @@ impl DsqlRunRepository {
                     "load_hot",
                     started.elapsed(),
                 );
-                let current_seq = match row {
-                    Some((seq,)) => {
-                        TransitionSeq(convert::u64_from_i64(seq, "workflow_hot.transition_seq")?)
-                    }
-                    None => TransitionSeq::ZERO,
+                let (current_seq, prior_history_size_bytes) = match row {
+                    Some((seq, history_size_bytes)) => (
+                        TransitionSeq(convert::u64_from_i64(seq, "workflow_hot.transition_seq")?),
+                        history_size_bytes.unwrap_or(0),
+                    ),
+                    None => (TransitionSeq::ZERO, 0),
                 };
                 // The transition sequence is the per-run OCC fence. We check it inside
                 // the same transaction as the write set so successful commits remain
@@ -183,6 +189,7 @@ impl DsqlRunRepository {
                     self.projection_partition_count,
                     &transition,
                     &state,
+                    prior_history_size_bytes,
                 )
                 .await?;
                 match tx.commit().await {
@@ -290,6 +297,7 @@ async fn write_transition(
     projection_partition_count: u32,
     transition: &Transition,
     state: &WorkflowState,
+    prior_history_size_bytes: i64,
 ) -> Result<()> {
     if transition.history_events.len() != transition.event_principals.len() {
         bail!(
@@ -298,17 +306,29 @@ async fn write_transition(
             transition.event_principals.len()
         );
     }
+    // The batch is encoded once: the same bytes are inserted and counted, so the
+    // History Size is the persisted size by construction (Requirement 1.1).
+    let events_data = (!transition.history_events.is_empty())
+        .then(|| codec::encode_history_events(&transition.history_events))
+        .transpose()?;
+    let history_size_bytes = prior_history_size_bytes.saturating_add(
+        events_data
+            .as_ref()
+            .map(|data| i64::try_from(data.len()).unwrap_or(i64::MAX))
+            .unwrap_or(0),
+    );
     // The commit path intentionally writes the hot state first, then derives
     // every side table from the same transition/state pair. History remains the
     // authority; side tables are rebuildable projections that make dispatch and
     // sweep queries efficient.
-    insert_workflow_hot(tx, run_key, shard_id, state).await?;
-    if !transition.history_events.is_empty() {
+    insert_workflow_hot(tx, run_key, shard_id, state, history_size_bytes).await?;
+    if let Some(events_data) = events_data {
         insert_history_batch(
             tx,
             run_key,
             state.transition_seq,
             transition.history_events.as_slice(),
+            events_data,
             transition.event_principals.as_slice(),
         )
         .await?;
@@ -438,7 +458,14 @@ async fn write_transition(
     // Visibility is a post-transition snapshot, not a delta side effect. Every
     // transition publishes its context so list/count state advances monotonically
     // from the committed run image rather than an incomplete stream of patches.
-    insert_projection_log(tx, run_key, state, projection_partition_count).await?;
+    insert_projection_log(
+        tx,
+        run_key,
+        state,
+        projection_partition_count,
+        history_size_bytes,
+    )
+    .await?;
     Ok(())
 }
 
@@ -447,17 +474,20 @@ pub(super) async fn insert_workflow_hot(
     run_key: RunKey,
     shard_id: ShardId,
     state: &WorkflowState,
+    history_size_bytes: i64,
 ) -> Result<()> {
     // `workflow_hot` is a materialized snapshot for recovery and read paths.
     // It is not the audit trail; history_batch carries the append-only events.
     let started = Instant::now();
     sqlx::query(
         "INSERT INTO workflow_hot
-         (run_key, namespace_id, workflow_id, shard_id, transition_seq, state_data, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, now())
+         (run_key, namespace_id, workflow_id, shard_id, transition_seq, state_data, \
+          history_size_bytes, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now())
          ON CONFLICT (run_key) DO UPDATE SET
              transition_seq = EXCLUDED.transition_seq,
              state_data = EXCLUDED.state_data,
+             history_size_bytes = EXCLUDED.history_size_bytes,
              shard_id = EXCLUDED.shard_id,
              updated_at = EXCLUDED.updated_at",
     )
@@ -470,6 +500,7 @@ pub(super) async fn insert_workflow_hot(
         "transition_seq",
     )?)
     .bind(codec::encode_workflow_state(state)?)
+    .bind(history_size_bytes)
     .execute(&mut **tx)
     .await?;
     metrics::record_dsql_statement_duration(
@@ -480,11 +511,15 @@ pub(super) async fn insert_workflow_hot(
     Ok(())
 }
 
+/// Insert one committed batch whose `events_data` the caller already encoded
+/// with `codec::encode_history_events`, so the bytes counted into the History
+/// Size are the bytes persisted.
 pub(super) async fn insert_history_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
     transition_seq: TransitionSeq,
     events: &[HistoryEvent],
+    events_data: Vec<u8>,
     principals: &[Option<tokeira_types::EventPrincipal>],
 ) -> Result<()> {
     if events.len() != principals.len() {
@@ -517,7 +552,7 @@ pub(super) async fn insert_history_batch(
     .bind(first_event_id)
     .bind(last_event_id)
     .bind(convert::i64_from_u64(transition_seq.0, "transition_seq")?)
-    .bind(codec::encode_history_events(events)?)
+    .bind(events_data)
     .bind(principals_data)
     .execute(&mut **tx)
     .await?;
@@ -767,6 +802,7 @@ async fn insert_projection_log(
     run_key: RunKey,
     state: &WorkflowState,
     projection_partition_count: u32,
+    history_size_bytes: i64,
 ) -> Result<()> {
     // Projection log rows are grouped per transition. Visibility sinks can
     // replay the projection stream without rereading workflow state/history.
@@ -782,7 +818,11 @@ async fn insert_projection_log(
     .await?
     .map(|(data,)| codec::decode_projection_context(&data))
     .transpose()?;
-    let context = workflow_projection_context_with_previous(state, previous_context.as_ref())?;
+    let context = workflow_projection_context_with_previous(
+        state,
+        previous_context.as_ref(),
+        history_size_bytes,
+    )?;
     sqlx::query(
         "INSERT INTO projection_log
          (partition_id, fanout, run_key, transition_seq, context_data, ops_data, created_at)

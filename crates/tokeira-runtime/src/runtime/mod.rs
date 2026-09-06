@@ -97,6 +97,8 @@ mod membership;
 mod query;
 pub(crate) mod workflow_task;
 
+pub use workflow_task::continue_as_new_advice_policy;
+
 pub(crate) use activity::{
     ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry, exhausted_reason_to_retry_state,
     reconcile_activity_dispatch_candidates, reconcile_due_activity_dispatches_once,
@@ -1589,6 +1591,10 @@ pub struct StartedWorkflowTask {
     /// Target-change decision attached to this specific WFT start. Transient
     /// wire-history synthesis must not recompute it from later routing state.
     pub target_worker_deployment_version_changed: bool,
+    /// Continue-as-new Advice the start transition recorded. A transient or
+    /// speculative task's synthesized started event on the poll response
+    /// carries exactly these values (continue-as-new-advice, Requirement 4.3).
+    pub advice: tokeira_kernel::RecordedAdvice,
     /// Opaque token used to complete the task.
     pub token: WorkflowTaskToken,
     /// Exact final server-authored delivery origin.
@@ -3692,6 +3698,7 @@ mod tests {
     ) -> StartRequest {
         let run_id = tokeira_types::RunId::new();
         StartRequest {
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
             initiator: None,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),

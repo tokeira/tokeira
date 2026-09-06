@@ -1,0 +1,4 @@
+kind: changed
+body: Describe reports the history size accounted at commit; state and history blobs gain versioned envelopes, so stores written by 0.1.2 must be recreated before upgrading.
+custom:
+  Slice: adde0109-84b6-4be7-9dd3-07a01aea023e

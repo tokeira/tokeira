@@ -129,6 +129,7 @@ fn stamp_callback_field_change(
 
 fn make_open_state(now: OffsetDateTime) -> WorkflowState {
     WorkflowState {
+        completed_update_count: 0,
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),
         workflow_id: WorkflowId("workflow".into()),
@@ -204,6 +205,7 @@ fn with_pending_wft(
     attempt: u32,
 ) -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         target_worker_deployment_version_changed: false,
@@ -892,6 +894,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                 let now = fixed_now();
                 let run_id = RunId::new();
                 StartRequest {
+                    advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                     initiator: None,
                     run_key: RunKey::new(),
                     namespace_id: NamespaceId::new(),
@@ -1156,6 +1159,8 @@ fn arb_wft_failed_request(
     )
         .prop_map(move |(failure_cause, failure_details, worker_identity)| {
             WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq,
                 started_event_id,
                 failure_cause,
@@ -1482,11 +1487,11 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             let logical_seq = 20 + offset;
             let state = with_pending_wft(make_open_state(now), logical_seq, None, 0);
             let req = StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(logical_seq),
                 worker_identity: WorkerIdentity("worker".into()),
                 request_id: format!("start-wft-{logical_seq}"),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
@@ -2284,11 +2289,11 @@ proptest! {
             .apply(
                 LoadedRun::Existing(state),
                 Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                    advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                     logical_seq: LogicalTaskSeq(30),
                     worker_identity: WorkerIdentity("worker".into()),
                     request_id: "sticky-start".into(),
                     history_size_bytes: 0,
-                    suggest_continue_as_new: false,
                     deployment_transition: None,
                     deployment_transition_revision_number: None,
                     polled_task_queue,
@@ -2668,11 +2673,11 @@ proptest! {
                     .apply(
                         LoadedRun::Existing(hot_state.clone()),
                         Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                             logical_seq: pending.logical_seq,
                             worker_identity: WorkerIdentity("worker".into()),
                             request_id: format!("start-{index}"),
                             history_size_bytes: 0,
-                            suggest_continue_as_new: false,
                             deployment_transition: None,
                             deployment_transition_revision_number: None,
                             polled_task_queue: hot_state.task_queue.clone(),
@@ -3369,6 +3374,7 @@ proptest! {
                 event_id: started_event_id,
                 happened_at: now,
                 kind: HistoryEventKind::WorkflowTaskStarted {
+                    suggest_continue_as_new_reasons: Vec::new(),
                     logical_seq,
                     scheduled_event_id,
                     attempt: 1,
@@ -4585,11 +4591,11 @@ proptest! {
                 .apply(
                     LoadedRun::Existing(transition.next_state.clone()),
                     Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                         logical_seq: old_seq,
                         worker_identity: WorkerIdentity("stale-worker".into()),
                         request_id: "stale-priority-task".into(),
                         history_size_bytes: 0,
-                        suggest_continue_as_new: false,
                         deployment_transition: None,
                         deployment_transition_revision_number: None,
                         polled_task_queue: TaskQueueName("queue".into()),
@@ -7383,6 +7389,8 @@ proptest! {
                 .apply(
                     LoadedRun::Existing(buffered),
                     Command::WorkflowTaskFailed(tokeira_kernel::WorkflowTaskFailedRequest {
+                        history_size_bytes: 0,
+                        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                         logical_seq: LogicalTaskSeq(30),
                         started_event_id: 13,
                         failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
@@ -7634,6 +7642,8 @@ fn wft_failed_with_buffered_events_schedules_fresh_normal_task() {
         .apply(
             LoadedRun::Existing(buffered),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(30),
                 started_event_id: 13,
                 failure_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
@@ -7769,11 +7779,11 @@ proptest! {
             ..WorkflowVersioningInfo::default()
         });
         let command = Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
             logical_seq: LogicalTaskSeq(30),
             worker_identity: WorkerIdentity("worker".into()),
             request_id: "target-observation".into(),
             history_size_bytes: 0,
-            suggest_continue_as_new: false,
             deployment_transition: None,
             deployment_transition_revision_number: None,
             target_version_changed_enabled: enabled,
@@ -7806,5 +7816,601 @@ proptest! {
         prop_assert_eq!(target_deployment_version, &routing_target);
         prop_assert_eq!(first.next_state.versioning_info.as_ref(), Some(&info));
         prop_assert_eq!(first, second);
+    }
+}
+
+// ── Continue-as-new advice ──────────────────────────────────────────────
+
+fn advice_policy(size: i64, count: i64, updates: u32) -> tokeira_kernel::ContinueAsNewAdvicePolicy {
+    tokeira_kernel::ContinueAsNewAdvicePolicy {
+        history_size_threshold_bytes: size,
+        history_count_threshold: count,
+        total_updates_suggest_threshold: updates,
+    }
+}
+
+fn arb_advice_policy() -> impl Strategy<Value = tokeira_kernel::ContinueAsNewAdvicePolicy> {
+    (0i64..64, 0i64..64, 0u32..8)
+        .prop_map(|(size, count, updates)| advice_policy(size, count, updates))
+}
+
+/// A start request for the advice properties. Callers that compare two runs
+/// clone one instance so the generated identities are shared.
+fn advice_start_request(
+    now: OffsetDateTime,
+    reserved_poller_identity: Option<WorkerIdentity>,
+) -> StartRequest {
+    let run_id = RunId::new();
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("advice-workflow".into());
+    StartRequest {
+        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+        initiator: None,
+        run_key: RunKey::derive(namespace_id, &workflow_id, run_id),
+        namespace_id,
+        workflow_id,
+        run_id,
+        workflow_type: WorkflowType("wf".into()),
+        task_queue: TaskQueueName("queue".into()),
+        deployment: None,
+        build_id: None,
+        versioning_override: None,
+        workflow_start_delay: None,
+        completion_callbacks: Vec::new(),
+        user_metadata: None,
+        links: Vec::new(),
+        on_conflict_options: None,
+        priority: None,
+        input: payloads("input"),
+        header: None,
+        memo: Memo::default(),
+        search_attributes: SearchAttributes::default(),
+        workflow_execution_timeout: None,
+        workflow_run_timeout: None,
+        workflow_task_timeout: default_workflow_task_timeout(),
+        retry_policy: None,
+        conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+        reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+        attempt: 1,
+        continued_execution_run_id: None,
+        first_execution_run_id: Some(run_id),
+        parent_run_key: None,
+        parent_workflow_id: None,
+        parent_run_id: None,
+        parent_namespace_id: None,
+        parent_namespace_name: None,
+        parent_initiated_event_id: 0,
+        root_workflow_id: None,
+        root_run_id: None,
+        original_execution_run_id: Some(run_id),
+        continued_failure: None,
+        last_completion_result: None,
+        first_run_started_at: None,
+        request: request_context("advice-start", now),
+        now,
+        client_cron_schedule: None,
+        cron_schedule: None,
+        eager_execution_accepted: false,
+        reserved_poller_identity,
+        inherited_versioning_info: None,
+    }
+}
+
+fn advice_start_wft_request(
+    state: &WorkflowState,
+    history_size_bytes: i64,
+    policy: tokeira_kernel::ContinueAsNewAdvicePolicy,
+    now: OffsetDateTime,
+) -> StartWorkflowTaskRequest {
+    let pending = state
+        .pending_workflow_task
+        .as_ref()
+        .expect("a pending workflow task to start");
+    StartWorkflowTaskRequest {
+        advice_policy: policy,
+        logical_seq: pending.logical_seq,
+        worker_identity: WorkerIdentity("worker".into()),
+        request_id: format!("advice-start-{}", pending.logical_seq.0),
+        history_size_bytes,
+        deployment_transition: None,
+        deployment_transition_revision_number: None,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
+        polled_task_queue: TaskQueueName("queue".into()),
+        now,
+    }
+}
+
+fn advice_wft_failed_request(
+    state: &WorkflowState,
+    failure_cause: WorkflowTaskFailedCause,
+    history_size_bytes: i64,
+    policy: tokeira_kernel::ContinueAsNewAdvicePolicy,
+    now: OffsetDateTime,
+) -> WorkflowTaskFailedRequest {
+    let pending = state
+        .pending_workflow_task
+        .as_ref()
+        .expect("a pending workflow task to fail");
+    WorkflowTaskFailedRequest {
+        history_size_bytes,
+        advice_policy: policy,
+        logical_seq: pending.logical_seq,
+        started_event_id: pending.started_event_id.unwrap_or(0),
+        failure_cause,
+        failure_details: None,
+        worker_identity: WorkerIdentity("worker".into()),
+        request: tokeira_types::RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+        now,
+        reset_reapply: Vec::new(),
+    }
+}
+
+/// The Advice carried by the last `WorkflowTaskStarted` event in a transition.
+fn started_event_advice(transition: &Transition) -> Option<tokeira_kernel::RecordedAdvice> {
+    transition
+        .history_events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowTaskStarted {
+                history_size_bytes,
+                suggest_continue_as_new,
+                suggest_continue_as_new_reasons,
+                ..
+            } => Some(tokeira_kernel::RecordedAdvice {
+                history_size_bytes: *history_size_bytes,
+                suggest_continue_as_new: *suggest_continue_as_new,
+                suggest_continue_as_new_reasons: suggest_continue_as_new_reasons.clone(),
+            }),
+            _ => None,
+        })
+}
+
+fn pending_advice(state: &WorkflowState) -> tokeira_kernel::RecordedAdvice {
+    state
+        .pending_workflow_task
+        .as_ref()
+        .expect("a pending workflow task")
+        .advice
+        .clone()
+}
+
+/// Zero the Advice on a transition so two runs can be compared for every
+/// other effect (Property 10).
+fn without_advice(transition: &Transition) -> Transition {
+    let mut masked = transition.clone();
+    if let Some(pending) = masked.next_state.pending_workflow_task.as_mut() {
+        pending.advice = Default::default();
+    }
+    for event in masked.history_events.iter_mut() {
+        if let HistoryEventKind::WorkflowTaskStarted {
+            history_size_bytes,
+            suggest_continue_as_new,
+            suggest_continue_as_new_reasons,
+            ..
+        } = &mut event.kind
+        {
+            *history_size_bytes = 0;
+            *suggest_continue_as_new = false;
+            suggest_continue_as_new_reasons.clear();
+        }
+    }
+    masked
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    // Feature: continue-as-new-advice, Property 2: the advice rule is a deterministic function of its operands
+    #[test]
+    fn property_advice_rule_is_deterministic(
+        size in any::<i64>(),
+        next_event_id in any::<i64>(),
+        in_flight in 0usize..4096,
+        completed in any::<u32>(),
+        size_threshold in any::<i64>(),
+        count_threshold in any::<i64>(),
+        update_threshold in any::<u32>(),
+    ) {
+        use tokeira_kernel::SuggestContinueAsNewReason as Reason;
+        let policy = advice_policy(size_threshold, count_threshold, update_threshold);
+        let first =
+            tokeira_kernel::continue_as_new_advice(size, next_event_id, in_flight, completed, policy);
+        let second =
+            tokeira_kernel::continue_as_new_advice(size, next_event_id, in_flight, completed, policy);
+        prop_assert_eq!(&first, &second);
+
+        let mut expected = Vec::new();
+        if size >= size_threshold {
+            expected.push(Reason::HistorySizeTooLarge);
+        }
+        if next_event_id >= count_threshold {
+            expected.push(Reason::TooManyHistoryEvents);
+        }
+        if update_threshold > 0
+            && in_flight as u64 + u64::from(completed) >= u64::from(update_threshold)
+        {
+            expected.push(Reason::TooManyUpdates);
+        }
+        prop_assert_eq!(&first.suggest_continue_as_new_reasons, &expected);
+        prop_assert_eq!(first.suggest_continue_as_new, !expected.is_empty());
+        prop_assert_eq!(first.history_size_bytes, size);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: continue-as-new-advice, Property 4: each attempt recomputes from the values at its own start
+    #[test]
+    fn property_each_attempt_recomputes_from_its_own_start(
+        attempts in prop::collection::vec((0i64..64, arb_advice_policy(), any::<bool>()), 1..5),
+    ) {
+        let now = fixed_now();
+        let kernel = kernel();
+        let start = kernel
+            .apply(LoadedRun::Absent, Command::Start(advice_start_request(now, None)))
+            .unwrap();
+        let mut state = start.next_state;
+        prop_assert_eq!(pending_advice(&state), Default::default());
+
+        let mut size_so_far = 0i64;
+        let mut previous_size = 0i64;
+        for (index, (size_step, policy, signal_first)) in attempts.into_iter().enumerate() {
+            size_so_far += size_step;
+            if signal_first && index > 0 {
+                // New events after a transient schedule convert the retry back
+                // to a persisted attempt-1 task; the Advice must still follow
+                // the values supplied to that start.
+                let signalled = kernel
+                    .apply(
+                        LoadedRun::Existing(state.clone()),
+                        Command::Signal(SignalRequest {
+                            signal_name: "sig".into(),
+                            input: payloads("signal"),
+                            header: None,
+                            links: Vec::new(),
+                            request: request_context(&format!("advice-signal-{index}"), now),
+                            now,
+                        }),
+                    )
+                    .unwrap();
+                state = signalled.next_state;
+            }
+            let in_flight = state.admitted_updates.len() + state.pending_updates.len();
+            let expected = tokeira_kernel::continue_as_new_advice(
+                size_so_far,
+                state.last_event_id + 1,
+                in_flight,
+                state.completed_update_count,
+                policy,
+            );
+            let started = kernel
+                .apply(
+                    LoadedRun::Existing(state.clone()),
+                    Command::WorkflowTaskStarted(advice_start_wft_request(
+                        &state,
+                        size_so_far,
+                        policy,
+                        now,
+                    )),
+                )
+                .unwrap();
+            let recorded = pending_advice(&started.next_state);
+            prop_assert_eq!(&recorded, &expected);
+            prop_assert!(recorded.history_size_bytes >= previous_size);
+            previous_size = recorded.history_size_bytes;
+            if let Some(event_advice) = started_event_advice(&started) {
+                prop_assert_eq!(&event_advice, &expected);
+            }
+
+            let failed = kernel
+                .apply(
+                    LoadedRun::Existing(started.next_state.clone()),
+                    Command::WorkflowTaskFailed(advice_wft_failed_request(
+                        &started.next_state,
+                        WorkflowTaskFailedCause::UnhandledCommand,
+                        size_so_far,
+                        policy,
+                        now,
+                    )),
+                )
+                .unwrap();
+            state = failed.next_state;
+            let rescheduled = state
+                .pending_workflow_task
+                .as_ref()
+                .expect("a failed task is rescheduled");
+            prop_assert!(rescheduled.started_event_id.is_none());
+            prop_assert_eq!(&rescheduled.advice, &Default::default());
+        }
+    }
+
+    // Feature: continue-as-new-advice, Property 5: successors account for themselves
+    #[test]
+    fn property_sync_matched_first_task_and_reset_synthesis_derive_by_the_rule(
+        policy in arb_advice_policy(),
+        reset_size in 0i64..64,
+        reset_policy in arb_advice_policy(),
+    ) {
+        let now = fixed_now();
+        let kernel = kernel();
+
+        // A sync-matched first task starts in the start transition with a
+        // History Size of 0; its count operand is its own event id (3).
+        let mut request = advice_start_request(now, Some(WorkerIdentity("poller".into())));
+        request.advice_policy = policy;
+        let start = kernel.apply(LoadedRun::Absent, Command::Start(request)).unwrap();
+        let recorded = started_event_advice(&start)
+            .expect("a sync-matched first task emits its started event");
+        let expected = tokeira_kernel::continue_as_new_advice(0, 3, 0, 0, policy);
+        prop_assert_eq!(&recorded, &expected);
+        prop_assert_eq!(&pending_advice(&start.next_state), &expected);
+
+        // A reset whose fork task was scheduled but not started synthesizes
+        // the started event by the rule from the supplied operands.
+        let start = kernel
+            .apply(LoadedRun::Absent, Command::Start(advice_start_request(now, None)))
+            .unwrap();
+        let state = start.next_state;
+        let expected = tokeira_kernel::continue_as_new_advice(
+            reset_size,
+            state.last_event_id + 1,
+            0,
+            state.completed_update_count,
+            reset_policy,
+        );
+        let reset = kernel
+            .apply(
+                LoadedRun::Existing(state.clone()),
+                Command::WorkflowTaskFailed(advice_wft_failed_request(
+                    &state,
+                    WorkflowTaskFailedCause::ResetWorkflow,
+                    reset_size,
+                    reset_policy,
+                    now,
+                )),
+            )
+            .unwrap();
+        let synthesized = started_event_advice(&reset)
+            .expect("the reset synthesizes the fork task's started event");
+        prop_assert_eq!(&synthesized, &expected);
+    }
+
+    // Feature: continue-as-new-advice, Property 10: the Advice is advisory
+    #[test]
+    fn property_advice_changes_nothing_but_the_advice(
+        policy_a in arb_advice_policy(),
+        policy_b in arb_advice_policy(),
+        size in 0i64..64,
+        sync_match in any::<bool>(),
+    ) {
+        let now = fixed_now();
+        let kernel = kernel();
+        let base = advice_start_request(
+            now,
+            sync_match.then(|| WorkerIdentity("poller".into())),
+        );
+        let run = |policy: tokeira_kernel::ContinueAsNewAdvicePolicy| {
+            let mut request = base.clone();
+            request.advice_policy = policy;
+            let start = kernel.apply(LoadedRun::Absent, Command::Start(request)).unwrap();
+            let started = if sync_match {
+                start.clone()
+            } else {
+                let state = start.next_state.clone();
+                kernel
+                    .apply(
+                        LoadedRun::Existing(state.clone()),
+                        Command::WorkflowTaskStarted(advice_start_wft_request(
+                            &state, size, policy, now,
+                        )),
+                    )
+                    .unwrap()
+            };
+            let completed = kernel
+                .apply(
+                    LoadedRun::Existing(started.next_state.clone()),
+                    Command::WorkflowTaskCompleted(completion_request(
+                        &started.next_state,
+                        vec![WorkflowCommand::RequestNewWorkflowTask],
+                        Default::default(),
+                        None,
+                        None,
+                        false,
+                        now,
+                    )),
+                )
+                .unwrap();
+            (start, started, completed)
+        };
+        let (start_a, started_a, completed_a) = run(policy_a);
+        let (start_b, started_b, completed_b) = run(policy_b);
+        prop_assert_eq!(without_advice(&start_a), without_advice(&start_b));
+        prop_assert_eq!(without_advice(&started_a), without_advice(&started_b));
+        prop_assert_eq!(without_advice(&completed_a), without_advice(&completed_b));
+    }
+
+    // Feature: continue-as-new-advice, Property 11: update counting matches the registry model
+    #[test]
+    fn property_update_counting_matches_the_registry_model(
+        ops in prop::collection::vec((0u8..4, 0u8..3), 1..12),
+    ) {
+        use std::collections::BTreeSet;
+        let now = fixed_now();
+        let kernel = kernel();
+        let mut state = make_open_state(now);
+        let mut admitted: BTreeSet<String> = BTreeSet::new();
+        let mut accepted: BTreeSet<String> = BTreeSet::new();
+        let mut completed: u32 = 0;
+        let mut seq = 70u64;
+        for (kind, slot) in ops {
+            let update_id = format!("update-{slot}");
+            seq += 1;
+            match kind {
+                // Admission: a duplicate of a live id is refused by the kernel,
+                // so the model skips it too.
+                0 => {
+                    if admitted.contains(&update_id) || accepted.contains(&update_id) {
+                        continue;
+                    }
+                    let transition = kernel
+                        .apply(
+                            LoadedRun::Existing(state.clone()),
+                            Command::Update(UpdateRequest {
+                                update_id: update_id.clone(),
+                                update_name: "handler".into(),
+                                input: payloads("update"),
+                                request: request_context(&format!("update-{seq}"), now),
+                                now,
+                            }),
+                        )
+                        .unwrap();
+                    state = transition.next_state;
+                    admitted.insert(update_id);
+                }
+                // Acceptance moves an id into the accepted set; an id the
+                // registry never saw is resurrected as accepted, exactly as
+                // the kernel does, while a second acceptance of an accepted id
+                // is an invalid transition the kernel refuses.
+                _ => {
+                    let started = with_pending_wft(state.clone(), seq, Some(22), 1);
+                    let body = match kind {
+                        1 => {
+                            if accepted.contains(&update_id) {
+                                continue;
+                            }
+                            UpdateProtocolBody::Accepted {
+                                update_id: update_id.clone(),
+                                update_name: "handler".into(),
+                                input: payloads("update"),
+                                sequencing_event_id: 1,
+                            }
+                        }
+                        2 => {
+                            if !accepted.contains(&update_id) {
+                                continue;
+                            }
+                            UpdateProtocolBody::Completed {
+                                update_id: update_id.clone(),
+                                result: payloads("result"),
+                                failure: None,
+                            }
+                        }
+                        _ => UpdateProtocolBody::Rejected {
+                            update_id: update_id.clone(),
+                            failure: payload("rejected"),
+                        },
+                    };
+                    let transition = kernel
+                        .apply(
+                            LoadedRun::Existing(started.clone()),
+                            Command::WorkflowTaskCompleted(completion_request(
+                                &started,
+                                vec![WorkflowCommand::ProtocolMessage {
+                                    message_id: format!("msg-{seq}"),
+                                    body,
+                                }],
+                                Default::default(),
+                                None,
+                                None,
+                                false,
+                                now,
+                            )),
+                        )
+                        .unwrap();
+                    state = transition.next_state;
+                    match kind {
+                        1 => {
+                            admitted.remove(&update_id);
+                            accepted.insert(update_id);
+                        }
+                        2 => {
+                            accepted.remove(&update_id);
+                            completed += 1;
+                        }
+                        _ => {
+                            admitted.remove(&update_id);
+                            accepted.remove(&update_id);
+                        }
+                    }
+                }
+            }
+            prop_assert_eq!(
+                state.admitted_updates.len() + state.pending_updates.len(),
+                admitted.len() + accepted.len()
+            );
+            prop_assert_eq!(state.completed_update_count, completed);
+        }
+    }
+
+    // Feature: continue-as-new-advice, Property 3: recorded Advice is identical on every delivery path
+    // (rebuild leg: the rebuilt pending record equals the recorded event)
+    #[test]
+    fn property_rebuild_copies_the_recorded_advice(
+        size in 0i64..64,
+        reasons_mask in 0u8..8,
+    ) {
+        let now = fixed_now();
+        let kernel = kernel();
+        let start = kernel
+            .apply(LoadedRun::Absent, Command::Start(advice_start_request(now, None)))
+            .unwrap();
+        let mut state = start.next_state.clone();
+        let mut history = start.history_events.to_vec();
+        if reasons_mask & 4 != 0 {
+            // One admitted update makes the update reason reachable at threshold 1.
+            let admitted = kernel
+                .apply(
+                    LoadedRun::Existing(state.clone()),
+                    Command::Update(UpdateRequest {
+                        update_id: "update-rebuild".into(),
+                        update_name: "handler".into(),
+                        input: payloads("update"),
+                        request: request_context("update-rebuild", now),
+                        now,
+                    }),
+                )
+                .unwrap();
+            history.extend(admitted.history_events.iter().cloned());
+            state = admitted.next_state;
+        }
+        let policy = advice_policy(
+            if reasons_mask & 1 != 0 { 0 } else { i64::MAX },
+            if reasons_mask & 2 != 0 { 0 } else { i64::MAX },
+            if reasons_mask & 4 != 0 { 1 } else { 0 },
+        );
+        let started = kernel
+            .apply(
+                LoadedRun::Existing(state.clone()),
+                Command::WorkflowTaskStarted(advice_start_wft_request(&state, size, policy, now)),
+            )
+            .unwrap();
+        history.extend(started.history_events.iter().cloned());
+        let recorded = pending_advice(&started.next_state);
+        prop_assert_eq!(
+            recorded.suggest_continue_as_new_reasons.len(),
+            usize::from(reasons_mask & 1 != 0) + usize::from(reasons_mask & 2 != 0)
+                + usize::from(reasons_mask & 4 != 0)
+        );
+
+        let replayed = kernel
+            .replay_history_prefix(
+                ReplayContext {
+                    run_key: state.run_key,
+                    namespace_id: state.namespace_id,
+                    workflow_id: state.workflow_id.clone(),
+                    run_id: state.run_id,
+                    deployment: None,
+                    build_id: None,
+                    parent_run_key: None,
+                    parent_workflow_id: None,
+                    first_run_started_at: None,
+                },
+                &history,
+            )
+            .unwrap();
+        prop_assert_eq!(pending_advice(&replayed), recorded);
     }
 }

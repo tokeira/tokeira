@@ -394,10 +394,29 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::NotEnforced,
     },
+    // Continue-as-new advice thresholds. Pinned v1.31.0 constants in the
+    // runtime, consulted once per workflow-task start through
+    // `tokeira_runtime::continue_as_new_advice_policy` (continue-as-new-advice,
+    // Requirement 3.3); the hard `limit.*.error` limits above stay unenforced.
     KeySpec {
         key: "limit.historySize.suggestContinueAsNew",
         value_type: ValueType::Int,
-        disposition: Disposition::NotEnforced,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.historyCount.suggestContinueAsNew",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "history.maxTotalUpdates",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "history.maxTotalUpdates.suggestContinueAsNewThreshold",
+        value_type: ValueType::Double,
+        disposition: Disposition::Wired,
     },
 ];
 

@@ -1545,6 +1545,7 @@ mod tests {
         let run_id = RunId::new();
         let result = runtime
             .start_workflow(StartRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 initiator: None,
                 run_key,
                 namespace_id: ns,

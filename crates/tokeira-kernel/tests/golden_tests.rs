@@ -99,6 +99,7 @@ fn request_context(id: &str) -> RequestContext {
 fn make_start_request() -> StartRequest {
     let run_id = RunId::new();
     StartRequest {
+        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
         initiator: None,
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),
@@ -153,6 +154,7 @@ fn make_start_request() -> StartRequest {
 fn make_signal_with_start_request() -> SignalWithStartRequest {
     let start = make_start_request();
     SignalWithStartRequest {
+        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
         initiator: None,
         run_key: start.run_key,
         namespace_id: start.namespace_id,
@@ -229,6 +231,7 @@ fn history_event(
 
 fn make_open_state() -> WorkflowState {
     WorkflowState {
+        completed_update_count: 0,
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),
         workflow_id: WorkflowId("workflow".into()),
@@ -359,6 +362,7 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
             3,
             started_at,
             HistoryEventKind::WorkflowTaskStarted {
+                suggest_continue_as_new_reasons: Vec::new(),
                 logical_seq: LogicalTaskSeq::ONE,
                 scheduled_event_id: 2,
                 attempt: 1,
@@ -630,6 +634,7 @@ fn replay_history_rejects_empty_or_non_started_sequences() {
 fn make_open_state_with_pending_wft() -> WorkflowState {
     let mut state = make_open_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         target_worker_deployment_version_changed: false,
@@ -648,6 +653,7 @@ fn make_open_state_with_pending_wft() -> WorkflowState {
 fn make_open_state_with_started_wft() -> WorkflowState {
     let mut state = make_open_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         target_worker_deployment_version_changed: false,
@@ -2425,6 +2431,7 @@ fn activity_resolved_paused_workflow_no_wft() {
 fn wft_failed_paused_workflow_no_redispatch() {
     let mut state = make_paused_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         target_worker_deployment_version_changed: false,
@@ -2441,6 +2448,8 @@ fn wft_failed_paused_workflow_no_redispatch() {
         .apply(
             LoadedRun::Existing(state),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 started_event_id: 9,
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
@@ -2473,6 +2482,7 @@ fn wft_failed_paused_workflow_no_redispatch() {
 fn wft_timed_out_paused_workflow_no_redispatch() {
     let mut state = make_paused_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         target_worker_deployment_version_changed: false,
@@ -2515,6 +2525,7 @@ fn wft_timed_out_paused_workflow_no_redispatch() {
 fn wft_completed_paused_workflow_no_force_wft() {
     let mut state = make_paused_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         target_worker_deployment_version_changed: false,
@@ -2888,11 +2899,11 @@ fn workflow_task_started_with_sticky() {
         .apply(
             LoadedRun::Existing(state),
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 worker_identity: WorkerIdentity("worker-a".into()),
                 request_id: "start-wft".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
@@ -2926,11 +2937,11 @@ fn workflow_task_started_with_deployment_transition_keeps_started_wft_running() 
         .apply(
             LoadedRun::Existing(state),
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 worker_identity: WorkerIdentity("worker-a".into()),
                 request_id: "start-wft".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: Some(target.clone()),
                 deployment_transition_revision_number: Some(42),
                 target_version_changed_enabled: false,
@@ -3804,6 +3815,8 @@ fn wft_failed_with_started_wft() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 started_event_id: 9,
                 failure_cause: WorkflowTaskFailedCause::NonDeterminismError,
@@ -3933,6 +3946,8 @@ fn wft_failed_no_sticky() {
         .apply(
             LoadedRun::Existing(state),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 started_event_id: 9,
                 failure_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
@@ -4115,11 +4130,11 @@ fn reject_wft_started_no_pending() {
         kernel().apply(
             LoadedRun::Existing(make_open_state()),
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 worker_identity: WorkerIdentity("worker".into()),
                 request_id: "start-wft".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
@@ -4138,11 +4153,11 @@ fn reject_wft_started_seq_mismatch() {
         kernel().apply(
             LoadedRun::Existing(make_open_state_with_pending_wft()),
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(4),
                 worker_identity: WorkerIdentity("worker".into()),
                 request_id: "start-wft".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
@@ -4170,11 +4185,11 @@ fn reject_wft_started_already_started() {
         kernel().apply(
             LoadedRun::Existing(started),
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 worker_identity: WorkerIdentity("worker".into()),
                 request_id: "start-wft".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
@@ -4478,6 +4493,8 @@ fn reject_wft_failed_absent_run() {
         kernel().apply(
             LoadedRun::Absent,
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 started_event_id: 9,
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
@@ -4500,6 +4517,8 @@ fn reject_wft_failed_closed_run() {
         kernel().apply(
             LoadedRun::Existing(make_closed_state()),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 started_event_id: 9,
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
@@ -4522,6 +4541,8 @@ fn reject_wft_failed_no_pending() {
         kernel().apply(
             LoadedRun::Existing(make_open_state()),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 started_event_id: 9,
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
@@ -4544,6 +4565,8 @@ fn reject_wft_failed_not_started() {
         kernel().apply(
             LoadedRun::Existing(make_open_state_with_pending_wft()),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 started_event_id: 9,
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
@@ -4566,6 +4589,8 @@ fn reject_wft_failed_seq_mismatch() {
         kernel().apply(
             LoadedRun::Existing(make_open_state_with_started_wft()),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(4),
                 started_event_id: 9,
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
@@ -4591,6 +4616,8 @@ fn reject_wft_failed_started_event_mismatch() {
         kernel().apply(
             LoadedRun::Existing(make_open_state_with_started_wft()),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 started_event_id: 10,
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
@@ -5257,11 +5284,11 @@ fn workflow_property_and_search_attribute_patches_record_merge_and_replay() {
         .apply(
             LoadedRun::Existing(started.next_state),
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: pending.logical_seq,
                 worker_identity: WorkerIdentity("worker".into()),
                 request_id: "start-patches".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
@@ -5432,6 +5459,7 @@ fn transient_completion_materializes_scheduled_started_with_task_times() {
     };
     state.workflow_task_attempt = 3;
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         target_worker_deployment_version_changed: true,
@@ -5679,11 +5707,11 @@ fn cancel_then_cancel_workflow_e2e() {
         .apply(
             LoadedRun::Existing(cancel.next_state.clone()),
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: cancel.next_state.pending_workflow_task.unwrap().logical_seq,
                 worker_identity: WorkerIdentity("worker".into()),
                 request_id: "start-wft".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
@@ -5698,6 +5726,7 @@ fn cancel_then_cancel_workflow_e2e() {
         .pending_workflow_task
         .clone()
         .unwrap_or(PendingWorkflowTask {
+            advice: Default::default(),
             task_type: tokeira_kernel::WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
             target_worker_deployment_version_changed: false,
@@ -8507,11 +8536,11 @@ fn golden_message_too_large_terminate_history() {
         .apply(
             LoadedRun::Existing(started.next_state),
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: pending.logical_seq,
                 worker_identity: WorkerIdentity("worker".into()),
                 request_id: "g1-wft-start".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
@@ -8673,11 +8702,11 @@ fn start_pending_task(state: WorkflowState) -> Transition {
         .apply(
             LoadedRun::Existing(state),
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: pending.logical_seq,
                 worker_identity: WorkerIdentity("worker".into()),
                 request_id: "speculative-start".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
@@ -9451,6 +9480,8 @@ fn speculative_explicit_fail_materializes_and_keeps_update_admitted() {
         .apply(
             LoadedRun::Existing(started),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: pending.logical_seq,
                 started_event_id: pending.started_event_id.unwrap(),
                 failure_cause: WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage,
@@ -9533,6 +9564,7 @@ fn worker_deployment_appended_postcard_fields_require_a_fresh_pre_baseline_store
     assert_old_shape_rejected(&WorkflowVersioningInfo::default(), 2);
     assert_old_shape_rejected(
         &PendingWorkflowTask {
+            advice: Default::default(),
             logical_seq: LogicalTaskSeq(1),
             scheduled_event_id: 2,
             scheduled_at: now(),
@@ -9550,11 +9582,11 @@ fn worker_deployment_appended_postcard_fields_require_a_fresh_pre_baseline_store
     assert_old_shape_rejected(&make_start_request(), 1);
     assert_old_shape_rejected(
         &StartWorkflowTaskRequest {
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
             logical_seq: LogicalTaskSeq(1),
             worker_identity: WorkerIdentity("worker".into()),
             request_id: "start".into(),
             history_size_bytes: 0,
-            suggest_continue_as_new: false,
             deployment_transition: None,
             deployment_transition_revision_number: None,
             polled_task_queue: TaskQueueName("queue".into()),
@@ -9566,6 +9598,7 @@ fn worker_deployment_appended_postcard_fields_require_a_fresh_pre_baseline_store
     );
     assert_old_shape_rejected(
         &HistoryEventKind::WorkflowTaskStarted {
+            suggest_continue_as_new_reasons: Vec::new(),
             logical_seq: LogicalTaskSeq(1),
             scheduled_event_id: 2,
             attempt: 1,

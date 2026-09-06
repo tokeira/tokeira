@@ -76,8 +76,8 @@ impl DsqlRunRepository {
                     }
                 }
 
-                let row = sqlx::query_as::<_, (i64, Vec<u8>)>(
-                    "SELECT transition_seq, state_data
+                let row = sqlx::query_as::<_, (i64, Option<i64>, Vec<u8>)>(
+                    "SELECT transition_seq, history_size_bytes, state_data
                      FROM workflow_hot
                      WHERE run_key = $1
                      FOR UPDATE",
@@ -85,11 +85,11 @@ impl DsqlRunRepository {
                 .bind(run_key.0)
                 .fetch_optional(&mut *tx)
                 .await?;
-                let Some((durable_seq, state_data)) = row else {
+                let Some((durable_seq, history_size_bytes, state_data)) = row else {
                     tx.rollback().await?;
                     return Ok(DeleteRunResult::NotFound);
                 };
-                let state = codec::decode_workflow_state(&state_data)?;
+                let state = codec::decode_workflow_state(run_key, &state_data)?;
                 let durable_seq = TransitionSeq(convert::u64_from_i64(
                     durable_seq,
                     "workflow_hot.transition_seq",
@@ -134,6 +134,7 @@ impl DsqlRunRepository {
                     context: deleted_workflow_projection_context(
                         &tombstone_state,
                         request.deleted_at,
+                        history_size_bytes.unwrap_or(0),
                     )?,
                 };
 

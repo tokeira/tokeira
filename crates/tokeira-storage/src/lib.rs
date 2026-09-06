@@ -24,6 +24,7 @@ pub mod api;
 #[cfg(test)]
 mod bug_condition_exploration_tests;
 pub mod chasm;
+pub mod codec;
 #[cfg(feature = "dsql")]
 pub mod dsql;
 pub mod memory;

@@ -86,6 +86,34 @@ pub fn external_payload_stats_for_event(event: &HistoryEvent) -> (i64, i64) {
 ///
 /// See `docs/architecture/020-kernel.md` for the full command
 /// taxonomy and which commands produce which events.
+/// Why the server suggests continuing as new
+/// (`temporal.api.enums.v1.SuggestContinueAsNewReason`,
+/// `proto/upstream/temporal/api/enums/v1/workflow.proto:208-226`).
+///
+/// The variants are declared in enum-value order (1, 2, 3) so a reasons list
+/// built by pushing them in declaration order matches v1.31.0's ordering; value
+/// 4 is reserved upstream and never emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SuggestContinueAsNewReason {
+    /// The persisted history size reached `limit.historySize.suggestContinueAsNew`.
+    HistorySizeTooLarge,
+    /// The next event id reached `limit.historyCount.suggestContinueAsNew`.
+    TooManyHistoryEvents,
+    /// In-flight plus completed updates reached the update threshold.
+    TooManyUpdates,
+}
+
+impl SuggestContinueAsNewReason {
+    /// Stable bounded label for the per-reason suggestion metric.
+    pub const fn metric_label(self) -> &'static str {
+        match self {
+            Self::HistorySizeTooLarge => "history_size_too_large",
+            Self::TooManyHistoryEvents => "too_many_history_events",
+            Self::TooManyUpdates => "too_many_updates",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HistoryEventKind {
     /// The workflow run was created. This is always the first
@@ -213,8 +241,13 @@ pub enum HistoryEventKind {
         attempt: u32,
         identity: WorkerIdentity,
         request_id: String,
+        /// Persisted History Size supplied with the start
+        /// (`WorkflowTaskStartedEventAttributes.history_size_bytes = 5`).
         history_size_bytes: i64,
+        /// `true` iff `suggest_continue_as_new_reasons` is non-empty (field 4).
         suggest_continue_as_new: bool,
+        /// Reasons in enum order (field 8; `workflow.proto:208-226`).
+        suggest_continue_as_new_reasons: Vec<SuggestContinueAsNewReason>,
         /// Public v1.31.0 target-change notification decision.
         #[serde(default)]
         target_worker_deployment_version_changed: bool,

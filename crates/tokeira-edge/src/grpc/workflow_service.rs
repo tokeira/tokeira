@@ -6705,6 +6705,7 @@ mod tests {
         principal: Option<EventPrincipal>,
     ) {
         let start = StartRequest {
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
             initiator: None,
             run_key,
             namespace_id: namespace_id_for("default"),

@@ -466,6 +466,9 @@ pub enum WorkflowIdReusePolicy {
 pub struct StartRequest {
     /// Composite storage key for this run.
     pub run_key: RunKey,
+    /// Thresholds for the Advice on a sync-matched first workflow task, which
+    /// starts in the same transition with a History Size of `0`.
+    pub advice_policy: ContinueAsNewAdvicePolicy,
     /// Namespace that owns the execution.
     pub namespace_id: NamespaceId,
     /// User-assigned workflow identifier.
@@ -610,6 +613,8 @@ pub struct StartAndUpdateRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SignalWithStartRequest {
     pub run_key: RunKey,
+    /// Thresholds for the Advice on a sync-matched first workflow task.
+    pub advice_policy: ContinueAsNewAdvicePolicy,
     pub namespace_id: NamespaceId,
     pub workflow_id: WorkflowId,
     pub run_id: RunId,
@@ -1131,6 +1136,38 @@ pub struct UpdateExecutionOptionsRequest {
     pub completion_callback_limit: Option<usize>,
 }
 
+/// Thresholds behind the continue-as-new Advice, resolved by the runtime and
+/// handed to the kernel as operands so the pure transition reads no
+/// configuration (continue-as-new-advice, Requirement 2.12).
+///
+/// The v1.31.0 defaults are `limit.historySize.suggestContinueAsNew` (4 MiB),
+/// `limit.historyCount.suggestContinueAsNew` (4096), and
+/// ceil(`history.maxTotalUpdates` × `history.maxTotalUpdates.suggestContinueAsNewThreshold`)
+/// = ceil(2000 × 0.9) = 1800 (`common/dynamicconfig/constants.go:370-375, 412-417,
+/// 2299-2308 @ v1.31.0`); the runtime pins them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinueAsNewAdvicePolicy {
+    /// `HISTORY_SIZE_TOO_LARGE` when the History Size reaches this many bytes.
+    pub history_size_threshold_bytes: i64,
+    /// `TOO_MANY_HISTORY_EVENTS` when the next event id reaches this value.
+    pub history_count_threshold: i64,
+    /// `TOO_MANY_UPDATES` when in-flight plus completed updates reach this
+    /// value; `0` disables the reason (`registry.go:497-500 @ v1.31.0`).
+    pub total_updates_suggest_threshold: u32,
+}
+
+impl ContinueAsNewAdvicePolicy {
+    /// The v1.31.0 defaults: 4 MiB, 4096 events, and ceil(2000 × 0.9) = 1800
+    /// updates (`common/dynamicconfig/constants.go:370-375, 412-417, 2299-2308
+    /// @ v1.31.0`). The runtime pins these as the policy it hands to every
+    /// start; the kernel itself never consults them.
+    pub const V1_31_0: Self = Self {
+        history_size_threshold_bytes: 4 * 1024 * 1024,
+        history_count_threshold: 4 * 1024,
+        total_updates_suggest_threshold: 1800,
+    };
+}
+
 /// Request from the runtime indicating a worker has picked
 /// up a workflow task.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1141,10 +1178,11 @@ pub struct StartWorkflowTaskRequest {
     pub worker_identity: WorkerIdentity,
     /// Runtime-generated idempotency key for this task start.
     pub request_id: String,
-    /// Approximate persisted history size at task start time.
+    /// Persisted History Size read with the run before this command; the
+    /// kernel records it and derives the Advice from it.
     pub history_size_bytes: i64,
-    /// Whether the runtime suggests continue-as-new soon.
-    pub suggest_continue_as_new: bool,
+    /// Thresholds in force at this start.
+    pub advice_policy: ContinueAsNewAdvicePolicy,
     /// If set, the worker's deployment version differs from the run's effective version.
     pub deployment_transition: Option<WorkerDeploymentVersionRef>,
     /// Routing revision attached to the deployment transition decision.
@@ -1404,6 +1442,13 @@ pub struct WorkflowTaskFailedRequest {
     /// by the request's reapply exclude bits (`collect_reset_reapply`).
     #[serde(default)]
     pub reset_reapply: Vec<HistoryEventKind>,
+    /// Persisted History Size of the run this command applies to. Used only
+    /// when a reset synthesizes the started event of a fork-point task that
+    /// was scheduled but not started, which derives a fresh Advice
+    /// (`workflow_resetter.go:533-550 @ v1.31.0`).
+    pub history_size_bytes: i64,
+    /// Thresholds in force for that synthesized start.
+    pub advice_policy: ContinueAsNewAdvicePolicy,
 }
 
 /// Request from the runtime when `RespondWorkflowTaskFailed` arrives with

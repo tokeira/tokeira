@@ -44,14 +44,15 @@ use crate::{
         DeploymentName, DispatchableActivityTask, DispatchableWorkflowTask, DueActivityDispatch,
         DueTimer, GenerationAdvanceResult, LeaseOutcome, LeaseRepository, NexusSweepEntry,
         ProjectionBatch, ProjectionLog, ProjectionRecord, ProvenancePut,
-        ReconstructibleNexusDelivery, RequestRecord, RunRepository, StoredTaskQueueConfig,
-        StoredTaskQueueConfigKey, StoredWorkerDeployment, TaskQueueConfigCasResult,
-        TaskQueueConfigRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
-        WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkerTaskProvenance,
-        WorkerTaskProvenanceError, WorkerTaskProvenanceStore, WorkflowRuleCreateResult,
-        WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
-        dispatchable_workflow_task, reconstructible_nexus_deliveries,
-        workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
+        ReconstructibleNexusDelivery, RequestRecord, RunHistoryStats, RunRepository,
+        StoredTaskQueueConfig, StoredTaskQueueConfigKey, StoredWorkerDeployment,
+        TaskQueueConfigCasResult, TaskQueueConfigRepository, TransitionAuditRecord,
+        WftTimeoutSweepEntry, WorkerDeploymentRepository, WorkerDeploymentVersionKey,
+        WorkerTaskProvenance, WorkerTaskProvenanceError, WorkerTaskProvenanceStore,
+        WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
+        deleted_workflow_projection_context, dispatchable_workflow_task,
+        reconstructible_nexus_deliveries, workflow_is_open_and_pinned_to_version,
+        workflow_projection_context_with_previous,
     },
     metrics as storage_metrics,
 };
@@ -103,6 +104,11 @@ struct StoreState {
     execution_index: HashMap<(NamespaceId, String, RunId), RunKey>,
     /// Materialized hot state by run key.
     runs: HashMap<RunKey, WorkflowState>,
+    /// Persisted History Size by run key: the sum of
+    /// [`crate::codec::history_batch_encoded_len`] over every committed batch,
+    /// maintained in the same lock acquisition as the batch so it mirrors the
+    /// DSQL `workflow_hot.history_size_bytes` column.
+    history_size: HashMap<RunKey, i64>,
     /// Worker Deployment registry records by namespace/name.
     worker_deployments: HashMap<DeploymentKey, StoredWorkerDeployment>,
     /// Durable namespace Workflow Rules in deterministic id order.
@@ -425,7 +431,10 @@ impl InMemoryStore {
 // mismatch is checked before postcard decodes the changed document, so v2
 // snapshots are refused with the existing actionable `VersionMismatch` error
 // instead of being interpreted with the v3 layout.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+// v4: the per-run `history_size` map, plus the continue-as-new advice fields on
+// `WorkflowState` and `HistoryEventKind::WorkflowTaskStarted` that changed the
+// positional layout of every `runs` and `history` entry.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
 
 /// Errors from the [`InMemoryStore`] snapshot persist/restore surface.
 #[derive(Debug, thiserror::Error)]
@@ -469,6 +478,7 @@ struct SnapshotDoc {
     current_execution: Vec<((NamespaceId, String), RunKey)>,
     execution_index: Vec<((NamespaceId, String, RunId), RunKey)>,
     runs: Vec<(RunKey, WorkflowState)>,
+    history_size: Vec<(RunKey, i64)>,
     worker_deployments: Vec<(DeploymentKey, StoredWorkerDeployment)>,
     workflow_rules: Vec<(NamespaceId, Vec<(String, WorkflowRuleRecord)>)>,
     task_queue_configs: Vec<(StoredTaskQueueConfigKey, StoredTaskQueueConfig)>,
@@ -513,6 +523,7 @@ impl SnapshotDoc {
             current_execution,
             execution_index,
             runs,
+            history_size,
             worker_deployments,
             workflow_rules,
             task_queue_configs,
@@ -542,6 +553,7 @@ impl SnapshotDoc {
             current_execution: sorted_pairs(current_execution),
             execution_index: sorted_pairs(execution_index),
             runs: sorted_pairs(runs),
+            history_size: sorted_pairs(history_size),
             worker_deployments: sorted_pairs(worker_deployments),
             workflow_rules: {
                 let mut namespaces = workflow_rules
@@ -584,6 +596,7 @@ impl SnapshotDoc {
             current_execution: self.current_execution.into_iter().collect(),
             execution_index: self.execution_index.into_iter().collect(),
             runs: self.runs.into_iter().collect(),
+            history_size: self.history_size.into_iter().collect(),
             worker_deployments: self.worker_deployments.into_iter().collect(),
             workflow_rules: self
                 .workflow_rules
@@ -672,15 +685,24 @@ impl RunRepository for InMemoryStore {
 
     #[tracing::instrument(name = "storage.load_run", skip(self), fields(run_key = %run_key.0))]
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
+        self.load_run_with_stats(run_key)
+            .await
+            .map(|(loaded, _)| loaded)
+    }
+
+    async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
         let started = Instant::now();
         let store = self.inner.lock().await;
-        let result = Ok(match store.runs.get(&run_key) {
+        let loaded = match store.runs.get(&run_key) {
             Some(state) => LoadedRun::Existing(state.clone()),
             None => LoadedRun::Absent,
-        });
+        };
+        let stats = RunHistoryStats {
+            history_size_bytes: store.history_size.get(&run_key).copied().unwrap_or(0),
+        };
         storage_metrics::record_load_run_duration(started.elapsed());
         storage_metrics::record_storage_operation("load_run", "success");
-        result
+        Ok((loaded, stats))
     }
 
     #[tracing::instrument(name = "storage.read_history", skip(self), fields(run_key = %run_key.0, after_event_id, limit))]
@@ -1019,6 +1041,21 @@ impl RunRepository for InMemoryStore {
             }
         }
 
+        // The History Size advances with the batch it accounts for, under the
+        // same lock acquisition, exactly as the DSQL commit writes the column
+        // in the transaction that inserts the batch (Requirement 1.1). A
+        // transition without events leaves it unchanged.
+        let history_size_bytes = {
+            let prior = store.history_size.get(&run_key).copied().unwrap_or(0);
+            let appended = if transition.history_events.is_empty() {
+                0
+            } else {
+                crate::codec::history_batch_encoded_len(&transition.history_events)?
+            };
+            let total = prior.saturating_add(appended);
+            store.history_size.insert(run_key, total);
+            total
+        };
         store
             .history
             .entry(run_key)
@@ -1224,6 +1261,7 @@ impl RunRepository for InMemoryStore {
             context: workflow_projection_context_with_previous(
                 &state,
                 previous_projection.as_ref(),
+                history_size_bytes,
             )?,
         });
 
@@ -1326,12 +1364,17 @@ impl RunRepository for InMemoryStore {
         let tombstone_seq = state.transition_seq.next();
         let mut tombstone_state = state.clone();
         tombstone_state.transition_seq = tombstone_seq;
+        let history_size_bytes = store.history_size.get(&run_key).copied().unwrap_or(0);
         let tombstone = ProjectionRecord {
             partition_id: partition_for(run_key),
             fanout: 1,
             run_key,
             transition_seq: tombstone_seq,
-            context: deleted_workflow_projection_context(&tombstone_state, request.deleted_at)?,
+            context: deleted_workflow_projection_context(
+                &tombstone_state,
+                request.deleted_at,
+                history_size_bytes,
+            )?,
         };
         // The tombstone and purge share this lock acquisition. No reader can
         // observe the run removed without its anti-resurrection record present.
@@ -1350,6 +1393,7 @@ impl RunRepository for InMemoryStore {
             state.run_id,
         ));
         store.runs.remove(&run_key);
+        store.history_size.remove(&run_key);
         store.history.remove(&run_key);
         store.history_principals.remove(&run_key);
         store.transition_audit.remove(&run_key);
@@ -1460,6 +1504,11 @@ impl RunRepository for InMemoryStore {
         successor_state.started_at = materialized_at;
         successor_state.first_run_started_at = Some(materialized_at);
 
+        // The successor's History Size is the encoded size of the copied prefix
+        // as one batch, which is how the DSQL materialization persists it
+        // (Requirement 1.6).
+        let prefix_size = crate::codec::history_batch_encoded_len(&copied_history)?;
+        store.history_size.insert(successor_run_key, prefix_size);
         store.history.insert(successor_run_key, copied_history);
         store
             .history_principals
@@ -2815,6 +2864,7 @@ mod tests {
 
     fn sample_state(run_key: RunKey) -> WorkflowState {
         WorkflowState {
+            completed_update_count: 0,
             run_key,
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".into()),
@@ -2830,6 +2880,7 @@ mod tests {
             external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                advice: Default::default(),
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
                 logical_seq: LogicalTaskSeq(1),
@@ -2905,6 +2956,126 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
+        }
+    }
+
+    fn scheduled_events(first_event_id: i64, count: usize) -> Vec<HistoryEvent> {
+        (0..count)
+            .map(|offset| {
+                let event_id = first_event_id + offset as i64;
+                history_event(
+                    event_id,
+                    fixed_now(),
+                    HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq: LogicalTaskSeq(event_id as u64),
+                        task_queue: TaskQueueName("queue".into()),
+                        workflow_task_timeout: Duration::seconds(10),
+                        attempt: 1,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    // Feature: continue-as-new-advice, Property 1: History Size is a reference-model accumulator
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn history_size_is_a_reference_model_accumulator(
+            batch_sizes in prop::collection::vec(0usize..4, 1..8),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                let store = InMemoryStore::default();
+                let run_key = RunKey::new();
+                let base = sample_state(run_key);
+                let (_, fresh) = store.load_run_with_stats(run_key).await.expect("load");
+                prop_assert_eq!(fresh.history_size_bytes, 0);
+
+                let mut expected = 0i64;
+                let mut previous = 0i64;
+                let mut next_event_id = 1i64;
+                let mut expected_seq = TransitionSeq::ZERO;
+                let last_index = batch_sizes.len() - 1;
+                for (index, batch) in batch_sizes.iter().enumerate() {
+                    let events = scheduled_events(next_event_id, *batch);
+                    next_event_id += *batch as i64;
+                    let mut state = base.clone();
+                    state.transition_seq = expected_seq.next();
+                    state.last_event_id = next_event_id - 1;
+                    if index == last_index {
+                        state.status = ExecutionStatus::Completed;
+                        state.closed_at = Some(fixed_now());
+                        state.pending_workflow_task = None;
+                    }
+                    if !events.is_empty() {
+                        expected += crate::codec::history_batch_encoded_len(&events)
+                            .expect("batch size");
+                    }
+                    let principals = vec![None; events.len()];
+                    let result = store
+                        .commit_transition(
+                            run_key,
+                            Transition {
+                                expected_seq,
+                                next_state: state,
+                                history_events: events.into(),
+                                event_principals: principals.into(),
+                                request_dedupe_ops: Default::default(),
+                                activity_ops: Default::default(),
+                                timer_ops: Default::default(),
+                                dispatch_ops: Default::default(),
+                            },
+                            ShardEpoch::ZERO,
+                        )
+                        .await
+                        .expect("commit");
+                    let applied = matches!(result, CommitResult::Applied { .. });
+                    prop_assert!(applied);
+                    expected_seq = expected_seq.next();
+
+                    let (_, stats) = store.load_run_with_stats(run_key).await.expect("load");
+                    prop_assert_eq!(stats.history_size_bytes, expected);
+                    prop_assert!(stats.history_size_bytes >= previous);
+                    previous = stats.history_size_bytes;
+                    let projected = store
+                        .inner
+                        .lock()
+                        .await
+                        .latest_projection(run_key)
+                        .map(|record| record.context.history_size_bytes);
+                    prop_assert_eq!(projected, Some(expected));
+                }
+
+                let bundle = tokeira_types::execution_home_bundle(
+                    base.namespace_id.0.as_bytes(),
+                    base.workflow_id.0.as_bytes(),
+                    1,
+                );
+                let deleted = store
+                    .delete_run_for_bundle(
+                        run_key,
+                        bundle,
+                        DeleteRunRequest {
+                            expected_seq,
+                            deleted_at: fixed_now(),
+                        },
+                        ShardEpoch::ZERO,
+                    )
+                    .await
+                    .expect("delete");
+                let DeleteRunResult::Deleted { tombstone } = deleted else {
+                    return Err(TestCaseError::fail(format!("delete failed: {deleted:?}")));
+                };
+                prop_assert_eq!(tombstone.context.history_size_bytes, expected);
+                let (absent, stats) = store.load_run_with_stats(run_key).await.expect("load");
+                prop_assert!(matches!(absent, LoadedRun::Absent));
+                prop_assert_eq!(stats.history_size_bytes, 0);
+                Ok(())
+            })?;
         }
     }
 
@@ -3038,7 +3209,7 @@ mod tests {
             ..WorkflowVersioningInfo::default()
         });
 
-        let projection = workflow_projection_context_with_previous(&state, None).unwrap();
+        let projection = workflow_projection_context_with_previous(&state, None, 0).unwrap();
         assert_eq!(
             projection
                 .search_attributes
@@ -3095,13 +3266,13 @@ mod tests {
             ..WorkflowVersioningInfo::default()
         });
 
-        let first = workflow_projection_context_with_previous(&state, None).unwrap();
+        let first = workflow_projection_context_with_previous(&state, None, 0).unwrap();
         state.versioning_info.as_mut().unwrap().deployment_version =
             Some(WorkerDeploymentVersionRef {
                 deployment_name: "deployment".to_owned(),
                 build_id: "build-2".to_owned(),
             });
-        let second = workflow_projection_context_with_previous(&state, Some(&first)).unwrap();
+        let second = workflow_projection_context_with_previous(&state, Some(&first), 0).unwrap();
 
         assert_eq!(
             second
@@ -4719,6 +4890,7 @@ mod tests {
                 3,
                 fixed_now(),
                 HistoryEventKind::WorkflowTaskStarted {
+                    suggest_continue_as_new_reasons: Vec::new(),
                     logical_seq: LogicalTaskSeq::ONE,
                     scheduled_event_id: 2,
                     attempt: 1,
@@ -4804,6 +4976,19 @@ mod tests {
         assert_eq!(pending.started_event_id, Some(3));
         assert!(successor.activities.is_empty());
         assert!(successor.timers.is_empty());
+
+        // Feature: continue-as-new-advice, Property 1 (reset leg): the successor
+        // starts at the encoded size of its copied prefix, persisted as one batch.
+        let prefix = RunRepository::read_history(&store, successor_run_key, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(prefix.len(), 3);
+        let (_, stats) = store.load_run_with_stats(successor_run_key).await.unwrap();
+        assert_eq!(
+            stats.history_size_bytes,
+            crate::codec::history_batch_encoded_len(&prefix).unwrap()
+        );
+        assert!(stats.history_size_bytes > 0);
     }
 
     #[tokio::test]

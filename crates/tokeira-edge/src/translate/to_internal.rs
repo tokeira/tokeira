@@ -73,6 +73,7 @@ pub fn start_request(req: StartWorkflowExecutionRequest, context: &EdgeContext) 
         .unwrap_or_else(|| RunKey::derive(namespace_id, &workflow_id, run_id));
     StartRequest {
         run_key,
+        advice_policy: tokeira_runtime::continue_as_new_advice_policy(),
         namespace_id,
         workflow_id,
         run_id,
@@ -163,6 +164,7 @@ pub fn signal_with_start_request(
     let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
     SignalWithStartRequest {
         run_key,
+        advice_policy: tokeira_runtime::continue_as_new_advice_policy(),
         namespace_id,
         workflow_id,
         run_id,

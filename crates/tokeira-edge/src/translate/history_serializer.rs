@@ -76,6 +76,20 @@ pub fn serialize_history_with_principals(
 /// authoritative committed history on Describe instead, using the same public
 /// representation returned by `GetWorkflowExecutionHistory` so the count is
 /// meaningful to clients rather than tied to an internal storage codec.
+/// Map a kernel reason to its public enum value
+/// (`proto/upstream/temporal/api/enums/v1/workflow.proto:208-226`).
+fn suggest_continue_as_new_reason_to_proto(
+    reason: tokeira_kernel::SuggestContinueAsNewReason,
+) -> tokeira_proto::enums::SuggestContinueAsNewReason {
+    use tokeira_kernel::SuggestContinueAsNewReason as Kernel;
+    use tokeira_proto::enums::SuggestContinueAsNewReason as Proto;
+    match reason {
+        Kernel::HistorySizeTooLarge => Proto::HistorySizeTooLarge,
+        Kernel::TooManyHistoryEvents => Proto::TooManyHistoryEvents,
+        Kernel::TooManyUpdates => Proto::TooManyUpdates,
+    }
+}
+
 pub fn serialized_history_size_bytes(events: &[HistoryEvent]) -> i64 {
     i64::try_from(history_to_proto(events).encoded_len()).unwrap_or(i64::MAX)
 }
@@ -829,6 +843,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             request_id,
             history_size_bytes,
             suggest_continue_as_new,
+            suggest_continue_as_new_reasons,
             target_worker_deployment_version_changed,
             target_version_changed_enabled: _,
             target_deployment_version: _,
@@ -839,6 +854,12 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 request_id: request_id.clone(),
                 history_size_bytes: *history_size_bytes,
                 suggest_continue_as_new: *suggest_continue_as_new,
+                // Field 8 (`history/v1/message.proto:297-327`); the kernel keeps
+                // the list in enum order and empty iff the flag is false.
+                suggest_continue_as_new_reasons: suggest_continue_as_new_reasons
+                    .iter()
+                    .map(|reason| suggest_continue_as_new_reason_to_proto(*reason) as i32)
+                    .collect(),
                 target_worker_deployment_version_changed:
                     *target_worker_deployment_version_changed,
                 ..Default::default()
@@ -2336,6 +2357,7 @@ mod tests {
             }),
             (1u64..100, 1i64..100, 1u32..5).prop_map(|(seq, sched, att)| {
                 HistoryEventKind::WorkflowTaskStarted {
+                    suggest_continue_as_new_reasons: Vec::new(),
                     logical_seq: LogicalTaskSeq(seq),
                     scheduled_event_id: sched,
                     attempt: att,
@@ -2603,6 +2625,81 @@ mod tests {
         }
     }
 
+    fn arb_recorded_reasons()
+    -> impl Strategy<Value = Vec<tokeira_kernel::SuggestContinueAsNewReason>> {
+        use tokeira_kernel::SuggestContinueAsNewReason as Reason;
+        (any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(size, count, updates)| {
+            let mut reasons = Vec::new();
+            if size {
+                reasons.push(Reason::HistorySizeTooLarge);
+            }
+            if count {
+                reasons.push(Reason::TooManyHistoryEvents);
+            }
+            if updates {
+                reasons.push(Reason::TooManyUpdates);
+            }
+            reasons
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: continue-as-new-advice, Property 7: wire round trip preserves the Advice
+        #[test]
+        fn started_event_advice_survives_the_wire(
+            history_size_bytes in any::<i64>(),
+            reasons in arb_recorded_reasons(),
+        ) {
+            let event = HistoryEvent {
+                event_id: 3,
+                happened_at: OffsetDateTime::from_unix_timestamp(1_000).unwrap(),
+                kind: HistoryEventKind::WorkflowTaskStarted {
+                    logical_seq: LogicalTaskSeq(1),
+                    scheduled_event_id: 2,
+                    attempt: 1,
+                    identity: WorkerIdentity("w".to_string()),
+                    request_id: "start-req".to_string(),
+                    history_size_bytes,
+                    suggest_continue_as_new: !reasons.is_empty(),
+                    suggest_continue_as_new_reasons: reasons.clone(),
+                    target_worker_deployment_version_changed: false,
+                    target_version_changed_enabled: false,
+                    target_deployment_version: None,
+                },
+            };
+
+            let bytes = history_event_to_proto(&event).encode_to_vec();
+            let decoded = history::HistoryEvent::decode(&bytes[..]).expect("decode should succeed");
+            let attrs = match decoded.attributes {
+                Some(Attributes::WorkflowTaskStartedEventAttributes(attrs)) => attrs,
+                other => {
+                    return Err(TestCaseError::fail(format!("unexpected attributes: {other:?}")));
+                }
+            };
+
+            prop_assert_eq!(attrs.history_size_bytes, history_size_bytes);
+            prop_assert_eq!(attrs.suggest_continue_as_new, !reasons.is_empty());
+            prop_assert_eq!(
+                attrs.suggest_continue_as_new_reasons.is_empty(),
+                !attrs.suggest_continue_as_new
+            );
+            let expected: Vec<i32> = reasons
+                .iter()
+                .map(|reason| suggest_continue_as_new_reason_to_proto(*reason) as i32)
+                .collect();
+            prop_assert_eq!(&attrs.suggest_continue_as_new_reasons, &expected);
+            // Every emitted value is a declared member of the public enum, so an
+            // SDK decodes the same reasons (`enums/v1/workflow.proto:208-226`).
+            for value in &attrs.suggest_continue_as_new_reasons {
+                prop_assert!(
+                    tokeira_proto::enums::SuggestContinueAsNewReason::try_from(*value).is_ok()
+                );
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -2796,6 +2893,7 @@ mod tests {
             event_id: 3,
             happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
             kind: HistoryEventKind::WorkflowTaskStarted {
+                suggest_continue_as_new_reasons: Vec::new(),
                 logical_seq: LogicalTaskSeq(1),
                 scheduled_event_id: 2,
                 attempt: 1,
@@ -4174,11 +4272,11 @@ mod tests {
                 .apply(
                     tokeira_kernel::LoadedRun::Existing(before_start),
                     Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                         logical_seq: LogicalTaskSeq(1),
                         worker_identity: WorkerIdentity("worker".into()),
                         request_id: "wft-start".into(),
                         history_size_bytes: 0,
-                        suggest_continue_as_new: false,
                         deployment_transition: None,
                         deployment_transition_revision_number: None,
                         target_version_changed_enabled: notification_enabled,

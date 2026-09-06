@@ -456,7 +456,7 @@ proptest! {
         pre_claim in any::<bool>(),
         statement_seed in any::<usize>(),
     ) {
-        let initialize = SchemaDecision::Initialize { target: 67 };
+        let initialize = SchemaDecision::Initialize { target: 68 };
         let statements = if pre_claim {
             bootstrap_statements_for_decision(&initialize)
                 .expect("initialize has a coordination bootstrap")
@@ -480,12 +480,12 @@ proptest! {
         prop_assert!(DdlValidator::validate(statements[selected], "bootstrap").is_empty());
 
         let contract = MigrationRunner::embedded_schema_contract();
-        prop_assert_eq!(contract.target_version, 67);
-        prop_assert_eq!(contract.maximum_readable_version, 67);
-        prop_assert_eq!(contract.immutable_through_version, 67);
+        prop_assert_eq!(contract.target_version, 68);
+        prop_assert_eq!(contract.maximum_readable_version, 68);
+        prop_assert_eq!(contract.immutable_through_version, 68);
         prop_assert_eq!(
             contract.migration_set_digest.as_str(),
-            "sha256:fb8d7c84c771a8cc9a9a8a53dca33a195d4ac7377e76df273171e7ee3d5e5892"
+            "sha256:270ceac8abf12e8926d1039b9a8e71ae1ff8656f29873e2397f9a7a7513d8953"
         );
         prop_assert_eq!(
             prefix_digest(contract.maximum_readable_version),

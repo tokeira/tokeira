@@ -3977,6 +3977,7 @@ impl WorkflowService {
         let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
         let request = StartRequest {
             run_key,
+            advice_policy: tokeira_runtime::continue_as_new_advice_policy(),
             namespace_id,
             workflow_id: workflow_id.clone(),
             run_id,
@@ -9069,8 +9070,15 @@ async fn append_transient_suffix(
                 attempt: pending.attempt,
                 identity: tokeira_types::WorkerIdentity(String::new()),
                 request_id: format!("transient-{}-{}", pending.logical_seq.0, pending.attempt),
-                history_size_bytes: 0,
-                suggest_continue_as_new: false,
+                // Synthesized from the pending record's Advice, decided when
+                // this attempt started, not from the thresholds in force at
+                // read time (continue-as-new-advice, Requirements 4.1, 4.4).
+                history_size_bytes: pending.advice.history_size_bytes,
+                suggest_continue_as_new: pending.advice.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: pending
+                    .advice
+                    .suggest_continue_as_new_reasons
+                    .clone(),
                 target_worker_deployment_version_changed: pending
                     .target_worker_deployment_version_changed,
                 target_version_changed_enabled: pending.target_version_changed_enabled,
@@ -10301,6 +10309,7 @@ mod tests {
         let run_id = RunId::new();
         let result = runtime
             .start_workflow(StartRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 initiator: None,
                 run_key: RunKey::new(),
                 namespace_id,
@@ -10398,6 +10407,7 @@ mod tests {
         };
         let start = runtime
             .start_workflow(StartRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 initiator: None,
                 run_key,
                 namespace_id,

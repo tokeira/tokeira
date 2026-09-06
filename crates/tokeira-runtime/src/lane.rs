@@ -710,8 +710,8 @@ where
                                 "failed to materialize reset successor"
                             );
                             reset_materialization_error = Some(error);
-                        } else if let Ok(LoadedRun::Existing(successor_state)) =
-                            repo.load_run(successor_run_key).await
+                        } else if let Ok((LoadedRun::Existing(successor_state), successor_stats)) =
+                            repo.load_run_with_stats(successor_run_key).await
                         {
                             let shard_id = {
                                 let owner = shard_owner.read().expect("shard_owner lock poisoned");
@@ -795,6 +795,13 @@ where
                                         // Guarded above: this branch is reached only
                                         // when the reapply extraction succeeded.
                                         reset_reapply: reset_reapply.clone().unwrap_or_default(),
+                                        // A scheduled-not-started fork task gets a
+                                        // freshly derived Advice from the successor's
+                                        // own History Size, the copied prefix's size
+                                        // (continue-as-new-advice, Requirement 2.10).
+                                        history_size_bytes: successor_stats.history_size_bytes,
+                                        advice_policy:
+                                            crate::runtime::continue_as_new_advice_policy(),
                                     },
                                 );
                                 let publisher = publisher.clone();
@@ -1151,6 +1158,8 @@ where
                                     };
                                     let start_request = StartRequest {
                                         run_key: successor_run_key,
+                                        advice_policy:
+                                            crate::runtime::continue_as_new_advice_policy(),
                                         namespace_id: new_state.namespace_id,
                                         workflow_id: new_state.workflow_id.clone(),
                                         run_id: successor_run_id,
@@ -2773,6 +2782,7 @@ mod tests {
     fn sample_state(run_key: RunKey) -> WorkflowState {
         let namespace_id = NamespaceId::new();
         WorkflowState {
+            completed_update_count: 0,
             run_key,
             namespace_id,
             workflow_id: WorkflowId("workflow".to_string()),
@@ -2788,6 +2798,7 @@ mod tests {
             external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq::ONE,
             pending_workflow_task: Some(PendingWorkflowTask {
+                advice: Default::default(),
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
                 target_worker_deployment_version_changed: false,

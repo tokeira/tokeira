@@ -98,6 +98,7 @@ fn start_request(
 ) -> StartRequest {
     let run_id = tokeira_types::RunId::new();
     StartRequest {
+        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
         initiator: None,
         run_key: tokeira_types::RunKey::new(),
         namespace_id,

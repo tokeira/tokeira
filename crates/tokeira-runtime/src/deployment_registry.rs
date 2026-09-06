@@ -3811,6 +3811,7 @@ mod tests {
         let workflow_id = WorkflowId(workflow_id_value.clone());
         let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
         let start = StartRequest {
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
             initiator: None,
             run_key,
             namespace_id,

@@ -11,9 +11,16 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
-use tokeira_kernel::{ActivityState, HistoryEvent, TimerState, WorkflowState, state::Priority};
+use tokeira_kernel::{ActivityState, TimerState, state::Priority};
 use tokeira_types::{EventPrincipal, Payloads, ProjectionCursor, WorkflowRuleRecord};
 
+// The hot-state and history-batch envelopes live in the feature-independent
+// `crate::codec` so the in-memory store accounts the History Size with the
+// same bytes; they are re-exported here so DSQL call sites keep one codec path.
+pub use crate::codec::{
+    BlobFormatError, decode_history_events, decode_workflow_state, encode_history_events,
+    encode_workflow_state, history_batch_encoded_len,
+};
 use crate::{
     BacklogPayload, ProjectionContext, StoredTaskQueueConfig, StoredTaskQueueConfigKind,
     StoredTaskQueueConfigMetadata, StoredWorkerDeployment, WorkerComputeControllerRecord,
@@ -74,29 +81,6 @@ pub fn encode_worker_compute_controller(record: &WorkerComputeControllerRecord) 
 
 /// Deserialize one versioned Worker Compute Controller record.
 pub fn decode_worker_compute_controller(bytes: &[u8]) -> Result<WorkerComputeControllerRecord> {
-    decode(bytes)
-}
-
-/// Serialize the current materialized workflow state for `workflow_hot`.
-pub fn encode_workflow_state(state: &WorkflowState) -> Result<Vec<u8>> {
-    encode(state)
-}
-
-/// Deserialize the authoritative hot-state snapshot for one run.
-pub fn decode_workflow_state(bytes: &[u8]) -> Result<WorkflowState> {
-    decode(bytes)
-}
-
-/// Serialize one committed history batch.
-///
-/// Batches are encoded as a vector because DSQL row limits and transaction
-/// shape are controlled by the commit path, not by individual event rows.
-pub fn encode_history_events(events: &[HistoryEvent]) -> Result<Vec<u8>> {
-    encode(&events)
-}
-
-/// Deserialize a committed history batch.
-pub fn decode_history_events(bytes: &[u8]) -> Result<Vec<HistoryEvent>> {
     decode(bytes)
 }
 
@@ -309,7 +293,7 @@ mod tests {
 
     use proptest::prelude::*;
     use time::OffsetDateTime;
-    use tokeira_kernel::HistoryEventKind;
+    use tokeira_kernel::{HistoryEvent, HistoryEventKind};
     use tokeira_types::{
         ArchetypeId, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, ProjectionCursor,
         RunId, RunKey, SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
@@ -342,7 +326,20 @@ mod tests {
         // Feature: edge-eager-dispatch, Property 7: Legacy started-event decoding.
         // The immediate pre-Tier-3.18 bytes remain readable as non-eager V1,
         // while the appended V2 shape durably round-trips an accepted marker.
-        let mut decoded = decode_history_events(LEGACY_WORKFLOW_EXECUTION_STARTED_V1).unwrap();
+        // The fixture is a bare pre-envelope batch: the enum variant is decoded
+        // through the raw codec, and the enveloped decoder must refuse the bytes
+        // rather than misread them (continue-as-new-advice, Requirement 10.3).
+        let fixture_run = RunKey(Uuid::from_u128(1));
+        let refused = decode_history_events(fixture_run, LEGACY_WORKFLOW_EXECUTION_STARTED_V1)
+            .unwrap_err()
+            .downcast::<BlobFormatError>()
+            .unwrap();
+        assert_eq!(refused.kind, "history_batch.events_data");
+        assert_eq!(
+            refused.observed, 1,
+            "a bare one-event batch leads with its count"
+        );
+        let mut decoded: Vec<HistoryEvent> = decode(LEGACY_WORKFLOW_EXECUTION_STARTED_V1).unwrap();
         assert_eq!(decoded.len(), 1);
         let legacy = decoded.pop().unwrap();
         assert!(matches!(
@@ -437,7 +434,7 @@ mod tests {
             },
         };
         let encoded = encode_history_events(std::slice::from_ref(&current)).unwrap();
-        let round_trip = decode_history_events(&encoded).unwrap();
+        let round_trip = decode_history_events(fixture_run, &encoded).unwrap();
         assert_eq!(round_trip, vec![current]);
         assert!(round_trip[0].kind.eager_execution_accepted());
     }

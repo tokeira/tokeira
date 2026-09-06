@@ -40,6 +40,7 @@ mod tests {
 
     fn sample_state(run_key: RunKey) -> WorkflowState {
         WorkflowState {
+            completed_update_count: 0,
             run_key,
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".into()),
@@ -55,6 +56,7 @@ mod tests {
             external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                advice: Default::default(),
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
                 logical_seq: LogicalTaskSeq(1),

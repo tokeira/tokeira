@@ -10,7 +10,7 @@
 > Mandate; tracker for the RPC→spec index.
 
 **Target:** `TEMPORAL_SERVER_COMPAT = 1.31.0`, proto `v1.62.11` (`crates/tokeira-build-info/src/pinned.rs`).
-**Last updated:** 2026-08-24 · **Contributors for status:** Kiro, Claude, Codex.
+**Last updated:** 2026-09-06 · **Contributors for status:** Kiro, Claude, Codex.
 
 ## How to read this
 
@@ -64,6 +64,13 @@ Done: C2, C4a, C4b, C5a, C5b, C6.
 
 Fix-to-green campaign (`docs/HANDOVER-functional-conformance.md`, retired to git history): a suite is **clean** when every
 test is green or a classified skip with a cited registry reason — zero unclassified non-pass.
+
+**2026-09-06 dependency-update verification:** All 45 previously CLEAN tiers were rerun.
+Against the [v0.1.0 release baseline](corpus-evidence.md), all 64 test-bearing entrypoints
+match their recorded outcome totals: 1,261 Go pass outcomes, 22 corpus-native skips,
+106 existing registry exclusions, and zero fail or unfinished outcomes. The measured engine
+was `632b46a87c702e69ff76ef41ec9cfe420ce36b91`; the comparison uses the release baseline's
+scope and counting conventions.
 
 | Tier | Suite | Result | Date | Notes |
 |------|-------|--------|------|-------|

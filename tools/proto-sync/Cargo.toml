@@ -1,8 +1,10 @@
 [package]
 name = "proto-sync"
+publish = false
 version = "0.1.0"
 edition = "2024"
-publish = false
+rust-version.workspace = true
+license.workspace = true
 description = "Vendor Temporal API protos and regenerate tokeira-proto's checked-in bindings"
 
 [dependencies]

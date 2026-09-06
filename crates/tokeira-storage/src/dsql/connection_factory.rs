@@ -10,6 +10,7 @@ use aurora_dsql_sqlx_connector::{DsqlConnectOptions, DsqlError};
 use sqlx::PgConnection;
 use thiserror::Error;
 
+/// Creates IAM-authenticated connections from endpoint and region configuration.
 #[derive(Clone, Debug)]
 pub struct ConnectionFactory {
     options: DsqlConnectOptions,
@@ -29,6 +30,7 @@ impl ConnectionFactory {
         Ok(Self { options })
     }
 
+    /// Mint an IAM token and open a TLS connection, preserving the failure category.
     pub async fn create_connection(&self) -> Result<PgConnection, ConnectionFactoryError> {
         // Use the connector entry point directly. `sqlx::PgConnection` cannot
         // mint DSQL IAM tokens on its own.
@@ -38,18 +40,21 @@ impl ConnectionFactory {
     }
 }
 
+/// Stable categories for failures while opening a physical DSQL connection.
 #[derive(Debug, Error)]
 pub enum ConnectionFactoryError {
+    /// Invalid connection configuration.
     #[error("DSQL connection configuration failed: {0}")]
     Config(String),
+    /// IAM token generation failed before connecting.
     #[error("DSQL IAM token generation failed: {0}")]
     Token(String),
+    /// The TCP or TLS connection could not be established.
     #[error("DSQL TCP/TLS connection failed: {0}")]
     Connection(String),
+    /// The database rejected the connection handshake.
     #[error("DSQL database handshake failed: {0}")]
     Database(String),
-    #[error("DSQL OCC retry exhausted: {0}")]
-    OccRetry(String),
 }
 
 impl ConnectionFactoryError {
@@ -58,24 +63,26 @@ impl ConnectionFactoryError {
     /// the failure came from local configuration, IAM token generation, TCP/TLS,
     /// or the database handshake.
     pub fn from_dsql_error(error: DsqlError) -> Self {
-        let message = error.to_string();
         match error {
             DsqlError::ConfigError(error) => Self::Config(error.to_string()),
             DsqlError::TokenError(error) => Self::Token(error.to_string()),
             DsqlError::ConnectionError(error) => Self::Connection(error.to_string()),
             DsqlError::DatabaseError(error) => Self::Database(error.to_string()),
-            DsqlError::OCCRetryExhausted { source, .. } => Self::OccRetry(source.to_string()),
-            _ => Self::Connection(message),
+            // Compiler-required: DsqlError is #[non_exhaustive] (connector
+            // 0.2.2, src/error.rs). At our exact =0.2.2 pin and feature set no
+            // value can reach this arm. A connector pin move is a reviewed
+            // dependency change whose review must revisit this mapping.
+            error => Self::Connection(error.to_string()),
         }
     }
 
+    /// Return the bounded label used by connection-failure metrics.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Config(_) => "config",
             Self::Token(_) => "token",
             Self::Connection(_) => "connection",
             Self::Database(_) => "database",
-            Self::OccRetry(_) => "occ_retry",
         }
     }
 }
@@ -120,6 +127,7 @@ mod tests {
     use std::io;
 
     use aurora_dsql_sqlx_connector::DsqlError;
+    use proptest::prelude::*;
 
     use super::ConnectionFactoryError;
 
@@ -152,6 +160,21 @@ mod tests {
                 ConnectionFactoryError::from_dsql_error(error).kind(),
                 category
             );
+        }
+    }
+
+    proptest! {
+        // Feature: dsql-connector-sqlx-09, Property 3: payloads cannot change failure categories.
+        #[test]
+        fn dsql_error_categories_are_message_independent(message in any::<String>()) {
+            let errors = [
+                DsqlError::ConfigError(Box::new(io::Error::other(message.clone()))),
+                DsqlError::TokenError(Box::new(io::Error::other(message.clone()))),
+                DsqlError::ConnectionError(sqlx::Error::Io(io::Error::other(message.clone()))),
+                DsqlError::DatabaseError(sqlx::Error::Protocol(message)),
+            ];
+            let categories = errors.map(|error| ConnectionFactoryError::from_dsql_error(error).kind());
+            prop_assert_eq!(categories, ["config", "token", "connection", "database"]);
         }
     }
 }

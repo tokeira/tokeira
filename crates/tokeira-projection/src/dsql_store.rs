@@ -10,7 +10,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use sqlx::{
-    Connection, PgConnection, Postgres, Row,
+    AssertSqlSafe, Connection, PgConnection, Postgres, Row,
     postgres::{PgArguments, PgRow},
     query::Query,
 };
@@ -297,7 +297,10 @@ impl VisibilityStore for DsqlVisibilityStore {
             sort_clause(sort),
             next_param
         );
-        let mut query = sqlx::query(&sql).bind(namespace_id.0);
+        // SQL safety: `sql` is the SQL compiler's output. Request values reach it
+        // only as `$n` placeholders (Property 2) and are bound below; interpolated
+        // identifiers come from the compiler's own tables.
+        let mut query = sqlx::query(AssertSqlSafe(sql)).bind(namespace_id.0);
         query = bind_sql_values(query, &values);
         query = query.bind(i64::try_from(limit + 1)?);
         let mut permit = self.director.acquire(DbClass::Projection).await?;
@@ -1574,7 +1577,10 @@ async fn count_without_group(
           {filter_sql}
         "#
     );
-    let mut query = sqlx::query(&sql).bind(namespace_id.0);
+    // SQL safety: `sql` is the SQL compiler's output. Request values reach it
+    // only as `$n` placeholders (Property 2) and are bound below; interpolated
+    // identifiers come from the compiler's own tables.
+    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(namespace_id.0);
     query = bind_sql_values(query, &values);
     let mut permit = director.acquire(DbClass::Projection).await?;
     let row = query.fetch_one(permit.connection()?).await?;
@@ -1604,7 +1610,10 @@ async fn count_system_group(
         GROUP BY {group_column}
         "#
     );
-    let mut query = sqlx::query(&sql).bind(namespace_id.0);
+    // SQL safety: `sql` is the SQL compiler's output. Request values reach it
+    // only as `$n` placeholders (Property 2) and are bound below; interpolated
+    // identifiers come from the compiler's own tables.
+    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(namespace_id.0);
     query = bind_sql_values(query, &values);
     let mut permit = director.acquire(DbClass::Projection).await?;
     let rows = query.fetch_all(permit.connection()?).await?;
@@ -1663,7 +1672,10 @@ async fn count_custom_group(
         GROUP BY idx.{column}
         "#
     );
-    let mut query = sqlx::query(&sql).bind(namespace_id.0);
+    // SQL safety: `sql` is the SQL compiler's output. Request values reach it
+    // only as `$n` placeholders (Property 2) and are bound below; interpolated
+    // identifiers come from the compiler's own tables.
+    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(namespace_id.0);
     query = bind_sql_values(query, &values);
     let mut permit = director.acquire(DbClass::Projection).await?;
     let rows = query.fetch_all(permit.connection()?).await?;
@@ -2162,6 +2174,63 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: dsql-connector-sqlx-09, Property 2: SQL structure never contains request text.
+        #[test]
+        fn compiled_filter_keeps_text_in_ordered_binds(
+            inputs in prop::collection::vec((any::<String>(), any::<bool>(), any::<u16>()), 1..16),
+            offset in 2usize..20,
+            disjunction in any::<bool>(),
+            negate in any::<bool>(),
+        ) {
+            let mut expected = Vec::new();
+            let mut request_text = Vec::new();
+            let mut expressions = Vec::new();
+            for (text, custom, attr_id) in inputs {
+                let value = format!("~request-value:{text}~");
+                let name = format!("~request-name:{text}~");
+                let field = if custom {
+                    expected.push(SqlValue::Int(i64::from(attr_id)));
+                    FieldRef::Custom {
+                        name: name.clone(),
+                        attr_id: AttrId(u64::from(attr_id)),
+                        attr_type: SearchAttrType::Keyword,
+                    }
+                } else {
+                    FieldRef::System(SystemField::WorkflowId)
+                };
+                expected.push(SqlValue::Text(value.clone()));
+                expressions.push(FilterExpr::Compare {
+                    field,
+                    op: CompareOp::Eq,
+                    value: FilterValue::String(value.clone()),
+                });
+                request_text.extend([value, name]);
+            }
+            let expr = expressions.into_iter().reduce(|left, right| {
+                if disjunction {
+                    FilterExpr::Or(Box::new(left), Box::new(right))
+                } else {
+                    FilterExpr::And(Box::new(left), Box::new(right))
+                }
+            }).expect("strategy generates at least one expression");
+            let filter = CompiledFilter {
+                archetype: None,
+                expr: Some(if negate { FilterExpr::Not(Box::new(expr)) } else { expr }),
+            };
+            let (sql, values, next_param) = compile_filter(&filter, offset).unwrap();
+            for text in request_text {
+                prop_assert!(!sql.contains(&text), "request text leaked into SQL: {:?}", sql);
+            }
+            // $1 is the enclosing query's namespace bind, reused by custom-attribute subqueries.
+            let placeholders: Vec<usize> = sql.split('$').skip(1).map(|suffix| {
+                suffix.chars().take_while(char::is_ascii_digit)
+                    .collect::<String>().parse::<usize>().unwrap()
+            }).filter(|parameter| *parameter != 1).collect();
+            prop_assert_eq!(placeholders, (offset..offset + expected.len()).collect::<Vec<_>>());
+            prop_assert_eq!(next_param, offset + expected.len());
+            prop_assert_eq!(values, expected);
+        }
 
         #[test]
         fn search_attr_value_codec_round_trips(value in arb_search_attr_value()) {

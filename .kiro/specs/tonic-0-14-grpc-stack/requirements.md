@@ -80,16 +80,19 @@ owns the corpus and the wire-coverage layer this feature re-verifies against.
   and the Target Stack: status code, status message, `grpc-status-details-bin` bytes,
   metadata, trailers, message framing, compression, gRPC-Web framing, reflection listings,
   HTTP API rendering, and Nexus HTTP rendering.
-- **Connector Exception:** while `aurora-dsql-sqlx-connector` is pinned below 0.2, the AWS
-  SDK's legacy HTTPS client keeps hyper 0.14, h2 0.3, hyper-rustls 0.24, and rustls 0.21 in
-  the lock as a client-only path to AWS endpoints. That edge is owned by the connector
-  slice, not this feature.
+- **Connector Exception:** the former allowance for the AWS SDK's legacy HTTPS client
+  while the connector was below 0.2. It ended with
+  [dsql-connector-sqlx-09](../dsql-connector-sqlx-09/requirements.md).
+- **SDK Type Dependencies:** http 0.2 and http-body 0.4 remain independently of the HTTP
+  client. `aws-sdk-dsql` 1.55.0 requires http 0.2 unconditionally; `aws-smithy-runtime`
+  1.12.1 requires http-body 0.4 and always enables `aws-smithy-types/http-body-0-4-x`
+  (their registry `Cargo.toml` files). They are not a surviving Connector Exception.
 
 ## Target State
 
 - The workspace resolves one HTTP stack: the Target Stack. The Legacy Stack is absent from
-  `Cargo.lock` except for the Connector Exception, which a lock-invariant test names
-  explicitly and which disappears with the connector slice.
+  `Cargo.lock`; the connector slice ended the Connector Exception. SDK Type Dependencies
+  remain explicitly permitted by the lock-invariant test.
 - The Generated Bindings are produced by `protox` plus `tonic-prost-build` 0.14 with no
   `protoc` on the machine; the Descriptor Sets keep their paths; the Binding Inventory is
   unchanged.
@@ -183,7 +186,7 @@ crate today.
 | `http-body` alias `http-body-legacy` | 0.4 | removed; `http-body-util` 0.1 for collection | engine | delete |
 | `tower-http` | 0.4 (`cors`) | 0.6 (`cors`) | workspace; engine | move |
 | `axum`, `hyper-timeout` | 0.6, 0.4 (transitive via tonic 0.11) | 0.8, 0.5 (transitive via tonic 0.14) | none | resolve away |
-| `h2`, `http`, `http-body` | 0.3, 0.2, 0.4 (transitive) | 0.4, 1, 1 | none | resolve away, except the Connector Exception, which keeps one legacy copy of each under the AWS legacy client |
+| `h2`, `http`, `http-body` | 0.3, 0.2, 0.4 (transitive) | 0.4, 1, 1 | none | h2 0.3 resolves away with the connector slice; http 0.2 and http-body 0.4 remain SDK Type Dependencies |
 | `connectrpc`, `connectrpc-build`, `buffa` | 0.6 (product surfaces) and 0.8 (conformance control) | unchanged | proto, proto-sync, runtime, edge, controller, autoscaler, compatibility, conformance, tokeirad | unchanged: both lines are already on hyper 1; unifying them on the 0.9 line is a separate slice |
 
 Every server setting in force today is preserved; the one implicit setting becomes explicit.
@@ -221,11 +224,10 @@ Target Stack line.
 `prost-types 0.12`, `prost-reflect 0.12`, `axum 0.6`, `tower-http 0.4`, or
 `hyper-timeout 0.4`.
 
-1.3 WHILE the Connector Exception applies, THE workspace lock MAY contain `hyper 0.14`
-with its `http 0.2` and `http-body 0.4`, `h2 0.3`, `hyper-rustls 0.24`, and `rustls 0.21`
-only as dependencies of the AWS SDK's legacy HTTPS client; WHEN
-`aurora-dsql-sqlx-connector` is pinned at 0.2 or later, THE workspace lock SHALL contain
-none of them.
+1.3 THE workspace lock SHALL contain no `hyper 0.14`, `h2 0.3`, `hyper-rustls 0.24`,
+`tokio-rustls 0.24`, `rustls 0.21`, `rustls-webpki 0.101`, or `webpki-roots 0.26`: the
+Connector Exception ended with the connector 0.2.2 move. THE workspace lock MAY retain
+`http 0.2` and `http-body 0.4` as SDK Type Dependencies, independently of the client.
 
 1.4 THE manifests SHALL declare no `hyper-legacy`, `http-body-legacy`, or `tonic-sdk`
 dependency alias.

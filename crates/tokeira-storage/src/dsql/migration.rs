@@ -8,7 +8,7 @@
 use std::{fs, path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, Connection, PgConnection, PgPool};
 use time::OffsetDateTime;
 use tokeira_observability::{ErrorBiasedSamplingReason, OutcomeLabel, mark_error_biased_sample};
 
@@ -320,7 +320,7 @@ impl MigrationRunner {
         connection: &mut PgConnection,
         decision: &SchemaDecision,
     ) -> Result<(), SchemaCompatibilityError> {
-        for statement in bootstrap_statements_for_decision(decision)? {
+        for statement in bootstrap_statements_for_decision(decision)?.iter().copied() {
             sqlx::query(statement).execute(&mut *connection).await?;
         }
         Ok(())
@@ -344,7 +344,13 @@ impl MigrationRunner {
             }
             let started_at = Instant::now();
             let mut tx = pool.begin().await?;
-            if let Err(error) = sqlx::query(&migration.sql).execute(&mut *tx).await {
+            // SQL safety: migration text comes from the embedded corpus or the trusted
+            // operator-selected migration directory; applied checksums are verified
+            // against the ledger. Request values are never interpolated into these bytes.
+            if let Err(error) = sqlx::query(AssertSqlSafe(migration.sql.as_str()))
+                .execute(&mut *tx)
+                .await
+            {
                 record_migration_failure(&migration, started_at.elapsed(), &error);
                 return Err(error).with_context(|| {
                     format!(
@@ -400,7 +406,13 @@ impl MigrationRunner {
             }
             let started_at = Instant::now();
             let mut tx = connection.begin().await?;
-            if let Err(error) = sqlx::query(&migration.sql).execute(&mut *tx).await {
+            // SQL safety: migration text comes from the embedded corpus or the trusted
+            // operator-selected migration directory; applied checksums are verified
+            // against the ledger. Request values are never interpolated into these bytes.
+            if let Err(error) = sqlx::query(AssertSqlSafe(migration.sql.as_str()))
+                .execute(&mut *tx)
+                .await
+            {
                 record_migration_failure(&migration, started_at.elapsed(), &error);
                 return Err(error).with_context(|| {
                     format!(
@@ -506,7 +518,7 @@ impl MigrationRunner {
         // Claim-protected recovery metadata must exist before the first
         // per-version compatibility write. The ordinary migration loop still
         // records all three exact migration identities in version order.
-        for statement in post_claim_bootstrap_statements() {
+        for statement in post_claim_bootstrap_statements().iter().copied() {
             renew_migration_lease(connection, leases, migration_lease, migration_gate).await?;
             sqlx::query(statement).execute(&mut *connection).await?;
         }
@@ -1034,11 +1046,17 @@ async fn execute_migration_step(
         let mut transaction = connection.begin().await?;
         let result = match &index_spec {
             Some(_) => {
-                sqlx::query_scalar::<_, String>(&migration.sql)
+                // SQL safety: migration text comes from the embedded corpus or the trusted
+                // operator-selected migration directory; applied checksums are verified
+                // against the ledger. Request values are never interpolated into these bytes.
+                sqlx::query_scalar::<_, String>(AssertSqlSafe(migration.sql.as_str()))
                     .fetch_optional(&mut *transaction)
                     .await
             }
-            None => sqlx::query(&migration.sql)
+            // SQL safety: migration text comes from the embedded corpus or the trusted
+            // operator-selected migration directory; applied checksums are verified
+            // against the ledger. Request values are never interpolated into these bytes.
+            None => sqlx::query(AssertSqlSafe(migration.sql.as_str()))
                 .execute(&mut *transaction)
                 .await
                 .map(|_| None),

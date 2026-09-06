@@ -90,17 +90,20 @@ the diagram as unconditional dependencies of the SDK crates and are omitted for 
 ### Connection Factory
 
 `crates/tokeira-storage/src/dsql/connection_factory.rs` keeps its shape. The error mapping
-becomes exhaustive:
+names the four enabled variants and retains the compiler-required fallback:
 
 ```rust
 pub fn from_dsql_error(error: DsqlError) -> Self {
-    // Exhaustive on purpose: a variant a future connector release adds must be
-    // classified here, not absorbed by a wildcard into `connection`.
     match error {
         DsqlError::ConfigError(error) => Self::Config(error.to_string()),
         DsqlError::TokenError(error) => Self::Token(error.to_string()),
         DsqlError::ConnectionError(error) => Self::Connection(error.to_string()),
         DsqlError::DatabaseError(error) => Self::Database(error.to_string()),
+        // Compiler-required: DsqlError is #[non_exhaustive] (connector
+        // 0.2.2, src/error.rs). At our exact =0.2.2 pin and feature set no
+        // value can reach this arm. A connector pin move is a reviewed
+        // dependency change whose review must revisit this mapping.
+        error => Self::Connection(error.to_string()),
     }
 }
 ```
@@ -117,14 +120,14 @@ Each of the eleven built-string sites wraps its text in `AssertSqlSafe` and carr
 comment that begins `// SQL safety:` and names the source of the text. The comment is the
 audit SQLx asks for; the static check in the engine's architecture tests keeps it present.
 
-Migration runner (`migration.rs:347`, `:403`, `:1037`, `:1041`; the text is a `String` copied
-from the embedded corpus, so the borrowed form is used and SQLx copies it once per
-statement):
+Migration runner (`migration.rs:347`, `:403`, `:1037`, `:1041`; the text is a `String` from
+the embedded corpus or the trusted operator-selected migration directory, so the borrowed
+form is used and SQLx copies it once per statement):
 
 ```rust
-// SQL safety: `migration.sql` is a file from the embedded migration corpus whose
-// checksum the runner verified against the ledger; nothing at request time can
-// reach a compile-time embedded file.
+// SQL safety: migration text comes from the embedded corpus or the trusted
+// operator-selected migration directory; applied checksums are verified
+// against the ledger. Request values are never interpolated into these bytes.
 sqlx::query(AssertSqlSafe(migration.sql.as_str())).execute(&mut *tx).await
 ```
 
@@ -300,7 +303,7 @@ SHALL name `tracing-log` and the lock SHALL resolve `tracing-log` as a dependenc
 | IAM token generation error (`DsqlError::TokenError`) | `ConnectionFactoryError::Token` | metric label `token` |
 | TCP or TLS failure (`DsqlError::ConnectionError`) | `ConnectionFactoryError::Connection` | metric label `connection` |
 | Handshake or server error (`DsqlError::DatabaseError`) | `ConnectionFactoryError::Database` | metric label `database` |
-| A connector variant this mapping does not name | compile error (exhaustive match) | none at runtime |
+| Compiler-required fallback for non-exhaustive `DsqlError` | `ConnectionFactoryError::Connection`; unreachable at the exact `=0.2.2` pin and feature set | existing `connection` fallback; reviewed pin moves must revisit the mapping |
 | `AssertSqlSafe` without its comment, or beyond the eleven sites | architecture test failure | none at runtime |
 | Legacy Client Set crate in the lock | Property 1 failure | none at runtime |
 | Live test environment variables unset | the test returns early | not a failure |

@@ -1,0 +1,4 @@
+kind: security
+body: Remove the legacy AWS HTTPS client and its four rustls-webpki and h2 advisory exceptions from the workspace.
+custom:
+  Slice: e9416557-3903-4a7c-bb6c-10bc18f3458d

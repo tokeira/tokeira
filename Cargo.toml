@@ -199,7 +199,7 @@ tokeira-build = { path = "crates/tokeira-build" }
 # Ed25519 keygen so key material never ships in the tree.
 tough = "0.24"
 tough-kms = "0.16"
-aws-sdk-kms = "1"
+aws-sdk-kms = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-lc-rs = "1"
 jiff = { version = "0.2", features = ["serde"] }
 

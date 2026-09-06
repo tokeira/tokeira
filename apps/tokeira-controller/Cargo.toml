@@ -15,7 +15,7 @@ doc = false
 [dependencies]
 anyhow.workspace = true
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-dynamodb = "1"
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 axum = "0.8"
 clap.workspace = true
 connectrpc = { version = "0.6", features = ["axum"] }

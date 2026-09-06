@@ -1,4 +1,0 @@
-kind: changed
-body: Public storage signatures now use SQLx 0.9 types; the Aurora DSQL connector moves to 0.2.2 in the 0.3.0 release train.
-custom:
-  Slice: 8cbfe010-eb5d-48fc-89bb-2787c45d0acc

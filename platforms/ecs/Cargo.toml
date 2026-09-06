@@ -20,7 +20,7 @@ content = ["observability"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-aws-sdk-ecs = "1"
+aws-sdk-ecs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 chrono = { version = "0.4", features = ["serde"] }
 dagger-sdk.workspace = true
 futures-util = "0.3"

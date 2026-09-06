@@ -16,7 +16,7 @@ doc = false
 anyhow.workspace = true
 async-trait.workspace = true
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-dynamodb = "1"
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 time.workspace = true
 tokeira-autoscaler = { path = "../../crates/tokeira-autoscaler" }
 tokeira-build-info.workspace = true

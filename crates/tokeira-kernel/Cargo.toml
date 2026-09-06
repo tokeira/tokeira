@@ -25,7 +25,7 @@ tracing.workspace = true
 tokeira-types = { path = "../tokeira-types", version = "0.1.2" }
 
 [dev-dependencies]
-postcard = { version = "1.0", features = ["alloc"] }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 prost = "0.12"
 proptest = "1.6"
 tokeira-proto = { path = "../tokeira-proto" }

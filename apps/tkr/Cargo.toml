@@ -15,13 +15,13 @@ anyhow.workspace = true
 async-trait.workspace = true
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 dagger-sdk.workspace = true
-aws-sdk-s3 = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "http-1x"] }
 base64 = "0.22"
 chrono.workspace = true
 clap.workspace = true
 console = "0.15"
 directories = "6"
-indicatif = "0.17"
+indicatif = "0.18"
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

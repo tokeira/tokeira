@@ -427,7 +427,10 @@ pub struct WorkflowExecutionDescription {
     pub execution_time: OffsetDateTime,
     pub execution_config: ExecutionConfigDescription,
     pub history_length: i64,
-    /// Protobuf-encoded size of the committed public history returned to SDKs.
+    /// The persisted History Size: the store's own encoded bytes of every
+    /// committed history batch, maintained at commit. It is the same number
+    /// the run's workflow tasks were told and the visibility `HistorySizeBytes`
+    /// attribute carries (`ExecutionStats.HistorySize` @ v1.31.0).
     pub history_size_bytes: i64,
     pub state_transition_count: i64,
     pub parent_namespace_id: Option<String>,

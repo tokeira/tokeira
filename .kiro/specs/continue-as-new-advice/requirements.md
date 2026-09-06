@@ -43,8 +43,11 @@ second transport for the transport-independence evidence.
 - **History Size:** The number of bytes of history batches storage has committed for a
   run, as encoded in the run's own store. Temporal calls this
   `ExecutionStats.HistorySize`.
-- **History Count:** The event id the `WorkflowTaskStarted` event receives; Temporal uses
-  `nextEventID` at the moment of the decision, which is that id.
+- **History Count:** The id the next history event would receive at the moment of the
+  decision (`GetNextEventID()`, `workflow_task_state_machine.go:1452 @ v1.31.0`). For a
+  persisted start that is the `WorkflowTaskStarted` event's own id; for a transient or
+  speculative start, whose events are not persisted, it is the virtual scheduled id, one
+  below the synthesized started id.
 - **Size Threshold, Count Threshold, Update Threshold:** The v1.31.0 defaults
   `limit.historySize.suggestContinueAsNew` = 4 MiB,
   `limit.historyCount.suggestContinueAsNew` = 4096, and
@@ -228,8 +231,8 @@ deterministic rule at every task start, so that replay and every delivery path a
 reasons iff the supplied History Size is greater than or equal to the Size Threshold.
 
 2.2 WHEN a workflow task starts, THE kernel SHALL include `TOO_MANY_HISTORY_EVENTS` in the
-reasons iff the event id assigned to the `WorkflowTaskStarted` event is greater than or
-equal to the Count Threshold.
+reasons iff the History Count, the next event id at the moment of the decision, is greater
+than or equal to the Count Threshold.
 
 2.3 WHEN a workflow task starts, THE kernel SHALL include `TOO_MANY_UPDATES` in the
 reasons iff the Update Threshold is non-zero and the number of in-flight updates

@@ -35,6 +35,7 @@ fn kernel() -> BasicKernel {
 
 fn open_state() -> WorkflowState {
     WorkflowState {
+        completed_update_count: 0,
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),
         workflow_id: WorkflowId("workflow".into()),
@@ -106,6 +107,7 @@ fn open_state() -> WorkflowState {
 /// Attempt-1 task with persisted Scheduled(8)/Started(9) events.
 fn with_started_attempt1(mut state: WorkflowState) -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         target_worker_deployment_version_changed: false,
@@ -125,6 +127,7 @@ fn with_started_attempt1(mut state: WorkflowState) -> WorkflowState {
 fn with_started_attempt2_virtual(mut state: WorkflowState) -> WorkflowState {
     state.workflow_task_attempt = 2;
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         target_worker_deployment_version_changed: false,
@@ -150,6 +153,8 @@ fn real_sticky() -> StickyAffinity {
 
 fn fail_request(started_event_id: i64) -> WorkflowTaskFailedRequest {
     WorkflowTaskFailedRequest {
+        history_size_bytes: 0,
+        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
         logical_seq: LogicalTaskSeq(3),
         started_event_id,
         failure_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
@@ -378,6 +383,7 @@ fn schedule_to_start_timeout_never_counts() {
     let mut state = open_state();
     state.sticky = Some(real_sticky());
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: Some(now()),
         target_worker_deployment_version_changed: false,
@@ -468,6 +474,7 @@ fn sticky_queue_start_preserves_real_sticky_affinity() {
     let mut state = open_state();
     state.sticky = Some(real_sticky());
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         target_worker_deployment_version_changed: false,
@@ -484,11 +491,11 @@ fn sticky_queue_start_preserves_real_sticky_affinity() {
         .apply(
             LoadedRun::Existing(state),
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: LogicalTaskSeq(3),
                 worker_identity: WorkerIdentity("worker".into()),
                 request_id: "req-1".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,

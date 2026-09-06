@@ -4229,19 +4229,19 @@ where
             None => return Ok(None),
         };
 
-        match self.repo.load_run(run_key).await? {
+        let (loaded, stats) = self.repo.load_run_with_stats(run_key).await?;
+        match loaded {
             LoadedRun::Existing(state) => {
                 // Describe surfaces history size and external-payload statistics
-                // (`describeworkflow/api.go:126,166 @ v1.31.0`). Tokeira derives
-                // both from the full committed history on read — history remains
-                // authoritative and no denormalized counter can drift.
-                let history = self.repo.read_history(run_key, 0, usize::MAX).await?;
-                let history_size_bytes =
-                    tokeira_edge::translate::history_serializer::serialized_history_size_bytes(
-                        &history,
-                    );
-                let (external_payload_count, external_payload_size_bytes) =
-                    tokeira_edge::translate::external_payload_stats(&history);
+                // (`describeworkflow/api.go:126,166 @ v1.31.0`). Both are
+                // state-maintained: the History Size is the statistic storage
+                // advances with every committed batch, the same number the
+                // continue-as-new advice and visibility read, and the payload
+                // statistics accumulate on the kernel state. No history read
+                // happens here (continue-as-new-advice, Requirements 7.1, 7.2).
+                let history_size_bytes = stats.history_size_bytes;
+                let external_payload_count = state.external_payload_count;
+                let external_payload_size_bytes = state.external_payload_size_bytes;
                 // Derived straight from committed kernel state: the counter
                 // and problem identity live on the run, the threshold is read
                 // live at derive time (Tier 3.22 `DynamicConfigChanges`).

@@ -717,6 +717,19 @@ pub struct AttributedHistoryEvent {
     pub principal: Option<EventPrincipal>,
 }
 
+/// Persisted per-run history statistics returned beside the loaded state.
+///
+/// `history_size_bytes` is the store's own encoded size of every history batch
+/// committed for the run, maintained in the commit that writes each batch. It
+/// is the single number the continue-as-new advice, `DescribeWorkflowExecution`,
+/// and the visibility `HistorySizeBytes` attribute all read
+/// (`ExecutionStats.HistorySize` in `mutable_state_impl.go:6610-6616 @ v1.31.0`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunHistoryStats {
+    /// Encoded bytes of committed history, `0` for a run with no batch yet.
+    pub history_size_bytes: i64,
+}
+
 /// Query surface the runtime needs from storage.
 ///
 /// The interface is intentionally shaped around semantics rather than a
@@ -755,6 +768,17 @@ pub trait RunRepository: Send + Sync {
     /// Load the full durable state for a run, or
     /// [`LoadedRun::Absent`] if the key is unknown.
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun>;
+
+    /// Load the run and its persisted history statistics in one repository
+    /// round trip.
+    ///
+    /// The authoritative stores read the statistic with the state so the value
+    /// handed to a workflow-task start is the one the same commit path
+    /// maintains. Wrappers must forward this method explicitly; the default
+    /// exists for test doubles and reports a zero statistic.
+    async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
+        Ok((self.load_run(run_key).await?, RunHistoryStats::default()))
+    }
 
     /// Read the authoritative history stream after a known event id.
     async fn read_history(
@@ -1734,11 +1758,9 @@ pub struct ProjectionContext {
     /// Generic transition counter for archetype-neutral visibility.
     #[serde(default)]
     pub transition_count: i64,
-    /// Approximate serialized history size in bytes.
-    ///
-    /// Tokeira does not yet maintain Temporal's exact byte accounting, but the
-    /// field must exist so visibility queries over `HistorySizeBytes` compile
-    /// against the v1.31.0 system search-attribute surface.
+    /// Persisted History Size after the transition: the store's own encoded
+    /// bytes of every committed history batch, maintained at commit and shared
+    /// with `DescribeWorkflowExecution` and the continue-as-new advice.
     #[serde(default)]
     pub history_size_bytes: i64,
     /// Parent workflow ID for child executions.
@@ -1797,6 +1819,7 @@ fn unix_epoch() -> OffsetDateTime {
 pub(crate) fn workflow_projection_context_with_previous(
     state: &WorkflowState,
     previous: Option<&ProjectionContext>,
+    history_size_bytes: i64,
 ) -> Result<ProjectionContext> {
     let mut context = projection_context(
         state,
@@ -1807,6 +1830,7 @@ pub(crate) fn workflow_projection_context_with_previous(
         },
         state.closed_at.unwrap_or(state.started_at),
         false,
+        history_size_bytes,
     )?;
 
     let mut used_versions = previous
@@ -1849,8 +1873,15 @@ pub(crate) fn workflow_projection_context_with_previous(
 pub(crate) fn deleted_workflow_projection_context(
     state: &WorkflowState,
     deleted_at: OffsetDateTime,
+    history_size_bytes: i64,
 ) -> Result<ProjectionContext> {
-    projection_context(state, VisibilityLifecycleState::Deleted, deleted_at, true)
+    projection_context(
+        state,
+        VisibilityLifecycleState::Deleted,
+        deleted_at,
+        true,
+        history_size_bytes,
+    )
 }
 
 fn projection_context(
@@ -1858,6 +1889,7 @@ fn projection_context(
     lifecycle_state: VisibilityLifecycleState,
     update_time: OffsetDateTime,
     redact_user_data: bool,
+    history_size_bytes: i64,
 ) -> Result<ProjectionContext> {
     let transition_count = i64::try_from(state.transition_seq.0).map_err(|_| {
         anyhow!(
@@ -2042,7 +2074,9 @@ fn projection_context(
         execution_duration,
         state_transition_count: transition_count,
         transition_count,
-        history_size_bytes: 0,
+        // The persisted History Size at this transition, so the visibility
+        // attribute equals what the workflow was told and what Describe reports.
+        history_size_bytes,
         parent_workflow_id: state.parent_workflow_id.clone(),
         parent_run_id: state.parent_run_id,
         root_workflow_id: state
@@ -2266,6 +2300,10 @@ where
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         (**self).load_run(run_key).await
+    }
+
+    async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
+        (**self).load_run_with_stats(run_key).await
     }
 
     async fn read_history(

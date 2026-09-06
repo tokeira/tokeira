@@ -53,6 +53,9 @@ struct PolledWorkflowTaskTarget {
     /// Current/Ramping target offered for SDK notification, distinct from a
     /// pinned effective dispatch destination.
     routing_target: Option<WorkerDeploymentVersionRef>,
+    /// Persisted History Size read with the run in the same round trip, the
+    /// operand the kernel records on the started event.
+    history_size_bytes: i64,
 }
 
 #[cfg(not(feature = "conformance"))]
@@ -65,6 +68,71 @@ fn target_version_changed_enabled() -> bool {
     crate::conformance::reads()
         .get_bool("system.enableSendTargetVersionChanged")
         .unwrap_or(true)
+}
+
+/// `history.maxTotalUpdates` default (`constants.go:2299-2303 @ v1.31.0`); only
+/// its product with the ratio below is consulted, never the hard limit. Off
+/// the `conformance` feature the product is already folded into
+/// `ContinueAsNewAdvicePolicy::V1_31_0`.
+#[cfg(feature = "conformance")]
+const WORKFLOW_EXECUTION_MAX_TOTAL_UPDATES: i64 = 2_000;
+
+/// `history.maxTotalUpdates.suggestContinueAsNewThreshold` default
+/// (`constants.go:2304-2308 @ v1.31.0`).
+#[cfg(feature = "conformance")]
+const MAX_TOTAL_UPDATES_SUGGEST_CONTINUE_AS_NEW_THRESHOLD: f64 = 0.9;
+
+/// The thresholds handed to the kernel with every workflow-task start.
+///
+/// Off the `conformance` feature these are the v1.31.0 defaults pinned in the
+/// release with no production configuration field (continue-as-new-advice,
+/// Requirements 3.1, 3.6). The update threshold is ceil(max_total × ratio) and
+/// `0` when either operand is `0`, which disables that reason
+/// (`update/registry.go:182-184, 497-500 @ v1.31.0`).
+#[cfg(not(feature = "conformance"))]
+pub fn continue_as_new_advice_policy() -> tokeira_kernel::ContinueAsNewAdvicePolicy {
+    tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0
+}
+
+/// The thresholds handed to the kernel with every workflow-task start, read
+/// through the override bridge with a per-key fallback to the pinned defaults
+/// (continue-as-new-advice, Requirement 3.2).
+#[cfg(feature = "conformance")]
+pub fn continue_as_new_advice_policy() -> tokeira_kernel::ContinueAsNewAdvicePolicy {
+    let reads = crate::conformance::reads();
+    let defaults = tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0;
+    let max_total_updates = reads
+        .get_i64("history.maxTotalUpdates")
+        .unwrap_or(WORKFLOW_EXECUTION_MAX_TOTAL_UPDATES);
+    let ratio = reads
+        .get_f64("history.maxTotalUpdates.suggestContinueAsNewThreshold")
+        .unwrap_or(MAX_TOTAL_UPDATES_SUGGEST_CONTINUE_AS_NEW_THRESHOLD);
+    tokeira_kernel::ContinueAsNewAdvicePolicy {
+        history_size_threshold_bytes: reads
+            .get_i64("limit.historySize.suggestContinueAsNew")
+            .unwrap_or(defaults.history_size_threshold_bytes),
+        history_count_threshold: reads
+            .get_i64("limit.historyCount.suggestContinueAsNew")
+            .unwrap_or(defaults.history_count_threshold),
+        total_updates_suggest_threshold: total_updates_suggest_threshold(max_total_updates, ratio),
+    }
+}
+
+/// ceil(max_total × ratio), or `0` when either operand is non-positive
+/// (`update/registry.go:182-184 @ v1.31.0`).
+#[cfg_attr(not(feature = "conformance"), allow(dead_code))]
+fn total_updates_suggest_threshold(max_total_updates: i64, ratio: f64) -> u32 {
+    // A NaN ratio disables the reason like a non-positive one: `max × NaN`
+    // could never clear a threshold, and `ceil` of it would be meaningless.
+    if max_total_updates <= 0 || ratio.is_nan() || ratio <= 0.0 {
+        return 0;
+    }
+    let product = (max_total_updates as f64 * ratio).ceil();
+    if product >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        product as u32
+    }
 }
 
 const DEFAULT_PENDING_COMMAND_LIMIT: usize = 2_000;
@@ -814,7 +882,10 @@ where
         &self,
         offered: &DispatchableWorkflowTask,
     ) -> Result<PolledWorkflowTaskTarget> {
-        let LoadedRun::Existing(state) = self.repo.load_run(offered.run_key).await? else {
+        // One round trip returns the state and its History Size (Requirement 1.8);
+        // the statistic read here is the one the start transition records.
+        let (loaded, stats) = self.repo.load_run_with_stats(offered.run_key).await?;
+        let LoadedRun::Existing(state) = loaded else {
             return Ok(PolledWorkflowTaskTarget {
                 resolved: ResolvedWorkflowTaskTarget {
                     deployment_version: None,
@@ -823,6 +894,7 @@ where
                 },
                 deployment_transition: None,
                 routing_target: None,
+                history_size_bytes: stats.history_size_bytes,
             });
         };
         let routing_config = self
@@ -840,6 +912,7 @@ where
             resolved,
             deployment_transition,
             routing_target,
+            history_size_bytes: stats.history_size_bytes,
         })
     }
 
@@ -1144,6 +1217,10 @@ where
                             request: failure_request.clone(),
                             now: OffsetDateTime::now_utc(),
                             reset_reapply: Vec::new(),
+                            // Consulted only when a reset synthesizes a started
+                            // event; a worker-reported failure never does.
+                            history_size_bytes: 0,
+                            advice_policy: continue_as_new_advice_policy(),
                         }),
                     )
                     .await
@@ -1225,6 +1302,10 @@ where
                             request: failure_request,
                             now: OffsetDateTime::now_utc(),
                             reset_reapply: Vec::new(),
+                            // Consulted only when a reset synthesizes a started
+                            // event; a worker-reported failure never does.
+                            history_size_bytes: 0,
+                            advice_policy: continue_as_new_advice_policy(),
                         }),
                     )
                     .await
@@ -1363,6 +1444,10 @@ where
                 request,
                 now,
                 reset_reapply: Vec::new(),
+                // Consulted only when a reset synthesizes a started event; a
+                // worker-reported failure never does.
+                history_size_bytes: 0,
+                advice_policy: continue_as_new_advice_policy(),
             })
         };
         // The consecutive-problem accumulator advances inside the kernel's
@@ -1702,8 +1787,8 @@ where
             logical_seq: offered.logical_seq,
             worker_identity: worker_identity.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
-            history_size_bytes: 0,
-            suggest_continue_as_new: false,
+            history_size_bytes: target.history_size_bytes,
+            advice_policy: continue_as_new_advice_policy(),
             deployment_transition: target.deployment_transition.clone(),
             deployment_transition_revision_number: target
                 .deployment_transition
@@ -1756,6 +1841,11 @@ where
         let started_event_id = pending
             .started_event_id
             .ok_or_else(|| anyhow!("workflow task started without started_event_id"))?;
+        if pending.advice.suggest_continue_as_new {
+            for reason in &pending.advice.suggest_continue_as_new_reasons {
+                runtime_metrics::record_workflow_suggest_continue_as_new(reason.metric_label());
+            }
+        }
 
         let token = WorkflowTaskToken {
             run_key: new_state.run_key,
@@ -1801,6 +1891,7 @@ where
             WorkerTaskClass::Workflow,
         );
         Ok(StartedWorkflowTask {
+            advice: pending.advice.clone(),
             run_key: new_state.run_key,
             run_id: new_state.run_id,
             workflow_id: new_state.workflow_id,
@@ -1863,6 +1954,7 @@ where
             build_id: state.build_id.clone(),
         };
         Ok(StartedWorkflowTask {
+            advice: pending.advice.clone(),
             run_key: state.run_key,
             run_id: state.run_id,
             workflow_id: state.workflow_id.clone(),
@@ -2011,6 +2103,7 @@ pub(crate) fn build_retry_successor_start(
     let inherited_versioning_info = retry_successor_versioning_info(state, started_versioning_info);
     StartRequest {
         run_key: successor_run_key,
+        advice_policy: continue_as_new_advice_policy(),
         namespace_id: state.namespace_id,
         workflow_id: state.workflow_id.clone(),
         run_id: new_run_id,
@@ -2177,6 +2270,7 @@ pub(crate) fn build_cron_successor_start(
     };
     Ok(StartRequest {
         run_key: successor_run_key,
+        advice_policy: continue_as_new_advice_policy(),
         namespace_id: state.namespace_id,
         workflow_id: state.workflow_id.clone(),
         run_id: new_run_id,
@@ -2273,6 +2367,120 @@ pub(crate) mod tests {
 
             prop_assert_eq!(normalize_pending_command_limit(configured), expected);
         }
+    }
+
+    // Feature: continue-as-new-advice, Property 6: policy accessors equal the pinned constants off-feature
+    #[cfg(not(feature = "conformance"))]
+    #[test]
+    fn advice_policy_is_the_pinned_v1_31_0_profile_off_feature() {
+        assert_eq!(
+            continue_as_new_advice_policy(),
+            tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        // Feature: continue-as-new-advice, Property 6: policy accessors equal the pinned constants off-feature
+        // (update-threshold derivation: ceil(max_total × ratio), `0` disables).
+        #[test]
+        fn update_threshold_is_the_ceiling_of_the_product_or_disabled(
+            max_total_updates in -10i64..100_000,
+            ratio in prop_oneof![Just(0.0f64), Just(-1.0f64), 0.0f64..=1.5f64],
+        ) {
+            let threshold = total_updates_suggest_threshold(max_total_updates, ratio);
+            if max_total_updates <= 0 || ratio <= 0.0 {
+                prop_assert_eq!(threshold, 0);
+            } else {
+                let expected = (max_total_updates as f64 * ratio).ceil() as u32;
+                prop_assert_eq!(threshold, expected);
+                prop_assert!(threshold >= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn update_threshold_of_the_v1_31_0_defaults_matches_the_pinned_policy() {
+        assert_eq!(total_updates_suggest_threshold(2_000, 0.9), 1_800);
+        assert_eq!(
+            total_updates_suggest_threshold(2_000, 0.9),
+            tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0.total_updates_suggest_threshold
+        );
+    }
+
+    // Feature: continue-as-new-advice, Property 6 (on-feature leg): an override moves
+    // only its own operand and a cleared key falls back to the pinned default.
+    #[cfg(feature = "conformance")]
+    #[test]
+    fn advice_policy_reads_each_key_with_per_key_fallback() {
+        use tokeira_conformance::OverrideValue;
+
+        const KEYS: [&str; 4] = [
+            "limit.historySize.suggestContinueAsNew",
+            "limit.historyCount.suggestContinueAsNew",
+            "history.maxTotalUpdates",
+            "history.maxTotalUpdates.suggestContinueAsNewThreshold",
+        ];
+        crate::conformance::install_registry_reads();
+        let overrides = tokeira_conformance::overrides();
+        let defaults = tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0;
+        for key in KEYS {
+            overrides.clear(key);
+        }
+        assert_eq!(continue_as_new_advice_policy(), defaults);
+
+        overrides
+            .set(
+                "limit.historySize.suggestContinueAsNew",
+                OverrideValue::Int(1_024),
+            )
+            .unwrap();
+        let policy = continue_as_new_advice_policy();
+        assert_eq!(policy.history_size_threshold_bytes, 1_024);
+        assert_eq!(
+            policy.history_count_threshold,
+            defaults.history_count_threshold
+        );
+        assert_eq!(
+            policy.total_updates_suggest_threshold,
+            defaults.total_updates_suggest_threshold
+        );
+
+        overrides
+            .set("history.maxTotalUpdates", OverrideValue::Int(10))
+            .unwrap();
+        overrides
+            .set(
+                "history.maxTotalUpdates.suggestContinueAsNewThreshold",
+                OverrideValue::Double(0.25),
+            )
+            .unwrap();
+        assert_eq!(
+            continue_as_new_advice_policy().total_updates_suggest_threshold,
+            3
+        );
+
+        overrides
+            .set("history.maxTotalUpdates", OverrideValue::Int(0))
+            .unwrap();
+        assert_eq!(
+            continue_as_new_advice_policy().total_updates_suggest_threshold,
+            0
+        );
+
+        overrides
+            .set(
+                "limit.historyCount.suggestContinueAsNew",
+                OverrideValue::Int(7),
+            )
+            .unwrap();
+        assert_eq!(continue_as_new_advice_policy().history_count_threshold, 7);
+
+        for key in KEYS {
+            overrides.clear(key);
+        }
+        assert_eq!(continue_as_new_advice_policy(), defaults);
     }
 
     fn app_failure(error_type: &str, non_retryable: bool) -> Payload {
@@ -2871,6 +3079,7 @@ pub(crate) mod tests {
         info: Option<WorkflowVersioningInfo>,
     ) -> WorkflowState {
         WorkflowState {
+            completed_update_count: 0,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId(workflow_id),
@@ -3467,11 +3676,11 @@ pub(crate) mod tests {
                 .as_ref()
                 .expect("a non-delayed successor schedules its first workflow task");
             let start_wft = Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                 logical_seq: pending.logical_seq,
                 worker_identity: WorkerIdentity("boundary-worker".into()),
                 request_id: "boundary-wft-start".into(),
                 history_size_bytes: 0,
-                suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: notification_enabled,

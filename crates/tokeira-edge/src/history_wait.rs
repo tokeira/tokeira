@@ -15,8 +15,8 @@ use tokeira_kernel::{HistoryEvent, LoadedRun, Transition};
 use tokeira_storage::{
     ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, BundleLease, CommitResult,
     DeleteRunRequest, DeleteRunResult, DispatchableActivityTask, DispatchableWorkflowTask,
-    DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry, RequestRecord, RunRepository,
-    TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentVersionKey,
+    DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry, RequestRecord, RunHistoryStats,
+    RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentVersionKey,
     WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
 };
 use tokeira_types::{
@@ -97,6 +97,11 @@ where
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         self.inner.load_run(run_key).await
+    }
+
+    async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
+        // Forwarded explicitly: the trait default would drop the statistic.
+        self.inner.load_run_with_stats(run_key).await
     }
 
     async fn read_history(
@@ -470,6 +475,7 @@ mod tests {
             .apply(
                 LoadedRun::Absent,
                 Command::Start(StartRequest {
+                    advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
                     initiator: None,
                     run_key,
                     namespace_id,

@@ -42,6 +42,12 @@ persistence.
   ownership epoch.
 - History, state, deduplication, audit, and the versioned projection record for a
   transition commit atomically.
+- Workflow-state and history-batch blobs carry a versioned envelope; a blob of any
+  other version fails to decode with `BlobFormatError` instead of being
+  reinterpreted under the current layout.
+- Each commit accounts the run's persisted history size in the same transaction
+  as the batch it appends (`RunHistoryStats`); readers consult that statistic and
+  never re-read history to derive it.
 - CHASM dirty-node batches apply all-or-nothing after every node precondition is
   checked; conflicts never force-overwrite newer state.
 - Projection records are ordered inputs to a rebuildable read model, not

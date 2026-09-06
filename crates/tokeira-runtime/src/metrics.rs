@@ -29,6 +29,11 @@ pub const QUERY_BUFFER_WAIT_SECONDS: &str = "tokeira_runtime_query_buffer_wait_s
 pub const WORKFLOW_TASK_STARTED_TOTAL: &str = "tokeira_runtime_workflow_task_started_total";
 pub const WORKFLOW_TASK_COMPLETED_TOTAL: &str = "tokeira_runtime_workflow_task_completed_total";
 pub const WORKFLOW_TASK_TIMED_OUT_TOTAL: &str = "tokeira_runtime_workflow_task_timed_out_total";
+/// Workflow-task starts whose recorded Advice suggested continue-as-new, one
+/// increment per reason (`WorkflowSuggestContinueAsNewCount`,
+/// `workflow_task_state_machine.go:539-548 @ v1.31.0`).
+pub const WORKFLOW_SUGGEST_CONTINUE_AS_NEW_TOTAL: &str =
+    "tokeira_runtime_workflow_suggest_continue_as_new_total";
 /// Speculative workflow task that MATERIALIZED into history (worker returned
 /// commands, heartbeat, interleaved events, or an update acceptance) — the
 /// bridge renames this to Temporal's `speculative_workflow_task_commits`
@@ -123,6 +128,7 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (QUERY_DISPATCH_TOTAL, MetricType::Counter),
     (QUERY_BUFFER_WAIT_SECONDS, MetricType::DurationHistogram),
     (WORKFLOW_TASK_STARTED_TOTAL, MetricType::Counter),
+    (WORKFLOW_SUGGEST_CONTINUE_AS_NEW_TOTAL, MetricType::Counter),
     (WORKFLOW_TASK_COMPLETED_TOTAL, MetricType::Counter),
     (WORKFLOW_TASK_TIMED_OUT_TOTAL, MetricType::Counter),
     (ACTIVITY_TASK_STARTED_TOTAL, MetricType::Counter),
@@ -425,6 +431,14 @@ pub fn record_query_buffer_wait(duration: std::time::Duration, outcome: QueryBuf
 
 pub fn record_workflow_task_started(outcome: OutcomeLabel) {
     counter!(WORKFLOW_TASK_STARTED_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+
+/// Record one reason behind a start whose Advice suggested continue-as-new.
+///
+/// `reason` is one of the three fixed enum labels, so the cardinality is
+/// bounded by construction.
+pub fn record_workflow_suggest_continue_as_new(reason: &'static str) {
+    counter!(WORKFLOW_SUGGEST_CONTINUE_AS_NEW_TOTAL, "reason" => reason).increment(1);
 }
 
 pub fn record_workflow_task_completed(outcome: OutcomeLabel) {

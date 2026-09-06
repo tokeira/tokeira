@@ -111,6 +111,36 @@ pub enum SchemaCompatibilityError {
         /// Unsafe migration version.
         version: u32,
     },
+    /// V068 would run against hot state this release cannot read.
+    #[error("{PRE_ENVELOPE_HOT_STATE_MESSAGE}")]
+    PreEnvelopeHotState,
+}
+
+/// The migration that introduced the hot-state and history-batch envelopes.
+///
+/// Rows written before it are positional postcard without a version prefix and
+/// cannot be decoded by this release, so applying it to a populated table is
+/// refused before the schema changes (continue-as-new-advice, Requirement 10.4).
+pub const ENVELOPE_MIGRATION_VERSION: u32 = 68;
+
+const PRE_ENVELOPE_HOT_STATE_MESSAGE: &str = "migration V068 cannot be applied: workflow_hot \
+     already holds rows written before Tokeira 0.1.3, and pre-0.1.3 hot state cannot be read by \
+     this release; recreate the cluster";
+
+/// Refuse to move a populated `workflow_hot` table across the envelope boundary.
+///
+/// Called only when V068 is not yet applied: a fresh cluster passes because the
+/// table is empty, and a cluster already at or beyond V068 never reaches here.
+async fn ensure_no_pre_envelope_hot_state(
+    connection: &mut PgConnection,
+) -> Result<(), SchemaCompatibilityError> {
+    let populated = sqlx::query_scalar::<_, i32>("SELECT 1 FROM workflow_hot LIMIT 1")
+        .fetch_optional(&mut *connection)
+        .await?;
+    if populated.is_some() {
+        return Err(SchemaCompatibilityError::PreEnvelopeHotState);
+    }
+    Ok(())
 }
 
 /// One migration statement that would be applied.
@@ -308,6 +338,10 @@ impl MigrationRunner {
             if self.is_applied(pool, &migration).await? {
                 continue;
             }
+            if migration.version == ENVELOPE_MIGRATION_VERSION {
+                let mut guard_connection = pool.acquire().await?;
+                ensure_no_pre_envelope_hot_state(&mut guard_connection).await?;
+            }
             let started_at = Instant::now();
             let mut tx = pool.begin().await?;
             if let Err(error) = sqlx::query(&migration.sql).execute(&mut *tx).await {
@@ -360,6 +394,9 @@ impl MigrationRunner {
         for migration in self.discover()? {
             if self.is_applied_connection(connection, &migration).await? {
                 continue;
+            }
+            if migration.version == ENVELOPE_MIGRATION_VERSION {
+                ensure_no_pre_envelope_hot_state(connection).await?;
             }
             let started_at = Instant::now();
             let mut tx = connection.begin().await?;
@@ -502,6 +539,9 @@ impl MigrationRunner {
                 .any(|applied| applied.version == migration.version)
             {
                 continue;
+            }
+            if migration.version == ENVELOPE_MIGRATION_VERSION {
+                ensure_no_pre_envelope_hot_state(connection).await?;
             }
             execute_migration_step(connection, migration).await?;
 
@@ -1032,6 +1072,7 @@ fn migration_is_idempotent(sql: &str) -> bool {
     (normalized.contains("CREATE TABLE IF NOT EXISTS"))
         || (normalized.contains("CREATE INDEX ASYNC IF NOT EXISTS"))
         || (normalized.contains("CREATE UNIQUE INDEX ASYNC IF NOT EXISTS"))
+        || (normalized.contains("ALTER TABLE") && normalized.contains("ADD COLUMN IF NOT EXISTS"))
         || (normalized.contains("INSERT INTO")
             && normalized.contains("ON CONFLICT")
             && normalized.contains("DO NOTHING"))
@@ -1618,8 +1659,21 @@ mod tests {
         let plans = MigrationRunner::embedded()
             .dry_run()
             .expect("embedded migrations are valid");
-        assert_eq!(plans.len(), 67);
+        assert_eq!(plans.len(), 68);
         assert!(plans.iter().all(|plan| migration_is_idempotent(&plan.sql)));
+    }
+
+    #[test]
+    fn add_column_is_idempotent_only_with_if_not_exists() {
+        assert!(migration_is_idempotent(
+            "ALTER TABLE workflow_hot ADD COLUMN IF NOT EXISTS history_size_bytes BIGINT;"
+        ));
+        assert!(!migration_is_idempotent(
+            "ALTER TABLE workflow_hot ADD COLUMN history_size_bytes BIGINT;"
+        ));
+        assert!(!migration_is_idempotent(
+            "ALTER TABLE workflow_hot DROP COLUMN IF EXISTS history_size_bytes;"
+        ));
     }
 
     #[test]

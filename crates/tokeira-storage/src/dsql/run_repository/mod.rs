@@ -29,11 +29,11 @@ use crate::{
     BacklogPayload, CommitResult, CompletionCallbackSweepEntry, CurrentExecutionConflictPolicy,
     DbClass, DeleteRunRequest, DeleteRunResult, DeliveryOrder, DispatchableActivityTask,
     DispatchableWorkflowTask, DueActivityDispatch, DueTimer, NexusSweepEntry, ProjectionRecord,
-    ReconstructibleNexusDelivery, RequestRecord, RunRepository, TransitionAuditRecord,
-    WftTimeoutSweepEntry, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
-    WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
-    dispatchable_workflow_task, metrics, workflow_is_open_and_pinned_to_version,
-    workflow_projection_context_with_previous,
+    ReconstructibleNexusDelivery, RequestRecord, RunHistoryStats, RunRepository,
+    TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentVersionKey,
+    WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
+    deleted_workflow_projection_context, dispatchable_workflow_task, metrics,
+    workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -463,6 +463,10 @@ impl RunRepository for DsqlRunRepository {
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         self.do_load_run(run_key).await
+    }
+
+    async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
+        self.do_load_run_with_stats(run_key).await
     }
 
     async fn read_history(
@@ -1020,12 +1024,21 @@ mod tests {
             let timer_state = sample_timer_state(seed);
             let projection_context = sample_projection_context(&workflow_state);
 
+            let run_key = workflow_state.run_key;
             prop_assert_eq!(
-                codec::decode_workflow_state(&codec::encode_workflow_state(&workflow_state).unwrap()).unwrap(),
+                codec::decode_workflow_state(
+                    run_key,
+                    &codec::encode_workflow_state(&workflow_state).unwrap(),
+                )
+                .unwrap(),
                 workflow_state
             );
             prop_assert_eq!(
-                codec::decode_history_events(&codec::encode_history_events(&history_events).unwrap()).unwrap(),
+                codec::decode_history_events(
+                    run_key,
+                    &codec::encode_history_events(&history_events).unwrap(),
+                )
+                .unwrap(),
                 history_events
             );
             prop_assert_eq!(
@@ -1791,6 +1804,7 @@ mod tests {
 
     fn sample_state(run_key: RunKey) -> WorkflowState {
         WorkflowState {
+            completed_update_count: 0,
             run_key,
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".to_owned()),
@@ -1806,6 +1820,7 @@ mod tests {
             external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                advice: Default::default(),
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
                 logical_seq: LogicalTaskSeq(1),

@@ -84,19 +84,35 @@ impl DsqlRunRepository {
 
     #[instrument(name = "dsql.load_run", skip(self), fields(run_key = %run_key.0))]
     pub(super) async fn do_load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
+        self.do_load_run_with_stats(run_key)
+            .await
+            .map(|(loaded, _)| loaded)
+    }
+
+    #[instrument(name = "dsql.load_run_with_stats", skip(self), fields(run_key = %run_key.0))]
+    pub(super) async fn do_load_run_with_stats(
+        &self,
+        run_key: RunKey,
+    ) -> Result<(LoadedRun, crate::RunHistoryStats)> {
         record_dsql_operation!(self, "load_run", Some(self.shard_for_run_key(run_key)), {
             let mut permit = self.director.acquire(DbClass::Read).await?;
-            let row = sqlx::query_as::<_, (Vec<u8>,)>(
-                "SELECT state_data FROM workflow_hot WHERE run_key = $1",
+            // One read returns the state and the statistic the same commit
+            // maintained (Requirement 1.8). A NULL column is a row from before
+            // V068 and reads as zero.
+            let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>)>(
+                "SELECT state_data, history_size_bytes FROM workflow_hot WHERE run_key = $1",
             )
             .bind(run_key.0)
             .fetch_optional(permit.connection()?)
             .await?;
             match row {
-                Some((state_data,)) => Ok(LoadedRun::Existing(codec::decode_workflow_state(
-                    &state_data,
-                )?)),
-                None => Ok(LoadedRun::Absent),
+                Some((state_data, history_size_bytes)) => Ok((
+                    LoadedRun::Existing(codec::decode_workflow_state(run_key, &state_data)?),
+                    crate::RunHistoryStats {
+                        history_size_bytes: history_size_bytes.unwrap_or(0),
+                    },
+                )),
+                None => Ok((LoadedRun::Absent, crate::RunHistoryStats::default())),
             }
         })
     }
@@ -151,9 +167,11 @@ impl DsqlRunRepository {
 
                 let mut events = Vec::new();
                 for (_first_event_id, _last_event_id, events_data, principals_data) in rows {
-                    for attributed in
-                        decode_attributed_history_batch(&events_data, principals_data.as_deref())?
-                    {
+                    for attributed in decode_attributed_history_batch(
+                        run_key,
+                        &events_data,
+                        principals_data.as_deref(),
+                    )? {
                         if attributed.event.event_id <= after_event_id {
                             continue;
                         }
@@ -249,7 +267,7 @@ impl DsqlRunRepository {
                                 transition_seq,
                                 "history_batch.transition_seq",
                             )?),
-                            history_events: codec::decode_history_events(&events_data)?,
+                            history_events: codec::decode_history_events(run_key, &events_data)?,
                             activity_ops: Vec::new(),
                             timer_ops: Vec::new(),
                             dispatch_ops: Vec::new(),
@@ -285,7 +303,7 @@ impl DsqlRunRepository {
                     tx.rollback().await?;
                     bail!("base run not found: {:?}", base_run_key);
                 };
-                let base_state = codec::decode_workflow_state(&base_state_data)?;
+                let base_state = codec::decode_workflow_state(base_run_key, &base_state_data)?;
                 let successor_run_key = RunKey::derive(
                     base_state.namespace_id,
                     &base_state.workflow_id,
@@ -312,9 +330,11 @@ impl DsqlRunRepository {
                 // a second source of truth for reset snapshots.
                 for (events_data, principals_data, _first_event_id, _last_event_id) in history_rows
                 {
-                    for attributed in
-                        decode_attributed_history_batch(&events_data, principals_data.as_deref())?
-                    {
+                    for attributed in decode_attributed_history_batch(
+                        base_run_key,
+                        &events_data,
+                        principals_data.as_deref(),
+                    )? {
                         if attributed.event.event_id == fork_event_id {
                             found_fork = true;
                             break;
@@ -362,11 +382,17 @@ impl DsqlRunRepository {
                 successor_state.started_at = materialized_at;
                 successor_state.first_run_started_at = Some(materialized_at);
                 let successor_shard = self.shard_for_run_key(successor_run_key);
+                // The copied prefix is persisted as one batch, and its encoded
+                // size seeds the successor's History Size (Requirement 1.6);
+                // the in-memory store computes the same number.
+                let prefix_data = codec::encode_history_events(&copied_events)?;
+                let prefix_size = i64::try_from(prefix_data.len()).unwrap_or(i64::MAX);
                 crate::dsql::run_repository::commit::insert_workflow_hot(
                     &mut tx,
                     successor_run_key,
                     successor_shard,
                     &successor_state,
+                    prefix_size,
                 )
                 .await?;
                 crate::dsql::run_repository::commit::insert_history_batch(
@@ -374,6 +400,7 @@ impl DsqlRunRepository {
                     successor_run_key,
                     successor_state.transition_seq,
                     &copied_events,
+                    prefix_data,
                     &copied_principals,
                 )
                 .await?;
@@ -410,10 +437,11 @@ impl DsqlRunRepository {
 }
 
 fn decode_attributed_history_batch(
+    run_key: RunKey,
     events_data: &[u8],
     principals_data: Option<&[u8]>,
 ) -> Result<Vec<AttributedHistoryEvent>> {
-    let events = codec::decode_history_events(events_data)?;
+    let events = codec::decode_history_events(run_key, events_data)?;
     let principals = match principals_data {
         Some(bytes) => codec::decode_history_principals(bytes)?,
         None => vec![None; events.len()],
@@ -453,6 +481,10 @@ mod attribution_tests {
         }
     }
 
+    fn run_key() -> RunKey {
+        RunKey(uuid::Uuid::from_u128(1))
+    }
+
     #[test]
     fn null_principal_sidecar_reads_legacy_batch_as_unattributed() {
         // Feature: authorization-foundation, Property 5: rows committed before
@@ -460,7 +492,7 @@ mod attribution_tests {
         let events = vec![event(1), event(2)];
         let events_data = codec::encode_history_events(&events).expect("encode history");
 
-        let decoded = decode_attributed_history_batch(&events_data, None)
+        let decoded = decode_attributed_history_batch(run_key(), &events_data, None)
             .expect("NULL sidecar is the legacy representation");
 
         assert_eq!(
@@ -489,8 +521,9 @@ mod attribution_tests {
         let principals_data =
             codec::encode_history_principals(&principals).expect("encode principals");
 
-        let decoded = decode_attributed_history_batch(&events_data, Some(&principals_data))
-            .expect("decode aligned sidecar");
+        let decoded =
+            decode_attributed_history_batch(run_key(), &events_data, Some(&principals_data))
+                .expect("decode aligned sidecar");
 
         assert_eq!(decoded[0].principal, principals[0]);
         assert_eq!(decoded[1].principal, None);
@@ -503,8 +536,9 @@ mod attribution_tests {
         let principals_data =
             codec::encode_history_principals(&[None]).expect("encode deliberately short sidecar");
 
-        let error = decode_attributed_history_batch(&events_data, Some(&principals_data))
-            .expect_err("misaligned sidecar must fail closed");
+        let error =
+            decode_attributed_history_batch(run_key(), &events_data, Some(&principals_data))
+                .expect_err("misaligned sidecar must fail closed");
 
         assert!(
             error

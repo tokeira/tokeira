@@ -23,8 +23,9 @@ Migration* (the root keeps the name and points here). The rules:
   forward-only: never edit, rename, reorder, or delete a baseline-locked migration;
   every schema change is a new migration above the current head, including any
   supported, idempotent `ALTER TABLE` operation.
-- **Contiguous versions.** No gaps or duplicate `VNNN`; the next schema change after
-  the baseline starts at V068.
+- **Contiguous versions.** No gaps or duplicate `VNNN`; the baseline ends at V067,
+  V068 (the per-run history size) is the first forward-only migration above it, and the
+  next schema change is V069.
 - **DSQL DDL subset always.** One statement per file; secondary indexes created `ASYNC`;
   no `CHECK` constraints (validate in the application); no `BIGSERIAL` (generate IDs
   in-app). `src/dsql/validation.rs` (`DdlValidator`) enforces the safe subset — if it

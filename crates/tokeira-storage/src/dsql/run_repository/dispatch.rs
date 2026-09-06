@@ -308,7 +308,7 @@ pub(super) fn collect_dispatchable_workflow_tasks(
         // Workflow task dispatch is derived from the hot state snapshot. There
         // is no separate workflow-task queue table to repair; replaying history
         // can rebuild this materialization.
-        let state = codec::decode_workflow_state(&state_data)?;
+        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
         let Some(task) = dispatchable_workflow_task(&state) else {
             continue;
         };

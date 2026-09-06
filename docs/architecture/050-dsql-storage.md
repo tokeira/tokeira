@@ -264,6 +264,8 @@ DSQL supports CHECK constraints in CREATE TABLE, but Tokeira uses application-le
 
 All BYTEA columns use `postcard` (compact binary serde encoding). Domain types derive `Serialize, Deserialize`; no separate schema definitions or mapping code is needed. Postcard's varint encoding produces smaller payloads for typical workflow data (small integers, short strings) while staying within DSQL's 1 MiB BYTEA limit.
 
+Workflow-state and history-batch blobs are wrapped in a versioned envelope (a magic version prefix ahead of the postcard body). A decoder that meets any other version fails with `BlobFormatError` naming the blob kind, the run, and the observed version, so a layout change to the enveloped types can never be misread as data. The `workflow_hot.history_size_bytes` column accumulates the encoded length of every committed batch under the same `FOR UPDATE` read that fences the commit; it is the single history-size statistic that Describe, visibility, and the continue-as-new advice consult.
+
 ### Implementation reference
 
 The complete schema DDL, migration tooling, connection pool, and codec are specified in `.kiro/specs/dsql-schema-connection/` and implemented in `tokeira-storage/src/dsql/`.

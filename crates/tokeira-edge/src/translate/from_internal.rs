@@ -87,8 +87,16 @@ pub async fn poll_response(
                     "transient-{}-{}",
                     started.token.logical_seq.0, started.token.attempt
                 ),
-                history_size_bytes: 0,
-                suggest_continue_as_new: false,
+                // The Advice the start transition recorded for this attempt,
+                // so the worker acts on what the server decided even though
+                // the event is synthesized (continue-as-new-advice,
+                // Requirement 4.2).
+                history_size_bytes: started.advice.history_size_bytes,
+                suggest_continue_as_new: started.advice.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: started
+                    .advice
+                    .suggest_continue_as_new_reasons
+                    .clone(),
                 target_worker_deployment_version_changed: started
                     .target_worker_deployment_version_changed,
                 target_version_changed_enabled: false,
@@ -306,6 +314,7 @@ mod tests {
     fn started_task(previous_started_event_id: i64, is_sticky_match: bool) -> StartedWorkflowTask {
         let run_key = RunKey::new();
         StartedWorkflowTask {
+            advice: Default::default(),
             token: WorkflowTaskToken {
                 run_key,
                 logical_seq: LogicalTaskSeq::ONE,

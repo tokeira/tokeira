@@ -583,6 +583,7 @@ where
             }
         };
         let start_request = StartRequest {
+            advice_policy: crate::runtime::continue_as_new_advice_policy(),
             run_key: child_run_key,
             namespace_id,
             workflow_id: child_workflow_id.clone(),

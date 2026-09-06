@@ -9,8 +9,8 @@ impl DsqlRunRepository {
     ) -> Result<bool> {
         record_dsql_operation!(self, "has_open_pinned_workflows", None, {
             let mut permit = self.director.acquire(DbClass::Read).await?;
-            let rows = sqlx::query_as::<_, (Vec<u8>,)>(
-                "SELECT state_data
+            let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+                "SELECT run_key, state_data
              FROM workflow_hot
              WHERE namespace_id = $1",
             )
@@ -19,8 +19,8 @@ impl DsqlRunRepository {
             .await?;
             metrics::record_dsql_rows_read("has_open_pinned_workflows", rows.len());
 
-            for (state_data,) in rows {
-                let state = codec::decode_workflow_state(&state_data)?;
+            for (run_key, state_data) in rows {
+                let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
                 if workflow_is_open_and_pinned_to_version(&state, namespace_id, version) {
                     return Ok(true);
                 }
@@ -217,7 +217,7 @@ pub(super) fn collect_workflow_timeout_entries(
     for (run_key, state_data) in rows {
         // Timeout scanners need enough state to evaluate both execution and
         // run timeout policies in runtime without reopening history.
-        let state = codec::decode_workflow_state(&state_data)?;
+        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
         if !state.status.is_open()
             || (state.workflow_execution_timeout.is_none() && state.workflow_run_timeout.is_none())
         {
@@ -248,7 +248,7 @@ pub(super) fn collect_started_workflow_task_entries(
     }
     let mut entries = Vec::new();
     for (run_key, state_data) in rows {
-        let state = codec::decode_workflow_state(&state_data)?;
+        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
         let Some(task) = state.pending_workflow_task else {
             continue;
         };
@@ -281,7 +281,7 @@ pub(super) fn collect_nexus_sweep_entries(
     for (run_key, state_data) in rows {
         // Nexus timeout tracking currently lives in the workflow snapshot so
         // this scan filters in Rust after shard-local row selection.
-        let state = codec::decode_workflow_state(&state_data)?;
+        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
         if !state.status.is_open() {
             continue;
         }
@@ -315,8 +315,8 @@ pub(super) fn collect_reconstructible_nexus_deliveries(
         return Ok(Vec::new());
     }
     let mut entries = Vec::new();
-    for (_, state_data) in rows {
-        let state = codec::decode_workflow_state(&state_data)?;
+    for (run_key, state_data) in rows {
+        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
         for delivery in crate::reconstructible_nexus_deliveries(&state, now) {
             entries.push(delivery);
             if entries.len() == limit {
@@ -341,7 +341,7 @@ pub(super) fn collect_completion_callback_sweep_entries(
     }
     let mut entries = Vec::new();
     for (run_key, state_data) in rows {
-        let state = codec::decode_workflow_state(&state_data)?;
+        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
         for (callback_index, callback) in state.completion_callbacks.iter().enumerate() {
             if !matches!(
                 callback.state,

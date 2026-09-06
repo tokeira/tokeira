@@ -17,12 +17,14 @@
 // not a style fix, so the advisory lint is allowed rather than acted on here.
 #![allow(clippy::large_enum_variant)]
 
+pub mod advice;
 pub mod command;
 pub mod event;
 pub mod kernel;
 pub mod state;
 pub mod transition;
 
+pub use advice::*;
 pub use command::*;
 pub use event::*;
 pub use kernel::*;

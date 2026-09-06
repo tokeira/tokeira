@@ -1317,6 +1317,7 @@ where
     let run_id = RunId::new();
     let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
     let request = StartRequest {
+        advice_policy: crate::runtime::continue_as_new_advice_policy(),
         run_key,
         namespace_id,
         workflow_id: workflow_id.clone(),

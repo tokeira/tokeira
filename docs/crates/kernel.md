@@ -22,6 +22,7 @@ workflow kernel.
 | `command` | External and worker-authored inputs such as start, signal, workflow-task completion, timeouts, reset, and Nexus resolution |
 | `event` | Durable `HistoryEvent` and `HistoryEventKind` values |
 | `kernel` | `Kernel`, `BasicKernel`, rejection types, and history-prefix replay |
+| `advice` | The continue-as-new advice rule: a pure function of the persisted history size, the next event id, the update counts, and the `ContinueAsNewAdvicePolicy` thresholds handed in with the start |
 | `transition` | `Transition` plus derived dispatch, activity, timer, and request-deduplication operations |
 
 The main entry point is `BasicKernel::apply`: it consumes a loaded state and one
@@ -40,6 +41,10 @@ state.
   Nexus decisions are reflected in state and history together.
 - Dispatch and timer operations are descriptions of derived work, not side
   effects executed by the kernel.
+- Continue-as-new advice is derived once, when a workflow task starts, from the
+  operands and thresholds carried by that command; completion, failure, timeout,
+  virtual-task synthesis, and rebuild copy the recorded values and never
+  recompute them.
 
 ## It does not own
 

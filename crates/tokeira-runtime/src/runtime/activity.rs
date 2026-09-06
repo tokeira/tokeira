@@ -2081,6 +2081,7 @@ mod tests {
 
     fn open_state(info: Option<WorkflowVersioningInfo>) -> WorkflowState {
         WorkflowState {
+            completed_update_count: 0,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".into()),

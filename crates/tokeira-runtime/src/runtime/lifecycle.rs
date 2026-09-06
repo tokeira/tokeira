@@ -1825,6 +1825,7 @@ mod tests {
         let now = OffsetDateTime::UNIX_EPOCH;
         let run_id = RunId::new();
         StartRequest {
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
             initiator: None,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),

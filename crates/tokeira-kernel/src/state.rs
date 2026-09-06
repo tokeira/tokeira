@@ -68,6 +68,12 @@ pub struct WorkflowState {
     /// Sum of declared external-payload sizes across committed history.
     #[serde(default)]
     pub external_payload_size_bytes: i64,
+    /// Updates that reached a completed outcome in this run, never a
+    /// rejection. Together with the in-flight set it is the operand of the
+    /// `TOO_MANY_UPDATES` continue-as-new reason (`registry.completedCount`,
+    /// `service/history/workflow/update/registry.go:92, 220, 382 @ v1.31.0`).
+    #[serde(default)]
+    pub completed_update_count: u32,
     /// Next logical task sequence to assign when scheduling a
     /// workflow task.
     pub next_workflow_task_seq: LogicalTaskSeq,
@@ -652,6 +658,31 @@ pub struct PendingWorkflowTask {
     /// invoking the pure transition.
     #[serde(default)]
     pub target_deployment_version: Option<WorkerDeploymentVersionRef>,
+    /// Continue-as-new Advice recorded when this task last started and
+    /// cleared at schedule, so a transient or speculative task materializes
+    /// the values decided at its start rather than a later threshold
+    /// (`WorkflowExecutionInfo.workflow_task_suggest_continue_as_new{,_reasons}`,
+    /// `workflow_task_history_size_bytes`,
+    /// `proto/internal/temporal/server/api/persistence/v1/executions.proto:90-93 @ v1.31.0`).
+    #[serde(default)]
+    pub advice: RecordedAdvice,
+}
+
+/// The continue-as-new Advice recorded on a `WorkflowTaskStarted` event: the
+/// History Size the run was measured at, the flag, and the reasons behind it.
+///
+/// The three values travel together from the pending task to late
+/// materialization, virtual-task synthesis, and rebuild; they are never
+/// recomputed after the start that recorded them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedAdvice {
+    /// Persisted History Size supplied with the start command; `0` for a
+    /// sync-matched first task.
+    pub history_size_bytes: i64,
+    /// `true` iff `suggest_continue_as_new_reasons` is non-empty.
+    pub suggest_continue_as_new: bool,
+    /// Reasons in enum order.
+    pub suggest_continue_as_new_reasons: Vec<crate::event::SuggestContinueAsNewReason>,
 }
 
 /// Task mode for a pending workflow task (spec speculative-wft K1).
@@ -1390,6 +1421,7 @@ mod tests {
 
     fn open_state() -> WorkflowState {
         WorkflowState {
+            completed_update_count: 0,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".into()),
@@ -1581,6 +1613,7 @@ mod tests {
             schedule_to_start_timeout: Duration::seconds(5),
         });
         state.pending_workflow_task = Some(PendingWorkflowTask {
+            advice: Default::default(),
             task_type: WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
             target_worker_deployment_version_changed: false,
@@ -1616,6 +1649,7 @@ mod tests {
         let target_version = version("deployment", "target");
         let mut state = open_state();
         state.pending_workflow_task = Some(PendingWorkflowTask {
+            advice: Default::default(),
             task_type: WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
             target_worker_deployment_version_changed: false,

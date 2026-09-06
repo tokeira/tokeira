@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
-use sqlx::{Connection, Row, postgres::PgRow};
+use sqlx::{AssertSqlSafe, Connection, Row, postgres::PgRow};
 use time::OffsetDateTime;
 use tokeira_types::{
     BuildId, ConfigurationFingerprint, ControllerInstanceKey, DeploymentId, IncarnationId,
@@ -886,7 +886,9 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
                  ORDER BY next_attempt_at ASC, action_id ASC
                  LIMIT $6"
             );
-            let rows = sqlx::query(&query)
+            // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;
+            // every request value is a bind parameter.
+            let rows = sqlx::query(AssertSqlSafe(query))
                 .bind(namespace_id.0)
                 .bind(i16::from(bucket))
                 .bind(now)
@@ -951,7 +953,9 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         let mut tx = permit.connection()?.begin().await?;
         let query =
             format!("SELECT {ACTION_COLUMNS} FROM worker_compute_action WHERE action_id = $1");
-        let row = sqlx::query(&query)
+        // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;
+        // every request value is a bind parameter.
+        let row = sqlx::query(AssertSqlSafe(query))
             .bind(claim.action_id)
             .fetch_optional(&mut *tx)
             .await?;
@@ -999,7 +1003,9 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         let mut tx = permit.connection()?.begin().await?;
         let query =
             format!("SELECT {ACTION_COLUMNS} FROM worker_compute_action WHERE action_id = $1");
-        let row = sqlx::query(&query)
+        // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;
+        // every request value is a bind parameter.
+        let row = sqlx::query(AssertSqlSafe(query))
             .bind(claim.action_id)
             .fetch_optional(&mut *tx)
             .await?;

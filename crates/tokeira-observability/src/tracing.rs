@@ -250,7 +250,10 @@ fn hex_bytes(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     use opentelemetry::{
         propagation::{Extractor, Injector, TextMapPropagator},
@@ -261,6 +264,55 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct LogCapture(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+    #[derive(Default)]
+    struct LogFields(HashMap<String, String>);
+
+    impl tracing::field::Visit for LogFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = LogFields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    #[test]
+    fn connector_log_records_reach_tracing_subscriber() {
+        let capture = LogCapture::default();
+        // nextest isolates global installation in this test's process. try_init
+        // installs LogTracer through tracing-subscriber's explicit tracing-log feature.
+        tracing_subscriber::registry()
+            .with(capture.clone())
+            .try_init()
+            .unwrap();
+        log::warn!(target: "aurora_dsql_sqlx_connector", "connector bridge probe");
+
+        let events = capture.0.lock().unwrap();
+        assert!(
+            events.iter().any(|fields| {
+                fields.get("log.target").map(String::as_str) == Some("aurora_dsql_sqlx_connector")
+                    && fields.get("message").map(String::as_str) == Some("connector bridge probe")
+            }),
+            "connector target and message must survive the log bridge: {events:?}"
+        );
+    }
 
     #[test]
     fn channel_trace_context_formats_origin_ids() {

@@ -360,7 +360,7 @@ pub(crate) fn worker_list_info(heartbeat: &WorkerHeartbeat) -> WorkerListInfo {
         sdk_name: heartbeat.sdk_name.clone(),
         sdk_version: heartbeat.sdk_version.clone(),
         status: heartbeat.status,
-        start_time: heartbeat.start_time.clone(),
+        start_time: heartbeat.start_time,
         host_name: host
             .map(|value| value.host_name.clone())
             .unwrap_or_default(),

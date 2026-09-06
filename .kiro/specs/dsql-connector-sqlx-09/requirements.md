@@ -104,8 +104,8 @@ lifecycle run this feature reuses as evidence.
 - **SQL sites.** Every `query*()` call passes a `&'static str` or is an Attested Site. The
   eleven sites that pass built strings are attested; the two sites that iterate a static
   slice pass the element by value. No new dynamic SQL and no `raw_sql` is introduced.
-- **Connection Factory.** `connect_with` remains the only Connector call. The error mapping is
-  exhaustive over the Connector's variants with no wildcard arm, and the `occ_retry`
+- **Connection Factory.** `connect_with` remains the only Connector call. The error mapping
+  names all four enabled variants before a compiler-required fallback, and the `occ_retry`
   Failure Category is removed: the only producer was the Connector's `OCCRetryExhausted`
   variant, which its `retry_on_occ` helper alone constructs, which Tokeira never calls, and
   which 0.2.2 compiles only under the `occ` feature.
@@ -169,7 +169,9 @@ Connector 0.2.2 against 0.1.2 (registry sources):
 - `src/connection.rs`: `connect(url)` and `connect_with(&DsqlConnectOptions) ->
   Result<PgConnection>` are byte-identical between the two versions.
 - `src/error.rs`: `DsqlError::{ConfigError, TokenError, ConnectionError, DatabaseError}` keep
-  their shapes; `OCCRetryExhausted` gains an `occ_type` field and `#[cfg(feature = "occ")]`.
+  their shapes; `DsqlError` is `#[non_exhaustive]`, so downstream matches require a
+  fallback even at an exact version pin. `OCCRetryExhausted` gains an `occ_type` field and
+  `#[cfg(feature = "occ")]`.
 - `src/config.rs` and `src/pool.rs`: `tracing::warn!`/`tracing::error!` become `log::debug!`/
   `log::error!`; `DsqlConnectOptions` gains an optional `credentials_provider`;
   `from_connection_string` and `authenticated_pg_options` keep their signatures.
@@ -366,9 +368,12 @@ contract is met deliberately rather than by blanket wrapping.
    workspace SHALL be either a `&'static str` or an `AssertSqlSafe` value.
 2. EACH Attested Site SHALL carry an inline comment naming the source of the SQL text and
    the reason that text cannot carry request data.
-3. THE four migration-runner sites SHALL attest that the text is a migration from the
-   embedded corpus whose checksum the runner verifies against the ledger, and THE runner
-   SHALL execute the embedded bytes unchanged.
+3. THE four migration-runner sites SHALL attest that the text comes from the embedded
+   corpus or the trusted operator-selected migration directory, with applied checksums
+   verified against the ledger and no request-value interpolation. THE runner SHALL
+   execute those bytes unchanged. `MigrationRunner::new`, `discover`, and
+   `discover_directory_migrations` in `crates/tokeira-storage/src/dsql/migration.rs`
+   establish the existing directory-backed path; production uses `embedded()`.
 4. THE three worker-compute sites SHALL attest that the only interpolated value is the
    `ACTION_COLUMNS` constant.
 5. THE four projection sites SHALL attest that the text is the SQL compiler's output, and
@@ -397,9 +402,11 @@ about what I observe.
 3. THE `occ_retry` Failure Category and the `ConnectionFactoryError::OccRetry` variant SHALL
    be removed, because no path in Tokeira could produce them and the Connector no longer
    compiles the source variant without its `occ` feature.
-4. THE Connector error mapping SHALL match the Connector's variants exhaustively with no
-   wildcard arm, so that a variant added by a future Connector release is a compile error
-   that forces a classification decision rather than a silent `connection` label.
+4. THE Connector error mapping SHALL name the four enabled variants before the
+   compiler-required fallback to `connection`. `DsqlError` is `#[non_exhaustive]`
+   (`aurora-dsql-sqlx-connector` 0.2.2, `src/error.rs`), so Rust requires the fallback;
+   at the exact `=0.2.2` pin and feature set no value can reach it. A connector pin move
+   SHALL be a reviewed dependency change whose review revisits this mapping.
 5. THE root manifest SHALL name `tracing-log` in the `tracing-subscriber` feature list, and
    THE workspace lock SHALL resolve `tracing-log` as a dependency of `tracing-subscriber`.
 6. WHEN a subscriber is installed through `SubscriberInitExt::try_init` under the

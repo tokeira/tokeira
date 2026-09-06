@@ -204,8 +204,10 @@ service implementations. Only the HTTP types those layers are written against ch
 *For any* workspace lock produced by this feature, each of `tonic`, `prost`, `prost-types`,
 `hyper-util`, and `tower-http` SHALL appear at exactly one version on the Target Stack
 line, none of the Legacy Stack versions in Requirement 1.2 SHALL appear, and `hyper 0.14`,
-`http 0.2`, `http-body 0.4`, `h2 0.3`, `hyper-rustls 0.24`, and `rustls 0.21` SHALL appear
-only while `aurora-dsql-sqlx-connector` is below 0.2.
+`h2 0.3`, `hyper-rustls 0.24`, `tokio-rustls 0.24`, `rustls 0.21`, `rustls-webpki 0.101`,
+and `webpki-roots 0.26` SHALL be absent unconditionally. The Connector Exception ended
+with the connector 0.2.2 move; `http 0.2` and `http-body 0.4` MAY remain as SDK Type
+Dependencies (Requirement 1.3), not as HTTP implementations.
 
 **Validates: Requirements 1.1, 1.2, 1.3**
 

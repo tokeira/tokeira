@@ -4180,7 +4180,7 @@ fn fake_continued_as_new_event(
     }
     Some(HistoryEvent {
         event_id: last.event_id,
-        event_time: last.event_time.clone(),
+        event_time: last.event_time,
         event_type: enums::EventType::WorkflowExecutionContinuedAsNew as i32,
         version: last.version,
         task_id: last.task_id,
@@ -8319,7 +8319,7 @@ mod tests {
                         sdk_version: "1.0".to_string(),
                     },
                 ),
-                metering_metadata: Some(metering.clone()),
+                metering_metadata: Some(metering),
                 sticky_attributes: Some(taskqueue::StickyExecutionAttributes {
                     worker_task_queue: Some(taskqueue::TaskQueue {
                         name: "sticky-queue".to_string(),

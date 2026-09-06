@@ -60,14 +60,20 @@ fn credentialed_sql_and_aws_tests_are_non_default_and_sleep_free() {
 
     let live_aws = include_str!("live_managed_dsql.rs");
     let sql_ownership = include_str!("../../tokeira-storage/tests/dsql_embedded_ownership.rs");
+    let connector_iam = include_str!("../../tokeira-storage/tests/dsql_connector_iam.rs");
     assert!(live_aws.starts_with("#![cfg(feature = \"dsql-integration\")]"));
     assert!(sql_ownership.starts_with("#![cfg(feature = \"dsql-integration\")]"));
+    assert_eq!(
+        connector_iam.lines().next(),
+        Some("#![cfg(feature = \"dsql-integration\")]")
+    );
     assert!(live_aws.contains("#[ignore = \"creates and destroys a billable Aurora DSQL cluster"));
     assert!(live_aws.contains("TOKEIRA_LIVE_MANAGED_DSQL_ACK"));
 
     for source in [
         live_aws,
         sql_ownership,
+        connector_iam,
         include_str!("embedded_telemetry.rs"),
     ] {
         assert!(
@@ -122,6 +128,7 @@ fn versions_of<'a>(packages: &'a [(String, String)], name: &str) -> Vec<&'a str>
 }
 
 // Feature: tonic-0-14-grpc-stack, Property 1: one stack in the lock
+// Feature: dsql-connector-sqlx-09, Property 1: one SQLx line and no legacy client
 #[test]
 fn workspace_resolves_one_grpc_and_http_stack() {
     let packages = locked_packages();
@@ -133,6 +140,9 @@ fn workspace_resolves_one_grpc_and_http_stack() {
         ("prost-types", "0.14."),
         ("hyper-util", "0.1."),
         ("tower-http", "0.6."),
+        ("sqlx", "0.9."),
+        ("sqlx-core", "0.9."),
+        ("sqlx-postgres", "0.9."),
     ] {
         let versions = versions_of(&packages, name);
         assert_eq!(
@@ -168,28 +178,99 @@ fn workspace_resolves_one_grpc_and_http_stack() {
         );
     }
 
-    // The AWS SDK's legacy HTTPS client keeps hyper 0.14 (with its http 0.2
-    // and http-body 0.4), h2 0.3, hyper-rustls 0.24, and rustls 0.21 alive
-    // only while the DSQL connector is pinned below 0.2, because that
-    // connector takes `aws-sdk-dsql`'s default features. Once the connector
-    // moves, this exception ends and all six must be gone.
-    let connector_below_0_2 = versions_of(&packages, "aurora-dsql-sqlx-connector")
-        .iter()
-        .any(|version| version.starts_with("0.1."));
+    // The legacy AWS HTTPS client left with connector 0.2. Re-enabling
+    // aws-smithy-runtime/tls-rustls must fail here on any future dependency move.
+    // http 0.2 and http-body 0.4 remain SDK type dependencies, regardless of
+    // HTTP client: aws-sdk-dsql 1.55.0 and aws-smithy-runtime 1.12.1 require
+    // them unconditionally in their Cargo.toml files.
     for (name, legacy_line) in [
         ("hyper", "0.14."),
-        ("http", "0.2."),
-        ("http-body", "0.4."),
         ("h2", "0.3."),
         ("hyper-rustls", "0.24."),
+        ("tokio-rustls", "0.24."),
         ("rustls", "0.21."),
+        ("rustls-webpki", "0.101."),
+        ("webpki-roots", "0.26."),
     ] {
         let present = versions_of(&packages, name)
             .iter()
             .any(|version| version.starts_with(legacy_line));
         assert!(
-            !present || connector_below_0_2,
-            "{name} {legacy_line}x is in the lock without the DSQL connector exception"
+            !present,
+            "{name} {legacy_line}x is in the lock; the legacy AWS client is back"
         );
     }
+    assert_eq!(
+        versions_of(&packages, "aurora-dsql-sqlx-connector"),
+        ["0.2.2"]
+    );
+}
+
+// Feature: dsql-connector-sqlx-09, Property 4: the log bridge is explicit and resolved
+#[test]
+fn connector_log_bridge_is_declared_and_resolved() {
+    let manifest: toml::Value = toml::from_str(include_str!("../../../Cargo.toml"))
+        .expect("workspace manifest remains valid TOML");
+    let features = manifest["workspace"]["dependencies"]["tracing-subscriber"]["features"]
+        .as_array()
+        .expect("tracing-subscriber declares features");
+    assert!(
+        features
+            .iter()
+            .any(|feature| feature.as_str() == Some("tracing-log"))
+    );
+
+    let lock: toml::Value = toml::from_str(include_str!("../../../Cargo.lock"))
+        .expect("workspace lock remains valid TOML");
+    let packages = lock["package"].as_array().expect("lock contains packages");
+    let subscriber = packages
+        .iter()
+        .find(|package| package["name"].as_str() == Some("tracing-subscriber"))
+        .expect("lock resolves tracing-subscriber");
+    assert!(
+        subscriber["dependencies"]
+            .as_array()
+            .expect("subscriber dependencies")
+            .iter()
+            .any(|dependency| dependency
+                .as_str()
+                .is_some_and(|name| name.split_whitespace().next() == Some("tracing-log")))
+    );
+    assert_eq!(versions_of(&locked_packages(), "tracing-log").len(), 1);
+}
+
+#[test]
+fn dynamic_sql_attestations_are_counted_and_explained() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut sources = Vec::new();
+    for directory in [
+        "crates/tokeira-storage/src",
+        "crates/tokeira-projection/src",
+        "apps/tkr/src",
+    ] {
+        collect_rust_sources(&root.join(directory), &mut sources);
+    }
+    let mut attestations = 0;
+    for source in sources {
+        let contents = fs::read_to_string(&source).expect("read SQL source");
+        let lines: Vec<_> = contents.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("use ") || !line.contains("AssertSqlSafe(") {
+                continue;
+            }
+            attestations += line.matches("AssertSqlSafe(").count();
+            assert!(
+                lines[index.saturating_sub(4)..index]
+                    .iter()
+                    .any(|previous| previous.trim_start().starts_with("// SQL safety:")),
+                "{}:{} has an unexplained SQL attestation",
+                source.display(),
+                index + 1
+            );
+        }
+    }
+    assert_eq!(
+        attestations, 11,
+        "new dynamic SQL requires an explicit audit"
+    );
 }

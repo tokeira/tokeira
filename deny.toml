@@ -22,23 +22,6 @@ ignore = [
     # to a revision without the default.
     "RUSTSEC-2023-0089", # `atomic-polyfill` unmaintained (transitive, via monty -> postcard)
     "RUSTSEC-2026-0097", # `rand` unsoundness in a custom-logger pattern Tokeira does not use
-    # rustls-webpki 0.101.7 rides aws-smithy-runtime's legacy `tls-rustls`
-    # connector (hyper 0.14 + rustls 0.21). No workspace manifest enables that
-    # feature any more; the one remaining enabler is aurora-dsql-sqlx-connector
-    # 0.1.2, which takes aws-sdk-dsql's defaults. The advisories concern
-    # certificate name-constraint validation and CRL parsing on connections to
-    # AWS service endpoints. Drop these three when the connector pin moves to a
-    # release without the service defaults (0.2.x, which needs SQLx 0.9).
-    "RUSTSEC-2026-0098", # rustls-webpki: name constraints for URI names
-    "RUSTSEC-2026-0099", # rustls-webpki: name constraints for wildcard certs
-    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
-    # h2 0.3.27 is the final release of the EOL 0.3 line; the fix ships only in
-    # 0.4.16+. The one remaining parent is the legacy AWS client stack above,
-    # which acts only as an HTTPS client to AWS service endpoints, so the
-    # unbounded empty-DATA-frame flaw has no untrusted peer; every server
-    # surface runs h2 0.4 (tonic 0.14 / hyper 1). Drop this entry with the
-    # rustls-webpki ones when the connector pin moves.
-    "RUSTSEC-2026-0258", # h2 0.3: unbounded empty DATA frames (client-only legacy AWS stack)
 ]
 
 [licenses]

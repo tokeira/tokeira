@@ -144,7 +144,7 @@ tokio = { version = "1.41", features = ["full"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json", "tracing-log"] }
 tonic = { version = "0.14", features = ["transport", "gzip"] }
 tonic-reflection = "0.14"
 tonic-web = "0.14"

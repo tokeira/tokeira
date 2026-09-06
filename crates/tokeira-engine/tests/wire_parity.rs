@@ -22,6 +22,9 @@ use std::{collections::BTreeMap, fs, net::SocketAddr, path::PathBuf};
 use anyhow::{Context as _, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
+use http_body_util::{BodyExt as _, Full};
+use hyper::client::conn::http1;
+use hyper_util::rt::TokioIo;
 use listener_support::{
     RawCall, RawResponse, STEP, Transport, WORKFLOW_SERVICE, execution, task_queue,
 };
@@ -42,6 +45,7 @@ use tokeira_proto::{
     },
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio_util::task::AbortOnDropHandle;
 use tonic::{Code, Status};
 
 const NAMESPACE: &str = "default";
@@ -770,69 +774,104 @@ async fn http1_post(
     content_type: &str,
     body: &[u8],
 ) -> Result<HttpReply> {
-    let mut stream = tokio::net::TcpStream::connect(addr).await?;
-    let head = format!(
-        "POST {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: {content_type}\r\nx-grpc-web: 1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await?;
-    let mut raw = Vec::new();
-    tokio::time::timeout(STEP, stream.read_to_end(&mut raw))
+    let request = http::Request::post(path)
+        .header("host", addr.to_string())
+        .header("content-type", content_type)
+        .header("x-grpc-web", "1")
+        .header("connection", "close")
+        .body(Full::new(Bytes::copy_from_slice(body)))?;
+    let stream = tokio::time::timeout(STEP, tokio::net::TcpStream::connect(addr))
         .await
-        .context("gRPC-Web reply did not complete")??;
-
-    let split = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .context("reply has no header terminator")?;
-    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
-    let mut lines = head.lines();
-    let status_line = lines.next().context("reply has no status line")?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .context("status line has no code")?
-        .parse()?;
-    let headers: BTreeMap<String, String> = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
-        .collect();
-    let body = if headers
-        .get("transfer-encoding")
-        .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
-    {
-        dechunk(&raw[split + 4..])?
-    } else {
-        raw[split + 4..].to_vec()
-    };
-    Ok(HttpReply {
-        status,
-        headers,
-        body,
+        .context("gRPC-Web connection did not complete")??;
+    let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await?;
+    let driver = AbortOnDropHandle::new(tokio::spawn(connection));
+    // HTTP framing defines completion. An early reply can close a socket with
+    // unread request bytes and reset it after sending a complete response; an
+    // EOF-based probe turns that teardown race into a false golden failure.
+    // Hyper still rejects a body truncated before its declared boundary.
+    let reply = tokio::time::timeout(STEP, async {
+        let response = sender
+            .send_request(request)
+            .await
+            .context("HTTP/1 request failed")?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .context("incomplete HTTP/1 response")?
+            .to_bytes()
+            .to_vec();
+        Ok::<_, anyhow::Error>(HttpReply {
+            status,
+            headers,
+            body,
+        })
     })
+    .await
+    .context("gRPC-Web reply did not complete");
+    driver.abort();
+    if let Err(error) = driver.await
+        && !error.is_cancelled()
+    {
+        return Err(error.into());
+    }
+    reply?
 }
 
-/// Undo HTTP/1.1 chunked transfer encoding; trailers after the last chunk are
-/// not part of gRPC-Web, which carries its status in the body's trailer frame.
-fn dechunk(mut rest: &[u8]) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
-    loop {
-        let line_end = rest
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .context("chunk size line has no terminator")?;
-        let size_text = std::str::from_utf8(&rest[..line_end])?;
-        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
-            .with_context(|| format!("chunk size `{size_text}` is not hex"))?;
-        rest = &rest[line_end + 2..];
-        if size == 0 {
-            return Ok(body);
+#[tokio::test]
+async fn http1_probe_completes_at_the_message_boundary() -> Result<()> {
+    for (response, complete) in [
+        ("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\npong", true),
+        (
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n4\r\npong\r\n0\r\n\r\n",
+            true,
+        ),
+        ("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\npo", false),
+        (
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n4\r\npo",
+            false,
+        ),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await?);
+            }
+            stream.write_all(response.as_bytes()).await?;
+            if !complete {
+                drop(stream);
+            }
+            // A complete HTTP message must not wait for the peer's TCP teardown.
+            let _ = released.await;
+            Ok::<_, anyhow::Error>(())
+        });
+        let reply = http1_post(addr, "/probe", "application/grpc-web+proto", &[]).await;
+        let _ = release.send(());
+        tokio::time::timeout(STEP, server).await???;
+        if complete {
+            let reply = reply?;
+            assert_eq!(reply.status, 200);
+            assert_eq!(reply.body, b"pong");
+        } else {
+            assert!(reply.is_err(), "truncated response was accepted");
         }
-        ensure!(rest.len() >= size + 2, "truncated chunk");
-        body.extend_from_slice(&rest[..size]);
-        rest = &rest[size + 2..];
     }
+    Ok(())
 }
 
 fn grpc_web_frame(flag: u8, payload: &[u8]) -> Vec<u8> {

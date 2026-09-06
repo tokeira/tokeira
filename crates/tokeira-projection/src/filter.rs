@@ -18,6 +18,8 @@ use crate::{
     },
 };
 
+/// Resolve a visibility predicate against registered fields and validate its literal types.
+/// An absent or blank predicate matches every execution within the caller's scope.
 pub async fn compile_filter<S: VisibilityStore + ?Sized>(
     input: Option<&str>,
     namespace_id: NamespaceId,
@@ -225,7 +227,10 @@ fn parse_schedule_in(input: &str) -> Option<(&str, Vec<String>)> {
 }
 
 fn parse_schedule_value(input: &str) -> ScheduleFilterValue {
-    let value = input.trim().trim_matches('"').trim_matches('\'');
+    let value = input.trim();
+    if let Some(text) = quoted_text(value) {
+        return ScheduleFilterValue::String(text.to_string());
+    }
     if value.eq_ignore_ascii_case("true") {
         return ScheduleFilterValue::Bool(true);
     }
@@ -274,15 +279,18 @@ where
     }
     if let Some((field, low, high)) = parse_between(input) {
         let field = resolve_field(field, namespace_id, store).await?;
-        let low = parse_value(&low);
-        let high = parse_value(&high);
+        let low = normalize_temporal_value(&field, parse_value(&low))?;
+        let high = normalize_temporal_value(&field, parse_value(&high))?;
         ensure_value_type(&field, &low)?;
         ensure_value_type(&field, &high)?;
         return Ok(FilterExpr::Between { field, low, high });
     }
     if let Some((field, values)) = parse_in(input) {
         let field = resolve_field(field, namespace_id, store).await?;
-        let values: Vec<_> = values.into_iter().map(|v| parse_value(&v)).collect();
+        let values: Vec<_> = values
+            .into_iter()
+            .map(|v| normalize_temporal_value(&field, parse_value(&v)))
+            .collect::<Result<_>>()?;
         for value in &values {
             ensure_value_type(&field, value)?;
         }
@@ -416,8 +424,19 @@ async fn resolve_field<S: VisibilityStore + ?Sized>(
     Err(anyhow!("unknown search attribute: {trimmed}"))
 }
 
+fn quoted_text(input: &str) -> Option<&str> {
+    let quote = input.chars().next().filter(|ch| matches!(ch, '\'' | '"'))?;
+    input.strip_prefix(quote)?.strip_suffix(quote)
+}
+
 fn parse_value(input: &str) -> FilterValue {
-    let trimmed = input.trim().trim_matches('"').trim_matches('\'');
+    let trimmed = input.trim();
+    // Quoting determines the literal type, even for text like "nan" or "true"
+    // (common/sqlquery/query.go, ParseValue @ v1.31.0). Datetime conversion
+    // belongs to the resolved field, so timestamp-shaped workflow IDs stay text.
+    if let Some(text) = quoted_text(trimmed) {
+        return FilterValue::String(text.to_string());
+    }
     if trimmed.eq_ignore_ascii_case("true") {
         return FilterValue::Bool(true);
     }
@@ -432,11 +451,6 @@ fn parse_value(input: &str) -> FilterValue {
     }
     if let Ok(value) = trimmed.parse::<f64>() {
         return FilterValue::Float(value);
-    }
-    if let Ok(value) =
-        OffsetDateTime::parse(trimmed, &time::format_description::well_known::Rfc3339)
-    {
-        return FilterValue::Datetime(value);
     }
     FilterValue::String(trimmed.to_string())
 }
@@ -601,18 +615,31 @@ fn split_once_ascii_case<'a>(input: &'a str, needle: &str) -> Option<(&'a str, &
 }
 
 fn normalize_temporal_value(field: &FieldRef, value: FilterValue) -> Result<FilterValue> {
-    if matches!(
+    if !matches!(
         field,
         FieldRef::System(
             SystemField::StartTime | SystemField::ExecutionTime | SystemField::CloseTime
-        )
-    ) && let FilterValue::Int(nanos) = value
-    {
-        return OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos))
-            .map(FilterValue::Datetime)
-            .map_err(|error| anyhow!("invalid nanosecond visibility timestamp: {error}"));
+        ) | FieldRef::Custom {
+            attr_type: SearchAttrType::Datetime,
+            ..
+        }
+    ) {
+        return Ok(value);
     }
-    Ok(value)
+    // Both system and custom datetime fields accept RFC3339 text or integer
+    // nanoseconds, including IN and BETWEEN operands (validateValueType in
+    // common/persistence/visibility/store/query/converter.go @ v1.31.0).
+    match value {
+        FilterValue::Int(nanos) => OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos))
+            .map(FilterValue::Datetime)
+            .map_err(|error| anyhow!("invalid nanosecond visibility timestamp: {error}")),
+        FilterValue::String(text) => {
+            OffsetDateTime::parse(&text, &time::format_description::well_known::Rfc3339)
+                .map(FilterValue::Datetime)
+                .map_err(|error| anyhow!("invalid visibility timestamp: {error}"))
+        }
+        other => Ok(other),
+    }
 }
 
 pub fn expected_type_for_field(field: &FieldRef) -> Option<SearchAttrType> {
@@ -767,6 +794,168 @@ mod tests {
 
     fn format_compare(field: &str, op: &str, value: &str) -> String {
         format!("{field} {op} \"{value}\"")
+    }
+
+    #[tokio::test]
+    async fn quoted_visibility_literals_preserve_text_across_predicates() {
+        let store = InMemoryVisibilityStore::default();
+        let namespace_id = NamespaceId(uuid::Uuid::from_u128(1));
+        for (name, kind) in [
+            ("KeywordValue", SearchAttrType::Keyword),
+            ("TextValue", SearchAttrType::Text),
+            ("ListValue", SearchAttrType::KeywordList),
+        ] {
+            store
+                .register_attr(namespace_id, name.to_string(), kind)
+                .await
+                .unwrap();
+        }
+        for text in [
+            "nan",
+            "NaN",
+            "inf",
+            "true",
+            "false",
+            "123",
+            "1.25",
+            "2026-01-02T03:04:05Z",
+            " padded ",
+        ] {
+            for quote in ['\'', '"'] {
+                let literal = format!("{quote}{text}{quote}");
+                let expected = FilterValue::String(text.to_string());
+                for field in ["WorkflowId", "KeywordValue", "TextValue", "ListValue"] {
+                    let query = format!("{field} = {literal}");
+                    let compiled = compile_filter(Some(&query), namespace_id, &store)
+                        .await
+                        .unwrap();
+                    assert!(
+                        matches!(compiled.expr, Some(FilterExpr::Compare { value, .. }) if value == expected),
+                        "{query}"
+                    );
+                }
+                let query = format!("WorkflowId IN ({literal})");
+                let compiled = compile_filter(Some(&query), namespace_id, &store)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(compiled.expr, Some(FilterExpr::In { values, .. }) if values == vec![expected.clone()]),
+                    "{query}"
+                );
+                let query = format!("WorkflowId BETWEEN {literal} AND {literal}");
+                let compiled = compile_filter(Some(&query), namespace_id, &store)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(compiled.expr, Some(FilterExpr::Between { low, high, .. }) if low == expected && high == expected),
+                    "{query}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn datetime_fields_convert_literals_across_predicates() {
+        let store = InMemoryVisibilityStore::default();
+        let namespace_id = NamespaceId(uuid::Uuid::from_u128(1));
+        store
+            .register_attr(
+                namespace_id,
+                "CustomTime".to_string(),
+                SearchAttrType::Datetime,
+            )
+            .await
+            .unwrap();
+        let expected = FilterValue::Datetime(OffsetDateTime::UNIX_EPOCH);
+        for field in ["StartTime", "ExecutionTime", "CloseTime", "CustomTime"] {
+            for literal in ["'1970-01-01T00:00:00Z'", "\"1970-01-01T00:00:00Z\"", "0"] {
+                let query = format!("{field} = {literal}");
+                let compiled = compile_filter(Some(&query), namespace_id, &store)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(compiled.expr, Some(FilterExpr::Compare { value, .. }) if value == expected),
+                    "{query}"
+                );
+                let query = format!("{field} IN ({literal})");
+                let compiled = compile_filter(Some(&query), namespace_id, &store)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(compiled.expr, Some(FilterExpr::In { values, .. }) if values == vec![expected.clone()]),
+                    "{query}"
+                );
+                let query = format!("{field} BETWEEN {literal} AND {literal}");
+                let compiled = compile_filter(Some(&query), namespace_id, &store)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(compiled.expr, Some(FilterExpr::Between { low, high, .. }) if low == expected && high == expected),
+                    "{query}"
+                );
+            }
+            assert!(
+                compile_filter(Some(&format!("{field} = 'nan'")), namespace_id, &store)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_attributes_reject_quoted_numeric_and_boolean_literals() {
+        let store = InMemoryVisibilityStore::default();
+        let namespace_id = NamespaceId(uuid::Uuid::from_u128(1));
+        for (field, kind, literal) in [
+            ("IntValue", SearchAttrType::Int, "123"),
+            ("DoubleValue", SearchAttrType::Double, "1.25"),
+            ("BoolValue", SearchAttrType::Bool, "true"),
+        ] {
+            store
+                .register_attr(namespace_id, field.to_string(), kind)
+                .await
+                .unwrap();
+            compile_filter(Some(&format!("{field} = {literal}")), namespace_id, &store)
+                .await
+                .unwrap();
+            for quote in ['\'', '"'] {
+                assert!(
+                    compile_filter(
+                        Some(&format!("{field} = {quote}{literal}{quote}")),
+                        namespace_id,
+                        &store
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schedule_filters_preserve_quoted_text_literals() {
+        let namespace_id = NamespaceId(uuid::Uuid::from_u128(1));
+        for text in ["nan", "inf", "true", "false", "123", "1.25"] {
+            let mut attributes = SearchAttributes::default();
+            attributes.0.insert(
+                "KeywordValue".to_string(),
+                SearchAttrValue::Keyword(text.to_string()),
+            );
+            for quote in ['\'', '"'] {
+                for field in ["ScheduleId", "KeywordValue"] {
+                    for query in [
+                        format!("{field} = {quote}{text}{quote}"),
+                        format!("{field} IN ({quote}{text}{quote})"),
+                    ] {
+                        let filter = compile_schedule_filter(&query).unwrap();
+                        assert!(
+                            filter.matches(text, namespace_id, false, "", &attributes),
+                            "{query}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // Feature: projection-visibility, Property 6:

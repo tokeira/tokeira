@@ -73,6 +73,7 @@ dsql-integration = [
 
 [dev-dependencies]
 http-body = "1"
+hyper = { workspace = true, features = ["client"] }
 metrics-util.workspace = true
 prost = "0.14"
 prost-types = "0.14"

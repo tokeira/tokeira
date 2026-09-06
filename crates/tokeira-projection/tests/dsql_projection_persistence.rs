@@ -1,5 +1,9 @@
 #![cfg(feature = "dsql-integration")]
 
+//! Live projection persistence checks using the storage crate's canonical migrations.
+
+use std::path::Path;
+
 use anyhow::Result;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use time::OffsetDateTime;
@@ -8,7 +12,7 @@ use tokeira_projection::{
 };
 use tokeira_storage::{
     ProjectionContext, ProjectionLog, ProjectionRecord,
-    dsql::{DsqlPoolConfig, DsqlStore, codec},
+    dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig, codec},
 };
 use tokeira_types::{
     ArchetypeId, ExecutionStatus, Memo, NamespaceId, Payload, ProjectionCursor, RunId, RunKey,
@@ -99,16 +103,19 @@ async fn visibility_sink_materializes_open_and_closed_execution_rows() -> Result
     let projection_context = sample_context(run_key);
 
     store
-        .apply(&ProjectionRecord {
-            partition_id: 0,
-            fanout: 1,
-            run_key,
-            transition_seq: TransitionSeq(1),
-            context: projection_context.clone(),
-        })
+        .apply(
+            &ProjectionRecord {
+                partition_id: 0,
+                fanout: 1,
+                run_key,
+                transition_seq: TransitionSeq(1),
+                context: projection_context.clone(),
+            },
+            0,
+        )
         .await?;
     let open = context.read_visibility_row(run_key).await?.unwrap();
-    assert_eq!(open.0, ExecutionStatus::Running.to_db_smallint());
+    assert_eq!(open.0, workflow_status_keyword(ExecutionStatus::Running));
     assert!(open.1.is_none());
 
     let closed_at = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
@@ -118,16 +125,22 @@ async fn visibility_sink_materializes_open_and_closed_execution_rows() -> Result
         Some(closed_at),
     );
     store
-        .apply(&ProjectionRecord {
-            partition_id: 0,
-            fanout: 1,
-            run_key,
-            transition_seq: TransitionSeq(2),
-            context: closed_context,
-        })
+        .apply(
+            &ProjectionRecord {
+                partition_id: 0,
+                fanout: 1,
+                run_key,
+                transition_seq: TransitionSeq(2),
+                context: closed_context,
+            },
+            0,
+        )
         .await?;
     let closed = context.read_visibility_row(run_key).await?.unwrap();
-    assert_eq!(closed.0, ExecutionStatus::Completed.to_db_smallint());
+    assert_eq!(
+        closed.0,
+        workflow_status_keyword(ExecutionStatus::Completed)
+    );
     assert_eq!(closed.1, Some(closed_at));
     Ok(())
 }
@@ -143,21 +156,24 @@ async fn close_execution_can_insert_catch_up_visibility_row() -> Result<()> {
     let closed_at = OffsetDateTime::from_unix_timestamp(1_000_001).unwrap();
 
     store
-        .apply(&ProjectionRecord {
-            partition_id: 0,
-            fanout: 1,
-            run_key,
-            transition_seq: TransitionSeq(1),
-            context: context_with_status(
-                sample_context(run_key),
-                ExecutionStatus::Failed,
-                Some(closed_at),
-            ),
-        })
+        .apply(
+            &ProjectionRecord {
+                partition_id: 0,
+                fanout: 1,
+                run_key,
+                transition_seq: TransitionSeq(1),
+                context: context_with_status(
+                    sample_context(run_key),
+                    ExecutionStatus::Failed,
+                    Some(closed_at),
+                ),
+            },
+            0,
+        )
         .await?;
 
     let row = context.read_visibility_row(run_key).await?.unwrap();
-    assert_eq!(row.0, ExecutionStatus::Failed.to_db_smallint());
+    assert_eq!(row.0, workflow_status_keyword(ExecutionStatus::Failed));
     assert_eq!(row.1, Some(closed_at));
     Ok(())
 }
@@ -177,31 +193,40 @@ async fn memo_merge_persists_across_visibility_updates() -> Result<()> {
     let third_context = second_context.clone();
 
     store
-        .apply(&ProjectionRecord {
-            partition_id: 0,
-            fanout: 1,
-            run_key,
-            transition_seq: TransitionSeq(1),
-            context: first_context,
-        })
+        .apply(
+            &ProjectionRecord {
+                partition_id: 0,
+                fanout: 1,
+                run_key,
+                transition_seq: TransitionSeq(1),
+                context: first_context,
+            },
+            0,
+        )
         .await?;
     store
-        .apply(&ProjectionRecord {
-            partition_id: 0,
-            fanout: 1,
-            run_key,
-            transition_seq: TransitionSeq(2),
-            context: second_context,
-        })
+        .apply(
+            &ProjectionRecord {
+                partition_id: 0,
+                fanout: 1,
+                run_key,
+                transition_seq: TransitionSeq(2),
+                context: second_context,
+            },
+            0,
+        )
         .await?;
     store
-        .apply(&ProjectionRecord {
-            partition_id: 0,
-            fanout: 1,
-            run_key,
-            transition_seq: TransitionSeq(3),
-            context: third_context,
-        })
+        .apply(
+            &ProjectionRecord {
+                partition_id: 0,
+                fanout: 1,
+                run_key,
+                transition_seq: TransitionSeq(3),
+                context: third_context,
+            },
+            0,
+        )
         .await?;
 
     let memo = context.read_visibility_memo(run_key).await?.unwrap();
@@ -229,6 +254,11 @@ impl TestContext {
             .connect(&url)
             .await?;
         let config = DsqlPoolConfig {
+            // nextest starts this test in its crate directory, not the workspace root.
+            migration: MigrationConfig {
+                migrations_dir: Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../tokeira-storage/migrations"),
+            },
             reservoir: tokeira_storage::dsql::ReservoirConfig {
                 target_ready: 4,
                 inflight_limit: 2,
@@ -259,7 +289,7 @@ impl TestContext {
 
     async fn clear_visibility_rows(&self, run_keys: &[RunKey]) -> Result<()> {
         for run_key in run_keys {
-            sqlx::query("DELETE FROM vis_execution WHERE run_key = $1")
+            sqlx::query("DELETE FROM execution_visibility_current WHERE run_key = $1")
                 .bind(run_key.0)
                 .execute(&self.pool)
                 .await?;
@@ -297,24 +327,26 @@ impl TestContext {
     async fn read_visibility_row(
         &self,
         run_key: RunKey,
-    ) -> Result<Option<(i16, Option<OffsetDateTime>)>> {
+    ) -> Result<Option<(String, Option<OffsetDateTime>)>> {
+        // The sink writes execution_visibility_current; vis_execution is a legacy table.
         let row = sqlx::query(
-            "SELECT execution_status, close_time FROM vis_execution WHERE run_key = $1",
+            "SELECT status_keyword, close_time FROM execution_visibility_current WHERE run_key = $1",
         )
         .bind(run_key.0)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| Ok((row.try_get("execution_status")?, row.try_get("close_time")?)))
+        row.map(|row| Ok((row.try_get("status_keyword")?, row.try_get("close_time")?)))
             .transpose()
     }
 
     async fn read_visibility_memo(&self, run_key: RunKey) -> Result<Option<Memo>> {
-        let row = sqlx::query("SELECT memo FROM vis_execution WHERE run_key = $1")
-            .bind(run_key.0)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row =
+            sqlx::query("SELECT memo_blob FROM execution_visibility_current WHERE run_key = $1")
+                .bind(run_key.0)
+                .fetch_optional(&self.pool)
+                .await?;
         row.map(|row| {
-            let data: Vec<u8> = row.try_get("memo")?;
+            let data: Vec<u8> = row.try_get("memo_blob")?;
             codec::decode::<Memo>(&data)
         })
         .transpose()
@@ -357,8 +389,8 @@ fn sample_context(run_key: RunKey) -> ProjectionContext {
         workflow_type: WorkflowType("workflow-type".to_owned()),
         task_queue: TaskQueueName("queue".to_owned()),
         execution_status: ExecutionStatus::Running,
-        start_time: OffsetDateTime::from_unix_timestamp(100).unwrap(),
-        update_time: OffsetDateTime::from_unix_timestamp(100).unwrap(),
+        start_time: OffsetDateTime::from_unix_timestamp(100).expect("fixture timestamp is valid"),
+        update_time: OffsetDateTime::from_unix_timestamp(100).expect("fixture timestamp is valid"),
         execution_time: None,
         close_time: None,
         history_length: 1,

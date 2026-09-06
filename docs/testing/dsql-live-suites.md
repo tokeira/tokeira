@@ -19,12 +19,13 @@ point them at a database holding application data.
 | Storage `dsql_embedded_ownership` | 1 | Embedded ownership lifecycle |
 | Projection `dsql_projection_persistence` | 5 | Visibility persistence and queries |
 
-Run the suites serially against the selected database:
+Run the suites and their test cases serially against the selected database. The shard
+fixtures reuse a deterministic shard ID across nextest's separate test processes:
 
 ```bash
-cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_shard_leasing
-cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_embedded_ownership
-cargo nextest run -p tokeira-projection --features dsql-integration --locked --test dsql_projection_persistence
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_shard_leasing --test-threads 1
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_embedded_ownership --test-threads 1
+cargo nextest run -p tokeira-projection --features dsql-integration --locked --test dsql_projection_persistence --test-threads 1
 ```
 
 A green result with the URL gates unset is not live evidence. Record the date, revision,
@@ -67,4 +68,6 @@ The [managed embedded DSQL live-AWS runbook](managed-embedded-dsql-live-aws.md) 
 separate ignored test that creates and destroys a billable cluster and starts the full
 embedded engine. Follow its acknowledgement, credential, descriptor, and recovery rules.
 The connector migration needs this lifecycle run as well as the endpoint test and all ten
-URL-gated tests; the implementation PR leaves those runs to the operator host.
+URL-gated tests. They run on a credentialed operator host; the managed runbook supplies a
+temporary nextest profile because the default three-minute timeout is too short for
+cluster lifecycle operations.

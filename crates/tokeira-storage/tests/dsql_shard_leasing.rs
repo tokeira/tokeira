@@ -1,8 +1,13 @@
 #![cfg(feature = "dsql-integration")]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering},
+//! Live lease fencing checks against an explicitly selected disposable database.
+
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use anyhow::Result;
@@ -11,11 +16,11 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{PendingWorkflowTask, Transition, WorkflowState};
 use tokeira_storage::{
     CommitResult, CurrentExecutionConflictPolicy, LeaseOutcome, LeaseRepository, RunRepository,
-    dsql::{DsqlPoolConfig, DsqlStore},
+    dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig},
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, RunId, RunKey, SearchAttributes,
-    ShardEpoch, ShardId, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType, dsql_spread_uuid,
+    ShardEpoch, ShardId, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
 };
 
 static NEXT_SHARD: AtomicU32 = AtomicU32::new(20_000);
@@ -234,6 +239,10 @@ impl TestContext {
             .connect(&url)
             .await?;
         let config = DsqlPoolConfig {
+            // nextest starts this test in its crate directory, not the workspace root.
+            migration: MigrationConfig {
+                migrations_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"),
+            },
             reservoir: tokeira_storage::dsql::ReservoirConfig {
                 target_ready: 4,
                 inflight_limit: 2,
@@ -260,11 +269,16 @@ impl TestContext {
     }
 
     async fn expire_lease(&self, shard_id: ShardId) -> Result<()> {
-        sqlx::query("UPDATE shard_lease SET lease_expiry = $1 WHERE shard_id = $2")
+        let result = sqlx::query("UPDATE shard_lease SET lease_expiry = $1 WHERE shard_id = $2")
             .bind(OffsetDateTime::now_utc() - Duration::seconds(1))
             .bind(shard_id_to_uuid(shard_id))
             .execute(&self.pool)
             .await?;
+        assert_eq!(
+            result.rows_affected(),
+            1,
+            "the fixture must expire the acquired lease"
+        );
         Ok(())
     }
 
@@ -279,7 +293,10 @@ impl TestContext {
 }
 
 fn shard_id_to_uuid(shard_id: ShardId) -> uuid::Uuid {
-    dsql_spread_uuid(&[b"shard", &shard_id.0.to_le_bytes()])
+    // Fixture SQL must match DsqlRunRepository::shard_id_to_uuid's reversible encoding.
+    let mut bytes = *b"tokeira-shard-id";
+    bytes[12..16].copy_from_slice(&shard_id.0.to_be_bytes());
+    uuid::Uuid::from_bytes(bytes)
 }
 
 fn next_shard() -> ShardId {
@@ -301,6 +318,7 @@ fn sample_transition(run_key: RunKey) -> Transition {
 
 fn sample_state(run_key: RunKey) -> WorkflowState {
     WorkflowState {
+        completed_update_count: 0,
         run_key,
         namespace_id: NamespaceId::new(),
         workflow_id: WorkflowId("workflow".to_owned()),
@@ -318,6 +336,7 @@ fn sample_state(run_key: RunKey) -> WorkflowState {
         external_payload_size_bytes: 0,
         next_workflow_task_seq: LogicalTaskSeq(1),
         pending_workflow_task: Some(PendingWorkflowTask {
+            advice: Default::default(),
             task_type: tokeira_kernel::WorkflowTaskType::Normal,
             logical_seq: LogicalTaskSeq(1),
             scheduled_event_id: 1,

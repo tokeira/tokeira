@@ -127,7 +127,9 @@
     - **DONE 2026-09-06:** The engine guard passes with the IAM test included in its exact
       first-line feature gate and no-sleep checks.
 
-- [ ] 6. Live Evidence
+- [x] 6. Live Evidence
+  - **DONE 2026-09-06:** Both required live runs passed; follow-up evidence is
+    recorded below.
   - [x] 6.1 Add `crates/tokeira-storage/tests/dsql_connector_iam.rs` (feature-gated,
     endpoint-gated, sleep-free)
     - _Requirements: 6.2_
@@ -141,12 +143,15 @@
     - **DONE 2026-09-06:** Documented URL fallback, endpoint/region gates, schema-bootstrap
       acknowledgement, and the managed lifecycle link; offline lychee passes.
 
-  - [ ] 6.3 Run the endpoint-gated test and the ten URL-gated tests against a live cluster
+  - [x] 6.3 Run the endpoint-gated test and the ten URL-gated tests against a live cluster
     on the migrated stack; record the runs here with dates
-    - not run in the landing slice; operator host
+    - **DONE 2026-09-06:** The IAM test and all ten URL-gated tests passed after
+      repairing stale live-only fixtures. This was
+      a follow-up to the landing slice; see the evidence below.
     - _Requirements: 4.7, 6.4_
-  - [ ] 6.4 Run the managed lifecycle test once on the migrated stack; record the run here
-    - not run in the landing slice; operator host
+  - [x] 6.4 Run the managed lifecycle test once on the migrated stack; record the run here
+    - **DONE 2026-09-06:** The managed lifecycle test passed in 559.305 seconds;
+      post-test cleanup was independently verified.
     - _Requirements: 4.7, 6.4_
 
 - [x] 7. Documentation and release notes
@@ -260,5 +265,53 @@
 
 The native linker reports macOS minimum-version warnings in dependency objects during
 builds; no toolchain or shared-cache configuration was changed. The four removed RustSec
-advisories are not encountered by cargo-deny. Tasks 6.3 and 6.4 remain operator-host work,
-and this landing slice does not claim live wire or IAM verification.
+advisories are not encountered by cargo-deny. Tasks 6.3 and 6.4 were deferred at landing;
+the credentialed follow-up below supplies the live evidence.
+
+## Live follow-up evidence — 2026-09-06
+
+Tests ran from merged revision `98c68a29bfd523b8464594cb319422ec9b1a7930` with the
+live-only fixture repairs in this follow-up. Production code, migration bytes,
+manifests, and the lock are unchanged.
+
+| Task | Suite | Live result |
+|---|---|---|
+| 6.3 | `dsql_connector_iam` | 1 passed |
+| 6.3 | `dsql_shard_leasing` | 4 passed |
+| 6.3 | `dsql_embedded_ownership` | 1 passed |
+| 6.3 | `dsql_projection_persistence` | 5 passed |
+| 6.4 | `managed_embedded_dsql_live_lifecycle` | 1 passed in 559.305 seconds |
+
+All runs used nextest with `--features dsql-integration --locked`, one test process at
+a time, and retries disabled. A private temporary nextest profile allowed ten minutes
+for each SQL test and two hours for the managed lifecycle, whose individual lifecycle
+boundaries retain their thirty-minute deadlines. Positional exact-name filters selected
+each suite from the five precompiled live binaries; the reported filtered tests were
+outside that individual invocation. The final 6.3 run executed all eleven required tests.
+The managed test ran with `--run-ignored only` and its exact test name. Reproduction
+commands are in [the live-suite runbook](../../../docs/testing/dsql-live-suites.md) and
+[the managed lifecycle runbook](../../../docs/testing/managed-embedded-dsql-live-aws.md).
+
+The first attempts exposed fixture drift that the default feature set cannot compile
+or exercise: missing state fields, the added sink partition argument, migration paths
+relative to the wrong working directory, the old hashed shard UUID encoding, and reads
+from the legacy visibility table. The fixtures now use the current default state fields,
+explicit partition, crate-relative migration paths, reversible shard encoding, and
+`execution_visibility_current` columns. Lease expiry also asserts that it updated exactly
+one row. The original lease, persistence, status, and memo guarantees remain asserted.
+
+The IAM and ownership tests passed on every live attempt. The initial nine SQL failures
+were migration-path failures; the next run's six assertion failures came from stale
+shard keys and visibility-table reads. After those fixture repairs, every required test
+passed. The managed lifecycle passed without production or lifecycle-test changes.
+
+Post-test cleanup completed and was independently verified.
+
+The six-command root §10.4 bar passed again after the fixture repairs: formatting,
+zero-warning workspace lint, workspace check, 3,341 nextest passes with two existing
+ignored tests skipped, one passing doctest with twenty ignored, and rustdoc with warnings
+denied. `cargo deny --locked check advisories bans licenses sources` passed all four
+checks. The live-only fixtures also passed `cargo clippy -p tokeira-storage -p
+tokeira-projection --features dsql-integration --test dsql_shard_leasing --test
+dsql_projection_persistence --locked -- -D warnings`; the constant timestamp unwraps in
+their helper now carry invariant messages. Offline lychee and whitespace checks passed.

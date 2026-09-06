@@ -114,21 +114,36 @@ directory as well.
 
 ## Run
 
-From the repository root, set the Region and a fresh descriptor path, then run only the
-ignored live test:
+From the repository root, create a temporary nextest profile, set the Region and a fresh
+descriptor path, then run only the ignored live test. The default nextest timeout is three
+minutes; remote lifecycle operations need the longer, narrowly scoped override below.
 
 ```bash
+DSQL_NEXTEST_CONFIG="$(mktemp)"
+cp .config/nextest.toml "$DSQL_NEXTEST_CONFIG"
+cat >> "$DSQL_NEXTEST_CONFIG" <<'TOML'
+
+[profile.dsql-live]
+retries = 0
+test-threads = 1
+
+[[profile.dsql-live.overrides]]
+filter = 'test(=managed_embedded_dsql_live_lifecycle)'
+slow-timeout = { period = "60s", terminate-after = 120 }
+TOML
+
 TOKEIRA_LIVE_MANAGED_DSQL_ACK=CREATE_AND_DELETE \
-TOKEIRA_LIVE_DSQL_REGION=eu-west-2 \
+TOKEIRA_LIVE_DSQL_REGION="${TOKEIRA_LIVE_DSQL_REGION:?set the target Region}" \
 TOKEIRA_LIVE_DSQL_DESCRIPTOR_PATH=/absolute/private/path/managed-dsql-live.json \
-cargo test -p tokeira-engine --test live_managed_dsql --locked \
-  --features dsql-integration \
-  managed_embedded_dsql_live_lifecycle -- --ignored --exact
+cargo nextest run -p tokeira-engine --test live_managed_dsql --locked \
+  --features dsql-integration --config-file "$DSQL_NEXTEST_CONFIG" \
+  --profile dsql-live --run-ignored only -- --exact managed_embedded_dsql_live_lifecycle
 ```
 
 The acknowledgement value is intentionally exact. The test allows up to 30 minutes for
 each lifecycle boundary because cluster creation, activation, and deletion are remote
-control-plane operations. A successful run leaves a destroyed tombstone at the descriptor
+control-plane operations; nextest provides an outer two-hour limit for the whole test.
+A successful run leaves a destroyed tombstone at the descriptor
 path; ordinary startup will not recreate from that tombstone. Choose a new descriptor path
 for a subsequent new-cluster run.
 

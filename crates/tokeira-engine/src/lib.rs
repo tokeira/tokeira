@@ -54,6 +54,8 @@ use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
 pub mod correlation_format;
+#[cfg(test)]
+mod embedded_dsql_tests;
 #[doc(hidden)]
 pub mod harness;
 mod http_api_transport;
@@ -230,8 +232,8 @@ async fn build_authorization_stack(config: &TokeiraConfig) -> Result<Authorizati
 use tokeira_kernel::{Link, LoadedRun};
 use tokeira_managed_dsql::{
     AwsDsqlControlPlane, CanonicalClusterIdentity, ClusterAction, CreateOrRecoverRequest,
-    LocalClusterDescriptorStore, ManagedDsqlLifecycle, Readiness, ResolvedCluster, StartupDeadline,
-    SystemLifecycleEnvironment,
+    DsqlControlPlane, LifecycleEnvironment, LocalClusterDescriptorStore, ManagedDsqlLifecycle,
+    Readiness, ResolvedCluster, StartupDeadline, SystemLifecycleEnvironment,
 };
 use tokeira_observability::{
     ClusterStatusLabel, DbClassLabel, EmbeddedOperationLabel, EmbeddedStorageModeLabel,
@@ -469,7 +471,11 @@ pub struct ClusterStartupReport {
     pub cluster_id: String,
     /// Canonical AWS DSQL cluster ARN.
     pub cluster_arn: String,
-    /// Current connection locator, never used as identity.
+    /// Locator supplied to this generation's database connection factory.
+    ///
+    /// Existing mode uses the configured endpoint; managed mode uses the AWS
+    /// endpoint observed before pool warmup. Later wake observations do not
+    /// retarget the pool or change this report field. Never used as identity.
     pub endpoint: String,
     /// Whether startup created, recovered, or validated the cluster.
     pub action: ClusterAction,
@@ -973,113 +979,32 @@ async fn start_embedded_dsql(
         AwsDsqlControlPlane::from_region(region.clone()),
     )
     .await?;
-    let lifecycle_deadline = StartupDeadline::at(deadline);
-    let resolved = match &config.storage {
-        EmbeddedStorageConfig::ManagedDsql(managed) => {
-            let lifecycle = ManagedDsqlLifecycle::new(
-                control.clone(),
-                LocalClusterDescriptorStore::new(&managed.descriptor_path),
-                SystemLifecycleEnvironment,
-            );
-            startup_phase(
-                deadline,
-                EmbeddedStartupPhase::ClusterResolution,
-                lifecycle.create_or_recover(
-                    CreateOrRecoverRequest {
-                        region: managed.region.clone(),
-                        tags: managed.tags.clone(),
-                    },
-                    lifecycle_deadline,
-                ),
-            )
-            .await?
-        }
-        EmbeddedStorageConfig::ExistingDsql(existing) => {
-            // `resolve_existing` cannot touch the descriptor seam. The inert
-            // path is never opened and exists only to satisfy the lifecycle's
-            // generic state-store type without adding another public adapter.
-            let unused_descriptor = LocalClusterDescriptorStore::new(PathBuf::new());
-            let lifecycle = ManagedDsqlLifecycle::new(
-                control.clone(),
-                unused_descriptor,
-                SystemLifecycleEnvironment,
-            );
-            let identity = CanonicalClusterIdentity::new(
-                &existing.region,
-                &existing.cluster_id,
-                &existing.cluster_arn,
-            )
-            .map_err(|_| EmbeddedEngineStartError::Phase {
-                phase: EmbeddedStartupPhase::ClusterResolution,
-            })?;
-            startup_phase(
-                deadline,
-                EmbeddedStartupPhase::ClusterResolution,
-                lifecycle.resolve_existing(identity, lifecycle_deadline),
-            )
-            .await?
-        }
-        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
-    };
-    let readiness = refresh_cluster_until_storage_handoff(
-        &config.storage,
-        control.clone(),
-        resolved,
-        lifecycle_deadline,
-        deadline,
-    )
-    .await?;
-    let cluster = match &readiness {
-        Readiness::Active(usable) => usable.resolved().clone(),
-        Readiness::WakeRequired(cluster) => cluster.clone(),
-    };
-
     let migration_policy = config
         .effective_migration_policy()
         .expect("durable embedded mode always has a migration policy");
-    let mut server = config.server;
-    server.infrastructure.storage = ConfigStorageKind::Dsql;
-    server.infrastructure.placement.controller_endpoint = None;
-    server.infrastructure.dsql.endpoint = Some(cluster.endpoint.clone());
-    server.infrastructure.dsql.region = Some(cluster.identity.region.clone());
-    server
-        .validate()
-        .map_err(|_| EmbeddedEngineStartError::Phase {
-            phase: EmbeddedStartupPhase::Configuration,
-        })?;
-
-    let limits = match &config.storage {
-        EmbeddedStorageConfig::ManagedDsql(managed) => &managed.limits,
-        EmbeddedStorageConfig::ExistingDsql(existing) => &existing.limits,
-        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
-    };
-    let mut pool_config = EmbeddedDsqlPoolConfig::with_limits(
-        limits.max_connections,
-        limits.concurrent_connection_creations,
-        limits.connection_rate_per_second,
-        limits.connection_burst,
-    );
-    pool_config.shard_count = server.infrastructure.placement.shard_count;
-    pool_config.projection_partition_count = server.infrastructure.placement.partition_count;
-    let auth = DsqlAuthConfig {
-        endpoint: cluster.endpoint.clone(),
-        region: Some(cluster.identity.region.clone()),
-        admin_role_arn: server.infrastructure.dsql.admin_role_arn.clone(),
-        runtime_role_arn: server.infrastructure.dsql.runtime_role_arn.clone(),
-        readonly_role_arn: server.infrastructure.dsql.readonly_role_arn.clone(),
-    };
-    let dsql_store = startup_phase(
+    let storage = config.storage.clone();
+    let ConnectedEmbeddedDsql {
+        server,
+        cluster,
+        connection_endpoint,
+        store: dsql_store,
+        wake_required,
+    } = connect_embedded_dsql(
+        config,
+        control.clone(),
+        SystemLifecycleEnvironment,
         deadline,
-        EmbeddedStartupPhase::ConnectionWarmup,
-        DsqlStore::connect_embedded(auth, pool_config, WarmupDeadline::new(deadline)),
+        DsqlStore::connect_embedded,
     )
     .await?;
+    let lifecycle_deadline = StartupDeadline::at(deadline);
     let director = dsql_store.connection_director_arc();
 
-    let cluster = if matches!(readiness, Readiness::WakeRequired(_)) {
+    let cluster = if wake_required {
         match refresh_cluster_after_wake(
-            &config.storage,
+            &storage,
             control,
+            SystemLifecycleEnvironment,
             cluster,
             lifecycle_deadline,
             deadline,
@@ -1145,7 +1070,7 @@ async fn start_embedded_dsql(
             StackTransport::Embedded,
             Arc::new(server),
             dsql_store,
-            cluster.endpoint.clone(),
+            connection_endpoint.clone(),
         ),
     )
     .await
@@ -1172,13 +1097,7 @@ async fn start_embedded_dsql(
     stack.engine_tasks.close_registration();
     let report = EngineStartupReport {
         storage_mode,
-        cluster: Some(ClusterStartupReport {
-            region: cluster.identity.region.clone(),
-            cluster_id: cluster.identity.cluster_id.clone(),
-            cluster_arn: cluster.identity.cluster_arn.clone(),
-            endpoint: cluster.endpoint.clone(),
-            action: cluster.action,
-        }),
+        cluster: Some(cluster_startup_report(&cluster, &connection_endpoint)),
         schema: Some(schema),
         ownership: Some(ownership_report),
     };
@@ -1205,6 +1124,162 @@ async fn start_embedded_dsql(
     };
     record_embedded_startup(&engine.startup_report);
     Ok(engine)
+}
+
+// Keep the AWS observation separate from the locator captured by the pool's
+// connection factory. Readiness and wake polling may refresh that observation;
+// they cannot retarget connections already established by this generation.
+#[derive(Debug)]
+struct ConnectedEmbeddedDsql<S> {
+    server: TokeiraConfig,
+    cluster: ResolvedCluster,
+    connection_endpoint: String,
+    store: S,
+    wake_required: bool,
+}
+
+// The injected control plane, clock, and connector exercise the actual startup
+// wiring offline without replacing identity validation or readiness decisions.
+async fn connect_embedded_dsql<C, T, F, Fut, S>(
+    config: EmbeddedEngineConfig,
+    control: C,
+    time: T,
+    deadline: Instant,
+    connect: F,
+) -> Result<ConnectedEmbeddedDsql<S>, EmbeddedEngineStartError>
+where
+    C: DsqlControlPlane + Clone,
+    T: LifecycleEnvironment + Clone,
+    F: FnOnce(DsqlAuthConfig, EmbeddedDsqlPoolConfig, WarmupDeadline) -> Fut,
+    Fut: Future<Output = Result<S>>,
+{
+    let lifecycle_deadline = StartupDeadline::at(deadline);
+    let resolved = match &config.storage {
+        EmbeddedStorageConfig::ManagedDsql(managed) => {
+            let lifecycle = ManagedDsqlLifecycle::new(
+                control.clone(),
+                LocalClusterDescriptorStore::new(&managed.descriptor_path),
+                time.clone(),
+            );
+            startup_phase(
+                deadline,
+                EmbeddedStartupPhase::ClusterResolution,
+                lifecycle.create_or_recover(
+                    CreateOrRecoverRequest {
+                        region: managed.region.clone(),
+                        tags: managed.tags.clone(),
+                    },
+                    lifecycle_deadline,
+                ),
+            )
+            .await?
+        }
+        EmbeddedStorageConfig::ExistingDsql(existing) => {
+            // `resolve_existing` cannot touch the descriptor seam. The inert
+            // path is never opened and exists only to satisfy the lifecycle's
+            // generic state-store type without adding another public adapter.
+            let unused_descriptor = LocalClusterDescriptorStore::new(PathBuf::new());
+            let lifecycle =
+                ManagedDsqlLifecycle::new(control.clone(), unused_descriptor, time.clone());
+            let identity = CanonicalClusterIdentity::new(
+                &existing.region,
+                &existing.cluster_id,
+                &existing.cluster_arn,
+            )
+            .map_err(|_| EmbeddedEngineStartError::Phase {
+                phase: EmbeddedStartupPhase::ClusterResolution,
+            })?;
+            startup_phase(
+                deadline,
+                EmbeddedStartupPhase::ClusterResolution,
+                lifecycle.resolve_existing(identity, lifecycle_deadline),
+            )
+            .await?
+        }
+        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
+    };
+    let readiness = refresh_cluster_until_storage_handoff(
+        &config.storage,
+        control.clone(),
+        time,
+        resolved,
+        lifecycle_deadline,
+        deadline,
+    )
+    .await?;
+    let cluster = match &readiness {
+        Readiness::Active(usable) => usable.resolved().clone(),
+        Readiness::WakeRequired(cluster) => cluster.clone(),
+    };
+
+    // GetCluster validates the canonical resource and status, but its public
+    // endpoint cannot select the caller's network path. In particular, AWS's
+    // PrivateLink database hostname is distinct from the management observation
+    // (Aurora DSQL User Guide, "Managing and connecting ... using AWS PrivateLink").
+    // Capture the locator once: the connector uses it for IAM signing, TLS, and
+    // every replenished connection, including the initial scale-to-zero wake.
+    let connection_endpoint = match &config.storage {
+        EmbeddedStorageConfig::ExistingDsql(existing) => existing.endpoint.clone(),
+        EmbeddedStorageConfig::ManagedDsql(_) => cluster.endpoint.clone(),
+        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
+    };
+    let mut server = config.server;
+    server.infrastructure.storage = ConfigStorageKind::Dsql;
+    server.infrastructure.placement.controller_endpoint = None;
+    server.infrastructure.dsql.endpoint = Some(connection_endpoint.clone());
+    server.infrastructure.dsql.region = Some(cluster.identity.region.clone());
+    server
+        .validate()
+        .map_err(|_| EmbeddedEngineStartError::Phase {
+            phase: EmbeddedStartupPhase::Configuration,
+        })?;
+
+    let limits = match &config.storage {
+        EmbeddedStorageConfig::ManagedDsql(managed) => &managed.limits,
+        EmbeddedStorageConfig::ExistingDsql(existing) => &existing.limits,
+        EmbeddedStorageConfig::InMemory => unreachable!("in-memory handled by caller"),
+    };
+    let mut pool_config = EmbeddedDsqlPoolConfig::with_limits(
+        limits.max_connections,
+        limits.concurrent_connection_creations,
+        limits.connection_rate_per_second,
+        limits.connection_burst,
+    );
+    pool_config.shard_count = server.infrastructure.placement.shard_count;
+    pool_config.projection_partition_count = server.infrastructure.placement.partition_count;
+    let auth = DsqlAuthConfig {
+        endpoint: connection_endpoint.clone(),
+        region: Some(cluster.identity.region.clone()),
+        admin_role_arn: server.infrastructure.dsql.admin_role_arn.clone(),
+        runtime_role_arn: server.infrastructure.dsql.runtime_role_arn.clone(),
+        readonly_role_arn: server.infrastructure.dsql.readonly_role_arn.clone(),
+    };
+    let store = startup_phase(
+        deadline,
+        EmbeddedStartupPhase::ConnectionWarmup,
+        connect(auth, pool_config, WarmupDeadline::new(deadline)),
+    )
+    .await?;
+    Ok(ConnectedEmbeddedDsql {
+        server,
+        cluster,
+        connection_endpoint,
+        store,
+        wake_required: matches!(readiness, Readiness::WakeRequired(_)),
+    })
+}
+
+fn cluster_startup_report(
+    cluster: &ResolvedCluster,
+    connection_endpoint: &str,
+) -> ClusterStartupReport {
+    ClusterStartupReport {
+        region: cluster.identity.region.clone(),
+        cluster_id: cluster.identity.cluster_id.clone(),
+        cluster_arn: cluster.identity.cluster_arn.clone(),
+        endpoint: connection_endpoint.to_owned(),
+        action: cluster.action,
+    }
 }
 
 fn storage_mode_label(mode: EmbeddedStorageMode) -> EmbeddedStorageModeLabel {
@@ -1279,19 +1354,24 @@ fn record_embedded_shutdown(report: &EngineStartupReport, failures: &[EmbeddedSh
     );
 }
 
-async fn refresh_cluster_until_storage_handoff(
+async fn refresh_cluster_until_storage_handoff<C, T>(
     storage: &EmbeddedStorageConfig,
-    control: AwsDsqlControlPlane,
+    control: C,
+    time: T,
     cluster: ResolvedCluster,
     lifecycle_deadline: StartupDeadline,
     deadline: Instant,
-) -> Result<Readiness, EmbeddedEngineStartError> {
+) -> Result<Readiness, EmbeddedEngineStartError>
+where
+    C: DsqlControlPlane,
+    T: LifecycleEnvironment,
+{
     match storage {
         EmbeddedStorageConfig::ManagedDsql(managed) => {
             let lifecycle = ManagedDsqlLifecycle::new(
                 control,
                 LocalClusterDescriptorStore::new(&managed.descriptor_path),
-                SystemLifecycleEnvironment,
+                time,
             );
             startup_phase(
                 deadline,
@@ -1304,7 +1384,7 @@ async fn refresh_cluster_until_storage_handoff(
             let lifecycle = ManagedDsqlLifecycle::new(
                 control,
                 LocalClusterDescriptorStore::new(PathBuf::new()),
-                SystemLifecycleEnvironment,
+                time,
             );
             startup_phase(
                 deadline,
@@ -1317,19 +1397,24 @@ async fn refresh_cluster_until_storage_handoff(
     }
 }
 
-async fn refresh_cluster_after_wake(
+async fn refresh_cluster_after_wake<C, T>(
     storage: &EmbeddedStorageConfig,
-    control: AwsDsqlControlPlane,
+    control: C,
+    time: T,
     cluster: ResolvedCluster,
     lifecycle_deadline: StartupDeadline,
     deadline: Instant,
-) -> Result<ResolvedCluster, EmbeddedEngineStartError> {
+) -> Result<ResolvedCluster, EmbeddedEngineStartError>
+where
+    C: DsqlControlPlane,
+    T: LifecycleEnvironment,
+{
     let usable = match storage {
         EmbeddedStorageConfig::ManagedDsql(managed) => {
             let lifecycle = ManagedDsqlLifecycle::new(
                 control,
                 LocalClusterDescriptorStore::new(&managed.descriptor_path),
-                SystemLifecycleEnvironment,
+                time,
             );
             startup_phase(
                 deadline,
@@ -1342,7 +1427,7 @@ async fn refresh_cluster_after_wake(
             let lifecycle = ManagedDsqlLifecycle::new(
                 control,
                 LocalClusterDescriptorStore::new(PathBuf::new()),
-                SystemLifecycleEnvironment,
+                time,
             );
             startup_phase(
                 deadline,

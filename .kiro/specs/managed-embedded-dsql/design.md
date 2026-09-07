@@ -362,10 +362,33 @@ the same path.
 
 Existing embedded DSQL bypasses the descriptor and every create/update/delete operation.
 It calls `GetCluster` with the configured cluster ID, validates the returned ID/ARN/Region,
-uses the returned endpoint for this process, and then enters the same bounded local-pool
-and explicit schema-policy path. It requires `GetCluster` plus database-connect IAM
+and retains AWS status/endpoint observations separately from the caller-selected
+`ExistingEmbeddedDsqlConfig.endpoint`. The configured locator feeds the bounded local
+pool's `DsqlAuthConfig`, effective server configuration, runtime construction, and
+startup report. Readiness and post-wake refresh validate identity/status without
+replacing this locator. Schema, ownership, and runtime repositories reuse the same
+director and reservoir, whose connection factory also retains the locator for future
+connections. A host changes the locator by supplying a new startup configuration.
+It requires `GetCluster` plus database-connect IAM
 permission but never requires create or delete permission. Intentional multi-process use
 continues to require distributed mode and its distributed coordination configuration.
+
+Managed mode still refreshes its descriptor during canonical recovery and selects the
+latest AWS-observed endpoint before pool construction. Post-wake observations continue
+to refresh AWS state in both modes, but cannot retarget the existing pool. The immutable
+startup report records the locator actually supplied to that pool, including when a
+post-wake AWS observation names another endpoint.
+
+The production startup connection phase accepts the existing `DsqlControlPlane` and
+`LifecycleEnvironment` seams plus a private connector function. Production passes
+`DsqlStore::connect_embedded`; offline tests capture its auth/pool arguments. The
+current pinned connector, `aurora-dsql-sqlx-connector` 0.2.2, preserves full hostnames in
+`src/config.rs::resolve_host`, signs that host in `authenticated_pg_options`, and
+enforces `VerifyFull` in `build_connect_options`. No connector change is required.
+The [AWS PrivateLink guide](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/privatelink-managing-clusters.html)
+defines the separate database hostname; the host supplies the API-returned
+`clusterVpcEndpoint` and provisions connectivity. Source/offline evidence does not
+establish live PrivateLink connectivity.
 
 #### Identity and status state machine
 
@@ -854,7 +877,7 @@ pub enum ClusterDescriptorState {
 | `creation_client_token` | AWS `CreateCluster.clientToken` | Printable, 1–128 bytes; generated once. | Always redacted/omitted. |
 | `cluster_id` | AWS identifier | `[a-z0-9]{26}` and equal to ARN resource ID. | Trace/event only, never metric label. |
 | `cluster_arn` | AWS ARN | DSQL service, matching Region/account/resource ID. | Trace/event only. |
-| `endpoint` | AWS response | Non-empty DSQL locator; refreshable. | Redacted by configuration logging. |
+| `endpoint` | AWS response for managed mode; caller configuration for existing mode | Non-empty database locator; selected once per generation independently of canonical identity. | Redacted by configuration logging; startup report identifies the connection factory's locator. |
 | `destroyed_at` | Administrative result | Written only after deleted/not-found. | Bounded outcome timestamp if host records it. |
 
 `SecretString` redacts `Debug` and `Display` but serializes its value only inside the
@@ -890,7 +913,7 @@ renewer; its states are `Open`, `Closing`, and `Fenced`.
 | Structure | Fields |
 |---|---|
 | `EngineStartupReport` | storage mode; optional cluster/schema/ownership sections |
-| `ClusterStartupReport` | action (`created`, `recovered`, `existing`), Region, ID, ARN, endpoint, final AWS status |
+| `ClusterStartupReport` | action (`created`, `recovered`, `existing`), Region, ID, ARN, connection factory locator (not a later AWS endpoint observation) |
 | `SchemaStartupReport` | observed version, target, maximum readable, digest identifier, decision, applied count |
 | `OwnershipStartupReport` | outcome (`acquired`, `clean_takeover`, `expired_takeover`), non-secret owner incarnation, expiry |
 
@@ -946,7 +969,13 @@ refresh only endpoint, reject identity disagreement and terminal/multi-Region st
 wake healthy scale-to-zero statuses, respect retry-after and deadline, and proceed to
 schema only after `ACTIVE`.
 
-**Validates: Requirements 3.5–3.16, 8.14, 13.4–13.6**
+For any explicitly configured existing-cluster locator, readiness and post-wake
+observations SHALL leave the connection factory, effective server configuration, and
+startup report bound to that locator. Managed startup SHALL continue selecting the
+AWS endpoint at storage handoff; later observations SHALL not misreport the pool's
+selected locator.
+
+**Validates: Requirements 3.5–3.20, 8.14, 13.4–13.6**
 
 ### Property 6: The release schema contract is deterministic and immutable
 

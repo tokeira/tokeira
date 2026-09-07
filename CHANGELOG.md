@@ -2,6 +2,12 @@
 
 All notable user-facing changes to this project are documented here.
 
+## 0.3.1 on 2026-09-07
+
+### Fixed
+
+* Existing embedded DSQL now honors the configured database endpoint through wake refresh and reports the pool locator, enabling PrivateLink without new configuration fields.
+
 ## 0.3.0 on 2026-09-06
 
 ### Added

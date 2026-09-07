@@ -21,8 +21,8 @@ publish = true
 serde.workspace = true
 thiserror.workspace = true
 prost = "0.14"
-tokeira-types = { path = "../tokeira-types", version = "0.3.0" }
-tokeira-proto = { path = "../tokeira-proto", version = "0.3.0" }
+tokeira-types = { path = "../tokeira-types", version = "0.3.1" }
+tokeira-proto = { path = "../tokeira-proto", version = "0.3.1" }
 
 [dev-dependencies]
 proptest = "1.6"

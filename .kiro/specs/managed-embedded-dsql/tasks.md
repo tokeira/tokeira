@@ -82,9 +82,10 @@
       `ACTIVE`, and reject failed, deleting, deleted, and multi-Region-only statuses.
     - _Requirements: 3.11–3.16, 8.14, 13.4–13.6_
   - [x] 4.4 Implement existing-cluster resolution without managed mutations
-    - Validate configured Region, cluster ID, and ARN with `GetCluster` by ID; refresh
-      only the endpoint; expose no create, protection-update, delete, or descriptor path.
-    - _Requirements: 3.1–3.9, 5.2, 9.11_
+    - Validate configured Region, cluster ID, and ARN with `GetCluster` by ID; keep
+      refreshed AWS observations separate from the configured database locator;
+      expose no create, protection-update, delete, or descriptor path.
+    - _Requirements: 3.1–3.9, 3.17–3.20, 5.2, 9.11_
   - [x] 4.5 Property test: Property 3 — creation is idempotent across every crash point
     - Drive the lifecycle with fake AWS, fake descriptor persistence, injected crashes,
       and deterministic replay for at least 100 cases.
@@ -98,8 +99,13 @@
   - [x] 4.7 Property test: Property 5 — recovery follows the cluster-status reference model
     - Compare generated AWS observation/error sequences with a pure status/retry model
       using injected time for at least 100 cases and no sleeps.
+    - Exercise production engine startup with generated PrivateLink-format locators,
+      distinct AWS endpoints, and ACTIVE/IDLE/INACTIVE handoffs; capture the database
+      auth boundary and verify readiness, wake, effective configuration, and report
+      retain the selected locator. Cover managed create/recover and identity mismatch
+      at resolution, readiness, and wake with deterministic regressions.
     - Tag: `// Feature: managed-embedded-dsql, Property 5: recovery follows the cluster-status reference model`
-    - _Requirements: 3.5–3.16, 8.14, 13.4–13.6_
+    - _Requirements: 3.5–3.20, 8.14, 13.4–13.6_
 
 - [x] 5. Checkpoint: managed lifecycle is green
   - Run formatting plus focused check, clippy, nextest, and doctests for

@@ -198,7 +198,13 @@ pub struct ExistingEmbeddedDsqlConfig {
     pub cluster_id: String,
     /// Canonical Aurora DSQL cluster ARN paired with `cluster_id`.
     pub cluster_arn: String,
-    /// Refreshable connection locator; never a resource identity.
+    /// Caller-selected database hostname, including an AWS PrivateLink hostname.
+    ///
+    /// Used for connections, TLS verification, and IAM authentication throughout
+    /// one engine generation. AWS identity/status observations, including wake
+    /// refresh, never replace it. Change it in the next startup configuration to
+    /// select a new locator. It is never used as resource identity or as the
+    /// management API endpoint; Region, cluster ID, and ARN remain mandatory.
     pub endpoint: String,
     /// Explicit policy required for an operator-supplied cluster.
     pub migration_policy: DsqlMigrationPolicy,

@@ -1,0 +1,5 @@
+kind: fixed
+body: Existing embedded DSQL now honors the configured database endpoint through wake refresh and reports the pool locator, enabling PrivateLink without new configuration fields.
+time: 2026-09-07T13:20:07.173933+01:00
+custom:
+    Slice: 7919c8a8-21d9-4a08-a474-1081b3ced1be

@@ -125,6 +125,13 @@ change, work must stop and that conflict must be raised for a new product decisi
 
 The following are external service facts, not Tokeira proposals:
 
+For existing-cluster connectivity, the [PrivateLink connection guide](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/privatelink-managing-clusters.html)
+distinguishes management and PostgreSQL connection endpoints. The
+[`GetVpcEndpointServiceName` response](https://docs.aws.amazon.com/aurora-dsql/latest/APIReference/API_GetVpcEndpointServiceName.html)
+provides `clusterVpcEndpoint`; this hostname includes an AWS-selected service
+identifier and must be used consistently for the database connection and IAM token.
+Verified 2026-09-07. Endpoint provisioning belongs to the host, not this engine.
+
 1. [`CreateCluster`](https://docs.aws.amazon.com/aurora-dsql/latest/APIReference/API_CreateCluster.html)
    accepts an idempotency `clientToken`; retrying with the same token after success
    returns the original result without another creation. The response supplies the
@@ -183,6 +190,13 @@ The following are external service facts, not Tokeira proposals:
 
 The descriptor must not persist AWS credentials, DSQL authentication tokens, prompts,
 tool data, or telemetry exporter credentials.
+
+### Existing-cluster connection locator
+
+| Field | Policy | Invalid input | Persistence / side effects |
+|---|---|---|---|
+| `ExistingEmbeddedDsqlConfig.endpoint` | Caller-selected database hostname, authoritative for one engine generation, including wake and connection replenishment | Empty or whitespace-only is rejected; connection failures fail startup without a storage fallback | No descriptor; never selects the management API or confers lifecycle mutation authority |
+| `ClusterStartupReport.endpoint` | Locator supplied to the generation's connection factory, equal to configured endpoint in existing mode | No success report on startup failure | Immutable diagnostic; does not follow later AWS endpoint observations |
 
 ### Schema compatibility decisions
 
@@ -346,6 +360,21 @@ respect it within the startup deadline.
 
 3.16 WHEN AWS rejects creation because of a service quota, THE managed DSQL lifecycle
 SHALL expose the service code, quota code, and remediation context in the startup error.
+
+3.17 WHEN existing DSQL mode is selected, THE embedded engine SHALL use the configured
+`endpoint` for every database connection in that engine generation, including warmup,
+IAM authentication, TLS verification, schema work, ownership, and runtime work.
+
+3.18 WHEN readiness or post-wake polling refreshes an existing cluster observation,
+THE embedded engine SHALL retain the configured connection locator while rejecting
+canonical ID, ARN, or Region disagreement and unsupported status as before.
+
+3.19 WHEN startup succeeds, THE embedded engine SHALL report the locator supplied to
+the generation's connection factory in `ClusterStartupReport.endpoint`.
+
+3.20 WHEN managed DSQL mode is selected, THE embedded engine SHALL select the AWS
+endpoint observed at the storage handoff for its connection factory, while preserving
+managed descriptor recovery and subsequent AWS identity/status observation refresh.
 
 ### Requirement 4: Release-bound Schema Compatibility Contract
 

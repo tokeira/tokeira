@@ -68,6 +68,34 @@ and leaves the engine untouched. Stopping a listener resets its in-flight calls
 with `UNAVAILABLE`, the same outcome a worker sees when a connection resets, so
 a parked long poll never holds shutdown for its timeout.
 
+## Existing Aurora DSQL connections
+
+Use `Engine::start_with_embedded_config` with `EmbeddedStorageConfig::ExistingDsql`
+for a durable embedded engine. Supply canonical Region, cluster ID and ARN, an
+explicit migration policy, and the database hostname in
+`ExistingEmbeddedDsqlConfig.endpoint`.
+
+The engine validates cluster identity and status through AWS `GetCluster`. The
+configured endpoint selects the database connection path for the entire engine
+generation, including scale-to-zero wake, fresh IAM tokens, TLS hostname
+verification, migrations, ownership, and runtime connections. AWS readiness and
+post-wake observations do not replace it. Change the configuration at the next
+startup to select a different locator. `server.infrastructure.dsql.endpoint` does
+not override this embedded setting.
+
+For [Aurora DSQL PrivateLink](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/privatelink-managing-clusters.html),
+supply the `clusterVpcEndpoint` returned by `GetVpcEndpointServiceName` for the
+canonical cluster. The host provisions the database and management connectivity.
+The endpoint grants no authority to create, replace, delete, or change protection
+on a cluster.
+
+`engine.startup_report().cluster.as_ref().map(|cluster| &cluster.endpoint)` reports
+the locator supplied to the database connection factory. Managed mode continues
+to use the AWS endpoint observed before pool warmup; subsequent wake observations
+do not change that report field or retarget the pool. No configuration fields or
+dependencies are added by this correction. Consumers using a different intended
+locator must update the existing field before restarting.
+
 ## Optional snapshots
 
 The embedded store remains ephemeral unless snapshot policy is present. A

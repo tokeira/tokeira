@@ -5,13 +5,13 @@ reviews each PR against Target_Release before the integration seat merges. Delta
 (task 5) are authored by the orchestrator and implemented by Codex after approval.
 
 - [ ] 1. F1 — proto resync to `v1.63.5` (branch `agent/claude/t132-proto-sync`, continued by Codex)
-  - [ ] 1.1 Create placeholder spec directories
+  - [x] 1.1 Create placeholder spec directories
     - `.kiro/specs/v132-standalone-activities/`, `v132-batch-operations-and-workers/`,
       `v132-visibility-query-converter/`, `v132-worker-deployments/`, `v132-nexus/`,
       `v132-lifecycle-fidelity/`, `v132-gated-surfaces/`, each with a `.placeholder.md`
       carrying the owner, the scope line from Requirement 9.1, and the corpus anchors.
     - _Requirements: 2.2, 9.1_
-  - [ ] 1.2 Atomic resync commit
+  - [x] 1.2 Atomic resync commit
     - `cargo run -p proto-sync -- v1.63.5`; restore
       `proto/upstream/temporal/server/api/adminservice/v1/service.proto` from `HEAD`;
       refresh `proto/upstream/temporalproto/openapi/` from `temporalio/api` at
@@ -19,60 +19,66 @@ reviews each PR against Target_Release before the integration seat merges. Delta
       `-- check` clean. One commit, no other changes. (Prepared by the orchestrator on
       the branch.)
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5_
-  - [ ] 1.3 Compile-drift fix
+  - [x] 1.3 Compile-drift fix
     - Type-path moves for `TimeSkippingConfig`; `#[allow(deprecated)]` with a D2 comment
       on `poller_group_infos` and `StartBatchOperationRequest.executions`; new enum arms
       that preserve today's behaviour; `cargo check --workspace --locked` green.
     - _Requirements: 1.6, 5.1, 5.2_
-  - [ ] 1.4 Deferred stubs for the six RPCs
+  - [x] 1.4 Deferred stubs for the six RPCs
     - Bracketed blocks in `crates/tokeira-edge/src/grpc/workflow_service.rs` per owning
       delta spec; `debug!` only.
     - _Requirements: 3.1, 3.2_
-  - [ ] 1.5 Capability literals
+  - [x] 1.5 Capability literals
     - Eight `NamespaceCapabilities` booleans, `SystemCapabilities.server_scaled_provider_cloud_run`,
       `NamespaceInfo.Limits.workflow_task_completion_size_limit_error = 0`, written
       verbatim at every construction site.
     - _Requirements: 4.1, 4.2_
-  - [ ] 1.6 Response defaults and inventory
+  - [x] 1.6 Response defaults and inventory
     - Emit protobuf defaults for every row in the audit's response table;
       `UNSUPPORTED_FIELDS.md` rows for every dropped request field;
       `binding-inventory.json` regenerated; `public.rs` OpenAPI comments at `v1.63.5`.
     - _Requirements: 5.3, 5.4, 5.5, 1.8_
-  - [ ] 1.7 Pins
+  - [x] 1.7 Pins
     - `TEMPORAL_PROTO_VERSION = "v1.63.5"`; rewrite the tracked-ahead note; claim
       unchanged.
     - _Requirements: 1.7, 1.9_
-  - [ ] 1.8 Property test: Property 1 — proto pin parity
+  - [x] 1.8 Property test: Property 1 — proto pin parity
     - In `tokeira-build-info`; skips with a documented reason when
       `proto/UPSTREAM_VERSION` is absent (published crate).
     - Tag: `// Feature: temporal-v1.32-compatibility, Property 1: proto pin parity`
     - _Requirements: 1.2, 1.7_
-  - [ ] 1.9 Feature matrix ownership
+  - [x] 1.9 Feature matrix ownership
     - Six RPCs owned once with `FeatureState::Stubbed` and delta-spec evidence;
       `matrix_classifies_every_upstream_rpc` and `every_rpc_is_owned_once` green.
     - _Requirements: 3.3, 3.5_
-  - [ ] 1.10 Property test: Property 6 — deferred stubs answer uniformly
+  - [x] 1.10 Property test: Property 6 — deferred stubs answer uniformly
     - Extend `crates/tokeira-edge/tests/grpc_deferred_handlers.rs` to the six RPCs,
       ≥100 generated request payloads each.
     - Tag: `// Feature: temporal-v1.32-compatibility, Property 6: deferred stubs answer uniformly`
     - _Requirements: 3.1, 3.2_
-  - [ ] 1.11 Property test: Property 7 — capability literals match the policy table
+  - [x] 1.11 Property test: Property 7 — capability literals match the policy table
     - Golden over `DescribeNamespace` and `GetSystemInfo` translation plus a source scan
       rejecting `..Default::default()` on capability structs.
     - Tag: `// Feature: temporal-v1.32-compatibility, Property 7: capability literals match the policy table`
     - _Requirements: 4.1, 4.2_
-  - [ ] 1.12 Property tests: Property 3 and Property 4 — audit structure
+  - [x] 1.12 Property tests: Property 3 and Property 4 — audit structure
     - Extend `crates/tokeira-edge/tests/surface_audit_structure.rs` to parse
       `.kiro/specs/temporal-v1.32-compatibility/design.md` with the same table grammar;
       enforce deferred-owner directories and kernel-free wire-through rows.
     - Tags: `// Feature: temporal-v1.32-compatibility, Property 3: every deferred surface has an owner directory`
       and `… Property 4: wire-through rows are kernel-free`
     - _Requirements: 2.2, 2.3, 2.5_
-  - [ ] 1.13 Property 9 — reproducible bindings
+  - [x] 1.13 Property 9 — reproducible bindings
     - `tools/proto-sync/tests/reproducible.rs` green at the resync commit (existing test).
     - _Requirements: 1.4_
   - [ ] 1.14 Checkpoint: §10.4 bar green on a devbox; amend the Surface_Audit for any
     row the resynced tree contradicted, in the same commit as the fix.
+    - Local macOS validation passed on 2026-09-14 for `64ad90d4`: all six §10.4
+      commands, 3,365 nextest tests passed (2 existing skips), doctests passed
+      (20 existing ignored examples), and rustdoc passed with warnings denied.
+      Proto reproducibility checks also passed. Audit amendments landed in that
+      commit; the prepared atomic resync is `24cbf23a`. Devbox validation remains
+      outstanding, so this checkpoint and the parent F1 task remain open.
     - _Requirements: 1.6, 2.4_
 
 - [ ] 2. F3 (engine side) — target pin and gate (branch `agent/codex/t132-target-pin`)

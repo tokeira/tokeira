@@ -4,7 +4,7 @@ Slices F1, F2, F3 are dispatched to Codex as separate worktrees; the orchestrato
 reviews each PR against Target_Release before the integration seat merges. Delta specs
 (task 5) are authored by the orchestrator and implemented by Codex after approval.
 
-- [ ] 1. F1 — proto resync to `v1.63.5` (branch `agent/claude/t132-proto-sync`, continued by Codex)
+- [x] 1. F1 — proto resync to `v1.63.5` (branch `agent/claude/t132-proto-sync`, continued by Codex)
   - [x] 1.1 Create placeholder spec directories
     - `.kiro/specs/v132-standalone-activities/`, `v132-batch-operations-and-workers/`,
       `v132-visibility-query-converter/`, `v132-worker-deployments/`, `v132-nexus/`,
@@ -71,14 +71,25 @@ reviews each PR against Target_Release before the integration seat merges. Delta
   - [x] 1.13 Property 9 — reproducible bindings
     - `tools/proto-sync/tests/reproducible.rs` green at the resync commit (existing test).
     - _Requirements: 1.4_
-  - [ ] 1.14 Checkpoint: §10.4 bar green on a devbox; amend the Surface_Audit for any
+  - [x] 1.14 Checkpoint: §10.4 bar green on a devbox; amend the Surface_Audit for any
     row the resynced tree contradicted, in the same commit as the fix.
     - Local macOS validation passed on 2026-09-14 for `64ad90d4`: all six §10.4
       commands, 3,365 nextest tests passed (2 existing skips), doctests passed
       (20 existing ignored examples), and rustdoc passed with warnings denied.
       Proto reproducibility checks also passed. Audit amendments landed in that
-      commit; the prepared atomic resync is `24cbf23a`. Devbox validation remains
-      outstanding, so this checkpoint and the parent F1 task remain open.
+      commit; the prepared atomic resync is `24cbf23a`.
+    - Devbox validation (Linux x86_64) passed on 2026-09-14 for `819da6d3`: fmt
+      with CI's `nightly-2026-06-16`, lint, workspace check, all 3,365 nextest tests
+      (2 existing skips), doctests (1 passed, 20 existing ignored examples), and
+      rustdoc with warnings denied. The complete test run used `--no-fail-fast`.
+    - The initial nextest run failed the unchanged runtime test
+      `backlog::tests::property_drain_routes_entries_to_the_correct_broker`
+      (`crates/tokeira-runtime/src/backlog.rs`, 50 ms poll deadline), leaving 941
+      tests unrun. Its saved case (`logical_seq = 1`, `attempt = 3`) passed both
+      the focused replay and the subsequent complete workspace run. The failing
+      seed was `eeac8264b343600b1a2378972d6bb22d2fac5aed1a24df3968cab5df9bd9bcdf`;
+      the remote regression file retained it for replay. F1 makes no runtime
+      change; the intermittent failure remains a follow-up risk.
     - _Requirements: 1.6, 2.4_
 
 - [ ] 2. F3 (engine side) — target pin and gate (branch `agent/codex/t132-target-pin`)

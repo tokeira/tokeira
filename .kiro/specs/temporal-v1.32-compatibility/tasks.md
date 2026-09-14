@@ -92,19 +92,19 @@ reviews each PR against Target_Release before the integration seat merges. Delta
       change; the intermittent failure remains a follow-up risk.
     - _Requirements: 1.6, 2.4_
 
-- [ ] 2. F3 (engine side) — target pin and gate (branch `agent/codex/t132-target-pin`)
-  - [ ] 2.1 Add `TEMPORAL_SERVER_TARGET = "1.32.0"` with its doc comment; expose through
+- [x] 2. F3 (engine side) — target pin and gate (branch `agent/codex/t132-target-pin`)
+  - [x] 2.1 Add `TEMPORAL_SERVER_TARGET = "1.32.0"` with its doc comment; expose through
     `build.rs` and `lib.rs`.
     - _Requirements: 8.1, 8.2, 8.3_
-  - [ ] 2.2 Pin gate compares against `v{TEMPORAL_SERVER_TARGET}`; messages name the
+  - [x] 2.2 Pin gate compares against `v{TEMPORAL_SERVER_TARGET}`; messages name the
     constant.
     - _Requirements: 7.6_
-  - [ ] 2.3 Confirm the `BumpTrailer` probe ignores the target constant; add a probe test.
+  - [x] 2.3 Confirm the `BumpTrailer` probe ignores the target constant; add a probe test.
     - _Requirements: 8.4_
-  - [ ] 2.4 Property test: Property 2 — target pin never trails the claim
+  - [x] 2.4 Property test: Property 2 — target pin never trails the claim
     - Tag: `// Feature: temporal-v1.32-compatibility, Property 2: target pin never trails the claim`
     - _Requirements: 8.2, 8.3, 8.5_
-  - [ ] 2.5 Checkpoint: bar green.
+  - [x] 2.5 Checkpoint: bar green.
 
 - [ ] 3. F2 — configuration denominator at `v1.32.0` (branch `agent/codex/t132-config-denominator`)
   - [ ] 3.1 Run the extractor at tag `v1.32.0`; commit

@@ -22,6 +22,15 @@ pub const SERVER_VERSION: &str = env!("TOKEIRA_BUILD_INFO_SERVER_VERSION");
 pub const TEMPORAL_PROTO_VERSION: &str = env!("TOKEIRA_BUILD_INFO_PROTO_VERSION");
 /// Temporal server version whose SDK-visible behavior Tokeira claims to match.
 pub const TEMPORAL_SERVER_COMPAT: &str = env!("TOKEIRA_BUILD_INFO_SERVER_COMPAT");
+/// Temporal server release under compatibility campaign, used by the conformance gate.
+/// Equals [`TEMPORAL_SERVER_COMPAT`] when no campaign is running; never advertised
+/// as the SDK-visible compatibility claim.
+///
+/// ```
+/// use tokeira_build_info::{TEMPORAL_SERVER_TARGET, pinned};
+/// assert_eq!(TEMPORAL_SERVER_TARGET, pinned::TEMPORAL_SERVER_TARGET);
+/// ```
+pub const TEMPORAL_SERVER_TARGET: &str = env!("TOKEIRA_BUILD_INFO_SERVER_TARGET");
 /// Rust toolchain channel pinned by `rust-toolchain.toml`.
 pub const RUST_TOOLCHAIN: &str = env!("TOKEIRA_BUILD_INFO_RUST_TOOLCHAIN");
 /// Deterministic source-tree digest produced by the versioned Dagger build.
@@ -117,6 +126,37 @@ mod tests {
     use std::{fs, process::Command};
 
     use super::*;
+
+    // Feature: temporal-v1.32-compatibility, Property 2: target pin never trails the claim
+    #[test]
+    fn server_target_is_not_behind_claim() {
+        // Pins name stable three-component releases, just like the compatibility
+        // bump protocol; numeric component ordering is their SemVer ordering.
+        let release = |value: &str| -> [u64; 3] {
+            value
+                .split('.')
+                .map(|component| {
+                    assert!(
+                        !component.is_empty()
+                            && component.bytes().all(|byte| byte.is_ascii_digit())
+                            && (component == "0" || !component.starts_with('0')),
+                        "pin must name a stable SemVer release: {value}"
+                    );
+                    component.parse().expect("SemVer component fits u64")
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("pin has exactly three SemVer components")
+        };
+        assert_eq!(TEMPORAL_SERVER_TARGET, pinned::TEMPORAL_SERVER_TARGET);
+        let target = release(TEMPORAL_SERVER_TARGET);
+        for claim in [pinned::TEMPORAL_SERVER_COMPAT, TEMPORAL_SERVER_COMPAT] {
+            assert!(
+                target >= release(claim),
+                "TEMPORAL_SERVER_TARGET must never trail TEMPORAL_SERVER_COMPAT"
+            );
+        }
+    }
 
     #[test]
     fn build_info_exposes_the_storage_owned_schema_contract() {

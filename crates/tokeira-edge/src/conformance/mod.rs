@@ -31,8 +31,8 @@
 //!   inflation (10.3), and real-gap monotonicity (10.5), each a pure check over the
 //!   [`test_report`] producing a structured pass/violations outcome (task 10).
 //! - [`pin`] — the pin-consistency gate: the fail-fast check that the fork's conformance
-//!   branch is pinned at the Temporal tag matching `TEMPORAL_SERVER_COMPAT` and is not the
-//!   fork's `main`, so the corpus can never be run against a release newer than the claim.
+//!   branch is pinned at the Temporal tag matching `TEMPORAL_SERVER_TARGET` and is not the
+//!   fork's `main`, so the corpus always measures the selected campaign release.
 
 pub mod gates;
 pub mod layer;

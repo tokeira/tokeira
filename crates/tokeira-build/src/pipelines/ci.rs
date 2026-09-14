@@ -1035,7 +1035,7 @@ cp target/release/tokeirad /tokeirad"#;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{fs, sync::Mutex};
 
     use proptest::prelude::*;
 
@@ -1110,6 +1110,66 @@ mod tests {
             assert!(result.passed);
             assert!(result.summary.contains("monotonicity epoch"));
         }
+    }
+
+    #[test]
+    fn bump_trailer_probe_ignores_target_changes_but_requires_claim_trailers() {
+        let repo = tempfile::tempdir().expect("temporary probe repository");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "probe")
+                .env("GIT_AUTHOR_EMAIL", "probe@example.invalid")
+                .env("GIT_COMMITTER_NAME", "probe")
+                .env("GIT_COMMITTER_EMAIL", "probe@example.invalid")
+                .args(args)
+                .output()
+                .expect("run fixture git");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        let commit_pins = |claim: &str, target: Option<&str>| {
+            let mut pins = format!("pub const TEMPORAL_SERVER_COMPAT: &str = \"{claim}\";\n");
+            if let Some(target) = target {
+                pins.push_str(&format!(
+                    "pub const TEMPORAL_SERVER_TARGET: &str = \"{target}\";\n"
+                ));
+            }
+            fs::write(repo.path().join(PINNED_RS), pins).expect("write fixture pins");
+            git(&["add", PINNED_RS]);
+            git(&["commit", "-q", "-m", "change fixture pins"]);
+        };
+        let probe = || {
+            let output = Command::new("sh")
+                .current_dir(repo.path())
+                .args(["-c", BUMP_TRAILER_PROBE])
+                .output()
+                .expect("run the production bump-trailer probe");
+            assert!(output.status.success(), "probe failed: {output:?}");
+            String::from_utf8(output.stdout).expect("probe emits UTF-8")
+        };
+        git(&["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.path().join("crates/tokeira-build-info/src"))
+            .expect("create fixture source directory");
+        commit_pins("1.31.0", None);
+        git(&["tag", "v0.1.0"]);
+
+        for target in ["1.32.0", "1.33.0"] {
+            commit_pins("1.31.0", Some(target));
+            let output = probe();
+            assert!(
+                output.is_empty(),
+                "target-only commit produced evidence: {output}"
+            );
+            assert!(evaluate_bump_trailers(&output).passed);
+        }
+
+        commit_pins("1.32.0", Some("1.33.0"));
+        let output = probe();
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("\t1.31.0\t1.32.0\t"), "{output}");
+        assert!(!evaluate_bump_trailers(&output).passed);
     }
 
     proptest! {

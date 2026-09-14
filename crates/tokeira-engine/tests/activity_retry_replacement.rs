@@ -116,6 +116,7 @@ fn schedule_activity_completion(
         task_token,
         identity: WORKER_IDENTITY.to_owned(),
         commands: vec![Command {
+            event_group_markers: Vec::new(),
             command_type: CommandType::ScheduleActivityTask as i32,
             user_metadata: None,
             attributes: Some(Attributes::ScheduleActivityTaskCommandAttributes(
@@ -561,6 +562,7 @@ async fn cancelled_poll_storms_cannot_strand_durable_retries() -> Result<()> {
             task_token: workflow_task.task_token,
             identity: WORKER_IDENTITY.to_owned(),
             commands: vec![Command {
+                event_group_markers: Vec::new(),
                 command_type: CommandType::ScheduleActivityTask as i32,
                 user_metadata: None,
                 attributes: Some(Attributes::ScheduleActivityTaskCommandAttributes(

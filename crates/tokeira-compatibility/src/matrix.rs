@@ -1,3 +1,6 @@
+//! RPC ownership and capability evidence for the advertised compatibility claim.
+//! Newer vendored RPCs stay outside the claim until campaign conformance is verified.
+
 use crate::{
     CompatibilityEvidence, CompatibilitySurface, CompatibilitySurfaceKind, ConformanceDisposition,
     DefaultPosture, EnablementKind, FeatureCatalogMetadata, FeatureEnablement, FeatureEntry,
@@ -565,8 +568,7 @@ const NEXUS_OPERATION_EXECUTION_SURFACES: &[CompatibilitySurface] = &[Compatibil
     kind: CompatibilitySurfaceKind::Rpc,
     identifier: "WorkflowService.NexusOperationExecution",
 }];
-/// RPCs present in vendored API v1.62.11 but absent from v1.31.0's API v1.62.8.
-pub const NEWER_VENDORED_WIRE_RPCS: &[&str] = &[
+const NEXUS_OPERATION_EXECUTION_RPCS: &[&str] = &[
     "WorkflowService.CountNexusOperationExecutions",
     "WorkflowService.DeleteNexusOperationExecution",
     "WorkflowService.DescribeNexusOperationExecution",
@@ -575,6 +577,25 @@ pub const NEWER_VENDORED_WIRE_RPCS: &[&str] = &[
     "WorkflowService.RequestCancelNexusOperationExecution",
     "WorkflowService.StartNexusOperationExecution",
     "WorkflowService.TerminateNexusOperationExecution",
+];
+
+/// RPCs in vendored API v1.63.5 absent from the claimed v1.31.0 API v1.62.8.
+/// Campaign stubs remain newer wire until the server compatibility claim moves.
+pub const NEWER_VENDORED_WIRE_RPCS: &[&str] = &[
+    "WorkflowService.CountNexusOperationExecutions",
+    "WorkflowService.CountWorkers",
+    "WorkflowService.DeleteNexusOperationExecution",
+    "WorkflowService.DescribeNexusOperationExecution",
+    "WorkflowService.ListNexusOperationExecutions",
+    "WorkflowService.PauseActivityExecution",
+    "WorkflowService.PollNexusOperationExecution",
+    "WorkflowService.PollWorkflowExecutionTimeSkipping",
+    "WorkflowService.RequestCancelNexusOperationExecution",
+    "WorkflowService.ResetActivityExecution",
+    "WorkflowService.StartNexusOperationExecution",
+    "WorkflowService.TerminateNexusOperationExecution",
+    "WorkflowService.UnpauseActivityExecution",
+    "WorkflowService.UpdateActivityExecutionOptions",
 ];
 
 const REMOTE_CLUSTER_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
@@ -1072,7 +1093,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         surfaces: NEXUS_OPERATION_EXECUTION_SURFACES,
         capability_field: None,
         dynamic_config_key: None,
-        rpcs: NEWER_VENDORED_WIRE_RPCS,
+        rpcs: NEXUS_OPERATION_EXECUTION_RPCS,
         notes: "These eight RPCs exist only in vendored API v1.62.11 and are absent from the v1.31.0 server's API v1.62.8.",
         evidence: MATRIX_AUDIT_EVIDENCE,
     },
@@ -1180,6 +1201,97 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         rpcs: EMPTY_RPCS,
         notes: "Weighted within-priority handout is disabled by default, preserves metadata while disabled, excludes sticky queues, and composes queue overrides over task-carried weights.",
         evidence: TASK_QUEUE_MANAGEMENT_EVIDENCE,
+    },
+    FeatureEntry {
+        catalog: NEWER_WIRE_UNAVAILABLE,
+        id: "v132-activity-execution-operators",
+        name: "Activity execution operators",
+        state: FeatureState::Stubbed,
+        surfaces: &[
+            CompatibilitySurface {
+                kind: CompatibilitySurfaceKind::Rpc,
+                identifier: "WorkflowService.PauseActivityExecution",
+            },
+            CompatibilitySurface {
+                kind: CompatibilitySurfaceKind::Rpc,
+                identifier: "WorkflowService.UnpauseActivityExecution",
+            },
+            CompatibilitySurface {
+                kind: CompatibilitySurfaceKind::Rpc,
+                identifier: "WorkflowService.ResetActivityExecution",
+            },
+            CompatibilitySurface {
+                kind: CompatibilitySurfaceKind::Rpc,
+                identifier: "WorkflowService.UpdateActivityExecutionOptions",
+            },
+        ],
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: &[
+            "WorkflowService.PauseActivityExecution",
+            "WorkflowService.UnpauseActivityExecution",
+            "WorkflowService.ResetActivityExecution",
+            "WorkflowService.UpdateActivityExecutionOptions",
+        ],
+        notes: "Deferred to v132-standalone-activities; outside the unchanged v1.31.0 claim.",
+        evidence: &[
+            CompatibilityEvidence {
+                kind: crate::CompatibilityEvidenceKind::ManualReview,
+                reference: ".kiro/specs/v132-standalone-activities/",
+            },
+            CompatibilityEvidence {
+                kind: crate::CompatibilityEvidenceKind::ManualReview,
+                reference: "chasm/lib/activity/frontend.go:450-570 @ v1.32.0",
+            },
+        ],
+    },
+    FeatureEntry {
+        catalog: NEWER_WIRE_UNAVAILABLE,
+        id: "v132-count-workers",
+        name: "Worker count",
+        state: FeatureState::Stubbed,
+        surfaces: &[CompatibilitySurface {
+            kind: CompatibilitySurfaceKind::Rpc,
+            identifier: "WorkflowService.CountWorkers",
+        }],
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: &["WorkflowService.CountWorkers"],
+        notes: "Deferred to v132-batch-operations-and-workers; outside the unchanged v1.31.0 claim.",
+        evidence: &[
+            CompatibilityEvidence {
+                kind: crate::CompatibilityEvidenceKind::ManualReview,
+                reference: ".kiro/specs/v132-batch-operations-and-workers/",
+            },
+            CompatibilityEvidence {
+                kind: crate::CompatibilityEvidenceKind::ManualReview,
+                reference: "service/frontend/workflow_handler.go:7416 @ v1.32.0",
+            },
+        ],
+    },
+    FeatureEntry {
+        catalog: NEWER_WIRE_UNAVAILABLE,
+        id: "v132-time-skipping-poll",
+        name: "Workflow time-skipping poll",
+        state: FeatureState::Stubbed,
+        surfaces: &[CompatibilitySurface {
+            kind: CompatibilitySurfaceKind::Rpc,
+            identifier: "WorkflowService.PollWorkflowExecutionTimeSkipping",
+        }],
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: &["WorkflowService.PollWorkflowExecutionTimeSkipping"],
+        notes: "Deferred to v132-gated-surfaces; outside the unchanged v1.31.0 claim.",
+        evidence: &[
+            CompatibilityEvidence {
+                kind: crate::CompatibilityEvidenceKind::ManualReview,
+                reference: ".kiro/specs/v132-gated-surfaces/",
+            },
+            CompatibilityEvidence {
+                kind: crate::CompatibilityEvidenceKind::ManualReview,
+                reference: "service/frontend/workflow_handler.go:7608-7625 @ v1.32.0",
+            },
+        ],
     },
     FeatureEntry {
         catalog: TEMPORAL_GA_ENABLED,
@@ -1425,6 +1537,67 @@ mod tests {
         assert!(seen.contains("OperatorService.CreateNexusEndpoint"));
     }
 
+    // Feature: temporal-v1.32-compatibility, Property 5: every upstream RPC is owned exactly once
+    #[test]
+    fn campaign_rpcs_have_one_stub_owner_and_ground_truth_evidence() {
+        let expected = [
+            (
+                "CountWorkers",
+                "v132-batch-operations-and-workers",
+                "service/frontend/workflow_handler.go",
+            ),
+            (
+                "PauseActivityExecution",
+                "v132-standalone-activities",
+                "chasm/lib/activity/frontend.go",
+            ),
+            (
+                "UnpauseActivityExecution",
+                "v132-standalone-activities",
+                "chasm/lib/activity/frontend.go",
+            ),
+            (
+                "ResetActivityExecution",
+                "v132-standalone-activities",
+                "chasm/lib/activity/frontend.go",
+            ),
+            (
+                "UpdateActivityExecutionOptions",
+                "v132-standalone-activities",
+                "chasm/lib/activity/frontend.go",
+            ),
+            (
+                "PollWorkflowExecutionTimeSkipping",
+                "v132-gated-surfaces",
+                "service/frontend/workflow_handler.go",
+            ),
+        ];
+        for (rpc, spec, source) in expected {
+            let qualified = format!("WorkflowService.{rpc}");
+            let owners = FEATURE_MATRIX
+                .iter()
+                .filter(|entry| entry.rpcs.contains(&qualified.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(owners.len(), 1, "{rpc}");
+            assert_eq!(owners[0].state, FeatureState::Stubbed, "{rpc}");
+            assert!(
+                owners[0]
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.reference.contains(spec)),
+                "{rpc}"
+            );
+            assert!(
+                owners[0]
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.reference.contains(source)
+                        && evidence.reference.contains("@ v1.32.0")),
+                "{rpc}"
+            );
+        }
+    }
+
     #[test]
     fn workflow_task_lifecycle_maps_all_current_capability_fields() {
         let entry = FEATURE_MATRIX
@@ -1510,7 +1683,7 @@ mod tests {
                 .expect("canonical feature catalog");
 
         assert_eq!(verified.target_rpc_count, 121);
-        assert_eq!(verified.newer_wire_rpc_count, 8);
+        assert_eq!(verified.newer_wire_rpc_count, 14);
     }
 
     proptest! {
@@ -1564,7 +1737,7 @@ mod tests {
             prop_assert_eq!(result.is_ok(), mutation == 0);
             if let Ok(verified) = result {
                 prop_assert_eq!(verified.target_rpc_count, 121);
-                prop_assert_eq!(verified.newer_wire_rpc_count, 8);
+                prop_assert_eq!(verified.newer_wire_rpc_count, 14);
             }
         }
 
@@ -1605,7 +1778,11 @@ mod tests {
             .collect()
     }
 
-    const INTENTIONALLY_UNMAPPED_CAPABILITY_FIELDS: &[&str] = &["server_scaled_deployments"];
+    // v132-worker-deployments owns both compute capabilities; F1 advertises false.
+    const INTENTIONALLY_UNMAPPED_CAPABILITY_FIELDS: &[&str] = &[
+        "server_scaled_deployments",
+        "server_scaled_provider_cloud_run",
+    ];
     const FUTURE_CAPABILITY_FIELDS: &[&str] = &["workflow_update"];
 
     fn get_system_info_capability_fields() -> Vec<&'static str> {

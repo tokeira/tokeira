@@ -622,8 +622,11 @@ pub use tokeira_projection::{
     ListWorkflowExecutionsResponse, WorkflowExecutionSummary,
 };
 
+/// System feature advertisement, set explicitly by the service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemCapabilities {
+    /// Cloud Run compute validation; deferred to v132-worker-deployments.
+    pub server_scaled_provider_cloud_run: bool,
     pub signal_and_query_header: bool,
     pub internal_error_differentiation: bool,
     pub activity_failure_include_heartbeat: bool,
@@ -645,8 +648,25 @@ pub struct SystemInfo {
     pub capabilities: SystemCapabilities,
 }
 
+/// Namespace feature advertisement, set explicitly by the service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamespaceCapabilities {
+    /// Worker command support; deferred to v132-gated-surfaces.
+    pub worker_commands: bool,
+    /// Standalone Nexus support; deferred to v132-nexus.
+    pub standalone_nexus_operation: bool,
+    /// Update callback support; deferred to v132-lifecycle-fidelity.
+    pub workflow_update_callbacks: bool,
+    /// Poller auto-enrollment; deferred to v132-batch-operations-and-workers.
+    pub poller_autoscaling_auto_enroll: bool,
+    /// Completion pagination; deferred to v132-gated-surfaces.
+    pub workflow_task_completion_pagination: bool,
+    /// Delayed standalone starts; deferred to v132-standalone-activities.
+    pub standalone_activity_start_delay: bool,
+    /// Standalone activity batches; deferred to v132-standalone-activities.
+    pub standalone_activity_batch_operations: bool,
+    /// Standalone activity operators; deferred to v132-standalone-activities.
+    pub standalone_activity_operator_commands: bool,
     pub worker_heartbeats: bool,
     pub reported_problems_search_attribute: bool,
 }

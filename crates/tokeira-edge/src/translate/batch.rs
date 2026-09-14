@@ -61,6 +61,8 @@ pub struct ListBatchOperationsRequest {
     pub next_page_token: Vec<u8>,
 }
 
+// v132-batch-operations-and-workers owns migration off deprecated executions.
+#[allow(deprecated)]
 pub fn start_batch_request_to_edge(
     req: workflowservice::StartBatchOperationRequest,
 ) -> Result<StartBatchOperationRequest, BatchTranslateError> {
@@ -301,6 +303,13 @@ pub fn start_batch_request_to_edge(
                 },
             )
         }
+        // v132-standalone-activities owns these new oneof tags. The old
+        // decoder saw no operation, so retain the existing missing-field error.
+        workflowservice::start_batch_operation_request::Operation::CancelActivitiesOperation(_)
+        | workflowservice::start_batch_operation_request::Operation::TerminateActivitiesOperation(_)
+        | workflowservice::start_batch_operation_request::Operation::DeleteActivitiesOperation(_) => {
+            return Err(BatchTranslateError::MissingField("operation"));
+        }
     };
 
     Ok(StartBatchOperationRequest {
@@ -364,6 +373,8 @@ pub fn describe_batch_response_to_proto(
     snapshot: BatchOperationSnapshot,
 ) -> workflowservice::DescribeBatchOperationResponse {
     workflowservice::DescribeBatchOperationResponse {
+        executions: Vec::new(),
+        query: String::new(),
         operation_type: batch_operation_type_to_proto(snapshot.operation_type) as i32,
         job_id: snapshot.job_id.0,
         state: batch_operation_state_to_proto(snapshot.state) as i32,
@@ -391,6 +402,8 @@ pub fn list_batch_response_to_proto(
     }
 }
 
+// v132-batch-operations-and-workers owns migration to the *_WORKFLOW values.
+#[allow(deprecated)]
 pub fn batch_operation_type_to_proto(value: BatchOperationType) -> enums::BatchOperationType {
     match value {
         BatchOperationType::Terminate => enums::BatchOperationType::Terminate,
@@ -425,6 +438,7 @@ fn workflow_execution_to_ref(value: &proto_common::WorkflowExecution) -> Workflo
 
 fn batch_info_to_proto(value: BatchOperationInfo) -> proto_batch::BatchOperationInfo {
     proto_batch::BatchOperationInfo {
+        operation_type: 0,
         job_id: value.job_id.0,
         state: batch_operation_state_to_proto(value.state) as i32,
         start_time: Some(tokeira_proto::conversions::common::to_proto_timestamp(
@@ -468,6 +482,8 @@ fn reset_target_from_proto(
 }
 
 #[cfg(test)]
+// v132-batch-operations-and-workers preserves deprecated executions until its migration.
+#[allow(deprecated)]
 mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
@@ -513,6 +529,34 @@ mod tests {
             Just(BatchOperationState::Completed),
             Just(BatchOperationState::Failed),
         ]
+    }
+
+    #[test]
+    fn activity_batch_variants_retain_unknown_operation_error() {
+        let operations = [
+            workflowservice::start_batch_operation_request::Operation::CancelActivitiesOperation(
+                proto_batch::BatchOperationCancelActivities::default(),
+            ),
+            workflowservice::start_batch_operation_request::Operation::TerminateActivitiesOperation(
+                proto_batch::BatchOperationTerminateActivities::default(),
+            ),
+            workflowservice::start_batch_operation_request::Operation::DeleteActivitiesOperation(
+                proto_batch::BatchOperationDeleteActivities::default(),
+            ),
+        ];
+        for operation in operations {
+            let request = workflowservice::StartBatchOperationRequest {
+                namespace: "default".to_string(),
+                job_id: "batch".to_string(),
+                visibility_query: "WorkflowType = 'example'".to_string(),
+                operation: Some(operation),
+                ..Default::default()
+            };
+            assert!(matches!(
+                start_batch_request_to_edge(request),
+                Err(BatchTranslateError::MissingField("operation"))
+            ));
+        }
     }
 
     // Feature: edge-batch-operations-transport, Property 3: Proto translation round-trip for batch types

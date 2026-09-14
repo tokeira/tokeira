@@ -178,6 +178,7 @@ pub fn list_schedules_response_to_proto(
                 memo: Some(memo_from_domain(&entry.memo)),
                 search_attributes: Some(search_attributes_from_domain(&entry.search_attributes)),
                 info: Some(proto_schedule::ScheduleListInfo {
+                    state_size_bytes: 0,
                     spec: Some(schedule_spec_to_proto_without_timezone_data(&entry.spec)),
                     workflow_type: Some(common::WorkflowType {
                         name: entry.action.start_workflow.workflow_type.0.clone(),
@@ -495,6 +496,7 @@ pub fn schedule_state_to_proto(state: &domain::ScheduleState) -> proto_schedule:
 pub fn schedule_info_to_proto(info: &domain::ScheduleInfo) -> proto_schedule::ScheduleInfo {
     #[allow(deprecated)]
     let info = proto_schedule::ScheduleInfo {
+        state_size_bytes: 0,
         action_count: info.action_count,
         missed_catchup_window: info.missed_catchup_window,
         overlap_skipped: info.overlap_skipped,

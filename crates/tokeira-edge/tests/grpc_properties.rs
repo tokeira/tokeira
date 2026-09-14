@@ -1759,6 +1759,9 @@ proptest! {
                     },
                 ),
                 request: Some(tokeira_proto::public::temporal::api::update::v1::Request {
+                    request_id: String::new(),
+                    completion_callbacks: Vec::new(),
+                    links: Vec::new(),
                     meta: Some(tokeira_proto::public::temporal::api::update::v1::Meta {
                         update_id,
                         identity: String::new(),

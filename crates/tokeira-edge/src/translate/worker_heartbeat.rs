@@ -58,6 +58,7 @@ pub fn worker_heartbeat_to_proto(
         return proto_worker::WorkerHeartbeat::decode(heartbeat.encoded_heartbeat.as_slice());
     }
     Ok(proto_worker::WorkerHeartbeat {
+        environment: None,
         worker_instance_key: heartbeat.worker_instance_key.0.clone(),
         worker_identity: heartbeat.worker_identity.0.clone(),
         task_queue: heartbeat.task_queue.0.clone(),
@@ -122,6 +123,15 @@ mod tests {
                 _ => None,
             };
             let heartbeat = proto_worker::WorkerHeartbeat {
+                environment: Some(proto_worker::EnvironmentInfo {
+                    runtimes: vec![proto_worker::environment_info::Runtime {
+                        r#type: status, version: sdk_version.clone(),
+                    }],
+                    hosting_environments: vec![proto_worker::environment_info::HostingEnvironment {
+                        r#type: status, version: sdk_name.clone(),
+                    }],
+                    platform: None,
+                }),
                 worker_instance_key: worker_instance_key.clone(),
                 worker_identity: worker_identity.clone(),
                 host_info: Some(WorkerHostInfo {
@@ -209,6 +219,7 @@ mod tests {
         let decoded = worker_heartbeat_from_proto(
             NamespaceId(Uuid::from_u128(1)),
             proto_worker::WorkerHeartbeat {
+                environment: None,
                 worker_instance_key: "worker".to_string(),
                 worker_identity: "identity".to_string(),
                 host_info: None,

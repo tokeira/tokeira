@@ -1,3 +1,5 @@
+//! Audit contracts keep deferred ownership explicit and wire changes out of the kernel.
+
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 #[derive(Debug)]
@@ -10,6 +12,7 @@ struct SurfaceAuditRow {
 
 #[derive(Debug)]
 struct MatrixRow {
+    qualified_name: String,
     kernel_impact: String,
     runtime_impact: String,
     projection_impact: String,
@@ -85,12 +88,125 @@ fn matrix_rows(design: &str) -> Vec<MatrixRow> {
         .filter_map(table_cells)
         .filter(|cells| cells.len() == 6 && cells[0] != "Qualified Name")
         .map(|cells| MatrixRow {
+            qualified_name: cells[0].clone(),
             kernel_impact: cells[2].clone(),
             runtime_impact: cells[3].clone(),
             projection_impact: cells[4].clone(),
             implementation_notes: cells[5].clone(),
         })
         .collect()
+}
+
+fn campaign_design_doc() -> String {
+    fs::read_to_string(workspace_root().join(".kiro/specs/temporal-v1.32-compatibility/design.md"))
+        .expect("Temporal v1.32 campaign design should be readable")
+}
+
+fn qualified_name(cell: &str) -> &str {
+    cell.split('`')
+        .nth(1)
+        .expect("qualified name is code-formatted")
+}
+
+// Feature: temporal-v1.32-compatibility, Property 3: every deferred surface has an owner directory
+#[test]
+fn campaign_deferred_surfaces_have_owner_directories() {
+    let rows = surface_audit_rows(&campaign_design_doc());
+    let deferred = rows.iter().filter(|row| row.classification == "Deferred");
+    assert!(rows.iter().any(|row| row.classification == "Deferred"));
+    for row in deferred {
+        let spec = target_spec_name(&row.target_spec)
+            .unwrap_or_else(|| panic!("deferred row has no owner: {row:?}"));
+        assert!(
+            workspace_root().join(".kiro/specs").join(spec).is_dir(),
+            "{row:?}"
+        );
+    }
+}
+
+// Feature: temporal-v1.32-compatibility, Property 4: wire-through rows are kernel-free
+#[test]
+fn campaign_wire_through_rows_are_kernel_free() {
+    let design = campaign_design_doc();
+    let rows = surface_audit_rows(&design);
+    let matrix = matrix_rows(&design);
+    assert!(rows.iter().any(|row| row.classification == "Wire through"));
+    for row in rows
+        .iter()
+        .filter(|row| row.classification == "Wire through")
+    {
+        let matches = matrix
+            .iter()
+            .filter(|entry| {
+                qualified_name(&entry.qualified_name) == qualified_name(&row.qualified_name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "wire-through row must have one matrix entry: {row:?}"
+        );
+        assert_eq!(matches[0].kernel_impact, "none", "{row:?}");
+    }
+    for row in matrix {
+        if row.kernel_impact != "none" {
+            assert!(
+                row.implementation_notes
+                    .starts_with("**Classified Deferred**"),
+                "{row:?}"
+            );
+        }
+    }
+}
+
+// Feature: temporal-v1.32-compatibility, Property 7: capability literals match the policy table
+#[test]
+fn capability_construction_sites_never_use_default_spread() {
+    let mut sources = Vec::new();
+    rust_sources(
+        &workspace_root().join("crates/tokeira-edge/src"),
+        &mut sources,
+    );
+    let mut sites = 0;
+    for path in sources {
+        let source = fs::read_to_string(&path).expect("edge source should be readable");
+        let markers = [
+            "NamespaceCapabilities {",
+            "SystemCapabilities {",
+            "get_system_info_response::Capabilities {",
+            "namespace_info::Capabilities {",
+        ];
+        for (start, marker) in markers
+            .iter()
+            .flat_map(|marker| source.match_indices(*marker))
+        {
+            sites += 1;
+            // Restrict the scan to this body; an outer response may use defaults.
+            let body = &source[start + marker.len()..];
+            let mut depth = 1;
+            let end = body
+                .char_indices()
+                .find_map(|(index, ch)| {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    (depth == 0).then_some(index)
+                })
+                .expect("capability body should close");
+            let compact = body[..end].split_whitespace().collect::<String>();
+            assert!(
+                !compact.contains("..Default::default()"),
+                "implicit capability in {}",
+                path.display()
+            );
+        }
+    }
+    assert!(
+        sites > 0,
+        "capability source scan must cover construction sites"
+    );
 }
 
 fn target_spec_name(cell: &str) -> Option<String> {

@@ -181,7 +181,7 @@ pub mod temporal {
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!("generated/upstream/tokeira_public_descriptor.bin");
 
-/// Official Temporal API v1.62.11 OpenAPI v2 document served by the HTTP API.
+/// Official Temporal API v1.63.5 OpenAPI v2 document served by the HTTP API.
 ///
 /// This is the decompressed `OpenAPIV2JSONSpec` artifact from the same upstream API
 /// release as the vendored protobuf surface. It intentionally remains an opaque byte
@@ -189,7 +189,7 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 pub const OPENAPI_V2_JSON: &[u8] =
     include_bytes!("generated/upstream/openapi/openapiv2.swagger.json");
 
-/// Official Temporal API v1.62.11 OpenAPI v3 document served by the HTTP API.
+/// Official Temporal API v1.63.5 OpenAPI v3 document served by the HTTP API.
 ///
 /// This is the decompressed `OpenAPIV3YAMLSpec` artifact from the same upstream API
 /// release as the vendored protobuf surface. It intentionally remains an opaque byte

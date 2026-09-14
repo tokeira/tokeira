@@ -8,13 +8,15 @@
 //! Temporal server release whose SDK-visible behaviour Tokeira claims to
 //! match, established through the api-conformance tracker.
 //!
-//! Tracked-ahead note: the vendored proto surface (`v1.62.11`) is ahead of the
-//! API version that Temporal Server `1.31.0` ships (`v1.62.8`). The extra RPCs
-//! present only in `v1.62.11` (Nexus operation execution) are not part of the
-//! `1.31.0` compatibility claim and are tracked separately in the
-//! api-conformance tracker.
+//! The vendored proto surface (`v1.63.5`) equals the API version Temporal
+//! server `1.32.0` ships (`go.mod @ v1.32.0`); it is no longer tracked ahead
+//! of the campaign release. The advertised compatibility claim remains
+//! `1.31.0` until the campaign supplies conformance evidence. Newer wire
+//! surfaces alone do not expand that claim.
 
-pub const TEMPORAL_PROTO_VERSION: &str = "v1.62.11";
+/// Vendored Temporal API tag; mirrors `proto/UPSTREAM_VERSION` exactly.
+pub const TEMPORAL_PROTO_VERSION: &str = "v1.63.5";
+/// Highest Temporal server release backed by the compatibility claim.
 pub const TEMPORAL_SERVER_COMPAT: &str = "1.31.0";
 
 /// The workspace's pinned toolchain channel, mirrored from

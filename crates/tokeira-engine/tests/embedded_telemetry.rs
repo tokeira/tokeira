@@ -164,6 +164,7 @@ async fn host_owned_telemetry_covers_rpc_workflow_activity_and_shutdown() -> Res
             task_token: workflow_task.task_token,
             identity: "telemetry-worker".to_owned(),
             commands: vec![Command {
+                event_group_markers: Vec::new(),
                 command_type: CommandType::ScheduleActivityTask as i32,
                 user_metadata: None,
                 attributes: Some(Attributes::ScheduleActivityTaskCommandAttributes(

@@ -148,8 +148,12 @@ export.
   `server_scaled_provider_cloud_run: bool`; `NamespaceCapabilities` gains the eight
   new booleans; construction sites set them explicitly.
 - **Type-path moves.** Every reference to `workflow::v1::TimeSkippingConfig` becomes
-  `common::v1::TimeSkippingConfig`; the edge's disposition (drop at the edge, documented)
-  is unchanged.
+  `common::v1::TimeSkippingConfig`; keep today's `INVALID_ARGUMENT` rejection of
+  behavioural requests and the execution-options mask validation. The removed `bound`
+  check maps to `fast_forward_config.is_some()` or `max_session_skip_count != 0`.
+  Empty start/signal configs remain accepted. D7 owns the `UNIMPLEMENTED` rejection of
+  every non-nil config (`service/frontend/workflow_handler.go:713` and `errors.go:118`
+  @ `v1.32.0`).
 - **Deprecated fields.** `poller_group_infos` on the four poll/describe responses and
   `StartBatchOperationRequest.executions` are now `[deprecated = true]`; the edge keeps
   reading and writing them under `#[allow(deprecated)]` with a comment naming D2 as the
@@ -296,14 +300,14 @@ Target_Release and by Tokeira.
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Message | `temporal.api.common.v1.TimeSkippingConfig` (moved from `workflow.v1`; `enabled` 1, `fast_forward_config` 2, `disable_propagation` 3, `max_session_skip_count` 4; `max_skipped_duration`, `max_elapsed_duration`, `max_target_time` removed) | v1.63.0 | No-op | Compile-level path move; the edge drops the field on every carrier (v1.62 disposition) | `v132-gated-surfaces` |
+| Message | `temporal.api.common.v1.TimeSkippingConfig` (moved from `workflow.v1`; `enabled` 1, `fast_forward_config` 2, `disable_propagation` moved 2 → 3, `max_session_skip_count` 4; `max_skipped_duration`, `max_elapsed_duration`, `max_target_time` removed) | v1.63.0 | No-op | Keeps today's `INVALID_ARGUMENT` rejection of behavioural requests (`enabled`, `disable_propagation`, present `fast_forward_config`, nonzero `max_session_skip_count`); empty start/signal configs remain accepted, execution-options masks remain rejected; D7 owns the stock rejection | `v132-gated-surfaces` |
 | Message | `temporal.api.common.v1.FastForwardConfig` (`id`, `duration`) | v1.63.0 | Deferred | Nested in `TimeSkippingConfig` | `v132-gated-surfaces` |
 | Message | `temporal.api.common.v1.TimeSkippingStatePropagation` (`initial_skipped_duration`, `fast_forward_target_time`, `initial_skip_count`) | v1.63.0 | Deferred | History and child-start carriers below | `v132-gated-surfaces` |
 | Message | `temporal.api.common.v1.TimeSkippingInfo` / `TimeSkippingFastForwardInfo` | v1.63.5 | Deferred | Carried on `WorkflowExecutionExtendedInfo.time_skipping_info` (9); emit default | `v132-gated-surfaces` |
 | Enum | `BatchOperationType` 1–6 `[deprecated]`; 13–18 `*_WORKFLOW`; 10–12 `*_ACTIVITY` | v1.63.4 | Deferred | Edge keeps today's values on responses and today's acceptance on requests; D2 migrates per `1.32.0` (release-note compatibility note) | `v132-batch-operations-and-workers` |
 | Field | `StartBatchOperationRequest.executions` (5) `[deprecated]` → `target_executions` (22, `common.Execution`) | v1.63.4 | Deferred | Read the deprecated field under `#[allow(deprecated)]`; ignore `target_executions` until D2 | `v132-batch-operations-and-workers` |
 | Message | `temporal.api.common.v1.Execution` (`type`, `business_id`, `run_id`) + enum `ExecutionType` | v1.63.4 | Deferred | Batch target addressing across workflows and activities | `v132-batch-operations-and-workers` |
-| Field | `DescribeNamespaceResponse.poller_group_infos` (7), `PollWorkflowTaskQueueResponse.poller_group_infos` (18), `PollActivityTaskQueueResponse.poller_group_infos` (21), `PollNexusTaskQueueResponse.poller_group_infos` (5) `[deprecated]` | v1.63.2 | No-op | Edge continues to emit empty lists under `#[allow(deprecated)]` | `v132-batch-operations-and-workers` |
+| Field | `DescribeNamespaceResponse.poller_group_infos` (7), `PollWorkflowTaskQueueResponse.poller_group_infos` (18), `PollActivityTaskQueueResponse.poller_group_infos` (21), `PollNexusTaskQueueResponse.poller_group_infos` (5) `[deprecated]` | v1.63.2 | No-op | The namespace field is added already deprecated; the three poll fields become deprecated. Emit empty lists under `#[allow(deprecated)]` | `v132-batch-operations-and-workers` |
 | Message | `temporal.api.taskqueue.v1.PollerGroupsInfo` (`version`, `poller_groups`) on `DescribeNamespaceResponse` (8), `PollWorkflowTaskQueueResponse` (19), `PollActivityTaskQueueResponse` (22), `PollNexusTaskQueueResponse` (6) | v1.63.2 | Deferred | Emit default | `v132-batch-operations-and-workers` |
 | Field | `WorkflowExecutionTimeSkippingTransitionedEventAttributes.disabled_after_bound` (2) → `disabled_after_fast_forward` (2) | v1.63.0 | No-op | Rename of a field the edge never emits | `v132-gated-surfaces` |
 
@@ -314,11 +318,11 @@ Target_Release and by Tokeira.
 | Field | `DescribeNamespaceRequest.weak_consistency` (3) | v1.62.12 | Deferred | No read-path branch; dropped | `v132-lifecycle-fidelity` |
 | Field | `ListWorkersRequest.include_system_workers` (5), `CountWorkersRequest.*` | v1.62.12 / v1.62.14 | Deferred | System-worker exclusion is D2's behaviour | `v132-batch-operations-and-workers` |
 | Field | `DescribeActivityExecutionRequest.include_heartbeat_details` (7), `.include_last_failure` (8) | v1.62.14 | Deferred | Standalone describe options | `v132-standalone-activities` |
-| Field | `StartWorkflowExecutionRequest.time_skipping_config` (29), `SignalWithStartWorkflowExecutionRequest.time_skipping_config` (27), `WorkflowExecutionOptions.time_skipping_config` (3) — re-typed | v1.63.0 | No-op | Already dropped; path move only | `v132-gated-surfaces` |
+| Field | `StartWorkflowExecutionRequest.time_skipping_config` (29), `SignalWithStartWorkflowExecutionRequest.time_skipping_config` (27), `WorkflowExecutionOptions.time_skipping_config` (3) — re-typed | v1.63.0 | No-op | Keeps today's `INVALID_ARGUMENT` rejection of behavioural requests; the removed bound maps to present `fast_forward_config` or nonzero `max_session_skip_count`. Execution-options mask validation is unchanged; D7 owns the stock rejection | `v132-gated-surfaces` |
 | Field | `RespondWorkflowTaskCompletedRequest.page_number` (21), `.intermediate_page` (22) | v1.63.2 | Deferred | Completion pagination is off in stock `1.32.0`; D7 decides the rejection shape | `v132-gated-surfaces` |
 | Field | `StartBatchOperationRequest.cancel_activities_operation` (19), `.terminate_activities_operation` (20), `.delete_activities_operation` (21) + messages `BatchOperationCancelActivities`, `BatchOperationTerminateActivities`, `BatchOperationDeleteActivities` | v1.63.4 | Deferred | Activity batch ops are gated off in stock `1.32.0` | `v132-standalone-activities` |
 | Field | `PauseActivityRequest.request_id` (7) (deprecated RPC) | v1.62.13 | Deferred | Idempotency key on the served-but-deprecated RPC; D1 ground-truths | `v132-standalone-activities` |
-| Message | `PauseActivityExecutionRequest`, `UnpauseActivityExecutionRequest`, `ResetActivityExecutionRequest`, `UpdateActivityExecutionOptionsRequest` and responses (field lists in `requirements.md` Contract Policy) | v1.62.12–v1.63.5 | Deferred | Behind the D1 stubs | `v132-standalone-activities` |
+| Message | `PauseActivityExecutionRequest`, `UnpauseActivityExecutionRequest`, `ResetActivityExecutionRequest`, `UpdateActivityExecutionOptionsRequest` and responses (full wire definitions in `workflowservice/v1/request_response.proto`) | v1.62.12–v1.63.5 | Deferred | Behind the D1 stubs | `v132-standalone-activities` |
 | Message | `PollWorkflowExecutionTimeSkippingRequest` / `Response` | v1.63.5 | Deferred | Behind the D7 stub | `v132-gated-surfaces` |
 | Field | `temporal.api.update.v1.Request.request_id` (3), `.completion_callbacks` (4), `.links` (5) | v1.62.13 | Deferred | Update callbacks are off in stock `1.32.0`; D6 owns the validation shape | `v132-lifecycle-fidelity` |
 | Field | `StartChildWorkflowExecutionCommandAttributes.versioning_override` (19) | v1.63.4 | Deferred | Child versioning override; `INVALID_VERSIONING_OVERRIDE` cause | `v132-worker-deployments` |
@@ -333,12 +337,13 @@ Target_Release and by Tokeira.
 | Field | `QueryWorkflowResponse.link` (3), `UpdateWorkflowExecutionResponse.link` (4) | v1.63.5 / v1.62.13 | Deferred | Emit default | `v132-lifecycle-fidelity` |
 | Field | `UpdateWorkflowExecutionOptionsResponse.update_time` (2) | v1.63.x | Deferred | Emit default | `v132-lifecycle-fidelity` |
 | Field | `WorkflowExecutionStartedEventAttributes.time_skipping_state_propagation` (43), `StartChildWorkflowExecutionInitiatedEventAttributes.time_skipping_config` (21, re-typed), `.time_skipping_state_propagation` (23), `WorkflowExecutionOptionsUpdatedEventAttributes.time_skipping_config_updated` (9) | v1.63.0 | Deferred | History serializer never emits them | `v132-gated-surfaces` |
+| Field | `WorkflowExecutionStartedEventAttributes.initial_skipped_duration` (42), `StartChildWorkflowExecutionInitiatedEventAttributes.initial_skipped_duration` (22) removed and reserved | v1.63.0 | No-op | The history serializer never populated either field; propagation now has the separate fields in the preceding row | `v132-gated-surfaces` |
 | Field | `StartChildWorkflowExecutionInitiatedEventAttributes.versioning_override` (24) | v1.63.4 | Deferred | History serializer emits default until D4 | `v132-worker-deployments` |
 | Field | `WorkflowExecutionOptionsUpdatedEventAttributes.workflow_update_options` (8) + nested `WorkflowUpdateOptionsUpdate` (`update_id`, `attached_request_id`, `attached_completion_callbacks`) | v1.62.13 | Deferred | Update callbacks | `v132-lifecycle-fidelity` |
 | Field | `HistoryEvent.event_group_markers` (304) | v1.62.14 | Deferred | History serializer emits default | `v132-gated-surfaces` |
 | Field | `CallbackInfo.Trigger.update_workflow_execution_completed` (2) + nested `UpdateWorkflowExecutionCompleted` (`update_id`) | v1.62.13 | Deferred | Update callbacks | `v132-lifecycle-fidelity` |
-| Field | `temporal.api.common.v1.Link.workflow` (5) + nested `Link.Workflow` (`namespace`, `workflow_id`, `run_id`, `reason`) | v1.62.13 | Deferred | Links are deferred since the v1.62 audit | `v132-lifecycle-fidelity` |
-| Field | `VersioningOverride.one_time` (5) + nested `OneTimeOverride` (`target_deployment_version`) | v1.63.0 | Deferred | One-time override | `v132-worker-deployments` |
+| Field | `temporal.api.common.v1.Link.workflow` (5) + nested `Link.Workflow` (`namespace`, `workflow_id`, `run_id`, `reason`) | v1.62.13 | Deferred | Existing link variants remain supported. Reject this new variant with the pre-resync missing-variant error; D6 owns its translation | `v132-lifecycle-fidelity` |
+| Field | `VersioningOverride.one_time` (5) + nested `OneTimeOverride` (`target_deployment_version`) | v1.63.0 | Deferred | Ignore the new oneof tag and retain the legacy-field fallback; D4 owns one-time override semantics | `v132-worker-deployments` |
 | Field | `WorkerDeploymentVersionSummary.compute_status` (14) + `ComputeStatus` (`provider_validation`) + `ProviderValidationStatus` (`error_message`, `last_check_time`) | v1.63.0 | Deferred | Compute-provider validation | `v132-worker-deployments` |
 | Field | `ActivityExecutionInfo.sdk_name` (35), `.sdk_version` (36), `.start_delay` (37), `.execution_time` (38); `ActivityExecutionListInfo.execution_time` (12); `ActivityExecutionOutcome.retry_state` (3) | v1.62.13–v1.63.5 | Deferred | Standalone describe/list fidelity | `v132-standalone-activities` |
 | Field | `ScheduleInfo.state_size_bytes` (12), `ScheduleListInfo.state_size_bytes` (7) | v1.62.13 | Deferred | Scheduler-v2 field | `v132-lifecycle-fidelity` |

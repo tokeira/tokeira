@@ -1700,6 +1700,9 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 accepted_request_message_id: format!("{update_id}/request"),
                 accepted_request_sequencing_event_id: *accepted_request_sequencing_event_id,
                 accepted_request: Some(proto_update::Request {
+                    request_id: String::new(),
+                    completion_callbacks: Vec::new(),
+                    links: Vec::new(),
                     meta: Some(proto_update::Meta {
                         update_id: update_id.clone(),
                         identity: String::new(),
@@ -1720,6 +1723,9 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         } => Attributes::WorkflowExecutionUpdateAdmittedEventAttributes(
             history::WorkflowExecutionUpdateAdmittedEventAttributes {
                 request: Some(proto_update::Request {
+                    request_id: String::new(),
+                    completion_callbacks: Vec::new(),
+                    links: Vec::new(),
                     meta: Some(proto_update::Meta {
                         update_id: update_id.clone(),
                         identity: String::new(),

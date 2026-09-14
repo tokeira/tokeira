@@ -144,6 +144,7 @@ async fn poll_activity(
 
 fn schedule_activity(activity_id: &str, queue: &str) -> Command {
     Command {
+        event_group_markers: Vec::new(),
         command_type: CommandType::ScheduleActivityTask as i32,
         user_metadata: None,
         attributes: Some(CommandAttributes::ScheduleActivityTaskCommandAttributes(
@@ -165,6 +166,7 @@ fn schedule_activity(activity_id: &str, queue: &str) -> Command {
 
 fn complete_workflow(result: &str) -> Command {
     Command {
+        event_group_markers: Vec::new(),
         command_type: CommandType::CompleteWorkflowExecution as i32,
         user_metadata: None,
         attributes: Some(
@@ -235,6 +237,7 @@ async fn respond_update(
     };
     let mut commands = vec![
         Command {
+            event_group_markers: Vec::new(),
             command_type: CommandType::ProtocolMessage as i32,
             user_metadata: None,
             attributes: Some(CommandAttributes::ProtocolMessageCommandAttributes(
@@ -244,6 +247,7 @@ async fn respond_update(
             )),
         },
         Command {
+            event_group_markers: Vec::new(),
             command_type: CommandType::ProtocolMessage as i32,
             user_metadata: None,
             attributes: Some(CommandAttributes::ProtocolMessageCommandAttributes(
@@ -560,6 +564,9 @@ async fn run_scenario(
                         namespace,
                         workflow_execution: Some(execution),
                         request: Some(UpdateRequest {
+                            request_id: String::new(),
+                            completion_callbacks: Vec::new(),
+                            links: Vec::new(),
                             meta: Some(UpdateMeta {
                                 update_id,
                                 identity: "scenario-client".to_owned(),
@@ -631,6 +638,9 @@ async fn run_scenario(
                                             namespace,
                                             workflow_execution: Some(execution(&second_id, "")),
                                             request: Some(UpdateRequest {
+                                                request_id: String::new(),
+                                                completion_callbacks: Vec::new(),
+                                                links: Vec::new(),
                                                 meta: Some(UpdateMeta {
                                                     update_id: format!("uws-update-{label}"),
                                                     identity: "scenario-client".to_owned(),
@@ -729,6 +739,7 @@ async fn run_scenario(
         task.task_token,
         &identity,
         vec![Command {
+            event_group_markers: Vec::new(),
             command_type: CommandType::RequestCancelActivityTask as i32,
             user_metadata: None,
             attributes: Some(

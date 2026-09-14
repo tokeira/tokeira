@@ -1290,6 +1290,7 @@ async fn discovery_and_namespace_reads_via_grpc() {
 
     let describe = grpc
         .describe_namespace(Request::new(workflowservice::DescribeNamespaceRequest {
+            weak_consistency: false,
             namespace: "default".to_string(),
             id: String::new(),
         }))
@@ -1320,6 +1321,7 @@ async fn register_namespace_roundtrip_and_duplicate_rejection() {
 
     let describe = grpc
         .describe_namespace(Request::new(workflowservice::DescribeNamespaceRequest {
+            weak_consistency: false,
             namespace: "payments".to_string(),
             id: String::new(),
         }))
@@ -1368,6 +1370,7 @@ async fn describe_namespace_missing_returns_not_found() {
 
     let err = grpc
         .describe_namespace(Request::new(workflowservice::DescribeNamespaceRequest {
+            weak_consistency: false,
             namespace: "missing".to_string(),
             id: String::new(),
         }))

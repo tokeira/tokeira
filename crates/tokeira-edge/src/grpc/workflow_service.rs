@@ -491,7 +491,10 @@ fn chasm_activity_outcome(
         }
         _ => return None,
     };
-    Some(activity_v1::ActivityExecutionOutcome { value: Some(value) })
+    Some(activity_v1::ActivityExecutionOutcome {
+        retry_state: 0,
+        value: Some(value),
+    })
 }
 
 /// The `info.last_failure` for a closed-with-failure activity: the worker's full
@@ -3060,6 +3063,51 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             },
         ))
     }
+    // === Batch operations and workers — deferred to v132-batch-operations-and-workers spec ===
+    deferred_unary!(
+        count_workers,
+        CountWorkersRequest,
+        CountWorkersResponse,
+        "v132-batch-operations-and-workers"
+    );
+    // === End Batch operations and workers block ===
+
+    // === Standalone activity operators — deferred to v132-standalone-activities spec ===
+    deferred_unary!(
+        pause_activity_execution,
+        PauseActivityExecutionRequest,
+        PauseActivityExecutionResponse,
+        "v132-standalone-activities"
+    );
+    deferred_unary!(
+        unpause_activity_execution,
+        UnpauseActivityExecutionRequest,
+        UnpauseActivityExecutionResponse,
+        "v132-standalone-activities"
+    );
+    deferred_unary!(
+        reset_activity_execution,
+        ResetActivityExecutionRequest,
+        ResetActivityExecutionResponse,
+        "v132-standalone-activities"
+    );
+    deferred_unary!(
+        update_activity_execution_options,
+        UpdateActivityExecutionOptionsRequest,
+        UpdateActivityExecutionOptionsResponse,
+        "v132-standalone-activities"
+    );
+    // === End Standalone activity operators block ===
+
+    // === Gated surfaces — deferred to v132-gated-surfaces spec ===
+    deferred_unary!(
+        poll_workflow_execution_time_skipping,
+        PollWorkflowExecutionTimeSkippingRequest,
+        PollWorkflowExecutionTimeSkippingResponse,
+        "v132-gated-surfaces"
+    );
+    // === End Gated surfaces block ===
+
     // === Worker Config — deferred to worker-config-management spec ===
     deferred_unary!(
         fetch_worker_config,
@@ -3879,6 +3927,7 @@ mod tests {
 
     fn test_worker_heartbeat(key: &str) -> worker_v1::WorkerHeartbeat {
         worker_v1::WorkerHeartbeat {
+            environment: None,
             worker_instance_key: key.to_string(),
             worker_identity: format!("identity-{key}"),
             host_info: None,
@@ -5882,6 +5931,7 @@ mod tests {
 
         let listed = grpc
             .list_workers(Request::new(workflowservice::ListWorkersRequest {
+                include_system_workers: false,
                 namespace: "default".to_owned(),
                 query: "WorkerInstanceKey='worker-a'".to_owned(),
                 page_size: 1,

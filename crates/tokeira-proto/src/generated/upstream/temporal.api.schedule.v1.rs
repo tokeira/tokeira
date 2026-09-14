@@ -387,6 +387,9 @@ pub struct ScheduleInfo {
     #[deprecated]
     #[prost(string, tag = "8")]
     pub invalid_schedule_error: ::prost::alloc::string::String,
+    /// Size of the schedule's internal state (including payloads) in bytes.
+    #[prost(int64, tag = "12")]
+    pub state_size_bytes: i64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Schedule {
@@ -422,6 +425,9 @@ pub struct ScheduleListInfo {
     pub recent_actions: ::prost::alloc::vec::Vec<ScheduleActionResult>,
     #[prost(message, repeated, tag = "6")]
     pub future_action_times: ::prost::alloc::vec::Vec<::prost_types::Timestamp>,
+    /// Size of the schedule's internal state (including payloads) in bytes.
+    #[prost(int64, tag = "7")]
+    pub state_size_bytes: i64,
 }
 /// ScheduleListEntry is returned by ListSchedules.
 #[derive(Clone, PartialEq, ::prost::Message)]

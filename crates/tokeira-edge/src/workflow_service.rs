@@ -4878,6 +4878,9 @@ impl WorkflowService {
             .map_err(EdgeError::from)?
         {
             let request = tokeira_proto::public::temporal::api::update::v1::Request {
+                request_id: String::new(),
+                completion_callbacks: Vec::new(),
+                links: Vec::new(),
                 meta: Some(tokeira_proto::public::temporal::api::update::v1::Meta {
                     update_id: update.update_id.clone(),
                     identity: update.identity,
@@ -5643,6 +5646,7 @@ impl WorkflowService {
             Ok(SystemInfo {
                 server_version: cluster.version,
                 capabilities: system_capabilities_with_matrix_overlay(SystemCapabilities {
+                    server_scaled_provider_cloud_run: false,
                     signal_and_query_header: true,
                     internal_error_differentiation: true,
                     activity_failure_include_heartbeat: false,
@@ -9447,6 +9451,14 @@ fn namespace_to_description(namespace: ResolvedNamespace) -> NamespaceDescriptio
         cluster_name: "local".to_string(),
         custom_search_attribute_aliases: std::collections::BTreeMap::new(),
         capabilities: NamespaceCapabilities {
+            worker_commands: false,
+            standalone_nexus_operation: false,
+            workflow_update_callbacks: false,
+            poller_autoscaling_auto_enroll: false,
+            workflow_task_completion_pagination: false,
+            standalone_activity_start_delay: false,
+            standalone_activity_batch_operations: false,
+            standalone_activity_operator_commands: false,
             worker_heartbeats: true,
             // v1.31.0 advertises this whenever the consecutive-problem
             // threshold is non-zero (`namespace_handler.go:851-862`). Tokeira
@@ -10152,6 +10164,7 @@ mod tests {
 
     fn baseline_capabilities() -> SystemCapabilities {
         SystemCapabilities {
+            server_scaled_provider_cloud_run: false,
             signal_and_query_header: true,
             internal_error_differentiation: true,
             activity_failure_include_heartbeat: false,

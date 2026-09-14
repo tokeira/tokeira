@@ -223,12 +223,19 @@ fn valid_non_negative_duration(
     }
 }
 
-fn time_skipping_requests_behavior(config: &workflow::TimeSkippingConfig) -> bool {
-    config.enabled || config.disable_propagation || config.bound.is_some()
+fn time_skipping_requests_behavior(config: &proto_common::TimeSkippingConfig) -> bool {
+    // F1 maps the former bound check onto the new fields while preserving today's
+    // INVALID_ARGUMENT path and acceptance of an empty config. v132-gated-surfaces
+    // owns v1.32.0's rejection of every non-nil config with UNIMPLEMENTED
+    // (service/frontend/workflow_handler.go:713 and errors.go:118 @ v1.32.0).
+    config.enabled
+        || config.disable_propagation
+        || config.fast_forward_config.is_some()
+        || config.max_session_skip_count != 0
 }
 
 fn reject_behavioral_time_skipping(
-    config: Option<&workflow::TimeSkippingConfig>,
+    config: Option<&proto_common::TimeSkippingConfig>,
     field: &'static str,
 ) -> Result<(), ProtoConversionError> {
     if config.is_some_and(time_skipping_requests_behavior) {
@@ -304,7 +311,11 @@ fn link_to_edge(link: &proto_common::Link) -> Result<EdgeLink, ProtoConversionEr
             operation_id: operation.operation_id.clone(),
             run_id: operation.run_id.clone(),
         }),
-        None => Err(ProtoConversionError::MissingField("Link.variant")),
+        // v132-lifecycle-fidelity owns Workflow links. The old decoder treated
+        // this new oneof tag as absent, so preserve the same missing-variant error.
+        None | Some(Variant::Workflow(_)) => {
+            Err(ProtoConversionError::MissingField("Link.variant"))
+        }
     }
 }
 
@@ -928,38 +939,41 @@ fn versioning_override_to_edge(
     let Some(override_) = override_ else {
         return Ok(None);
     };
-    if let Some(modern) = override_.r#override {
-        return match modern {
-            workflow::versioning_override::Override::Pinned(pinned) => {
-                if pinned.behavior
-                    != workflow::versioning_override::PinnedOverrideBehavior::Pinned as i32
-                {
-                    return Err(ProtoConversionError::InvalidArgument(
-                        "must specify pinned override behavior if override is pinned.".to_string(),
-                    ));
-                }
-                let version = pinned.version.ok_or_else(|| {
-                    ProtoConversionError::InvalidArgument(
-                        "must provide version if override is pinned.".to_string(),
-                    )
-                })?;
-                if version.deployment_name.is_empty() || version.build_id.is_empty() {
-                    return Err(ProtoConversionError::MissingField(
-                        "VersioningOverride.pinned.version.deployment_name/build_id",
-                    ));
-                }
-                Ok(Some(VersioningOverride::Pinned {
-                    deployment_series: version.deployment_name,
-                    build_id: version.build_id,
-                }))
+    match override_.r#override {
+        Some(workflow::versioning_override::Override::Pinned(pinned)) => {
+            if pinned.behavior
+                != workflow::versioning_override::PinnedOverrideBehavior::Pinned as i32
+            {
+                return Err(ProtoConversionError::InvalidArgument(
+                    "must specify pinned override behavior if override is pinned.".to_string(),
+                ));
             }
-            workflow::versioning_override::Override::AutoUpgrade(enabled) if enabled => {
-                Ok(Some(VersioningOverride::AutoUpgrade))
+            let version = pinned.version.ok_or_else(|| {
+                ProtoConversionError::InvalidArgument(
+                    "must provide version if override is pinned.".to_string(),
+                )
+            })?;
+            if version.deployment_name.is_empty() || version.build_id.is_empty() {
+                return Err(ProtoConversionError::MissingField(
+                    "VersioningOverride.pinned.version.deployment_name/build_id",
+                ));
             }
-            workflow::versioning_override::Override::AutoUpgrade(_) => Err(
-                ProtoConversionError::InvalidArgument("override behavior is required".to_string()),
-            ),
-        };
+            return Ok(Some(VersioningOverride::Pinned {
+                deployment_series: version.deployment_name,
+                build_id: version.build_id,
+            }));
+        }
+        Some(workflow::versioning_override::Override::AutoUpgrade(true)) => {
+            return Ok(Some(VersioningOverride::AutoUpgrade));
+        }
+        Some(workflow::versioning_override::Override::AutoUpgrade(false)) => {
+            return Err(ProtoConversionError::InvalidArgument(
+                "override behavior is required".to_string(),
+            ));
+        }
+        // v132-worker-deployments owns OneTime. Before resync, its unknown
+        // oneof tag decoded as absent and legacy behavior remained authoritative.
+        None | Some(workflow::versioning_override::Override::OneTime(_)) => {}
     }
     match enums::VersioningBehavior::try_from(override_.behavior).ok() {
         Some(enums::VersioningBehavior::Pinned) => {
@@ -1108,6 +1122,7 @@ pub fn update_workflow_execution_options_response_to_proto(
     resp: EdgeUpdateWorkflowExecutionOptionsResponse,
 ) -> workflowservice::UpdateWorkflowExecutionOptionsResponse {
     workflowservice::UpdateWorkflowExecutionOptionsResponse {
+        update_time: None,
         workflow_execution_options: Some(workflow::WorkflowExecutionOptions {
             versioning_override: resp.versioning_override.map(|override_| {
                 versioning_override_from_edge(&versioning_override_to_kernel(&override_))
@@ -2314,6 +2329,7 @@ fn worker_deployment_version_summary_from_edge(
 ) -> deployment_proto::worker_deployment_info::WorkerDeploymentVersionSummary {
     let record = &view.record;
     deployment_proto::worker_deployment_info::WorkerDeploymentVersionSummary {
+        compute_status: None,
         version: version_string(&view.deployment_name, &view.build_id),
         status: worker_deployment_version_status_to_proto(record.status),
         deployment_version: Some(worker_deployment_version_from_parts(
@@ -2395,6 +2411,7 @@ fn broker_backlog_stats_to_proto(
     stats: tokeira_runtime::BrokerBacklogStats,
 ) -> taskqueue_proto::TaskQueueStats {
     taskqueue_proto::TaskQueueStats {
+        rate_limiting_active: false,
         approximate_backlog_count: stats.count as i64,
         approximate_backlog_age: time::Duration::try_from(stats.oldest_age)
             .ok()
@@ -3254,6 +3271,8 @@ pub fn signal_response_to_proto(
 }
 
 /// Build the proto poll response from the edge DTO.
+// v132-batch-operations-and-workers owns migration of poller_group_infos.
+#[allow(deprecated)]
 pub fn poll_response_to_proto(
     resp: PollWorkflowTaskQueueResponse,
 ) -> workflowservice::PollWorkflowTaskQueueResponse {
@@ -3291,6 +3310,8 @@ pub fn poll_response_to_proto(
         .unwrap_or_default();
 
     workflowservice::PollWorkflowTaskQueueResponse {
+        poller_group_infos: Vec::new(),
+        poller_groups_info: None,
         task_token: resp.task_token,
         workflow_execution,
         workflow_type: Some(tokeira_proto::common::WorkflowType {
@@ -3900,6 +3921,7 @@ fn activity_execution_list_info_from_summary(
         _ => None,
     };
     activity_proto::ActivityExecutionListInfo {
+        execution_time: None,
         activity_id: value.activity_id,
         run_id: value.run_id.0.to_string(),
         activity_type: Some(proto_common::ActivityType {
@@ -3958,10 +3980,13 @@ pub fn system_info_to_proto(resp: SystemInfo) -> workflowservice::GetSystemInfoR
             count_group_by_execution_status: resp.capabilities.count_group_by_execution_status,
             nexus: resp.capabilities.nexus,
             server_scaled_deployments: resp.capabilities.server_scaled_deployments,
+            server_scaled_provider_cloud_run: false,
         }),
     }
 }
 
+// v132-batch-operations-and-workers owns migration of poller_group_infos.
+#[allow(deprecated)]
 pub fn namespace_to_proto(
     namespace: NamespaceDescription,
     standalone_activities: bool,
@@ -4000,8 +4025,20 @@ pub fn namespace_to_proto(
                 standalone_activities,
                 worker_poll_complete_on_shutdown: false,
                 poller_autoscaling: false,
+                worker_commands: false,
+                standalone_nexus_operation: false,
+                workflow_update_callbacks: false,
+                poller_autoscaling_auto_enroll: false,
+                workflow_task_completion_pagination: false,
+                standalone_activity_start_delay: false,
+                standalone_activity_batch_operations: false,
+                standalone_activity_operator_commands: false,
             }),
-            limits: None,
+            limits: Some(namespace_proto::namespace_info::Limits {
+                blob_size_limit_error: 0,
+                memo_size_limit_error: 0,
+                workflow_task_completion_size_limit_error: 0,
+            }),
             supports_schedules: false,
         }),
         config: Some(namespace_proto::NamespaceConfig {
@@ -4029,6 +4066,8 @@ pub fn namespace_to_proto(
         failover_version: 1,
         is_global_namespace: namespace.is_global,
         failover_history: Vec::new(),
+        poller_group_infos: Vec::new(),
+        poller_groups_info: None,
     }
 }
 
@@ -4387,6 +4426,7 @@ fn task_queue_stats_to_proto(
     stats: crate::translate::TaskQueueStatsDto,
 ) -> taskqueue_proto::TaskQueueStats {
     taskqueue_proto::TaskQueueStats {
+        rate_limiting_active: false,
         approximate_backlog_count: stats.approximate_backlog_count,
         approximate_backlog_age: time::Duration::try_from(stats.approximate_backlog_age)
             .ok()
@@ -4721,6 +4761,7 @@ pub fn signal_with_start_response_to_proto(
     resp: EdgeSignalWithStartWorkflowExecutionResponse,
 ) -> workflowservice::SignalWithStartWorkflowExecutionResponse {
     workflowservice::SignalWithStartWorkflowExecutionResponse {
+        first_execution_run_id: String::new(),
         run_id: resp.run_id.0.to_string(),
         started: resp.started,
         signal_link: None,
@@ -5853,6 +5894,8 @@ pub fn poll_activity_request_to_edge(
     })
 }
 
+// v132-batch-operations-and-workers owns migration of poller_group_infos.
+#[allow(deprecated)]
 pub fn poll_activity_response_to_proto(
     resp: crate::translate::PollActivityTaskQueueResponse,
 ) -> workflowservice::PollActivityTaskQueueResponse {
@@ -5863,6 +5906,8 @@ pub fn poll_activity_response_to_proto(
     ));
 
     workflowservice::PollActivityTaskQueueResponse {
+        poller_group_infos: Vec::new(),
+        poller_groups_info: None,
         task_token: resp.task_token,
         workflow_namespace: resp.workflow_namespace,
         workflow_type: Some(tokeira_proto::common::WorkflowType {
@@ -6103,6 +6148,7 @@ fn activity_options_to_proto(
     value: &crate::translate::ActivityOptions,
 ) -> activity_proto::ActivityOptions {
     activity_proto::ActivityOptions {
+        start_delay: None,
         task_queue: value.task_queue.as_ref().map(|name| {
             tokeira_proto::conversions::common::task_queue_from_domain(
                 &tokeira_types::TaskQueueName(name.clone()),
@@ -6384,6 +6430,7 @@ pub fn query_response_to_proto(
     resp: crate::translate::QueryWorkflowResponse,
 ) -> workflowservice::QueryWorkflowResponse {
     workflowservice::QueryWorkflowResponse {
+        link: None,
         query_result: resp.result.map(|p| payloads_from_domain(&p)),
         query_rejected: resp.rejected_status.map(|status| {
             tokeira_proto::public::temporal::api::query::v1::QueryRejected {
@@ -6520,6 +6567,7 @@ pub fn update_response_to_proto(
     };
 
     workflowservice::UpdateWorkflowExecutionResponse {
+        link: None,
         update_ref: Some(update::UpdateRef {
             workflow_execution: Some(proto_common::WorkflowExecution {
                 workflow_id: resp.update_ref.workflow_id,
@@ -7813,12 +7861,67 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
 
         let mut req = minimal_start_proto();
-        req.time_skipping_config = Some(workflow::TimeSkippingConfig {
+        req.time_skipping_config = Some(proto_common::TimeSkippingConfig {
             enabled: true,
             ..Default::default()
         });
         let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    fn assert_behavioral_time_skipping_rejected(config: proto_common::TimeSkippingConfig) {
+        let mut start = minimal_start_proto();
+        start.time_skipping_config = Some(config.clone());
+        let status = proto_conversion_status(start_request_to_edge(start).unwrap_err());
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            proto_conversion_status(ProtoConversionError::MissingField(
+                "StartWorkflowExecutionRequest.time_skipping_config",
+            ))
+            .message(),
+        );
+
+        let mut signal = minimal_signal_with_start_proto();
+        signal.time_skipping_config = Some(config);
+        let status =
+            proto_conversion_status(signal_with_start_request_to_edge(signal).unwrap_err());
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            proto_conversion_status(ProtoConversionError::MissingField(
+                "SignalWithStartWorkflowExecutionRequest.time_skipping_config",
+            ))
+            .message(),
+        );
+    }
+
+    #[test]
+    fn start_and_signal_with_start_reject_fast_forward_config() {
+        assert_behavioral_time_skipping_rejected(proto_common::TimeSkippingConfig {
+            fast_forward_config: Some(proto_common::FastForwardConfig::default()),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn start_and_signal_with_start_reject_nonzero_max_session_skip_count() {
+        for count in [i32::MIN, -1, 1, i32::MAX] {
+            assert_behavioral_time_skipping_rejected(proto_common::TimeSkippingConfig {
+                max_session_skip_count: count,
+                ..Default::default()
+            });
+        }
+    }
+
+    #[test]
+    fn start_and_signal_with_start_keep_accepting_empty_time_skipping_config() {
+        let mut start = minimal_start_proto();
+        start.time_skipping_config = Some(proto_common::TimeSkippingConfig::default());
+        assert!(start_request_to_edge(start).is_ok());
+        let mut signal = minimal_signal_with_start_proto();
+        signal.time_skipping_config = Some(proto_common::TimeSkippingConfig::default());
+        assert!(signal_with_start_request_to_edge(signal).is_ok());
     }
 
     #[test]
@@ -8126,7 +8229,7 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
 
         let mut req = minimal_signal_with_start_proto();
-        req.time_skipping_config = Some(workflow::TimeSkippingConfig {
+        req.time_skipping_config = Some(proto_common::TimeSkippingConfig {
             enabled: true,
             ..Default::default()
         });
@@ -8470,6 +8573,65 @@ mod tests {
     }
 
     #[test]
+    fn new_workflow_link_retains_unknown_variant_error() {
+        let link = proto_common::Link {
+            variant: Some(proto_common::link::Variant::Workflow(
+                proto_common::link::Workflow {
+                    namespace: "default".to_string(),
+                    workflow_id: "workflow".to_string(),
+                    run_id: "run".to_string(),
+                    reason: "backlink".to_string(),
+                },
+            )),
+        };
+        assert_eq!(
+            link_to_edge(&link)
+                .expect_err("new link remains deferred")
+                .to_string(),
+            link_to_edge(&proto_common::Link::default())
+                .expect_err("absent variant")
+                .to_string(),
+        );
+    }
+
+    // v132-worker-deployments owns OneTime semantics; F1 preserves the legacy fallback.
+    #[allow(deprecated)]
+    #[test]
+    fn one_time_override_retains_legacy_field_fallback() {
+        for behavior in [
+            enums::VersioningBehavior::Unspecified,
+            enums::VersioningBehavior::Pinned,
+            enums::VersioningBehavior::AutoUpgrade,
+        ] {
+            let legacy = workflow::VersioningOverride {
+                behavior: behavior as i32,
+                deployment: Some(deployment_proto::Deployment {
+                    series_name: "deployment".to_string(),
+                    build_id: "legacy".to_string(),
+                }),
+                ..Default::default()
+            };
+            let with_one_time = workflow::VersioningOverride {
+                r#override: Some(workflow::versioning_override::Override::OneTime(
+                    workflow::versioning_override::OneTimeOverride {
+                        target_deployment_version: Some(
+                            deployment_proto::WorkerDeploymentVersion {
+                                deployment_name: "deployment".to_string(),
+                                build_id: "new".to_string(),
+                            },
+                        ),
+                    },
+                )),
+                ..legacy.clone()
+            };
+            assert_eq!(
+                versioning_override_to_edge(Some(with_one_time)).expect("one-time ignored"),
+                versioning_override_to_edge(Some(legacy)).expect("legacy override")
+            );
+        }
+    }
+
+    #[test]
     fn namespace_archival_disabled() {
         let proto = namespace_to_proto(
             NamespaceDescription {
@@ -8483,6 +8645,14 @@ mod tests {
                 cluster_name: "local".to_string(),
                 custom_search_attribute_aliases: std::collections::BTreeMap::new(),
                 capabilities: crate::translate::NamespaceCapabilities {
+                    worker_commands: false,
+                    standalone_nexus_operation: false,
+                    workflow_update_callbacks: false,
+                    poller_autoscaling_auto_enroll: false,
+                    workflow_task_completion_pagination: false,
+                    standalone_activity_start_delay: false,
+                    standalone_activity_batch_operations: false,
+                    standalone_activity_operator_commands: false,
                     worker_heartbeats: true,
                     reported_problems_search_attribute: false,
                 },
@@ -8525,6 +8695,14 @@ mod tests {
                 cluster_name: "local".to_string(),
                 custom_search_attribute_aliases: std::collections::BTreeMap::new(),
                 capabilities: crate::translate::NamespaceCapabilities {
+                    worker_commands: false,
+                    standalone_nexus_operation: false,
+                    workflow_update_callbacks: false,
+                    poller_autoscaling_auto_enroll: false,
+                    workflow_task_completion_pagination: false,
+                    standalone_activity_start_delay: false,
+                    standalone_activity_batch_operations: false,
+                    standalone_activity_operator_commands: false,
                     worker_heartbeats: true,
                     reported_problems_search_attribute: false,
                 },
@@ -8554,6 +8732,14 @@ mod tests {
                     cluster_name: "local".to_string(),
                     custom_search_attribute_aliases: std::collections::BTreeMap::new(),
                     capabilities: crate::translate::NamespaceCapabilities {
+                        worker_commands: false,
+                        standalone_nexus_operation: false,
+                        workflow_update_callbacks: false,
+                        poller_autoscaling_auto_enroll: false,
+                        workflow_task_completion_pagination: false,
+                        standalone_activity_start_delay: false,
+                        standalone_activity_batch_operations: false,
+                        standalone_activity_operator_commands: false,
                         worker_heartbeats: true,
                         reported_problems_search_attribute: false,
                     },
@@ -8611,11 +8797,13 @@ mod tests {
             "count_group_by_execution_status",
             "nexus",
             "server_scaled_deployments",
+            "server_scaled_provider_cloud_run",
         ];
 
         let proto = system_info_to_proto(SystemInfo {
             server_version: "0.1.0+abcdef12".to_string(),
             capabilities: crate::translate::SystemCapabilities {
+                server_scaled_provider_cloud_run: false,
                 signal_and_query_header: true,
                 internal_error_differentiation: true,
                 activity_failure_include_heartbeat: false,
@@ -9338,6 +9526,7 @@ mod tests {
             }),
             identity: "operator".to_string(),
             activity_options: Some(activity_proto::ActivityOptions {
+                start_delay: None,
                 task_queue: Some(taskqueue::TaskQueue {
                     name: "queue-b".to_string(),
                     ..Default::default()
@@ -9469,6 +9658,9 @@ mod tests {
             ..Default::default()
         };
         let update_request = |name: &str, id: &str| update::Request {
+            request_id: String::new(),
+            completion_callbacks: Vec::new(),
+            links: Vec::new(),
             meta: Some(update::Meta {
                 update_id: id.to_string(),
                 identity: String::new(),
@@ -9553,6 +9745,9 @@ mod tests {
                 ..Default::default()
             }),
             request: Some(update::Request {
+                request_id: String::new(),
+                completion_callbacks: Vec::new(),
+                links: Vec::new(),
                 meta: Some(update::Meta {
                     update_id: "u1".to_string(),
                     identity: String::new(),
@@ -9694,6 +9889,9 @@ mod tests {
                 run_id: String::new(),
             }),
             request: Some(update::Request {
+                request_id: String::new(),
+                completion_callbacks: Vec::new(),
+                links: Vec::new(),
                 meta: Some(update::Meta {
                     update_id: String::new(),
                     identity: "update-client".to_string(),

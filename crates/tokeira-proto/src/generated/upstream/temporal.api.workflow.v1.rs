@@ -147,6 +147,12 @@ pub struct WorkflowExecutionExtendedInfo {
     /// Information about the workflow execution pause operation.
     #[prost(message, optional, tag = "8")]
     pub pause_info: ::core::option::Option<WorkflowExecutionPauseInfo>,
+    /// Information about time skipping of the workflow execution.
+    /// If the execution has never enabled time skipping, it will be nil.
+    #[prost(message, optional, tag = "9")]
+    pub time_skipping_info: ::core::option::Option<
+        super::super::common::v1::TimeSkippingInfo,
+    >,
 }
 /// Holds all the information about worker versioning for a particular workflow execution.
 /// Experimental. Versioning info is experimental and might change in the future.
@@ -618,17 +624,25 @@ pub mod callback_info {
     /// Trigger for when the workflow is closed.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct WorkflowClosed {}
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+    /// Trigger for when a workflow update is completed.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct UpdateWorkflowExecutionCompleted {
+        #[prost(string, tag = "1")]
+        pub update_id: ::prost::alloc::string::String,
+    }
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Trigger {
-        #[prost(oneof = "trigger::Variant", tags = "1")]
+        #[prost(oneof = "trigger::Variant", tags = "1, 2")]
         pub variant: ::core::option::Option<trigger::Variant>,
     }
     /// Nested message and enum types in `Trigger`.
     pub mod trigger {
-        #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+        #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
         pub enum Variant {
             #[prost(message, tag = "1")]
             WorkflowClosed(super::WorkflowClosed),
+            #[prost(message, tag = "2")]
+            UpdateWorkflowExecutionCompleted(super::UpdateWorkflowExecutionCompleted),
         }
     }
 }
@@ -739,73 +753,19 @@ pub struct WorkflowExecutionOptions {
     /// If set, overrides the workflow's priority sent by the SDK.
     #[prost(message, optional, tag = "2")]
     pub priority: ::core::option::Option<super::super::common::v1::Priority>,
-    /// Time-skipping configuration for this workflow execution.
-    /// If not set, the time-skipping conf will not get updated upon request,
-    /// i.e. the existing time-skipping conf will be preserved.
+    /// The time-skipping configuration for this workflow execution.
+    /// When `fast_forward` is set, time will be fast-forwarded to a future point relative
+    /// to the current workflow timestamp. Each call takes effect, even if
+    /// `fast_forward` is set to the same duration, since the target time is recalculated
+    /// from the current timestamp on every call.
+    ///
+    /// This field must be updated as a whole; updating individual sub-fields is not supported.
+    /// When setting the update mask in `UpdateWorkflowExecutionOptionsRequest`,
+    /// `BatchOperationUpdateWorkflowExecutionOptions`, etc., use a mask that covers the entire field.
     #[prost(message, optional, tag = "3")]
-    pub time_skipping_config: ::core::option::Option<TimeSkippingConfig>,
-}
-/// Configuration for time skipping during a workflow execution.
-/// When enabled, virtual time advances automatically whenever there is no in-flight work.
-/// In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,
-/// and possibly other features added in the future.
-/// User timers are not classified as in-flight work and will be skipped over.
-/// When time advances, it skips to the earlier of the next user timer or the configured bound, if either exists.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TimeSkippingConfig {
-    /// Enables or disables time skipping for this workflow execution.
-    /// By default, this field is propagated to transitively related workflows (child workflows/start-as-new/reset)
-    /// at the time they are started.
-    /// Changes made after a transitively related workflow has started are not propagated.
-    #[prost(bool, tag = "1")]
-    pub enabled: bool,
-    /// If set, the enabled field is not propagated to transitively related workflows.
-    #[prost(bool, tag = "2")]
-    pub disable_propagation: bool,
-    /// Optional bound that limits how long time skipping remains active.
-    /// Once the bound is reached, time skipping is automatically disabled.
-    /// It can later be re-enabled via UpdateWorkflowExecutionOptions.
-    ///
-    /// This is particularly useful in testing scenarios where workflows
-    /// are expected to receive signals, updates, or other events while
-    /// timers are in progress.
-    ///
-    /// This bound is not propagated to transitively related workflows.
-    /// When bound is also needed for transitively related workflows,
-    /// it is recommended to set disable_propagation to true
-    /// and configure TimeSkippingConfig explicitly for transitively related workflows.
-    #[prost(oneof = "time_skipping_config::Bound", tags = "4, 5, 6")]
-    pub bound: ::core::option::Option<time_skipping_config::Bound>,
-}
-/// Nested message and enum types in `TimeSkippingConfig`.
-pub mod time_skipping_config {
-    /// Optional bound that limits how long time skipping remains active.
-    /// Once the bound is reached, time skipping is automatically disabled.
-    /// It can later be re-enabled via UpdateWorkflowExecutionOptions.
-    ///
-    /// This is particularly useful in testing scenarios where workflows
-    /// are expected to receive signals, updates, or other events while
-    /// timers are in progress.
-    ///
-    /// This bound is not propagated to transitively related workflows.
-    /// When bound is also needed for transitively related workflows,
-    /// it is recommended to set disable_propagation to true
-    /// and configure TimeSkippingConfig explicitly for transitively related workflows.
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Bound {
-        /// Maximum total virtual time that can be skipped.
-        #[prost(message, tag = "4")]
-        MaxSkippedDuration(::prost_types::Duration),
-        /// Maximum elapsed time since time skipping was enabled.
-        /// This includes both skipped time and real time elapsing.
-        /// (-- api-linter: core::0142::time-field-names=disabled --)
-        #[prost(message, tag = "5")]
-        MaxElapsedDuration(::prost_types::Duration),
-        /// Absolute virtual timestamp at which time skipping is disabled.
-        /// Time skipping will not advance beyond this point.
-        #[prost(message, tag = "6")]
-        MaxTargetTime(::prost_types::Timestamp),
-    }
+    pub time_skipping_config: ::core::option::Option<
+        super::super::common::v1::TimeSkippingConfig,
+    >,
 }
 /// Used to override the versioning behavior (and pinned deployment version, if applicable) of a
 /// specific workflow execution. If set, this override takes precedence over worker-sent values.
@@ -837,7 +797,7 @@ pub struct VersioningOverride {
     #[prost(string, tag = "9")]
     pub pinned_version: ::prost::alloc::string::String,
     /// Indicates whether to override the workflow to be AutoUpgrade or Pinned.
-    #[prost(oneof = "versioning_override::Override", tags = "3, 4")]
+    #[prost(oneof = "versioning_override::Override", tags = "3, 4, 5")]
     pub r#override: ::core::option::Option<versioning_override::Override>,
 }
 /// Nested message and enum types in `VersioningOverride`.
@@ -858,6 +818,34 @@ pub mod versioning_override {
         /// will be rejected with a PreconditionFailed error.
         #[prost(message, optional, tag = "2")]
         pub version: ::core::option::Option<
+            super::super::super::deployment::v1::WorkerDeploymentVersion,
+        >,
+    }
+    /// Routes Workflow Tasks for this execution to `target_deployment_version`
+    /// until a Workflow Task completes on that version, then clears the override.
+    ///
+    /// This does not force the workflow's normal Versioning Behavior to become
+    /// Pinned. After the Workflow Task completes on `target_deployment_version`,
+    /// the workflow execution's normal Versioning Behavior and Deployment Version
+    /// are taken from the worker's completion response.
+    ///
+    /// Example: if an execution is one-time moved from version X to version Y, and
+    /// version Z later becomes current:
+    ///
+    /// * if worker Y reports Pinned, the execution stays on Y;
+    /// * if worker Y reports AutoUpgrade, the execution routes to Z on a future
+    ///   Workflow Task;
+    /// * if worker Y reports Pinned and the workflow uses upgrade-on-continue-as-new,
+    ///   the current run stays on Y and the execution can route to Z after
+    ///   continue-as-new.
+    ///
+    /// If no Workflow Task completes on `target_deployment_version`, this override
+    /// remains pending.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct OneTimeOverride {
+        /// Required. Worker Deployment Version to receive the one-time Workflow Task.
+        #[prost(message, optional, tag = "1")]
+        pub target_deployment_version: ::core::option::Option<
             super::super::super::deployment::v1::WorkerDeploymentVersion,
         >,
     }
@@ -902,12 +890,22 @@ pub mod versioning_override {
     /// Indicates whether to override the workflow to be AutoUpgrade or Pinned.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Override {
-        /// Override the workflow to have Pinned behavior.
+        /// Override the workflow to have Pinned behavior. This is a sticky override:
+        /// Workflow Tasks continue to route according to this override until it is
+        /// explicitly removed.
         #[prost(message, tag = "3")]
         Pinned(PinnedOverride),
         /// Override the workflow to have AutoUpgrade behavior.
         #[prost(bool, tag = "4")]
         AutoUpgrade(bool),
+        /// Override Workflow Task routing to a specific Worker Deployment Version until
+        /// one Workflow Task completes there. After completion, the workflow execution's
+        /// Versioning Behavior and Deployment Version come from the worker's completion
+        /// response.
+        /// (-- api-linter: core::0142::time-field-type=disabled
+        /// aip.dev/not-precedent: one_time describes one-time routing semantics, not a timestamp or duration. --)
+        #[prost(message, tag = "5")]
+        OneTime(OneTimeOverride),
     }
 }
 /// When StartWorkflowExecution uses the conflict policy WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING and

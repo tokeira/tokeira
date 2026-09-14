@@ -64,6 +64,30 @@ pub mod namespace_info {
         /// True if the namespace supports poller autoscaling
         #[prost(bool, tag = "9")]
         pub poller_autoscaling: bool,
+        /// True if the namespace supports worker commands (server-to-worker communication via control queues).
+        #[prost(bool, tag = "10")]
+        pub worker_commands: bool,
+        /// True if the namespace supports standalone Nexus operations.
+        #[prost(bool, tag = "11")]
+        pub standalone_nexus_operation: bool,
+        /// True if the namespace supports attaching callbacks on workflow updates
+        #[prost(bool, tag = "12")]
+        pub workflow_update_callbacks: bool,
+        /// When true, workers should use poller autoscaling by default unless explicitly configured otherwise.
+        #[prost(bool, tag = "13")]
+        pub poller_autoscaling_auto_enroll: bool,
+        /// True if the namespace supports pagination of `RespondWorkflowTaskCompleted` request.
+        #[prost(bool, tag = "14")]
+        pub workflow_task_completion_pagination: bool,
+        /// True if the namespace supports start delay for standalone activities.
+        #[prost(bool, tag = "15")]
+        pub standalone_activity_start_delay: bool,
+        /// True if the namespace supports batch operations for standalone activities.
+        #[prost(bool, tag = "16")]
+        pub standalone_activity_batch_operations: bool,
+        /// True if the namespace supports standalone activity operator commands.
+        #[prost(bool, tag = "17")]
+        pub standalone_activity_operator_commands: bool,
     }
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Limits {
@@ -75,6 +99,11 @@ pub mod namespace_info {
         /// Maximum total memo size in bytes per workflow execution.
         #[prost(int64, tag = "2")]
         pub memo_size_limit_error: i64,
+        /// Maximum total size in bytes of a single RespondWorkflowTaskCompleted request.
+        /// Requests exceeding this fail the workflow task with
+        /// WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE. 0 means no explicit limit.
+        #[prost(int64, tag = "3")]
+        pub workflow_task_completion_size_limit_error: i64,
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

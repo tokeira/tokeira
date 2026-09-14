@@ -13,6 +13,9 @@ pub struct BatchOperationInfo {
     /// Batch operation close time
     #[prost(message, optional, tag = "4")]
     pub close_time: ::core::option::Option<::prost_types::Timestamp>,
+    /// Operation type
+    #[prost(enumeration = "super::super::enums::v1::BatchOperationType", tag = "5")]
+    pub operation_type: i32,
 }
 /// BatchOperationTermination sends terminate requests to batch workflows.
 /// Keep the parameter in sync with temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest.
@@ -25,6 +28,18 @@ pub struct BatchOperationTermination {
     /// The identity of the worker/client
     #[prost(string, tag = "2")]
     pub identity: ::prost::alloc::string::String,
+}
+/// BatchOperationTerminateActivities sends terminate requests to a batch of activities.
+/// Keep the parameter in sync with temporal.api.workflowservice.v1.TerminateActivityExecutionRequest.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BatchOperationTerminateActivities {
+    /// The identity of the worker/client
+    #[prost(string, tag = "1")]
+    pub identity: ::prost::alloc::string::String,
+    /// Reason for requesting the termination, recorded and available via the PollActivityExecution API.
+    /// Not propagated to a worker if an activity attempt is currently running.
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
 }
 /// BatchOperationSignal sends signals to batch workflows.
 /// Keep the parameter in sync with temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest.
@@ -53,6 +68,18 @@ pub struct BatchOperationCancellation {
     #[prost(string, tag = "1")]
     pub identity: ::prost::alloc::string::String,
 }
+/// BatchOperationCancelActivities sends cancel requests to a batch of activities.
+/// Keep the parameter in sync with temporal.api.workflowservice.v1.RequestCancelActivityExecutionRequest.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BatchOperationCancelActivities {
+    /// The identity of the worker/client
+    #[prost(string, tag = "1")]
+    pub identity: ::prost::alloc::string::String,
+    /// Reason for requesting the cancellation, recorded and available via the PollActivityExecution API.
+    /// Not propagated to a worker if an activity attempt is currently running.
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
 /// BatchOperationDeletion sends deletion requests to batch workflows.
 /// Keep the parameter in sync with temporal.api.workflowservice.v1.DeleteWorkflowExecutionRequest.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -61,6 +88,10 @@ pub struct BatchOperationDeletion {
     #[prost(string, tag = "1")]
     pub identity: ::prost::alloc::string::String,
 }
+/// BatchOperationDeleteActivities sends deletion requests to a batch of activities.
+/// Keep the parameter in sync with temporal.api.workflowservice.v1.DeleteActivityExecutionRequest.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BatchOperationDeleteActivities {}
 /// BatchOperationReset sends reset requests to batch workflows.
 /// Keep the parameter in sync with temporal.api.workflowservice.v1.ResetWorkflowExecutionRequest.
 #[derive(Clone, PartialEq, ::prost::Message)]

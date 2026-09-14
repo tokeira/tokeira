@@ -238,9 +238,9 @@ The four deprecated RPCs `PauseActivity`, `UnpauseActivity`, `ResetActivity`,
 
 | Shape | Change | Policy in this spec | Behaviour owner |
 |---|---|---|---|
-| `TimeSkippingConfig` | Moved `temporal.api.workflow.v1` → `temporal.api.common.v1`; fields `max_skipped_duration`, `max_elapsed_duration`, `max_target_time` removed; `fast_forward_config` (2), `disable_propagation` (3), `max_session_skip_count` (4) added; new `TimeSkippingStatePropagation`, `TimeSkippingInfo`, `TimeSkippingFastForwardInfo`, `enums/v1/time_skipping.proto` | Compile against the new path; the edge continues to drop the field (v1.62 audit disposition) | D7 |
+| `TimeSkippingConfig` | Moved `temporal.api.workflow.v1` → `temporal.api.common.v1`; fields `max_skipped_duration`, `max_elapsed_duration`, `max_target_time` removed; `fast_forward_config` (2) and `max_session_skip_count` (4) added; `disable_propagation` moved from tag 2 to 3; new `TimeSkippingStatePropagation`, `TimeSkippingInfo`, `TimeSkippingFastForwardInfo`, `enums/v1/time_skipping.proto` | Compile against the new path; keep today's `INVALID_ARGUMENT` rejection of behavioural requests, mapping the removed bound to present `fast_forward_config` or nonzero `max_session_skip_count`; preserve execution-options mask validation. D7 owns the target stock rejection | D7 |
 | `BatchOperationType` | Values 1–6 deprecated; 13–18 `*_WORKFLOW` added; 10–12 `*_ACTIVITY` added | Generated enum gains the values; the edge keeps emitting what it emits today | D2 |
-| `DescribeBatchOperationResponse.executions` (5) | Deprecated for `target_executions` (22) of `common.Execution` (`ExecutionType`, `business_id`, `run_id`) | Emit protobuf default for the new field | D2 |
+| `StartBatchOperationRequest.executions` (5) | Deprecated for `target_executions` (22) of `common.Execution` (`ExecutionType`, `business_id`, `run_id`) | Ignore the new request field until D2 | D2 |
 | `poller_group_infos` (four messages) | Deprecated for `PollerGroupsInfo { version, poller_groups }` | Emit protobuf default for the new field; deprecated field unchanged | D2 |
 | `WorkerHeartbeat.environment` (25) | New `EnvironmentInfo` with runtime, hosting, platform enums | Preserved inside the lossless heartbeat image (existing design) | D2 |
 | `Command.event_group_markers` (302), `HistoryEvent.event_group_markers` (304) | New repeated `sdk.v1.EventGroupMarker` | Dropped at the edge; documented in `UNSUPPORTED_FIELDS.md` | D7 |
@@ -347,13 +347,17 @@ behaviour before the owning Delta_Spec decides it.
 
 1. WHEN the drift fix lands, THE edge SHALL compile against
    `temporal.api.common.v1.TimeSkippingConfig` on every message that carries it and SHALL
-   continue to drop the field with the same disposition recorded in the v1.62 audit.
+   keep today's `INVALID_ARGUMENT` rejection of behavioural requests: `enabled`,
+   `disable_propagation`, a present `fast_forward_config`, or nonzero
+   `max_session_skip_count`. The start/signal call sites and execution-options mask
+   rejection SHALL remain unchanged. Empty configs SHALL remain accepted on start/signal;
+   D7 owns Target_Release's `UNIMPLEMENTED` rejection of every non-nil config.
 2. WHEN the drift fix lands, THE edge SHALL emit the same `BatchOperationType` values it
    emits today on `DescribeBatchOperation` and `ListBatchOperations`, and SHALL accept
    on `StartBatchOperation` whatever it accepts today; migration to the `*_WORKFLOW`
    values is owned by D2.
 3. WHEN the drift fix lands, THE edge SHALL emit the protobuf default for
-   `DescribeBatchOperationResponse.target_executions`, every `poller_groups_info`
+   `DescribeBatchOperationResponse.executions` and `.query`, every `poller_groups_info`
    field, `TaskQueueStats.rate_limiting_active`, `StartWorkflowExecutionResponse.first_execution_run_id`,
    `QueryWorkflowResponse.link`, and `UpdateWorkflowExecutionResponse.link`.
 4. WHEN the drift fix lands, THE `crates/tokeira-edge/UNSUPPORTED_FIELDS.md` file SHALL

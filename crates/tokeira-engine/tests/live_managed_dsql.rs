@@ -349,6 +349,7 @@ async fn exercise_network_worker(addr: std::net::SocketAddr, workflow_id: &str) 
             identity: "managed-live-network-worker".to_owned(),
             namespace: "default".to_owned(),
             commands: vec![Command {
+                event_group_markers: Vec::new(),
                 command_type: CommandType::CompleteWorkflowExecution as i32,
                 user_metadata: None,
                 attributes: Some(

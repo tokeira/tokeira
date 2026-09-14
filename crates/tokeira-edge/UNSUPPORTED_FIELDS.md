@@ -19,7 +19,7 @@ does not support or cannot yet populate, along with rationale.
 | `on_conflict_options` | Supported | Applies request id, callbacks, and links to the running workflow under `USE_EXISTING` |
 | `priority` | Supported | Persisted and rendered through describe/history |
 | `eager_worker_deployment_options` | Supported | Worker-deployment routing option used only when eager execution is requested |
-| `time_skipping_config` | Rejected | Test-server feature; behavioural requests return `INVALID_ARGUMENT` |
+| `time_skipping_config` | Rejected when behavioral | `enabled`, `disable_propagation`, present `fast_forward_config`, or nonzero `max_session_skip_count` return `INVALID_ARGUMENT`; an empty message remains accepted. `v132-gated-surfaces` owns the v1.32.0 stock rejection |
 
 ## Schedule Transport
 
@@ -94,3 +94,37 @@ does not support or cannot yet populate, along with rationale.
 |---|---|---|
 | `update_ref` | Not populated | Update reference tracking not implemented |
 | `stage` | Not populated | Update lifecycle stage not threaded |
+
+## Temporal API v1.63.5 campaign request fields
+
+The v1.32 compatibility campaign leaves these fields unmodeled until their owner
+implements the behavior. Field numbers and shapes come from `proto/upstream/` at
+`v1.63.5`. Existing request validation and deprecated request fields retain their
+pre-resync treatment.
+
+| Field | Current treatment | Owning spec |
+|---|---|---|
+| `DescribeNamespaceRequest.weak_consistency` | Dropped; no alternate read path | `v132-lifecycle-fidelity` |
+| `ListWorkersRequest.include_system_workers` | Dropped; existing listing behavior retained | `v132-batch-operations-and-workers` |
+| `DescribeActivityExecutionRequest.include_heartbeat_details` | Dropped; existing describe rendering retained | `v132-standalone-activities` |
+| `DescribeActivityExecutionRequest.include_last_failure` | Dropped; existing describe rendering retained | `v132-standalone-activities` |
+| `RespondWorkflowTaskCompletedRequest.page_number` | Dropped; no completion pagination | `v132-gated-surfaces` |
+| `RespondWorkflowTaskCompletedRequest.intermediate_page` | Dropped; no completion pagination | `v132-gated-surfaces` |
+| `StartBatchOperationRequest.target_executions` | Dropped; the deprecated `executions` field remains authoritative | `v132-batch-operations-and-workers` |
+| `StartBatchOperationRequest.cancel_activities_operation`, `.terminate_activities_operation`, `.delete_activities_operation` | Same missing-operation error as the old decoder's unknown oneof tags; payloads are not translated | `v132-standalone-activities` |
+| `PauseActivityRequest.request_id` | Dropped on the served deprecated RPC | `v132-standalone-activities` |
+| `update.v1.Request.request_id` | Dropped; no attached request-id tracking | `v132-lifecycle-fidelity` |
+| `update.v1.Request.completion_callbacks` | Dropped; no update callback attachment | `v132-lifecycle-fidelity` |
+| `update.v1.Request.links` | Dropped; no update backlink attachment | `v132-lifecycle-fidelity` |
+| `StartChildWorkflowExecutionCommandAttributes.versioning_override` | Dropped; child-start translation unchanged | `v132-worker-deployments` |
+| `Command.event_group_markers` | Dropped; no event-group model | `v132-gated-surfaces` |
+| `activity.v1.ActivityOptions.start_delay` | Dropped; no standalone delayed start | `v132-standalone-activities` |
+| `VersioningOverride.one_time` | New oneof tag ignored; deprecated-field fallback retained | `v132-worker-deployments` |
+| `common.v1.Link.workflow` | Rejected with the existing missing-variant error; older link variants retain their translation | `v132-lifecycle-fidelity` |
+| `CountWorkersRequest` (all fields) | Entire RPC is deferred and returns `UNIMPLEMENTED` | `v132-batch-operations-and-workers` |
+| `PauseActivityExecutionRequest`, `UnpauseActivityExecutionRequest`, `ResetActivityExecutionRequest`, `UpdateActivityExecutionOptionsRequest` (all fields) | Entire RPCs are deferred and return `UNIMPLEMENTED` | `v132-standalone-activities` |
+| `PollWorkflowExecutionTimeSkippingRequest` (all fields) | Entire RPC is deferred and returns `UNIMPLEMENTED` | `v132-gated-surfaces` |
+
+`WorkerHeartbeat.environment` is retained in the lossless heartbeat image and is not
+dropped. `sdk.v1.ExternalStorageReference` has no request carrier in this vendored
+surface; its future integration belongs to `v132-gated-surfaces`.

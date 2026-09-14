@@ -172,6 +172,20 @@ mod tests {
     // an in-crate copy of the storage crate's schema contract. In the
     // workspace, the authoritative files exist and must match exactly.
 
+    // Feature: temporal-v1.32-compatibility, Property 1: proto pin parity
+    #[test]
+    fn proto_pin_matches_upstream_version_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../proto/UPSTREAM_VERSION");
+        let version = match fs::read_to_string(path) {
+            Ok(version) => version,
+            // Published crates carry no workspace proto tree; only that absence
+            // skips parity. Permissions and other read failures must still fail.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("read {path}: {error}"),
+        };
+        assert_eq!(TEMPORAL_PROTO_VERSION, version);
+    }
+
     #[test]
     fn pinned_toolchain_matches_the_workspace_toolchain_file() {
         let workspace_file = fs::read_to_string(concat!(

@@ -218,6 +218,30 @@ pub struct VersionDrainageInfo {
     #[prost(message, optional, tag = "3")]
     pub last_checked_time: ::core::option::Option<::prost_types::Timestamp>,
 }
+/// ComputeStatus represents compute-related configuration and health for a Worker Deployment Version.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComputeStatus {
+    /// provider_validation encapsulates the health signal for validating the compute provider.
+    #[prost(message, optional, tag = "1")]
+    pub provider_validation: ::core::option::Option<
+        compute_status::ProviderValidationStatus,
+    >,
+}
+/// Nested message and enum types in `ComputeStatus`.
+pub mod compute_status {
+    /// ProviderValidationStatus represents the result of the most recent
+    /// connectivity check between Temporal and a customer's compute provider.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct ProviderValidationStatus {
+        /// Human-readable error message if connectivity validation failed.
+        /// An empty string means validation passed.
+        #[prost(string, tag = "1")]
+        pub error_message: ::prost::alloc::string::String,
+        /// Timestamp of the last validation check.
+        #[prost(message, optional, tag = "2")]
+        pub last_check_time: ::core::option::Option<::prost_types::Timestamp>,
+    }
+}
 /// A Worker Deployment (Deployment, for short) represents all workers serving
 /// a shared set of Task Queues. Typically, a Deployment represents one service or
 /// application.
@@ -320,6 +344,9 @@ pub mod worker_deployment_info {
         pub compute_config: ::core::option::Option<
             super::super::super::compute::v1::ComputeConfigSummary,
         >,
+        /// ComputeStatus represents compute-related configuration and healthchecks.
+        #[prost(message, optional, tag = "14")]
+        pub compute_status: ::core::option::Option<super::ComputeStatus>,
     }
 }
 /// A Worker Deployment Version (Version, for short) represents a

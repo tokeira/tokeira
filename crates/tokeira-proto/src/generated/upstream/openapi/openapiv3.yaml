@@ -109,6 +109,15 @@ paths:
           in: query
           schema:
             type: string
+        - name: weakConsistency
+          in: query
+          description: |-
+            If true, the server may serve the response from an eventually-consistent
+             source instead of reading through to persistence. Defaults to false,
+             which preserves read-after-write consistency. SDKs should set this when
+             fetching namespace capabilities on worker/client startup.
+          schema:
+            type: boolean
       responses:
         "200":
           description: OK
@@ -397,6 +406,16 @@ paths:
           schema:
             type: string
             format: bytes
+        - name: includeHeartbeatDetails
+          in: query
+          description: Include the heartbeat_details field inside info in the response if available.
+          schema:
+            type: boolean
+        - name: includeLastFailure
+          in: query
+          description: Include the last_failure field inside info in the response if available.
+          schema:
+            type: boolean
       responses:
         "200":
           description: OK
@@ -661,6 +680,107 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/activities/{activityId}/pause:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        PauseActivityExecution pauses the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity
+
+         Pausing an activity means:
+         - If the activity is currently waiting for a retry or is running and subsequently fails,
+           it will not be rescheduled until it is unpaused.
+         - If the activity is already paused, calling this method will have no effect.
+         - If the activity is running and finishes successfully, the activity will be completed.
+         - If the activity is running and finishes with failure:
+           * if there is no retry left - the activity will be completed.
+           * if there are more retries left - the activity will be paused.
+         For long-running activities:
+         - activities in paused state will send a cancellation with "activity_paused" set to 'true' in response to 'RecordActivityTaskHeartbeat'.
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID
+      operationId: PauseActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PauseActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/activities/{activityId}/reset:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        ResetActivityExecution resets the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+
+         Resetting an activity means:
+         * number of attempts will be reset to 0.
+         * activity timeouts will be reset.
+         * if the activity is waiting for retry, and it is not paused or 'keep_paused' is not provided:
+            it will be scheduled immediately (* see 'jitter' flag)
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID or type.
+      operationId: ResetActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResetActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
   /api/v1/namespaces/{namespace}/activities/{activityId}/resolve-as-canceled:
     post:
       tags:
@@ -738,6 +858,92 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TerminateActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/activities/{activityId}/unpause:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        UnpauseActivityExecution unpauses the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+
+         If activity is not paused, this call will have no effect.
+         If the activity was paused while waiting for retry, it will be scheduled immediately (* see 'jitter' flag).
+         Once the activity is unpaused, all timeout timers will be regenerated.
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID
+      operationId: UnpauseActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnpauseActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnpauseActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/activities/{activityId}/update-options:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        UpdateActivityExecutionOptions is called by the client to update the options of an activity by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+      operationId: UpdateActivityExecutionOptions
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateActivityExecutionOptionsRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateActivityExecutionOptionsResponse'
         default:
           description: Default error response
           content:
@@ -2033,6 +2239,7 @@ paths:
         - WorkflowService
       description: |-
         Deprecated. Use `GetWorkerVersioningRules`.
+         Will be removed in server version v1.32.0.
          Fetches the worker build id versioning sets for a task queue.
       operationId: GetWorkerBuildIdCompatibility
       parameters:
@@ -2074,7 +2281,7 @@ paths:
         - WorkflowService
       description: |-
         Fetches the Build ID assignment and redirect rules for a Task Queue.
-         WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+         Will be removed in server version v1.32.0.
       operationId: GetWorkerVersioningRules
       parameters:
         - name: namespace
@@ -2274,6 +2481,45 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UpdateNamespaceResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/worker-count:
+    get:
+      tags:
+        - WorkflowService
+      description: CountWorkers counts the number of workers in a specific namespace.
+      operationId: CountWorkers
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: query
+          in: query
+          description: |-
+            Query to filter workers before counting.
+             Supported filter fields are the same as in ListWorkersRequest.
+          schema:
+            type: string
+        - name: includeSystemWorkers
+          in: query
+          description: |-
+            When true, the count will include system workers that are created implicitly
+             by the server and not by the user. By default, system workers are excluded.
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountWorkersResponse'
         default:
           description: Default error response
           content:
@@ -2852,6 +3098,7 @@ paths:
         - WorkflowService
       description: |-
         Deprecated. Use `DescribeTaskQueue`.
+         Will be removed in server version v1.32.0.
 
          Fetches task reachability to determine whether a worker may be retired.
          The request may specify task queues to query for or let the server fetch all task queues mapped to the given
@@ -2965,6 +3212,13 @@ paths:
             * Status
           schema:
             type: string
+        - name: includeSystemWorkers
+          in: query
+          description: |-
+            When true, the response will include system workers that are created implicitly
+             by the server and not by the user. By default, system workers are excluded.
+          schema:
+            type: boolean
       responses:
         "200":
           description: OK
@@ -3739,6 +3993,123 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/workflows/{workflowId}/activities/{activityId}/pause:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        PauseActivityExecution pauses the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity
+
+         Pausing an activity means:
+         - If the activity is currently waiting for a retry or is running and subsequently fails,
+           it will not be rescheduled until it is unpaused.
+         - If the activity is already paused, calling this method will have no effect.
+         - If the activity is running and finishes successfully, the activity will be completed.
+         - If the activity is running and finishes with failure:
+           * if there is no retry left - the activity will be completed.
+           * if there are more retries left - the activity will be paused.
+         For long-running activities:
+         - activities in paused state will send a cancellation with "activity_paused" set to 'true' in response to 'RecordActivityTaskHeartbeat'.
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID
+      operationId: PauseActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: workflowId
+          in: path
+          description: |-
+            If provided, pause a workflow activity (or activities) for the given workflow ID.
+             If empty, targets a standalone activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PauseActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/workflows/{workflowId}/activities/{activityId}/reset:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        ResetActivityExecution resets the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+
+         Resetting an activity means:
+         * number of attempts will be reset to 0.
+         * activity timeouts will be reset.
+         * if the activity is waiting for retry, and it is not paused or 'keep_paused' is not provided:
+            it will be scheduled immediately (* see 'jitter' flag)
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID or type.
+      operationId: ResetActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: workflowId
+          in: path
+          description: |-
+            If provided, targets a workflow activity for the given workflow ID.
+             If empty, targets a standalone activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResetActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
   /api/v1/namespaces/{namespace}/workflows/{workflowId}/activities/{activityId}/resolve-as-canceled:
     post:
       tags:
@@ -3782,6 +4153,108 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RespondActivityTaskCanceledByIdResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/workflows/{workflowId}/activities/{activityId}/unpause:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        UnpauseActivityExecution unpauses the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+
+         If activity is not paused, this call will have no effect.
+         If the activity was paused while waiting for retry, it will be scheduled immediately (* see 'jitter' flag).
+         Once the activity is unpaused, all timeout timers will be regenerated.
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID
+      operationId: UnpauseActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: workflowId
+          in: path
+          description: |-
+            If provided, targets a workflow activity for the given workflow ID.
+             If empty, targets a standalone activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnpauseActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnpauseActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/workflows/{workflowId}/activities/{activityId}/update-options:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        UpdateActivityExecutionOptions is called by the client to update the options of an activity by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+      operationId: UpdateActivityExecutionOptions
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity
+          required: true
+          schema:
+            type: string
+        - name: workflowId
+          in: path
+          description: |-
+            If provided, targets a workflow activity for the given workflow ID.
+             If empty, targets a standalone activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateActivityExecutionOptionsRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateActivityExecutionOptionsResponse'
         default:
           description: Default error response
           content:
@@ -4093,6 +4566,50 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TerminateWorkflowExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/time-skipping/poll:
+    get:
+      tags:
+        - WorkflowService
+      operationId: PollWorkflowExecutionTimeSkipping
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: workflow_execution.workflow_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: workflowExecution.workflowId
+          in: query
+          schema:
+            type: string
+        - name: workflowExecution.runId
+          in: query
+          schema:
+            type: string
+        - name: fastForwardId
+          in: query
+          description: |-
+            Required. Identifies the fast-forward whose completion the caller wants to wait for.
+             Must match the `fast_forward_id` set in the execution's TimeSkippingConfig.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollWorkflowExecutionTimeSkippingResponse'
         default:
           description: Default error response
           content:
@@ -4466,6 +4983,15 @@ paths:
           in: query
           schema:
             type: string
+        - name: weakConsistency
+          in: query
+          description: |-
+            If true, the server may serve the response from an eventually-consistent
+             source instead of reading through to persistence. Defaults to false,
+             which preserves read-after-write consistency. SDKs should set this when
+             fetching namespace capabilities on worker/client startup.
+          schema:
+            type: boolean
       responses:
         "200":
           description: OK
@@ -4978,6 +5504,16 @@ paths:
           schema:
             type: string
             format: bytes
+        - name: includeHeartbeatDetails
+          in: query
+          description: Include the heartbeat_details field inside info in the response if available.
+          schema:
+            type: boolean
+        - name: includeLastFailure
+          in: query
+          description: Include the last_failure field inside info in the response if available.
+          schema:
+            type: boolean
       responses:
         "200":
           description: OK
@@ -5242,6 +5778,107 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/activities/{activityId}/pause:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        PauseActivityExecution pauses the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity
+
+         Pausing an activity means:
+         - If the activity is currently waiting for a retry or is running and subsequently fails,
+           it will not be rescheduled until it is unpaused.
+         - If the activity is already paused, calling this method will have no effect.
+         - If the activity is running and finishes successfully, the activity will be completed.
+         - If the activity is running and finishes with failure:
+           * if there is no retry left - the activity will be completed.
+           * if there are more retries left - the activity will be paused.
+         For long-running activities:
+         - activities in paused state will send a cancellation with "activity_paused" set to 'true' in response to 'RecordActivityTaskHeartbeat'.
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID
+      operationId: PauseActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PauseActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/activities/{activityId}/reset:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        ResetActivityExecution resets the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+
+         Resetting an activity means:
+         * number of attempts will be reset to 0.
+         * activity timeouts will be reset.
+         * if the activity is waiting for retry, and it is not paused or 'keep_paused' is not provided:
+            it will be scheduled immediately (* see 'jitter' flag)
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID or type.
+      operationId: ResetActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResetActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
   /namespaces/{namespace}/activities/{activityId}/resolve-as-canceled:
     post:
       tags:
@@ -5319,6 +5956,92 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TerminateActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/activities/{activityId}/unpause:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        UnpauseActivityExecution unpauses the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+
+         If activity is not paused, this call will have no effect.
+         If the activity was paused while waiting for retry, it will be scheduled immediately (* see 'jitter' flag).
+         Once the activity is unpaused, all timeout timers will be regenerated.
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID
+      operationId: UnpauseActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnpauseActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnpauseActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/activities/{activityId}/update-options:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        UpdateActivityExecutionOptions is called by the client to update the options of an activity by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+      operationId: UpdateActivityExecutionOptions
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateActivityExecutionOptionsRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateActivityExecutionOptionsResponse'
         default:
           description: Default error response
           content:
@@ -6589,6 +7312,7 @@ paths:
         - WorkflowService
       description: |-
         Deprecated. Use `GetWorkerVersioningRules`.
+         Will be removed in server version v1.32.0.
          Fetches the worker build id versioning sets for a task queue.
       operationId: GetWorkerBuildIdCompatibility
       parameters:
@@ -6630,7 +7354,7 @@ paths:
         - WorkflowService
       description: |-
         Fetches the Build ID assignment and redirect rules for a Task Queue.
-         WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+         Will be removed in server version v1.32.0.
       operationId: GetWorkerVersioningRules
       parameters:
         - name: namespace
@@ -6797,6 +7521,45 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DescribeTaskQueueResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/worker-count:
+    get:
+      tags:
+        - WorkflowService
+      description: CountWorkers counts the number of workers in a specific namespace.
+      operationId: CountWorkers
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: query
+          in: query
+          description: |-
+            Query to filter workers before counting.
+             Supported filter fields are the same as in ListWorkersRequest.
+          schema:
+            type: string
+        - name: includeSystemWorkers
+          in: query
+          description: |-
+            When true, the count will include system workers that are created implicitly
+             by the server and not by the user. By default, system workers are excluded.
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountWorkersResponse'
         default:
           description: Default error response
           content:
@@ -7375,6 +8138,7 @@ paths:
         - WorkflowService
       description: |-
         Deprecated. Use `DescribeTaskQueue`.
+         Will be removed in server version v1.32.0.
 
          Fetches task reachability to determine whether a worker may be retired.
          The request may specify task queues to query for or let the server fetch all task queues mapped to the given
@@ -7488,6 +8252,13 @@ paths:
             * Status
           schema:
             type: string
+        - name: includeSystemWorkers
+          in: query
+          description: |-
+            When true, the response will include system workers that are created implicitly
+             by the server and not by the user. By default, system workers are excluded.
+          schema:
+            type: boolean
       responses:
         "200":
           description: OK
@@ -8262,6 +9033,123 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/workflows/{workflowId}/activities/{activityId}/pause:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        PauseActivityExecution pauses the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity
+
+         Pausing an activity means:
+         - If the activity is currently waiting for a retry or is running and subsequently fails,
+           it will not be rescheduled until it is unpaused.
+         - If the activity is already paused, calling this method will have no effect.
+         - If the activity is running and finishes successfully, the activity will be completed.
+         - If the activity is running and finishes with failure:
+           * if there is no retry left - the activity will be completed.
+           * if there are more retries left - the activity will be paused.
+         For long-running activities:
+         - activities in paused state will send a cancellation with "activity_paused" set to 'true' in response to 'RecordActivityTaskHeartbeat'.
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID
+      operationId: PauseActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: workflowId
+          in: path
+          description: |-
+            If provided, pause a workflow activity (or activities) for the given workflow ID.
+             If empty, targets a standalone activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PauseActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/workflows/{workflowId}/activities/{activityId}/reset:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        ResetActivityExecution resets the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+
+         Resetting an activity means:
+         * number of attempts will be reset to 0.
+         * activity timeouts will be reset.
+         * if the activity is waiting for retry, and it is not paused or 'keep_paused' is not provided:
+            it will be scheduled immediately (* see 'jitter' flag)
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID or type.
+      operationId: ResetActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: workflowId
+          in: path
+          description: |-
+            If provided, targets a workflow activity for the given workflow ID.
+             If empty, targets a standalone activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResetActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
   /namespaces/{namespace}/workflows/{workflowId}/activities/{activityId}/resolve-as-canceled:
     post:
       tags:
@@ -8305,6 +9193,108 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RespondActivityTaskCanceledByIdResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/workflows/{workflowId}/activities/{activityId}/unpause:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        UnpauseActivityExecution unpauses the execution of an activity specified by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+
+         If activity is not paused, this call will have no effect.
+         If the activity was paused while waiting for retry, it will be scheduled immediately (* see 'jitter' flag).
+         Once the activity is unpaused, all timeout timers will be regenerated.
+
+         Returns a `NotFound` error if there is no pending activity with the provided ID
+      operationId: UnpauseActivityExecution
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity.
+          required: true
+          schema:
+            type: string
+        - name: workflowId
+          in: path
+          description: |-
+            If provided, targets a workflow activity for the given workflow ID.
+             If empty, targets a standalone activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnpauseActivityExecutionRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnpauseActivityExecutionResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/workflows/{workflowId}/activities/{activityId}/update-options:
+    post:
+      tags:
+        - WorkflowService
+      description: |-
+        UpdateActivityExecutionOptions is called by the client to update the options of an activity by its ID.
+         This API can be used to target a workflow activity or a standalone activity.
+      operationId: UpdateActivityExecutionOptions
+      parameters:
+        - name: namespace
+          in: path
+          description: Namespace of the workflow which scheduled this activity
+          required: true
+          schema:
+            type: string
+        - name: workflowId
+          in: path
+          description: |-
+            If provided, targets a workflow activity for the given workflow ID.
+             If empty, targets a standalone activity.
+          required: true
+          schema:
+            type: string
+        - name: activityId
+          in: path
+          description: The ID of the activity to target.
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateActivityExecutionOptionsRequest'
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateActivityExecutionOptionsResponse'
         default:
           description: Default error response
           content:
@@ -8622,6 +9612,50 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/time-skipping/poll:
+    get:
+      tags:
+        - WorkflowService
+      operationId: PollWorkflowExecutionTimeSkipping
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: workflow_execution.workflow_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: workflowExecution.workflowId
+          in: query
+          schema:
+            type: string
+        - name: workflowExecution.runId
+          in: query
+          schema:
+            type: string
+        - name: fastForwardId
+          in: query
+          description: |-
+            Required. Identifies the fast-forward whose completion the caller wants to wait for.
+             Must match the `fast_forward_id` set in the execution's TimeSkippingConfig.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollWorkflowExecutionTimeSkippingResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
   /namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/update-options:
     post:
       tags:
@@ -8743,6 +9777,7 @@ components:
             - ACTIVITY_EXECUTION_STATUS_CANCELED
             - ACTIVITY_EXECUTION_STATUS_TERMINATED
             - ACTIVITY_EXECUTION_STATUS_TIMED_OUT
+            - ACTIVITY_EXECUTION_STATUS_PAUSED
           type: string
           description: A general status for this activity, indicates whether it is currently running or in one of the terminal statuses.
           format: enum
@@ -8798,7 +9833,9 @@ components:
         heartbeatDetails:
           allOf:
             - $ref: '#/components/schemas/Payloads'
-          description: Details provided in the last recorded activity heartbeat.
+          description: |-
+            Details provided in the last recorded activity heartbeat.
+             DescribeActivityExecution does not set this field unless include_heartbeat_details was true in the request.
         lastHeartbeatTime:
           type: string
           description: Time the last heartbeat was recorded.
@@ -8821,7 +9858,9 @@ components:
           format: date-time
         expirationTime:
           type: string
-          description: Scheduled time + schedule to close timeout.
+          description: |-
+            The time at which the activity's Schedule-to-Close timeout expires.
+             Calculated as `schedule_time` + `start_delay` + `schedule_to_close_timeout`.
           format: date-time
         closeTime:
           type: string
@@ -8830,7 +9869,9 @@ components:
         lastFailure:
           allOf:
             - $ref: '#/components/schemas/Failure'
-          description: Failure details from the last failed attempt.
+          description: |-
+            Failure details from the last failed attempt.
+             DescribeActivityExecution does not set this field unless include_last_failure was true in the request.
         lastWorkerIdentity:
           type: string
         currentRetryInterval:
@@ -8888,6 +9929,26 @@ components:
         totalHeartbeatCount:
           type: string
           description: Total number of heartbeats recorded across all attempts of this activity, including retries.
+        sdkName:
+          type: string
+          description: |-
+            The name of the SDK of the worker that most recently picked up an attempt of this activity.
+             Overwritten on each new attempt. Empty if unknown.
+        sdkVersion:
+          type: string
+          description: |-
+            The version of the SDK of the worker that most recently picked up an attempt of this activity.
+             Overwritten on each new attempt. Empty if unknown.
+        startDelay:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
+        executionTime:
+          type: string
+          description: |-
+            The time at which the first activity task is made available for dispatch, computed as
+             `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
+          format: date-time
       description: Information about a standalone activity.
     ActivityExecutionListInfo:
       type: object
@@ -8919,6 +9980,7 @@ components:
             - ACTIVITY_EXECUTION_STATUS_CANCELED
             - ACTIVITY_EXECUTION_STATUS_TERMINATED
             - ACTIVITY_EXECUTION_STATUS_TIMED_OUT
+            - ACTIVITY_EXECUTION_STATUS_PAUSED
           type: string
           description: |-
             Only scheduled and terminal statuses appear here. More detailed information in PendingActivityInfo but not
@@ -8943,6 +10005,12 @@ components:
           description: |-
             The difference between close time and scheduled time.
              This field is only populated if the activity is closed.
+        executionTime:
+          type: string
+          description: |-
+            The time at which the first activity task is made available for dispatch, computed as
+             `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
+          format: date-time
       description: |-
         Limited activity information returned in the list response.
          When adding fields here, ensure that it is also present in ActivityExecutionInfo (note that it
@@ -8958,6 +10026,21 @@ components:
           allOf:
             - $ref: '#/components/schemas/Failure'
           description: The failure if the activity completed unsuccessfully.
+        retryState:
+          enum:
+            - RETRY_STATE_UNSPECIFIED
+            - RETRY_STATE_IN_PROGRESS
+            - RETRY_STATE_NON_RETRYABLE_FAILURE
+            - RETRY_STATE_TIMEOUT
+            - RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED
+            - RETRY_STATE_RETRY_POLICY_NOT_SET
+            - RETRY_STATE_INTERNAL_SERVER_ERROR
+            - RETRY_STATE_CANCEL_REQUESTED
+          type: string
+          description: |-
+            The retry state associated with an unsuccessful activity execution.
+             This field is only meaningful when `failure` is set.
+          format: enum
       description: 'The outcome of a completed activity execution: either a successful result or a failure.'
     ActivityFailureInfo:
       type: object
@@ -9033,6 +10116,13 @@ components:
           description: |-
             Priority metadata. If this message is not present, or any fields are not
              present, they inherit the values from the workflow.
+        startDelay:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: |-
+            Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
+             When updated, the time is added to the original `schedule_time`, not to the current time.
+             If the resulting time is in the past, the task is made available for dispatch immediately.
     ActivityPropertiesModifiedExternallyEventAttributes:
       type: object
       properties:
@@ -9364,6 +10454,20 @@ components:
         createTime:
           type: string
           format: date-time
+    BatchOperationCancelActivities:
+      type: object
+      properties:
+        identity:
+          type: string
+          description: The identity of the worker/client
+        reason:
+          type: string
+          description: |-
+            Reason for requesting the cancellation, recorded and available via the PollActivityExecution API.
+             Not propagated to a worker if an activity attempt is currently running.
+      description: |-
+        BatchOperationCancelActivities sends cancel requests to a batch of activities.
+         Keep the parameter in sync with temporal.api.workflowservice.v1.RequestCancelActivityExecutionRequest.
     BatchOperationCancellation:
       type: object
       properties:
@@ -9374,6 +10478,12 @@ components:
         BatchOperationCancellation sends cancel requests to batch workflows.
          Keep the parameter in sync with temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest.
          Ignore first_execution_run_id because this is used for single workflow operation.
+    BatchOperationDeleteActivities:
+      type: object
+      properties: {}
+      description: |-
+        BatchOperationDeleteActivities sends deletion requests to a batch of activities.
+         Keep the parameter in sync with temporal.api.workflowservice.v1.DeleteActivityExecutionRequest.
     BatchOperationDeletion:
       type: object
       properties:
@@ -9406,6 +10516,30 @@ components:
           type: string
           description: Batch operation close time
           format: date-time
+        operationType:
+          enum:
+            - BATCH_OPERATION_TYPE_UNSPECIFIED
+            - BATCH_OPERATION_TYPE_TERMINATE
+            - BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW
+            - BATCH_OPERATION_TYPE_CANCEL
+            - BATCH_OPERATION_TYPE_CANCEL_WORKFLOW
+            - BATCH_OPERATION_TYPE_SIGNAL
+            - BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW
+            - BATCH_OPERATION_TYPE_DELETE
+            - BATCH_OPERATION_TYPE_DELETE_WORKFLOW
+            - BATCH_OPERATION_TYPE_RESET
+            - BATCH_OPERATION_TYPE_RESET_WORKFLOW
+            - BATCH_OPERATION_TYPE_UPDATE_EXECUTION_OPTIONS
+            - BATCH_OPERATION_TYPE_UPDATE_WORKFLOW_EXECUTION_OPTIONS
+            - BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY
+            - BATCH_OPERATION_TYPE_UPDATE_ACTIVITY_OPTIONS
+            - BATCH_OPERATION_TYPE_RESET_ACTIVITY
+            - BATCH_OPERATION_TYPE_TERMINATE_ACTIVITY
+            - BATCH_OPERATION_TYPE_CANCEL_ACTIVITY
+            - BATCH_OPERATION_TYPE_DELETE_ACTIVITY
+          type: string
+          description: Operation type
+          format: enum
     BatchOperationReset:
       type: object
       properties:
@@ -9500,6 +10634,20 @@ components:
       description: |-
         BatchOperationSignal sends signals to batch workflows.
          Keep the parameter in sync with temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest.
+    BatchOperationTerminateActivities:
+      type: object
+      properties:
+        identity:
+          type: string
+          description: The identity of the worker/client
+        reason:
+          type: string
+          description: |-
+            Reason for requesting the termination, recorded and available via the PollActivityExecution API.
+             Not propagated to a worker if an activity attempt is currently running.
+      description: |-
+        BatchOperationTerminateActivities sends terminate requests to a batch of activities.
+         Keep the parameter in sync with temporal.api.workflowservice.v1.TerminateActivityExecutionRequest.
     BatchOperationTermination:
       type: object
       properties:
@@ -10147,6 +11295,29 @@ components:
       description: |-
         ComputeScaler instructs the Temporal Service when to scale up or down the number of
          Workers that comprise a WorkerDeployment.
+    ComputeStatus:
+      type: object
+      properties:
+        providerValidation:
+          allOf:
+            - $ref: '#/components/schemas/ComputeStatus_ProviderValidationStatus'
+          description: provider_validation encapsulates the health signal for validating the compute provider.
+      description: ComputeStatus represents compute-related configuration and health for a Worker Deployment Version.
+    ComputeStatus_ProviderValidationStatus:
+      type: object
+      properties:
+        errorMessage:
+          type: string
+          description: |-
+            Human-readable error message if connectivity validation failed.
+             An empty string means validation passed.
+        lastCheckTime:
+          type: string
+          description: Timestamp of the last validation check.
+          format: date-time
+      description: |-
+        ProviderValidationStatus represents the result of the most recent
+         connectivity check between Temporal and a customer's compute provider.
     ConfigMetadata:
       type: object
       properties:
@@ -10243,6 +11414,12 @@ components:
             $ref: '#/components/schemas/Payload'
         count:
           type: string
+    CountWorkersResponse:
+      type: object
+      properties:
+        count:
+          type: string
+          description: Number of workers matching the query.
     CountWorkflowExecutionsResponse:
       type: object
       properties:
@@ -10571,7 +11748,9 @@ components:
         info:
           allOf:
             - $ref: '#/components/schemas/ActivityExecutionInfo'
-          description: Information about the activity execution.
+          description: |-
+            Information about the activity execution. Fields heartbeat_details and last_failure are omitted unless
+             the request has include_heartbeat_details or include_last_failure set to true, respectively.
         input:
           allOf:
             - $ref: '#/components/schemas/Payloads'
@@ -10598,14 +11777,23 @@ components:
           enum:
             - BATCH_OPERATION_TYPE_UNSPECIFIED
             - BATCH_OPERATION_TYPE_TERMINATE
+            - BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW
             - BATCH_OPERATION_TYPE_CANCEL
+            - BATCH_OPERATION_TYPE_CANCEL_WORKFLOW
             - BATCH_OPERATION_TYPE_SIGNAL
+            - BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW
             - BATCH_OPERATION_TYPE_DELETE
+            - BATCH_OPERATION_TYPE_DELETE_WORKFLOW
             - BATCH_OPERATION_TYPE_RESET
+            - BATCH_OPERATION_TYPE_RESET_WORKFLOW
             - BATCH_OPERATION_TYPE_UPDATE_EXECUTION_OPTIONS
+            - BATCH_OPERATION_TYPE_UPDATE_WORKFLOW_EXECUTION_OPTIONS
             - BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY
             - BATCH_OPERATION_TYPE_UPDATE_ACTIVITY_OPTIONS
             - BATCH_OPERATION_TYPE_RESET_ACTIVITY
+            - BATCH_OPERATION_TYPE_TERMINATE_ACTIVITY
+            - BATCH_OPERATION_TYPE_CANCEL_ACTIVITY
+            - BATCH_OPERATION_TYPE_DELETE_ACTIVITY
           type: string
           description: Batch operation type
           format: enum
@@ -10644,6 +11832,14 @@ components:
         reason:
           type: string
           description: Reason indicates the reason to stop a operation
+        query:
+          type: string
+          description: Query is the visibility query that defines the group of workflow to apply the batch operation
+        executions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Execution'
+          description: Executions is the list of workflow OR standalone activity executions to apply the batch operation
     DescribeDeploymentResponse:
       type: object
       properties:
@@ -10670,6 +11866,23 @@ components:
           description: |-
             Contains the historical state of failover_versions for the cluster, truncated to contain only the last N
              states to ensure that the list does not grow unbounded.
+        pollerGroupInfos:
+          type: array
+          items:
+            $ref: '#/components/schemas/PollerGroupInfo'
+          description: |-
+            Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
+             ignore stale updates.
+             The initial info that client should use for poller group assignment. This information is
+             updated through poll response. Client is supposed to use the info received in the latest
+             poll response.
+        pollerGroupsInfo:
+          allOf:
+            - $ref: '#/components/schemas/PollerGroupsInfo'
+          description: |-
+            The initial, versioned info that client should use for poller group assignment. This
+             information is updated through poll responses. Client is supposed to use the info with the
+             highest version it has received.
     DescribeNexusOperationExecutionResponse:
       type: object
       properties:
@@ -10974,6 +12187,208 @@ components:
           type: string
           description: Nexus task queue to route requests to.
       description: Target a worker polling on a Nexus task queue in a specific namespace.
+    EnvironmentInfo:
+      type: object
+      properties:
+        runtimes:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvironmentInfo_Runtime'
+          description: The runtime(s) the SDK is operating in.
+        hostingEnvironments:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvironmentInfo_HostingEnvironment'
+          description: 'The hosting environment(s) the SDK is operating in. Repeated to allow for layering (ex: Docker inside k8s).'
+        platform:
+          allOf:
+            - $ref: '#/components/schemas/EnvironmentInfo_Platform'
+          description: The platform the SDK is operating on.
+    EnvironmentInfo_HostingEnvironment:
+      type: object
+      properties:
+        type:
+          enum:
+            - HOSTING_ENVIRONMENT_TYPE_UNSPECIFIED
+            - HOSTING_ENVIRONMENT_TYPE_DOCKER
+            - HOSTING_ENVIRONMENT_TYPE_K8S
+            - HOSTING_ENVIRONMENT_TYPE_AWS_LAMBDA
+            - HOSTING_ENVIRONMENT_TYPE_AWS_ECS
+            - HOSTING_ENVIRONMENT_TYPE_GOOGLE_CLOUD_RUN
+            - HOSTING_ENVIRONMENT_TYPE_GOOGLE_APP_ENGINE
+            - HOSTING_ENVIRONMENT_TYPE_AZURE_APP_SERVICE
+            - HOSTING_ENVIRONMENT_TYPE_AZURE_FUNCTIONS
+            - HOSTING_ENVIRONMENT_TYPE_AZURE_CONTAINER_APPS
+          type: string
+          description: The type of hosting environment.
+          format: enum
+        version:
+          type: string
+          description: The version of the hosting environment, if obtainable.
+    EnvironmentInfo_LinuxPlatform:
+      type: object
+      properties:
+        version:
+          type: string
+          description: The Linux kernel or distribution version, if obtainable.
+        architecture:
+          enum:
+            - ARCHITECTURE_UNSPECIFIED
+            - ARCHITECTURE_AMD64
+            - ARCHITECTURE_ARM64
+          type: string
+          description: The architecture of the worker process.
+          format: enum
+        libc:
+          enum:
+            - LIBC_UNSPECIFIED
+            - LIBC_GLIBC
+            - LIBC_MUSL
+          type: string
+          description: The libc used by the worker process.
+          format: enum
+    EnvironmentInfo_MacOSPlatform:
+      type: object
+      properties:
+        version:
+          type: string
+          description: The macOS version, if obtainable.
+        architecture:
+          enum:
+            - ARCHITECTURE_UNSPECIFIED
+            - ARCHITECTURE_AMD64
+            - ARCHITECTURE_ARM64
+          type: string
+          description: The architecture of the worker process.
+          format: enum
+    EnvironmentInfo_Platform:
+      type: object
+      properties:
+        linux:
+          $ref: '#/components/schemas/EnvironmentInfo_LinuxPlatform'
+        macos:
+          $ref: '#/components/schemas/EnvironmentInfo_MacOSPlatform'
+        windows:
+          $ref: '#/components/schemas/EnvironmentInfo_WindowsPlatform'
+    EnvironmentInfo_Runtime:
+      type: object
+      properties:
+        type:
+          enum:
+            - RUNTIME_TYPE_UNSPECIFIED
+            - RUNTIME_TYPE_JVM
+            - RUNTIME_TYPE_CPYTHON
+            - RUNTIME_TYPE_NODE
+            - RUNTIME_TYPE_BUN
+            - RUNTIME_TYPE_CRUBY
+            - RUNTIME_TYPE_GO
+            - RUNTIME_TYPE_DOTNET_FRAMEWORK
+            - RUNTIME_TYPE_DOTNET_CORE
+            - RUNTIME_TYPE_NATIVE
+            - RUNTIME_TYPE_ROADRUNNER
+          type: string
+          description: The type of the runtime.
+          format: enum
+        version:
+          type: string
+          description: The version of the runtime, if obtainable.
+    EnvironmentInfo_WindowsPlatform:
+      type: object
+      properties:
+        version:
+          type: string
+          description: The Windows version, if obtainable.
+        architecture:
+          enum:
+            - ARCHITECTURE_UNSPECIFIED
+            - ARCHITECTURE_AMD64
+            - ARCHITECTURE_ARM64
+          type: string
+          description: The architecture of the worker process.
+          format: enum
+        crt:
+          enum:
+            - CRT_UNSPECIFIED
+            - CRT_UCRT
+            - CRT_MSVCRT
+            - CRT_MINGW
+            - CRT_CYGWIN
+          type: string
+          description: The C runtime used by the worker process, if obtainable.
+          format: enum
+    EventGroupMarker:
+      type: object
+      properties:
+        label:
+          $ref: '#/components/schemas/EventGroupMarker_Label'
+        inboundEvent:
+          $ref: '#/components/schemas/EventGroupMarker_InboundEvent'
+        inboundUpdate:
+          $ref: '#/components/schemas/EventGroupMarker_InboundUpdate'
+    EventGroupMarker_InboundEvent:
+      type: object
+      properties:
+        inboundEventId:
+          type: string
+      description: |-
+        The event ID of an event in the present workflow that triggered implicit
+         creation of this group Marker.
+
+         The target event's type must be one of the following:
+          - `WORKFLOW_EXECUTION_STARTED`
+          - `WORKFLOW_EXECUTION_SIGNALED`
+    EventGroupMarker_InboundUpdate:
+      type: object
+      properties:
+        inboundUpdateId:
+          type: string
+      description: |-
+        The identifier of an inbound Update (request.meta.update_id)
+         whose handler triggered implicit creation of this group Marker.
+
+         Used in place of `inbound_event_id` for Updates because the event ID of the
+         UpdateAccepted history event is not known until the Workflow Task is
+         completed and recorded by the server, which may be too late.
+    EventGroupMarker_Label:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Opaque identifier assigned by the SDK.
+        label:
+          allOf:
+            - $ref: '#/components/schemas/Payload'
+          description: |-
+            This payload should be a "json/plain"-encoded payload that is a single
+             JSON string for use in user interfaces. User interface formatting may not
+             apply to this text when used in "label" situations. The payload data
+             section is limited to 400 bytes by default.
+
+             Payload only needs to be set on the first use of a given Marker ID;
+             further references to an existing Marker ID reuse existing attributes of
+             the referenced Marker -- i.e. further label payloads are ignored.
+
+             Note that it is valid to have distinct Markers (i.e. distinct Marker IDs)
+             in a given workflow execution that carry the same label, provided that
+             they have the distinct ID.
+      description: A user-defined short-form string value to be used as the group's label.
+    Execution:
+      type: object
+      properties:
+        type:
+          enum:
+            - EXECUTION_TYPE_UNSPECIFIED
+            - EXECUTION_TYPE_WORKFLOW
+            - EXECUTION_TYPE_ACTIVITY
+          type: string
+          format: enum
+        businessId:
+          type: string
+        runId:
+          type: string
+      description: |-
+        Identifies a specific execution within a namespace. This is used for standalone activities
+         executions in batch jobs currently.
     ExternalWorkflowExecutionCancelRequestedEventAttributes:
       type: object
       properties:
@@ -11071,6 +12486,28 @@ components:
           $ref: '#/components/schemas/NexusOperationFailureInfo'
         nexusHandlerFailureInfo:
           $ref: '#/components/schemas/NexusHandlerFailureInfo'
+    FastForwardConfig:
+      type: object
+      properties:
+        id:
+          type: string
+          description: |-
+            A client-supplied ID, required field, set alongside `duration`. It is used to poll for
+             fast-forward completion via PollWorkflowExecutionTimeSkipping.
+             The server performs no idempotency check on this ID; the client is responsible for managing it.
+        duration:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: |-
+            Fast-forward the current execution by this duration ahead of the current execution time; required field.
+             The duration yields a target time (current execution time + duration), surfaced as `target_time` in
+             TimeSkippingFastForwardInfo. Once virtual time reaches that target, the fast-forward completes, time
+             skipping is disabled, and no further time is skipped. Time skipping can be resumed either
+             by updating the TimeSkippingConfig with a new FastForwardConfig, or by clearing the FastForwardConfig
+             to skip through to the end of the execution.
+
+             If this duration exceeds the remaining execution timeout, time will not pass beyond the end
+             of the execution, and the fast-forward won't have a chance to complete.
     FetchWorkerConfigRequest:
       type: object
       properties:
@@ -11224,6 +12661,12 @@ components:
             True if the server supports server-scaled deployments.
              This flag is dependent both on server version and for server-scaled deployments
              to be enabled via server configuration.
+        serverScaledProviderCloudRun:
+          type: boolean
+          description: |-
+            True if the server supports the Cloud Run compute provider for
+             server-scaled deployments. Dependent on server version and the
+             provider being enabled via server configuration.
       description: System capability details.
     GetWorkerBuildIdCompatibilityResponse:
       type: object
@@ -11442,6 +12885,11 @@ components:
           allOf:
             - $ref: '#/components/schemas/Principal'
           description: Server-computed authenticated caller identity associated with this event.
+        eventGroupMarkers:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventGroupMarker'
+          description: Event group markers attached to this event.
         workflowExecutionStartedEventAttributes:
           $ref: '#/components/schemas/WorkflowExecutionStartedEventAttributes'
         workflowExecutionCompletedEventAttributes:
@@ -11645,6 +13093,8 @@ components:
           $ref: '#/components/schemas/Link_Activity'
         nexusOperation:
           $ref: '#/components/schemas/Link_NexusOperation'
+        workflow:
+          $ref: '#/components/schemas/Link_Workflow'
       description: |-
         Link can be associated with history events. It might contain information about an external entity
          related to the history event. For example, workflow A makes a Nexus call that starts workflow B:
@@ -11679,6 +13129,18 @@ components:
         runId:
           type: string
       description: A link to a standalone Nexus operation.
+    Link_Workflow:
+      type: object
+      properties:
+        namespace:
+          type: string
+        workflowId:
+          type: string
+        runId:
+          type: string
+        reason:
+          type: string
+      description: "A link to a workflow execution. This is a more general version of WorkflowEvent that doesn't specify a \n particular event within the workflow, useful when you want to link to a workflow but there is no particular event to link to,\n such as a Query or a Rejected Update."
     Link_WorkflowEvent:
       type: object
       properties:
@@ -12077,6 +13539,30 @@ components:
         pollerAutoscaling:
           type: boolean
           description: True if the namespace supports poller autoscaling
+        workerCommands:
+          type: boolean
+          description: True if the namespace supports worker commands (server-to-worker communication via control queues).
+        standaloneNexusOperation:
+          type: boolean
+          description: True if the namespace supports standalone Nexus operations.
+        workflowUpdateCallbacks:
+          type: boolean
+          description: True if the namespace supports attaching callbacks on workflow updates
+        pollerAutoscalingAutoEnroll:
+          type: boolean
+          description: When true, workers should use poller autoscaling by default unless explicitly configured otherwise.
+        workflowTaskCompletionPagination:
+          type: boolean
+          description: True if the namespace supports pagination of `RespondWorkflowTaskCompleted` request.
+        standaloneActivityStartDelay:
+          type: boolean
+          description: True if the namespace supports start delay for standalone activities.
+        standaloneActivityBatchOperations:
+          type: boolean
+          description: True if the namespace supports batch operations for standalone activities.
+        standaloneActivityOperatorCommands:
+          type: boolean
+          description: True if the namespace supports standalone activity operator commands.
       description: Namespace capability details. Should contain what features are enabled in a namespace.
     NamespaceInfo_Limits:
       type: object
@@ -12090,6 +13576,12 @@ components:
         memoSizeLimitError:
           type: string
           description: Maximum total memo size in bytes per workflow execution.
+        workflowTaskCompletionSizeLimitError:
+          type: string
+          description: |-
+            Maximum total size in bytes of a single RespondWorkflowTaskCompleted request.
+             Requests exceeding this fail the workflow task with
+             WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE. 0 means no explicit limit.
     NamespaceReplicationConfig:
       type: object
       properties:
@@ -12482,6 +13974,9 @@ components:
         identity:
           type: string
           description: The identity of the client who started this operation.
+        stateSizeBytes:
+          type: string
+          description: Updated once on scheduled and once on terminal status.
       description: Full current state of a standalone Nexus operation, as of the time of the request.
     NexusOperationExecutionListInfo:
       type: object
@@ -12534,6 +14029,9 @@ components:
           description: |-
             The difference between close time and scheduled time.
              This field is only populated if the operation is closed.
+        stateSizeBytes:
+          type: string
+          description: Updated once on scheduled and once on terminal status.
       description: |-
         Limited Nexus operation information returned in the list response.
          When adding fields here, ensure that it is also present in NexusOperationExecutionInfo (note that it may already be present in
@@ -12729,6 +14227,38 @@ components:
     PatchScheduleResponse:
       type: object
       properties: {}
+    PauseActivityExecutionRequest:
+      type: object
+      properties:
+        namespace:
+          type: string
+          description: Namespace of the workflow which scheduled this activity.
+        workflowId:
+          type: string
+          description: |-
+            If provided, pause a workflow activity (or activities) for the given workflow ID.
+             If empty, targets a standalone activity.
+        activityId:
+          type: string
+          description: The ID of the activity to target.
+        runId:
+          type: string
+          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
+        identity:
+          type: string
+          description: The identity of the client who initiated this request.
+        reason:
+          type: string
+          description: Reason to pause the activity.
+        resourceId:
+          type: string
+          description: Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+        requestId:
+          type: string
+          description: Used to de-dupe pause requests.
+    PauseActivityExecutionResponse:
+      type: object
+      properties: {}
     PauseActivityRequest:
       type: object
       properties:
@@ -12753,9 +14283,14 @@ components:
         reason:
           type: string
           description: Reason to pause the activity.
+        requestId:
+          type: string
+          description: Used to de-dupe pause requests.
+      description: Deprecated. Use `PauseActivityExecutionRequest`.
     PauseActivityResponse:
       type: object
       properties: {}
+      description: Deprecated. Use `PauseActivityExecutionResponse`.
     PauseInfo_Manual:
       type: object
       properties:
@@ -13121,6 +14656,27 @@ components:
           allOf:
             - $ref: '#/components/schemas/Failure'
           description: The failure if the operation completed unsuccessfully.
+    PollWorkflowExecutionTimeSkippingResponse:
+      type: object
+      properties:
+        fastForwardPollingResult:
+          enum:
+            - FAST_FORWARD_POLLING_RESULT_UNSPECIFIED
+            - FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT
+            - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED
+            - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED
+          type: string
+          description: The outcome of the poll for the fast-forward identified by the request's `fast_forward_id`.
+          format: enum
+        failedReason:
+          type: string
+          description: |-
+            Set only when the result is FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED; explains why
+             the fast-forward can no longer complete.
+        fastForwardInfo:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingFastForwardInfo'
+          description: The execution's current fast-forward, if any.
     PollWorkflowTaskQueueResponse:
       type: object
       properties:
@@ -13222,8 +14778,21 @@ components:
           items:
             $ref: '#/components/schemas/PollerGroupInfo'
           description: |-
-            The weighted list of poller groups IDs that client should use for future polls to this task
+            Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
+             ignore stale updates.
+             The weighted list of poller groups IDs that client should use for future polls to this task
              queue. Client is expected to:
+               1. Maintain minimum number of pollers no less than the number of groups.
+               2. Try to assign the next poll to a group without any pending polls,
+               3. If every group has some pending polls, assign the next poll to a group randomly
+                 according to the weights.
+        pollerGroupsInfo:
+          allOf:
+            - $ref: '#/components/schemas/PollerGroupsInfo'
+          description: |-
+            The weighted, versioned list of poller groups IDs that client should use for future polls to
+             this task queue. Client should ignore this if it has already applied a snapshot with a
+             version greater than or equal to `poller_groups_info.version`. Client is expected to:
                1. Maintain minimum number of pollers no less than the number of groups.
                2. Try to assign the next poll to a group without any pending polls,
                3. If every group has some pending polls, assign the next poll to a group randomly
@@ -13236,6 +14805,23 @@ components:
         weight:
           type: number
           format: float
+    PollerGroupsInfo:
+      type: object
+      properties:
+        version:
+          type: string
+          description: |-
+            Monotonically increasing version of this snapshot. A client should ignore any snapshot whose
+             version is not greater than the one it last applied.
+        pollerGroups:
+          type: array
+          items:
+            $ref: '#/components/schemas/PollerGroupInfo'
+          description: The weighted list of poller groups the client should use for future polls to this task queue.
+      description: |-
+        A versioned snapshot of the poller groups the client should use for future polls to a task
+         queue. The version is monotonically increasing so that a client can ignore a snapshot that is
+         older than the one it has already applied.
     PollerInfo:
       type: object
       properties:
@@ -13465,6 +15051,10 @@ components:
           $ref: '#/components/schemas/Payloads'
         queryRejected:
           $ref: '#/components/schemas/QueryRejected'
+        link:
+          allOf:
+            - $ref: '#/components/schemas/Link'
+          description: Holds the link to the Workflow execution that processed the Query.
     RampByPercentage:
       type: object
       properties:
@@ -13671,6 +15261,19 @@ components:
           $ref: '#/components/schemas/Meta'
         input:
           $ref: '#/components/schemas/Input'
+        requestId:
+          type: string
+          description: The request ID of the request.
+        completionCallbacks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Callback'
+          description: Callbacks to be called by the server when this update reaches a terminal state.
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/Link'
+          description: Links to be associated with this update.
       description: The client request that triggers a Workflow Update.
     RequestCancelActivityExecutionRequest:
       type: object
@@ -13681,7 +15284,7 @@ components:
           type: string
         runId:
           type: string
-          description: Activity run ID, targets the latest run if run_id is empty.
+          description: Activity run ID. If empty, targets the latest run.
         identity:
           type: string
           description: The identity of the worker/client.
@@ -13885,6 +15488,56 @@ components:
             Indicate if the request is still buffered. If so, the event ID is not known and its value
              will be an invalid event ID.
       description: RequestIdInfo contains details of a request ID.
+    ResetActivityExecutionRequest:
+      type: object
+      properties:
+        namespace:
+          type: string
+          description: Namespace of the workflow which scheduled this activity.
+        workflowId:
+          type: string
+          description: |-
+            If provided, targets a workflow activity for the given workflow ID.
+             If empty, targets a standalone activity.
+        activityId:
+          type: string
+          description: The ID of the activity to target.
+        runId:
+          type: string
+          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
+        identity:
+          type: string
+          description: The identity of the client who initiated this request.
+        keepPaused:
+          type: boolean
+          description: If activity is paused, it will remain paused after reset
+        jitter:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: |-
+            If set, and activity is in backoff, the activity will start at a random time within the specified jitter duration.
+             (unless it is paused and keep_paused is set)
+        restoreOriginalOptions:
+          type: boolean
+          description: |-
+            If set, the activity options will be restored to the defaults.
+             Default options are then options activity was created with.
+             They are part of the first schedule event.
+        resourceId:
+          type: string
+          description: Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+        requestId:
+          type: string
+          description: Used to de-dupe reset requests.
+        resetHeartbeat:
+          type: boolean
+          description: |-
+            Reset persisted heartbeat details.
+             Reset always resets the attempt counter. Passing this flag causes reset to additionally
+             discard any persisted heartbeat details.
+    ResetActivityExecutionResponse:
+      type: object
+      properties: {}
     ResetActivityRequest:
       type: object
       properties:
@@ -13926,11 +15579,14 @@ components:
           description: |-
             If set, the activity options will be restored to the defaults.
              Default options are then options activity was created with.
-             They are part of the first SCHEDULE event.
-      description: 'NOTE: keep in sync with temporal.api.batch.v1.BatchOperationResetActivities'
+             They are part of the first schedule event.
+      description: |-
+        NOTE: keep in sync with temporal.api.batch.v1.BatchOperationResetActivities
+         Deprecated. Use `ResetActivityExecutionRequest`.
     ResetActivityResponse:
       type: object
       properties: {}
+      description: Deprecated. Use `ResetActivityExecutionRequest`.
     ResetOptions:
       type: object
       properties:
@@ -14517,6 +16173,9 @@ components:
         invalidScheduleError:
           type: string
           description: Deprecated.
+        stateSizeBytes:
+          type: string
+          description: Size of the schedule's internal state (including payloads) in bytes.
     ScheduleListEntry:
       type: object
       properties:
@@ -14560,6 +16219,9 @@ components:
           items:
             type: string
             format: date-time
+        stateSizeBytes:
+          type: string
+          description: Size of the schedule's internal state (including payloads) in bytes.
       description: |-
         ScheduleListInfo is an abbreviated set of values from Schedule and ScheduleInfo
          that's returned in ListSchedules.
@@ -15163,9 +16825,9 @@ components:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
           description: |-
-            Time to wait before dispatching the first workflow task. Cannot be used with `cron_schedule`.
+            Time to wait before making the first workflow task available for dispatch. Cannot be used with `cron_schedule`.
              Note that the signal will be delivered with the first workflow task. If the workflow gets
-             another SignalWithStartWorkflow before the delay a workflow task will be dispatched immediately
+             another SignalWithStartWorkflow before the delay a workflow task will be made available for dispatch immediately
              and the rest of the delay period will be ignored, even if that request also had a delay.
              Signal via SignalWorkflowExecution will not unblock the workflow.
         userMetadata:
@@ -15200,6 +16862,9 @@ components:
         runId:
           type: string
           description: The run id of the workflow that was started - or just signaled, if it was already running.
+        firstExecutionRunId:
+          type: string
+          description: If the workflow was started as a result of a de-dupe, this field will contain the run id of the first execution in the chain.
         started:
           type: boolean
           description: If true, a new workflow was started.
@@ -15382,7 +17047,7 @@ components:
         startDelay:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
-          description: Time to wait before dispatching the first activity task. This delay is not applied to retry attempts.
+          description: Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
     StartActivityExecutionResponse:
       type: object
       properties:
@@ -15420,6 +17085,14 @@ components:
           description: |-
             Executions to apply the batch operation
              This field and `visibility_query` are mutually exclusive
+             DEPRECATED: Use `target_executions` instead.
+        targetExecutions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Execution'
+          description: |-
+            Target executions to apply the batch operation. This field and `visibility_query`
+             are mutually exclusive.
         maxOperationsPerSecond:
           type: number
           description: |-
@@ -15448,6 +17121,12 @@ components:
           $ref: '#/components/schemas/BatchOperationResetActivities'
         updateActivityOptionsOperation:
           $ref: '#/components/schemas/BatchOperationUpdateActivityOptions'
+        cancelActivitiesOperation:
+          $ref: '#/components/schemas/BatchOperationCancelActivities'
+        terminateActivitiesOperation:
+          $ref: '#/components/schemas/BatchOperationTerminateActivities'
+        deleteActivitiesOperation:
+          $ref: '#/components/schemas/BatchOperationDeleteActivities'
     StartBatchOperationResponse:
       type: object
       properties: {}
@@ -15470,6 +17149,7 @@ components:
             - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED
             - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS
             - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND
+            - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE
           type: string
           format: enum
         control:
@@ -15557,6 +17237,22 @@ components:
           allOf:
             - $ref: '#/components/schemas/Priority'
           description: Priority metadata
+        timeSkippingConfig:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingConfig'
+          description: The propagated time-skipping configuration for the child workflow.
+        timeSkippingStatePropagation:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingStatePropagation'
+          description: |-
+            The time-skipping state propagated from the parent workflow. This can be nil if no time skipping
+             has occurred or there is no previous run.
+        versioningOverride:
+          allOf:
+            - $ref: '#/components/schemas/VersioningOverride'
+          description: |-
+            Versioning override requested for the child workflow. If present, this explicit override
+             takes precedence over versioning behavior inherited from the parent workflow.
     StartNexusOperationExecutionRequest:
       type: object
       properties:
@@ -15761,8 +17457,8 @@ components:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
           description: |-
-            Time to wait before dispatching the first workflow task. Cannot be used with `cron_schedule`.
-             If the workflow gets a signal before the delay, a workflow task will be dispatched and the rest
+            Time to wait before making the first workflow task available for dispatch. Cannot be used with `cron_schedule`.
+             If the workflow gets a signal before the delay, a workflow task will be made available for dispatch and the rest
              of the delay will be ignored.
         completionCallbacks:
           type: array
@@ -15816,6 +17512,9 @@ components:
         runId:
           type: string
           description: The run id of the workflow that was started - or used (via WorkflowIdConflictPolicy USE_EXISTING).
+        firstExecutionRunId:
+          type: string
+          description: If the workflow was started as a result of a de-dupe, this field will contain the run id of the first execution in the chain.
         started:
           type: boolean
           description: If true, a new workflow was started.
@@ -16063,6 +17762,13 @@ components:
                workflow goes to a normal queue, and the rest workflow tasks go to the Sticky queue associated with a specific
                worker instance.
           format: float
+        rateLimitingActive:
+          type: boolean
+          description: |-
+            Whether rate limiting blocked any dispatches within the recent observation window (approximately
+             30 seconds). When true, adding more workers will not increase throughput — the bottleneck is the
+             rate limit, not worker count. This field is useful for auto-scaling systems to avoid unnecessary
+             scale-up.
       description: |-
         TaskQueueStats contains statistics about task queue backlog and activity.
 
@@ -16167,7 +17873,7 @@ components:
           type: string
         runId:
           type: string
-          description: Activity run ID, targets the latest run if run_id is empty.
+          description: Activity run ID. If empty, targets the latest run.
         identity:
           type: string
           description: The identity of the worker/client.
@@ -16243,33 +17949,114 @@ components:
       properties:
         enabled:
           type: boolean
-          description: "Enables or disables time skipping for this workflow execution.\n By default, this field is propagated to transitively related workflows (child workflows/start-as-new/reset) \n at the time they are started.\n Changes made after a transitively related workflow has started are not propagated."
+          description: Enables or disables time skipping for this workflow execution.
+        fastForwardConfig:
+          allOf:
+            - $ref: '#/components/schemas/FastForwardConfig'
+          description: An optional opt-in to control time-skipping behavior through fast-forward; see its definition for details.
         disablePropagation:
           type: boolean
-          description: If set, the enabled field is not propagated to transitively related workflows.
-        maxSkippedDuration:
-          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
-          type: string
-          description: Maximum total virtual time that can be skipped.
-        maxElapsedDuration:
-          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
-          type: string
           description: |-
-            Maximum elapsed time since time skipping was enabled.
-             This includes both skipped time and real time elapsing.
-        maxTargetTime:
-          type: string
+            By default, executions started by another execution (e.g. a child workflow of a parent workflow or
+             a schedule with the time-skipping policy enabled) inherit the "enabled" flag and skip time when possible.
+             This flag disables that inheritance.
+        maxSessionSkipCount:
+          type: integer
           description: |-
-            Absolute virtual timestamp at which time skipping is disabled.
-             Time skipping will not advance beyond this point.
-          format: date-time
+            The maximum number of skips allowed every time this field is updated. It protects the execution from
+             situations like unlimited retries when backoff is skipped.
+
+             Every time the execution skips time, the skip count is incremented by one, and when it reaches
+             max_session_skip_count, time skipping stops. Whenever this config field is updated, the accumulated
+             skip count is cleared, marking the start of a new session.
+             For an execution with a chain of runs (retry, cron, continue-as-new), the count is accumulated
+             across all runs within the same session.
+
+             If this field is not set, the server applies a large default value (e.g. 100). The default can
+             be changed through dynamic config, and is overridden by this field when set.
+          format: int32
       description: |-
-        Configuration for time skipping during a workflow execution.
-         When enabled, virtual time advances automatically whenever there is no in-flight work.
-         In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,
-         and possibly other features added in the future.
-         User timers are not classified as in-flight work and will be skipped over.
-         When time advances, it skips to the earlier of the next user timer or the configured bound, if either exists.
+        The configuration for time skipping of an execution.
+         When time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.
+         Options like fast_forward, disable_propagation, and max_session_skip_count are provided for granular
+         control of the execution's time skipping behavior. See each field's comment for a detailed explanation.
+
+         An example of workflows with time skipping:
+         For workflows, an execution is a chain of runs including retries, cron, and continue-as-new.
+         In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations, etc.
+         User timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the
+         time point of the registered fast-forward when there is no in-flight work.
+         Whenever time is skipped, the skip count is incremented by one; max_session_skip_count bounds the number of skips allowed within a single time-skipping session.
+         For child workflows, by default, if the parent execution is skipping time, the child execution will also skip time,
+         but a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the
+         "enabled" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the
+         parent execution as its start time.
+    TimeSkippingFastForwardInfo:
+      type: object
+      properties:
+        fastForwardDuration:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: The client-supplied `fast_forward` duration.
+        fastForwardId:
+          type: string
+          description: The client-supplied ID set alongside `fast_forward` duration.
+        targetTime:
+          type: string
+          description: The target virtual time at which the fast-forward completes.
+          format: date-time
+        hasCompleted:
+          type: boolean
+          description: True once `target_time` has been reached.
+      description: TimeSkippingFastForwardInfo describes the current time-skipping fast-forward on an execution.
+    TimeSkippingInfo:
+      type: object
+      properties:
+        currentTime:
+          type: string
+          description: |-
+            Current virtual time of the execution. If the execution hasn't skipped
+             any time yet, it will be the same as wall clock time.
+          format: date-time
+        effectiveConfig:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingConfig'
+          description: |-
+            The current effective time-skipping config, which can differ from the config the user last set:
+             internally-defaulted fields are populated, and `enabled` reflects whether the execution is still
+             skipping time — e.g. it is set to false once `max_session_skip_count` is reached, the fast-forward
+             completes, or a client call disables time skipping.
+        fastForwardInfo:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingFastForwardInfo'
+          description: The execution's current fast-forward, if any. Unset if time skipping is enabled without a fast-forward.
+        currentSessionSkipCount:
+          type: integer
+          description: |-
+            The number of skips accumulated in the current session, bounded by `max_session_skip_count`.
+             A new session begins — and this resets to 0 — each time `max_session_skip_count` is updated.
+          format: int32
+      description: Describes the current time-skipping state of a workflow execution.
+    TimeSkippingStatePropagation:
+      type: object
+      properties:
+        initialSkippedDuration:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: |-
+            The time skipped by the previous run. It is propagated both to executions started by the
+             current execution and through a chain of runs (CaN, cron, retry).
+        fastForwardTargetTime:
+          type: string
+          description: The fast-forward target time. It only propagates across a chain of runs within the same execution.
+          format: date-time
+        initialSkipCount:
+          type: integer
+          description: The initial skip count. It only propagates across a chain of runs within the same execution.
+          format: int32
+      description: |-
+        The time-skipping state that needs to be propagated from one execution to another, or through a chain of runs
+         within the same execution.
     TimeoutFailureInfo:
       type: object
       properties:
@@ -16386,6 +18173,42 @@ components:
         applied:
           type: boolean
           description: True is the rule was applied, based on the rule conditions (predicate/visibility_query).
+    UnpauseActivityExecutionRequest:
+      type: object
+      properties:
+        namespace:
+          type: string
+          description: Namespace of the workflow which scheduled this activity.
+        workflowId:
+          type: string
+          description: |-
+            If provided, targets a workflow activity for the given workflow ID.
+             If empty, targets a standalone activity.
+        activityId:
+          type: string
+          description: The ID of the activity to target.
+        runId:
+          type: string
+          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
+        identity:
+          type: string
+          description: The identity of the client who initiated this request.
+        reason:
+          type: string
+          description: Reason to unpause the activity.
+        jitter:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: If set, the activity will start at a random time within the specified jitter duration.
+        resourceId:
+          type: string
+          description: Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+        requestId:
+          type: string
+          description: Used to de-dupe unpause requests.
+    UnpauseActivityExecutionResponse:
+      type: object
+      properties: {}
     UnpauseActivityRequest:
       type: object
       properties:
@@ -16418,9 +18241,11 @@ components:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
           description: If set, the activity will start at a random time within the specified jitter duration.
+      description: Deprecated. Use `UnpauseActivityExecutionRequest`.
     UnpauseActivityResponse:
       type: object
       properties: {}
+      description: Deprecated. Use `UnpauseActivityExecutionResponse`.
     UnpauseWorkflowExecutionRequest:
       type: object
       properties:
@@ -16446,6 +18271,55 @@ components:
       type: object
       properties: {}
       description: Response to a successful UnpauseWorkflowExecution request.
+    UpdateActivityExecutionOptionsRequest:
+      type: object
+      properties:
+        namespace:
+          type: string
+          description: Namespace of the workflow which scheduled this activity
+        workflowId:
+          type: string
+          description: |-
+            If provided, targets a workflow activity for the given workflow ID.
+             If empty, targets a standalone activity.
+        activityId:
+          type: string
+          description: The ID of the activity to target.
+        runId:
+          type: string
+          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
+        identity:
+          type: string
+          description: The identity of the client who initiated this request
+        activityOptions:
+          allOf:
+            - $ref: '#/components/schemas/ActivityOptions'
+          description: Activity options. Partial updates are accepted and controlled by update_mask
+        updateMask:
+          type: string
+          description: Controls which fields from `activity_options` will be applied
+          format: field-mask
+        restoreOriginal:
+          type: boolean
+          description: |-
+            If set, the activity options will be restored to the default.
+             Default options are then options activity was created with.
+             They are part of the first schedule event.
+             This flag cannot be combined with any other option; if you supply
+             restore_original together with other options, the request will be rejected.
+        resourceId:
+          type: string
+          description: Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+        requestId:
+          type: string
+          description: Used to de-dupe update requests.
+    UpdateActivityExecutionOptionsResponse:
+      type: object
+      properties:
+        activityOptions:
+          allOf:
+            - $ref: '#/components/schemas/ActivityOptions'
+          description: Activity options after an update
     UpdateActivityOptionsRequest:
       type: object
       properties:
@@ -16481,10 +18355,12 @@ components:
           description: |-
             If set, the activity options will be restored to the default.
              Default options are then options activity was created with.
-             They are part of the first SCHEDULE event.
+             They are part of the first schedule event.
              This flag cannot be combined with any other option; if you supply
              restore_original together with other options, the request will be rejected.
-      description: 'NOTE: keep in sync with temporal.api.batch.v1.BatchOperationUpdateActivityOptions'
+      description: |-
+        NOTE: keep in sync with temporal.api.batch.v1.BatchOperationUpdateActivityOptions
+         Deprecated. Use `UpdateActivityExecutionOptionsRequest`.
     UpdateActivityOptionsResponse:
       type: object
       properties:
@@ -16492,6 +18368,7 @@ components:
           allOf:
             - $ref: '#/components/schemas/ActivityOptions'
           description: Activity options after an update
+      description: Deprecated. Use `UpdateActivityExecutionOptionsResponse`.
     UpdateDeploymentMetadata:
       type: object
       properties:
@@ -16844,6 +18721,15 @@ components:
           allOf:
             - $ref: '#/components/schemas/WorkflowExecutionOptions'
           description: Workflow Execution options after update.
+        updateTime:
+          type: string
+          description: |-
+            The Workflow Execution time when the options were updated. When time skipping is
+             enabled, this is the workflow's virtual time rather than wall-clock time.
+
+             This timestamp cannot be used for time-skipping fast-forward verification,
+             use `fast_forward_id` in `PollWorkflowExecutionTimeSkippingRequest` instead.
+          format: date-time
     UpdateWorkflowExecutionRequest:
       type: object
       properties:
@@ -16914,6 +18800,10 @@ components:
              request WaitPolicy, and before the context deadline expired; clients may
              may then retry the call as needed.
           format: enum
+        link:
+          allOf:
+            - $ref: '#/components/schemas/Link'
+          description: Link to the update event. May be null if the update has not yet been accepted.
     UpsertWorkflowSearchAttributesEventAttributes:
       type: object
       properties:
@@ -17024,10 +18914,23 @@ components:
         pinned:
           allOf:
             - $ref: '#/components/schemas/VersioningOverride_PinnedOverride'
-          description: Override the workflow to have Pinned behavior.
+          description: |-
+            Override the workflow to have Pinned behavior. This is a sticky override:
+             Workflow Tasks continue to route according to this override until it is
+             explicitly removed.
         autoUpgrade:
           type: boolean
           description: Override the workflow to have AutoUpgrade behavior.
+        oneTime:
+          allOf:
+            - $ref: '#/components/schemas/VersioningOverride_OneTimeOverride'
+          description: |-
+            Override Workflow Task routing to a specific Worker Deployment Version until
+             one Workflow Task completes there. After completion, the workflow execution's
+             Versioning Behavior and Deployment Version come from the worker's completion
+             response.
+             (-- api-linter: core::0142::time-field-type=disabled
+                 aip.dev/not-precedent: one_time describes one-time routing semantics, not a timestamp or duration. --)
         behavior:
           enum:
             - VERSIONING_BEHAVIOR_UNSPECIFIED
@@ -17062,6 +18965,33 @@ components:
 
          Pinned behavior overrides are automatically inherited by child workflows, workflow retries, continue-as-new
          workflows, and cron workflows.
+    VersioningOverride_OneTimeOverride:
+      type: object
+      properties:
+        targetDeploymentVersion:
+          allOf:
+            - $ref: '#/components/schemas/WorkerDeploymentVersion'
+          description: Required. Worker Deployment Version to receive the one-time Workflow Task.
+      description: |-
+        Routes Workflow Tasks for this execution to `target_deployment_version`
+         until a Workflow Task completes on that version, then clears the override.
+
+         This does not force the workflow's normal Versioning Behavior to become
+         Pinned. After the Workflow Task completes on `target_deployment_version`,
+         the workflow execution's normal Versioning Behavior and Deployment Version
+         are taken from the worker's completion response.
+
+         Example: if an execution is one-time moved from version X to version Y, and
+         version Z later becomes current:
+         - if worker Y reports Pinned, the execution stays on Y;
+         - if worker Y reports AutoUpgrade, the execution routes to Z on a future
+           Workflow Task;
+         - if worker Y reports Pinned and the workflow uses upgrade-on-continue-as-new,
+           the current run stays on Y and the execution can route to Z after
+           continue-as-new.
+
+         If no Workflow Task completes on `target_deployment_version`, this override
+         remains pending.
     VersioningOverride_PinnedOverride:
       type: object
       properties:
@@ -17266,6 +19196,10 @@ components:
           format: date-time
         computeConfig:
           $ref: '#/components/schemas/ComputeConfigSummary'
+        computeStatus:
+          allOf:
+            - $ref: '#/components/schemas/ComputeStatus'
+          description: ComputeStatus represents compute-related configuration and healthchecks.
     WorkerDeploymentOptions:
       type: object
       properties:
@@ -17527,6 +19461,10 @@ components:
           items:
             $ref: '#/components/schemas/StorageDriverInfo'
           description: Storage drivers in use by this SDK.
+        environment:
+          allOf:
+            - $ref: '#/components/schemas/EnvironmentInfo'
+          description: Information about the environment this SDK is running in.
       description: |-
         Worker info message, contains information about the worker and its current state.
          All information is provided by the worker itself.
@@ -18051,6 +19989,12 @@ components:
           allOf:
             - $ref: '#/components/schemas/WorkflowExecutionPauseInfo'
           description: Information about the workflow execution pause operation.
+        timeSkippingInfo:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingInfo'
+          description: |-
+            Information about time skipping of the workflow execution.
+             If the execution has never enabled time skipping, it will be nil.
       description: Holds all the extra information about workflow execution that is not part of Visibility.
     WorkflowExecutionFailedEventAttributes:
       type: object
@@ -18219,7 +20163,7 @@ components:
         timeSkippingConfig:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: "Time-skipping configuration for this workflow execution.\n If not set, the time-skipping conf will not get updated upon request, \n i.e. the existing time-skipping conf will be preserved."
+          description: "The time-skipping configuration for this workflow execution.\n When `fast_forward` is set, time will be fast-forwarded to a future point relative\n to the current workflow timestamp. Each call takes effect, even if\n `fast_forward` is set to the same duration, since the target time is recalculated\n from the current timestamp on every call.\n\n This field must be updated as a whole; updating individual sub-fields is not supported.\n When setting the update mask in `UpdateWorkflowExecutionOptionsRequest`, \n `BatchOperationUpdateWorkflowExecutionOptions`, etc., use a mask that covers the entire field."
     WorkflowExecutionOptionsUpdatedEventAttributes:
       type: object
       properties:
@@ -18254,7 +20198,33 @@ components:
         timeSkippingConfig:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: If set, the time-skipping configuration was changed. Contains the full updated configuration.
+          description: TimeSkippingConfig override upserted in this event. Represents the full config.
+        timeSkippingConfigUpdated:
+          type: boolean
+          description: |-
+            Indicates the time skipping config was updated by the recent call to update
+             workflow execution options.
+        workflowUpdateOptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkflowExecutionOptionsUpdatedEventAttributes_WorkflowUpdateOptionsUpdate'
+          description: Updates to workflow updates options.
+    WorkflowExecutionOptionsUpdatedEventAttributes_WorkflowUpdateOptionsUpdate:
+      type: object
+      properties:
+        updateId:
+          type: string
+          description: The ID of the workflow update this update options update corresponds to.
+        attachedRequestId:
+          type: string
+          description: |-
+            Request ID attached to the running workflow update so that subsequent requests with same
+             request ID will be deduped
+        attachedCompletionCallbacks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Callback'
+          description: Completion callbacks attached to the running workflow update.
     WorkflowExecutionPauseInfo:
       type: object
       properties:
@@ -18563,6 +20533,12 @@ components:
 
              The configuration may be updated after start via UpdateWorkflowExecutionOptions, which
              will be reflected in the WorkflowExecutionOptionsUpdatedEvent.
+        timeSkippingStatePropagation:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingStatePropagation'
+          description: |-
+            The time-skipping state propagated from a previous run of this workflow. This can be nil
+             if no time skipping has occurred or there is no previous run.
       description: Always the first event in workflow history
     WorkflowExecutionTerminatedEventAttributes:
       type: object
@@ -18580,12 +20556,12 @@ components:
       properties:
         targetTime:
           type: string
-          description: The virtual time after time skipping was applied.
+          description: The virtual time point that time skipping advanced to.
           format: date-time
-        disabledAfterBound:
+        disabledAfterFastForward:
           type: boolean
           description: |-
-            when true, time skipping was disabled automatically due to a bound being reached.
+            When true, time skipping has been stopped automatically due to a call to fast_forward completing.
              (-- api-linter: core::0140::prepositions=disabled
                  aip.dev/not-precedent: "after" is used to indicate temporal ordering. --)
         wallClockTime:
@@ -18593,8 +20569,8 @@ components:
           description: The wall-clock time when the time-skipping state changed event was generated.
           format: date-time
       description: |-
-        Attributes for an event indicating that time skipping state changed for a workflow execution,
-         either time was advanced or time skipping was disabled automatically due to a bound being reached.
+        Attributes for an event indicating that time skipping state changed for a workflow execution:
+         either time was advanced, or time skipping was stopped automatically due to the fast_forward completing.
          The worker_may_ignore field in HistoryEvent should always be set true for this event.
     WorkflowExecutionTimedOutEventAttributes:
       type: object
@@ -19127,6 +21103,9 @@ components:
             - WORKFLOW_TASK_FAILED_CAUSE_FEATURE_DISABLED
             - WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE
             - WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE
+            - WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE
+            - WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED
+            - WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE
           type: string
           format: enum
         failure:

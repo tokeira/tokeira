@@ -284,6 +284,7 @@ pub(crate) fn workflow_already_started_status(message: String, run_id: String) -
     use tokeira_proto::public::temporal::api::errordetails::v1::WorkflowExecutionAlreadyStartedFailure;
 
     let failure = WorkflowExecutionAlreadyStartedFailure {
+        first_execution_run_id: String::new(),
         start_request_id: String::new(),
         run_id,
     };

@@ -14,6 +14,73 @@ pub struct UserMetadata {
     #[prost(message, optional, tag = "2")]
     pub details: ::core::option::Option<super::super::common::v1::Payload>,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EventGroupMarker {
+    /// What this Marker represents. The variant determines whether the Marker was
+    /// created explicitly by user code (label) or implicitly by the SDK on inbound
+    /// signals/events (inbound_event) or update handlers (inbound_update).
+    #[prost(oneof = "event_group_marker::Variant", tags = "1, 2, 3")]
+    pub variant: ::core::option::Option<event_group_marker::Variant>,
+}
+/// Nested message and enum types in `EventGroupMarker`.
+pub mod event_group_marker {
+    /// A user-defined short-form string value to be used as the group's label.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct Label {
+        /// Opaque identifier assigned by the SDK.
+        #[prost(string, tag = "1")]
+        pub id: ::prost::alloc::string::String,
+        /// This payload should be a "json/plain"-encoded payload that is a single
+        /// JSON string for use in user interfaces. User interface formatting may not
+        /// apply to this text when used in "label" situations. The payload data
+        /// section is limited to 400 bytes by default.
+        ///
+        /// Payload only needs to be set on the first use of a given Marker ID;
+        /// further references to an existing Marker ID reuse existing attributes of
+        /// the referenced Marker -- i.e. further label payloads are ignored.
+        ///
+        /// Note that it is valid to have distinct Markers (i.e. distinct Marker IDs)
+        /// in a given workflow execution that carry the same label, provided that
+        /// they have the distinct ID.
+        #[prost(message, optional, tag = "2")]
+        pub label: ::core::option::Option<super::super::super::common::v1::Payload>,
+    }
+    /// The event ID of an event in the present workflow that triggered implicit
+    /// creation of this group Marker.
+    ///
+    /// The target event's type must be one of the following:
+    ///
+    /// * `WORKFLOW_EXECUTION_STARTED`
+    /// * `WORKFLOW_EXECUTION_SIGNALED`
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct InboundEvent {
+        #[prost(int64, tag = "1")]
+        pub inbound_event_id: i64,
+    }
+    /// The identifier of an inbound Update (request.meta.update_id)
+    /// whose handler triggered implicit creation of this group Marker.
+    ///
+    /// Used in place of `inbound_event_id` for Updates because the event ID of the
+    /// UpdateAccepted history event is not known until the Workflow Task is
+    /// completed and recorded by the server, which may be too late.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct InboundUpdate {
+        #[prost(string, tag = "1")]
+        pub inbound_update_id: ::prost::alloc::string::String,
+    }
+    /// What this Marker represents. The variant determines whether the Marker was
+    /// created explicitly by user code (label) or implicitly by the SDK on inbound
+    /// signals/events (inbound_event) or update handlers (inbound_update).
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Variant {
+        #[prost(message, tag = "1")]
+        Label(Label),
+        #[prost(message, tag = "2")]
+        InboundEvent(InboundEvent),
+        #[prost(message, tag = "3")]
+        InboundUpdate(InboundUpdate),
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WorkflowTaskCompletedMetadata {
     /// Internal flags used by the core SDK. SDKs using flags must comply with the following behavior:
@@ -132,6 +199,21 @@ pub struct StackTrace {
     /// Collection of `FileLocation`s, each for a stack frame that comprise a stack trace.
     #[prost(message, repeated, tag = "1")]
     pub locations: ::prost::alloc::vec::Vec<StackTraceFileLocation>,
+}
+/// ExternalStorageReference identifies a payload stored in an external storage system.
+/// It is used as a claim-check token, allowing the actual payload data to be retrieved
+/// from the named driver using the provided claim data.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExternalStorageReference {
+    /// The name of the storage driver responsible for retrieving the payload.
+    #[prost(string, tag = "1")]
+    pub driver_name: ::prost::alloc::string::String,
+    /// Driver-specific key-value pairs that identify and provide access to the stored payload.
+    #[prost(btree_map = "string, string", tag = "2")]
+    pub claim_data: ::prost::alloc::collections::BTreeMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WorkerConfig {

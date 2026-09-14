@@ -337,6 +337,7 @@ async fn wait_for_visibility_size(worker: &Transport, workflow_id: &str, size: i
 
 fn complete_workflow() -> Command {
     Command {
+        event_group_markers: Vec::new(),
         command_type: CommandType::CompleteWorkflowExecution as i32,
         user_metadata: None,
         attributes: Some(

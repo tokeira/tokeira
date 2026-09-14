@@ -1702,10 +1702,6 @@
             "number": 0
           },
           {
-            "name": "EDITION_LEGACY",
-            "number": 900
-          },
-          {
             "name": "EDITION_PROTO2",
             "number": 998
           },
@@ -1716,10 +1712,6 @@
           {
             "name": "EDITION_2023",
             "number": 1000
-          },
-          {
-            "name": "EDITION_2024",
-            "number": 1001
           },
           {
             "name": "EDITION_1_TEST_ONLY",
@@ -1740,10 +1732,6 @@
           {
             "name": "EDITION_99999_TEST_ONLY",
             "number": 99999
-          },
-          {
-            "name": "EDITION_MAX",
-            "number": 2147483647
           }
         ]
       },
@@ -1777,6 +1765,10 @@
           {
             "name": "ACTIVITY_EXECUTION_STATUS_TIMED_OUT",
             "number": 6
+          },
+          {
+            "name": "ACTIVITY_EXECUTION_STATUS_PAUSED",
+            "number": 7
           }
         ]
       },
@@ -1881,24 +1873,48 @@
             "number": 1
           },
           {
+            "name": "BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW",
+            "number": 13
+          },
+          {
             "name": "BATCH_OPERATION_TYPE_CANCEL",
             "number": 2
+          },
+          {
+            "name": "BATCH_OPERATION_TYPE_CANCEL_WORKFLOW",
+            "number": 14
           },
           {
             "name": "BATCH_OPERATION_TYPE_SIGNAL",
             "number": 3
           },
           {
+            "name": "BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW",
+            "number": 15
+          },
+          {
             "name": "BATCH_OPERATION_TYPE_DELETE",
             "number": 4
+          },
+          {
+            "name": "BATCH_OPERATION_TYPE_DELETE_WORKFLOW",
+            "number": 16
           },
           {
             "name": "BATCH_OPERATION_TYPE_RESET",
             "number": 5
           },
           {
+            "name": "BATCH_OPERATION_TYPE_RESET_WORKFLOW",
+            "number": 17
+          },
+          {
             "name": "BATCH_OPERATION_TYPE_UPDATE_EXECUTION_OPTIONS",
             "number": 6
+          },
+          {
+            "name": "BATCH_OPERATION_TYPE_UPDATE_WORKFLOW_EXECUTION_OPTIONS",
+            "number": 18
           },
           {
             "name": "BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY",
@@ -1911,6 +1927,18 @@
           {
             "name": "BATCH_OPERATION_TYPE_RESET_ACTIVITY",
             "number": 9
+          },
+          {
+            "name": "BATCH_OPERATION_TYPE_TERMINATE_ACTIVITY",
+            "number": 10
+          },
+          {
+            "name": "BATCH_OPERATION_TYPE_CANCEL_ACTIVITY",
+            "number": 11
+          },
+          {
+            "name": "BATCH_OPERATION_TYPE_DELETE_ACTIVITY",
+            "number": 12
           }
         ]
       },
@@ -2397,6 +2425,44 @@
           {
             "name": "EVENT_TYPE_WORKFLOW_EXECUTION_TIME_SKIPPING_TRANSITIONED",
             "number": 60
+          }
+        ]
+      },
+      {
+        "enum": "temporal.api.enums.v1.ExecutionType",
+        "values": [
+          {
+            "name": "EXECUTION_TYPE_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "EXECUTION_TYPE_WORKFLOW",
+            "number": 1
+          },
+          {
+            "name": "EXECUTION_TYPE_ACTIVITY",
+            "number": 2
+          }
+        ]
+      },
+      {
+        "enum": "temporal.api.enums.v1.FastForwardPollingResult",
+        "values": [
+          {
+            "name": "FAST_FORWARD_POLLING_RESULT_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT",
+            "number": 1
+          },
+          {
+            "name": "FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED",
+            "number": 2
+          },
+          {
+            "name": "FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED",
+            "number": 3
           }
         ]
       },
@@ -3053,6 +3119,10 @@
           {
             "name": "START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND",
             "number": 2
+          },
+          {
+            "name": "START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE",
+            "number": 3
           }
         ]
       },
@@ -3566,6 +3636,18 @@
           {
             "name": "WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE",
             "number": 37
+          },
+          {
+            "name": "WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE",
+            "number": 38
+          },
+          {
+            "name": "WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED",
+            "number": 39
+          },
+          {
+            "name": "WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE",
+            "number": 40
           }
         ]
       }
@@ -3854,6 +3936,16 @@
       {
         "field": "activity_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PauseActivityExecutionRequest",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "activity_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.PollActivityExecutionRequest",
         "number": 2,
         "oneof": null,
@@ -3886,6 +3978,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.RequestCancelActivityExecutionRequest",
         "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "activity_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
+        "number": 3,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -3942,6 +4044,26 @@
         "type_name": ""
       },
       {
+        "field": "activity_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "activity_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "activity_options",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.batch.v1.BatchOperationUpdateActivityOptions",
@@ -3956,6 +4078,26 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflow.v1.PendingActivityInfo",
         "number": 24,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.activity.v1.ActivityOptions"
+      },
+      {
+        "field": "activity_options",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
+        "number": 6,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.activity.v1.ActivityOptions"
+      },
+      {
+        "field": "activity_options",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsResponse",
+        "number": 1,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
@@ -4472,6 +4614,36 @@
         "type_name": ""
       },
       {
+        "field": "architecture",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.LinuxPlatform",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.Architecture"
+      },
+      {
+        "field": "architecture",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.MacOSPlatform",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.Architecture"
+      },
+      {
+        "field": "architecture",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.WindowsPlatform",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.Architecture"
+      },
+      {
         "field": "archived",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.GetWorkflowExecutionHistoryResponse",
@@ -4612,10 +4784,30 @@
         "type_name": ".temporal.api.common.v1.Callback"
       },
       {
+        "field": "attached_completion_callbacks",
+        "label": "LABEL_REPEATED",
+        "message": "temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes.WorkflowUpdateOptionsUpdate",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.Callback"
+      },
+      {
         "field": "attached_request_id",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes",
         "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "attached_request_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes.WorkflowUpdateOptionsUpdate",
+        "number": 2,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -5282,6 +5474,16 @@
         "type_name": ""
       },
       {
+        "field": "business_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.Execution",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "cache_mutable_state",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.server.api.adminservice.v1.DescribeMutableStateResponse",
@@ -5360,6 +5562,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.workflow.v1.CallbackInfo"
+      },
+      {
+        "field": "cancel_activities_operation",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.StartBatchOperationRequest",
+        "number": 19,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.batch.v1.BatchOperationCancelActivities"
       },
       {
         "field": "cancel_activity",
@@ -5792,6 +6004,16 @@
         "type_name": ""
       },
       {
+        "field": "claim_data",
+        "label": "LABEL_REPEATED",
+        "message": "temporal.api.sdk.v1.ExternalStorageReference",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.sdk.v1.ExternalStorageReference.ClaimDataEntry"
+      },
+      {
         "field": "client_name",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.errordetails.v1.ClientVersionNotSupportedFailure",
@@ -6144,6 +6366,16 @@
       {
         "field": "completion_callbacks",
         "label": "LABEL_REPEATED",
+        "message": "temporal.api.update.v1.Request",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.Callback"
+      },
+      {
+        "field": "completion_callbacks",
+        "label": "LABEL_REPEATED",
         "message": "temporal.api.workflowservice.v1.StartActivityExecutionRequest",
         "number": 19,
         "oneof": null,
@@ -6210,6 +6442,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.workflowservice.v1.ValidateWorkerDeploymentVersionComputeConfigRequest.ComputeConfigScalingGroupsEntry"
+      },
+      {
+        "field": "compute_status",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.deployment.v1.WorkerDeploymentInfo.WorkerDeploymentVersionSummary",
+        "number": 14,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.deployment.v1.ComputeStatus"
       },
       {
         "field": "config",
@@ -6664,6 +6906,16 @@
       {
         "field": "count",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.CountWorkersResponse",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
+        "field": "count",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.CountWorkflowExecutionsResponse",
         "number": 1,
         "oneof": null,
@@ -6912,6 +7164,16 @@
         "type_name": ""
       },
       {
+        "field": "crt",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.WindowsPlatform",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.WindowsPlatform.Crt"
+      },
+      {
         "field": "csharp_namespace",
         "label": "LABEL_OPTIONAL",
         "message": "google.protobuf.FileOptions",
@@ -7092,6 +7354,16 @@
         "type_name": ""
       },
       {
+        "field": "current_session_skip_count",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingInfo",
+        "number": 6,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT32",
+        "type_name": ""
+      },
+      {
         "field": "current_since_time",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.deployment.v1.WorkerDeploymentInfo.WorkerDeploymentVersionSummary",
@@ -7120,6 +7392,16 @@
         "proto3_optional": false,
         "type": "TYPE_INT32",
         "type_name": ""
+      },
+      {
+        "field": "current_time",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingInfo",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
       },
       {
         "field": "current_used_slots",
@@ -7410,6 +7692,16 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
+      },
+      {
+        "field": "delete_activities_operation",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.StartBatchOperationRequest",
+        "number": 21,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.batch.v1.BatchOperationDeleteActivities"
       },
       {
         "field": "delete_assignment_rule",
@@ -8082,16 +8374,6 @@
         "type_name": ""
       },
       {
-        "field": "deprecation_warning",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FieldOptions.FeatureSupport",
-        "number": 3,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_STRING",
-        "type_name": ""
-      },
-      {
         "field": "description",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.namespace.v1.NamespaceInfo",
@@ -8364,15 +8646,15 @@
       {
         "field": "disable_propagation",
         "label": "LABEL_OPTIONAL",
-        "message": "temporal.api.workflow.v1.TimeSkippingConfig",
-        "number": 2,
+        "message": "temporal.api.common.v1.TimeSkippingConfig",
+        "number": 3,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_BOOL",
         "type_name": ""
       },
       {
-        "field": "disabled_after_bound",
+        "field": "disabled_after_fast_forward",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.history.v1.WorkflowExecutionTimeSkippingTransitionedEventAttributes",
         "number": 2,
@@ -8432,6 +8714,16 @@
         "type_name": ".temporal.api.enums.v1.VersionDrainageStatus"
       },
       {
+        "field": "driver_name",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.sdk.v1.ExternalStorageReference",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "drivers",
         "label": "LABEL_REPEATED",
         "message": "temporal.api.worker.v1.WorkerHeartbeat",
@@ -8450,6 +8742,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.worker.v1.StorageDriverInfo"
+      },
+      {
+        "field": "duration",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.FastForwardConfig",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Duration"
       },
       {
         "field": "eager_execution_accepted",
@@ -8552,34 +8854,14 @@
         "type_name": ".google.protobuf.FieldOptions.EditionDefault"
       },
       {
-        "field": "edition_deprecated",
+        "field": "effective_config",
         "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FieldOptions.FeatureSupport",
+        "message": "temporal.api.common.v1.TimeSkippingInfo",
         "number": 2,
         "oneof": null,
         "proto3_optional": false,
-        "type": "TYPE_ENUM",
-        "type_name": ".google.protobuf.Edition"
-      },
-      {
-        "field": "edition_introduced",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FieldOptions.FeatureSupport",
-        "number": 1,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_ENUM",
-        "type_name": ".google.protobuf.Edition"
-      },
-      {
-        "field": "edition_removed",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FieldOptions.FeatureSupport",
-        "number": 4,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_ENUM",
-        "type_name": ".google.protobuf.Edition"
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.TimeSkippingConfig"
       },
       {
         "field": "effective_rate_limit",
@@ -8624,7 +8906,7 @@
       {
         "field": "enabled",
         "label": "LABEL_OPTIONAL",
-        "message": "temporal.api.workflow.v1.TimeSkippingConfig",
+        "message": "temporal.api.common.v1.TimeSkippingConfig",
         "number": 1,
         "oneof": null,
         "proto3_optional": false,
@@ -8922,6 +9204,16 @@
         "type_name": ".google.protobuf.EnumDescriptorProto"
       },
       {
+        "field": "environment",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.WorkerHeartbeat",
+        "number": 25,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo"
+      },
+      {
         "field": "error",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.RespondNexusTaskFailedRequest",
@@ -8930,6 +9222,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.nexus.v1.HandlerError"
+      },
+      {
+        "field": "error_message",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.deployment.v1.ComputeStatus.ProviderValidationStatus",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
       },
       {
         "field": "error_message",
@@ -8960,6 +9262,26 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
+      },
+      {
+        "field": "event_group_markers",
+        "label": "LABEL_REPEATED",
+        "message": "temporal.api.command.v1.Command",
+        "number": 302,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.sdk.v1.EventGroupMarker"
+      },
+      {
+        "field": "event_group_markers",
+        "label": "LABEL_REPEATED",
+        "message": "temporal.api.history.v1.HistoryEvent",
+        "number": 304,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.sdk.v1.EventGroupMarker"
       },
       {
         "field": "event_id",
@@ -9334,12 +9656,42 @@
       {
         "field": "execution_time",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.activity.v1.ActivityExecutionInfo",
+        "number": 38,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
+      },
+      {
+        "field": "execution_time",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.activity.v1.ActivityExecutionListInfo",
+        "number": 12,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
+      },
+      {
+        "field": "execution_time",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflow.v1.WorkflowExecutionInfo",
         "number": 9,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".google.protobuf.Timestamp"
+      },
+      {
+        "field": "executions",
+        "label": "LABEL_REPEATED",
+        "message": "temporal.api.workflowservice.v1.DescribeBatchOperationResponse",
+        "number": 12,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.Execution"
       },
       {
         "field": "executions",
@@ -9610,6 +9962,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.command.v1.FailWorkflowExecutionCommandAttributes"
+      },
+      {
+        "field": "failed_reason",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PollWorkflowExecutionTimeSkippingResponse",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
       },
       {
         "field": "failover_history",
@@ -10042,24 +10404,84 @@
         "type_name": ".temporal.api.taskqueue.v1.TaskQueueConfig.FairnessWeightOverridesEntry"
       },
       {
-        "field": "feature_support",
+        "field": "fast_forward_config",
         "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.EnumValueOptions",
+        "message": "temporal.api.common.v1.TimeSkippingConfig",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.FastForwardConfig"
+      },
+      {
+        "field": "fast_forward_duration",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingFastForwardInfo",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Duration"
+      },
+      {
+        "field": "fast_forward_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingFastForwardInfo",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "fast_forward_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PollWorkflowExecutionTimeSkippingRequest",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "fast_forward_info",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingInfo",
         "number": 4,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.FieldOptions.FeatureSupport"
+        "type_name": ".temporal.api.common.v1.TimeSkippingFastForwardInfo"
       },
       {
-        "field": "feature_support",
+        "field": "fast_forward_info",
         "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FieldOptions",
-        "number": 22,
+        "message": "temporal.api.workflowservice.v1.PollWorkflowExecutionTimeSkippingResponse",
+        "number": 3,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.FieldOptions.FeatureSupport"
+        "type_name": ".temporal.api.common.v1.TimeSkippingFastForwardInfo"
+      },
+      {
+        "field": "fast_forward_polling_result",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PollWorkflowExecutionTimeSkippingResponse",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.enums.v1.FastForwardPollingResult"
+      },
+      {
+        "field": "fast_forward_target_time",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingStatePropagation",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
       },
       {
         "field": "features",
@@ -10086,6 +10508,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "google.protobuf.ExtensionRangeOptions",
         "number": 50,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.FeatureSet"
+      },
+      {
+        "field": "features",
+        "label": "LABEL_OPTIONAL",
+        "message": "google.protobuf.FeatureSetDefaults.FeatureSetEditionDefault",
+        "number": 2,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
@@ -10234,6 +10666,16 @@
       {
         "field": "first_execution_run_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.errordetails.v1.WorkflowExecutionAlreadyStartedFailure",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "first_execution_run_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.history.v1.WorkflowExecutionStartedEventAttributes",
         "number": 16,
         "oneof": null,
@@ -10246,6 +10688,26 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest",
         "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "first_execution_run_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionResponse",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "first_execution_run_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.StartWorkflowExecutionResponse",
+        "number": 6,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -10320,16 +10782,6 @@
         "proto3_optional": false,
         "type": "TYPE_INT64",
         "type_name": ""
-      },
-      {
-        "field": "fixed_features",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FeatureSetDefaults.FeatureSetEditionDefault",
-        "number": 5,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.FeatureSet"
       },
       {
         "field": "force",
@@ -10560,6 +11012,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.workflowservice.v1.CountWorkflowExecutionsResponse.AggregationGroup"
+      },
+      {
+        "field": "has_completed",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingFastForwardInfo",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
       },
       {
         "field": "header",
@@ -11112,6 +11574,16 @@
         "type_name": ""
       },
       {
+        "field": "hosting_environments",
+        "label": "LABEL_REPEATED",
+        "message": "temporal.api.worker.v1.EnvironmentInfo",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.HostingEnvironment"
+      },
+      {
         "field": "hour",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.schedule.v1.CalendarSpec",
@@ -11147,6 +11619,16 @@
         "message": "temporal.api.batch.v1.BatchOperationTriggerWorkflowRule",
         "number": 2,
         "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.FastForwardConfig",
+        "number": 1,
+        "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
@@ -11215,6 +11697,16 @@
         "field": "id",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.rules.v1.WorkflowRuleSpec",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.sdk.v1.EventGroupMarker.Label",
         "number": 1,
         "oneof": null,
         "proto3_optional": false,
@@ -11354,6 +11846,16 @@
       {
         "field": "identity",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.batch.v1.BatchOperationCancelActivities",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "identity",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.batch.v1.BatchOperationCancellation",
         "number": 1,
         "oneof": null,
@@ -11396,6 +11898,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.batch.v1.BatchOperationSignal",
         "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "identity",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.batch.v1.BatchOperationTerminateActivities",
+        "number": 1,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -11794,6 +12306,16 @@
       {
         "field": "identity",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PauseActivityExecutionRequest",
+        "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "identity",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.PauseActivityRequest",
         "number": 3,
         "oneof": null,
@@ -11906,6 +12428,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest",
         "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "identity",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
+        "number": 5,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -12184,6 +12716,16 @@
       {
         "field": "identity",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+        "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "identity",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.UnpauseActivityRequest",
         "number": 3,
         "oneof": null,
@@ -12196,6 +12738,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.UnpauseWorkflowExecutionRequest",
         "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "identity",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
+        "number": 5,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -12302,10 +12854,60 @@
         "type_name": ""
       },
       {
+        "field": "inbound_event",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.sdk.v1.EventGroupMarker",
+        "number": 2,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.sdk.v1.EventGroupMarker.InboundEvent"
+      },
+      {
+        "field": "inbound_event_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.sdk.v1.EventGroupMarker.InboundEvent",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
+        "field": "inbound_update",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.sdk.v1.EventGroupMarker",
+        "number": 3,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.sdk.v1.EventGroupMarker.InboundUpdate"
+      },
+      {
+        "field": "inbound_update_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.sdk.v1.EventGroupMarker.InboundUpdate",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "include_deleted",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.namespace.v1.NamespaceFilter",
         "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "include_heartbeat_details",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.DescribeActivityExecutionRequest",
+        "number": 7,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_BOOL",
@@ -12326,6 +12928,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.DescribeNexusOperationExecutionRequest",
         "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "include_last_failure",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.DescribeActivityExecutionRequest",
+        "number": 8,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_BOOL",
@@ -12345,6 +12957,26 @@
         "field": "include_outcome",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.DescribeNexusOperationExecutionRequest",
+        "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "include_system_workers",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.CountWorkersRequest",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "include_system_workers",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ListWorkersRequest",
         "number": 5,
         "oneof": null,
         "proto3_optional": false,
@@ -12550,6 +13182,26 @@
         "proto3_optional": false,
         "type": "TYPE_INT32",
         "type_name": ""
+      },
+      {
+        "field": "initial_skip_count",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingStatePropagation",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT32",
+        "type_name": ""
+      },
+      {
+        "field": "initial_skipped_duration",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingStatePropagation",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Duration"
       },
       {
         "field": "initial_versioning_behavior",
@@ -13002,6 +13654,16 @@
         "type_name": ""
       },
       {
+        "field": "intermediate_page",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.RespondWorkflowTaskCompletedRequest",
+        "number": 22,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
         "field": "internal",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.common.v1.Callback",
@@ -13254,8 +13916,28 @@
       {
         "field": "jitter",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
+        "number": 7,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Duration"
+      },
+      {
+        "field": "jitter",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.ResetActivityRequest",
         "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Duration"
+      },
+      {
+        "field": "jitter",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+        "number": 9,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
@@ -13385,6 +14067,16 @@
         "field": "keep_paused",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.batch.v1.BatchOperationResetActivities",
+        "number": 6,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "keep_paused",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
         "number": 6,
         "oneof": null,
         "proto3_optional": false,
@@ -13674,6 +14366,16 @@
       {
         "field": "key",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.sdk.v1.ExternalStorageReference.ClaimDataEntry",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "key",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.taskqueue.v1.TaskQueueConfig.FairnessWeightOverridesEntry",
         "number": 1,
         "oneof": null,
@@ -13882,6 +14584,26 @@
         "type_name": ".google.protobuf.FieldDescriptorProto.Label"
       },
       {
+        "field": "label",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.sdk.v1.EventGroupMarker",
+        "number": 1,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.sdk.v1.EventGroupMarker.Label"
+      },
+      {
+        "field": "label",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.sdk.v1.EventGroupMarker.Label",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.Payload"
+      },
+      {
         "field": "lang_used_flags",
         "label": "LABEL_REPEATED",
         "message": "temporal.api.sdk.v1.WorkflowTaskCompletedMetadata",
@@ -14045,6 +14767,16 @@
         "field": "last_changed_time",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.deployment.v1.VersionDrainageInfo",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
+      },
+      {
+        "field": "last_check_time",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.deployment.v1.ComputeStatus.ProviderValidationStatus",
         "number": 2,
         "oneof": null,
         "proto3_optional": false,
@@ -14492,6 +15224,16 @@
         "type_name": ""
       },
       {
+        "field": "libc",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.LinuxPlatform",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.LinuxPlatform.Libc"
+      },
+      {
         "field": "lifecycle_stage",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.update.v1.WaitPolicy",
@@ -14544,6 +15286,16 @@
       {
         "field": "link",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.QueryWorkflowResponse",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.Link"
+      },
+      {
+        "field": "link",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.SignalWorkflowExecutionResponse",
         "number": 1,
         "oneof": null,
@@ -14565,6 +15317,16 @@
         "field": "link",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.StartWorkflowExecutionResponse",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.Link"
+      },
+      {
+        "field": "link",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateWorkflowExecutionResponse",
         "number": 4,
         "oneof": null,
         "proto3_optional": false,
@@ -14644,6 +15406,16 @@
       {
         "field": "links",
         "label": "LABEL_REPEATED",
+        "message": "temporal.api.update.v1.Request",
+        "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.Link"
+      },
+      {
+        "field": "links",
+        "label": "LABEL_REPEATED",
         "message": "temporal.api.workflow.v1.PostResetOperation.SignalWorkflow",
         "number": 4,
         "oneof": null,
@@ -14710,6 +15482,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.common.v1.Link"
+      },
+      {
+        "field": "linux",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.Platform",
+        "number": 1,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.LinuxPlatform"
       },
       {
         "field": "local_activity_slots_info",
@@ -14780,6 +15562,16 @@
         "proto3_optional": false,
         "type": "TYPE_BYTES",
         "type_name": ""
+      },
+      {
+        "field": "macos",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.Platform",
+        "number": 2,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.MacOSPlatform"
       },
       {
         "field": "major_version_sets",
@@ -14922,16 +15714,6 @@
         "type_name": ""
       },
       {
-        "field": "max_elapsed_duration",
-        "label": "LABEL_OPTIONAL",
-        "message": "temporal.api.workflow.v1.TimeSkippingConfig",
-        "number": 5,
-        "oneof": 0,
-        "proto3_optional": false,
-        "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.Duration"
-      },
-      {
         "field": "max_operations_per_second",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.StartBatchOperationRequest",
@@ -14962,6 +15744,16 @@
         "type_name": ""
       },
       {
+        "field": "max_session_skip_count",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingConfig",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT32",
+        "type_name": ""
+      },
+      {
         "field": "max_sets",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.GetWorkerBuildIdCompatibilityRequest",
@@ -14970,26 +15762,6 @@
         "proto3_optional": false,
         "type": "TYPE_INT32",
         "type_name": ""
-      },
-      {
-        "field": "max_skipped_duration",
-        "label": "LABEL_OPTIONAL",
-        "message": "temporal.api.workflow.v1.TimeSkippingConfig",
-        "number": 4,
-        "oneof": 0,
-        "proto3_optional": false,
-        "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.Duration"
-      },
-      {
-        "field": "max_target_time",
-        "label": "LABEL_OPTIONAL",
-        "message": "temporal.api.workflow.v1.TimeSkippingConfig",
-        "number": 6,
-        "oneof": 0,
-        "proto3_optional": false,
-        "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.Timestamp"
       },
       {
         "field": "max_tasks_per_second",
@@ -15644,6 +16416,26 @@
       {
         "field": "name",
         "label": "LABEL_OPTIONAL",
+        "message": "nexusannotations.v1.OperationOptions",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "name",
+        "label": "LABEL_OPTIONAL",
+        "message": "nexusannotations.v1.ServiceOptions",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "name",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.common.v1.ActivityType",
         "number": 1,
         "oneof": null,
@@ -15875,6 +16667,16 @@
         "field": "namespace",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.common.v1.Link.NexusOperation",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "namespace",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.Link.Workflow",
         "number": 1,
         "oneof": null,
         "proto3_optional": false,
@@ -16155,6 +16957,16 @@
         "field": "namespace",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.CountSchedulesRequest",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "namespace",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.CountWorkersRequest",
         "number": 1,
         "oneof": null,
         "proto3_optional": false,
@@ -16654,6 +17466,16 @@
       {
         "field": "namespace",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PauseActivityExecutionRequest",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "namespace",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.PauseActivityRequest",
         "number": 1,
         "oneof": null,
@@ -16705,6 +17527,16 @@
         "field": "namespace",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.PollNexusTaskQueueRequest",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "namespace",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PollWorkflowExecutionTimeSkippingRequest",
         "number": 1,
         "oneof": null,
         "proto3_optional": false,
@@ -16805,6 +17637,16 @@
         "field": "namespace",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "namespace",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
         "number": 1,
         "oneof": null,
         "proto3_optional": false,
@@ -17124,6 +17966,16 @@
       {
         "field": "namespace",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "namespace",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.UnpauseActivityRequest",
         "number": 1,
         "oneof": null,
@@ -17135,6 +17987,16 @@
         "field": "namespace",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.UnpauseWorkflowExecutionRequest",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "namespace",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
         "number": 1,
         "oneof": null,
         "proto3_optional": false,
@@ -18442,6 +19304,16 @@
         "type_name": ".temporal.api.workflow.v1.OnConflictOptions"
       },
       {
+        "field": "one_time",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflow.v1.VersioningOverride",
+        "number": 5,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.workflow.v1.VersioningOverride.OneTimeOverride"
+      },
+      {
         "field": "oneof_decl",
         "label": "LABEL_REPEATED",
         "message": "google.protobuf.DescriptorProto",
@@ -18794,6 +19666,16 @@
       {
         "field": "operation_type",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.batch.v1.BatchOperationInfo",
+        "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.enums.v1.BatchOperationType"
+      },
+      {
+        "field": "operation_type",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.DescribeBatchOperationResponse",
         "number": 1,
         "oneof": null,
@@ -19102,16 +19984,6 @@
         "type_name": ""
       },
       {
-        "field": "overridable_features",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FeatureSetDefaults.FeatureSetEditionDefault",
-        "number": 4,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.FeatureSet"
-      },
-      {
         "field": "owner_email",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.namespace.v1.NamespaceInfo",
@@ -19169,6 +20041,16 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "page_number",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.RespondWorkflowTaskCompletedRequest",
+        "number": 21,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT32",
         "type_name": ""
       },
       {
@@ -19672,6 +20554,16 @@
         "type_name": ""
       },
       {
+        "field": "php_generic_services",
+        "label": "LABEL_OPTIONAL",
+        "message": "google.protobuf.FileOptions",
+        "number": 42,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
         "field": "php_metadata_namespace",
         "label": "LABEL_OPTIONAL",
         "message": "google.protobuf.FileOptions",
@@ -19710,6 +20602,16 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
+      },
+      {
+        "field": "platform",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.Platform"
       },
       {
         "field": "plugins",
@@ -19766,6 +20668,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.namespace.v1.NamespaceInfo.Capabilities",
         "number": 9,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "poller_autoscaling_auto_enroll",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.namespace.v1.NamespaceInfo.Capabilities",
+        "number": 13,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_BOOL",
@@ -19854,6 +20766,16 @@
       {
         "field": "poller_group_infos",
         "label": "LABEL_REPEATED",
+        "message": "temporal.api.workflowservice.v1.DescribeNamespaceResponse",
+        "number": 7,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.taskqueue.v1.PollerGroupInfo"
+      },
+      {
+        "field": "poller_group_infos",
+        "label": "LABEL_REPEATED",
         "message": "temporal.api.workflowservice.v1.PollActivityTaskQueueResponse",
         "number": 21,
         "oneof": null,
@@ -19880,6 +20802,56 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.taskqueue.v1.PollerGroupInfo"
+      },
+      {
+        "field": "poller_groups",
+        "label": "LABEL_REPEATED",
+        "message": "temporal.api.taskqueue.v1.PollerGroupsInfo",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.taskqueue.v1.PollerGroupInfo"
+      },
+      {
+        "field": "poller_groups_info",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.DescribeNamespaceResponse",
+        "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.taskqueue.v1.PollerGroupsInfo"
+      },
+      {
+        "field": "poller_groups_info",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PollActivityTaskQueueResponse",
+        "number": 22,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.taskqueue.v1.PollerGroupsInfo"
+      },
+      {
+        "field": "poller_groups_info",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PollNexusTaskQueueResponse",
+        "number": 6,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.taskqueue.v1.PollerGroupsInfo"
+      },
+      {
+        "field": "poller_groups_info",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PollWorkflowTaskQueueResponse",
+        "number": 19,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.taskqueue.v1.PollerGroupsInfo"
       },
       {
         "field": "poller_scaling_decision",
@@ -20382,6 +21354,16 @@
         "type_name": ""
       },
       {
+        "field": "provider_validation",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.deployment.v1.ComputeStatus",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.deployment.v1.ComputeStatus.ProviderValidationStatus"
+      },
+      {
         "field": "public_dependency",
         "label": "LABEL_REPEATED",
         "message": "google.protobuf.FileDescriptorProto",
@@ -20454,8 +21436,28 @@
       {
         "field": "query",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.CountWorkersRequest",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "query",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.CountWorkflowExecutionsRequest",
         "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "query",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.DescribeBatchOperationResponse",
+        "number": 11,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -20802,6 +21804,16 @@
         "type_name": ".temporal.api.enums.v1.RateLimitSource"
       },
       {
+        "field": "rate_limiting_active",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.taskqueue.v1.TaskQueueStats",
+        "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
         "field": "rate_per_second",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.taskqueue.v1.PollerInfo",
@@ -20874,8 +21886,38 @@
       {
         "field": "reason",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.batch.v1.BatchOperationCancelActivities",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "reason",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.batch.v1.BatchOperationTerminateActivities",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "reason",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.command.v1.RequestCancelExternalWorkflowExecutionCommandAttributes",
         "number": 6,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "reason",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.Link.Workflow",
+        "number": 4,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -21014,6 +22056,16 @@
       {
         "field": "reason",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PauseActivityExecutionRequest",
+        "number": 6,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "reason",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.PauseActivityRequest",
         "number": 6,
         "oneof": null,
@@ -21126,6 +22178,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest",
         "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "reason",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+        "number": 8,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -21714,6 +22776,16 @@
       {
         "field": "request_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.update.v1.Request",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "request_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.CreateScheduleRequest",
         "number": 6,
         "oneof": null,
@@ -21764,6 +22836,26 @@
       {
         "field": "request_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PauseActivityExecutionRequest",
+        "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "request_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PauseActivityRequest",
+        "number": 7,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "request_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.PauseWorkflowExecutionRequest",
         "number": 6,
         "oneof": null,
@@ -21796,6 +22888,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest",
         "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "request_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
+        "number": 10,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -21884,8 +22986,28 @@
       {
         "field": "request_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+        "number": 11,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "request_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.UnpauseWorkflowExecutionRequest",
         "number": 6,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "request_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
+        "number": 10,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -22104,6 +23226,16 @@
       {
         "field": "reset_heartbeat",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
+        "number": 11,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "reset_heartbeat",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.ResetActivityRequest",
         "number": 6,
         "oneof": null,
@@ -22264,6 +23396,16 @@
       {
         "field": "resource_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PauseActivityExecutionRequest",
+        "number": 7,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "resource_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatByIdRequest",
         "number": 7,
         "oneof": null,
@@ -22286,6 +23428,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.RecordWorkerHeartbeatRequest",
         "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "resource_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
+        "number": 9,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -22374,6 +23526,26 @@
       {
         "field": "resource_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+        "number": 10,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "resource_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
+        "number": 9,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "resource_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.UpdateWorkerConfigRequest",
         "number": 7,
         "oneof": null,
@@ -22424,6 +23596,16 @@
       {
         "field": "restore_original",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
+        "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "restore_original",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.UpdateActivityOptionsRequest",
         "number": 8,
         "oneof": null,
@@ -22435,6 +23617,16 @@
         "field": "restore_original_options",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.batch.v1.BatchOperationResetActivities",
+        "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "restore_original_options",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
         "number": 8,
         "oneof": null,
         "proto3_optional": false,
@@ -22730,6 +23922,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.common.v1.RetryPolicy"
+      },
+      {
+        "field": "retry_state",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.activity.v1.ActivityExecutionOutcome",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.enums.v1.RetryState"
       },
       {
         "field": "retry_state",
@@ -23144,6 +24346,16 @@
       {
         "field": "run_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.Execution",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "run_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.common.v1.Link.Activity",
         "number": 3,
         "oneof": null,
@@ -23155,6 +24367,16 @@
         "field": "run_id",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.common.v1.Link.NexusOperation",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "run_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.Link.Workflow",
         "number": 3,
         "oneof": null,
         "proto3_optional": false,
@@ -23324,6 +24546,16 @@
       {
         "field": "run_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PauseActivityExecutionRequest",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "run_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.PauseWorkflowExecutionRequest",
         "number": 3,
         "oneof": null,
@@ -23396,6 +24628,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.RequestCancelNexusOperationExecutionRequest",
         "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "run_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
+        "number": 4,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -23504,8 +24746,28 @@
       {
         "field": "run_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "run_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.UnpauseWorkflowExecutionRequest",
         "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "run_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
+        "number": 4,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -23530,6 +24792,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.common.v1.WorkflowExecution"
+      },
+      {
+        "field": "runtimes",
+        "label": "LABEL_REPEATED",
+        "message": "temporal.api.worker.v1.EnvironmentInfo",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.Runtime"
       },
       {
         "field": "scaler",
@@ -24334,6 +25606,16 @@
       {
         "field": "sdk_name",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.activity.v1.ActivityExecutionInfo",
+        "number": 35,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "sdk_name",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.sdk.v1.WorkflowTaskCompletedMetadata",
         "number": 3,
         "oneof": null,
@@ -24356,6 +25638,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.worker.v1.WorkerListInfo",
         "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "sdk_version",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.activity.v1.ActivityExecutionInfo",
+        "number": 36,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -24796,6 +26088,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.GetSystemInfoResponse.Capabilities",
         "number": 12,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "server_scaled_provider_cloud_run",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.GetSystemInfoResponse.Capabilities",
+        "number": 13,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_BOOL",
@@ -25452,6 +26754,46 @@
         "type_name": ""
       },
       {
+        "field": "standalone_activity_batch_operations",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.namespace.v1.NamespaceInfo.Capabilities",
+        "number": 16,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "standalone_activity_operator_commands",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.namespace.v1.NamespaceInfo.Capabilities",
+        "number": 17,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "standalone_activity_start_delay",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.namespace.v1.NamespaceInfo.Capabilities",
+        "number": 15,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "standalone_nexus_operation",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.namespace.v1.NamespaceInfo.Capabilities",
+        "number": 11,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
         "field": "start",
         "label": "LABEL_OPTIONAL",
         "message": "google.protobuf.DescriptorProto.ExtensionRange",
@@ -25520,6 +26862,26 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.history.v1.StartChildWorkflowExecutionInitiatedEventAttributes"
+      },
+      {
+        "field": "start_delay",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.activity.v1.ActivityExecutionInfo",
+        "number": 37,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Duration"
+      },
+      {
+        "field": "start_delay",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.activity.v1.ActivityOptions",
+        "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Duration"
       },
       {
         "field": "start_delay",
@@ -26312,6 +27674,46 @@
         "type_name": ""
       },
       {
+        "field": "state_size_bytes",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.nexus.v1.NexusOperationExecutionInfo",
+        "number": 29,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
+        "field": "state_size_bytes",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.nexus.v1.NexusOperationExecutionListInfo",
+        "number": 12,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
+        "field": "state_size_bytes",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.schedule.v1.ScheduleInfo",
+        "number": 12,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
+        "field": "state_size_bytes",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.schedule.v1.ScheduleListInfo",
+        "number": 7,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
         "field": "state_transition_count",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.activity.v1.ActivityExecutionInfo",
@@ -26772,6 +28174,26 @@
         "type_name": ".temporal.api.operatorservice.v1.ListSearchAttributesResponse.SystemAttributesEntry"
       },
       {
+        "field": "tags",
+        "label": "LABEL_REPEATED",
+        "message": "nexusannotations.v1.OperationOptions",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "tags",
+        "label": "LABEL_REPEATED",
+        "message": "nexusannotations.v1.ServiceOptions",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "target",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.nexus.v1.EndpointSpec",
@@ -26810,6 +28232,36 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
+      },
+      {
+        "field": "target_deployment_version",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflow.v1.VersioningOverride.OneTimeOverride",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.deployment.v1.WorkerDeploymentVersion"
+      },
+      {
+        "field": "target_executions",
+        "label": "LABEL_REPEATED",
+        "message": "temporal.api.workflowservice.v1.StartBatchOperationRequest",
+        "number": 22,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.Execution"
+      },
+      {
+        "field": "target_time",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.TimeSkippingFastForwardInfo",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
       },
       {
         "field": "target_time",
@@ -27472,6 +28924,16 @@
         "type_name": ""
       },
       {
+        "field": "terminate_activities_operation",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.StartBatchOperationRequest",
+        "number": 20,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.batch.v1.BatchOperationTerminateActivities"
+      },
+      {
         "field": "terminated_failure_info",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.failure.v1.Failure",
@@ -27494,12 +28956,22 @@
       {
         "field": "time_skipping_config",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.history.v1.StartChildWorkflowExecutionInitiatedEventAttributes",
+        "number": 21,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.TimeSkippingConfig"
+      },
+      {
+        "field": "time_skipping_config",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes",
         "number": 7,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
-        "type_name": ".temporal.api.workflow.v1.TimeSkippingConfig"
+        "type_name": ".temporal.api.common.v1.TimeSkippingConfig"
       },
       {
         "field": "time_skipping_config",
@@ -27509,7 +28981,7 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
-        "type_name": ".temporal.api.workflow.v1.TimeSkippingConfig"
+        "type_name": ".temporal.api.common.v1.TimeSkippingConfig"
       },
       {
         "field": "time_skipping_config",
@@ -27519,7 +28991,7 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
-        "type_name": ".temporal.api.workflow.v1.TimeSkippingConfig"
+        "type_name": ".temporal.api.common.v1.TimeSkippingConfig"
       },
       {
         "field": "time_skipping_config",
@@ -27529,7 +29001,7 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
-        "type_name": ".temporal.api.workflow.v1.TimeSkippingConfig"
+        "type_name": ".temporal.api.common.v1.TimeSkippingConfig"
       },
       {
         "field": "time_skipping_config",
@@ -27539,7 +29011,47 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
-        "type_name": ".temporal.api.workflow.v1.TimeSkippingConfig"
+        "type_name": ".temporal.api.common.v1.TimeSkippingConfig"
+      },
+      {
+        "field": "time_skipping_config_updated",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes",
+        "number": 9,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "time_skipping_info",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflow.v1.WorkflowExecutionExtendedInfo",
+        "number": 9,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.TimeSkippingInfo"
+      },
+      {
+        "field": "time_skipping_state_propagation",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.history.v1.StartChildWorkflowExecutionInitiatedEventAttributes",
+        "number": 23,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.TimeSkippingStatePropagation"
+      },
+      {
+        "field": "time_skipping_state_propagation",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.history.v1.WorkflowExecutionStartedEventAttributes",
+        "number": 43,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.TimeSkippingStatePropagation"
       },
       {
         "field": "timeout_failure_info",
@@ -27824,6 +29336,16 @@
       {
         "field": "type",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.Execution",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.enums.v1.ExecutionType"
+      },
+      {
+        "field": "type",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.common.v1.Principal",
         "number": 1,
         "oneof": null,
@@ -27910,6 +29432,26 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
+      },
+      {
+        "field": "type",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.HostingEnvironment",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.HostingEnvironment.HostingEnvironmentType"
+      },
+      {
+        "field": "type",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.Runtime",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.Runtime.RuntimeType"
       },
       {
         "field": "type",
@@ -28224,6 +29766,16 @@
       {
         "field": "update_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes.WorkflowUpdateOptionsUpdate",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "update_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.update.v1.Meta",
         "number": 1,
         "oneof": null,
@@ -28236,6 +29788,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.update.v1.UpdateRef",
         "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "update_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflow.v1.CallbackInfo.UpdateWorkflowExecutionCompleted",
+        "number": 1,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -28296,6 +29858,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflow.v1.PostResetOperation.UpdateWorkflowOptions",
         "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.FieldMask"
+      },
+      {
+        "field": "update_mask",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
+        "number": 7,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
@@ -28412,6 +29984,16 @@
         "type_name": ".google.protobuf.Timestamp"
       },
       {
+        "field": "update_time",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateWorkflowExecutionOptionsResponse",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
+      },
+      {
         "field": "update_workflow",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.ExecuteMultiOperationRequest.Operation",
@@ -28430,6 +30012,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.workflowservice.v1.UpdateWorkflowExecutionResponse"
+      },
+      {
+        "field": "update_workflow_execution_completed",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflow.v1.CallbackInfo.Trigger",
+        "number": 2,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.workflow.v1.CallbackInfo.UpdateWorkflowExecutionCompleted"
       },
       {
         "field": "update_workflow_options",
@@ -29124,6 +30716,16 @@
       {
         "field": "value",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.sdk.v1.ExternalStorageReference.ClaimDataEntry",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "value",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.taskqueue.v1.TaskQueueConfig.FairnessWeightOverridesEntry",
         "number": 2,
         "oneof": null,
@@ -29374,7 +30976,67 @@
       {
         "field": "version",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.taskqueue.v1.PollerGroupsInfo",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
+        "field": "version",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.version.v1.ReleaseInfo",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "version",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.HostingEnvironment",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "version",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.LinuxPlatform",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "version",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.MacOSPlatform",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "version",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.Runtime",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "version",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.WindowsPlatform",
         "number": 1,
         "oneof": null,
         "proto3_optional": false,
@@ -29550,6 +31212,26 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.taskqueue.v1.TaskQueueVersioningInfo"
+      },
+      {
+        "field": "versioning_override",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes",
+        "number": 19,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.workflow.v1.VersioningOverride"
+      },
+      {
+        "field": "versioning_override",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.history.v1.StartChildWorkflowExecutionInitiatedEventAttributes",
+        "number": 24,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.workflow.v1.VersioningOverride"
       },
       {
         "field": "versioning_override",
@@ -29782,6 +31464,16 @@
         "type_name": ""
       },
       {
+        "field": "weak_consistency",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.DescribeNamespaceRequest",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
         "field": "weak_dependency",
         "label": "LABEL_REPEATED",
         "message": "google.protobuf.FileDescriptorProto",
@@ -29802,6 +31494,16 @@
         "type_name": ""
       },
       {
+        "field": "windows",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.worker.v1.EnvironmentInfo.Platform",
+        "number": 3,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.worker.v1.EnvironmentInfo.WindowsPlatform"
+      },
+      {
         "field": "worker",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.nexus.v1.EndpointTarget",
@@ -29810,6 +31512,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".temporal.api.nexus.v1.EndpointTarget.Worker"
+      },
+      {
+        "field": "worker_commands",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.namespace.v1.NamespaceInfo.Capabilities",
+        "number": 10,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
       },
       {
         "field": "worker_config",
@@ -30342,6 +32054,16 @@
         "type_name": ".temporal.api.worker.v1.WorkerInfo"
       },
       {
+        "field": "workflow",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.Link",
+        "number": 5,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.Link.Workflow"
+      },
+      {
         "field": "workflow_cache_size",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.sdk.v1.WorkerConfig",
@@ -30546,6 +32268,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.PollActivityTaskQueueResponse",
         "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.common.v1.WorkflowExecution"
+      },
+      {
+        "field": "workflow_execution",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PollWorkflowExecutionTimeSkippingRequest",
+        "number": 2,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
@@ -30984,6 +32716,16 @@
       {
         "field": "workflow_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.common.v1.Link.Workflow",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "workflow_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.common.v1.Link.WorkflowEvent",
         "number": 2,
         "oneof": null,
@@ -31064,6 +32806,16 @@
       {
         "field": "workflow_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.PauseActivityExecutionRequest",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "workflow_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.PauseWorkflowExecutionRequest",
         "number": 2,
         "oneof": null,
@@ -31075,6 +32827,16 @@
         "field": "workflow_id",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatByIdRequest",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "workflow_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
         "number": 2,
         "oneof": null,
         "proto3_optional": false,
@@ -31134,7 +32896,27 @@
       {
         "field": "workflow_id",
         "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "workflow_id",
+        "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.UnpauseWorkflowExecutionRequest",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "workflow_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
         "number": 2,
         "oneof": null,
         "proto3_optional": false,
@@ -31612,6 +33394,26 @@
         "type_name": ""
       },
       {
+        "field": "workflow_task_completion_pagination",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.namespace.v1.NamespaceInfo.Capabilities",
+        "number": 14,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "workflow_task_completion_size_limit_error",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.namespace.v1.NamespaceInfo.Limits",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
         "field": "workflow_task_failed_event_attributes",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.history.v1.HistoryEvent",
@@ -31972,6 +33774,26 @@
         "type_name": ""
       },
       {
+        "field": "workflow_update_callbacks",
+        "label": "LABEL_OPTIONAL",
+        "message": "temporal.api.namespace.v1.NamespaceInfo.Capabilities",
+        "number": 12,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
+        "field": "workflow_update_options",
+        "label": "LABEL_REPEATED",
+        "message": "temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes",
+        "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes.WorkflowUpdateOptionsUpdate"
+      },
+      {
         "field": "year",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.schedule.v1.CalendarSpec",
@@ -32002,6 +33824,7 @@
       "google/protobuf/field_mask.proto",
       "google/protobuf/timestamp.proto",
       "google/protobuf/wrappers.proto",
+      "nexusannotations/v1/options.proto",
       "temporal/api/activity/v1/message.proto",
       "temporal/api/batch/v1/message.proto",
       "temporal/api/callback/v1/message.proto",
@@ -32024,6 +33847,7 @@
       "temporal/api/enums/v1/reset.proto",
       "temporal/api/enums/v1/schedule.proto",
       "temporal/api/enums/v1/task_queue.proto",
+      "temporal/api/enums/v1/time_skipping.proto",
       "temporal/api/enums/v1/update.proto",
       "temporal/api/enums/v1/workflow.proto",
       "temporal/api/errordetails/v1/message.proto",
@@ -32043,6 +33867,8 @@
       "temporal/api/rules/v1/message.proto",
       "temporal/api/schedule/v1/message.proto",
       "temporal/api/sdk/v1/enhanced_stack_trace.proto",
+      "temporal/api/sdk/v1/event_group_marker.proto",
+      "temporal/api/sdk/v1/external_storage.proto",
       "temporal/api/sdk/v1/task_complete_metadata.proto",
       "temporal/api/sdk/v1/user_metadata.proto",
       "temporal/api/sdk/v1/worker_config.proto",
@@ -32083,7 +33909,6 @@
       "google.protobuf.FieldMask",
       "google.protobuf.FieldOptions",
       "google.protobuf.FieldOptions.EditionDefault",
-      "google.protobuf.FieldOptions.FeatureSupport",
       "google.protobuf.FileDescriptorProto",
       "google.protobuf.FileDescriptorSet",
       "google.protobuf.FileOptions",
@@ -32107,6 +33932,8 @@
       "google.protobuf.UInt64Value",
       "google.protobuf.UninterpretedOption",
       "google.protobuf.UninterpretedOption.NamePart",
+      "nexusannotations.v1.OperationOptions",
+      "nexusannotations.v1.ServiceOptions",
       "temporal.api.activity.v1.ActivityExecutionInfo",
       "temporal.api.activity.v1.ActivityExecutionListInfo",
       "temporal.api.activity.v1.ActivityExecutionOutcome",
@@ -32114,12 +33941,15 @@
       "temporal.api.activity.v1.CallbackInfo",
       "temporal.api.activity.v1.CallbackInfo.ActivityClosed",
       "temporal.api.activity.v1.CallbackInfo.Trigger",
+      "temporal.api.batch.v1.BatchOperationCancelActivities",
       "temporal.api.batch.v1.BatchOperationCancellation",
+      "temporal.api.batch.v1.BatchOperationDeleteActivities",
       "temporal.api.batch.v1.BatchOperationDeletion",
       "temporal.api.batch.v1.BatchOperationInfo",
       "temporal.api.batch.v1.BatchOperationReset",
       "temporal.api.batch.v1.BatchOperationResetActivities",
       "temporal.api.batch.v1.BatchOperationSignal",
+      "temporal.api.batch.v1.BatchOperationTerminateActivities",
       "temporal.api.batch.v1.BatchOperationTermination",
       "temporal.api.batch.v1.BatchOperationTriggerWorkflowRule",
       "temporal.api.batch.v1.BatchOperationUnpauseActivities",
@@ -32152,12 +33982,15 @@
       "temporal.api.common.v1.Callback.Nexus",
       "temporal.api.common.v1.Callback.Nexus.HeaderEntry",
       "temporal.api.common.v1.DataBlob",
+      "temporal.api.common.v1.Execution",
+      "temporal.api.common.v1.FastForwardConfig",
       "temporal.api.common.v1.Header",
       "temporal.api.common.v1.Header.FieldsEntry",
       "temporal.api.common.v1.Link",
       "temporal.api.common.v1.Link.Activity",
       "temporal.api.common.v1.Link.BatchJob",
       "temporal.api.common.v1.Link.NexusOperation",
+      "temporal.api.common.v1.Link.Workflow",
       "temporal.api.common.v1.Link.WorkflowEvent",
       "temporal.api.common.v1.Link.WorkflowEvent.EventReference",
       "temporal.api.common.v1.Link.WorkflowEvent.RequestIdReference",
@@ -32175,6 +34008,10 @@
       "temporal.api.common.v1.RetryPolicy",
       "temporal.api.common.v1.SearchAttributes",
       "temporal.api.common.v1.SearchAttributes.IndexedFieldsEntry",
+      "temporal.api.common.v1.TimeSkippingConfig",
+      "temporal.api.common.v1.TimeSkippingFastForwardInfo",
+      "temporal.api.common.v1.TimeSkippingInfo",
+      "temporal.api.common.v1.TimeSkippingStatePropagation",
       "temporal.api.common.v1.WorkerSelector",
       "temporal.api.common.v1.WorkerVersionCapabilities",
       "temporal.api.common.v1.WorkerVersionStamp",
@@ -32189,6 +34026,8 @@
       "temporal.api.compute.v1.ComputeConfigSummary.ScalingGroupsEntry",
       "temporal.api.compute.v1.ComputeProvider",
       "temporal.api.compute.v1.ComputeScaler",
+      "temporal.api.deployment.v1.ComputeStatus",
+      "temporal.api.deployment.v1.ComputeStatus.ProviderValidationStatus",
       "temporal.api.deployment.v1.Deployment",
       "temporal.api.deployment.v1.DeploymentInfo",
       "temporal.api.deployment.v1.DeploymentInfo.MetadataEntry",
@@ -32227,6 +34066,7 @@
       "temporal.api.errordetails.v1.SystemWorkflowFailure",
       "temporal.api.errordetails.v1.WorkflowExecutionAlreadyStartedFailure",
       "temporal.api.errordetails.v1.WorkflowNotReadyFailure",
+      "temporal.api.errordetails.v1.WorkflowTaskCompletionBufferLostFailure",
       "temporal.api.export.v1.WorkflowExecution",
       "temporal.api.export.v1.WorkflowExecutions",
       "temporal.api.failure.v1.ActivityFailureInfo",
@@ -32292,6 +34132,7 @@
       "temporal.api.history.v1.WorkflowExecutionContinuedAsNewEventAttributes",
       "temporal.api.history.v1.WorkflowExecutionFailedEventAttributes",
       "temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes",
+      "temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes.WorkflowUpdateOptionsUpdate",
       "temporal.api.history.v1.WorkflowExecutionPausedEventAttributes",
       "temporal.api.history.v1.WorkflowExecutionSignaledEventAttributes",
       "temporal.api.history.v1.WorkflowExecutionStartedEventAttributes",
@@ -32409,6 +34250,12 @@
       "temporal.api.schedule.v1.TriggerImmediatelyRequest",
       "temporal.api.sdk.v1.EnhancedStackTrace",
       "temporal.api.sdk.v1.EnhancedStackTrace.SourcesEntry",
+      "temporal.api.sdk.v1.EventGroupMarker",
+      "temporal.api.sdk.v1.EventGroupMarker.InboundEvent",
+      "temporal.api.sdk.v1.EventGroupMarker.InboundUpdate",
+      "temporal.api.sdk.v1.EventGroupMarker.Label",
+      "temporal.api.sdk.v1.ExternalStorageReference",
+      "temporal.api.sdk.v1.ExternalStorageReference.ClaimDataEntry",
       "temporal.api.sdk.v1.StackTrace",
       "temporal.api.sdk.v1.StackTraceFileLocation",
       "temporal.api.sdk.v1.StackTraceFileSlice",
@@ -32427,6 +34274,7 @@
       "temporal.api.taskqueue.v1.CompatibleVersionSet",
       "temporal.api.taskqueue.v1.ConfigMetadata",
       "temporal.api.taskqueue.v1.PollerGroupInfo",
+      "temporal.api.taskqueue.v1.PollerGroupsInfo",
       "temporal.api.taskqueue.v1.PollerInfo",
       "temporal.api.taskqueue.v1.PollerScalingDecision",
       "temporal.api.taskqueue.v1.RampByPercentage",
@@ -32463,6 +34311,13 @@
       "temporal.api.version.v1.VersionInfo",
       "temporal.api.worker.v1.CancelActivityCommand",
       "temporal.api.worker.v1.CancelActivityResult",
+      "temporal.api.worker.v1.EnvironmentInfo",
+      "temporal.api.worker.v1.EnvironmentInfo.HostingEnvironment",
+      "temporal.api.worker.v1.EnvironmentInfo.LinuxPlatform",
+      "temporal.api.worker.v1.EnvironmentInfo.MacOSPlatform",
+      "temporal.api.worker.v1.EnvironmentInfo.Platform",
+      "temporal.api.worker.v1.EnvironmentInfo.Runtime",
+      "temporal.api.worker.v1.EnvironmentInfo.WindowsPlatform",
       "temporal.api.worker.v1.PluginInfo",
       "temporal.api.worker.v1.StorageDriverInfo",
       "temporal.api.worker.v1.WorkerCommand",
@@ -32475,6 +34330,7 @@
       "temporal.api.worker.v1.WorkerSlotsInfo",
       "temporal.api.workflow.v1.CallbackInfo",
       "temporal.api.workflow.v1.CallbackInfo.Trigger",
+      "temporal.api.workflow.v1.CallbackInfo.UpdateWorkflowExecutionCompleted",
       "temporal.api.workflow.v1.CallbackInfo.WorkflowClosed",
       "temporal.api.workflow.v1.DeploymentTransition",
       "temporal.api.workflow.v1.DeploymentVersionTransition",
@@ -32494,8 +34350,8 @@
       "temporal.api.workflow.v1.RequestIdInfo",
       "temporal.api.workflow.v1.ResetPointInfo",
       "temporal.api.workflow.v1.ResetPoints",
-      "temporal.api.workflow.v1.TimeSkippingConfig",
       "temporal.api.workflow.v1.VersioningOverride",
+      "temporal.api.workflow.v1.VersioningOverride.OneTimeOverride",
       "temporal.api.workflow.v1.VersioningOverride.PinnedOverride",
       "temporal.api.workflow.v1.WorkflowExecutionConfig",
       "temporal.api.workflow.v1.WorkflowExecutionExtendedInfo",
@@ -32513,6 +34369,8 @@
       "temporal.api.workflowservice.v1.CountSchedulesRequest",
       "temporal.api.workflowservice.v1.CountSchedulesResponse",
       "temporal.api.workflowservice.v1.CountSchedulesResponse.AggregationGroup",
+      "temporal.api.workflowservice.v1.CountWorkersRequest",
+      "temporal.api.workflowservice.v1.CountWorkersResponse",
       "temporal.api.workflowservice.v1.CountWorkflowExecutionsRequest",
       "temporal.api.workflowservice.v1.CountWorkflowExecutionsResponse",
       "temporal.api.workflowservice.v1.CountWorkflowExecutionsResponse.AggregationGroup",
@@ -32631,6 +34489,8 @@
       "temporal.api.workflowservice.v1.ListWorkflowRulesResponse",
       "temporal.api.workflowservice.v1.PatchScheduleRequest",
       "temporal.api.workflowservice.v1.PatchScheduleResponse",
+      "temporal.api.workflowservice.v1.PauseActivityExecutionRequest",
+      "temporal.api.workflowservice.v1.PauseActivityExecutionResponse",
       "temporal.api.workflowservice.v1.PauseActivityRequest",
       "temporal.api.workflowservice.v1.PauseActivityResponse",
       "temporal.api.workflowservice.v1.PauseWorkflowExecutionRequest",
@@ -32643,6 +34503,8 @@
       "temporal.api.workflowservice.v1.PollNexusOperationExecutionResponse",
       "temporal.api.workflowservice.v1.PollNexusTaskQueueRequest",
       "temporal.api.workflowservice.v1.PollNexusTaskQueueResponse",
+      "temporal.api.workflowservice.v1.PollWorkflowExecutionTimeSkippingRequest",
+      "temporal.api.workflowservice.v1.PollWorkflowExecutionTimeSkippingResponse",
       "temporal.api.workflowservice.v1.PollWorkflowExecutionUpdateRequest",
       "temporal.api.workflowservice.v1.PollWorkflowExecutionUpdateResponse",
       "temporal.api.workflowservice.v1.PollWorkflowTaskQueueRequest",
@@ -32665,6 +34527,8 @@
       "temporal.api.workflowservice.v1.RequestCancelNexusOperationExecutionResponse",
       "temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest",
       "temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionResponse",
+      "temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
+      "temporal.api.workflowservice.v1.ResetActivityExecutionResponse",
       "temporal.api.workflowservice.v1.ResetActivityRequest",
       "temporal.api.workflowservice.v1.ResetActivityResponse",
       "temporal.api.workflowservice.v1.ResetStickyTaskQueueRequest",
@@ -32730,10 +34594,14 @@
       "temporal.api.workflowservice.v1.TerminateWorkflowExecutionResponse",
       "temporal.api.workflowservice.v1.TriggerWorkflowRuleRequest",
       "temporal.api.workflowservice.v1.TriggerWorkflowRuleResponse",
+      "temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+      "temporal.api.workflowservice.v1.UnpauseActivityExecutionResponse",
       "temporal.api.workflowservice.v1.UnpauseActivityRequest",
       "temporal.api.workflowservice.v1.UnpauseActivityResponse",
       "temporal.api.workflowservice.v1.UnpauseWorkflowExecutionRequest",
       "temporal.api.workflowservice.v1.UnpauseWorkflowExecutionResponse",
+      "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
+      "temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsResponse",
       "temporal.api.workflowservice.v1.UpdateActivityOptionsRequest",
       "temporal.api.workflowservice.v1.UpdateActivityOptionsResponse",
       "temporal.api.workflowservice.v1.UpdateNamespaceRequest",
@@ -32896,6 +34764,14 @@
         "input": ".temporal.api.workflowservice.v1.CountSchedulesRequest",
         "method": "CountSchedules",
         "output": ".temporal.api.workflowservice.v1.CountSchedulesResponse",
+        "server_streaming": false,
+        "service": "temporal.api.workflowservice.v1.WorkflowService"
+      },
+      {
+        "client_streaming": false,
+        "input": ".temporal.api.workflowservice.v1.CountWorkersRequest",
+        "method": "CountWorkers",
+        "output": ".temporal.api.workflowservice.v1.CountWorkersResponse",
         "server_streaming": false,
         "service": "temporal.api.workflowservice.v1.WorkflowService"
       },
@@ -33325,6 +35201,14 @@
       },
       {
         "client_streaming": false,
+        "input": ".temporal.api.workflowservice.v1.PauseActivityExecutionRequest",
+        "method": "PauseActivityExecution",
+        "output": ".temporal.api.workflowservice.v1.PauseActivityExecutionResponse",
+        "server_streaming": false,
+        "service": "temporal.api.workflowservice.v1.WorkflowService"
+      },
+      {
+        "client_streaming": false,
         "input": ".temporal.api.workflowservice.v1.PauseActivityRequest",
         "method": "PauseActivity",
         "output": ".temporal.api.workflowservice.v1.PauseActivityResponse",
@@ -33368,6 +35252,14 @@
         "input": ".temporal.api.workflowservice.v1.PollNexusTaskQueueRequest",
         "method": "PollNexusTaskQueue",
         "output": ".temporal.api.workflowservice.v1.PollNexusTaskQueueResponse",
+        "server_streaming": false,
+        "service": "temporal.api.workflowservice.v1.WorkflowService"
+      },
+      {
+        "client_streaming": false,
+        "input": ".temporal.api.workflowservice.v1.PollWorkflowExecutionTimeSkippingRequest",
+        "method": "PollWorkflowExecutionTimeSkipping",
+        "output": ".temporal.api.workflowservice.v1.PollWorkflowExecutionTimeSkippingResponse",
         "server_streaming": false,
         "service": "temporal.api.workflowservice.v1.WorkflowService"
       },
@@ -33448,6 +35340,14 @@
         "input": ".temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest",
         "method": "RequestCancelWorkflowExecution",
         "output": ".temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionResponse",
+        "server_streaming": false,
+        "service": "temporal.api.workflowservice.v1.WorkflowService"
+      },
+      {
+        "client_streaming": false,
+        "input": ".temporal.api.workflowservice.v1.ResetActivityExecutionRequest",
+        "method": "ResetActivityExecution",
+        "output": ".temporal.api.workflowservice.v1.ResetActivityExecutionResponse",
         "server_streaming": false,
         "service": "temporal.api.workflowservice.v1.WorkflowService"
       },
@@ -33701,6 +35601,14 @@
       },
       {
         "client_streaming": false,
+        "input": ".temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest",
+        "method": "UnpauseActivityExecution",
+        "output": ".temporal.api.workflowservice.v1.UnpauseActivityExecutionResponse",
+        "server_streaming": false,
+        "service": "temporal.api.workflowservice.v1.WorkflowService"
+      },
+      {
+        "client_streaming": false,
         "input": ".temporal.api.workflowservice.v1.UnpauseActivityRequest",
         "method": "UnpauseActivity",
         "output": ".temporal.api.workflowservice.v1.UnpauseActivityResponse",
@@ -33712,6 +35620,14 @@
         "input": ".temporal.api.workflowservice.v1.UnpauseWorkflowExecutionRequest",
         "method": "UnpauseWorkflowExecution",
         "output": ".temporal.api.workflowservice.v1.UnpauseWorkflowExecutionResponse",
+        "server_streaming": false,
+        "service": "temporal.api.workflowservice.v1.WorkflowService"
+      },
+      {
+        "client_streaming": false,
+        "input": ".temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest",
+        "method": "UpdateActivityExecutionOptions",
+        "output": ".temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsResponse",
         "server_streaming": false,
         "service": "temporal.api.workflowservice.v1.WorkflowService"
       },

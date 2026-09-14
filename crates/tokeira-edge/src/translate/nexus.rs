@@ -152,10 +152,13 @@ pub fn poll_request_to_edge(
     })
 }
 
+// v132-batch-operations-and-workers owns migration of poller_group_infos.
+#[allow(deprecated)]
 pub fn poll_response_to_proto(
     resp: PollNexusTaskQueueResponse,
 ) -> Result<workflowservice::PollNexusTaskQueueResponse, NexusTranslateError> {
     Ok(workflowservice::PollNexusTaskQueueResponse {
+        poller_groups_info: None,
         task_token: resp.task_token,
         request: Some(nexus_task_to_proto_request(&resp.request)?),
         poller_group_id: String::new(),

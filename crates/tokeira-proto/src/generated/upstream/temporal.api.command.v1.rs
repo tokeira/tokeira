@@ -290,6 +290,12 @@ pub struct StartChildWorkflowExecutionCommandAttributes {
     /// present, they inherit the values from the workflow.
     #[prost(message, optional, tag = "18")]
     pub priority: ::core::option::Option<super::super::common::v1::Priority>,
+    /// Versioning override for the child workflow. If present, this explicit override takes
+    /// precedence over versioning behavior inherited from the parent workflow.
+    #[prost(message, optional, tag = "19")]
+    pub versioning_override: ::core::option::Option<
+        super::super::workflow::v1::VersioningOverride,
+    >,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProtocolMessageCommandAttributes {
@@ -377,6 +383,11 @@ pub struct Command {
     ///   started where the summary is used to identify the timer.
     #[prost(message, optional, tag = "301")]
     pub user_metadata: ::core::option::Option<super::super::sdk::v1::UserMetadata>,
+    /// Event Group Markers attached to the command by the workflow author.
+    #[prost(message, repeated, tag = "302")]
+    pub event_group_markers: ::prost::alloc::vec::Vec<
+        super::super::sdk::v1::EventGroupMarker,
+    >,
     /// The command details. The type must match that in `command_type`.
     #[prost(
         oneof = "command::Attributes",

@@ -618,6 +618,9 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
                     run_id: run_id_for_update,
                 }),
                 request: Some(tokeira_proto::public::temporal::api::update::v1::Request {
+                    request_id: String::new(),
+                    completion_callbacks: Vec::new(),
+                    links: Vec::new(),
                     meta: Some(tokeira_proto::public::temporal::api::update::v1::Meta {
                         update_id: "update-1".to_string(),
                         identity: "starter".to_string(),
@@ -712,6 +715,7 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
             identity: "worker-1".to_string(),
             commands: vec![
                 Command {
+                    event_group_markers: Vec::new(),
                     command_type: tokeira_proto::enums::CommandType::ProtocolMessage as i32,
                     user_metadata: None,
                     attributes: Some(CommandAttributes::ProtocolMessageCommandAttributes(
@@ -721,6 +725,7 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
                     )),
                 },
                 Command {
+                    event_group_markers: Vec::new(),
                     command_type: tokeira_proto::enums::CommandType::ProtocolMessage as i32,
                     user_metadata: None,
                     attributes: Some(CommandAttributes::ProtocolMessageCommandAttributes(

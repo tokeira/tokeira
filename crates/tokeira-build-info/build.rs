@@ -16,6 +16,7 @@ const SOURCE_REVISION_KEY: &str = "TOKEIRA_BUILD_INFO_SOURCE_REVISION";
 const SERVER_VERSION_KEY: &str = "TOKEIRA_BUILD_INFO_SERVER_VERSION";
 const PROTO_VERSION_KEY: &str = "TOKEIRA_BUILD_INFO_PROTO_VERSION";
 const SERVER_COMPAT_KEY: &str = "TOKEIRA_BUILD_INFO_SERVER_COMPAT";
+const SERVER_TARGET_KEY: &str = "TOKEIRA_BUILD_INFO_SERVER_TARGET";
 const RUST_TOOLCHAIN_KEY: &str = "TOKEIRA_BUILD_INFO_RUST_TOOLCHAIN";
 const SOURCE_TREE_HASH_KEY: &str = "TOKEIRA_BUILD_INFO_SOURCE_TREE_HASH";
 const FEATURE_MATRIX_DIGEST_KEY: &str = "TOKEIRA_BUILD_INFO_FEATURE_MATRIX_DIGEST";
@@ -49,6 +50,16 @@ struct SchemaContractMetadata {
 }
 
 fn main() {
+    // The campaign target belongs to the compiled source, including registry and
+    // versioned builds. Reading it separately keeps claim-only provenance manifests
+    // valid and prevents a manifest from overriding the corpus the gate accepts.
+    println!("cargo:rerun-if-changed=src/pinned.rs");
+    let pinned_source = fs::read_to_string(manifest_dir().join("src/pinned.rs"))
+        .expect("read the packaged compatibility pins");
+    let server_target = capture_const(&pinned_source, "TEMPORAL_SERVER_TARGET")
+        .expect("pinned.rs defines TEMPORAL_SERVER_TARGET");
+    println!("cargo:rustc-env={SERVER_TARGET_KEY}={server_target}");
+
     println!("cargo:rerun-if-env-changed=TOKEIRA_BUILD_MANIFEST_PATH");
     println!("cargo:rerun-if-env-changed=TOKEIRA_GIT_SHA");
     println!("cargo:rerun-if-env-changed=TOKEIRA_SOURCE_REVISION");
@@ -69,7 +80,6 @@ fn main() {
         "cargo:rerun-if-changed={}",
         root.join("Cargo.toml").display()
     );
-    println!("cargo:rerun-if-changed=src/pinned.rs");
     println!("cargo:rerun-if-changed=src/provenance.rs");
     // Live Git provenance changes with the checked-out commit; without this the
     // embedded revision would survive a checkout until something else rebuilt.

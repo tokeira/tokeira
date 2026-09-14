@@ -105,6 +105,20 @@ reviews each PR against Target_Release before the integration seat merges. Delta
     - Tag: `// Feature: temporal-v1.32-compatibility, Property 2: target pin never trails the claim`
     - _Requirements: 8.2, 8.3, 8.5_
   - [x] 2.5 Checkpoint: bar green.
+    - Local macOS validation passed on 2026-09-14 for `f6305ebc`, rebased onto
+      campaign head `41b3ede0` (merged F1): all six §10.4 commands, 3,370 nextest
+      tests passed (2 existing skips), doctests (2 passed, 20 existing ignored
+      examples), and rustdoc with warnings denied. The complete nextest rerun
+      used `--no-fail-fast`.
+    - The first rebased nextest run passed 3,369 tests and timed out the unchanged
+      `backlog::tests::property_drain_routes_entries_to_the_correct_broker`
+      (`crates/tokeira-runtime/src/backlog.rs`) at 180 seconds. The focused replay
+      passed in 0.184 seconds; the subsequent full run passed it in 0.231 seconds.
+      F1 already records this test as intermittent; F3 changes no runtime code,
+      and that test remains a follow-up risk.
+    - Dependency bans/licenses/sources passed. Offline source links passed with
+      the gitignored `.tokeira-build/` output excluded: the unfiltered check found
+      a missing documentation file in a generated scoped-workspace README.
 
 - [ ] 3. F2 — configuration denominator at `v1.32.0` (branch `agent/codex/t132-config-denominator`)
   - [ ] 3.1 Run the extractor at tag `v1.32.0`; commit

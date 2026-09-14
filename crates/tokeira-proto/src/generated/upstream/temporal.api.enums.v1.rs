@@ -336,6 +336,37 @@ impl WorkerStatus {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ExecutionType {
+    Unspecified = 0,
+    /// A workflow execution archetype.
+    Workflow = 1,
+    /// An activity execution archetype. This is reserved for standalone activities.
+    Activity = 2,
+}
+impl ExecutionType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "EXECUTION_TYPE_UNSPECIFIED",
+            Self::Workflow => "EXECUTION_TYPE_WORKFLOW",
+            Self::Activity => "EXECUTION_TYPE_ACTIVITY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "EXECUTION_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "EXECUTION_TYPE_WORKFLOW" => Some(Self::Workflow),
+            "EXECUTION_TYPE_ACTIVITY" => Some(Self::Activity),
+            _ => None,
+        }
+    }
+}
 /// Whenever this list of events is changed do change the function shouldBufferEvent in mutableStateBuilder.go to make sure to do the correct event ordering
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -1946,8 +1977,8 @@ impl RoutingConfigUpdateState {
     }
 }
 /// Status of a standalone activity.
-/// The status is updated once, when the activity is originally scheduled, and again when the activity reaches a terminal
-/// status.
+/// The status is updated when the activity is originally scheduled, paused, unpaused, and when the
+/// activity reaches a terminal state.
 /// (-- api-linter: core::0216::synonyms=disabled
 /// aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -1985,6 +2016,9 @@ pub enum ActivityExecutionStatus {
     ///   reached when retry is blocked (RetryPolicy.maximum_attempts exhausted,
     ///   SCHEDULE_TO_CLOSE would be exceeded, or cancellation has been requested).
     TimedOut = 6,
+    /// The activity is paused. Paused state is only reachable after calling
+    /// PauseActivityExecution on a standalone activity.
+    Paused = 7,
 }
 impl ActivityExecutionStatus {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2000,6 +2034,7 @@ impl ActivityExecutionStatus {
             Self::Canceled => "ACTIVITY_EXECUTION_STATUS_CANCELED",
             Self::Terminated => "ACTIVITY_EXECUTION_STATUS_TERMINATED",
             Self::TimedOut => "ACTIVITY_EXECUTION_STATUS_TIMED_OUT",
+            Self::Paused => "ACTIVITY_EXECUTION_STATUS_PAUSED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2012,6 +2047,7 @@ impl ActivityExecutionStatus {
             "ACTIVITY_EXECUTION_STATUS_CANCELED" => Some(Self::Canceled),
             "ACTIVITY_EXECUTION_STATUS_TERMINATED" => Some(Self::Terminated),
             "ACTIVITY_EXECUTION_STATUS_TIMED_OUT" => Some(Self::TimedOut),
+            "ACTIVITY_EXECUTION_STATUS_PAUSED" => Some(Self::Paused),
             _ => None,
         }
     }
@@ -2307,15 +2343,36 @@ impl NexusOperationIdConflictPolicy {
 #[repr(i32)]
 pub enum BatchOperationType {
     Unspecified = 0,
+    /// DEPRECATED: Use BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW instead.
+    #[deprecated]
     Terminate = 1,
+    TerminateWorkflow = 13,
+    /// DEPRECATED: Use BATCH_OPERATION_TYPE_CANCEL_WORKFLOW instead.
+    #[deprecated]
     Cancel = 2,
+    CancelWorkflow = 14,
+    /// DEPRECATED: Use BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW instead.
+    #[deprecated]
     Signal = 3,
+    SignalWorkflow = 15,
+    /// DEPRECATED: Use BATCH_OPERATION_TYPE_DELETE_WORKFLOW instead.
+    #[deprecated]
     Delete = 4,
+    DeleteWorkflow = 16,
+    /// DEPRECATED: Use BATCH_OPERATION_TYPE_RESET_WORKFLOW instead.
+    #[deprecated]
     Reset = 5,
+    ResetWorkflow = 17,
+    /// DEPRECATED: Use BATCH_OPERATION_TYPE_UPDATE_WORKFLOW_EXECUTION_OPTIONS instead.
+    #[deprecated]
     UpdateExecutionOptions = 6,
+    UpdateWorkflowExecutionOptions = 18,
     UnpauseActivity = 7,
     UpdateActivityOptions = 8,
     ResetActivity = 9,
+    TerminateActivity = 10,
+    CancelActivity = 11,
+    DeleteActivity = 12,
 }
 impl BatchOperationType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2325,36 +2382,66 @@ impl BatchOperationType {
     pub fn as_str_name(&self) -> &'static str {
         match self {
             Self::Unspecified => "BATCH_OPERATION_TYPE_UNSPECIFIED",
+            #[allow(deprecated)]
             Self::Terminate => "BATCH_OPERATION_TYPE_TERMINATE",
+            Self::TerminateWorkflow => "BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW",
+            #[allow(deprecated)]
             Self::Cancel => "BATCH_OPERATION_TYPE_CANCEL",
+            Self::CancelWorkflow => "BATCH_OPERATION_TYPE_CANCEL_WORKFLOW",
+            #[allow(deprecated)]
             Self::Signal => "BATCH_OPERATION_TYPE_SIGNAL",
+            Self::SignalWorkflow => "BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW",
+            #[allow(deprecated)]
             Self::Delete => "BATCH_OPERATION_TYPE_DELETE",
+            Self::DeleteWorkflow => "BATCH_OPERATION_TYPE_DELETE_WORKFLOW",
+            #[allow(deprecated)]
             Self::Reset => "BATCH_OPERATION_TYPE_RESET",
+            Self::ResetWorkflow => "BATCH_OPERATION_TYPE_RESET_WORKFLOW",
+            #[allow(deprecated)]
             Self::UpdateExecutionOptions => {
                 "BATCH_OPERATION_TYPE_UPDATE_EXECUTION_OPTIONS"
+            }
+            Self::UpdateWorkflowExecutionOptions => {
+                "BATCH_OPERATION_TYPE_UPDATE_WORKFLOW_EXECUTION_OPTIONS"
             }
             Self::UnpauseActivity => "BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY",
             Self::UpdateActivityOptions => "BATCH_OPERATION_TYPE_UPDATE_ACTIVITY_OPTIONS",
             Self::ResetActivity => "BATCH_OPERATION_TYPE_RESET_ACTIVITY",
+            Self::TerminateActivity => "BATCH_OPERATION_TYPE_TERMINATE_ACTIVITY",
+            Self::CancelActivity => "BATCH_OPERATION_TYPE_CANCEL_ACTIVITY",
+            Self::DeleteActivity => "BATCH_OPERATION_TYPE_DELETE_ACTIVITY",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
             "BATCH_OPERATION_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
-            "BATCH_OPERATION_TYPE_TERMINATE" => Some(Self::Terminate),
-            "BATCH_OPERATION_TYPE_CANCEL" => Some(Self::Cancel),
-            "BATCH_OPERATION_TYPE_SIGNAL" => Some(Self::Signal),
-            "BATCH_OPERATION_TYPE_DELETE" => Some(Self::Delete),
-            "BATCH_OPERATION_TYPE_RESET" => Some(Self::Reset),
+            "BATCH_OPERATION_TYPE_TERMINATE" => {
+                Some(#[allow(deprecated)] Self::Terminate)
+            }
+            "BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW" => Some(Self::TerminateWorkflow),
+            "BATCH_OPERATION_TYPE_CANCEL" => Some(#[allow(deprecated)] Self::Cancel),
+            "BATCH_OPERATION_TYPE_CANCEL_WORKFLOW" => Some(Self::CancelWorkflow),
+            "BATCH_OPERATION_TYPE_SIGNAL" => Some(#[allow(deprecated)] Self::Signal),
+            "BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW" => Some(Self::SignalWorkflow),
+            "BATCH_OPERATION_TYPE_DELETE" => Some(#[allow(deprecated)] Self::Delete),
+            "BATCH_OPERATION_TYPE_DELETE_WORKFLOW" => Some(Self::DeleteWorkflow),
+            "BATCH_OPERATION_TYPE_RESET" => Some(#[allow(deprecated)] Self::Reset),
+            "BATCH_OPERATION_TYPE_RESET_WORKFLOW" => Some(Self::ResetWorkflow),
             "BATCH_OPERATION_TYPE_UPDATE_EXECUTION_OPTIONS" => {
-                Some(Self::UpdateExecutionOptions)
+                Some(#[allow(deprecated)] Self::UpdateExecutionOptions)
+            }
+            "BATCH_OPERATION_TYPE_UPDATE_WORKFLOW_EXECUTION_OPTIONS" => {
+                Some(Self::UpdateWorkflowExecutionOptions)
             }
             "BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY" => Some(Self::UnpauseActivity),
             "BATCH_OPERATION_TYPE_UPDATE_ACTIVITY_OPTIONS" => {
                 Some(Self::UpdateActivityOptions)
             }
             "BATCH_OPERATION_TYPE_RESET_ACTIVITY" => Some(Self::ResetActivity),
+            "BATCH_OPERATION_TYPE_TERMINATE_ACTIVITY" => Some(Self::TerminateActivity),
+            "BATCH_OPERATION_TYPE_CANCEL_ACTIVITY" => Some(Self::CancelActivity),
+            "BATCH_OPERATION_TYPE_DELETE_ACTIVITY" => Some(Self::DeleteActivity),
             _ => None,
         }
     }
@@ -2574,6 +2661,13 @@ pub enum WorkflowTaskFailedCause {
     GrpcMessageTooLarge = 36,
     /// A workflow task failed because payloads were too large.
     PayloadsTooLarge = 37,
+    /// A workflow task failed because an external storage operation failed.
+    /// Check the workflow task failure message for more information.
+    ExternalStorageFailure = 38,
+    /// A workflow task is failed because the workflow is paused before the task is started.
+    WorkflowPauseRequestedBeforeTaskStarted = 39,
+    /// A workflow task failed because the request exceeded a size limit.
+    RequestTooLarge = 40,
 }
 impl WorkflowTaskFailedCause {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2680,6 +2774,13 @@ impl WorkflowTaskFailedCause {
                 "WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE"
             }
             Self::PayloadsTooLarge => "WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE",
+            Self::ExternalStorageFailure => {
+                "WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE"
+            }
+            Self::WorkflowPauseRequestedBeforeTaskStarted => {
+                "WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED"
+            }
+            Self::RequestTooLarge => "WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2789,6 +2890,13 @@ impl WorkflowTaskFailedCause {
             "WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE" => {
                 Some(Self::PayloadsTooLarge)
             }
+            "WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE" => {
+                Some(Self::ExternalStorageFailure)
+            }
+            "WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED" => {
+                Some(Self::WorkflowPauseRequestedBeforeTaskStarted)
+            }
+            "WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE" => Some(Self::RequestTooLarge),
             _ => None,
         }
     }
@@ -2799,6 +2907,7 @@ pub enum StartChildWorkflowExecutionFailedCause {
     Unspecified = 0,
     WorkflowAlreadyExists = 1,
     NamespaceNotFound = 2,
+    InvalidVersioningOverride = 3,
 }
 impl StartChildWorkflowExecutionFailedCause {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2816,6 +2925,9 @@ impl StartChildWorkflowExecutionFailedCause {
             Self::NamespaceNotFound => {
                 "START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND"
             }
+            Self::InvalidVersioningOverride => {
+                "START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2829,6 +2941,9 @@ impl StartChildWorkflowExecutionFailedCause {
             }
             "START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND" => {
                 Some(Self::NamespaceNotFound)
+            }
+            "START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE" => {
+                Some(Self::InvalidVersioningOverride)
             }
             _ => None,
         }
@@ -3238,6 +3353,57 @@ impl ScheduleOverlapPolicy {
             "SCHEDULE_OVERLAP_POLICY_CANCEL_OTHER" => Some(Self::CancelOther),
             "SCHEDULE_OVERLAP_POLICY_TERMINATE_OTHER" => Some(Self::TerminateOther),
             "SCHEDULE_OVERLAP_POLICY_ALLOW_ALL" => Some(Self::AllowAll),
+            _ => None,
+        }
+    }
+}
+/// FastForwardPollingResult is the result of polling and waiting for a fast-forward to complete
+/// on a time-skipping execution.
+/// FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT and FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED
+/// are the normal poll outcomes; FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED means the
+/// fast-forward can no longer complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FastForwardPollingResult {
+    /// Never returned; guards against an unset result.
+    Unspecified = 0,
+    /// The poll timed out server-side before the fast-forward completed. The caller may poll again.
+    PollTimeout = 1,
+    /// The fast-forward identified by the request's `fast_forward_id` reached its target time and completed.
+    FastForwardCompleted = 2,
+    /// The fast-forward can no longer complete, which usually indicates improper usage of
+    /// fast-forward on the client side. Possible reasons: the `fast_forward_id` does not match
+    /// the execution's current fast-forward, the execution ended before the fast-forward
+    /// completed, the fast-forward config was updated while the poll was in flight, etc.
+    /// See `failed_reason` in the response for the specific cause.
+    FastForwardFailed = 3,
+}
+impl FastForwardPollingResult {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FAST_FORWARD_POLLING_RESULT_UNSPECIFIED",
+            Self::PollTimeout => "FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT",
+            Self::FastForwardCompleted => {
+                "FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED"
+            }
+            Self::FastForwardFailed => "FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FAST_FORWARD_POLLING_RESULT_UNSPECIFIED" => Some(Self::Unspecified),
+            "FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT" => Some(Self::PollTimeout),
+            "FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED" => {
+                Some(Self::FastForwardCompleted)
+            }
+            "FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED" => {
+                Some(Self::FastForwardFailed)
+            }
             _ => None,
         }
     }

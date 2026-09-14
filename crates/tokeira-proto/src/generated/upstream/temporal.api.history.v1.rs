@@ -237,7 +237,13 @@ pub struct WorkflowExecutionStartedEventAttributes {
     /// will be reflected in the WorkflowExecutionOptionsUpdatedEvent.
     #[prost(message, optional, tag = "41")]
     pub time_skipping_config: ::core::option::Option<
-        super::super::workflow::v1::TimeSkippingConfig,
+        super::super::common::v1::TimeSkippingConfig,
+    >,
+    /// The time-skipping state propagated from a previous run of this workflow. This can be nil
+    /// if no time skipping has occurred or there is no previous run.
+    #[prost(message, optional, tag = "43")]
+    pub time_skipping_state_propagation: ::core::option::Option<
+        super::super::common::v1::TimeSkippingStatePropagation,
     >,
 }
 /// Wrapper for a target deployment version that the SDK declined to upgrade to.
@@ -1084,6 +1090,23 @@ pub struct StartChildWorkflowExecutionInitiatedEventAttributes {
     /// Priority metadata
     #[prost(message, optional, tag = "20")]
     pub priority: ::core::option::Option<super::super::common::v1::Priority>,
+    /// The propagated time-skipping configuration for the child workflow.
+    #[prost(message, optional, tag = "21")]
+    pub time_skipping_config: ::core::option::Option<
+        super::super::common::v1::TimeSkippingConfig,
+    >,
+    /// The time-skipping state propagated from the parent workflow. This can be nil if no time skipping
+    /// has occurred or there is no previous run.
+    #[prost(message, optional, tag = "23")]
+    pub time_skipping_state_propagation: ::core::option::Option<
+        super::super::common::v1::TimeSkippingStatePropagation,
+    >,
+    /// Versioning override requested for the child workflow. If present, this explicit override
+    /// takes precedence over versioning behavior inherited from the parent workflow.
+    #[prost(message, optional, tag = "24")]
+    pub versioning_override: ::core::option::Option<
+        super::super::workflow::v1::VersioningOverride,
+    >,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StartChildWorkflowExecutionFailedEventAttributes {
@@ -1275,11 +1298,38 @@ pub struct WorkflowExecutionOptionsUpdatedEventAttributes {
     /// Ignored if nil.
     #[prost(message, optional, tag = "6")]
     pub priority: ::core::option::Option<super::super::common::v1::Priority>,
-    /// If set, the time-skipping configuration was changed. Contains the full updated configuration.
+    /// TimeSkippingConfig override upserted in this event. Represents the full config.
     #[prost(message, optional, tag = "7")]
     pub time_skipping_config: ::core::option::Option<
-        super::super::workflow::v1::TimeSkippingConfig,
+        super::super::common::v1::TimeSkippingConfig,
     >,
+    /// Indicates the time skipping config was updated by the recent call to update
+    /// workflow execution options.
+    #[prost(bool, tag = "9")]
+    pub time_skipping_config_updated: bool,
+    /// Updates to workflow updates options.
+    #[prost(message, repeated, tag = "8")]
+    pub workflow_update_options: ::prost::alloc::vec::Vec<
+        workflow_execution_options_updated_event_attributes::WorkflowUpdateOptionsUpdate,
+    >,
+}
+/// Nested message and enum types in `WorkflowExecutionOptionsUpdatedEventAttributes`.
+pub mod workflow_execution_options_updated_event_attributes {
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct WorkflowUpdateOptionsUpdate {
+        /// The ID of the workflow update this update options update corresponds to.
+        #[prost(string, tag = "1")]
+        pub update_id: ::prost::alloc::string::String,
+        /// Request ID attached to the running workflow update so that subsequent requests with same
+        /// request ID will be deduped
+        #[prost(string, tag = "2")]
+        pub attached_request_id: ::prost::alloc::string::String,
+        /// Completion callbacks attached to the running workflow update.
+        #[prost(message, repeated, tag = "3")]
+        pub attached_completion_callbacks: ::prost::alloc::vec::Vec<
+            super::super::super::common::v1::Callback,
+        >,
+    }
 }
 /// Not used anywhere. Use case is replaced by WorkflowExecutionOptionsUpdatedEventAttributes
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1399,19 +1449,19 @@ pub struct WorkflowExecutionUnpausedEventAttributes {
     #[prost(string, tag = "3")]
     pub request_id: ::prost::alloc::string::String,
 }
-/// Attributes for an event indicating that time skipping state changed for a workflow execution,
-/// either time was advanced or time skipping was disabled automatically due to a bound being reached.
+/// Attributes for an event indicating that time skipping state changed for a workflow execution:
+/// either time was advanced, or time skipping was stopped automatically due to the fast_forward completing.
 /// The worker_may_ignore field in HistoryEvent should always be set true for this event.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WorkflowExecutionTimeSkippingTransitionedEventAttributes {
-    /// The virtual time after time skipping was applied.
+    /// The virtual time point that time skipping advanced to.
     #[prost(message, optional, tag = "1")]
     pub target_time: ::core::option::Option<::prost_types::Timestamp>,
-    /// when true, time skipping was disabled automatically due to a bound being reached.
+    /// When true, time skipping has been stopped automatically due to a call to fast_forward completing.
     /// (-- api-linter: core::0140::prepositions=disabled
     /// aip.dev/not-precedent: "after" is used to indicate temporal ordering. --)
     #[prost(bool, tag = "2")]
-    pub disabled_after_bound: bool,
+    pub disabled_after_fast_forward: bool,
     /// The wall-clock time when the time-skipping state changed event was generated.
     #[prost(message, optional, tag = "3")]
     pub wall_clock_time: ::core::option::Option<::prost_types::Timestamp>,
@@ -1633,6 +1683,11 @@ pub struct HistoryEvent {
     /// Server-computed authenticated caller identity associated with this event.
     #[prost(message, optional, tag = "303")]
     pub principal: ::core::option::Option<super::super::common::v1::Principal>,
+    /// Event group markers attached to this event.
+    #[prost(message, repeated, tag = "304")]
+    pub event_group_markers: ::prost::alloc::vec::Vec<
+        super::super::sdk::v1::EventGroupMarker,
+    >,
     /// The event details. The type must match that in `event_type`.
     #[prost(
         oneof = "history_event::Attributes",

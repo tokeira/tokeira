@@ -152,6 +152,12 @@ pub struct TaskQueueStats {
     ///   worker instance.
     #[prost(float, tag = "4")]
     pub tasks_dispatch_rate: f32,
+    /// Whether rate limiting blocked any dispatches within the recent observation window (approximately
+    /// 30 seconds). When true, adding more workers will not increase throughput — the bottleneck is the
+    /// rate limit, not worker count. This field is useful for auto-scaling systems to avoid unnecessary
+    /// scale-up.
+    #[prost(bool, tag = "5")]
+    pub rate_limiting_active: bool,
 }
 /// Deprecated. Use `InternalTaskQueueStatus`. This is kept until `DescribeTaskQueue` supports legacy behavior.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -367,6 +373,19 @@ pub struct PollerGroupInfo {
     pub id: ::prost::alloc::string::String,
     #[prost(float, tag = "2")]
     pub weight: f32,
+}
+/// A versioned snapshot of the poller groups the client should use for future polls to a task
+/// queue. The version is monotonically increasing so that a client can ignore a snapshot that is
+/// older than the one it has already applied.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PollerGroupsInfo {
+    /// Monotonically increasing version of this snapshot. A client should ignore any snapshot whose
+    /// version is not greater than the one it last applied.
+    #[prost(int64, tag = "1")]
+    pub version: i64,
+    /// The weighted list of poller groups the client should use for future polls to this task queue.
+    #[prost(message, repeated, tag = "2")]
+    pub poller_groups: ::prost::alloc::vec::Vec<PollerGroupInfo>,
 }
 /// Attached to task responses to give hints to the SDK about how it may adjust its number of
 /// pollers.

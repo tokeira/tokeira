@@ -69,6 +69,17 @@ pub struct Request {
     pub meta: ::core::option::Option<Meta>,
     #[prost(message, optional, tag = "2")]
     pub input: ::core::option::Option<Input>,
+    /// The request ID of the request.
+    #[prost(string, tag = "3")]
+    pub request_id: ::prost::alloc::string::String,
+    /// Callbacks to be called by the server when this update reaches a terminal state.
+    #[prost(message, repeated, tag = "4")]
+    pub completion_callbacks: ::prost::alloc::vec::Vec<
+        super::super::common::v1::Callback,
+    >,
+    /// Links to be associated with this update.
+    #[prost(message, repeated, tag = "5")]
+    pub links: ::prost::alloc::vec::Vec<super::super::common::v1::Link>,
 }
 /// An Update protocol message indicating that a Workflow Update has been rejected.
 #[derive(Clone, PartialEq, ::prost::Message)]

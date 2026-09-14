@@ -136,6 +136,9 @@ pub struct WorkerHeartbeat {
     /// Storage drivers in use by this SDK.
     #[prost(message, repeated, tag = "24")]
     pub drivers: ::prost::alloc::vec::Vec<StorageDriverInfo>,
+    /// Information about the environment this SDK is running in.
+    #[prost(message, optional, tag = "25")]
+    pub environment: ::core::option::Option<EnvironmentInfo>,
 }
 /// Detailed worker information.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -206,6 +209,376 @@ pub struct StorageDriverInfo {
     /// The type of the driver, required.
     #[prost(string, tag = "1")]
     pub r#type: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnvironmentInfo {
+    /// The runtime(s) the SDK is operating in.
+    #[prost(message, repeated, tag = "1")]
+    pub runtimes: ::prost::alloc::vec::Vec<environment_info::Runtime>,
+    /// The hosting environment(s) the SDK is operating in. Repeated to allow for layering (ex: Docker inside k8s).
+    #[prost(message, repeated, tag = "2")]
+    pub hosting_environments: ::prost::alloc::vec::Vec<
+        environment_info::HostingEnvironment,
+    >,
+    /// The platform the SDK is operating on.
+    #[prost(message, optional, tag = "3")]
+    pub platform: ::core::option::Option<environment_info::Platform>,
+}
+/// Nested message and enum types in `EnvironmentInfo`.
+pub mod environment_info {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Runtime {
+        /// The type of the runtime.
+        #[prost(enumeration = "runtime::RuntimeType", tag = "1")]
+        pub r#type: i32,
+        /// The version of the runtime, if obtainable.
+        #[prost(string, tag = "2")]
+        pub version: ::prost::alloc::string::String,
+    }
+    /// Nested message and enum types in `Runtime`.
+    pub mod runtime {
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            ::prost::Enumeration
+        )]
+        #[repr(i32)]
+        pub enum RuntimeType {
+            /// Should never actually be set, exists to follow convention of having a default.
+            /// SDKs should just leave `runtimes` empty if none can be determined.
+            Unspecified = 0,
+            Jvm = 1,
+            Cpython = 2,
+            Node = 3,
+            Bun = 4,
+            Cruby = 5,
+            Go = 6,
+            DotnetFramework = 7,
+            DotnetCore = 8,
+            Native = 9,
+            Roadrunner = 10,
+        }
+        impl RuntimeType {
+            /// String value of the enum field names used in the ProtoBuf definition.
+            ///
+            /// The values are not transformed in any way and thus are considered stable
+            /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+            pub fn as_str_name(&self) -> &'static str {
+                match self {
+                    Self::Unspecified => "RUNTIME_TYPE_UNSPECIFIED",
+                    Self::Jvm => "RUNTIME_TYPE_JVM",
+                    Self::Cpython => "RUNTIME_TYPE_CPYTHON",
+                    Self::Node => "RUNTIME_TYPE_NODE",
+                    Self::Bun => "RUNTIME_TYPE_BUN",
+                    Self::Cruby => "RUNTIME_TYPE_CRUBY",
+                    Self::Go => "RUNTIME_TYPE_GO",
+                    Self::DotnetFramework => "RUNTIME_TYPE_DOTNET_FRAMEWORK",
+                    Self::DotnetCore => "RUNTIME_TYPE_DOTNET_CORE",
+                    Self::Native => "RUNTIME_TYPE_NATIVE",
+                    Self::Roadrunner => "RUNTIME_TYPE_ROADRUNNER",
+                }
+            }
+            /// Creates an enum from field names used in the ProtoBuf definition.
+            pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+                match value {
+                    "RUNTIME_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+                    "RUNTIME_TYPE_JVM" => Some(Self::Jvm),
+                    "RUNTIME_TYPE_CPYTHON" => Some(Self::Cpython),
+                    "RUNTIME_TYPE_NODE" => Some(Self::Node),
+                    "RUNTIME_TYPE_BUN" => Some(Self::Bun),
+                    "RUNTIME_TYPE_CRUBY" => Some(Self::Cruby),
+                    "RUNTIME_TYPE_GO" => Some(Self::Go),
+                    "RUNTIME_TYPE_DOTNET_FRAMEWORK" => Some(Self::DotnetFramework),
+                    "RUNTIME_TYPE_DOTNET_CORE" => Some(Self::DotnetCore),
+                    "RUNTIME_TYPE_NATIVE" => Some(Self::Native),
+                    "RUNTIME_TYPE_ROADRUNNER" => Some(Self::Roadrunner),
+                    _ => None,
+                }
+            }
+        }
+    }
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct HostingEnvironment {
+        /// The type of hosting environment.
+        #[prost(enumeration = "hosting_environment::HostingEnvironmentType", tag = "1")]
+        pub r#type: i32,
+        /// The version of the hosting environment, if obtainable.
+        #[prost(string, tag = "2")]
+        pub version: ::prost::alloc::string::String,
+    }
+    /// Nested message and enum types in `HostingEnvironment`.
+    pub mod hosting_environment {
+        /// What kind of hosting environment we're running in. This list is about what can actually be
+        /// detected reliably and is unrelated to what SDKs can actually run in.
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            ::prost::Enumeration
+        )]
+        #[repr(i32)]
+        pub enum HostingEnvironmentType {
+            /// Should never actually be set, exists to follow convention of having a default.
+            /// SDKs should just leave `hosting_environments` empty if none can be determined.
+            Unspecified = 0,
+            /// Should always be in the list if we're running inside a docker container
+            Docker = 1,
+            /// Should always be in the list if we're running inside any k8s environment
+            K8s = 2,
+            /// Detect via `AWS_LAMBDA_FUNCTION_NAME`
+            AwsLambda = 3,
+            /// Detect via `ECS_CONTAINER_METADATA_URI_V4` or `ECS_CONTAINER_METADATA_URI`
+            AwsEcs = 4,
+            /// Detect via `K_SERVICE`
+            GoogleCloudRun = 6,
+            /// Detect via `GAE_SERVICE`
+            GoogleAppEngine = 7,
+            /// Detect via `WEBSITE_SITE_NAME`
+            AzureAppService = 8,
+            /// Detect via `FUNCTIONS_EXTENSION_VERSION`
+            AzureFunctions = 9,
+            /// Detect via `CONTAINER_APP_NAME`
+            AzureContainerApps = 10,
+        }
+        impl HostingEnvironmentType {
+            /// String value of the enum field names used in the ProtoBuf definition.
+            ///
+            /// The values are not transformed in any way and thus are considered stable
+            /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+            pub fn as_str_name(&self) -> &'static str {
+                match self {
+                    Self::Unspecified => "HOSTING_ENVIRONMENT_TYPE_UNSPECIFIED",
+                    Self::Docker => "HOSTING_ENVIRONMENT_TYPE_DOCKER",
+                    Self::K8s => "HOSTING_ENVIRONMENT_TYPE_K8S",
+                    Self::AwsLambda => "HOSTING_ENVIRONMENT_TYPE_AWS_LAMBDA",
+                    Self::AwsEcs => "HOSTING_ENVIRONMENT_TYPE_AWS_ECS",
+                    Self::GoogleCloudRun => "HOSTING_ENVIRONMENT_TYPE_GOOGLE_CLOUD_RUN",
+                    Self::GoogleAppEngine => "HOSTING_ENVIRONMENT_TYPE_GOOGLE_APP_ENGINE",
+                    Self::AzureAppService => "HOSTING_ENVIRONMENT_TYPE_AZURE_APP_SERVICE",
+                    Self::AzureFunctions => "HOSTING_ENVIRONMENT_TYPE_AZURE_FUNCTIONS",
+                    Self::AzureContainerApps => {
+                        "HOSTING_ENVIRONMENT_TYPE_AZURE_CONTAINER_APPS"
+                    }
+                }
+            }
+            /// Creates an enum from field names used in the ProtoBuf definition.
+            pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+                match value {
+                    "HOSTING_ENVIRONMENT_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+                    "HOSTING_ENVIRONMENT_TYPE_DOCKER" => Some(Self::Docker),
+                    "HOSTING_ENVIRONMENT_TYPE_K8S" => Some(Self::K8s),
+                    "HOSTING_ENVIRONMENT_TYPE_AWS_LAMBDA" => Some(Self::AwsLambda),
+                    "HOSTING_ENVIRONMENT_TYPE_AWS_ECS" => Some(Self::AwsEcs),
+                    "HOSTING_ENVIRONMENT_TYPE_GOOGLE_CLOUD_RUN" => {
+                        Some(Self::GoogleCloudRun)
+                    }
+                    "HOSTING_ENVIRONMENT_TYPE_GOOGLE_APP_ENGINE" => {
+                        Some(Self::GoogleAppEngine)
+                    }
+                    "HOSTING_ENVIRONMENT_TYPE_AZURE_APP_SERVICE" => {
+                        Some(Self::AzureAppService)
+                    }
+                    "HOSTING_ENVIRONMENT_TYPE_AZURE_FUNCTIONS" => {
+                        Some(Self::AzureFunctions)
+                    }
+                    "HOSTING_ENVIRONMENT_TYPE_AZURE_CONTAINER_APPS" => {
+                        Some(Self::AzureContainerApps)
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Platform {
+        #[prost(oneof = "platform::Variant", tags = "1, 2, 3")]
+        pub variant: ::core::option::Option<platform::Variant>,
+    }
+    /// Nested message and enum types in `Platform`.
+    pub mod platform {
+        #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+        pub enum Variant {
+            #[prost(message, tag = "1")]
+            Linux(super::LinuxPlatform),
+            #[prost(message, tag = "2")]
+            Macos(super::MacOsPlatform),
+            #[prost(message, tag = "3")]
+            Windows(super::WindowsPlatform),
+        }
+    }
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct LinuxPlatform {
+        /// The Linux kernel or distribution version, if obtainable.
+        #[prost(string, tag = "1")]
+        pub version: ::prost::alloc::string::String,
+        /// The architecture of the worker process.
+        #[prost(enumeration = "Architecture", tag = "2")]
+        pub architecture: i32,
+        /// The libc used by the worker process.
+        #[prost(enumeration = "linux_platform::Libc", tag = "3")]
+        pub libc: i32,
+    }
+    /// Nested message and enum types in `LinuxPlatform`.
+    pub mod linux_platform {
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            ::prost::Enumeration
+        )]
+        #[repr(i32)]
+        pub enum Libc {
+            Unspecified = 0,
+            Glibc = 1,
+            Musl = 2,
+        }
+        impl Libc {
+            /// String value of the enum field names used in the ProtoBuf definition.
+            ///
+            /// The values are not transformed in any way and thus are considered stable
+            /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+            pub fn as_str_name(&self) -> &'static str {
+                match self {
+                    Self::Unspecified => "LIBC_UNSPECIFIED",
+                    Self::Glibc => "LIBC_GLIBC",
+                    Self::Musl => "LIBC_MUSL",
+                }
+            }
+            /// Creates an enum from field names used in the ProtoBuf definition.
+            pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+                match value {
+                    "LIBC_UNSPECIFIED" => Some(Self::Unspecified),
+                    "LIBC_GLIBC" => Some(Self::Glibc),
+                    "LIBC_MUSL" => Some(Self::Musl),
+                    _ => None,
+                }
+            }
+        }
+    }
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct MacOsPlatform {
+        /// The macOS version, if obtainable.
+        #[prost(string, tag = "1")]
+        pub version: ::prost::alloc::string::String,
+        /// The architecture of the worker process.
+        #[prost(enumeration = "Architecture", tag = "2")]
+        pub architecture: i32,
+    }
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct WindowsPlatform {
+        /// The Windows version, if obtainable.
+        #[prost(string, tag = "1")]
+        pub version: ::prost::alloc::string::String,
+        /// The architecture of the worker process.
+        #[prost(enumeration = "Architecture", tag = "2")]
+        pub architecture: i32,
+        /// The C runtime used by the worker process, if obtainable.
+        #[prost(enumeration = "windows_platform::Crt", tag = "3")]
+        pub crt: i32,
+    }
+    /// Nested message and enum types in `WindowsPlatform`.
+    pub mod windows_platform {
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            ::prost::Enumeration
+        )]
+        #[repr(i32)]
+        pub enum Crt {
+            Unspecified = 0,
+            Ucrt = 1,
+            Msvcrt = 2,
+            Mingw = 3,
+            Cygwin = 4,
+        }
+        impl Crt {
+            /// String value of the enum field names used in the ProtoBuf definition.
+            ///
+            /// The values are not transformed in any way and thus are considered stable
+            /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+            pub fn as_str_name(&self) -> &'static str {
+                match self {
+                    Self::Unspecified => "CRT_UNSPECIFIED",
+                    Self::Ucrt => "CRT_UCRT",
+                    Self::Msvcrt => "CRT_MSVCRT",
+                    Self::Mingw => "CRT_MINGW",
+                    Self::Cygwin => "CRT_CYGWIN",
+                }
+            }
+            /// Creates an enum from field names used in the ProtoBuf definition.
+            pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+                match value {
+                    "CRT_UNSPECIFIED" => Some(Self::Unspecified),
+                    "CRT_UCRT" => Some(Self::Ucrt),
+                    "CRT_MSVCRT" => Some(Self::Msvcrt),
+                    "CRT_MINGW" => Some(Self::Mingw),
+                    "CRT_CYGWIN" => Some(Self::Cygwin),
+                    _ => None,
+                }
+            }
+        }
+    }
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        ::prost::Enumeration
+    )]
+    #[repr(i32)]
+    pub enum Architecture {
+        Unspecified = 0,
+        Amd64 = 1,
+        Arm64 = 2,
+    }
+    impl Architecture {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "ARCHITECTURE_UNSPECIFIED",
+                Self::Amd64 => "ARCHITECTURE_AMD64",
+                Self::Arm64 => "ARCHITECTURE_ARM64",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "ARCHITECTURE_UNSPECIFIED" => Some(Self::Unspecified),
+                "ARCHITECTURE_AMD64" => Some(Self::Amd64),
+                "ARCHITECTURE_ARM64" => Some(Self::Arm64),
+                _ => None,
+            }
+        }
+    }
 }
 /// A command sent from the server to a worker.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

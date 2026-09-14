@@ -2,6 +2,10 @@
 /// The outcome of a completed activity execution: either a successful result or a failure.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ActivityExecutionOutcome {
+    /// The retry state associated with an unsuccessful activity execution.
+    /// This field is only meaningful when `failure` is set.
+    #[prost(enumeration = "super::super::enums::v1::RetryState", tag = "3")]
+    pub retry_state: i32,
     #[prost(oneof = "activity_execution_outcome::Value", tags = "1, 2")]
     pub value: ::core::option::Option<activity_execution_outcome::Value>,
 }
@@ -55,6 +59,11 @@ pub struct ActivityOptions {
     /// present, they inherit the values from the workflow.
     #[prost(message, optional, tag = "7")]
     pub priority: ::core::option::Option<super::super::common::v1::Priority>,
+    /// Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
+    /// When updated, the time is added to the original `schedule_time`, not to the current time.
+    /// If the resulting time is in the past, the task is made available for dispatch immediately.
+    #[prost(message, optional, tag = "8")]
+    pub start_delay: ::core::option::Option<::prost_types::Duration>,
 }
 /// Information about a standalone activity.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -104,6 +113,7 @@ pub struct ActivityExecutionInfo {
     #[prost(message, optional, tag = "11")]
     pub retry_policy: ::core::option::Option<super::super::common::v1::RetryPolicy>,
     /// Details provided in the last recorded activity heartbeat.
+    /// DescribeActivityExecution does not set this field unless include_heartbeat_details was true in the request.
     #[prost(message, optional, tag = "12")]
     pub heartbeat_details: ::core::option::Option<super::super::common::v1::Payloads>,
     /// Time the last heartbeat was recorded.
@@ -121,13 +131,15 @@ pub struct ActivityExecutionInfo {
     /// Time the activity was originally scheduled via a StartActivityExecution request.
     #[prost(message, optional, tag = "17")]
     pub schedule_time: ::core::option::Option<::prost_types::Timestamp>,
-    /// Scheduled time + schedule to close timeout.
+    /// The time at which the activity's Schedule-to-Close timeout expires.
+    /// Calculated as `schedule_time` + `start_delay` + `schedule_to_close_timeout`.
     #[prost(message, optional, tag = "18")]
     pub expiration_time: ::core::option::Option<::prost_types::Timestamp>,
     /// Time when the activity transitioned to a closed state.
     #[prost(message, optional, tag = "19")]
     pub close_time: ::core::option::Option<::prost_types::Timestamp>,
     /// Failure details from the last failed attempt.
+    /// DescribeActivityExecution does not set this field unless include_last_failure was true in the request.
     #[prost(message, optional, tag = "20")]
     pub last_failure: ::core::option::Option<super::super::failure::v1::Failure>,
     #[prost(string, tag = "21")]
@@ -180,6 +192,21 @@ pub struct ActivityExecutionInfo {
     /// Total number of heartbeats recorded across all attempts of this activity, including retries.
     #[prost(int64, tag = "34")]
     pub total_heartbeat_count: i64,
+    /// The name of the SDK of the worker that most recently picked up an attempt of this activity.
+    /// Overwritten on each new attempt. Empty if unknown.
+    #[prost(string, tag = "35")]
+    pub sdk_name: ::prost::alloc::string::String,
+    /// The version of the SDK of the worker that most recently picked up an attempt of this activity.
+    /// Overwritten on each new attempt. Empty if unknown.
+    #[prost(string, tag = "36")]
+    pub sdk_version: ::prost::alloc::string::String,
+    /// Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
+    #[prost(message, optional, tag = "37")]
+    pub start_delay: ::core::option::Option<::prost_types::Duration>,
+    /// The time at which the first activity task is made available for dispatch, computed as
+    /// `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
+    #[prost(message, optional, tag = "38")]
+    pub execution_time: ::core::option::Option<::prost_types::Timestamp>,
 }
 /// Limited activity information returned in the list response.
 /// When adding fields here, ensure that it is also present in ActivityExecutionInfo (note that it
@@ -223,6 +250,10 @@ pub struct ActivityExecutionListInfo {
     /// This field is only populated if the activity is closed.
     #[prost(message, optional, tag = "11")]
     pub execution_duration: ::core::option::Option<::prost_types::Duration>,
+    /// The time at which the first activity task is made available for dispatch, computed as
+    /// `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
+    #[prost(message, optional, tag = "12")]
+    pub execution_time: ::core::option::Option<::prost_types::Timestamp>,
 }
 /// CallbackInfo contains the state of an attached activity callback.
 #[derive(Clone, PartialEq, ::prost::Message)]

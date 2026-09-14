@@ -77,6 +77,17 @@ pub struct WorkflowExecution {
     #[prost(string, tag = "2")]
     pub run_id: ::prost::alloc::string::String,
 }
+/// Identifies a specific execution within a namespace. This is used for standalone activities
+/// executions in batch jobs currently.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Execution {
+    #[prost(enumeration = "super::super::enums::v1::ExecutionType", tag = "1")]
+    pub r#type: i32,
+    #[prost(string, tag = "2")]
+    pub business_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub run_id: ::prost::alloc::string::String,
+}
 /// Represents the identifier used by a workflow author to define the workflow. Typically, the
 /// name of a function. This is sometimes referred to as the workflow's "name"
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -256,7 +267,7 @@ pub mod callback {
 /// workflow B, and vice-versa.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Link {
-    #[prost(oneof = "link::Variant", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "link::Variant", tags = "1, 2, 3, 4, 5")]
     pub variant: ::core::option::Option<link::Variant>,
 }
 /// Nested message and enum types in `Link`.
@@ -336,6 +347,20 @@ pub mod link {
         #[prost(string, tag = "3")]
         pub run_id: ::prost::alloc::string::String,
     }
+    /// A link to a workflow execution. This is a more general version of WorkflowEvent that doesn't specify a
+    /// particular event within the workflow, useful when you want to link to a workflow but there is no particular event to link to,
+    /// such as a Query or a Rejected Update.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Workflow {
+        #[prost(string, tag = "1")]
+        pub namespace: ::prost::alloc::string::String,
+        #[prost(string, tag = "2")]
+        pub workflow_id: ::prost::alloc::string::String,
+        #[prost(string, tag = "3")]
+        pub run_id: ::prost::alloc::string::String,
+        #[prost(string, tag = "4")]
+        pub reason: ::prost::alloc::string::String,
+    }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Variant {
         #[prost(message, tag = "1")]
@@ -346,6 +371,8 @@ pub mod link {
         Activity(Activity),
         #[prost(message, tag = "4")]
         NexusOperation(NexusOperation),
+        #[prost(message, tag = "5")]
+        Workflow(Workflow),
     }
 }
 /// Principal is an authenticated caller identity computed by the server from trusted
@@ -493,4 +520,117 @@ pub struct OnConflictOptions {
     /// Attaches the links to the running execution.
     #[prost(bool, tag = "3")]
     pub attach_links: bool,
+}
+/// The configuration for time skipping of an execution.
+/// When time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.
+/// Options like fast_forward, disable_propagation, and max_session_skip_count are provided for granular
+/// control of the execution's time skipping behavior. See each field's comment for a detailed explanation.
+///
+/// An example of workflows with time skipping:
+/// For workflows, an execution is a chain of runs including retries, cron, and continue-as-new.
+/// In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations, etc.
+/// User timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the
+/// time point of the registered fast-forward when there is no in-flight work.
+/// Whenever time is skipped, the skip count is incremented by one; max_session_skip_count bounds the number of skips allowed within a single time-skipping session.
+/// For child workflows, by default, if the parent execution is skipping time, the child execution will also skip time,
+/// but a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the
+/// "enabled" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the
+/// parent execution as its start time.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TimeSkippingConfig {
+    /// Enables or disables time skipping for this workflow execution.
+    #[prost(bool, tag = "1")]
+    pub enabled: bool,
+    /// An optional opt-in to control time-skipping behavior through fast-forward; see its definition for details.
+    #[prost(message, optional, tag = "2")]
+    pub fast_forward_config: ::core::option::Option<FastForwardConfig>,
+    /// By default, executions started by another execution (e.g. a child workflow of a parent workflow or
+    /// a schedule with the time-skipping policy enabled) inherit the "enabled" flag and skip time when possible.
+    /// This flag disables that inheritance.
+    #[prost(bool, tag = "3")]
+    pub disable_propagation: bool,
+    /// The maximum number of skips allowed every time this field is updated. It protects the execution from
+    /// situations like unlimited retries when backoff is skipped.
+    ///
+    /// Every time the execution skips time, the skip count is incremented by one, and when it reaches
+    /// max_session_skip_count, time skipping stops. Whenever this config field is updated, the accumulated
+    /// skip count is cleared, marking the start of a new session.
+    /// For an execution with a chain of runs (retry, cron, continue-as-new), the count is accumulated
+    /// across all runs within the same session.
+    ///
+    /// If this field is not set, the server applies a large default value (e.g. 100). The default can
+    /// be changed through dynamic config, and is overridden by this field when set.
+    #[prost(int32, tag = "4")]
+    pub max_session_skip_count: i32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FastForwardConfig {
+    /// A client-supplied ID, required field, set alongside `duration`. It is used to poll for
+    /// fast-forward completion via PollWorkflowExecutionTimeSkipping.
+    /// The server performs no idempotency check on this ID; the client is responsible for managing it.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Fast-forward the current execution by this duration ahead of the current execution time; required field.
+    /// The duration yields a target time (current execution time + duration), surfaced as `target_time` in
+    /// TimeSkippingFastForwardInfo. Once virtual time reaches that target, the fast-forward completes, time
+    /// skipping is disabled, and no further time is skipped. Time skipping can be resumed either
+    /// by updating the TimeSkippingConfig with a new FastForwardConfig, or by clearing the FastForwardConfig
+    /// to skip through to the end of the execution.
+    ///
+    /// If this duration exceeds the remaining execution timeout, time will not pass beyond the end
+    /// of the execution, and the fast-forward won't have a chance to complete.
+    #[prost(message, optional, tag = "2")]
+    pub duration: ::core::option::Option<::prost_types::Duration>,
+}
+/// The time-skipping state that needs to be propagated from one execution to another, or through a chain of runs
+/// within the same execution.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TimeSkippingStatePropagation {
+    /// The time skipped by the previous run. It is propagated both to executions started by the
+    /// current execution and through a chain of runs (CaN, cron, retry).
+    #[prost(message, optional, tag = "1")]
+    pub initial_skipped_duration: ::core::option::Option<::prost_types::Duration>,
+    /// The fast-forward target time. It only propagates across a chain of runs within the same execution.
+    #[prost(message, optional, tag = "2")]
+    pub fast_forward_target_time: ::core::option::Option<::prost_types::Timestamp>,
+    /// The initial skip count. It only propagates across a chain of runs within the same execution.
+    #[prost(int32, tag = "3")]
+    pub initial_skip_count: i32,
+}
+/// Describes the current time-skipping state of a workflow execution.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TimeSkippingInfo {
+    /// Current virtual time of the execution. If the execution hasn't skipped
+    /// any time yet, it will be the same as wall clock time.
+    #[prost(message, optional, tag = "1")]
+    pub current_time: ::core::option::Option<::prost_types::Timestamp>,
+    /// The current effective time-skipping config, which can differ from the config the user last set:
+    /// internally-defaulted fields are populated, and `enabled` reflects whether the execution is still
+    /// skipping time — e.g. it is set to false once `max_session_skip_count` is reached, the fast-forward
+    /// completes, or a client call disables time skipping.
+    #[prost(message, optional, tag = "2")]
+    pub effective_config: ::core::option::Option<TimeSkippingConfig>,
+    /// The execution's current fast-forward, if any. Unset if time skipping is enabled without a fast-forward.
+    #[prost(message, optional, tag = "4")]
+    pub fast_forward_info: ::core::option::Option<TimeSkippingFastForwardInfo>,
+    /// The number of skips accumulated in the current session, bounded by `max_session_skip_count`.
+    /// A new session begins — and this resets to 0 — each time `max_session_skip_count` is updated.
+    #[prost(int32, tag = "6")]
+    pub current_session_skip_count: i32,
+}
+/// TimeSkippingFastForwardInfo describes the current time-skipping fast-forward on an execution.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TimeSkippingFastForwardInfo {
+    /// The client-supplied `fast_forward` duration.
+    #[prost(message, optional, tag = "1")]
+    pub fast_forward_duration: ::core::option::Option<::prost_types::Duration>,
+    /// The client-supplied ID set alongside `fast_forward` duration.
+    #[prost(string, tag = "2")]
+    pub fast_forward_id: ::prost::alloc::string::String,
+    /// The target virtual time at which the fast-forward completes.
+    #[prost(message, optional, tag = "3")]
+    pub target_time: ::core::option::Option<::prost_types::Timestamp>,
+    /// True once `target_time` has been reached.
+    #[prost(bool, tag = "4")]
+    pub has_completed: bool,
 }

@@ -64,6 +64,12 @@ pub struct DescribeNamespaceRequest {
     pub namespace: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub id: ::prost::alloc::string::String,
+    /// If true, the server may serve the response from an eventually-consistent
+    /// source instead of reading through to persistence. Defaults to false,
+    /// which preserves read-after-write consistency. SDKs should set this when
+    /// fetching namespace capabilities on worker/client startup.
+    #[prost(bool, tag = "3")]
+    pub weak_consistency: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DescribeNamespaceResponse {
@@ -86,6 +92,23 @@ pub struct DescribeNamespaceResponse {
     #[prost(message, repeated, tag = "6")]
     pub failover_history: ::prost::alloc::vec::Vec<
         super::super::replication::v1::FailoverStatus,
+    >,
+    /// Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
+    /// ignore stale updates.
+    /// The initial info that client should use for poller group assignment. This information is
+    /// updated through poll response. Client is supposed to use the info received in the latest
+    /// poll response.
+    #[deprecated]
+    #[prost(message, repeated, tag = "7")]
+    pub poller_group_infos: ::prost::alloc::vec::Vec<
+        super::super::taskqueue::v1::PollerGroupInfo,
+    >,
+    /// The initial, versioned info that client should use for poller group assignment. This
+    /// information is updated through poll responses. Client is supposed to use the info with the
+    /// highest version it has received.
+    #[prost(message, optional, tag = "8")]
+    pub poller_groups_info: ::core::option::Option<
+        super::super::taskqueue::v1::PollerGroupsInfo,
     >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -211,8 +234,8 @@ pub struct StartWorkflowExecutionRequest {
     pub last_completion_result: ::core::option::Option<
         super::super::common::v1::Payloads,
     >,
-    /// Time to wait before dispatching the first workflow task. Cannot be used with `cron_schedule`.
-    /// If the workflow gets a signal before the delay, a workflow task will be dispatched and the rest
+    /// Time to wait before making the first workflow task available for dispatch. Cannot be used with `cron_schedule`.
+    /// If the workflow gets a signal before the delay, a workflow task will be made available for dispatch and the rest
     /// of the delay will be ignored.
     #[prost(message, optional, tag = "20")]
     pub workflow_start_delay: ::core::option::Option<::prost_types::Duration>,
@@ -256,7 +279,7 @@ pub struct StartWorkflowExecutionRequest {
     /// Time-skipping configuration. If not set, time skipping is disabled.
     #[prost(message, optional, tag = "29")]
     pub time_skipping_config: ::core::option::Option<
-        super::super::workflow::v1::TimeSkippingConfig,
+        super::super::common::v1::TimeSkippingConfig,
     >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -264,6 +287,9 @@ pub struct StartWorkflowExecutionResponse {
     /// The run id of the workflow that was started - or used (via WorkflowIdConflictPolicy USE_EXISTING).
     #[prost(string, tag = "1")]
     pub run_id: ::prost::alloc::string::String,
+    /// If the workflow was started as a result of a de-dupe, this field will contain the run id of the first execution in the chain.
+    #[prost(string, tag = "6")]
+    pub first_execution_run_id: ::prost::alloc::string::String,
     /// If true, a new workflow was started.
     #[prost(bool, tag = "3")]
     pub started: bool,
@@ -344,7 +370,7 @@ pub struct PollWorkflowTaskQueueRequest {
     pub task_queue: ::core::option::Option<super::super::taskqueue::v1::TaskQueue>,
     /// Unless this is the first poll, the client must pass one of the poller group IDs received in
     /// `poller_group_infos` of the last the PollWorkflowTaskQueueResponse according to the
-    /// instructions. If not set, the poll is routed randomly which can cause it being blocked
+    /// instructions. If not set, the poll is routed randomly which can cause it to be blocked
     /// without receiving a task while the queue actually has tasks in another server location.
     #[prost(string, tag = "10")]
     pub poller_group_id: ::prost::alloc::string::String,
@@ -461,6 +487,8 @@ pub struct PollWorkflowTaskQueueResponse {
     /// Corresponding RespondQueryTaskCompleted should pass this value for proper routing.
     #[prost(string, tag = "17")]
     pub poller_group_id: ::prost::alloc::string::String,
+    /// Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
+    /// ignore stale updates.
     /// The weighted list of poller groups IDs that client should use for future polls to this task
     /// queue. Client is expected to:
     ///
@@ -468,9 +496,22 @@ pub struct PollWorkflowTaskQueueResponse {
     /// 1. Try to assign the next poll to a group without any pending polls,
     /// 1. If every group has some pending polls, assign the next poll to a group randomly
     ///    according to the weights.
+    #[deprecated]
     #[prost(message, repeated, tag = "18")]
     pub poller_group_infos: ::prost::alloc::vec::Vec<
         super::super::taskqueue::v1::PollerGroupInfo,
+    >,
+    /// The weighted, versioned list of poller groups IDs that client should use for future polls to
+    /// this task queue. Client should ignore this if it has already applied a snapshot with a
+    /// version greater than or equal to `poller_groups_info.version`. Client is expected to:
+    ///
+    /// 1. Maintain minimum number of pollers no less than the number of groups.
+    /// 1. Try to assign the next poll to a group without any pending polls,
+    /// 1. If every group has some pending polls, assign the next poll to a group randomly
+    ///    according to the weights.
+    #[prost(message, optional, tag = "19")]
+    pub poller_groups_info: ::core::option::Option<
+        super::super::taskqueue::v1::PollerGroupsInfo,
     >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -567,6 +608,16 @@ pub struct RespondWorkflowTaskCompletedRequest {
     /// tasks (e.g. activity cancellation) to this specific worker instance.
     #[prost(string, tag = "20")]
     pub worker_control_task_queue: ::prost::alloc::string::String,
+    /// 0-indexed page number when the workflow task completion is split across multiple
+    /// requests ("pages"). 0 for single-page requests. May only be set to non-zero value
+    /// when the namespace capability workflow_task_completion_pagination is true.
+    #[prost(int32, tag = "21")]
+    pub page_number: i32,
+    /// True for non-final pages of a paginated workflow task completion. The final page's
+    /// `page_number` tells the server how many intermediate pages (0..page_number-1) preceded it.
+    /// May only be used when the namespace capability workflow_task_completion_pagination is true.
+    #[prost(bool, tag = "22")]
+    pub intermediate_page: bool,
 }
 /// Nested message and enum types in `RespondWorkflowTaskCompletedRequest`.
 pub mod respond_workflow_task_completed_request {
@@ -656,7 +707,7 @@ pub struct PollActivityTaskQueueRequest {
     pub task_queue: ::core::option::Option<super::super::taskqueue::v1::TaskQueue>,
     /// Unless this is the first poll, the client must pass one of the poller group IDs received in
     /// `poller_group_infos` of the last the PollActivityTaskQueueResponse according to the
-    /// instructions. If not set, the poll is routed randomly which can cause it being blocked
+    /// instructions. If not set, the poll is routed randomly which can cause it to be blocked
     /// without receiving a task while the queue actually has tasks in another server location.
     #[prost(string, tag = "10")]
     pub poller_group_id: ::prost::alloc::string::String,
@@ -776,9 +827,22 @@ pub struct PollActivityTaskQueueResponse {
     /// 1. Try to assign the next poll to a group without any pending polls,
     /// 1. If every group has some pending polls, assign the next poll to a group randomly
     ///    according to the weights.
+    #[deprecated]
     #[prost(message, repeated, tag = "21")]
     pub poller_group_infos: ::prost::alloc::vec::Vec<
         super::super::taskqueue::v1::PollerGroupInfo,
+    >,
+    /// The weighted, versioned list of poller groups IDs that client should use for future polls to
+    /// this task queue. Client should ignore this if it has already applied a snapshot with a
+    /// version greater than or equal to `poller_groups_info.version`. Client is expected to:
+    ///
+    /// 1. Maintain minimum number of pollers no less than the number of groups.
+    /// 1. Try to assign the next poll to a group without any pending polls,
+    /// 1. If every group has some pending polls, assign the next poll to a group randomly
+    ///    according to the weights.
+    #[prost(message, optional, tag = "22")]
+    pub poller_groups_info: ::core::option::Option<
+        super::super::taskqueue::v1::PollerGroupsInfo,
     >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1215,9 +1279,9 @@ pub struct SignalWithStartWorkflowExecutionRequest {
     >,
     #[prost(message, optional, tag = "19")]
     pub header: ::core::option::Option<super::super::common::v1::Header>,
-    /// Time to wait before dispatching the first workflow task. Cannot be used with `cron_schedule`.
+    /// Time to wait before making the first workflow task available for dispatch. Cannot be used with `cron_schedule`.
     /// Note that the signal will be delivered with the first workflow task. If the workflow gets
-    /// another SignalWithStartWorkflow before the delay a workflow task will be dispatched immediately
+    /// another SignalWithStartWorkflow before the delay a workflow task will be made available for dispatch immediately
     /// and the rest of the delay period will be ignored, even if that request also had a delay.
     /// Signal via SignalWorkflowExecution will not unblock the workflow.
     #[prost(message, optional, tag = "20")]
@@ -1242,7 +1306,7 @@ pub struct SignalWithStartWorkflowExecutionRequest {
     /// Time-skipping configuration. If not set, time skipping is disabled.
     #[prost(message, optional, tag = "27")]
     pub time_skipping_config: ::core::option::Option<
-        super::super::workflow::v1::TimeSkippingConfig,
+        super::super::common::v1::TimeSkippingConfig,
     >,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1250,6 +1314,9 @@ pub struct SignalWithStartWorkflowExecutionResponse {
     /// The run id of the workflow that was started - or just signaled, if it was already running.
     #[prost(string, tag = "1")]
     pub run_id: ::prost::alloc::string::String,
+    /// If the workflow was started as a result of a de-dupe, this field will contain the run id of the first execution in the chain.
+    #[prost(string, tag = "4")]
+    pub first_execution_run_id: ::prost::alloc::string::String,
     /// If true, a new workflow was started.
     #[prost(bool, tag = "2")]
     pub started: bool,
@@ -1628,6 +1695,9 @@ pub struct QueryWorkflowResponse {
     pub query_result: ::core::option::Option<super::super::common::v1::Payloads>,
     #[prost(message, optional, tag = "2")]
     pub query_rejected: ::core::option::Option<super::super::query::v1::QueryRejected>,
+    /// Holds the link to the Workflow execution that processed the Query.
+    #[prost(message, optional, tag = "3")]
+    pub link: ::core::option::Option<super::super::common::v1::Link>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DescribeWorkflowExecutionRequest {
@@ -1897,6 +1967,11 @@ pub mod get_system_info_response {
         /// to be enabled via server configuration.
         #[prost(bool, tag = "12")]
         pub server_scaled_deployments: bool,
+        /// True if the server supports the Cloud Run compute provider for
+        /// server-scaled deployments. Dependent on server version and the
+        /// provider being enabled via server configuration.
+        #[prost(bool, tag = "13")]
+        pub server_scaled_provider_cloud_run: bool,
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2528,6 +2603,9 @@ pub struct UpdateWorkflowExecutionResponse {
         tag = "3"
     )]
     pub stage: i32,
+    /// Link to the update event. May be null if the update has not yet been accepted.
+    #[prost(message, optional, tag = "4")]
+    pub link: ::core::option::Option<super::super::common::v1::Link>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StartBatchOperationRequest {
@@ -2546,10 +2624,16 @@ pub struct StartBatchOperationRequest {
     pub reason: ::prost::alloc::string::String,
     /// Executions to apply the batch operation
     /// This field and `visibility_query` are mutually exclusive
+    /// DEPRECATED: Use `target_executions` instead.
+    #[deprecated]
     #[prost(message, repeated, tag = "5")]
     pub executions: ::prost::alloc::vec::Vec<
         super::super::common::v1::WorkflowExecution,
     >,
+    /// Target executions to apply the batch operation. This field and `visibility_query`
+    /// are mutually exclusive.
+    #[prost(message, repeated, tag = "22")]
+    pub target_executions: ::prost::alloc::vec::Vec<super::super::common::v1::Execution>,
     /// Limit for the number of operations processed per second within this batch.
     /// Its purpose is to reduce the stress on the system caused by batch operations, which helps to prevent system
     /// overload and minimize potential delays in executing ongoing tasks for user workers.
@@ -2561,7 +2645,7 @@ pub struct StartBatchOperationRequest {
     /// Operation input
     #[prost(
         oneof = "start_batch_operation_request::Operation",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub operation: ::core::option::Option<start_batch_operation_request::Operation>,
 }
@@ -2598,6 +2682,18 @@ pub mod start_batch_operation_request {
         UpdateActivityOptionsOperation(
             super::super::super::batch::v1::BatchOperationUpdateActivityOptions,
         ),
+        #[prost(message, tag = "19")]
+        CancelActivitiesOperation(
+            super::super::super::batch::v1::BatchOperationCancelActivities,
+        ),
+        #[prost(message, tag = "20")]
+        TerminateActivitiesOperation(
+            super::super::super::batch::v1::BatchOperationTerminateActivities,
+        ),
+        #[prost(message, tag = "21")]
+        DeleteActivitiesOperation(
+            super::super::super::batch::v1::BatchOperationDeleteActivities,
+        ),
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2628,7 +2724,7 @@ pub struct DescribeBatchOperationRequest {
     #[prost(string, tag = "2")]
     pub job_id: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DescribeBatchOperationResponse {
     /// Batch operation type
     #[prost(enumeration = "super::super::enums::v1::BatchOperationType", tag = "1")]
@@ -2660,6 +2756,12 @@ pub struct DescribeBatchOperationResponse {
     /// Reason indicates the reason to stop a operation
     #[prost(string, tag = "10")]
     pub reason: ::prost::alloc::string::String,
+    /// Query is the visibility query that defines the group of workflow to apply the batch operation
+    #[prost(string, tag = "11")]
+    pub query: ::prost::alloc::string::String,
+    /// Executions is the list of workflow OR standalone activity executions to apply the batch operation
+    #[prost(message, repeated, tag = "12")]
+    pub executions: ::prost::alloc::vec::Vec<super::super::common::v1::Execution>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListBatchOperationsRequest {
@@ -2736,7 +2838,7 @@ pub struct PollNexusTaskQueueRequest {
     pub task_queue: ::core::option::Option<super::super::taskqueue::v1::TaskQueue>,
     /// Unless this is the first poll, the client must pass one of the poller group IDs received in
     /// `poller_group_infos` of the last the PollNexusTaskQueueResponse according to the
-    /// instructions. If not set, the poll is routed randomly which can cause it being blocked
+    /// instructions. If not set, the poll is routed randomly which can cause it to be blocked
     /// without receiving a task while the queue actually has tasks in another server location.
     #[prost(string, tag = "9")]
     pub poller_group_id: ::prost::alloc::string::String,
@@ -2792,9 +2894,22 @@ pub struct PollNexusTaskQueueResponse {
     /// 1. Try to assign the next poll to a group without any pending polls,
     /// 1. If every group has some pending polls, assign the next poll to a group randomly
     ///    according to the weights.
+    #[deprecated]
     #[prost(message, repeated, tag = "5")]
     pub poller_group_infos: ::prost::alloc::vec::Vec<
         super::super::taskqueue::v1::PollerGroupInfo,
+    >,
+    /// The weighted, versioned list of poller groups IDs that client should use for future polls to
+    /// this task queue. Client should ignore this if it has already applied a snapshot with a
+    /// version greater than or equal to `poller_groups_info.version`. Client is expected to:
+    ///
+    /// 1. Maintain minimum number of pollers no less than the number of groups.
+    /// 1. Try to assign the next poll to a group without any pending polls,
+    /// 1. If every group has some pending polls, assign the next poll to a group randomly
+    ///    according to the weights.
+    #[prost(message, optional, tag = "6")]
+    pub poller_groups_info: ::core::option::Option<
+        super::super::taskqueue::v1::PollerGroupsInfo,
     >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2919,6 +3034,7 @@ pub mod execute_multi_operation_response {
     }
 }
 /// NOTE: keep in sync with temporal.api.batch.v1.BatchOperationUpdateActivityOptions
+/// Deprecated. Use `UpdateActivityExecutionOptionsRequest`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateActivityOptionsRequest {
     /// Namespace of the workflow which scheduled this activity
@@ -2940,7 +3056,7 @@ pub struct UpdateActivityOptionsRequest {
     pub update_mask: ::core::option::Option<::prost_types::FieldMask>,
     /// If set, the activity options will be restored to the default.
     /// Default options are then options activity was created with.
-    /// They are part of the first SCHEDULE event.
+    /// They are part of the first schedule event.
     /// This flag cannot be combined with any other option; if you supply
     /// restore_original together with other options, the request will be rejected.
     #[prost(bool, tag = "8")]
@@ -2966,6 +3082,47 @@ pub mod update_activity_options_request {
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateActivityExecutionOptionsRequest {
+    /// Namespace of the workflow which scheduled this activity
+    #[prost(string, tag = "1")]
+    pub namespace: ::prost::alloc::string::String,
+    /// If provided, targets a workflow activity for the given workflow ID.
+    /// If empty, targets a standalone activity.
+    #[prost(string, tag = "2")]
+    pub workflow_id: ::prost::alloc::string::String,
+    /// The ID of the activity to target.
+    #[prost(string, tag = "3")]
+    pub activity_id: ::prost::alloc::string::String,
+    /// Run ID of the workflow or standalone activity. If empty, targets the latest run.
+    #[prost(string, tag = "4")]
+    pub run_id: ::prost::alloc::string::String,
+    /// The identity of the client who initiated this request
+    #[prost(string, tag = "5")]
+    pub identity: ::prost::alloc::string::String,
+    /// Activity options. Partial updates are accepted and controlled by update_mask
+    #[prost(message, optional, tag = "6")]
+    pub activity_options: ::core::option::Option<
+        super::super::activity::v1::ActivityOptions,
+    >,
+    /// Controls which fields from `activity_options` will be applied
+    #[prost(message, optional, tag = "7")]
+    pub update_mask: ::core::option::Option<::prost_types::FieldMask>,
+    /// If set, the activity options will be restored to the default.
+    /// Default options are then options activity was created with.
+    /// They are part of the first schedule event.
+    /// This flag cannot be combined with any other option; if you supply
+    /// restore_original together with other options, the request will be rejected.
+    #[prost(bool, tag = "8")]
+    pub restore_original: bool,
+    /// Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+    #[prost(string, tag = "9")]
+    pub resource_id: ::prost::alloc::string::String,
+    /// Used to de-dupe update requests.
+    #[prost(string, tag = "10")]
+    pub request_id: ::prost::alloc::string::String,
+}
+/// Deprecated. Use `UpdateActivityExecutionOptionsResponse`.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateActivityOptionsResponse {
     /// Activity options after an update
     #[prost(message, optional, tag = "1")]
@@ -2973,6 +3130,15 @@ pub struct UpdateActivityOptionsResponse {
         super::super::activity::v1::ActivityOptions,
     >,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateActivityExecutionOptionsResponse {
+    /// Activity options after an update
+    #[prost(message, optional, tag = "1")]
+    pub activity_options: ::core::option::Option<
+        super::super::activity::v1::ActivityOptions,
+    >,
+}
+/// Deprecated. Use `PauseActivityExecutionRequest`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PauseActivityRequest {
     /// Namespace of the workflow which scheduled this activity.
@@ -2987,6 +3153,9 @@ pub struct PauseActivityRequest {
     /// Reason to pause the activity.
     #[prost(string, tag = "6")]
     pub reason: ::prost::alloc::string::String,
+    /// Used to de-dupe pause requests.
+    #[prost(string, tag = "7")]
+    pub request_id: ::prost::alloc::string::String,
     /// either activity id or activity type must be provided
     #[prost(oneof = "pause_activity_request::Activity", tags = "4, 5")]
     pub activity: ::core::option::Option<pause_activity_request::Activity>,
@@ -3005,8 +3174,40 @@ pub mod pause_activity_request {
         Type(::prost::alloc::string::String),
     }
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PauseActivityExecutionRequest {
+    /// Namespace of the workflow which scheduled this activity.
+    #[prost(string, tag = "1")]
+    pub namespace: ::prost::alloc::string::String,
+    /// If provided, pause a workflow activity (or activities) for the given workflow ID.
+    /// If empty, targets a standalone activity.
+    #[prost(string, tag = "2")]
+    pub workflow_id: ::prost::alloc::string::String,
+    /// The ID of the activity to target.
+    #[prost(string, tag = "3")]
+    pub activity_id: ::prost::alloc::string::String,
+    /// Run ID of the workflow or standalone activity. If empty, targets the latest run.
+    #[prost(string, tag = "4")]
+    pub run_id: ::prost::alloc::string::String,
+    /// The identity of the client who initiated this request.
+    #[prost(string, tag = "5")]
+    pub identity: ::prost::alloc::string::String,
+    /// Reason to pause the activity.
+    #[prost(string, tag = "6")]
+    pub reason: ::prost::alloc::string::String,
+    /// Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+    #[prost(string, tag = "7")]
+    pub resource_id: ::prost::alloc::string::String,
+    /// Used to de-dupe pause requests.
+    #[prost(string, tag = "8")]
+    pub request_id: ::prost::alloc::string::String,
+}
+/// Deprecated. Use `PauseActivityExecutionResponse`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PauseActivityResponse {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PauseActivityExecutionResponse {}
+/// Deprecated. Use `UnpauseActivityExecutionRequest`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnpauseActivityRequest {
     /// Namespace of the workflow which scheduled this activity.
@@ -3047,9 +3248,44 @@ pub mod unpause_activity_request {
         UnpauseAll(bool),
     }
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UnpauseActivityExecutionRequest {
+    /// Namespace of the workflow which scheduled this activity.
+    #[prost(string, tag = "1")]
+    pub namespace: ::prost::alloc::string::String,
+    /// If provided, targets a workflow activity for the given workflow ID.
+    /// If empty, targets a standalone activity.
+    #[prost(string, tag = "2")]
+    pub workflow_id: ::prost::alloc::string::String,
+    /// The ID of the activity to target.
+    #[prost(string, tag = "3")]
+    pub activity_id: ::prost::alloc::string::String,
+    /// Run ID of the workflow or standalone activity. If empty, targets the latest run.
+    #[prost(string, tag = "4")]
+    pub run_id: ::prost::alloc::string::String,
+    /// The identity of the client who initiated this request.
+    #[prost(string, tag = "5")]
+    pub identity: ::prost::alloc::string::String,
+    /// Reason to unpause the activity.
+    #[prost(string, tag = "8")]
+    pub reason: ::prost::alloc::string::String,
+    /// If set, the activity will start at a random time within the specified jitter duration.
+    #[prost(message, optional, tag = "9")]
+    pub jitter: ::core::option::Option<::prost_types::Duration>,
+    /// Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+    #[prost(string, tag = "10")]
+    pub resource_id: ::prost::alloc::string::String,
+    /// Used to de-dupe unpause requests.
+    #[prost(string, tag = "11")]
+    pub request_id: ::prost::alloc::string::String,
+}
+/// Deprecated. Use `UnpauseActivityExecutionResponse`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnpauseActivityResponse {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UnpauseActivityExecutionResponse {}
 /// NOTE: keep in sync with temporal.api.batch.v1.BatchOperationResetActivities
+/// Deprecated. Use `ResetActivityExecutionRequest`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResetActivityRequest {
     /// Namespace of the workflow which scheduled this activity.
@@ -3074,7 +3310,7 @@ pub struct ResetActivityRequest {
     pub jitter: ::core::option::Option<::prost_types::Duration>,
     /// If set, the activity options will be restored to the defaults.
     /// Default options are then options activity was created with.
-    /// They are part of the first SCHEDULE event.
+    /// They are part of the first schedule event.
     #[prost(bool, tag = "9")]
     pub restore_original_options: bool,
     /// either activity id, activity type or update_all must be provided
@@ -3097,8 +3333,53 @@ pub mod reset_activity_request {
         MatchAll(bool),
     }
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResetActivityExecutionRequest {
+    /// Namespace of the workflow which scheduled this activity.
+    #[prost(string, tag = "1")]
+    pub namespace: ::prost::alloc::string::String,
+    /// If provided, targets a workflow activity for the given workflow ID.
+    /// If empty, targets a standalone activity.
+    #[prost(string, tag = "2")]
+    pub workflow_id: ::prost::alloc::string::String,
+    /// The ID of the activity to target.
+    #[prost(string, tag = "3")]
+    pub activity_id: ::prost::alloc::string::String,
+    /// Run ID of the workflow or standalone activity. If empty, targets the latest run.
+    #[prost(string, tag = "4")]
+    pub run_id: ::prost::alloc::string::String,
+    /// The identity of the client who initiated this request.
+    #[prost(string, tag = "5")]
+    pub identity: ::prost::alloc::string::String,
+    /// If activity is paused, it will remain paused after reset
+    #[prost(bool, tag = "6")]
+    pub keep_paused: bool,
+    /// If set, and activity is in backoff, the activity will start at a random time within the specified jitter duration.
+    /// (unless it is paused and keep_paused is set)
+    #[prost(message, optional, tag = "7")]
+    pub jitter: ::core::option::Option<::prost_types::Duration>,
+    /// If set, the activity options will be restored to the defaults.
+    /// Default options are then options activity was created with.
+    /// They are part of the first schedule event.
+    #[prost(bool, tag = "8")]
+    pub restore_original_options: bool,
+    /// Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+    #[prost(string, tag = "9")]
+    pub resource_id: ::prost::alloc::string::String,
+    /// Used to de-dupe reset requests.
+    #[prost(string, tag = "10")]
+    pub request_id: ::prost::alloc::string::String,
+    /// Reset persisted heartbeat details.
+    /// Reset always resets the attempt counter. Passing this flag causes reset to additionally
+    /// discard any persisted heartbeat details.
+    #[prost(bool, tag = "11")]
+    pub reset_heartbeat: bool,
+}
+/// Deprecated. Use `ResetActivityExecutionRequest`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResetActivityResponse {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResetActivityExecutionResponse {}
 /// Keep the parameters in sync with:
 ///
 /// * temporal.api.batch.v1.BatchOperationUpdateWorkflowExecutionOptions.
@@ -3135,6 +3416,13 @@ pub struct UpdateWorkflowExecutionOptionsResponse {
     pub workflow_execution_options: ::core::option::Option<
         super::super::workflow::v1::WorkflowExecutionOptions,
     >,
+    /// The Workflow Execution time when the options were updated. When time skipping is
+    /// enabled, this is the workflow's virtual time rather than wall-clock time.
+    ///
+    /// This timestamp cannot be used for time-skipping fast-forward verification,
+    /// use `fast_forward_id` in `PollWorkflowExecutionTimeSkippingRequest` instead.
+    #[prost(message, optional, tag = "2")]
+    pub update_time: ::core::option::Option<::prost_types::Timestamp>,
 }
 /// \[cleanup-wv-pre-release\] Pre-release deployment APIs, clean up later
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -3904,6 +4192,10 @@ pub struct ListWorkersRequest {
     /// * Status
     #[prost(string, tag = "4")]
     pub query: ::prost::alloc::string::String,
+    /// When true, the response will include system workers that are created implicitly
+    /// by the server and not by the user. By default, system workers are excluded.
+    #[prost(bool, tag = "5")]
+    pub include_system_workers: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListWorkersResponse {
@@ -4057,6 +4349,25 @@ pub struct DescribeWorkerResponse {
     #[prost(message, optional, tag = "1")]
     pub worker_info: ::core::option::Option<super::super::worker::v1::WorkerInfo>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CountWorkersRequest {
+    #[prost(string, tag = "1")]
+    pub namespace: ::prost::alloc::string::String,
+    /// Query to filter workers before counting.
+    /// Supported filter fields are the same as in ListWorkersRequest.
+    #[prost(string, tag = "2")]
+    pub query: ::prost::alloc::string::String,
+    /// When true, the count will include system workers that are created implicitly
+    /// by the server and not by the user. By default, system workers are excluded.
+    #[prost(bool, tag = "3")]
+    pub include_system_workers: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CountWorkersResponse {
+    /// Number of workers matching the query.
+    #[prost(int64, tag = "1")]
+    pub count: i64,
+}
 /// Request to pause a workflow execution.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PauseWorkflowExecutionRequest {
@@ -4199,7 +4510,7 @@ pub struct StartActivityExecutionRequest {
     pub on_conflict_options: ::core::option::Option<
         super::super::common::v1::OnConflictOptions,
     >,
-    /// Time to wait before dispatching the first activity task. This delay is not applied to retry attempts.
+    /// Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
     #[prost(message, optional, tag = "22")]
     pub start_delay: ::core::option::Option<::prost_types::Duration>,
 }
@@ -4238,13 +4549,20 @@ pub struct DescribeActivityExecutionRequest {
     /// sequence of state changes.
     #[prost(bytes = "vec", tag = "6")]
     pub long_poll_token: ::prost::alloc::vec::Vec<u8>,
+    /// Include the heartbeat_details field inside info in the response if available.
+    #[prost(bool, tag = "7")]
+    pub include_heartbeat_details: bool,
+    /// Include the last_failure field inside info in the response if available.
+    #[prost(bool, tag = "8")]
+    pub include_last_failure: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DescribeActivityExecutionResponse {
     /// The run ID of the activity, useful when run_id was not specified in the request.
     #[prost(string, tag = "1")]
     pub run_id: ::prost::alloc::string::String,
-    /// Information about the activity execution.
+    /// Information about the activity execution. Fields heartbeat_details and last_failure are omitted unless
+    /// the request has include_heartbeat_details or include_last_failure set to true, respectively.
     #[prost(message, optional, tag = "2")]
     pub info: ::core::option::Option<super::super::activity::v1::ActivityExecutionInfo>,
     /// Serialized activity input, passed as arguments to the activity function.
@@ -4624,7 +4942,7 @@ pub struct RequestCancelActivityExecutionRequest {
     pub namespace: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub activity_id: ::prost::alloc::string::String,
-    /// Activity run ID, targets the latest run if run_id is empty.
+    /// Activity run ID. If empty, targets the latest run.
     #[prost(string, tag = "3")]
     pub run_id: ::prost::alloc::string::String,
     /// The identity of the worker/client.
@@ -4646,7 +4964,7 @@ pub struct TerminateActivityExecutionRequest {
     pub namespace: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub activity_id: ::prost::alloc::string::String,
-    /// Activity run ID, targets the latest run if run_id is empty.
+    /// Activity run ID. If empty, targets the latest run.
     #[prost(string, tag = "3")]
     pub run_id: ::prost::alloc::string::String,
     /// The identity of the worker/client.
@@ -4727,6 +5045,41 @@ pub struct DeleteNexusOperationExecutionRequest {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteNexusOperationExecutionResponse {}
+/// A long-poll request that blocks according to a time-skipping waiting policy on the workflow
+/// execution. Currently the only supported policy is waiting for completion of the fast-forward
+/// identified by `fast_forward_id`; the poll also returns once anything else settles that outcome
+/// (e.g. the execution ends or time skipping is disabled).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PollWorkflowExecutionTimeSkippingRequest {
+    #[prost(string, tag = "1")]
+    pub namespace: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub workflow_execution: ::core::option::Option<
+        super::super::common::v1::WorkflowExecution,
+    >,
+    /// Required. Identifies the fast-forward whose completion the caller wants to wait for.
+    /// Must match the `fast_forward_id` set in the execution's TimeSkippingConfig.
+    #[prost(string, tag = "3")]
+    pub fast_forward_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PollWorkflowExecutionTimeSkippingResponse {
+    /// The outcome of the poll for the fast-forward identified by the request's `fast_forward_id`.
+    #[prost(
+        enumeration = "super::super::enums::v1::FastForwardPollingResult",
+        tag = "1"
+    )]
+    pub fast_forward_polling_result: i32,
+    /// Set only when the result is FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED; explains why
+    /// the fast-forward can no longer complete.
+    #[prost(string, tag = "2")]
+    pub failed_reason: ::prost::alloc::string::String,
+    /// The execution's current fast-forward, if any.
+    #[prost(message, optional, tag = "3")]
+    pub fast_forward_info: ::core::option::Option<
+        super::super::common::v1::TimeSkippingFastForwardInfo,
+    >,
+}
 /// Generated client implementations.
 pub mod workflow_service_client {
     #![allow(
@@ -6568,6 +6921,7 @@ pub mod workflow_service_client {
             self.inner.unary(req, path, codec).await
         }
         /// Deprecated. Use `UpdateWorkerVersioningRules`.
+        /// Will be removed in server version v1.32.0.
         ///
         /// Allows users to specify sets of worker build id versions on a per task queue basis. Versions
         /// are ordered, and may be either compatible with some extant version, or a new incompatible
@@ -6616,6 +6970,7 @@ pub mod workflow_service_client {
             self.inner.unary(req, path, codec).await
         }
         /// Deprecated. Use `GetWorkerVersioningRules`.
+        /// Will be removed in server version v1.32.0.
         /// Fetches the worker build id versioning sets for a task queue.
         pub async fn get_worker_build_id_compatibility(
             &mut self,
@@ -6667,7 +7022,7 @@ pub mod workflow_service_client {
         /// the target Build ID of a redirect rule is able to process event histories made by the source
         /// Build ID by using [Patching](https://docs.temporal.io/workflows#patching) or other means.
         ///
-        /// WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+        /// Will be removed in server version v1.32.0.
         /// (-- api-linter: core::0127::http-annotation=disabled
         /// aip.dev/not-precedent: We do yet expose versioning API to HTTP. --)
         pub async fn update_worker_versioning_rules(
@@ -6700,7 +7055,7 @@ pub mod workflow_service_client {
             self.inner.unary(req, path, codec).await
         }
         /// Fetches the Build ID assignment and redirect rules for a Task Queue.
-        /// WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+        /// Will be removed in server version v1.32.0.
         pub async fn get_worker_versioning_rules(
             &mut self,
             request: impl tonic::IntoRequest<super::GetWorkerVersioningRulesRequest>,
@@ -6731,6 +7086,7 @@ pub mod workflow_service_client {
             self.inner.unary(req, path, codec).await
         }
         /// Deprecated. Use `DescribeTaskQueue`.
+        /// Will be removed in server version v1.32.0.
         ///
         /// Fetches task reachability to determine whether a worker may be retired.
         /// The request may specify task queues to query for or let the server fetch all task queues mapped to the given
@@ -8075,6 +8431,36 @@ pub mod workflow_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// CountWorkers counts the number of workers in a specific namespace.
+        pub async fn count_workers(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CountWorkersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CountWorkersResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/temporal.api.workflowservice.v1.WorkflowService/CountWorkers",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "temporal.api.workflowservice.v1.WorkflowService",
+                        "CountWorkers",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Updates task queue configuration.
         /// For the overall queue rate limit: the rate limit set by this api overrides the worker-set rate limit,
         /// which uncouples the rate limit from the worker lifecycle.
@@ -8735,6 +9121,161 @@ pub mod workflow_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// PauseActivityExecution pauses the execution of an activity specified by its ID.
+        /// This API can be used to target a workflow activity or a standalone activity
+        ///
+        /// Pausing an activity means:
+        ///
+        /// * If the activity is currently waiting for a retry or is running and subsequently fails,
+        ///  it will not be rescheduled until it is unpaused.
+        /// * If the activity is already paused, calling this method will have no effect.
+        /// * If the activity is running and finishes successfully, the activity will be completed.
+        /// * If the activity is running and finishes with failure:
+        ///  * if there is no retry left - the activity will be completed.
+        ///  * if there are more retries left - the activity will be paused.
+        ///    For long-running activities:
+        /// * activities in paused state will send a cancellation with "activity_paused" set to 'true' in response to 'RecordActivityTaskHeartbeat'.
+        ///
+        /// Returns a `NotFound` error if there is no pending activity with the provided ID
+        pub async fn pause_activity_execution(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PauseActivityExecutionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PauseActivityExecutionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/temporal.api.workflowservice.v1.WorkflowService/PauseActivityExecution",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "temporal.api.workflowservice.v1.WorkflowService",
+                        "PauseActivityExecution",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// ResetActivityExecution resets the execution of an activity specified by its ID.
+        /// This API can be used to target a workflow activity or a standalone activity.
+        ///
+        /// Resetting an activity means:
+        ///
+        /// * number of attempts will be reset to 0.
+        /// * activity timeouts will be reset.
+        /// * if the activity is waiting for retry, and it is not paused or 'keep_paused' is not provided:
+        ///  it will be scheduled immediately (\* see 'jitter' flag)
+        ///
+        /// Returns a `NotFound` error if there is no pending activity with the provided ID or type.
+        pub async fn reset_activity_execution(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ResetActivityExecutionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ResetActivityExecutionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/temporal.api.workflowservice.v1.WorkflowService/ResetActivityExecution",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "temporal.api.workflowservice.v1.WorkflowService",
+                        "ResetActivityExecution",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// UnpauseActivityExecution unpauses the execution of an activity specified by its ID.
+        /// This API can be used to target a workflow activity or a standalone activity.
+        ///
+        /// If activity is not paused, this call will have no effect.
+        /// If the activity was paused while waiting for retry, it will be scheduled immediately (\* see 'jitter' flag).
+        /// Once the activity is unpaused, all timeout timers will be regenerated.
+        ///
+        /// Returns a `NotFound` error if there is no pending activity with the provided ID
+        pub async fn unpause_activity_execution(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UnpauseActivityExecutionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UnpauseActivityExecutionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/temporal.api.workflowservice.v1.WorkflowService/UnpauseActivityExecution",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "temporal.api.workflowservice.v1.WorkflowService",
+                        "UnpauseActivityExecution",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// UpdateActivityExecutionOptions is called by the client to update the options of an activity by its ID.
+        /// This API can be used to target a workflow activity or a standalone activity.
+        pub async fn update_activity_execution_options(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::UpdateActivityExecutionOptionsRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateActivityExecutionOptionsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/temporal.api.workflowservice.v1.WorkflowService/UpdateActivityExecutionOptions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "temporal.api.workflowservice.v1.WorkflowService",
+                        "UpdateActivityExecutionOptions",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// TerminateNexusOperationExecution terminates an existing Nexus operation immediately.
         ///
         /// Termination happens immediately and the operation handler cannot react to it. A terminated operation will have
@@ -8801,6 +9342,37 @@ pub mod workflow_service_client {
                     GrpcMethod::new(
                         "temporal.api.workflowservice.v1.WorkflowService",
                         "DeleteNexusOperationExecution",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn poll_workflow_execution_time_skipping(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::PollWorkflowExecutionTimeSkippingRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::PollWorkflowExecutionTimeSkippingResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/temporal.api.workflowservice.v1.WorkflowService/PollWorkflowExecutionTimeSkipping",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "temporal.api.workflowservice.v1.WorkflowService",
+                        "PollWorkflowExecutionTimeSkipping",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -9423,6 +9995,7 @@ pub mod workflow_service_server {
             tonic::Status,
         >;
         /// Deprecated. Use `UpdateWorkerVersioningRules`.
+        /// Will be removed in server version v1.32.0.
         ///
         /// Allows users to specify sets of worker build id versions on a per task queue basis. Versions
         /// are ordered, and may be either compatible with some extant version, or a new incompatible
@@ -9447,6 +10020,7 @@ pub mod workflow_service_server {
             tonic::Status,
         >;
         /// Deprecated. Use `GetWorkerVersioningRules`.
+        /// Will be removed in server version v1.32.0.
         /// Fetches the worker build id versioning sets for a task queue.
         async fn get_worker_build_id_compatibility(
             &self,
@@ -9476,7 +10050,7 @@ pub mod workflow_service_server {
         /// the target Build ID of a redirect rule is able to process event histories made by the source
         /// Build ID by using [Patching](https://docs.temporal.io/workflows#patching) or other means.
         ///
-        /// WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+        /// Will be removed in server version v1.32.0.
         /// (-- api-linter: core::0127::http-annotation=disabled
         /// aip.dev/not-precedent: We do yet expose versioning API to HTTP. --)
         async fn update_worker_versioning_rules(
@@ -9487,7 +10061,7 @@ pub mod workflow_service_server {
             tonic::Status,
         >;
         /// Fetches the Build ID assignment and redirect rules for a Task Queue.
-        /// WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+        /// Will be removed in server version v1.32.0.
         async fn get_worker_versioning_rules(
             &self,
             request: tonic::Request<super::GetWorkerVersioningRulesRequest>,
@@ -9496,6 +10070,7 @@ pub mod workflow_service_server {
             tonic::Status,
         >;
         /// Deprecated. Use `DescribeTaskQueue`.
+        /// Will be removed in server version v1.32.0.
         ///
         /// Fetches task reachability to determine whether a worker may be retired.
         /// The request may specify task queues to query for or let the server fetch all task queues mapped to the given
@@ -9950,6 +10525,14 @@ pub mod workflow_service_server {
             tonic::Response<super::ListWorkersResponse>,
             tonic::Status,
         >;
+        /// CountWorkers counts the number of workers in a specific namespace.
+        async fn count_workers(
+            &self,
+            request: tonic::Request<super::CountWorkersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CountWorkersResponse>,
+            tonic::Status,
+        >;
         /// Updates task queue configuration.
         /// For the overall queue rate limit: the rate limit set by this api overrides the worker-set rate limit,
         /// which uncouples the rate limit from the worker lifecycle.
@@ -10164,6 +10747,71 @@ pub mod workflow_service_server {
             tonic::Response<super::DeleteActivityExecutionResponse>,
             tonic::Status,
         >;
+        /// PauseActivityExecution pauses the execution of an activity specified by its ID.
+        /// This API can be used to target a workflow activity or a standalone activity
+        ///
+        /// Pausing an activity means:
+        ///
+        /// * If the activity is currently waiting for a retry or is running and subsequently fails,
+        ///  it will not be rescheduled until it is unpaused.
+        /// * If the activity is already paused, calling this method will have no effect.
+        /// * If the activity is running and finishes successfully, the activity will be completed.
+        /// * If the activity is running and finishes with failure:
+        ///  * if there is no retry left - the activity will be completed.
+        ///  * if there are more retries left - the activity will be paused.
+        ///    For long-running activities:
+        /// * activities in paused state will send a cancellation with "activity_paused" set to 'true' in response to 'RecordActivityTaskHeartbeat'.
+        ///
+        /// Returns a `NotFound` error if there is no pending activity with the provided ID
+        async fn pause_activity_execution(
+            &self,
+            request: tonic::Request<super::PauseActivityExecutionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PauseActivityExecutionResponse>,
+            tonic::Status,
+        >;
+        /// ResetActivityExecution resets the execution of an activity specified by its ID.
+        /// This API can be used to target a workflow activity or a standalone activity.
+        ///
+        /// Resetting an activity means:
+        ///
+        /// * number of attempts will be reset to 0.
+        /// * activity timeouts will be reset.
+        /// * if the activity is waiting for retry, and it is not paused or 'keep_paused' is not provided:
+        ///  it will be scheduled immediately (\* see 'jitter' flag)
+        ///
+        /// Returns a `NotFound` error if there is no pending activity with the provided ID or type.
+        async fn reset_activity_execution(
+            &self,
+            request: tonic::Request<super::ResetActivityExecutionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ResetActivityExecutionResponse>,
+            tonic::Status,
+        >;
+        /// UnpauseActivityExecution unpauses the execution of an activity specified by its ID.
+        /// This API can be used to target a workflow activity or a standalone activity.
+        ///
+        /// If activity is not paused, this call will have no effect.
+        /// If the activity was paused while waiting for retry, it will be scheduled immediately (\* see 'jitter' flag).
+        /// Once the activity is unpaused, all timeout timers will be regenerated.
+        ///
+        /// Returns a `NotFound` error if there is no pending activity with the provided ID
+        async fn unpause_activity_execution(
+            &self,
+            request: tonic::Request<super::UnpauseActivityExecutionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UnpauseActivityExecutionResponse>,
+            tonic::Status,
+        >;
+        /// UpdateActivityExecutionOptions is called by the client to update the options of an activity by its ID.
+        /// This API can be used to target a workflow activity or a standalone activity.
+        async fn update_activity_execution_options(
+            &self,
+            request: tonic::Request<super::UpdateActivityExecutionOptionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateActivityExecutionOptionsResponse>,
+            tonic::Status,
+        >;
         /// TerminateNexusOperationExecution terminates an existing Nexus operation immediately.
         ///
         /// Termination happens immediately and the operation handler cannot react to it. A terminated operation will have
@@ -10186,6 +10834,13 @@ pub mod workflow_service_server {
             request: tonic::Request<super::DeleteNexusOperationExecutionRequest>,
         ) -> std::result::Result<
             tonic::Response<super::DeleteNexusOperationExecutionResponse>,
+            tonic::Status,
+        >;
+        async fn poll_workflow_execution_time_skipping(
+            &self,
+            request: tonic::Request<super::PollWorkflowExecutionTimeSkippingRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PollWorkflowExecutionTimeSkippingResponse>,
             tonic::Status,
         >;
     }
@@ -15048,6 +15703,51 @@ pub mod workflow_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/temporal.api.workflowservice.v1.WorkflowService/CountWorkers" => {
+                    #[allow(non_camel_case_types)]
+                    struct CountWorkersSvc<T: WorkflowService>(pub Arc<T>);
+                    impl<
+                        T: WorkflowService,
+                    > tonic::server::UnaryService<super::CountWorkersRequest>
+                    for CountWorkersSvc<T> {
+                        type Response = super::CountWorkersResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CountWorkersRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WorkflowService>::count_workers(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CountWorkersSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/temporal.api.workflowservice.v1.WorkflowService/UpdateTaskQueueConfig" => {
                     #[allow(non_camel_case_types)]
                     struct UpdateTaskQueueConfigSvc<T: WorkflowService>(pub Arc<T>);
@@ -16069,6 +16769,209 @@ pub mod workflow_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/temporal.api.workflowservice.v1.WorkflowService/PauseActivityExecution" => {
+                    #[allow(non_camel_case_types)]
+                    struct PauseActivityExecutionSvc<T: WorkflowService>(pub Arc<T>);
+                    impl<
+                        T: WorkflowService,
+                    > tonic::server::UnaryService<super::PauseActivityExecutionRequest>
+                    for PauseActivityExecutionSvc<T> {
+                        type Response = super::PauseActivityExecutionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PauseActivityExecutionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WorkflowService>::pause_activity_execution(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PauseActivityExecutionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/temporal.api.workflowservice.v1.WorkflowService/ResetActivityExecution" => {
+                    #[allow(non_camel_case_types)]
+                    struct ResetActivityExecutionSvc<T: WorkflowService>(pub Arc<T>);
+                    impl<
+                        T: WorkflowService,
+                    > tonic::server::UnaryService<super::ResetActivityExecutionRequest>
+                    for ResetActivityExecutionSvc<T> {
+                        type Response = super::ResetActivityExecutionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ResetActivityExecutionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WorkflowService>::reset_activity_execution(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ResetActivityExecutionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/temporal.api.workflowservice.v1.WorkflowService/UnpauseActivityExecution" => {
+                    #[allow(non_camel_case_types)]
+                    struct UnpauseActivityExecutionSvc<T: WorkflowService>(pub Arc<T>);
+                    impl<
+                        T: WorkflowService,
+                    > tonic::server::UnaryService<super::UnpauseActivityExecutionRequest>
+                    for UnpauseActivityExecutionSvc<T> {
+                        type Response = super::UnpauseActivityExecutionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::UnpauseActivityExecutionRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WorkflowService>::unpause_activity_execution(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UnpauseActivityExecutionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/temporal.api.workflowservice.v1.WorkflowService/UpdateActivityExecutionOptions" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateActivityExecutionOptionsSvc<T: WorkflowService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: WorkflowService,
+                    > tonic::server::UnaryService<
+                        super::UpdateActivityExecutionOptionsRequest,
+                    > for UpdateActivityExecutionOptionsSvc<T> {
+                        type Response = super::UpdateActivityExecutionOptionsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::UpdateActivityExecutionOptionsRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WorkflowService>::update_activity_execution_options(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpdateActivityExecutionOptionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/temporal.api.workflowservice.v1.WorkflowService/TerminateNexusOperationExecution" => {
                     #[allow(non_camel_case_types)]
                     struct TerminateNexusOperationExecutionSvc<T: WorkflowService>(
@@ -16162,6 +17065,60 @@ pub mod workflow_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DeleteNexusOperationExecutionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/temporal.api.workflowservice.v1.WorkflowService/PollWorkflowExecutionTimeSkipping" => {
+                    #[allow(non_camel_case_types)]
+                    struct PollWorkflowExecutionTimeSkippingSvc<T: WorkflowService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: WorkflowService,
+                    > tonic::server::UnaryService<
+                        super::PollWorkflowExecutionTimeSkippingRequest,
+                    > for PollWorkflowExecutionTimeSkippingSvc<T> {
+                        type Response = super::PollWorkflowExecutionTimeSkippingResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::PollWorkflowExecutionTimeSkippingRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WorkflowService>::poll_workflow_execution_time_skipping(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PollWorkflowExecutionTimeSkippingSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

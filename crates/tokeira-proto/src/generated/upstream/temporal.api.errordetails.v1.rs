@@ -12,6 +12,8 @@ pub struct WorkflowExecutionAlreadyStartedFailure {
     pub start_request_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub run_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub first_execution_run_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NamespaceNotActiveFailure {
@@ -158,3 +160,8 @@ pub struct NexusOperationExecutionAlreadyStartedFailure {
     #[prost(string, tag = "2")]
     pub run_id: ::prost::alloc::string::String,
 }
+/// An error indicating that the server lost the buffered pages of a paginated workflow task
+/// completion. This is a transient error: the workflow task is still valid, and the client
+/// should resend all pages from page 0 using the same task token.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WorkflowTaskCompletionBufferLostFailure {}

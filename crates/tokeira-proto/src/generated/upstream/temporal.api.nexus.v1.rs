@@ -424,6 +424,9 @@ pub struct NexusOperationExecutionInfo {
     /// The identity of the client who started this operation.
     #[prost(string, tag = "28")]
     pub identity: ::prost::alloc::string::String,
+    /// Updated once on scheduled and once on terminal status.
+    #[prost(int64, tag = "29")]
+    pub state_size_bytes: i64,
 }
 /// Limited Nexus operation information returned in the list response.
 /// When adding fields here, ensure that it is also present in NexusOperationExecutionInfo (note that it may already be present in
@@ -469,4 +472,7 @@ pub struct NexusOperationExecutionListInfo {
     /// This field is only populated if the operation is closed.
     #[prost(message, optional, tag = "11")]
     pub execution_duration: ::core::option::Option<::prost_types::Duration>,
+    /// Updated once on scheduled and once on terminal status.
+    #[prost(int64, tag = "12")]
+    pub state_size_bytes: i64,
 }

@@ -196,6 +196,9 @@ reviews each PR against Target_Release before the integration seat merges. Delta
 
 ## Notes
 
+- Every task lands on the campaign branch `compat/temporal-1.32`; every PR targets it.
+  The integration seat merges `origin/main` into the branch to keep it current and
+  merges the branch into `main` once, after task 7.7 (Requirement 11.8).
 - Tasks 1–3 are disjoint by file set and run in parallel worktrees. Task 4's fork work
   is independent of the engine repo except for 2.x (the gate must accept the target
   tag before a run is attempted).

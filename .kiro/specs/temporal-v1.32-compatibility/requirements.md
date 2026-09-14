@@ -102,6 +102,10 @@ work is deliberately sequenced after it so every checkpoint stays bisectable and
   against an unchanged `tokeirad`, per suite: pass, fail, skip, unfinished.
 - **Bump_Trailer**: the `Server-Compat-Bump: <reason>` commit trailer that
   `crates/tokeira-build/src/pipelines/ci.rs` requires on any commit changing the Claim.
+- **Campaign_Branch**: the integration branch `compat/temporal-1.32`, created from
+  `main` at `271a9121`. Every slice PR of this campaign targets it; `main` keeps the
+  `1.31.0` claim, pins, denominator, and docs unchanged until the Campaign_Branch
+  merges into `main` at the Claim flip.
 
 ## Target State
 
@@ -120,6 +124,10 @@ work is deliberately sequenced after it so every checkpoint stays bisectable and
 - Empty_Configuration selects the Stock_Posture of Target_Release (Requirement 12).
 - After the seven Delta_Specs and the corpus drive-to-green, the Claim is `"1.32.0"`
   with the Bump_Trailer, the evidence table, and the `docs/conformance/v1.32.0/` folder.
+- All of the above lands on the Campaign_Branch. `main` stays a consistent `1.31.0`
+  tree throughout, so `0.3.x` patch releases never carry a partial `1.32.0` state; the
+  Campaign_Branch merges into `main` once, at the Claim flip, ahead of the `0.4.0`
+  train.
 
 Out of scope: any behaviour past tag `v1.32.0` (upstream `main`); implementing features
 that Target_Release gates off by default (they are in-surface only as their
@@ -524,6 +532,9 @@ is trustworthy.
    Target_Release and re-cited.
 7. THE `ServerCompatMonotonicity` and `ProtoMonotonicity` probes SHALL pass against the
    last `v*` tag.
+8. WHEN the bump commit is merged into the Campaign_Branch, THE Campaign_Branch SHALL be
+   merged into `main` with a merge commit (ancestry preserved) as the campaign's final
+   PR, and no slice of this campaign SHALL reach `main` by any other path.
 
 ### Requirement 12: Empty Configuration follows the Target_Release stock posture
 

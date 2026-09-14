@@ -513,6 +513,17 @@ it owns; this spec only records the citations (Target State).
 
 ## Migration and Rollout
 
+**Campaign branch.** All work lands on `compat/temporal-1.32`, created from `main` at
+`271a9121`. Slice worktrees base on it (Codex: worktree from `main`, then
+`git checkout -b agent/codex/<slug> compat/temporal-1.32`; tkw: `--base compat/temporal-1.32`)
+and slice PRs target it. `main` keeps the `1.31.0` claim, pins, denominator, and docs
+unchanged, so the `0.3.x` release line never carries a partial `1.32.0` state. The
+integration seat keeps the branch current by merging `origin/main` into it (a merge,
+never a rebase, once the branch is shared); this is the one sanctioned carve-out from
+`AGENTS.md` §10.5, which forbids merging `main` into a *task* branch. The campaign's
+last PR merges the branch into `main` with a merge commit, immediately ahead of the
+`0.4.0` train.
+
 1. **F1a — resync commit.** Proto tree, generated bindings, restored Tokeira-owned
    trees, refreshed OpenAPI documents, `UPSTREAM_VERSION`. Red workspace is expected.
 2. **F1b — drift commit(s).** Type-path moves, deprecated-field allows, enum arms, six

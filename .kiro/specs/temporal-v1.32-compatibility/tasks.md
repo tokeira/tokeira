@@ -165,24 +165,41 @@ reviews each PR against Target_Release before the integration seat merges. Delta
       retired keys with live conformance overrides; the ledger verifies those
       explicitly without counting them as v1.32.0 declarations.
 
-- [ ] 4. F3 (fork side) — `tokeira/conformance-v1.32.0` and the baseline
-  - [ ] 4.1 Branch from tag `v1.32.0`; re-apply the Harness_Shim and fork tooling.
+- [x] 4. F3 (fork side) — `tokeira/conformance-v1.32.0` and the baseline
+  - [x] 4.1 Branch from tag `v1.32.0`; re-apply the Harness_Shim and fork tooling.
     - _Requirements: 7.1_
-  - [ ] 4.2 Port the shim across the `tests/testcore` delta (`WithTimeout`,
+  - [x] 4.2 Port the shim across the `tests/testcore` delta (`WithTimeout`,
     `overrideDynamicConfig` split, `dedicatedClusterGuard`, new files); `go vet` and
     the shim's own tests green.
     - _Requirements: 7.2_
-  - [ ] 4.3 Pin the toolchain to `go 1.26.8`.
+  - [x] 4.3 Pin the toolchain to `go 1.26.8`.
     - _Requirements: 7.4_
-  - [ ] 4.4 Re-verify every skip-registry entry's reason at `v1.32.0`; drop entries whose
+  - [x] 4.4 Re-verify every skip-registry entry's reason at `v1.32.0`; drop entries whose
     reason no longer holds.
     - _Requirements: 7.3_
-  - [ ] 4.5 Baseline run of the whole corpus against unchanged `tokeirad`; write
+  - [x] 4.5 Baseline run of the whole corpus against unchanged `tokeirad`; write
     `reference/FINDINGS-v1.32.0.md` in the row shape of the design.
     - _Requirements: 7.5_
-  - [ ] 4.6 Assign every regression and new suite to a delta spec; raise anything that
+  - [x] 4.6 Assign every regression and new suite to a delta spec; raise anything that
     fits none.
     - _Requirements: 7.5, 9.4_
+    - [Recorded baseline](reference/FINDINGS-v1.32.0.md): all 138 flat-package
+      entrypoints attempted on 2026-09-15, each against a fresh engine at
+      `f78b3412ff1f55edc109b162e9cecef0c7c82de4`. The 137 upstream entrypoints
+      produced 887 pass, 1,382 fail, 147 skip and 227 unfinished outcomes.
+      All 26 regressions and 45 newly measured suites have owners; five public
+      scope allocations and two HTTP gate decisions are raised in the findings.
+    - Fork head: `4d71235efae67869a5c2e75fa2836765cf9fd347`; the complete capture
+      used its parent `ea5246188aaae5e5f79e0c885e16279959285273`. The follow-up
+      repairs only the fork-owned smoke test's authorization initialization;
+      standalone and runner-owned startup both passed separately. Captured
+      baseline outcomes remain unchanged.
+    - All 118 inherited exclusions were audited: 99 retained, 12 removed,
+      six renamed and one narrowed, yielding 112 active exact identities.
+      Go shim/tool tests passed on macOS and Linux; vet and the full fork lint
+      passed. All six Rust completion commands passed on macOS (3,371 nextest
+      passes, two existing skips), alongside dependency and offline-link checks.
+      No engine behavior or dependency changed; the claim remains 1.31.0.
 
 - [ ] 5. Delta specs (orchestrator authors; integration seat approves; Codex implements)
   - [ ] 5.1 `v132-standalone-activities` (D1) — spec PR, approval, implementation.

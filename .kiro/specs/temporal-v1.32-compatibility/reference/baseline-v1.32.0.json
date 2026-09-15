@@ -1,0 +1,3118 @@
+{
+  "schema_version": 1,
+  "engine_commit": "f78b3412ff1f55edc109b162e9cecef0c7c82de4",
+  "engine_binary_sha256": "08b09f8c94950bb03aa03077d0ceda673f95599cc048ce2293db078a0e7183d2",
+  "fork_commit": "ea5246188aaae5e5f79e0c885e16279959285273",
+  "upstream_tag": "v1.32.0",
+  "upstream_commit": "d94e34a1ebba5410a2e7d07119a76896909591aa",
+  "go_version": "go version go1.26.8 linux/amd64",
+  "started_at": "2026-09-15T10:39:18Z",
+  "finished_at": "2026-09-15T12:05:48Z",
+  "engine_isolation": "fresh process per entrypoint",
+  "verified_engine_source_input_count": 1382,
+  "ordinary_timeout_seconds": 300,
+  "versioning3_timeout_seconds": 1800,
+  "test_parallelism": 1,
+  "upstream_entrypoints": 137,
+  "fork_smoke_entrypoints": 1,
+  "upstream_counts": {
+    "pass": 887,
+    "fail": 1382,
+    "skip": 147,
+    "unfinished": 227
+  },
+  "all_counts": {
+    "pass": 887,
+    "fail": 1383,
+    "skip": 147,
+    "unfinished": 227
+  },
+  "registry_exclusion_count": 112,
+  "native_skip_count": 35,
+  "classification_counts": {
+    "out-of-surface": 26,
+    "new-suite": 45,
+    "regression": 26,
+    "unchanged-clean": 40
+  },
+  "artifact_sha256": {
+    "events.jsonl": "f5a5ff7d337095b6608ceadf23697e020735ea1dde5efee974039663861b1b22",
+    "outcomes.json": "bb2c26531e18317f8112c0c395cd1e877e16d80bf5365a0eb72cfdf44806aa9b",
+    "run.log": "003658dbccbfa07cfc65c5565d8df35fa813c310065ad03957110bea8e286006",
+    "harness.patch": "6d8742902d423dfe83682021bce4f23523b5c8c258ede7f6aece14b5e9bc3a6c",
+    "harness-files.json": "4ac3cd2a9f3cd300926553ef45b3ff4db90ad6303abaf3803d947e190f70a120",
+    "engine-source-files.txt": "7dbee646071b706578b38c12f053d3dba7dbc343977ca2d9294e5406c13a8092",
+    "engine-data-files.txt": "9a0e6f87ba86b8acb869c98fc17884eb433a003525eeeccf117490ff6d03c906"
+  },
+  "suites": [
+    {
+      "suite": "TestAcquireShardSuite",
+      "source": "tests/acquire_shard_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestAcquireShard_OwnershipLostErrorSuite",
+        "TestAcquireShard_DeadlineExceededErrorSuite",
+        "TestAcquireShard_EventualSuccess"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Injects history-shard acquisition faults and inspects in-process retries/logging.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 4,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestAcquireShardSuite/TestDeadlineExceeded_DoesRetry",
+        "TestAcquireShardSuite/TestEventualSuccess",
+        "TestAcquireShardSuite/TestOwnershipLost_DoesNotRetry"
+      ]
+    },
+    {
+      "suite": "TestActivityAPIBatchCancelClientTestSuite",
+      "source": "tests/activity_api_batch_cancel_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 6,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestActivityAPIBatchCancelClientTestSuite/TestActivityBatchCancel_Success",
+        "TestActivityAPIBatchCancelClientTestSuite/TestActivityBatchCancel_Success/Executions",
+        "TestActivityAPIBatchCancelClientTestSuite/TestActivityBatchCancel_Success/TargetExecutions"
+      ]
+    },
+    {
+      "suite": "TestActivityAPIBatchDeleteClientTestSuite",
+      "source": "tests/activity_api_batch_delete_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 6,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestActivityAPIBatchDeleteClientTestSuite/TestActivityBatchDelete_IncludesNonRunning",
+        "TestActivityAPIBatchDeleteClientTestSuite/TestActivityBatchDelete_Success",
+        "TestActivityAPIBatchDeleteClientTestSuite/TestActivityBatchDelete_Success/Executions"
+      ]
+    },
+    {
+      "suite": "TestActivityAPIBatchResetClientTestSuite",
+      "source": "tests/activity_api_batch_reset_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestActivityAPIBatchResetClientTestSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 6,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestActivityAPIBatchResetClientTestSuite/TestActivityBatchReset_DontResetAttempts",
+        "TestActivityAPIBatchResetClientTestSuite/TestActivityBatchReset_Failed",
+        "TestActivityAPIBatchResetClientTestSuite/TestActivityBatchReset_RunningWorkflowsResetAttempts"
+      ]
+    },
+    {
+      "suite": "TestActivityAPIBatchSecurityTestSuite",
+      "source": "tests/activity_api_batch_security_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestScheduleActivityOnPerNSTQ_Blocked"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestActivityAPIBatchSecurityTestSuite/TestScheduleActivityOnPerNSTQ_Blocked"
+      ]
+    },
+    {
+      "suite": "TestActivityAPIBatchTerminateClientTestSuite",
+      "source": "tests/activity_api_batch_terminate_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 12,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestActivityAPIBatchTerminateClientTestSuite/TestActivityBatchTerminate_NoMatchingActivitiesCompletes",
+        "TestActivityAPIBatchTerminateClientTestSuite/TestActivityBatchTerminate_Success",
+        "TestActivityAPIBatchTerminateClientTestSuite/TestActivityBatchTerminate_Success/Executions"
+      ]
+    },
+    {
+      "suite": "TestActivityApiBatchUnpauseClientTestSuite",
+      "source": "tests/activity_api_batch_unpause_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestActivityApiBatchUnpauseClientTestSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 5,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestActivityApiBatchUpdateOptionsClientTestSuite",
+      "source": "tests/activity_api_batch_update_options_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestActivityApiBatchUpdateOptionsClientTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestActivityApiBatchUpdateOptionsClientTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 2,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestActivityApiBatchUpdateOptionsClientTestSuite/TestActivityBatchUpdateOptionsMatchAll"
+      ]
+    },
+    {
+      "suite": "TestActivityApiPauseClientTestSuite",
+      "source": "tests/activity_api_pause_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestActivityAPIPauseClientTestSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 8,
+        "fail": 12,
+        "skip": 1,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestActivityApiPauseClientTestSuite/execution-api",
+        "TestActivityApiPauseClientTestSuite/execution-api/TestActivityPauseApi_AfterWorkflowCompleted",
+        "TestActivityApiPauseClientTestSuite/execution-api/TestActivityPauseApi_IncreaseAttemptsOnFailure"
+      ]
+    },
+    {
+      "suite": "TestActivityApiPause_AttributesToActivityInContextMetadata",
+      "source": "tests/activity_api_pause_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Enables the unwired startup-only frontend.contextMetadataSetTrailer flag, whose stock default is false (common/dynamicconfig/constants.go; service/frontend/fx.go; tests/activity_api_pause_test.go @ v1.32.0).",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestActivityApiResetClientTestSuite",
+      "source": "tests/activity_api_reset_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestActivityApiResetClientTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestActivityApiResetClientTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 9,
+        "fail": 16,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestActivityApiResetClientTestSuite/execution-api",
+        "TestActivityApiResetClientTestSuite/execution-api/TestActivityResetApi_AfterRetry",
+        "TestActivityApiResetClientTestSuite/execution-api/TestActivityResetApi_AfterWorkflowCompleted"
+      ]
+    },
+    {
+      "suite": "TestActivityApiRulesClientTestSuite",
+      "source": "tests/activity_api_rules_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestActivityApiRulesClientTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestActivityApiRulesClientTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 5,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestActivityApiUpdateClientTestSuite",
+      "source": "tests/activity_api_update_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestActivityAPIUpdateClientTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestActivityAPIUpdateClientTestSuite"
+      ],
+      "new_entrypoint_name": true,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 5,
+        "fail": 6,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestActivityApiUpdateClientTestSuite/execution-api",
+        "TestActivityApiUpdateClientTestSuite/execution-api/TestActivityUpdateApi_ChangeRetryInterval",
+        "TestActivityApiUpdateClientTestSuite/execution-api/TestActivityUpdateApi_ChangeScheduleToClose"
+      ]
+    },
+    {
+      "suite": "TestActivityClientTestSuite",
+      "source": "tests/activity_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestActivityClientTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestActivityClientTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 6,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestActivityParityTestSuite",
+      "source": "tests/activity_parity_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 26,
+        "fail": 99,
+        "skip": 1,
+        "unfinished": 129
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestActivityParityTestSuite/TestCompleteByID",
+        "TestActivityParityTestSuite/TestCompleteByID/BeforeStarted",
+        "TestActivityParityTestSuite/TestCompleteByID/BeforeStarted/StandaloneActivity"
+      ]
+    },
+    {
+      "suite": "TestActivityTestSuite",
+      "source": "tests/activity_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestActivityTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestActivityTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 10,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestActivityUpdateExecutionOptionsApi",
+      "source": "tests/activity_api_update_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 5,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestActivityUpdateExecutionOptionsApi/ChangeRetryInterval",
+        "TestActivityUpdateExecutionOptionsApi/ChangeScheduleToClose",
+        "TestActivityUpdateExecutionOptionsApi/ChangeScheduleToCloseAndRetry"
+      ]
+    },
+    {
+      "suite": "TestAddTasksSuite",
+      "source": "tests/add_tasks_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestAddTasksSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Injects internal history-task hooks and calls AdminService/HistoryService.AddTasks.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 1
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestAddTasksSuite/TestAddTasks_ErrGetShardByID",
+        "TestAddTasksSuite/TestAddTasks_Ok"
+      ]
+    },
+    {
+      "suite": "TestAdminBatchRefreshWorkflowTasksTestSuite",
+      "source": "tests/admin_batch_refresh_workflow_tasks_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestAdminBatchRefreshWorkflowTasksTestSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Exercises AdminService batch task-refresh, outside WorkflowService/OperatorService.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 8,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestAdminBatchRefreshWorkflowTasksTestSuite/TestStartAdminBatchOperation_0_SeparateLimitFromFrontendBatchOperation",
+        "TestAdminBatchRefreshWorkflowTasksTestSuite/TestStartAdminBatchOperation_InvalidArgument_NoExecutionsOrQuery",
+        "TestAdminBatchRefreshWorkflowTasksTestSuite/TestStartAdminBatchOperation_InvalidArgument_NoJobId"
+      ]
+    },
+    {
+      "suite": "TestAdminRebuildMutableState_ChasmDisabled",
+      "source": "tests/admin_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestAdminRebuildMutableState_ChasmDisabled"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Exercises AdminService mutable-state rebuild.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestAdminRebuildMutableState_ChasmDisabled/TestAdminRebuildMutableState"
+      ]
+    },
+    {
+      "suite": "TestAdminRebuildMutableState_ChasmEnabled",
+      "source": "tests/admin_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestAdminRebuildMutableState_ChasmEnabled"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Exercises AdminService mutable-state rebuild.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestAdminRebuildMutableState_ChasmEnabled/TestAdminRebuildMutableState"
+      ]
+    },
+    {
+      "suite": "TestAdvancedVisibilitySuite",
+      "source": "tests/advanced_visibility_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestAdvancedVisibilitySuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestAdvancedVisibilitySuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-visibility-query-converter",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 19,
+        "fail": 3,
+        "skip": 12,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestAdvancedVisibilitySuite/TestCountGroupByNamespaceDivision",
+        "TestAdvancedVisibilitySuite/TestCountGroupByWorkflow"
+      ]
+    },
+    {
+      "suite": "TestAdvancedVisibilitySuiteLegacy",
+      "source": "tests/advanced_visibility_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestAdvancedVisibilitySuiteLegacy"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "v132-visibility-query-converter",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 19,
+        "fail": 3,
+        "skip": 12,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestAdvancedVisibilitySuiteLegacy/TestCountGroupByNamespaceDivision",
+        "TestAdvancedVisibilitySuiteLegacy/TestCountGroupByWorkflow"
+      ]
+    },
+    {
+      "suite": "TestArchivalSuite",
+      "source": "tests/archival_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestArchivalSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Requires Temporal archiver providers and persistence fixtures.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 4
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestArchivalSuite/TestArchival_ArchiverWorker",
+        "TestArchivalSuite/TestArchival_ContinueAsNew",
+        "TestArchivalSuite/TestArchival_TimerQueueProcessor"
+      ]
+    },
+    {
+      "suite": "TestCallbacksMigrationSuite",
+      "source": "tests/callbacks_migration_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestCallbacksMigrationSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 4,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestCallbacksSuiteCHASM",
+      "source": "tests/callbacks_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestCallbacksSuiteCHASM"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 9,
+        "fail": 6,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestCallbacksSuiteCHASM/TestScheduledCallbackTokenMigration_LegacyWriteEnvelopeRead",
+        "TestCallbacksSuiteCHASM/TestWorkflowCallbacks_InvalidArgument",
+        "TestCallbacksSuiteCHASM/TestWorkflowCallbacks_InvalidArgument/https_required"
+      ]
+    },
+    {
+      "suite": "TestCallbacksSuiteHSM",
+      "source": "tests/callbacks_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestCallbacksSuiteHSM"
+      ],
+      "previous_clean_entrypoints": [
+        "TestCallbacksSuiteHSM"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 9,
+        "fail": 6,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestCallbacksSuiteHSM/TestScheduledCallbackTokenMigration_LegacyWriteEnvelopeRead",
+        "TestCallbacksSuiteHSM/TestWorkflowCallbacks_InvalidArgument",
+        "TestCallbacksSuiteHSM/TestWorkflowCallbacks_InvalidArgument/https_required"
+      ]
+    },
+    {
+      "suite": "TestCancelWorkflowSuite",
+      "source": "tests/cancel_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestCancelWorkflowSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestCancelWorkflowSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 6,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestChasmSuite",
+      "source": "tests/chasm_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestChasmTestSuite",
+        "TestChasmTestSuiteLegacy"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Runs CHASM framework test components through the in-process ChasmContext.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 49,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestChasmSuite/TestCountExecutions_GroupBy",
+        "TestChasmSuite/TestCountExecutions_GroupBy/unified=false",
+        "TestChasmSuite/TestCountExecutions_GroupBy/unified=true"
+      ]
+    },
+    {
+      "suite": "TestChildWorkflowSuite",
+      "source": "tests/child_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestChildWorkflowSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestChildWorkflowSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 8,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestClientDataConverterTestSuite",
+      "source": "tests/client_data_converter_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestClientDataConverterTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestClientDataConverterTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 1,
+        "fail": 0,
+        "skip": 3,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestClientMiscTestSuite",
+      "source": "tests/client_misc_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestClientMiscTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestClientMiscTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 24,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestClientMiscTestSuite/TestListBatchOperations"
+      ]
+    },
+    {
+      "suite": "TestContinueAsNewTestSuite",
+      "source": "tests/continue_as_new_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestContinueAsNewTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestContinueAsNewTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 8,
+        "fail": 5,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestContinueAsNewTestSuite/TestContinueAsNewWithDelayStart",
+        "TestContinueAsNewTestSuite/TestResetOfNonCurrentRunAfterContinueAsNew_FirstExecutionRunId",
+        "TestContinueAsNewTestSuite/TestResetOfNonCurrentRunFromDifferentChain_FirstExecutionRunId"
+      ]
+    },
+    {
+      "suite": "TestCronTestClientSuite",
+      "source": "tests/cron_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestCronTestClientSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestCronTestClientSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 2,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestCronTestSuite",
+      "source": "tests/cron_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestCronTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestCronTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 3,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestDLQSuite",
+      "source": "tests/dlq_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestDLQSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Writes Temporal persistence task queues and invokes internal DLQ administration.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestDLQSuite/TestCancelRunningMerge"
+      ]
+    },
+    {
+      "suite": "TestDeploymentVersionSuite",
+      "source": "tests/worker_deployment_version_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestDeploymentVersionSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestDeploymentVersionSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-worker-deployments",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 62,
+        "fail": 6,
+        "skip": 1,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestDeploymentVersionSuite/TestResetWorkflowExecution_ReactivateVersionOnPinned",
+        "TestDeploymentVersionSuite/TestSignalWithStartWorkflowExecution_ReactivateVersionOnPinned",
+        "TestDeploymentVersionSuite/TestStartWorkflowExecution_ReactivateVersionOnPinned"
+      ]
+    },
+    {
+      "suite": "TestDescribeTestSuite",
+      "source": "tests/describe_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestDescribeTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestDescribeTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 3,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestDispatchCancelToWorkerWithEagerActivity",
+      "source": "tests/worker_commands_task_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-gated-surfaces",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestEagerWorkflowTestSuite",
+      "source": "tests/eager_workflow_start_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestEagerWorkflowTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestEagerWorkflowTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 6,
+        "fail": 0,
+        "skip": 1,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestFairnessAutoEnableSuite",
+      "source": "tests/priority_fairness_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestFairnessAutoEnableSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestFairnessAutoEnableSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 2,
+        "fail": 0,
+        "skip": 4,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestFairnessSuite",
+      "source": "tests/priority_fairness_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestFairnessSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestFairnessSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 2,
+        "fail": 0,
+        "skip": 4,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestGetHistorySuite_DisableTransitionHistory",
+      "source": "tests/gethistory_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestGetHistoryFunctionalSuite",
+        "TestRawHistoryClientSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestGetHistoryFunctionalSuite",
+        "TestRawHistoryClientSuite"
+      ],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 5,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestGetHistorySuite_EnableTransitionHistory",
+      "source": "tests/gethistory_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestGetHistoryFunctionalSuite",
+        "TestRawHistoryClientSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestGetHistoryFunctionalSuite",
+        "TestRawHistoryClientSuite"
+      ],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 5,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestHistoryNodeCleanupSuite",
+      "source": "tests/history_node_cleanup_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts deletion of Temporal history_tree/history_node storage rows.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 1
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestHistoryNodeCleanupSuite/TestDeletionOfSingleWorkflow",
+        "TestHistoryNodeCleanupSuite/TestDeletionOfWorkflowAfterReset"
+      ]
+    },
+    {
+      "suite": "TestHttpApiTestSuite",
+      "source": "tests/http_api_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestHttpApiTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestHttpApiTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 5,
+        "fail": 4,
+        "skip": 0,
+        "unfinished": 2
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestHttpApiTestSuite/TestHTTPAPIBasics_Protojson",
+        "TestHttpApiTestSuite/TestHTTPAPIBasics_ProtojsonPretty",
+        "TestHttpApiTestSuite/TestHTTPAPIBasics_Shorthand"
+      ]
+    },
+    {
+      "suite": "TestLinksTestSuite",
+      "source": "tests/links_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestLinksTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestLinksTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 2,
+        "fail": 14,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestLinksTestSuite/TestSignalWithStartWorkflowExecution_BacklinkSurvivesReset",
+        "TestLinksTestSuite/TestSignalWithStartWorkflowExecution_BacklinkSurvivesReset/SignalExistingWorkflow",
+        "TestLinksTestSuite/TestSignalWithStartWorkflowExecution_BacklinkSurvivesReset/SignalStartsNewWorkflow"
+      ]
+    },
+    {
+      "suite": "TestMaxBufferedEventSuite",
+      "source": "tests/max_buffered_event_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestMaxBufferedEventSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestMaxBufferedEventSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 2,
+        "fail": 0,
+        "skip": 1,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestMirroredIncludeExcludeSpec",
+      "source": "tests/schedule_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestMirroredIncludeExcludeSpecOnUpdate",
+      "source": "tests/schedule_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestNamespaceInterceptorTestSuite",
+      "source": "tests/namespace_interceptor_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestNamespaceInterceptorTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestNamespaceInterceptorTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 2,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestNamespaceSuite",
+      "source": "tests/namespace_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestNamespaceSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestNamespaceSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 8,
+        "fail": 0,
+        "skip": 2,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestNexusAPIValidationTestSuite",
+      "source": "tests/nexus_api_validation_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestNexusAPIValidationTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestNexusAPIValidationTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 21,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestNexusAPIValidationTestSuite/TestNexusStartOperation_WithNamespaceAndTaskQueue_NamespaceNotFound"
+      ]
+    },
+    {
+      "suite": "TestNexusApiTestSuiteWithLegacyErrorPaths",
+      "source": "tests/nexus_api_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestNexusApiTestSuiteWithLegacyErrorPaths"
+      ],
+      "previous_clean_entrypoints": [
+        "TestNexusApiTestSuiteWithLegacyErrorPaths"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 18,
+        "fail": 21,
+        "skip": 1,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestNexusApiTestSuiteWithLegacyErrorPaths/TestNexusCancelOperation_Outcomes",
+        "TestNexusApiTestSuiteWithLegacyErrorPaths/TestNexusCancelOperation_Outcomes/handler_error:INTERNAL",
+        "TestNexusApiTestSuiteWithLegacyErrorPaths/TestNexusCancelOperation_Outcomes/handler_error:INTERNAL/ByEndpoint"
+      ]
+    },
+    {
+      "suite": "TestNexusApiTestSuiteWithTemporalFailures",
+      "source": "tests/nexus_api_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestNexusApiTestSuiteWithTemporalFailures"
+      ],
+      "previous_clean_entrypoints": [
+        "TestNexusApiTestSuiteWithTemporalFailures"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 18,
+        "fail": 21,
+        "skip": 1,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestNexusApiTestSuiteWithTemporalFailures/TestNexusCancelOperation_Outcomes",
+        "TestNexusApiTestSuiteWithTemporalFailures/TestNexusCancelOperation_Outcomes/handler_error:INTERNAL",
+        "TestNexusApiTestSuiteWithTemporalFailures/TestNexusCancelOperation_Outcomes/handler_error:INTERNAL/ByEndpoint"
+      ]
+    },
+    {
+      "suite": "TestNexusEndpointsCommonSuite",
+      "source": "tests/nexus_endpoint_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestNexusEndpointsFunctionalSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestNexusEndpointsFunctionalSuite"
+      ],
+      "new_entrypoint_name": true,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": "Compares Temporal persistence-manager and MatchingService endpoint table versions and pagination; public OperatorService coverage remains in TestNexusEndpointsOperatorSuite (tests/nexus_endpoint_test.go @ v1.32.0).",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestNexusEndpointsCommonSuite/TestListOrdering"
+      ]
+    },
+    {
+      "suite": "TestNexusEndpointsMatchingSuite",
+      "source": "tests/nexus_endpoint_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestNexusEndpointsFunctionalSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestNexusEndpointsFunctionalSuite"
+      ],
+      "new_entrypoint_name": true,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": "Exercises internal MatchingService endpoint CRUD, clocks and table-version long polling; public OperatorService coverage remains in TestNexusEndpointsOperatorSuite (tests/nexus_endpoint_test.go @ v1.32.0).",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 15,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestNexusEndpointsMatchingSuite/TestList"
+      ]
+    },
+    {
+      "suite": "TestNexusEndpointsOperatorSuite",
+      "source": "tests/nexus_endpoint_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestNexusEndpointsFunctionalSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestNexusEndpointsFunctionalSuite"
+      ],
+      "new_entrypoint_name": true,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 34,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestNexusMatchingTestSuite",
+      "source": "tests/nexus_matching_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Dispatches directly to MatchingService and forces matching topology.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 3
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestNexusMatchingTestSuite/TestDispatchNexusTaskOnNonRootPartitionNoForwarding",
+        "TestNexusMatchingTestSuite/TestDispatchNexusTaskWithMatchingBehaviors"
+      ]
+    },
+    {
+      "suite": "TestNexusStandaloneTestSuite",
+      "source": "tests/nexus_standalone_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 69,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestNexusStandaloneTestSuite/TestAsyncCompletionIgnoresExecutionTransitionInCallbackToken",
+        "TestNexusStandaloneTestSuite/TestCountStandaloneNexusOperation",
+        "TestNexusStandaloneTestSuite/TestCountStandaloneNexusOperation/CountByCustomSearchAttribute"
+      ]
+    },
+    {
+      "suite": "TestNexusWorkflowTestSuiteCHASM",
+      "source": "tests/nexus_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 19,
+        "fail": 12,
+        "skip": 10,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestNexusWorkflowTestSuiteCHASM/TestNexusAsyncOperationWithMultipleCallers",
+        "TestNexusWorkflowTestSuiteCHASM/TestNexusAsyncOperationWithMultipleCallers/conflict-policy-fail",
+        "TestNexusWorkflowTestSuiteCHASM/TestNexusAsyncOperationWithMultipleCallers/conflict-policy-use-existing"
+      ]
+    },
+    {
+      "suite": "TestNexusWorkflowTestSuiteHSM",
+      "source": "tests/nexus_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestNexusWorkflowTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestNexusWorkflowTestSuite"
+      ],
+      "new_entrypoint_name": true,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 19,
+        "fail": 10,
+        "skip": 8,
+        "unfinished": 12
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestNexusWorkflowTestSuiteHSM/TestNexusAsyncOperationWithMultipleCallers",
+        "TestNexusWorkflowTestSuiteHSM/TestNexusAsyncOperationWithMultipleCallers/conflict-policy-fail",
+        "TestNexusWorkflowTestSuiteHSM/TestNexusAsyncOperationWithMultipleCallers/conflict-policy-use-existing"
+      ]
+    },
+    {
+      "suite": "TestNexusWorkflowUpdateTestSuite",
+      "source": "tests/nexus_workflow_update_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-nexus",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 16,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestNexusWorkflowUpdateTestSuite/TestDescribeWorkflowShowsUpdateCallbacks",
+        "TestNexusWorkflowUpdateTestSuite/TestWorkflowUpdateAsyncAttachedNexusOperation",
+        "TestNexusWorkflowUpdateTestSuite/TestWorkflowUpdateAsyncNexusOperation"
+      ]
+    },
+    {
+      "suite": "TestNilSearchAttributeSuite",
+      "source": "tests/nil_search_attribute_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowStart_NilSearchAttributesFiltered",
+        "TestWorkflowStart_AllNilSearchAttributesFiltered",
+        "TestDescribeWorkflow_NilSearchAttributesNotVisible",
+        "TestWorkflowStart_NilMemoFiltered",
+        "TestWorkflowStart_AllNilMemoFiltered",
+        "TestDescribeWorkflow_NilMemoNotVisible"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": "All-nil memo/search-attribute message presence is a public serialization contract, outside the query-converter placeholder; lifecycle ownership is proposed.",
+      "counts": {
+        "pass": 4,
+        "fail": 3,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestNilSearchAttributeSuite/TestWorkflowStart_AllNilMemoFiltered",
+        "TestNilSearchAttributeSuite/TestWorkflowStart_AllNilSearchAttributesFiltered"
+      ]
+    },
+    {
+      "suite": "TestPartitionScaling_Backlog",
+      "source": "tests/partition_scaling_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts Temporal partition topology, forwarding and internal queue statistics.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 1,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestPartitionScaling_Down",
+      "source": "tests/partition_scaling_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts Temporal partition topology, forwarding and internal queue statistics.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestPartitionScaling_Down_AndStopPolling",
+      "source": "tests/partition_scaling_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts Temporal partition topology, forwarding and internal queue statistics.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestPartitionScaling_Down_FromDC",
+      "source": "tests/partition_scaling_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts Temporal partition topology, forwarding and internal queue statistics.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestPartitionScaling_Up",
+      "source": "tests/partition_scaling_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts Temporal partition topology, forwarding and internal queue statistics.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestPartitionScaling_Up_FromDC",
+      "source": "tests/partition_scaling_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts Temporal partition topology, forwarding and internal queue statistics.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 1,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestPauseWorkflowExecutionSuite",
+      "source": "tests/pause_workflow_execution_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestPauseWorkflowExecutionSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 1,
+        "fail": 24,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestPauseWorkflowExecutionSuite/TestActivityRetryDeferredWhilePaused",
+        "TestPauseWorkflowExecutionSuite/TestCancelWhilePaused",
+        "TestPauseWorkflowExecutionSuite/TestExecutionTimeoutWhilePaused"
+      ]
+    },
+    {
+      "suite": "TestPollerScalingFunctionalSuite",
+      "source": "tests/poller_scaling_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestPollerScalingFunctionalSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestPollerScalingFunctionalSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 5,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestPrematureEosTestSuite",
+      "source": "tests/premature_eos_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestPrematureEosTestSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": "Speculative workflow-task history pagination is not explicit in the lifecycle placeholder.",
+      "counts": {
+        "pass": 2,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestPrioritySuite",
+      "source": "tests/priority_fairness_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestPrioritySuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestPrioritySuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 4,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestPurgeDLQTasksSuite",
+      "source": "tests/purge_dlq_tasks_api_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestPurgeDLQTasksSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Seeds internal history task queues and invokes AdminService.PurgeDLQTasks.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 3,
+        "skip": 0,
+        "unfinished": 4
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestPurgeDLQTasksSuite/TestPurgeDLQTasks",
+        "TestPurgeDLQTasksSuite/TestPurgeDLQTasks/DeleteTasksUnavailableError",
+        "TestPurgeDLQTasksSuite/TestPurgeDLQTasks/HappyPath"
+      ]
+    },
+    {
+      "suite": "TestQueryWorkflowSuite",
+      "source": "tests/query_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestQueryWorkflowSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestQueryWorkflowSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 10,
+        "fail": 0,
+        "skip": 1,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestRawHistorySuite",
+      "source": "tests/gethistory_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestRawHistorySuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestRawHistorySuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 4,
+        "fail": 0,
+        "skip": 1,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestRelayTaskTestSuite",
+      "source": "tests/relay_task_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestRelayTaskTestSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": "Relay workflow-task timeout history and attempt counts are not explicit in the lifecycle placeholder.",
+      "counts": {
+        "pass": 2,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestResetWorkflowTestSuite",
+      "source": "tests/reset_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestResetWorkflowTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestResetWorkflowTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 16,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestResetWorkflowTestSuite/TestResetWorkflowByRunID_CurrentExecutionMissing"
+      ]
+    },
+    {
+      "suite": "TestScheduleCHASM",
+      "source": "tests/schedule_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestScheduleCHASM"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 4,
+        "fail": 14,
+        "skip": 1,
+        "unfinished": 43
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestScheduleCHASM/Backfill",
+        "TestScheduleCHASM/IdleClose",
+        "TestScheduleCHASM/IdleClose/BackfillBlocks"
+      ]
+    },
+    {
+      "suite": "TestScheduleCHASMWorkflowPauseInteraction",
+      "source": "tests/schedule_workflow_pause_interaction_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 10,
+        "fail": 5,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestScheduleCHASMWorkflowPauseInteraction/ContinueAsNew",
+        "TestScheduleCHASMWorkflowPauseInteraction/Overlap",
+        "TestScheduleCHASMWorkflowPauseInteraction/Overlap/CancelOther"
+      ]
+    },
+    {
+      "suite": "TestScheduleCountsVisibility",
+      "source": "tests/schedule_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestScheduleCreationRolloutPercent",
+      "source": "tests/schedule_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts internal CHASM scheduler creation and rollout buckets via SchedulerClient.DescribeSchedule (tests/schedule_test.go @ v1.32.0).",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 1
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestScheduleFarFutureActionTimes",
+      "source": "tests/schedule_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 1,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestScheduleManyCalendars",
+      "source": "tests/schedule_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestScheduleMigrationDeferredWithRunningWorkflow",
+      "source": "tests/schedule_migration_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts migration of internal scheduler workflows to CHASM components.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 1
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestScheduleMigrationTestSuite",
+      "source": "tests/schedule_migration_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestScheduleMigrationTestSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts migration of internal scheduler workflows to CHASM components.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestScheduleMigrationTestSuite/TestCHASMScheduleDescribeAfterDisablingCreationAndMigration"
+      ]
+    },
+    {
+      "suite": "TestScheduleMigrationV1ToV2NoDuplicateRecentActions",
+      "source": "tests/schedule_migration_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestScheduleMigrationV1ToV2NoDuplicateRecentActions"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts migration of internal scheduler workflows to CHASM components.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestScheduleMigration_NoRunningWorkflows_GeneratorStarts",
+      "source": "tests/schedule_migration_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts migration of internal scheduler workflows to CHASM components.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestScheduleMigration_StaleRunningDoesNotSkipPending",
+      "source": "tests/schedule_migration_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Asserts migration of internal scheduler workflows to CHASM components.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestScheduleNextActionTimeVisibility",
+      "source": "tests/schedule_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 1,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestScheduleV1",
+      "source": "tests/schedule_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestScheduleV1"
+      ],
+      "previous_clean_entrypoints": [
+        "TestScheduleV1"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 38,
+        "fail": 11,
+        "skip": 5,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestScheduleV1/Backfill",
+        "TestScheduleV1/Backfill/MultiRangeCountedExactlyOnce",
+        "TestScheduleV1/Backfill/ReprocessCompletedActionExactTimeActive"
+      ]
+    },
+    {
+      "suite": "TestScheduleV1WorkflowPauseInteraction",
+      "source": "tests/schedule_workflow_pause_interaction_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 10,
+        "fail": 5,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestScheduleV1WorkflowPauseInteraction/ContinueAsNew",
+        "TestScheduleV1WorkflowPauseInteraction/Overlap",
+        "TestScheduleV1WorkflowPauseInteraction/Overlap/CancelOther"
+      ]
+    },
+    {
+      "suite": "TestSignalWithStartFromWorkflowTestSuite",
+      "source": "tests/signal_with_start_from_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 1,
+        "unfinished": 11
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestSignalWithStartFromWorkflowTestSuite/TestBothWorkflowsVisibleAfterSWSFromWorkflowProtoBinary",
+        "TestSignalWithStartFromWorkflowTestSuite/TestHappyPath",
+        "TestSignalWithStartFromWorkflowTestSuite/TestIDConflictPolicy_Fail"
+      ]
+    },
+    {
+      "suite": "TestSignalWorkflowTestSuiteChasm",
+      "source": "tests/signal_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 12,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestSignalWorkflowTestSuiteLegacy",
+      "source": "tests/signal_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestSignalWorkflowTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestSignalWorkflowTestSuite"
+      ],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 12,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestSizeLimitFunctionalSuite",
+      "source": "tests/sizelimit_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestSizeLimitFunctionalSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestSizeLimitFunctionalSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 1,
+        "fail": 0,
+        "skip": 4,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestStandaloneActivityTestSuite",
+      "source": "tests/activity_standalone_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestStandaloneActivityTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestStandaloneActivityTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-standalone-activities",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 1,
+        "fail": 300,
+        "skip": 3,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestStandaloneActivityTestSuite/TestCallbacks",
+        "TestStandaloneActivityTestSuite/TestCallbacks/AcceptedOnStart",
+        "TestStandaloneActivityTestSuite/TestCallbacks/CanceledWithCallbacks"
+      ]
+    },
+    {
+      "suite": "TestStickyTqTestSuite",
+      "source": "tests/stickytq_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestStickyTqTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestStickyTqTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 3,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestTLSFunctionalSuite",
+      "source": "tests/tls_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestTLSFunctionalSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Requires an in-process test cluster provisioned with WithMTLS and TLSConfigProvider; this external baseline is plaintext loopback.",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 3,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestTLSFunctionalSuite/TestGRPCMTLS",
+        "TestTLSFunctionalSuite/TestHTTPMTLS"
+      ]
+    },
+    {
+      "suite": "TestTaskQueueStats_Pri_Suite",
+      "source": "tests/task_queue_stats_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestTaskQueueStats_Pri_Suite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": "Public DescribeTaskQueue statistics need scope allocation under the workers delta; internal routing/cache-hook cases need separate exact exclusions.",
+      "counts": {
+        "pass": 0,
+        "fail": 13,
+        "skip": 0,
+        "unfinished": 10
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestTaskQueueStats_Pri_Suite/TestAddMultipleTasks_ValidateStats_Cached",
+        "TestTaskQueueStats_Pri_Suite/TestDescribeTaskQueue_NonRoot",
+        "TestTaskQueueStats_Pri_Suite/TestNoTasks_ValidateStats"
+      ]
+    },
+    {
+      "suite": "TestTaskQueueSuite",
+      "source": "tests/task_queue_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestTaskQueueSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestTaskQueueSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 6,
+        "fail": 4,
+        "skip": 8,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestTaskQueueSuite/TestAdminGetTaskQueueUserData_NonRootPartition",
+        "TestTaskQueueSuite/TestAdminGetTaskQueueUserData_RootPartition",
+        "TestTaskQueueSuite/TestDescribeTaskQueue_RateLimitingActive"
+      ]
+    },
+    {
+      "suite": "TestTimeSkippingFastForwardFunctionalSuite",
+      "source": "tests/timeskipping_fast_forward_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-gated-surfaces",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 11,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestTimeSkippingFastForwardFunctionalSuite/TestEventsOrderOfFastForwardTimerFiredDuringStartedWorkflowTask",
+        "TestTimeSkippingFastForwardFunctionalSuite/TestFastForward_DescribeFollowsChain",
+        "TestTimeSkippingFastForwardFunctionalSuite/TestFastForward_EqualsRunTimeout"
+      ]
+    },
+    {
+      "suite": "TestTimeSkippingPropagationTestSuite",
+      "source": "tests/timeskipping_propagation_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-gated-surfaces",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 13,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestTimeSkippingPropagationTestSuite/TestTSPInCaN",
+        "TestTimeSkippingPropagationTestSuite/TestTSPInCaN_BudgetCapOverChain",
+        "TestTimeSkippingPropagationTestSuite/TestTSPInCaN_SkipSessionPropagated"
+      ]
+    },
+    {
+      "suite": "TestTimeSkippingTestSuite",
+      "source": "tests/timeskipping_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-gated-surfaces",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 1,
+        "fail": 14,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestTimeSkippingTestSuite/TestTimeSkippingTransitionEventOrdersAfterOptionsUpdated",
+        "TestTimeSkippingTestSuite/TestTimeSkipping_ActivityRetryBackoff",
+        "TestTimeSkippingTestSuite/TestTimeSkipping_CanceledTimerNotUsedAsSkipTarget"
+      ]
+    },
+    {
+      "suite": "TestTransientTaskSuite",
+      "source": "tests/transient_task_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestTransientTaskSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestTransientTaskSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 4,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestUpdateWithStartSuite",
+      "source": "tests/update_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestUpdateWithStartSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestUpdateWithStartSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 32,
+        "fail": 8,
+        "skip": 2,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestUpdateWithStartSuite/TestReturnUpdateRateLimitError",
+        "TestUpdateWithStartSuite/TestUpdateIsAbortedByClosingWorkflow",
+        "TestUpdateWithStartSuite/TestUpdateIsAbortedByClosingWorkflow/retry_request_once_when_workflow_was_not_started"
+      ]
+    },
+    {
+      "suite": "TestUpdateWorkflowSdkSuite",
+      "source": "tests/update_workflow_sdk_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestUpdateWorkflowSdkSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestUpdateWorkflowSdkSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 5,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestUpdateWorkflowSdkSuite/TestUpdateSameRequestIDDeduplicatesCallbacks"
+      ]
+    },
+    {
+      "suite": "TestUserMetadataSuite",
+      "source": "tests/user_metadata_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestUserMetadataSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestUserMetadataSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 5,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestUserTimersTestSuite",
+      "source": "tests/user_timers_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestUserTimersTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestUserTimersTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 2,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestVersioning3FunctionalSuite",
+      "source": "tests/versioning_3_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestVersioning3FunctionalSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestVersioning3FunctionalSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-worker-deployments",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 13,
+        "fail": 2,
+        "skip": 33,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestVersioning3FunctionalSuite/TestChildWorkflowExplicitAutoUpgradeOverrideTakesPrecedence"
+      ]
+    },
+    {
+      "suite": "TestVersioning3OneTimeOverrideFunctionalSuite",
+      "source": "tests/versioning_3_one_time_override_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-worker-deployments",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestVersioning3OneTimeOverrideFunctionalSuite/TestChildWorkflowExplicitOverrideRoutesToTargetAndClears"
+      ]
+    },
+    {
+      "suite": "TestVersioningFunctionalSuite",
+      "source": "tests/versioning_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestVersioningFunctionalSuite"
+      ],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": false,
+      "owner": "registry-skip",
+      "out_of_surface_reason": "Enables V1/V2 worker versioning, disabled in stock v1.32.0; stock rejection remains owned by v132-worker-deployments (common/dynamicconfig/constants.go; tests/versioning_test.go @ v1.32.0).",
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 411,
+        "skip": 5,
+        "unfinished": 0
+      },
+      "classification": "out-of-surface",
+      "representative_nonpassing_tests": [
+        "TestVersioningFunctionalSuite/TestAssignmentRuleDelete",
+        "TestVersioningFunctionalSuite/TestAssignmentRuleInsert",
+        "TestVersioningFunctionalSuite/TestAssignmentRuleReplace"
+      ]
+    },
+    {
+      "suite": "TestWFTFailureReportedProblemsTestSuite",
+      "source": "tests/workflow_task_reported_problems_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWFTFailureReportedProblemsTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWFTFailureReportedProblemsTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 5,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkerCommandsTaskSuite",
+      "source": "tests/worker_commands_task_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-gated-surfaces",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 3,
+        "skip": 0,
+        "unfinished": 5
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestWorkerCommandsTaskSuite/TestDispatchCancelOnContinueAsNew",
+        "TestWorkerCommandsTaskSuite/TestDispatchCancelOnWorkflowReset",
+        "TestWorkerCommandsTaskSuite/TestDispatchCancelOnWorkflowTermination"
+      ]
+    },
+    {
+      "suite": "TestWorkerDeploymentSuite",
+      "source": "tests/worker_deployment_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkerDeploymentSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkerDeploymentSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-worker-deployments",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 58,
+        "fail": 0,
+        "skip": 5,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkerRegistryTestSuite",
+      "source": "tests/worker_registry_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkerRegistryTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkerRegistryTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 6,
+        "fail": 2,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestWorkerRegistryTestSuite/TestWorkerRegistry_CountWorkers"
+      ]
+    },
+    {
+      "suite": "TestWorkflowAPIBatchCancelClientTestSuite",
+      "source": "tests/workflow_api_batch_cancel_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 5,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestWorkflowAPIBatchCancelClientTestSuite/TestWorkflowBatchCancel_Success",
+        "TestWorkflowAPIBatchCancelClientTestSuite/TestWorkflowBatchCancel_Success/Executions",
+        "TestWorkflowAPIBatchCancelClientTestSuite/TestWorkflowBatchCancel_Success/TargetExecutions"
+      ]
+    },
+    {
+      "suite": "TestWorkflowAPIBatchDeleteClientTestSuite",
+      "source": "tests/workflow_api_batch_delete_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 5,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestWorkflowAPIBatchDeleteClientTestSuite/TestWorkflowBatchDelete_Success",
+        "TestWorkflowAPIBatchDeleteClientTestSuite/TestWorkflowBatchDelete_Success/Executions",
+        "TestWorkflowAPIBatchDeleteClientTestSuite/TestWorkflowBatchDelete_Success/TargetExecutions"
+      ]
+    },
+    {
+      "suite": "TestWorkflowAPIBatchResetClientTestSuite",
+      "source": "tests/workflow_api_batch_reset_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 5,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestWorkflowAPIBatchResetClientTestSuite/TestWorkflowBatchReset_Success",
+        "TestWorkflowAPIBatchResetClientTestSuite/TestWorkflowBatchReset_Success/Executions",
+        "TestWorkflowAPIBatchResetClientTestSuite/TestWorkflowBatchReset_Success/TargetExecutions"
+      ]
+    },
+    {
+      "suite": "TestWorkflowAPIBatchSignalClientTestSuite",
+      "source": "tests/workflow_api_batch_signal_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 1,
+        "fail": 6,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestWorkflowAPIBatchSignalClientTestSuite/TestWorkflowBatchSignal_SeparateJobsNotDeduped",
+        "TestWorkflowAPIBatchSignalClientTestSuite/TestWorkflowBatchSignal_Success",
+        "TestWorkflowAPIBatchSignalClientTestSuite/TestWorkflowBatchSignal_Success/Executions"
+      ]
+    },
+    {
+      "suite": "TestWorkflowAPIBatchTerminateClientTestSuite",
+      "source": "tests/workflow_api_batch_terminate_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 6,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestWorkflowAPIBatchTerminateClientTestSuite/TestWorkflowBatchTerminate_Success",
+        "TestWorkflowAPIBatchTerminateClientTestSuite/TestWorkflowBatchTerminate_Success/Executions",
+        "TestWorkflowAPIBatchTerminateClientTestSuite/TestWorkflowBatchTerminate_Success/TargetExecutions"
+      ]
+    },
+    {
+      "suite": "TestWorkflowAPIBatchUpdateOptionsClientTestSuite",
+      "source": "tests/workflow_api_batch_update_options_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-batch-operations-and-workers",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 5,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestWorkflowAPIBatchUpdateOptionsClientTestSuite/TestWorkflowBatchUpdateOptions_Success",
+        "TestWorkflowAPIBatchUpdateOptionsClientTestSuite/TestWorkflowBatchUpdateOptions_Success/Executions",
+        "TestWorkflowAPIBatchUpdateOptionsClientTestSuite/TestWorkflowBatchUpdateOptions_Success/TargetExecutions"
+      ]
+    },
+    {
+      "suite": "TestWorkflowAliasSearchAttributeTestSuite",
+      "source": "tests/workflow_alias_search_attribute_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowAliasSearchAttributeTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowAliasSearchAttributeTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-visibility-query-converter",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 3,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkflowBufferedEventsTestSuite",
+      "source": "tests/workflow_buffered_events_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowBufferedEventsTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowBufferedEventsTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 4,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkflowCompletionPaginationTestSuite",
+      "source": "tests/workflow_completion_pagination_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-gated-surfaces",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 0,
+        "fail": 12,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": [
+        "TestWorkflowCompletionPaginationTestSuite/TestBufferLimits",
+        "TestWorkflowCompletionPaginationTestSuite/TestBufferLimits/both_limits_sufficiently_large",
+        "TestWorkflowCompletionPaginationTestSuite/TestBufferLimits/namespace_share_exhausted"
+      ]
+    },
+    {
+      "suite": "TestWorkflowDeleteExecutionSuite",
+      "source": "tests/workflow_delete_execution_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowDeleteExecutionSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowDeleteExecutionSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 4,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkflowFailuresTestSuite",
+      "source": "tests/workflow_failures_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowFailuresTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowFailuresTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 4,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkflowMemoTestSuite",
+      "source": "tests/workflow_memo_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowMemoTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowMemoTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 3,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkflowResetTestSuite",
+      "source": "tests/workflow_reset_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowResetTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowResetTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 9,
+        "fail": 4,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestWorkflowResetTestSuite/TestBatchResetWithOptionsUpdate",
+        "TestWorkflowResetTestSuite/TestRepeatedResets_FailedWorkflowDoesNotDoubleCountFailedMetric",
+        "TestWorkflowResetTestSuite/TestResetWorkflowWithOptionsUpdate"
+      ]
+    },
+    {
+      "suite": "TestWorkflowResetWithChildTestSuite",
+      "source": "tests/workflow_reset_with_child_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowResetWithChildTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowResetWithChildTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 4,
+        "fail": 0,
+        "skip": 6,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkflowTaskTestSuite",
+      "source": "tests/workflow_task_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowTaskTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowTaskTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 9,
+        "fail": 0,
+        "skip": 1,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkflowTestSuite",
+      "source": "tests/workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 34,
+        "fail": 12,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "regression",
+      "representative_nonpassing_tests": [
+        "TestWorkflowTestSuite/TestSignalWithStartWorkflowExecution_FirstExecutionRunId",
+        "TestWorkflowTestSuite/TestSignalWithStartWorkflowExecution_FirstExecutionRunId/brand_new_start_via_SignalWithStart",
+        "TestWorkflowTestSuite/TestSignalWithStartWorkflowExecution_FirstExecutionRunId/reject_duplicate_on_completed_workflow_carries_first_execution_run_id"
+      ]
+    },
+    {
+      "suite": "TestWorkflowTimerTestSuite",
+      "source": "tests/workflow_timer_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowTimerTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowTimerTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 3,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkflowTypeEncodingSuite",
+      "source": "tests/workflow_type_encoding_test.go @ v1.32.0",
+      "previous_entrypoints": [],
+      "previous_clean_entrypoints": [],
+      "new_entrypoint_name": true,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": "Workflow-name control bytes/UTF-8 and binary transport metadata are not explicit in the lifecycle placeholder.",
+      "counts": {
+        "pass": 23,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "new-suite",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkflowUpdateSuite",
+      "source": "tests/update_workflow_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowUpdateSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowUpdateSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-lifecycle-fidelity",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 69,
+        "fail": 0,
+        "skip": 9,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    },
+    {
+      "suite": "TestWorkflowVisibilityTestSuite",
+      "source": "tests/workflow_visibility_test.go @ v1.32.0",
+      "previous_entrypoints": [
+        "TestWorkflowVisibilityTestSuite"
+      ],
+      "previous_clean_entrypoints": [
+        "TestWorkflowVisibilityTestSuite"
+      ],
+      "new_entrypoint_name": false,
+      "owner": "v132-visibility-query-converter",
+      "out_of_surface_reason": null,
+      "scope_allocation_note": null,
+      "counts": {
+        "pass": 2,
+        "fail": 0,
+        "skip": 0,
+        "unfinished": 0
+      },
+      "classification": "unchanged-clean",
+      "representative_nonpassing_tests": []
+    }
+  ],
+  "fork_smoke_counts": {
+    "pass": 0,
+    "fail": 1,
+    "skip": 0,
+    "unfinished": 0
+  },
+  "post_baseline_validation": {
+    "fork_commit": "4d71235efae67869a5c2e75fa2836765cf9fd347",
+    "changed_paths": [
+      "tests/tokeira_conformance_test.go"
+    ],
+    "platform": "macOS (darwin/amd64)",
+    "engine_source_commit": "f78b3412ff1f55edc109b162e9cecef0c7c82de4",
+    "smoke_standalone": "pass",
+    "smoke_runner": "pass",
+    "full_corpus_rerun": false,
+    "artifact_sha256": {
+      "harness-final.patch": "8373463fa928a0bd1a524e123c8b84c4f485490d1dd46338cb9b8a46607b3ae7",
+      "harness-final-files.json": "db1104ddd863ec61178a9719527a903ee273447aa3aea87bd1b81ed2d143b831",
+      "smoke-standalone-macos.log": "843eeaa9e5a6b326ff90e9f580cf8c18ba6c162bdefee8cf74861c9443384c14",
+      "smoke-runner-macos.log": "b12ce8ed9709274ca422ea96f499b81bd50f9054b99309804bf6bac22d3899d7",
+      "fork-final-lint.log": "3218ef2966697c98639b5ba71442ede8e13112957a95b8797387f84a32791f3d"
+    }
+  }
+}

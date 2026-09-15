@@ -241,7 +241,10 @@ digests, and every doc cite in Requirement 11.5–11.6. No behaviour change ride
 |---|---|---|---|---|
 
 `Classification` is one of `unchanged-clean`, `regression`, `new-suite`,
-`out-of-surface`; `Owner` is a delta spec name or `registry-skip` with the cited reason.
+`out-of-surface`, `expected-until-flip`; `Owner` is a delta spec name or
+`registry-skip` with the cited reason.
+`expected-until-flip` identifies a successor that fails only because the advertised
+compatibility claim has not flipped and must be re-verified at Phase 4.
 
 ### Denominator files
 

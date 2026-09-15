@@ -451,6 +451,15 @@ test therefore raced its worker; the fork makes the wait it relies on explicit. 
 edit should be offered upstream. Tier 9.43 then completed with 11 pass outcomes, zero
 skips, zero failures, and zero unfinished outcomes.
 
+The integration seat retained this single sanctioned corpus-body exception on
+2026-09-15 for `tokeira/conformance-v1.32.0`: the same query parameter is carried
+forward in `runHTTPAPIBasicsTest` (`tests/http_api_test.go:152 @ v1.32.0`). The
+long-poll condition remains `request.Request.GetWaitNewEvent()`
+(`service/history/api/getworkflowexecutionhistory/api.go:220 @ v1.32.0`). This
+synchronization is still to be offered upstream. The separate v1.32.0 HTTP rerun
+is recorded in the [baseline addendum](../../.kiro/specs/temporal-v1.32-compatibility/reference/FINDINGS-v1.32.0.md#http-synchronization-and-scope-addendum-2026-09-15);
+it does not replace the v1.31.0 release evidence above.
+
 ### Tier 10.45 coverage exception
 
 The observer-effect exception is disclosed in the wire section: coverage was disabled

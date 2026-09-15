@@ -180,8 +180,8 @@ added and every entry's origin and evidence are re-verified.
 ### 6. Configuration denominator (`tools/temporal-config-audit`, `crates/tokeira-compatibility`)
 
 ```sh
-go run ./tools/temporal-config-audit -repo <reference-fork> -tag v1.32.0 \
-  -output crates/tokeira-compatibility/data/temporal-v1.32.0-settings.json
+go -C tools/temporal-config-audit run . -repo <reference-fork> -tag v1.32.0 \
+  -output ../../crates/tokeira-compatibility/data/temporal-v1.32.0-settings.json
 ```
 
 The classification ledger `temporal-v1.32.0-classification.json` is authored by
@@ -192,6 +192,10 @@ record both defaults and the owning delta spec. `configuration.rs` includes the
 `v1.32.0` files; the `v1.31.0` files are deleted. `tools/compatibility-docs` renders
 `docs/conformance/v1.32.0/temporal-configuration.md` with a header stating it is the
 `TEMPORAL_SERVER_TARGET` denominator while the claim is still `1.31.0`.
+Use `cargo run -p compatibility-docs --locked -- write-temporal` to render only
+this inventory, and `check-temporal` to verify it. The existing `write` and `check`
+modes still cover all three artifacts; the scoped modes preserve the separately
+maintained v1.31.0 operator reference and canonical configuration example.
 
 ### 7. Conformance branch (fork) and baseline
 
@@ -241,9 +245,29 @@ digests, and every doc cite in Requirement 11.5–11.6. No behaviour change ride
 
 ### Denominator files
 
-Format and verifier unchanged from `configuration-policy` (`design.md` there, § Data
-Models). The only additions are per-entry change notes: `added_in`, `removed_in`,
-`renamed_from`, `default_changed_from`, each optional.
+The source format and active-key exactness contract remain those of
+`configuration-policy` (`design.md` there, § Data Models). Classifications add optional
+`added_in`, `removed_in`, `renamed_from` (a list, for consolidations),
+`default_changed_from`, and `change_notes`. Changed defaults retain both source
+expressions, explain effective values, and name the owning delta spec in `owner`.
+
+Removed classifications live in a separate `removed_settings` collection, never in
+the active denominator or disposition counts. Each requires `removed_in`, migration
+notes, and historical evidence. Renames refer to these retirement records. The verifier
+rejects active/retired overlap and validates every conformance-registry entry against
+its active or explicitly retired classification. This preserves a strict cross-check
+while behavior migrations remain owned by their delta specs: Tokeira still consults
+`component.callbacks.allowedAddresses` (Nexus) and
+`history.versionReactivationSignalCacheTTL` (worker deployments), although neither is
+declared at `v1.32.0`. The latter has no TTL alias: target deduplication tracks the
+highest signaled revision (`service/worker/workerdeployment/client.go:2054 @ v1.32.0`).
+
+The complete extraction contains 683 settings (627 in `constants.go`, 56 elsewhere),
+compared with 613 at `v1.31.0`: 84 added keys, 14 removed keys, and 12 changed default
+expressions. The exact removed callback-URL toggle is
+`component.nexusoperations.useSystemCallbackURL`. Source-expression changes include
+activity long polling from 20 to 60 seconds and an unchanged one-second buffer
+(`chasm/lib/activity/config.go` and `common/constants.go @ v1.32.0`).
 
 ### Placeholder spec file
 

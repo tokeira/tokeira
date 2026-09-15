@@ -14,7 +14,7 @@ use tokeira_compatibility::{
 use tokeira_config::{CONFIG_FIELD_CATALOG, ConfigFieldDocumentation, TokeiraConfig};
 
 /// Relative path of the generated Temporal configuration denominator.
-pub const TEMPORAL_CONFIGURATION_PATH: &str = "docs/conformance/v1.31.0/temporal-configuration.md";
+pub const TEMPORAL_CONFIGURATION_PATH: &str = "docs/conformance/v1.32.0/temporal-configuration.md";
 /// Relative path of the generated Tokeira operator configuration reference.
 pub const TOKEIRA_CONFIGURATION_PATH: &str = "docs/conformance/v1.31.0/tokeira-configuration.md";
 /// Relative path of the canonical annotated production configuration example.
@@ -23,7 +23,7 @@ pub const CONFIG_EXAMPLE_PATH: &str = "config.example.toml";
 /// One complete deterministic render.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedDocumentation {
-    /// Complete Temporal v1.31.0 configuration denominator.
+    /// Complete Temporal v1.32.0 target configuration denominator.
     pub temporal_configuration: String,
     /// Tokeira feature/configuration reference.
     pub tokeira_configuration: String,
@@ -51,18 +51,23 @@ pub(crate) fn render_temporal_configuration(ledger: &VerifiedConfigurationLedger
 
     let mut output = String::new();
     output.push_str(
-        "# Temporal v1.31.0 configuration surface\n\n\
-> This is the complete source-aware configuration denominator for Tokeira's \
-Temporal server v1.31.0 compatibility target. It records what Temporal exposes \
-and Tokeira's treatment of each item; it is not a list of raw keys accepted by \
-`tokeirad`.\n\n\
+        "# Temporal v1.32.0 configuration surface\n\n\
+> This is the `TEMPORAL_SERVER_TARGET` denominator for **v1.32.0**. Tokeira's \
+advertised compatibility claim (`TEMPORAL_SERVER_COMPAT`) remains **v1.31.0**. \
+Target defaults and migration owners below record required work; they do not \
+assert that behavior changes have landed. This is not a list of raw keys \
+accepted by `tokeirad`.\n\n\
 ## Method and authority\n\n\
 The checked audit reads production, non-test Go files from the local Temporal \
-source at tag `v1.31.0`, parses `New*Setting` declarations with the Go AST, and \
+source at tag `v1.32.0`, parses `New*Setting` declarations with the Go AST, and \
 records constructor, scope, value kind, default expression, and source anchor. \
 The immutable extraction snapshot is joined one-to-one with an owner-authored \
 classification ledger. Duplicate, missing, extra, non-literal, or unresolved \
-entries fail verification before this document can be generated.\n\n",
+entries fail verification before this document can be generated. Removed keys \
+are audited separately and excluded from the denominator. Their retained \
+conformance overrides remain checked against the actual registry until the \
+owning delta migrates the consult site. Unchanged treatments describe the \
+current v1.31.0 profile.\n\n",
     );
     writeln!(
         output,
@@ -77,8 +82,8 @@ entries fail verification before this document can be generated.\n\n",
     )
     .expect("String writes are infallible");
     output.push_str(
-        "- Source evidence: `crates/tokeira-compatibility/data/temporal-v1.31.0-settings.json`.\n\
-- Product decisions: `crates/tokeira-compatibility/data/temporal-v1.31.0-classification.json`.\n\n\
+        "- Source evidence: `crates/tokeira-compatibility/data/temporal-v1.32.0-settings.json`.\n\
+- Product decisions: `crates/tokeira-compatibility/data/temporal-v1.32.0-classification.json`.\n\n\
 ## Disposition summary\n\n\
 Counts below include dynamic settings and the separately audited static groups.\n\n\
 | Tokeira treatment | Count |\n\
@@ -87,6 +92,61 @@ Counts below include dynamic settings and the separately audited static groups.\
     for (disposition, count) in &ledger.disposition_counts {
         writeln!(output, "| {} | {count} |", disposition.label())
             .expect("String writes are infallible");
+    }
+
+    output.push_str(
+        "\n## Changes from v1.31.0\n\n\
+Added keys include renames and consolidations. Defaults are source expressions; \
+notes resolve symbolic values and distinguish representation changes from \
+behavior changes. Every changed default names its owning delta spec.\n\n\
+| Target key | Added in | Previous keys | Previous default | Target default | Owner | Notes |\n\
+|---|---|---|---|---|---|---|\n",
+    );
+    for (_, entry) in &dynamic {
+        if entry.added_in.is_none() && entry.default_changed_from.is_none() {
+            continue;
+        }
+        writeln!(
+            output,
+            "| `{}` | {} | {} | {} | `{}` | `{}` | {} |",
+            markdown(&entry.temporal_key),
+            entry.added_in.as_deref().unwrap_or("—"),
+            code_list(&entry.renamed_from),
+            entry
+                .default_changed_from
+                .as_deref()
+                .map_or_else(|| "—".to_owned(), |value| format!("`{}`", markdown(value)),),
+            markdown(&entry.temporal_default),
+            markdown(&entry.owner),
+            markdown(
+                entry
+                    .change_notes
+                    .as_deref()
+                    .unwrap_or(&entry.tokeira_treatment)
+            ),
+        )
+        .expect("String writes are infallible");
+    }
+    output.push_str(
+        "\n## Removed keys\n\n\
+These historical records are excluded from target counts. A wired override \
+here describes an existing Tokeira consult site, not a v1.32.0 setting.\n\n\
+| Previous key | Removed in | Previous default | Retained conformance override | Owner | Migration | Evidence |\n\
+|---|---|---|---|---|---|---|\n",
+    );
+    for entry in &ledger.removed_settings {
+        writeln!(
+            output,
+            "| `{}` | {} | `{}` | {} | `{}` | {} | {} |",
+            markdown(&entry.temporal_key),
+            entry.removed_in.as_deref().unwrap_or("—"),
+            markdown(&entry.temporal_default),
+            entry.conformance_override.label(),
+            markdown(&entry.owner),
+            markdown(&entry.tokeira_treatment),
+            code_list(&entry.evidence),
+        )
+        .expect("String writes are infallible");
     }
 
     output.push_str(
@@ -109,13 +169,13 @@ Counts below include dynamic settings and the separately audited static groups.\
 
     output.push_str(
         "\n## Dynamic settings\n\n\
-| Temporal key | Scope / type | Temporal default | Tokeira treatment | Conformance override | Source |\n\
-|---|---|---|---|---|---|\n",
+| Temporal key | Scope / type | Temporal default | Tokeira treatment | Conformance override | Owner | Source at v1.32.0 |\n\
+|---|---|---|---|---|---|---|\n",
     );
     for (declaration, classification) in dynamic {
         writeln!(
             output,
-            "| `{}` | {} / `{}` | `{}` | {} — {} | {} | `{}` |",
+            "| `{}` | {} / `{}` | `{}` | {} — {} | {} | `{}` | `{}` |",
             markdown(&declaration.key),
             declaration.scope.label(),
             markdown(&declaration.value_kind),
@@ -123,6 +183,7 @@ Counts below include dynamic settings and the separately audited static groups.\
             classification.classification.label(),
             markdown(&classification.tokeira_treatment),
             classification.conformance_override.label(),
+            markdown(&classification.owner),
             markdown(&declaration.source),
         )
         .expect("String writes are infallible");
@@ -436,7 +497,23 @@ mod tests {
         assert!(
             rendered
                 .temporal_configuration
-                .contains("Dynamic setting declarations: **613**")
+                .contains("Dynamic setting declarations: **683**")
+        );
+        assert!(
+            rendered
+                .temporal_configuration
+                .contains("`TEMPORAL_SERVER_TARGET`")
+        );
+        assert!(
+            rendered
+                .temporal_configuration
+                .contains("remains **v1.31.0**")
+        );
+        assert!(rendered.temporal_configuration.contains("## Removed keys"));
+        assert!(
+            rendered
+                .temporal_configuration
+                .contains("20 seconds to 60 seconds")
         );
         assert!(
             rendered

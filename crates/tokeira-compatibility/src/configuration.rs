@@ -1,16 +1,18 @@
-//! Checked classification of Temporal's v1.31.0 configuration surface.
+//! Checked classification of Temporal's v1.32.0 target configuration surface.
 //!
 //! Temporal source declarations are immutable evidence; Tokeira classifications
 //! are owner-authored product decisions. Keeping the two JSON inputs separate
 //! prevents a source refresh from silently rewriting the decisions joined here.
+//! Retired keys preserve migration evidence and any still-live conformance
+//! overrides, but never contribute to the target release's denominator.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const SOURCE_SNAPSHOT: &str = include_str!("../data/temporal-v1.31.0-settings.json");
-const CLASSIFICATION_LEDGER: &str = include_str!("../data/temporal-v1.31.0-classification.json");
+const SOURCE_SNAPSHOT: &str = include_str!("../data/temporal-v1.32.0-settings.json");
+const CLASSIFICATION_LEDGER: &str = include_str!("../data/temporal-v1.32.0-classification.json");
 
 /// One production `New*Setting` declaration extracted from Temporal source.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -149,6 +151,22 @@ pub struct ConfigurationClassification {
     pub conformance_override: ConformanceOverrideDisposition,
     /// Repository-relative verification anchors.
     pub evidence: Vec<String>,
+    /// Release that introduced this key relative to the previous inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_in: Option<String>,
+    /// Release that removed this key; only valid in the retired collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_in: Option<String>,
+    /// Previous keys consolidated or renamed into this declaration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed_from: Vec<String>,
+    /// Previous source expression; the current expression stays in `temporal_default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_changed_from: Option<String>,
+    /// Migration context, including effective values when expressions are symbolic.
+    /// The `owner` identifies the delta spec responsible for changed defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_notes: Option<String>,
 }
 
 /// Classification of a top-level static Temporal server configuration group.
@@ -171,6 +189,8 @@ pub struct StaticConfigurationClassification {
 pub struct ConfigurationLedger {
     /// One classification for every source declaration.
     pub dynamic_settings: Vec<ConfigurationClassification>,
+    /// Historical keys absent from the target denominator, including migration notes.
+    pub removed_settings: Vec<ConfigurationClassification>,
     /// Relevant top-level static configuration groups.
     pub static_groups: Vec<StaticConfigurationClassification>,
 }
@@ -189,6 +209,8 @@ pub struct ConformanceKey {
 pub struct VerifiedConfigurationLedger {
     /// Dynamic declarations joined in key order.
     pub dynamic_settings: Vec<(SettingDeclaration, ConfigurationClassification)>,
+    /// Verified retired keys, sorted separately and excluded from disposition counts.
+    pub removed_settings: Vec<ConfigurationClassification>,
     /// Static groups ordered by group name.
     pub static_groups: Vec<StaticConfigurationClassification>,
     /// Counts by primary disposition.
@@ -262,6 +284,7 @@ pub fn checked_configuration_ledger()
     let conformance_keys = ledger
         .dynamic_settings
         .iter()
+        .chain(&ledger.removed_settings)
         .filter(|entry| entry.conformance_override != ConformanceOverrideDisposition::None)
         .map(|entry| ConformanceKey {
             key: entry.temporal_key.clone(),
@@ -293,6 +316,12 @@ pub fn verify_configuration_ledger(
     let mut classifications = BTreeMap::new();
     for classification in &ledger.dynamic_settings {
         validate_classification(classification)?;
+        if classification.removed_in.is_some() {
+            return Err(ConfigurationLedgerError::InvalidMetadata {
+                key: classification.temporal_key.clone(),
+                reason: "retired key appears in the target denominator",
+            });
+        }
         if classifications
             .insert(classification.temporal_key.clone(), classification.clone())
             .is_some()
@@ -314,7 +343,47 @@ pub fn verify_configuration_ledger(
         }
     }
 
-    let conformance = conformance_map(conformance_keys, &source)?;
+    let mut removed = BTreeMap::new();
+    for classification in &ledger.removed_settings {
+        validate_classification(classification)?;
+        let key = &classification.temporal_key;
+        if classification.removed_in.is_none()
+            || classification.change_notes.is_none()
+            || source.contains_key(key)
+        {
+            return Err(ConfigurationLedgerError::InvalidMetadata {
+                key: key.clone(),
+                reason: "retired key needs removal evidence and must be absent from the target",
+            });
+        }
+        if removed
+            .insert(key.clone(), classification.clone())
+            .is_some()
+        {
+            return Err(ConfigurationLedgerError::DuplicateClassification(
+                key.clone(),
+            ));
+        }
+    }
+    for classification in classifications.values() {
+        for previous in &classification.renamed_from {
+            if !removed.contains_key(previous) {
+                return Err(ConfigurationLedgerError::InvalidMetadata {
+                    key: classification.temporal_key.clone(),
+                    reason: "rename refers to a key without a retirement record",
+                });
+            }
+        }
+    }
+
+    // The target snapshot stays exact even while delta specs still own old
+    // consult sites (callback policy and reactivation TTL in v1.31.0). A retired
+    // override must match the real registry too; it is not an unknown-key bypass.
+    let known_keys = source.keys().chain(removed.keys()).cloned().collect();
+    let conformance = conformance_map(conformance_keys, &known_keys)?;
+    for classification in removed.values() {
+        validate_conformance(classification, &conformance)?;
+    }
     let mut dynamic_settings = Vec::with_capacity(source.len());
     let mut disposition_counts = BTreeMap::new();
     for (key, declaration) in source {
@@ -333,17 +402,7 @@ pub fn verify_configuration_ledger(
                 reason: "default differs from source declaration",
             });
         }
-        let expected = conformance
-            .get(&declaration.key)
-            .copied()
-            .unwrap_or(ConformanceOverrideDisposition::None);
-        if classification.conformance_override != expected {
-            return Err(ConfigurationLedgerError::ConformanceMismatch {
-                key: declaration.key,
-                expected,
-                actual: classification.conformance_override,
-            });
-        }
+        validate_conformance(&classification, &conformance)?;
         *disposition_counts
             .entry(classification.classification)
             .or_insert(0) += 1;
@@ -366,6 +425,7 @@ pub fn verify_configuration_ledger(
 
     Ok(VerifiedConfigurationLedger {
         dynamic_settings,
+        removed_settings: removed.into_values().collect(),
         static_groups,
         disposition_counts,
     })
@@ -398,10 +458,51 @@ fn validate_classification(
             .evidence
             .iter()
             .all(|value| is_repository_relative_evidence(value))
+        || [
+            &classification.added_in,
+            &classification.removed_in,
+            &classification.default_changed_from,
+            &classification.change_notes,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value.trim().is_empty())
+        || classification
+            .renamed_from
+            .iter()
+            .any(|key| key.trim().is_empty())
     {
         return Err(ConfigurationLedgerError::InvalidMetadata {
             key: classification.temporal_key.clone(),
             reason: "classification metadata is incomplete or not repository-relative",
+        });
+    }
+    if let Some(previous) = &classification.default_changed_from
+        && (previous == &classification.temporal_default
+            || classification.change_notes.is_none()
+            || !classification.owner.starts_with(".kiro/specs/v132-"))
+    {
+        return Err(ConfigurationLedgerError::InvalidMetadata {
+            key: classification.temporal_key.clone(),
+            reason: "changed default needs distinct values, migration notes, and a delta-spec owner",
+        });
+    }
+    Ok(())
+}
+
+fn validate_conformance(
+    classification: &ConfigurationClassification,
+    conformance: &BTreeMap<String, ConformanceOverrideDisposition>,
+) -> Result<(), ConfigurationLedgerError> {
+    let expected = conformance
+        .get(&classification.temporal_key)
+        .copied()
+        .unwrap_or(ConformanceOverrideDisposition::None);
+    if classification.conformance_override != expected {
+        return Err(ConfigurationLedgerError::ConformanceMismatch {
+            key: classification.temporal_key.clone(),
+            expected,
+            actual: classification.conformance_override,
         });
     }
     Ok(())
@@ -437,12 +538,12 @@ fn is_repository_relative_evidence(value: &str) -> bool {
 
 fn conformance_map(
     keys: &[ConformanceKey],
-    source: &BTreeMap<String, SettingDeclaration>,
+    known_keys: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, ConformanceOverrideDisposition>, ConfigurationLedgerError> {
     let mut mapped = BTreeMap::new();
     for key in keys {
-        let canonical = source
-            .keys()
+        let canonical = known_keys
+            .iter()
             .find(|candidate| candidate.eq_ignore_ascii_case(&key.key))
             .ok_or_else(|| ConfigurationLedgerError::UnknownConformanceKey(key.key.clone()))?
             .clone();
@@ -490,7 +591,7 @@ mod tests {
             verify_configuration_ledger(&declarations, &ledger, &checked_conformance_keys())
                 .expect("complete checked ledger");
 
-        assert_eq!(verified.dynamic_settings.len(), 613);
+        assert_eq!(verified.dynamic_settings.len(), 683);
         assert_eq!(
             verified
                 .dynamic_settings
@@ -499,10 +600,13 @@ mod tests {
                     .source
                     .starts_with("common/dynamicconfig/constants.go:"))
                 .count(),
-            565
+            627
         );
         for key in [
             "activity.enableStandalone",
+            "activity.startDelayEnabled",
+            "history.enableStandaloneActivityOperatorCommands",
+            "nexusoperation.enableStandalone",
             "matching.enableFairness",
             "matching.priorityLevels",
             "matching.useNewMatcher",
@@ -516,104 +620,124 @@ mod tests {
         }
     }
 
+    #[test]
+    fn migration_records_have_target_evidence_and_existing_owners() {
+        let ledger = classification_ledger().expect("checked classification ledger");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_eq!(ledger.removed_settings.len(), 14);
+        assert_eq!(
+            ledger
+                .dynamic_settings
+                .iter()
+                .filter(|entry| entry.added_in.is_some())
+                .count(),
+            84
+        );
+        assert_eq!(
+            ledger
+                .dynamic_settings
+                .iter()
+                .filter(|entry| entry.default_changed_from.is_some())
+                .count(),
+            12
+        );
+        for entry in &ledger.dynamic_settings {
+            assert!(
+                entry
+                    .evidence
+                    .iter()
+                    .any(|anchor| anchor.ends_with(" @ v1.32.0"))
+            );
+            assert!(
+                root.join(&entry.owner).exists(),
+                "missing owner for {}",
+                entry.temporal_key
+            );
+            if let Some(added) = &entry.added_in {
+                assert_eq!(added, "v1.32.0");
+            }
+        }
+        for entry in &ledger.removed_settings {
+            assert_eq!(entry.removed_in.as_deref(), Some("v1.32.0"));
+            assert!(root.join(&entry.owner).exists());
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
+        // Input order cannot change the checked target join or canonical snapshot bytes.
         // Feature: configuration-policy, Property 3: source denominator determinism
+        // Feature: temporal-v1.32-compatibility, Property 8: denominator exactness at v1.32.0
         #[test]
         fn source_denominator_determinism(
-            mut keys in prop::collection::btree_set("[a-z]{1,8}", 1..40)
-                .prop_map(|keys| keys.into_iter().collect::<Vec<_>>()),
-            rotate in any::<usize>(),
+            source_order in prop::collection::vec(any::<u64>(), 683),
+            ledger_order in prop::collection::vec(any::<u64>(), 683),
         ) {
-            let declarations = keys
-                .iter()
-                .map(|key| SettingDeclaration {
-                    key: key.clone(),
-                    constructor: "NewGlobalBoolSetting".to_owned(),
-                    scope: TemporalConfigScope::Global,
-                    value_kind: "Bool".to_owned(),
-                    default_expression: "false".to_owned(),
-                    source: format!("common/dynamicconfig/constants.go:{}", key.len()),
-                })
-                .collect::<Vec<_>>();
-            let expected = declarations
-                .iter()
-                .map(|entry| entry.key.clone())
-                .collect::<BTreeSet<_>>();
+            let mut declarations = source_snapshot().unwrap();
+            let mut ledger = classification_ledger().unwrap();
+            let conformance = checked_conformance_keys();
+            let expected = verify_configuration_ledger(&declarations, &ledger, &conformance).unwrap();
+            let priorities = declarations.iter().enumerate()
+                .map(|(index, entry)| (entry.key.clone(), (source_order[index], ledger_order[index])))
+                .collect::<BTreeMap<_, _>>();
+            declarations.sort_by_key(|entry| priorities[&entry.key].0);
+            ledger.dynamic_settings.sort_by_key(|entry| priorities[&entry.temporal_key].1);
+            ledger.removed_settings.reverse();
+            ledger.static_groups.reverse();
+            prop_assert_eq!(verify_configuration_ledger(&declarations, &ledger, &conformance).unwrap(), expected);
 
-            let length = keys.len();
-            keys.rotate_left(rotate % length);
-            let permuted = keys
-                .into_iter()
-                .map(|key| declarations
-                    .iter()
-                    .find(|entry| entry.key == key)
-                    .expect("generated key exists")
-                    .clone())
-                .collect::<Vec<_>>();
-            let normalized = permuted
-                .iter()
-                .map(|entry| entry.key.clone())
-                .collect::<BTreeSet<_>>();
-            prop_assert_eq!(normalized, expected);
-
-            let mut invalid = declarations[0].clone();
-            invalid.source = "/absolute/source.go:1".to_owned();
-            prop_assert!(validate_source(&invalid).is_err());
+            declarations.sort_by(|left, right| left.key.cmp(&right.key));
+            let encoded = serde_json::to_string_pretty(&declarations).unwrap() + "\n";
+            prop_assert_eq!(encoded, SOURCE_SNAPSHOT);
         }
 
+        // Every drift mutation is rejected, including retired keys still present in the bridge.
         // Feature: configuration-policy, Property 4: classification-ledger exactness
+        // Feature: temporal-v1.32-compatibility, Property 8: denominator exactness at v1.32.0
         #[test]
-        fn classification_ledger_exactness(mutation in 0_u8..6) {
-            let declaration = SettingDeclaration {
-                key: "test.setting".to_owned(),
-                constructor: "NewGlobalBoolSetting".to_owned(),
-                scope: TemporalConfigScope::Global,
-                value_kind: "Bool".to_owned(),
-                default_expression: "false".to_owned(),
-                source: "common/dynamicconfig/constants.go:1".to_owned(),
-            };
-            let classification = ConfigurationClassification {
-                temporal_key: declaration.key.clone(),
-                temporal_default: declaration.default_expression.clone(),
-                temporal_scope: declaration.scope,
-                classification: ConfigurationDisposition::PinnedBehavioralConstant,
-                tokeira_treatment: "Pinned to the v1.31.0 default.".to_owned(),
-                owner: "crates/tokeira-runtime".to_owned(),
-                conformance_override: ConformanceOverrideDisposition::None,
-                evidence: vec![declaration.source.clone()],
-            };
-            let mut declarations = vec![declaration];
-            let mut ledger = ConfigurationLedger {
-                dynamic_settings: vec![classification],
-                static_groups: Vec::new(),
-            };
-            let mut conformance = Vec::new();
+        fn classification_ledger_exactness(index in 0_usize..683, mutation in 0_u8..18) {
+            let mut declarations = source_snapshot().unwrap();
+            let mut ledger = classification_ledger().unwrap();
+            let mut conformance = checked_conformance_keys();
             match mutation {
                 0 => {}
-                1 => ledger.dynamic_settings.clear(),
-                2 => ledger.dynamic_settings.push(ledger.dynamic_settings[0].clone()),
-                3 => ledger.dynamic_settings[0].temporal_key = "invented".to_owned(),
-                4 => ledger.dynamic_settings[0].owner.clear(),
-                5 => {
-                    ledger.dynamic_settings[0].conformance_override =
-                        ConformanceOverrideDisposition::Wired;
-                    conformance.push(ConformanceKey {
-                        key: "test.setting".to_owned(),
-                        disposition: ConformanceOverrideDisposition::KernelExcluded,
-                    });
+                1 => { declarations.remove(index); }
+                2 => declarations.push(declarations[index].clone()),
+                3 => declarations[index].key = "invented.target.key".to_owned(),
+                4 => declarations[index].default_expression.push_str(" changed"),
+                5 => { ledger.dynamic_settings.remove(index); }
+                6 => ledger.dynamic_settings.push(ledger.dynamic_settings[index].clone()),
+                7 => ledger.dynamic_settings[index].temporal_key = "invented.ledger.key".to_owned(),
+                8 => ledger.dynamic_settings[index].owner.clear(),
+                9 => ledger.dynamic_settings[index].evidence.clear(),
+                10 => declarations[index].source = "/absolute/source.go:1".to_owned(),
+                11 => ledger.dynamic_settings[index].removed_in = Some("v1.32.0".to_owned()),
+                12 => ledger.removed_settings.push(ledger.removed_settings[0].clone()),
+                13 => ledger.removed_settings[0].removed_in = None,
+                14 => {
+                    let entry = ledger.removed_settings.iter_mut()
+                        .find(|entry| entry.conformance_override == ConformanceOverrideDisposition::Wired).unwrap();
+                    entry.conformance_override = ConformanceOverrideDisposition::None;
+                }
+                15 => conformance.push(ConformanceKey {
+                    key: "unknown.bridge.key".to_owned(),
+                    disposition: ConformanceOverrideDisposition::Wired,
+                }),
+                16 => {
+                    let entry = ledger.dynamic_settings.iter_mut()
+                        .find(|entry| entry.default_changed_from.is_some()).unwrap();
+                    entry.change_notes = None;
+                }
+                17 => {
+                    let entry = ledger.dynamic_settings.iter_mut()
+                        .find(|entry| !entry.renamed_from.is_empty()).unwrap();
+                    entry.renamed_from.push("unknown.previous.key".to_owned());
                 }
                 _ => unreachable!(),
             }
-            let result = verify_configuration_ledger(
-                &declarations,
-                &ledger,
-                &conformance,
-            );
-            prop_assert_eq!(result.is_ok(), mutation == 0);
-
-            declarations.clear();
+            let result = verify_configuration_ledger(&declarations, &ledger, &conformance);
+            prop_assert_eq!(result.is_ok(), mutation == 0, "{:?}", result);
         }
     }
 }

@@ -1,10 +1,18 @@
 [
   {
-    "key": "activity.enableStandalone",
+    "key": "activity.enableCallbacks",
     "constructor": "NewNamespaceBoolSetting",
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
+    "source": "chasm/lib/activity/config.go:37"
+  },
+  {
+    "key": "activity.enableStandalone",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
     "source": "chasm/lib/activity/config.go:11"
   },
   {
@@ -12,7 +20,7 @@
     "constructor": "NewNamespaceDurationSetting",
     "scope": "Namespace",
     "value_kind": "Duration",
-    "default_expression": "time.Second",
+    "default_expression": "common.DefaultLongPollBuffer",
     "source": "chasm/lib/activity/config.go:23"
   },
   {
@@ -20,8 +28,16 @@
     "constructor": "NewNamespaceDurationSetting",
     "scope": "Namespace",
     "value_kind": "Duration",
-    "default_expression": "20 * time.Second",
+    "default_expression": "common.DefaultLongPollTimeout",
     "source": "chasm/lib/activity/config.go:17"
+  },
+  {
+    "key": "activity.startDelayEnabled",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "chasm/lib/activity/config.go:31"
   },
   {
     "key": "admin.enableListHistoryTasks",
@@ -29,7 +45,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:26"
+    "source": "common/dynamicconfig/constants.go:27"
   },
   {
     "key": "admin.matchingNamespaceTaskqueueToPartitionDispatchRate",
@@ -37,7 +53,7 @@
     "scope": "TaskQueue",
     "value_kind": "Float",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:36"
+    "source": "common/dynamicconfig/constants.go:37"
   },
   {
     "key": "admin.matchingNamespaceToPartitionDispatchRate",
@@ -45,7 +61,39 @@
     "scope": "Namespace",
     "value_kind": "Float",
     "default_expression": "10000",
-    "source": "common/dynamicconfig/constants.go:31"
+    "source": "common/dynamicconfig/constants.go:32"
+  },
+  {
+    "key": "callback.allowedAddresses",
+    "constructor": "NewNamespaceTypedSettingWithConverter",
+    "scope": "Namespace",
+    "value_kind": "Typed",
+    "default_expression": "AddressMatchRules{}",
+    "source": "chasm/lib/callback/config.go:82"
+  },
+  {
+    "key": "callback.encodeInternalTokenWithEnvelope",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "chasm/lib/callback/config.go:72"
+  },
+  {
+    "key": "callback.inspectSourceHeader",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "chasm/lib/callback/config.go:41"
+  },
+  {
+    "key": "callback.maxPerExecution",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "chasm/lib/callback/config.go:17"
   },
   {
     "key": "callback.request.timeout",
@@ -53,7 +101,7 @@
     "scope": "Destination",
     "value_kind": "Duration",
     "default_expression": "time.Second * 10",
-    "source": "chasm/lib/callback/config.go:17"
+    "source": "chasm/lib/callback/config.go:23"
   },
   {
     "key": "callback.retryPolicy.initialInterval",
@@ -61,7 +109,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Second",
-    "source": "chasm/lib/callback/config.go:23"
+    "source": "chasm/lib/callback/config.go:29"
   },
   {
     "key": "callback.retryPolicy.maxInterval",
@@ -69,23 +117,15 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Hour",
-    "source": "chasm/lib/callback/config.go:29"
+    "source": "chasm/lib/callback/config.go:35"
   },
   {
-    "key": "chasm.callback.allowedAddresses",
-    "constructor": "NewNamespaceTypedSettingWithConverter",
+    "key": "chasm.maxLinksPerComponent",
+    "constructor": "NewNamespaceIntSetting",
     "scope": "Namespace",
-    "value_kind": "Typed",
-    "default_expression": "AddressMatchRules{}",
-    "source": "chasm/lib/callback/config.go:55"
-  },
-  {
-    "key": "component.callbacks.allowedAddresses",
-    "constructor": "NewNamespaceTypedSettingWithConverter",
-    "scope": "Namespace",
-    "value_kind": "Typed",
-    "default_expression": "AddressMatchRules{}",
-    "source": "components/callbacks/config.go:55"
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "common/dynamicconfig/constants.go:1115"
   },
   {
     "key": "component.callbacks.request.timeout",
@@ -93,7 +133,7 @@
     "scope": "Destination",
     "value_kind": "Duration",
     "default_expression": "time.Second * 10",
-    "source": "components/callbacks/config.go:17"
+    "source": "components/callbacks/config.go:18"
   },
   {
     "key": "component.callbacks.retryPolicy.initialInterval",
@@ -101,7 +141,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Second",
-    "source": "components/callbacks/config.go:23"
+    "source": "components/callbacks/config.go:24"
   },
   {
     "key": "component.callbacks.retryPolicy.maxInterval",
@@ -109,7 +149,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Hour",
-    "source": "components/callbacks/config.go:29"
+    "source": "components/callbacks/config.go:30"
   },
   {
     "key": "component.nexusoperations.callback.endpoint.template",
@@ -117,15 +157,15 @@
     "scope": "Global",
     "value_kind": "String",
     "default_expression": "\"unset\"",
-    "source": "components/nexusoperations/config.go:126"
+    "source": "components/nexusoperations/config.go:114"
   },
   {
     "key": "component.nexusoperations.disallowedHeaders",
     "constructor": "NewGlobalTypedSettingWithConverter",
     "scope": "Global",
     "value_kind": "Typed",
-    "default_expression": "[]string{\n\t\"request-timeout\",\n\tinterceptor.DCRedirectionApiHeaderName,\n\tinterceptor.DCRedirectionContextHeaderName,\n\theaders.CallerNameHeaderName,\n\theaders.CallerTypeHeaderName,\n\theaders.CallOriginHeaderName,\n\theaders.PrincipalTypeHeaderName,\n\theaders.PrincipalNameHeaderName,\n}",
-    "source": "components/nexusoperations/config.go:91"
+    "default_expression": "[]string{\n\t\"request-timeout\",\n\tinterceptor.DCRedirectionAPIHeaderName,\n\tinterceptor.DCRedirectionSourceCellHeaderName,\n\tinterceptor.DCRedirectionContextHeaderName,\n\theaders.CallerNameHeaderName,\n\theaders.CallerTypeHeaderName,\n\theaders.CallOriginHeaderName,\n\theaders.PrincipalTypeHeaderName,\n\theaders.PrincipalNameHeaderName,\n}",
+    "source": "components/nexusoperations/config.go:78"
   },
   {
     "key": "component.nexusoperations.limit.dispatch.task.timeout.min",
@@ -181,7 +221,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "0",
-    "source": "components/nexusoperations/config.go:118"
+    "source": "components/nexusoperations/config.go:106"
   },
   {
     "key": "component.nexusoperations.limit.service.name.length",
@@ -197,7 +237,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "chasmnexus.NexusMetricTagConfig{}",
-    "source": "components/nexusoperations/config.go:146"
+    "source": "components/nexusoperations/config.go:134"
   },
   {
     "key": "component.nexusoperations.recordCancelRequestCompletionEvents",
@@ -205,7 +245,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "components/nexusoperations/config.go:159"
+    "source": "components/nexusoperations/config.go:147"
   },
   {
     "key": "component.nexusoperations.request.timeout",
@@ -221,7 +261,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Second",
-    "source": "components/nexusoperations/config.go:134"
+    "source": "components/nexusoperations/config.go:122"
   },
   {
     "key": "component.nexusoperations.retryPolicy.maxInterval",
@@ -229,15 +269,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Hour",
-    "source": "components/nexusoperations/config.go:140"
-  },
-  {
-    "key": "component.nexusoperations.useSystemCallbackURL",
-    "constructor": "NewGlobalBoolSetting",
-    "scope": "Global",
-    "value_kind": "Bool",
-    "default_expression": "true",
-    "source": "components/nexusoperations/config.go:78"
+    "source": "components/nexusoperations/config.go:128"
   },
   {
     "key": "dynamicconfig.subscriptionPollInterval",
@@ -245,7 +277,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Minute",
-    "source": "common/dynamicconfig/constants.go:18"
+    "source": "common/dynamicconfig/constants.go:19"
   },
   {
     "key": "frontend.ListWorkersEnabled",
@@ -253,7 +285,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:3217"
+    "source": "common/dynamicconfig/constants.go:3616"
   },
   {
     "key": "frontend.MaxConcurrentAdminBatchOperationPerNamespace",
@@ -261,7 +293,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:1035"
+    "source": "common/dynamicconfig/constants.go:1135"
   },
   {
     "key": "frontend.MaxConcurrentBatchOperationPerNamespace",
@@ -269,7 +301,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:1020"
+    "source": "common/dynamicconfig/constants.go:1120"
   },
   {
     "key": "frontend.MaxExecutionCountBatchOperationPerNamespace",
@@ -277,7 +309,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:1025"
+    "source": "common/dynamicconfig/constants.go:1125"
   },
   {
     "key": "frontend.WorkerCommandsEnabled",
@@ -285,7 +317,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:3223"
+    "source": "common/dynamicconfig/constants.go:3622"
   },
   {
     "key": "frontend.WorkerHeartbeatsEnabled",
@@ -293,7 +325,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:3201"
+    "source": "common/dynamicconfig/constants.go:3591"
   },
   {
     "key": "frontend.WorkflowPauseEnabled",
@@ -301,7 +333,23 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:3229"
+    "source": "common/dynamicconfig/constants.go:3634"
+  },
+  {
+    "key": "frontend.WorkflowTimeSkippingEnabled",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3639"
+  },
+  {
+    "key": "frontend.WorkflowTimeSkippingMaxSkipPerSession",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "200",
+    "source": "common/dynamicconfig/constants.go:3644"
   },
   {
     "key": "frontend.allowDeleteNamespaceIfNexusEndpointTarget",
@@ -309,7 +357,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:936"
+    "source": "common/dynamicconfig/constants.go:1025"
   },
   {
     "key": "frontend.allowedExperiments",
@@ -317,7 +365,7 @@
     "scope": "Namespace",
     "value_kind": "Typed",
     "default_expression": "[]string(nil)",
-    "source": "common/dynamicconfig/constants.go:588"
+    "source": "common/dynamicconfig/constants.go:669"
   },
   {
     "key": "frontend.callbackHeaderMaxLength",
@@ -325,7 +373,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "8 * 1024",
-    "source": "common/dynamicconfig/constants.go:993"
+    "source": "common/dynamicconfig/constants.go:1090"
   },
   {
     "key": "frontend.callbackURLMaxLength",
@@ -333,7 +381,15 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:988"
+    "source": "common/dynamicconfig/constants.go:1085"
+  },
+  {
+    "key": "frontend.contextMetadataSetTrailer",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:869"
   },
   {
     "key": "frontend.deleteNamespaceConcurrentDeleteExecutionsActivities",
@@ -341,7 +397,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "4",
-    "source": "common/dynamicconfig/constants.go:1089"
+    "source": "common/dynamicconfig/constants.go:1203"
   },
   {
     "key": "frontend.deleteNamespaceDeleteActivityRPS",
@@ -349,7 +405,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:1070"
+    "source": "common/dynamicconfig/constants.go:1184"
   },
   {
     "key": "frontend.deleteNamespaceDeletePageSize",
@@ -357,7 +413,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:1077"
+    "source": "common/dynamicconfig/constants.go:1191"
   },
   {
     "key": "frontend.deleteNamespaceNamespaceDeleteDelay",
@@ -365,7 +421,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "0 * time.Hour",
-    "source": "common/dynamicconfig/constants.go:1096"
+    "source": "common/dynamicconfig/constants.go:1210"
   },
   {
     "key": "frontend.deleteNamespacePagesPerExecution",
@@ -373,7 +429,15 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "256",
-    "source": "common/dynamicconfig/constants.go:1083"
+    "source": "common/dynamicconfig/constants.go:1197"
+  },
+  {
+    "key": "frontend.deleteNamespaceUseChasmDeleteExecution",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1175"
   },
   {
     "key": "frontend.disableListVisibilityByFilter",
@@ -381,7 +445,15 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:837"
+    "source": "common/dynamicconfig/constants.go:919"
+  },
+  {
+    "key": "frontend.enableBatchOperationsForStandaloneActivities",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1140"
   },
   {
     "key": "frontend.enableBatcher",
@@ -389,7 +461,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1030"
+    "source": "common/dynamicconfig/constants.go:1130"
   },
   {
     "key": "frontend.enableCancelWorkerPollsOnShutdown",
@@ -397,7 +469,15 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:3207"
+    "source": "common/dynamicconfig/constants.go:3597"
+  },
+  {
+    "key": "frontend.enableMatchingFanOutForPollCancellation",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3605"
   },
   {
     "key": "frontend.enablePrincipalPropagation",
@@ -405,7 +485,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:848"
+    "source": "common/dynamicconfig/constants.go:930"
   },
   {
     "key": "frontend.enableSchedules",
@@ -413,7 +493,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:901"
+    "source": "common/dynamicconfig/constants.go:983"
   },
   {
     "key": "frontend.enableServerVersionCheck",
@@ -421,7 +501,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "os.Getenv(\"TEMPORAL_VERSION_CHECK_DISABLED\") == \"\"",
-    "source": "common/dynamicconfig/constants.go:827"
+    "source": "common/dynamicconfig/constants.go:909"
   },
   {
     "key": "frontend.enableTokenNamespaceEnforcement",
@@ -429,7 +509,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:832"
+    "source": "common/dynamicconfig/constants.go:914"
   },
   {
     "key": "frontend.enableUpdateWorkflowExecution",
@@ -437,7 +517,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1041"
+    "source": "common/dynamicconfig/constants.go:1146"
   },
   {
     "key": "frontend.enableUpdateWorkflowExecutionAsyncAccepted",
@@ -445,7 +525,15 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1047"
+    "source": "common/dynamicconfig/constants.go:1152"
+  },
+  {
+    "key": "frontend.enforceScheduleDurationValidation",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:988"
   },
   {
     "key": "frontend.exposeAuthorizerErrors",
@@ -453,7 +541,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:842"
+    "source": "common/dynamicconfig/constants.go:924"
   },
   {
     "key": "frontend.globalNamespaceCount",
@@ -461,7 +549,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:683"
+    "source": "common/dynamicconfig/constants.go:769"
   },
   {
     "key": "frontend.globalNamespaceRPS",
@@ -469,7 +557,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:729"
+    "source": "common/dynamicconfig/constants.go:806"
   },
   {
     "key": "frontend.globalNamespaceRPS.namespaceReplicationInducingAPIs",
@@ -477,7 +565,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:750"
+    "source": "common/dynamicconfig/constants.go:827"
   },
   {
     "key": "frontend.globalNamespaceRPS.visibility",
@@ -485,7 +573,15 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:742"
+    "source": "common/dynamicconfig/constants.go:819"
+  },
+  {
+    "key": "frontend.globalNamespaceWorkerDeploymentReadBurstRatio",
+    "constructor": "NewNamespaceFloatSetting",
+    "scope": "Namespace",
+    "value_kind": "Float",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:752"
   },
   {
     "key": "frontend.globalNamespaceWorkerDeploymentReadRPS",
@@ -493,7 +589,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "50",
-    "source": "common/dynamicconfig/constants.go:666"
+    "source": "common/dynamicconfig/constants.go:747"
   },
   {
     "key": "frontend.globalRPS",
@@ -501,7 +597,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:643"
+    "source": "common/dynamicconfig/constants.go:724"
   },
   {
     "key": "frontend.historyHostErrorPercentage",
@@ -509,7 +605,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.5",
-    "source": "common/dynamicconfig/constants.go:792"
+    "source": "common/dynamicconfig/constants.go:874"
   },
   {
     "key": "frontend.historyHostSelfErrorProportion",
@@ -517,7 +613,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.05",
-    "source": "common/dynamicconfig/constants.go:797"
+    "source": "common/dynamicconfig/constants.go:879"
   },
   {
     "key": "frontend.historyMaxPageSize",
@@ -525,7 +621,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "primitives.GetHistoryMaxPageSize",
-    "source": "common/dynamicconfig/constants.go:633"
+    "source": "common/dynamicconfig/constants.go:714"
   },
   {
     "key": "frontend.httpAllowedHosts",
@@ -533,7 +629,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "MatchAnythingRE",
-    "source": "common/dynamicconfig/constants.go:593"
+    "source": "common/dynamicconfig/constants.go:674"
   },
   {
     "key": "frontend.keepAliveMaxConnectionAge",
@@ -541,7 +637,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:874"
+    "source": "common/dynamicconfig/constants.go:956"
   },
   {
     "key": "frontend.keepAliveMaxConnectionAgeGrace",
@@ -549,7 +645,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "70 * time.Second",
-    "source": "common/dynamicconfig/constants.go:882"
+    "source": "common/dynamicconfig/constants.go:964"
   },
   {
     "key": "frontend.keepAliveMaxConnectionIdle",
@@ -557,7 +653,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "2 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:866"
+    "source": "common/dynamicconfig/constants.go:948"
   },
   {
     "key": "frontend.keepAliveMinTime",
@@ -565,7 +661,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "10 * time.Second",
-    "source": "common/dynamicconfig/constants.go:854"
+    "source": "common/dynamicconfig/constants.go:936"
   },
   {
     "key": "frontend.keepAlivePermitWithoutStream",
@@ -573,7 +669,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:859"
+    "source": "common/dynamicconfig/constants.go:941"
   },
   {
     "key": "frontend.keepAliveTime",
@@ -581,7 +677,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:888"
+    "source": "common/dynamicconfig/constants.go:970"
   },
   {
     "key": "frontend.keepAliveTimeout",
@@ -589,7 +685,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "10 * time.Second",
-    "source": "common/dynamicconfig/constants.go:895"
+    "source": "common/dynamicconfig/constants.go:977"
   },
   {
     "key": "frontend.linkMaxSize",
@@ -597,7 +693,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "4000",
-    "source": "common/dynamicconfig/constants.go:1010"
+    "source": "common/dynamicconfig/constants.go:1105"
   },
   {
     "key": "frontend.maskInternalErrorDetails",
@@ -605,7 +701,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:787"
+    "source": "common/dynamicconfig/constants.go:864"
   },
   {
     "key": "frontend.maxBadBinaries",
@@ -613,7 +709,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:782"
+    "source": "common/dynamicconfig/constants.go:859"
   },
   {
     "key": "frontend.maxWorkflowRulesPerNamespace",
@@ -621,7 +717,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:3189"
+    "source": "common/dynamicconfig/constants.go:3579"
   },
   {
     "key": "frontend.maxlinksPerRequest",
@@ -629,7 +725,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:1015"
+    "source": "common/dynamicconfig/constants.go:1110"
   },
   {
     "key": "frontend.namespaceBurstRatio",
@@ -637,7 +733,7 @@
     "scope": "Namespace",
     "value_kind": "Float",
     "default_expression": "2",
-    "source": "common/dynamicconfig/constants.go:660"
+    "source": "common/dynamicconfig/constants.go:741"
   },
   {
     "key": "frontend.namespaceBurstRatio.namespaceReplicationInducingAPIs",
@@ -645,7 +741,7 @@
     "scope": "Namespace",
     "value_kind": "Float",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:720"
+    "source": "common/dynamicconfig/constants.go:797"
   },
   {
     "key": "frontend.namespaceBurstRatio.visibility",
@@ -653,7 +749,7 @@
     "scope": "Namespace",
     "value_kind": "Float",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:713"
+    "source": "common/dynamicconfig/constants.go:790"
   },
   {
     "key": "frontend.namespaceCount",
@@ -661,7 +757,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1200",
-    "source": "common/dynamicconfig/constants.go:671"
+    "source": "common/dynamicconfig/constants.go:757"
   },
   {
     "key": "frontend.namespaceRPS",
@@ -669,7 +765,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2400",
-    "source": "common/dynamicconfig/constants.go:655"
+    "source": "common/dynamicconfig/constants.go:736"
   },
   {
     "key": "frontend.namespaceRPS.namespaceReplicationInducingAPIs",
@@ -677,7 +773,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:706"
+    "source": "common/dynamicconfig/constants.go:783"
   },
   {
     "key": "frontend.namespaceRPS.visibility",
@@ -685,7 +781,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:700"
+    "source": "common/dynamicconfig/constants.go:777"
   },
   {
     "key": "frontend.nexusForwardRequestUseEndpointDispatch",
@@ -693,7 +789,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:979"
+    "source": "common/dynamicconfig/constants.go:1076"
   },
   {
     "key": "frontend.nexusRequestHeadersBlacklist",
@@ -701,7 +797,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "util.MustWildCardStringsToRegexp([]string{\n\t\"accept-encoding\",\n\t\"x-forwarded-for\",\n\t\"xdc-redirection\",\n\t\"xdc-redirection-api\",\n\t\"temporal-nexus-failure-support\",\n})",
-    "source": "common/dynamicconfig/constants.go:964"
+    "source": "common/dynamicconfig/constants.go:1061"
   },
   {
     "key": "frontend.persistenceDynamicRateLimitingParams",
@@ -709,7 +805,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "DefaultDynamicRateLimitingParams",
-    "source": "common/dynamicconfig/constants.go:621"
+    "source": "common/dynamicconfig/constants.go:702"
   },
   {
     "key": "frontend.persistenceGlobalMaxQPS",
@@ -717,7 +813,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:606"
+    "source": "common/dynamicconfig/constants.go:687"
   },
   {
     "key": "frontend.persistenceGlobalNamespaceMaxQPS",
@@ -725,7 +821,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:616"
+    "source": "common/dynamicconfig/constants.go:697"
   },
   {
     "key": "frontend.persistenceMaxQPS",
@@ -733,7 +829,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "2000",
-    "source": "common/dynamicconfig/constants.go:601"
+    "source": "common/dynamicconfig/constants.go:682"
   },
   {
     "key": "frontend.persistenceNamespaceMaxQPS",
@@ -741,15 +837,15 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:611"
+    "source": "common/dynamicconfig/constants.go:692"
   },
   {
-    "key": "frontend.pollWaitForNamespaceRateLimitToken",
+    "key": "frontend.pollerAutoscalingAutoEnroll",
     "constructor": "NewNamespaceBoolSetting",
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:691"
+    "source": "common/dynamicconfig/constants.go:3628"
   },
   {
     "key": "frontend.reachabilityQuerySetDurationSinceDefault",
@@ -757,7 +853,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:526"
+    "source": "common/dynamicconfig/constants.go:597"
   },
   {
     "key": "frontend.rps",
@@ -765,7 +861,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "2400",
-    "source": "common/dynamicconfig/constants.go:638"
+    "source": "common/dynamicconfig/constants.go:719"
   },
   {
     "key": "frontend.rps.namespaceReplicationInducingAPIs",
@@ -773,7 +869,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:648"
+    "source": "common/dynamicconfig/constants.go:729"
   },
   {
     "key": "frontend.searchAttributesNumberOfKeysLimit",
@@ -781,7 +877,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:807"
+    "source": "common/dynamicconfig/constants.go:889"
   },
   {
     "key": "frontend.searchAttributesSizeOfValueLimit",
@@ -789,7 +885,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2 * 1024",
-    "source": "common/dynamicconfig/constants.go:812"
+    "source": "common/dynamicconfig/constants.go:894"
   },
   {
     "key": "frontend.searchAttributesTotalSizeLimit",
@@ -797,7 +893,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "40 * 1024",
-    "source": "common/dynamicconfig/constants.go:817"
+    "source": "common/dynamicconfig/constants.go:899"
   },
   {
     "key": "frontend.sendRawWorkflowHistory",
@@ -805,7 +901,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:802"
+    "source": "common/dynamicconfig/constants.go:884"
   },
   {
     "key": "frontend.shutdownDrainDuration",
@@ -813,7 +909,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "0 * time.Second",
-    "source": "common/dynamicconfig/constants.go:772"
+    "source": "common/dynamicconfig/constants.go:849"
   },
   {
     "key": "frontend.shutdownFailHealthCheckDuration",
@@ -821,7 +917,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "0 * time.Second",
-    "source": "common/dynamicconfig/constants.go:777"
+    "source": "common/dynamicconfig/constants.go:854"
   },
   {
     "key": "frontend.throttledLogRPS",
@@ -829,7 +925,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:767"
+    "source": "common/dynamicconfig/constants.go:844"
   },
   {
     "key": "frontend.visibilityArchivalQueryMaxPageSize",
@@ -837,7 +933,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10000",
-    "source": "common/dynamicconfig/constants.go:822"
+    "source": "common/dynamicconfig/constants.go:904"
   },
   {
     "key": "frontend.visibilityMaxPageSize",
@@ -845,7 +941,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:628"
+    "source": "common/dynamicconfig/constants.go:709"
   },
   {
     "key": "frontend.workerVersioningDataAPIs",
@@ -853,7 +949,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1054"
+    "source": "common/dynamicconfig/constants.go:1159"
   },
   {
     "key": "frontend.workerVersioningRuleAPIs",
@@ -861,7 +957,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1064"
+    "source": "common/dynamicconfig/constants.go:1169"
   },
   {
     "key": "frontend.workerVersioningWorkflowAPIs",
@@ -869,7 +965,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1059"
+    "source": "common/dynamicconfig/constants.go:1164"
   },
   {
     "key": "frontend.workflowRulesAPIsEnabled",
@@ -877,7 +973,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:3183"
+    "source": "common/dynamicconfig/constants.go:3573"
   },
   {
     "key": "history.ChasmStandbyTaskDiscardDelay",
@@ -885,7 +981,7 @@
     "scope": "ChasmTaskType",
     "value_kind": "Duration",
     "default_expression": "24 * time.Hour",
-    "source": "common/dynamicconfig/constants.go:1759"
+    "source": "common/dynamicconfig/constants.go:2015"
   },
   {
     "key": "history.EnableHistoryReplicationRateLimiter",
@@ -893,7 +989,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2720"
+    "source": "common/dynamicconfig/constants.go:3001"
   },
   {
     "key": "history.EnableReplicationReceiverSlowSubmissionFlowControl",
@@ -901,7 +997,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2685"
+    "source": "common/dynamicconfig/constants.go:2966"
   },
   {
     "key": "history.EnableReplicationTaskBatching",
@@ -909,7 +1005,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2645"
+    "source": "common/dynamicconfig/constants.go:2916"
   },
   {
     "key": "history.EnableReplicationTaskTieredProcessing",
@@ -917,7 +1013,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2650"
+    "source": "common/dynamicconfig/constants.go:2921"
   },
   {
     "key": "history.MaxBufferedQueryCount",
@@ -925,7 +1021,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:2477"
+    "source": "common/dynamicconfig/constants.go:2748"
   },
   {
     "key": "history.ReplicationEnableDLQMetrics",
@@ -933,7 +1029,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2573"
+    "source": "common/dynamicconfig/constants.go:2844"
   },
   {
     "key": "history.ReplicationEnableRateLimit",
@@ -941,7 +1037,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2725"
+    "source": "common/dynamicconfig/constants.go:3006"
   },
   {
     "key": "history.ReplicationEnableRateLimitShadowMode",
@@ -949,7 +1045,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2730"
+    "source": "common/dynamicconfig/constants.go:3011"
   },
   {
     "key": "history.ReplicationEnableUpdateWithNewTaskMerge",
@@ -957,7 +1053,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2578"
+    "source": "common/dynamicconfig/constants.go:2849"
   },
   {
     "key": "history.ReplicationExecutableTaskErrorRetryBackoffCoefficient",
@@ -965,7 +1061,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "1.2",
-    "source": "common/dynamicconfig/constants.go:2765"
+    "source": "common/dynamicconfig/constants.go:3046"
   },
   {
     "key": "history.ReplicationExecutableTaskErrorRetryExpiration",
@@ -973,7 +1069,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "10 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2780"
+    "source": "common/dynamicconfig/constants.go:3061"
   },
   {
     "key": "history.ReplicationExecutableTaskErrorRetryMaxAttempts",
@@ -981,7 +1077,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "80",
-    "source": "common/dynamicconfig/constants.go:2775"
+    "source": "common/dynamicconfig/constants.go:3056"
   },
   {
     "key": "history.ReplicationExecutableTaskErrorRetryMaxInterval",
@@ -989,7 +1085,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2770"
+    "source": "common/dynamicconfig/constants.go:3051"
   },
   {
     "key": "history.ReplicationExecutableTaskErrorRetryWait",
@@ -997,7 +1093,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2760"
+    "source": "common/dynamicconfig/constants.go:3041"
   },
   {
     "key": "history.ReplicationLowPriorityProcessorSchedulerWorkerCount",
@@ -1005,7 +1101,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "128",
-    "source": "common/dynamicconfig/constants.go:2634"
+    "source": "common/dynamicconfig/constants.go:2905"
   },
   {
     "key": "history.ReplicationLowPriorityTaskParallelism",
@@ -1013,7 +1109,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:2639"
+    "source": "common/dynamicconfig/constants.go:2910"
   },
   {
     "key": "history.ReplicationMultipleBatches",
@@ -1021,7 +1117,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2584"
+    "source": "common/dynamicconfig/constants.go:2855"
   },
   {
     "key": "history.ReplicationProcessorSchedulerQueueSize",
@@ -1029,7 +1125,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "128",
-    "source": "common/dynamicconfig/constants.go:2624"
+    "source": "common/dynamicconfig/constants.go:2895"
   },
   {
     "key": "history.ReplicationProcessorSchedulerWorkerCount",
@@ -1037,7 +1133,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "512",
-    "source": "common/dynamicconfig/constants.go:2629"
+    "source": "common/dynamicconfig/constants.go:2900"
   },
   {
     "key": "history.ReplicationProgressCacheMaxSize",
@@ -1045,7 +1141,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "128000",
-    "source": "common/dynamicconfig/constants.go:2695"
+    "source": "common/dynamicconfig/constants.go:2976"
   },
   {
     "key": "history.ReplicationProgressCacheTTL",
@@ -1053,7 +1149,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Hour",
-    "source": "common/dynamicconfig/constants.go:2700"
+    "source": "common/dynamicconfig/constants.go:2981"
   },
   {
     "key": "history.ReplicationReceiverLivenessMultiplier",
@@ -1061,7 +1157,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "3",
-    "source": "common/dynamicconfig/constants.go:2710"
+    "source": "common/dynamicconfig/constants.go:2991"
   },
   {
     "key": "history.ReplicationReceiverMaxOutstandingTaskCount",
@@ -1069,7 +1165,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "500",
-    "source": "common/dynamicconfig/constants.go:2670"
+    "source": "common/dynamicconfig/constants.go:2951"
   },
   {
     "key": "history.ReplicationReceiverSlowSubmissionWindow",
@@ -1077,7 +1173,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "10 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2680"
+    "source": "common/dynamicconfig/constants.go:2961"
   },
   {
     "key": "history.ReplicationReceiverSubmissionLatencyThreshold",
@@ -1085,7 +1181,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2675"
+    "source": "common/dynamicconfig/constants.go:2956"
   },
   {
     "key": "history.ReplicationResendMaxBatchCount",
@@ -1093,7 +1189,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:2690"
+    "source": "common/dynamicconfig/constants.go:2971"
   },
   {
     "key": "history.ReplicationStreamEventLoopRetryMaxAttempts",
@@ -1101,7 +1197,15 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2665"
+    "source": "common/dynamicconfig/constants.go:2946"
+  },
+  {
+    "key": "history.ReplicationStreamReadBufferSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2926"
   },
   {
     "key": "history.ReplicationStreamSendEmptyTaskDuration",
@@ -1109,7 +1213,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Minute",
-    "source": "common/dynamicconfig/constants.go:2705"
+    "source": "common/dynamicconfig/constants.go:2986"
   },
   {
     "key": "history.ReplicationStreamSenderErrorRetryBackoffCoefficient",
@@ -1117,7 +1221,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "1.2",
-    "source": "common/dynamicconfig/constants.go:2740"
+    "source": "common/dynamicconfig/constants.go:3021"
   },
   {
     "key": "history.ReplicationStreamSenderErrorRetryExpiration",
@@ -1125,7 +1229,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "3 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2755"
+    "source": "common/dynamicconfig/constants.go:3036"
   },
   {
     "key": "history.ReplicationStreamSenderErrorRetryMaxAttempts",
@@ -1133,7 +1237,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "80",
-    "source": "common/dynamicconfig/constants.go:2750"
+    "source": "common/dynamicconfig/constants.go:3031"
   },
   {
     "key": "history.ReplicationStreamSenderErrorRetryMaxInterval",
@@ -1141,7 +1245,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "3 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2745"
+    "source": "common/dynamicconfig/constants.go:3026"
   },
   {
     "key": "history.ReplicationStreamSenderErrorRetryWait",
@@ -1149,7 +1253,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2735"
+    "source": "common/dynamicconfig/constants.go:3016"
   },
   {
     "key": "history.ReplicationStreamSenderHighPriorityQPS",
@@ -1157,7 +1261,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2655"
+    "source": "common/dynamicconfig/constants.go:2936"
   },
   {
     "key": "history.ReplicationStreamSenderLivenessMultiplier",
@@ -1165,7 +1269,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:2715"
+    "source": "common/dynamicconfig/constants.go:2996"
   },
   {
     "key": "history.ReplicationStreamSenderLowPriorityQPS",
@@ -1173,7 +1277,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2660"
+    "source": "common/dynamicconfig/constants.go:2941"
   },
   {
     "key": "history.ReplicationStreamSyncStatusDuration",
@@ -1181,7 +1285,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2619"
+    "source": "common/dynamicconfig/constants.go:2890"
   },
   {
     "key": "history.ReplicationTaskApplyTimeout",
@@ -1189,7 +1293,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "20 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2498"
+    "source": "common/dynamicconfig/constants.go:2769"
   },
   {
     "key": "history.ReplicationTaskFetcherAggregationInterval",
@@ -1197,7 +1301,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "2 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2508"
+    "source": "common/dynamicconfig/constants.go:2779"
   },
   {
     "key": "history.ReplicationTaskFetcherErrorRetryWait",
@@ -1205,7 +1309,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Second",
-    "source": "common/dynamicconfig/constants.go:2518"
+    "source": "common/dynamicconfig/constants.go:2789"
   },
   {
     "key": "history.ReplicationTaskFetcherParallelism",
@@ -1213,7 +1317,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "4",
-    "source": "common/dynamicconfig/constants.go:2503"
+    "source": "common/dynamicconfig/constants.go:2774"
   },
   {
     "key": "history.ReplicationTaskFetcherTimerJitterCoefficient",
@@ -1221,7 +1325,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2513"
+    "source": "common/dynamicconfig/constants.go:2784"
   },
   {
     "key": "history.ReplicationTaskProcessorCleanupInterval",
@@ -1229,7 +1333,7 @@
     "scope": "ShardID",
     "value_kind": "Duration",
     "default_expression": "1 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2553"
+    "source": "common/dynamicconfig/constants.go:2824"
   },
   {
     "key": "history.ReplicationTaskProcessorCleanupJitterCoefficient",
@@ -1237,7 +1341,7 @@
     "scope": "ShardID",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2558"
+    "source": "common/dynamicconfig/constants.go:2829"
   },
   {
     "key": "history.ReplicationTaskProcessorErrorRetryBackoffCoefficient",
@@ -1245,7 +1349,7 @@
     "scope": "ShardID",
     "value_kind": "Float",
     "default_expression": "1.2",
-    "source": "common/dynamicconfig/constants.go:2528"
+    "source": "common/dynamicconfig/constants.go:2799"
   },
   {
     "key": "history.ReplicationTaskProcessorErrorRetryExpiration",
@@ -1253,7 +1357,7 @@
     "scope": "ShardID",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2543"
+    "source": "common/dynamicconfig/constants.go:2814"
   },
   {
     "key": "history.ReplicationTaskProcessorErrorRetryMaxAttempts",
@@ -1261,7 +1365,7 @@
     "scope": "ShardID",
     "value_kind": "Int",
     "default_expression": "80",
-    "source": "common/dynamicconfig/constants.go:2538"
+    "source": "common/dynamicconfig/constants.go:2809"
   },
   {
     "key": "history.ReplicationTaskProcessorErrorRetryMaxInterval",
@@ -1269,7 +1373,7 @@
     "scope": "ShardID",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2533"
+    "source": "common/dynamicconfig/constants.go:2804"
   },
   {
     "key": "history.ReplicationTaskProcessorErrorRetryWait",
@@ -1277,7 +1381,7 @@
     "scope": "ShardID",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2523"
+    "source": "common/dynamicconfig/constants.go:2794"
   },
   {
     "key": "history.ReplicationTaskProcessorHostQPS",
@@ -1285,7 +1389,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "1500",
-    "source": "common/dynamicconfig/constants.go:2563"
+    "source": "common/dynamicconfig/constants.go:2834"
   },
   {
     "key": "history.ReplicationTaskProcessorNoTaskInitialWait",
@@ -1293,7 +1397,7 @@
     "scope": "ShardID",
     "value_kind": "Duration",
     "default_expression": "2 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2548"
+    "source": "common/dynamicconfig/constants.go:2819"
   },
   {
     "key": "history.ReplicationTaskProcessorShardQPS",
@@ -1301,7 +1405,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "30",
-    "source": "common/dynamicconfig/constants.go:2568"
+    "source": "common/dynamicconfig/constants.go:2839"
   },
   {
     "key": "history.SkipReapplicationByNamespaceID",
@@ -1309,7 +1413,7 @@
     "scope": "NamespaceID",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2467"
+    "source": "common/dynamicconfig/constants.go:2738"
   },
   {
     "key": "history.TaskDLQEnabled",
@@ -1317,7 +1421,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2589"
+    "source": "common/dynamicconfig/constants.go:2860"
   },
   {
     "key": "history.TaskDLQErrorPattern",
@@ -1325,7 +1429,7 @@
     "scope": "Global",
     "value_kind": "String",
     "default_expression": "\"\"",
-    "source": "common/dynamicconfig/constants.go:2606"
+    "source": "common/dynamicconfig/constants.go:2877"
   },
   {
     "key": "history.TaskDLQInternalErrors",
@@ -1333,7 +1437,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2600"
+    "source": "common/dynamicconfig/constants.go:2871"
   },
   {
     "key": "history.TaskDLQUnexpectedErrorAttempts",
@@ -1341,7 +1445,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "70",
-    "source": "common/dynamicconfig/constants.go:2595"
+    "source": "common/dynamicconfig/constants.go:2866"
   },
   {
     "key": "history.acquireShardConcurrency",
@@ -1349,7 +1453,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:1693"
+    "source": "common/dynamicconfig/constants.go:1939"
   },
   {
     "key": "history.acquireShardInterval",
@@ -1357,7 +1461,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Minute",
-    "source": "common/dynamicconfig/constants.go:1688"
+    "source": "common/dynamicconfig/constants.go:1934"
   },
   {
     "key": "history.alignMembershipChange",
@@ -1365,7 +1469,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "0 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1652"
+    "source": "common/dynamicconfig/constants.go:1898"
   },
   {
     "key": "history.allowResetWithPendingChildren",
@@ -1373,7 +1477,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2396"
+    "source": "common/dynamicconfig/constants.go:2667"
   },
   {
     "key": "history.archivalBackendMaxRPS",
@@ -1381,7 +1485,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "10000.0",
-    "source": "common/dynamicconfig/constants.go:2278"
+    "source": "common/dynamicconfig/constants.go:2540"
   },
   {
     "key": "history.archivalProcessorArchiveDelay",
@@ -1389,7 +1493,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2273"
+    "source": "common/dynamicconfig/constants.go:2535"
   },
   {
     "key": "history.archivalProcessorMaxPollHostRPS",
@@ -1397,7 +1501,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:2236"
+    "source": "common/dynamicconfig/constants.go:2498"
   },
   {
     "key": "history.archivalProcessorMaxPollInterval",
@@ -1405,7 +1509,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2247"
+    "source": "common/dynamicconfig/constants.go:2509"
   },
   {
     "key": "history.archivalProcessorMaxPollIntervalJitterCoefficient",
@@ -1413,7 +1517,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2252"
+    "source": "common/dynamicconfig/constants.go:2514"
   },
   {
     "key": "history.archivalProcessorMaxPollRPS",
@@ -1421,7 +1525,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:2231"
+    "source": "common/dynamicconfig/constants.go:2493"
   },
   {
     "key": "history.archivalProcessorPollBackoffInterval",
@@ -1429,7 +1533,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2267"
+    "source": "common/dynamicconfig/constants.go:2529"
   },
   {
     "key": "history.archivalProcessorSchedulerWorkerCount",
@@ -1437,7 +1541,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "512",
-    "source": "common/dynamicconfig/constants.go:2241"
+    "source": "common/dynamicconfig/constants.go:2503"
   },
   {
     "key": "history.archivalProcessorUpdateAckInterval",
@@ -1445,7 +1549,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "30 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2257"
+    "source": "common/dynamicconfig/constants.go:2519"
   },
   {
     "key": "history.archivalProcessorUpdateAckIntervalJitterCoefficient",
@@ -1453,7 +1557,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2262"
+    "source": "common/dynamicconfig/constants.go:2524"
   },
   {
     "key": "history.archivalQueueMaxReaderCount",
@@ -1461,7 +1565,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "2",
-    "source": "common/dynamicconfig/constants.go:2283"
+    "source": "common/dynamicconfig/constants.go:2545"
   },
   {
     "key": "history.archivalTaskBatchSize",
@@ -1469,7 +1573,39 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2226"
+    "source": "common/dynamicconfig/constants.go:2488"
+  },
+  {
+    "key": "history.businessIDReuseBurstRatio",
+    "constructor": "NewNamespaceFloatSetting",
+    "scope": "Namespace",
+    "value_kind": "Float",
+    "default_expression": "1.0",
+    "source": "common/dynamicconfig/constants.go:3082"
+  },
+  {
+    "key": "history.businessIDReuseLimiterCacheSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10000",
+    "source": "common/dynamicconfig/constants.go:3088"
+  },
+  {
+    "key": "history.businessIDReuseLimiterCacheTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "60 * time.Second",
+    "source": "common/dynamicconfig/constants.go:3094"
+  },
+  {
+    "key": "history.businessIDReuseRate",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:3076"
   },
   {
     "key": "history.cacheBackgroundEvict",
@@ -1477,7 +1613,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "DefaultHistoryCacheBackgroundEvictSettings",
-    "source": "common/dynamicconfig/constants.go:1623"
+    "source": "common/dynamicconfig/constants.go:1869"
   },
   {
     "key": "history.cacheNonUserContextLockTimeout",
@@ -1485,7 +1621,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "500 * time.Millisecond",
-    "source": "common/dynamicconfig/constants.go:1605"
+    "source": "common/dynamicconfig/constants.go:1851"
   },
   {
     "key": "history.cacheSizeBasedLimit",
@@ -1493,7 +1629,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1593"
+    "source": "common/dynamicconfig/constants.go:1839"
   },
   {
     "key": "history.cacheTTL",
@@ -1501,7 +1637,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Hour",
-    "source": "common/dynamicconfig/constants.go:1600"
+    "source": "common/dynamicconfig/constants.go:1846"
   },
   {
     "key": "history.chasmMaxInMemoryPureTasks",
@@ -1509,7 +1645,23 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "32",
-    "source": "common/dynamicconfig/constants.go:2837"
+    "source": "common/dynamicconfig/constants.go:3153"
+  },
+  {
+    "key": "history.chasmSchedulerCreationRolloutPercent",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:3166"
+  },
+  {
+    "key": "history.chasmSchedulerMigrationRolloutPercent",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:3188"
   },
   {
     "key": "history.clientOwnershipCachingEnabled",
@@ -1517,7 +1669,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1718"
+    "source": "common/dynamicconfig/constants.go:1964"
   },
   {
     "key": "history.clientOwnershipCachingUnusedTTL",
@@ -1525,7 +1677,15 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "30 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1726"
+    "source": "common/dynamicconfig/constants.go:1972"
+  },
+  {
+    "key": "history.connectionCloseDelay",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "60 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1980"
   },
   {
     "key": "history.defaultActivityRetryPolicy",
@@ -1533,7 +1693,7 @@
     "scope": "Namespace",
     "value_kind": "Typed",
     "default_expression": "retrypolicy.DefaultDefaultRetrySettings",
-    "source": "common/dynamicconfig/constants.go:2384"
+    "source": "common/dynamicconfig/constants.go:2655"
   },
   {
     "key": "history.defaultWorkflowRetryPolicy",
@@ -1541,7 +1701,7 @@
     "scope": "Namespace",
     "value_kind": "Typed",
     "default_expression": "retrypolicy.DefaultDefaultRetrySettings",
-    "source": "common/dynamicconfig/constants.go:2390"
+    "source": "common/dynamicconfig/constants.go:2661"
   },
   {
     "key": "history.defaultWorkflowTaskTimeout",
@@ -1549,7 +1709,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "primitives.DefaultWorkflowTaskTimeout",
-    "source": "common/dynamicconfig/constants.go:2462"
+    "source": "common/dynamicconfig/constants.go:2733"
   },
   {
     "key": "history.disableFetchRelocatableAttributesFromVisibility",
@@ -1557,7 +1717,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2219"
+    "source": "common/dynamicconfig/constants.go:2481"
   },
   {
     "key": "history.discardSpeculativeWorkflowTaskMaximumEventsCount",
@@ -1565,7 +1725,15 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:2447"
+    "source": "common/dynamicconfig/constants.go:2718"
+  },
+  {
+    "key": "history.emitReplicationLifecycleEvents",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1736"
   },
   {
     "key": "history.emitShardLagLog",
@@ -1573,7 +1741,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2379"
+    "source": "common/dynamicconfig/constants.go:2650"
   },
   {
     "key": "history.enableBestEffortDeleteTasksOnWorkflowUpdate",
@@ -1581,15 +1749,15 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1582"
+    "source": "common/dynamicconfig/constants.go:1802"
   },
   {
     "key": "history.enableCHASMCallbacks",
     "constructor": "NewNamespaceBoolSetting",
     "scope": "Namespace",
     "value_kind": "Bool",
-    "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2870"
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3211"
   },
   {
     "key": "history.enableCHASMSchedulerCreation",
@@ -1597,7 +1765,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2843"
+    "source": "common/dynamicconfig/constants.go:3159"
   },
   {
     "key": "history.enableCHASMSchedulerMigration",
@@ -1605,23 +1773,47 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2857"
+    "source": "common/dynamicconfig/constants.go:3181"
+  },
+  {
+    "key": "history.enableCHASMSchedulerMigrationWithRunningWorkflows",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3197"
   },
   {
     "key": "history.enableCHASMSchedulerRouting",
     "constructor": "NewNamespaceBoolSetting",
     "scope": "Namespace",
     "value_kind": "Bool",
-    "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2850"
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3174"
   },
   {
     "key": "history.enableCHASMSchedulerSentinels",
     "constructor": "NewNamespaceBoolSetting",
     "scope": "Namespace",
     "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3205"
+  },
+  {
+    "key": "history.enableCHASMSignalBacklinks",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2864"
+    "source": "common/dynamicconfig/constants.go:3224"
+  },
+  {
+    "key": "history.enableCHASMSkipPersistence",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3145"
   },
   {
     "key": "history.enableChasm",
@@ -1629,15 +1821,15 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2831"
+    "source": "common/dynamicconfig/constants.go:3140"
   },
   {
-    "key": "history.enableDeleteWorkflowExecutionReplication",
+    "key": "history.enableCloseInboundReplicationStreamOnShutdown",
     "constructor": "NewGlobalBoolSetting",
     "scope": "Global",
     "value_kind": "Bool",
-    "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1537"
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1741"
   },
   {
     "key": "history.enableDropRepeatedWorkflowTaskFailures",
@@ -1645,7 +1837,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2452"
+    "source": "common/dynamicconfig/constants.go:2723"
   },
   {
     "key": "history.enableHistoryReplicationDLQV2",
@@ -1653,7 +1845,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1530"
+    "source": "common/dynamicconfig/constants.go:1751"
   },
   {
     "key": "history.enableHostLevelEventsCache",
@@ -1661,7 +1853,23 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1683"
+    "source": "common/dynamicconfig/constants.go:1929"
+  },
+  {
+    "key": "history.enablePaginationTokenBranchValidation",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1717"
+  },
+  {
+    "key": "history.enablePaginationTokenBranchValidationShadowMode",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1724"
   },
   {
     "key": "history.enableParentClosePolicy",
@@ -1669,7 +1877,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2406"
+    "source": "common/dynamicconfig/constants.go:2677"
   },
   {
     "key": "history.enableReplicationStream",
@@ -1677,7 +1885,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1520"
+    "source": "common/dynamicconfig/constants.go:1731"
   },
   {
     "key": "history.enableSeparateReplicationEnableFlag",
@@ -1685,7 +1893,23 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1525"
+    "source": "common/dynamicconfig/constants.go:1746"
+  },
+  {
+    "key": "history.enableSignalWithStartFromWorkflow",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3218"
+  },
+  {
+    "key": "history.enableStandaloneActivityOperatorCommands",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "chasm/lib/activity/config.go:43"
   },
   {
     "key": "history.enableTransitionHistory",
@@ -1693,7 +1917,15 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1641"
+    "source": "common/dynamicconfig/constants.go:1887"
+  },
+  {
+    "key": "history.enableUpdateCallbacks",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3232"
   },
   {
     "key": "history.enableUpdateWithStartRetryOnClosedWorkflowAbort",
@@ -1701,7 +1933,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2309"
+    "source": "common/dynamicconfig/constants.go:2571"
   },
   {
     "key": "history.enableUpdateWithStartRetryableErrorOnClosedWorkflowAbort",
@@ -1709,7 +1941,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2314"
+    "source": "common/dynamicconfig/constants.go:2576"
   },
   {
     "key": "history.enableUpdateWorkflowModeIgnoreCurrent",
@@ -1717,15 +1949,15 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1635"
+    "source": "common/dynamicconfig/constants.go:1881"
   },
   {
     "key": "history.enableVersionReactivationSignals",
     "constructor": "NewGlobalBoolSetting",
     "scope": "Global",
     "value_kind": "Bool",
-    "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2902"
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3260"
   },
   {
     "key": "history.enableWorkflowExecutionTimeoutTimer",
@@ -1733,7 +1965,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1629"
+    "source": "common/dynamicconfig/constants.go:1875"
   },
   {
     "key": "history.enableWorkflowIdReuseStartTimeValidation",
@@ -1741,7 +1973,15 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2790"
+    "source": "common/dynamicconfig/constants.go:3071"
+  },
+  {
+    "key": "history.enableWorkflowTaskCompletionPagination",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1808"
   },
   {
     "key": "history.enableWorkflowTaskStampIncrementOnFailure",
@@ -1749,7 +1989,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2442"
+    "source": "common/dynamicconfig/constants.go:2713"
   },
   {
     "key": "history.eventsCacheMaxSizeBytes",
@@ -1757,7 +1997,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "512 * 1024",
-    "source": "common/dynamicconfig/constants.go:1668"
+    "source": "common/dynamicconfig/constants.go:1914"
   },
   {
     "key": "history.eventsCacheTTL",
@@ -1765,7 +2005,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Hour",
-    "source": "common/dynamicconfig/constants.go:1678"
+    "source": "common/dynamicconfig/constants.go:1924"
   },
   {
     "key": "history.eventsHostLevelCacheMaxSizeBytes",
@@ -1773,7 +2013,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "512 * 512 * 1024",
-    "source": "common/dynamicconfig/constants.go:1673"
+    "source": "common/dynamicconfig/constants.go:1919"
   },
   {
     "key": "history.externalPayloadsEnabled",
@@ -1781,7 +2021,15 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2922"
+    "source": "common/dynamicconfig/constants.go:3280"
+  },
+  {
+    "key": "history.healthHistoryInitializationTime",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "60 * time.Second",
+    "source": "common/dynamicconfig/constants.go:3120"
   },
   {
     "key": "history.healthPersistenceErrorRatio",
@@ -1789,7 +2037,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.90",
-    "source": "common/dynamicconfig/constants.go:2800"
+    "source": "common/dynamicconfig/constants.go:3105"
   },
   {
     "key": "history.healthPersistenceLatencyFailure",
@@ -1797,7 +2045,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "500",
-    "source": "common/dynamicconfig/constants.go:2795"
+    "source": "common/dynamicconfig/constants.go:3100"
   },
   {
     "key": "history.healthRPCErrorRatio",
@@ -1805,7 +2053,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.90",
-    "source": "common/dynamicconfig/constants.go:2810"
+    "source": "common/dynamicconfig/constants.go:3115"
   },
   {
     "key": "history.healthRPCLatencyFailure",
@@ -1813,7 +2061,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "500",
-    "source": "common/dynamicconfig/constants.go:2805"
+    "source": "common/dynamicconfig/constants.go:3110"
   },
   {
     "key": "history.historyMaxAutoResetPoints",
@@ -1821,7 +2069,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "primitives.DefaultHistoryMaxAutoResetPoints",
-    "source": "common/dynamicconfig/constants.go:2401"
+    "source": "common/dynamicconfig/constants.go:2672"
   },
   {
     "key": "history.hostLevelCacheMaxSize",
@@ -1829,7 +2077,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "128000",
-    "source": "common/dynamicconfig/constants.go:1611"
+    "source": "common/dynamicconfig/constants.go:1857"
   },
   {
     "key": "history.hostLevelCacheMaxSizeBytes",
@@ -1837,7 +2085,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "256000 * 4 * 1024",
-    "source": "common/dynamicconfig/constants.go:1617"
+    "source": "common/dynamicconfig/constants.go:1863"
   },
   {
     "key": "history.longPollExpirationInterval",
@@ -1845,7 +2093,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "time.Second * 20",
-    "source": "common/dynamicconfig/constants.go:1588"
+    "source": "common/dynamicconfig/constants.go:1834"
   },
   {
     "key": "history.maxInFlightUpdatePayloads",
@@ -1853,7 +2101,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "20 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:2294"
+    "source": "common/dynamicconfig/constants.go:2556"
   },
   {
     "key": "history.maxInFlightUpdates",
@@ -1861,7 +2109,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:2289"
+    "source": "common/dynamicconfig/constants.go:2551"
   },
   {
     "key": "history.maxLocalParentWorkflowVerificationDuration",
@@ -1869,7 +2117,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2613"
+    "source": "common/dynamicconfig/constants.go:2884"
   },
   {
     "key": "history.maxTotalUpdates",
@@ -1877,7 +2125,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2000",
-    "source": "common/dynamicconfig/constants.go:2299"
+    "source": "common/dynamicconfig/constants.go:2561"
   },
   {
     "key": "history.maxTotalUpdates.suggestContinueAsNewThreshold",
@@ -1885,7 +2133,7 @@
     "scope": "Namespace",
     "value_kind": "Float",
     "default_expression": "0.9",
-    "source": "common/dynamicconfig/constants.go:2304"
+    "source": "common/dynamicconfig/constants.go:2566"
   },
   {
     "key": "history.maximumBufferedEventsBatch",
@@ -1893,7 +2141,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2340"
+    "source": "common/dynamicconfig/constants.go:2602"
   },
   {
     "key": "history.maximumBufferedEventsSizeInBytes",
@@ -1901,7 +2149,15 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "2 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:2345"
+    "source": "common/dynamicconfig/constants.go:2607"
+  },
+  {
+    "key": "history.maximumEventBatchSizeInBytes",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2613"
   },
   {
     "key": "history.maximumSignalsPerExecution",
@@ -1909,7 +2165,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10000",
-    "source": "common/dynamicconfig/constants.go:2351"
+    "source": "common/dynamicconfig/constants.go:2622"
   },
   {
     "key": "history.memoryTimerProcessorSchedulerWorkerCount",
@@ -1917,7 +2173,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "64",
-    "source": "common/dynamicconfig/constants.go:1960"
+    "source": "common/dynamicconfig/constants.go:2222"
   },
   {
     "key": "history.mutableStateChecksumGenProbability",
@@ -1925,7 +2181,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:2482"
+    "source": "common/dynamicconfig/constants.go:2753"
   },
   {
     "key": "history.mutableStateChecksumInvalidateBefore",
@@ -1933,7 +2189,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:2492"
+    "source": "common/dynamicconfig/constants.go:2763"
   },
   {
     "key": "history.mutableStateChecksumVerifyProbability",
@@ -1941,7 +2197,15 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:2487"
+    "source": "common/dynamicconfig/constants.go:2758"
+  },
+  {
+    "key": "history.namespaceRPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1763"
   },
   {
     "key": "history.numParentClosePolicySystemWorkflows",
@@ -1949,7 +2213,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:2417"
+    "source": "common/dynamicconfig/constants.go:2688"
   },
   {
     "key": "history.outboundProcessorMaxPollHostRPS",
@@ -1957,7 +2221,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:2066"
+    "source": "common/dynamicconfig/constants.go:2328"
   },
   {
     "key": "history.outboundProcessorMaxPollInterval",
@@ -1965,7 +2229,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2071"
+    "source": "common/dynamicconfig/constants.go:2333"
   },
   {
     "key": "history.outboundProcessorMaxPollIntervalJitterCoefficient",
@@ -1973,7 +2237,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2076"
+    "source": "common/dynamicconfig/constants.go:2338"
   },
   {
     "key": "history.outboundProcessorMaxPollRPS",
@@ -1981,7 +2245,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:2061"
+    "source": "common/dynamicconfig/constants.go:2323"
   },
   {
     "key": "history.outboundProcessorPollBackoffInterval",
@@ -1989,7 +2253,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2091"
+    "source": "common/dynamicconfig/constants.go:2353"
   },
   {
     "key": "history.outboundProcessorUpdateAckInterval",
@@ -1997,7 +2261,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "30 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2081"
+    "source": "common/dynamicconfig/constants.go:2343"
   },
   {
     "key": "history.outboundProcessorUpdateAckIntervalJitterCoefficient",
@@ -2005,7 +2269,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2086"
+    "source": "common/dynamicconfig/constants.go:2348"
   },
   {
     "key": "history.outboundQueue.circuitBreakerSettings",
@@ -2013,7 +2277,7 @@
     "scope": "Destination",
     "value_kind": "Typed",
     "default_expression": "CircuitBreakerSettings{}",
-    "source": "common/dynamicconfig/constants.go:2116"
+    "source": "common/dynamicconfig/constants.go:2378"
   },
   {
     "key": "history.outboundQueue.groupLimiter.bufferSize",
@@ -2021,7 +2285,7 @@
     "scope": "Destination",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2101"
+    "source": "common/dynamicconfig/constants.go:2363"
   },
   {
     "key": "history.outboundQueue.groupLimiter.concurrency",
@@ -2029,7 +2293,7 @@
     "scope": "Destination",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2106"
+    "source": "common/dynamicconfig/constants.go:2368"
   },
   {
     "key": "history.outboundQueue.hostScheduler.maxTaskRPS",
@@ -2037,7 +2301,7 @@
     "scope": "Destination",
     "value_kind": "Float",
     "default_expression": "100.0",
-    "source": "common/dynamicconfig/constants.go:2111"
+    "source": "common/dynamicconfig/constants.go:2373"
   },
   {
     "key": "history.outboundQueue.standbyTaskMissingEventsDestinationDownErr",
@@ -2045,7 +2309,7 @@
     "scope": "Destination",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2133"
+    "source": "common/dynamicconfig/constants.go:2395"
   },
   {
     "key": "history.outboundQueue.standbyTaskMissingEventsDiscardDelay",
@@ -2053,7 +2317,7 @@
     "scope": "Destination",
     "value_kind": "Duration",
     "default_expression": "time.Duration(math.MaxInt64)",
-    "source": "common/dynamicconfig/constants.go:2126"
+    "source": "common/dynamicconfig/constants.go:2388"
   },
   {
     "key": "history.outboundQueueMaxPredicateSize",
@@ -2061,7 +2325,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10 * 1024",
-    "source": "common/dynamicconfig/constants.go:2051"
+    "source": "common/dynamicconfig/constants.go:2313"
   },
   {
     "key": "history.outboundQueueMaxReaderCount",
@@ -2069,7 +2333,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "4",
-    "source": "common/dynamicconfig/constants.go:2096"
+    "source": "common/dynamicconfig/constants.go:2358"
   },
   {
     "key": "history.outboundQueuePendingTaskCriticalCount",
@@ -2077,7 +2341,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "9000",
-    "source": "common/dynamicconfig/constants.go:2046"
+    "source": "common/dynamicconfig/constants.go:2308"
   },
   {
     "key": "history.outboundQueuePendingTasksMaxCount",
@@ -2085,7 +2349,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10000",
-    "source": "common/dynamicconfig/constants.go:2037"
+    "source": "common/dynamicconfig/constants.go:2299"
   },
   {
     "key": "history.outboundTaskBatchSize",
@@ -2093,7 +2357,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2032"
+    "source": "common/dynamicconfig/constants.go:2294"
   },
   {
     "key": "history.parentClosePolicyThreshold",
@@ -2101,7 +2365,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:2411"
+    "source": "common/dynamicconfig/constants.go:2682"
   },
   {
     "key": "history.persistenceDynamicRateLimitingParams",
@@ -2109,7 +2373,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "DefaultDynamicRateLimitingParams",
-    "source": "common/dynamicconfig/constants.go:1575"
+    "source": "common/dynamicconfig/constants.go:1795"
   },
   {
     "key": "history.persistenceGlobalMaxQPS",
@@ -2117,7 +2381,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1554"
+    "source": "common/dynamicconfig/constants.go:1774"
   },
   {
     "key": "history.persistenceGlobalNamespaceMaxQPS",
@@ -2125,7 +2389,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1565"
+    "source": "common/dynamicconfig/constants.go:1785"
   },
   {
     "key": "history.persistenceMaxQPS",
@@ -2133,7 +2397,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "9000",
-    "source": "common/dynamicconfig/constants.go:1549"
+    "source": "common/dynamicconfig/constants.go:1769"
   },
   {
     "key": "history.persistenceNamespaceMaxQPS",
@@ -2141,7 +2405,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1559"
+    "source": "common/dynamicconfig/constants.go:1779"
   },
   {
     "key": "history.persistencePerShardNamespaceMaxQPS",
@@ -2149,7 +2413,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1570"
+    "source": "common/dynamicconfig/constants.go:1790"
   },
   {
     "key": "history.queueCriticalSlicesCount",
@@ -2157,7 +2421,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "50",
-    "source": "common/dynamicconfig/constants.go:1781"
+    "source": "common/dynamicconfig/constants.go:2037"
   },
   {
     "key": "history.queueMaxPredicateSize",
@@ -2165,7 +2429,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10 * 1024",
-    "source": "common/dynamicconfig/constants.go:1797"
+    "source": "common/dynamicconfig/constants.go:2053"
   },
   {
     "key": "history.queueMoveGroupTaskCountBase",
@@ -2173,7 +2437,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "500",
-    "source": "common/dynamicconfig/constants.go:1806"
+    "source": "common/dynamicconfig/constants.go:2068"
   },
   {
     "key": "history.queueMoveGroupTaskCountMultiplier",
@@ -2181,7 +2445,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "3.0",
-    "source": "common/dynamicconfig/constants.go:1812"
+    "source": "common/dynamicconfig/constants.go:2074"
   },
   {
     "key": "history.queuePendingTaskCriticalCount",
@@ -2189,7 +2453,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "9000",
-    "source": "common/dynamicconfig/constants.go:1768"
+    "source": "common/dynamicconfig/constants.go:2024"
   },
   {
     "key": "history.queuePendingTasksMaxCount",
@@ -2197,7 +2461,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10000",
-    "source": "common/dynamicconfig/constants.go:1787"
+    "source": "common/dynamicconfig/constants.go:2043"
   },
   {
     "key": "history.queueReaderStuckCriticalAttempts",
@@ -2205,7 +2469,15 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "3",
-    "source": "common/dynamicconfig/constants.go:1774"
+    "source": "common/dynamicconfig/constants.go:2030"
+  },
+  {
+    "key": "history.queueShrinkPredicateMaxPendingKeys",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:2062"
   },
   {
     "key": "history.replicatorMaxSkipTaskCount",
@@ -2213,7 +2485,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "250",
-    "source": "common/dynamicconfig/constants.go:2325"
+    "source": "common/dynamicconfig/constants.go:2587"
   },
   {
     "key": "history.replicatorProcessorMaxPollInterval",
@@ -2221,7 +2493,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2330"
+    "source": "common/dynamicconfig/constants.go:2592"
   },
   {
     "key": "history.replicatorProcessorMaxPollIntervalJitterCoefficient",
@@ -2229,7 +2501,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2335"
+    "source": "common/dynamicconfig/constants.go:2597"
   },
   {
     "key": "history.replicatorTaskBatchSize",
@@ -2237,7 +2509,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2320"
+    "source": "common/dynamicconfig/constants.go:2582"
   },
   {
     "key": "history.retentionTimerJitterDuration",
@@ -2245,7 +2517,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "30 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1954"
+    "source": "common/dynamicconfig/constants.go:2216"
   },
   {
     "key": "history.routingInfoCacheMaxSize",
@@ -2253,7 +2525,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10000",
-    "source": "common/dynamicconfig/constants.go:2916"
+    "source": "common/dynamicconfig/constants.go:3274"
   },
   {
     "key": "history.routingInfoCacheTTL",
@@ -2261,7 +2533,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2910"
+    "source": "common/dynamicconfig/constants.go:3268"
   },
   {
     "key": "history.rps",
@@ -2269,7 +2541,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "3000",
-    "source": "common/dynamicconfig/constants.go:1544"
+    "source": "common/dynamicconfig/constants.go:1758"
   },
   {
     "key": "history.sendRawHistoryBetweenInternalServices",
@@ -2277,7 +2549,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2815"
+    "source": "common/dynamicconfig/constants.go:3124"
   },
   {
     "key": "history.sendRawHistoryBytesToMatchingService",
@@ -2285,7 +2557,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2825"
+    "source": "common/dynamicconfig/constants.go:3134"
   },
   {
     "key": "history.sendTransientOrSpeculativeWorkflowTaskEvents",
@@ -2293,7 +2565,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2457"
+    "source": "common/dynamicconfig/constants.go:2728"
   },
   {
     "key": "history.shardFinalizerTimeout",
@@ -2301,7 +2573,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "2 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1712"
+    "source": "common/dynamicconfig/constants.go:1958"
   },
   {
     "key": "history.shardFirstUpdateInterval",
@@ -2309,7 +2581,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "10 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2361"
+    "source": "common/dynamicconfig/constants.go:2632"
   },
   {
     "key": "history.shardIOConcurrency",
@@ -2317,7 +2589,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:1732"
+    "source": "common/dynamicconfig/constants.go:1988"
   },
   {
     "key": "history.shardIOTimeout",
@@ -2325,7 +2597,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second * debug.TimeoutMultiplier",
-    "source": "common/dynamicconfig/constants.go:1737"
+    "source": "common/dynamicconfig/constants.go:1993"
   },
   {
     "key": "history.shardLingerOwnershipCheckQPS",
@@ -2333,7 +2605,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "4",
-    "source": "common/dynamicconfig/constants.go:1698"
+    "source": "common/dynamicconfig/constants.go:1944"
   },
   {
     "key": "history.shardLingerTimeLimit",
@@ -2341,7 +2613,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1704"
+    "source": "common/dynamicconfig/constants.go:1950"
   },
   {
     "key": "history.shardSyncMinInterval",
@@ -2349,7 +2621,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2374"
+    "source": "common/dynamicconfig/constants.go:2645"
   },
   {
     "key": "history.shardUpdateMinInterval",
@@ -2357,7 +2629,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2356"
+    "source": "common/dynamicconfig/constants.go:2627"
   },
   {
     "key": "history.shardUpdateMinTasksCompleted",
@@ -2365,7 +2637,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:2367"
+    "source": "common/dynamicconfig/constants.go:2638"
   },
   {
     "key": "history.shutdownDrainDuration",
@@ -2373,7 +2645,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "0 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1658"
+    "source": "common/dynamicconfig/constants.go:1904"
   },
   {
     "key": "history.standbyClusterDelay",
@@ -2381,7 +2653,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1742"
+    "source": "common/dynamicconfig/constants.go:1998"
   },
   {
     "key": "history.standbyTaskMissingEventsDiscardDelay",
@@ -2389,7 +2661,7 @@
     "scope": "TaskType",
     "value_kind": "Duration",
     "default_expression": "15 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1753"
+    "source": "common/dynamicconfig/constants.go:2009"
   },
   {
     "key": "history.standbyTaskMissingEventsResendDelay",
@@ -2397,7 +2669,7 @@
     "scope": "TaskType",
     "value_kind": "Duration",
     "default_expression": "10 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1747"
+    "source": "common/dynamicconfig/constants.go:2003"
   },
   {
     "key": "history.standbyTaskReReplicationContextTimeout",
@@ -2405,7 +2677,7 @@
     "scope": "NamespaceID",
     "value_kind": "Duration",
     "default_expression": "30 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2472"
+    "source": "common/dynamicconfig/constants.go:2743"
   },
   {
     "key": "history.startupMembershipJoinDelay",
@@ -2413,7 +2685,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "0 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1646"
+    "source": "common/dynamicconfig/constants.go:1892"
   },
   {
     "key": "history.taskSchedulerEnableExecutionQueueScheduler",
@@ -2421,7 +2693,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1864"
+    "source": "common/dynamicconfig/constants.go:2126"
   },
   {
     "key": "history.taskSchedulerEnableRateLimiter",
@@ -2429,7 +2701,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1819"
+    "source": "common/dynamicconfig/constants.go:2081"
   },
   {
     "key": "history.taskSchedulerEnableRateLimiterShadowMode",
@@ -2437,7 +2709,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1824"
+    "source": "common/dynamicconfig/constants.go:2086"
   },
   {
     "key": "history.taskSchedulerExecutionQueueSchedulerMaxQueues",
@@ -2445,7 +2717,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "500",
-    "source": "common/dynamicconfig/constants.go:1870"
+    "source": "common/dynamicconfig/constants.go:2132"
   },
   {
     "key": "history.taskSchedulerExecutionQueueSchedulerQueueConcurrency",
@@ -2453,7 +2725,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "2",
-    "source": "common/dynamicconfig/constants.go:1882"
+    "source": "common/dynamicconfig/constants.go:2144"
   },
   {
     "key": "history.taskSchedulerExecutionQueueSchedulerQueueTTL",
@@ -2461,7 +2733,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1876"
+    "source": "common/dynamicconfig/constants.go:2138"
   },
   {
     "key": "history.taskSchedulerGlobalMaxQPS",
@@ -2469,7 +2741,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1835"
+    "source": "common/dynamicconfig/constants.go:2097"
   },
   {
     "key": "history.taskSchedulerGlobalNamespaceMaxQPS",
@@ -2477,7 +2749,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1847"
+    "source": "common/dynamicconfig/constants.go:2109"
   },
   {
     "key": "history.taskSchedulerInactiveChannelDeletionDelay",
@@ -2485,7 +2757,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Hour",
-    "source": "common/dynamicconfig/constants.go:1859"
+    "source": "common/dynamicconfig/constants.go:2121"
   },
   {
     "key": "history.taskSchedulerMaxQPS",
@@ -2493,7 +2765,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1841"
+    "source": "common/dynamicconfig/constants.go:2103"
   },
   {
     "key": "history.taskSchedulerNamespaceMaxQPS",
@@ -2501,7 +2773,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1853"
+    "source": "common/dynamicconfig/constants.go:2115"
   },
   {
     "key": "history.taskSchedulerRateLimiterStartupDelay",
@@ -2509,7 +2781,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1830"
+    "source": "common/dynamicconfig/constants.go:2092"
   },
   {
     "key": "history.throttledLogRPS",
@@ -2517,7 +2789,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "4",
-    "source": "common/dynamicconfig/constants.go:2422"
+    "source": "common/dynamicconfig/constants.go:2693"
   },
   {
     "key": "history.timerProcessorMaxPollHostRPS",
@@ -2525,7 +2797,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1924"
+    "source": "common/dynamicconfig/constants.go:2186"
   },
   {
     "key": "history.timerProcessorMaxPollInterval",
@@ -2533,7 +2805,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1929"
+    "source": "common/dynamicconfig/constants.go:2191"
   },
   {
     "key": "history.timerProcessorMaxPollIntervalJitterCoefficient",
@@ -2541,7 +2813,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:1934"
+    "source": "common/dynamicconfig/constants.go:2196"
   },
   {
     "key": "history.timerProcessorMaxPollRPS",
@@ -2549,7 +2821,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:1919"
+    "source": "common/dynamicconfig/constants.go:2181"
   },
   {
     "key": "history.timerProcessorMaxTimeShift",
@@ -2557,7 +2829,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1944"
+    "source": "common/dynamicconfig/constants.go:2206"
   },
   {
     "key": "history.timerProcessorPollBackoffInterval",
@@ -2565,7 +2837,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1939"
+    "source": "common/dynamicconfig/constants.go:2201"
   },
   {
     "key": "history.timerProcessorSchedulerActiveRoundRobinWeights",
@@ -2573,7 +2845,7 @@
     "scope": "Namespace",
     "value_kind": "Map",
     "default_expression": "nil",
-    "source": "common/dynamicconfig/constants.go:1899"
+    "source": "common/dynamicconfig/constants.go:2161"
   },
   {
     "key": "history.timerProcessorSchedulerStandbyRoundRobinWeights",
@@ -2581,7 +2853,7 @@
     "scope": "Namespace",
     "value_kind": "Map",
     "default_expression": "nil",
-    "source": "common/dynamicconfig/constants.go:1904"
+    "source": "common/dynamicconfig/constants.go:2166"
   },
   {
     "key": "history.timerProcessorSchedulerWorkerCount",
@@ -2589,7 +2861,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "512",
-    "source": "common/dynamicconfig/constants.go:1894"
+    "source": "common/dynamicconfig/constants.go:2156"
   },
   {
     "key": "history.timerProcessorUpdateAckInterval",
@@ -2597,7 +2869,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "30 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1909"
+    "source": "common/dynamicconfig/constants.go:2171"
   },
   {
     "key": "history.timerProcessorUpdateAckIntervalJitterCoefficient",
@@ -2605,7 +2877,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:1914"
+    "source": "common/dynamicconfig/constants.go:2176"
   },
   {
     "key": "history.timerQueueMaxReaderCount",
@@ -2613,7 +2885,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "2",
-    "source": "common/dynamicconfig/constants.go:1949"
+    "source": "common/dynamicconfig/constants.go:2211"
   },
   {
     "key": "history.timerTaskBatchSize",
@@ -2621,7 +2893,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:1889"
+    "source": "common/dynamicconfig/constants.go:2151"
   },
   {
     "key": "history.transferProcessorEnsureCloseBeforeDelete",
@@ -2629,7 +2901,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:2021"
+    "source": "common/dynamicconfig/constants.go:2283"
   },
   {
     "key": "history.transferProcessorMaxPollHostRPS",
@@ -2637,7 +2909,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1976"
+    "source": "common/dynamicconfig/constants.go:2238"
   },
   {
     "key": "history.transferProcessorMaxPollInterval",
@@ -2645,7 +2917,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1996"
+    "source": "common/dynamicconfig/constants.go:2258"
   },
   {
     "key": "history.transferProcessorMaxPollIntervalJitterCoefficient",
@@ -2653,7 +2925,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2001"
+    "source": "common/dynamicconfig/constants.go:2263"
   },
   {
     "key": "history.transferProcessorMaxPollRPS",
@@ -2661,7 +2933,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:1971"
+    "source": "common/dynamicconfig/constants.go:2233"
   },
   {
     "key": "history.transferProcessorPollBackoffInterval",
@@ -2669,7 +2941,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2016"
+    "source": "common/dynamicconfig/constants.go:2278"
   },
   {
     "key": "history.transferProcessorSchedulerActiveRoundRobinWeights",
@@ -2677,7 +2949,7 @@
     "scope": "Namespace",
     "value_kind": "Map",
     "default_expression": "nil",
-    "source": "common/dynamicconfig/constants.go:1986"
+    "source": "common/dynamicconfig/constants.go:2248"
   },
   {
     "key": "history.transferProcessorSchedulerStandbyRoundRobinWeights",
@@ -2685,7 +2957,7 @@
     "scope": "Namespace",
     "value_kind": "Map",
     "default_expression": "nil",
-    "source": "common/dynamicconfig/constants.go:1991"
+    "source": "common/dynamicconfig/constants.go:2253"
   },
   {
     "key": "history.transferProcessorSchedulerWorkerCount",
@@ -2693,7 +2965,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "512",
-    "source": "common/dynamicconfig/constants.go:1981"
+    "source": "common/dynamicconfig/constants.go:2243"
   },
   {
     "key": "history.transferProcessorUpdateAckInterval",
@@ -2701,7 +2973,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "30 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2006"
+    "source": "common/dynamicconfig/constants.go:2268"
   },
   {
     "key": "history.transferProcessorUpdateAckIntervalJitterCoefficient",
@@ -2709,7 +2981,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2011"
+    "source": "common/dynamicconfig/constants.go:2273"
   },
   {
     "key": "history.transferQueueMaxReaderCount",
@@ -2717,7 +2989,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "2",
-    "source": "common/dynamicconfig/constants.go:2026"
+    "source": "common/dynamicconfig/constants.go:2288"
   },
   {
     "key": "history.transferTaskBatchSize",
@@ -2725,7 +2997,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:1966"
+    "source": "common/dynamicconfig/constants.go:2228"
   },
   {
     "key": "history.versionMembershipCacheMaxSize",
@@ -2733,7 +3005,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10000",
-    "source": "common/dynamicconfig/constants.go:2883"
+    "source": "common/dynamicconfig/constants.go:3246"
   },
   {
     "key": "history.versionMembershipCacheTTL",
@@ -2741,23 +3013,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2877"
-  },
-  {
-    "key": "history.versionReactivationSignalCacheMaxSize",
-    "constructor": "NewGlobalIntSetting",
-    "scope": "Global",
-    "value_kind": "Int",
-    "default_expression": "10000",
-    "source": "common/dynamicconfig/constants.go:2896"
-  },
-  {
-    "key": "history.versionReactivationSignalCacheTTL",
-    "constructor": "NewGlobalDurationSetting",
-    "scope": "Global",
-    "value_kind": "Duration",
-    "default_expression": "10 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2889"
+    "source": "common/dynamicconfig/constants.go:3240"
   },
   {
     "key": "history.visibilityProcessorEnableCloseWorkflowCleanup",
@@ -2765,7 +3021,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2200"
+    "source": "common/dynamicconfig/constants.go:2462"
   },
   {
     "key": "history.visibilityProcessorEnsureCloseBeforeDelete",
@@ -2773,7 +3029,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:2195"
+    "source": "common/dynamicconfig/constants.go:2457"
   },
   {
     "key": "history.visibilityProcessorMaxPollHostRPS",
@@ -2781,7 +3037,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:2150"
+    "source": "common/dynamicconfig/constants.go:2412"
   },
   {
     "key": "history.visibilityProcessorMaxPollInterval",
@@ -2789,7 +3045,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:2170"
+    "source": "common/dynamicconfig/constants.go:2432"
   },
   {
     "key": "history.visibilityProcessorMaxPollIntervalJitterCoefficient",
@@ -2797,7 +3053,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2175"
+    "source": "common/dynamicconfig/constants.go:2437"
   },
   {
     "key": "history.visibilityProcessorMaxPollRPS",
@@ -2805,7 +3061,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:2145"
+    "source": "common/dynamicconfig/constants.go:2407"
   },
   {
     "key": "history.visibilityProcessorPollBackoffInterval",
@@ -2813,7 +3069,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2190"
+    "source": "common/dynamicconfig/constants.go:2452"
   },
   {
     "key": "history.visibilityProcessorRelocateAttributesMinBlobSize",
@@ -2821,7 +3077,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:2207"
+    "source": "common/dynamicconfig/constants.go:2469"
   },
   {
     "key": "history.visibilityProcessorSchedulerActiveRoundRobinWeights",
@@ -2829,7 +3085,7 @@
     "scope": "Namespace",
     "value_kind": "Map",
     "default_expression": "nil",
-    "source": "common/dynamicconfig/constants.go:2160"
+    "source": "common/dynamicconfig/constants.go:2422"
   },
   {
     "key": "history.visibilityProcessorSchedulerStandbyRoundRobinWeights",
@@ -2837,7 +3093,7 @@
     "scope": "Namespace",
     "value_kind": "Map",
     "default_expression": "nil",
-    "source": "common/dynamicconfig/constants.go:2165"
+    "source": "common/dynamicconfig/constants.go:2427"
   },
   {
     "key": "history.visibilityProcessorSchedulerWorkerCount",
@@ -2845,7 +3101,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "512",
-    "source": "common/dynamicconfig/constants.go:2155"
+    "source": "common/dynamicconfig/constants.go:2417"
   },
   {
     "key": "history.visibilityProcessorUpdateAckInterval",
@@ -2853,7 +3109,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "30 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2180"
+    "source": "common/dynamicconfig/constants.go:2442"
   },
   {
     "key": "history.visibilityProcessorUpdateAckIntervalJitterCoefficient",
@@ -2861,7 +3117,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.15",
-    "source": "common/dynamicconfig/constants.go:2185"
+    "source": "common/dynamicconfig/constants.go:2447"
   },
   {
     "key": "history.visibilityQueueMaxReaderCount",
@@ -2869,7 +3125,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "2",
-    "source": "common/dynamicconfig/constants.go:2213"
+    "source": "common/dynamicconfig/constants.go:2475"
   },
   {
     "key": "history.visibilityTaskBatchSize",
@@ -2877,7 +3133,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2140"
+    "source": "common/dynamicconfig/constants.go:2402"
   },
   {
     "key": "history.workflowIdReuseMinimalInterval",
@@ -2885,7 +3141,31 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2785"
+    "source": "common/dynamicconfig/constants.go:3066"
+  },
+  {
+    "key": "history.workflowTaskCompletionBufferNamespaceRatio",
+    "constructor": "NewNamespaceFloatSetting",
+    "scope": "Namespace",
+    "value_kind": "Float",
+    "default_expression": "0.5",
+    "source": "common/dynamicconfig/constants.go:1827"
+  },
+  {
+    "key": "history.workflowTaskCompletionBufferSizeLimit",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "40 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:1821"
+  },
+  {
+    "key": "history.workflowTaskCompletionBufferTotalSizeLimit",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1024 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:1814"
   },
   {
     "key": "history.workflowTaskCriticalAttempt",
@@ -2893,7 +3173,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:2432"
+    "source": "common/dynamicconfig/constants.go:2703"
   },
   {
     "key": "history.workflowTaskHeartbeatTimeout",
@@ -2901,7 +3181,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "time.Minute * 30",
-    "source": "common/dynamicconfig/constants.go:2427"
+    "source": "common/dynamicconfig/constants.go:2698"
   },
   {
     "key": "history.workflowTaskRetryMaxInterval",
@@ -2909,7 +3189,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Minute * 10",
-    "source": "common/dynamicconfig/constants.go:2437"
+    "source": "common/dynamicconfig/constants.go:2708"
   },
   {
     "key": "history.xdcCacheMaxSizeBytes",
@@ -2917,7 +3197,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "8 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:1663"
+    "source": "common/dynamicconfig/constants.go:1909"
   },
   {
     "key": "internal-frontend.globalNamespaceRPS",
@@ -2925,7 +3205,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:736"
+    "source": "common/dynamicconfig/constants.go:813"
   },
   {
     "key": "internal-frontend.globalNamespaceRPS.visibility",
@@ -2933,7 +3213,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:760"
+    "source": "common/dynamicconfig/constants.go:837"
   },
   {
     "key": "limit.blobSize.error",
@@ -2941,7 +3221,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:316"
+    "source": "common/dynamicconfig/constants.go:387"
   },
   {
     "key": "limit.blobSize.warn",
@@ -2949,7 +3229,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "512 * 1024",
-    "source": "common/dynamicconfig/constants.go:321"
+    "source": "common/dynamicconfig/constants.go:392"
   },
   {
     "key": "limit.endpointDescriptionMaxSize",
@@ -2957,7 +3237,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "20000",
-    "source": "common/dynamicconfig/constants.go:554"
+    "source": "common/dynamicconfig/constants.go:625"
   },
   {
     "key": "limit.endpointExternalURLMaxLength",
@@ -2965,7 +3245,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "4 * 1024",
-    "source": "common/dynamicconfig/constants.go:549"
+    "source": "common/dynamicconfig/constants.go:620"
   },
   {
     "key": "limit.endpointListDefaultPageSize",
@@ -2973,7 +3253,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:559"
+    "source": "common/dynamicconfig/constants.go:630"
   },
   {
     "key": "limit.endpointListMaxPageSize",
@@ -2981,7 +3261,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:564"
+    "source": "common/dynamicconfig/constants.go:635"
   },
   {
     "key": "limit.endpointNameMaxLength",
@@ -2989,7 +3269,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "200",
-    "source": "common/dynamicconfig/constants.go:544"
+    "source": "common/dynamicconfig/constants.go:615"
   },
   {
     "key": "limit.historyCount.error",
@@ -2997,7 +3277,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "50 * 1024",
-    "source": "common/dynamicconfig/constants.go:376"
+    "source": "common/dynamicconfig/constants.go:447"
   },
   {
     "key": "limit.historyCount.suggestContinueAsNew",
@@ -3005,7 +3285,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "4 * 1024",
-    "source": "common/dynamicconfig/constants.go:412"
+    "source": "common/dynamicconfig/constants.go:483"
   },
   {
     "key": "limit.historyCount.warn",
@@ -3013,7 +3293,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10 * 1024",
-    "source": "common/dynamicconfig/constants.go:381"
+    "source": "common/dynamicconfig/constants.go:452"
   },
   {
     "key": "limit.historyMaxPageSize",
@@ -3021,7 +3301,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "primitives.GetHistoryMaxPageSize",
-    "source": "common/dynamicconfig/constants.go:418"
+    "source": "common/dynamicconfig/constants.go:489"
   },
   {
     "key": "limit.historySize.error",
@@ -3029,7 +3309,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "50 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:360"
+    "source": "common/dynamicconfig/constants.go:431"
   },
   {
     "key": "limit.historySize.suggestContinueAsNew",
@@ -3037,7 +3317,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "4 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:370"
+    "source": "common/dynamicconfig/constants.go:441"
   },
   {
     "key": "limit.historySize.warn",
@@ -3045,7 +3325,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:365"
+    "source": "common/dynamicconfig/constants.go:436"
   },
   {
     "key": "limit.maxIDLength",
@@ -3053,7 +3333,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:423"
+    "source": "common/dynamicconfig/constants.go:494"
   },
   {
     "key": "limit.memoSize.error",
@@ -3061,7 +3341,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:326"
+    "source": "common/dynamicconfig/constants.go:397"
   },
   {
     "key": "limit.memoSize.warn",
@@ -3069,7 +3349,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2 * 1024",
-    "source": "common/dynamicconfig/constants.go:331"
+    "source": "common/dynamicconfig/constants.go:402"
   },
   {
     "key": "limit.mutableStateActivityFailureSize.error",
@@ -3077,7 +3357,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "4 * 1024",
-    "source": "common/dynamicconfig/constants.go:386"
+    "source": "common/dynamicconfig/constants.go:457"
   },
   {
     "key": "limit.mutableStateActivityFailureSize.warn",
@@ -3085,7 +3365,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2 * 1024",
-    "source": "common/dynamicconfig/constants.go:392"
+    "source": "common/dynamicconfig/constants.go:463"
   },
   {
     "key": "limit.mutableStateSize.error",
@@ -3093,7 +3373,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "8 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:397"
+    "source": "common/dynamicconfig/constants.go:468"
   },
   {
     "key": "limit.mutableStateSize.warn",
@@ -3101,7 +3381,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:402"
+    "source": "common/dynamicconfig/constants.go:473"
   },
   {
     "key": "limit.mutableStateTombstoneCountLimit",
@@ -3109,7 +3389,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "16",
-    "source": "common/dynamicconfig/constants.go:407"
+    "source": "common/dynamicconfig/constants.go:478"
   },
   {
     "key": "limit.numPendingActivities.error",
@@ -3117,7 +3397,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2000",
-    "source": "common/dynamicconfig/constants.go:342"
+    "source": "common/dynamicconfig/constants.go:413"
   },
   {
     "key": "limit.numPendingCancelRequests.error",
@@ -3125,7 +3405,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2000",
-    "source": "common/dynamicconfig/constants.go:354"
+    "source": "common/dynamicconfig/constants.go:425"
   },
   {
     "key": "limit.numPendingChildExecutions.error",
@@ -3133,7 +3413,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2000",
-    "source": "common/dynamicconfig/constants.go:336"
+    "source": "common/dynamicconfig/constants.go:407"
   },
   {
     "key": "limit.numPendingSignals.error",
@@ -3141,7 +3421,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2000",
-    "source": "common/dynamicconfig/constants.go:348"
+    "source": "common/dynamicconfig/constants.go:419"
   },
   {
     "key": "limit.reachabilityQueryBuildIds",
@@ -3149,7 +3429,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "5",
-    "source": "common/dynamicconfig/constants.go:510"
+    "source": "common/dynamicconfig/constants.go:581"
   },
   {
     "key": "limit.reachabilityTaskQueueScan",
@@ -3157,7 +3437,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:504"
+    "source": "common/dynamicconfig/constants.go:575"
   },
   {
     "key": "limit.taskQueuesPerBuildId",
@@ -3165,7 +3445,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:538"
+    "source": "common/dynamicconfig/constants.go:609"
   },
   {
     "key": "limit.userMetadataDetailsSize",
@@ -3173,7 +3453,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "20000",
-    "source": "common/dynamicconfig/constants.go:3171"
+    "source": "common/dynamicconfig/constants.go:3555"
   },
   {
     "key": "limit.userMetadataSummarySize",
@@ -3181,7 +3461,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "400",
-    "source": "common/dynamicconfig/constants.go:3166"
+    "source": "common/dynamicconfig/constants.go:3550"
   },
   {
     "key": "limit.versionBuildIdLimitPerQueue",
@@ -3189,7 +3469,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:444"
+    "source": "common/dynamicconfig/constants.go:515"
   },
   {
     "key": "limit.versionCompatibleSetLimitPerQueue",
@@ -3197,7 +3477,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:437"
+    "source": "common/dynamicconfig/constants.go:508"
   },
   {
     "key": "limit.workerBuildIdSize",
@@ -3205,7 +3485,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "255",
-    "source": "common/dynamicconfig/constants.go:429"
+    "source": "common/dynamicconfig/constants.go:500"
   },
   {
     "key": "limit.wv.AssignmentRuleLimitPerQueue",
@@ -3213,7 +3493,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:451"
+    "source": "common/dynamicconfig/constants.go:522"
   },
   {
     "key": "limit.wv.RedirectRuleLimitPerQueue",
@@ -3221,7 +3501,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "500",
-    "source": "common/dynamicconfig/constants.go:458"
+    "source": "common/dynamicconfig/constants.go:529"
   },
   {
     "key": "limit.wv.RedirectRuleMaxUpstreamBuildIDsPerQueue",
@@ -3229,7 +3509,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "50",
-    "source": "common/dynamicconfig/constants.go:465"
+    "source": "common/dynamicconfig/constants.go:536"
   },
   {
     "key": "matching.PollerHistoryTTL",
@@ -3237,7 +3517,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:478"
+    "source": "common/dynamicconfig/constants.go:549"
   },
   {
     "key": "matching.TaskQueueInfoByBuildIdTTL",
@@ -3245,7 +3525,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1360"
+    "source": "common/dynamicconfig/constants.go:1494"
   },
   {
     "key": "matching.alignMembershipChange",
@@ -3253,7 +3533,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "0 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1276"
+    "source": "common/dynamicconfig/constants.go:1405"
   },
   {
     "key": "matching.autoEnableV2",
@@ -3261,7 +3541,7 @@
     "scope": "TaskQueue",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1470"
+    "source": "common/dynamicconfig/constants.go:1634"
   },
   {
     "key": "matching.backlogMetricsEmitInterval",
@@ -3269,7 +3549,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "time.Minute",
-    "source": "common/dynamicconfig/constants.go:1303"
+    "source": "common/dynamicconfig/constants.go:1432"
   },
   {
     "key": "matching.backlogNegligibleAge",
@@ -3277,7 +3557,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1313"
+    "source": "common/dynamicconfig/constants.go:1442"
   },
   {
     "key": "matching.backlogTaskForwardTimeout",
@@ -3285,7 +3565,15 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "60 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1436"
+    "source": "common/dynamicconfig/constants.go:1587"
+  },
+  {
+    "key": "matching.connectionCloseDelay",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1708"
   },
   {
     "key": "matching.deploymentWorkflowVersion",
@@ -3293,7 +3581,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2",
-    "source": "common/dynamicconfig/constants.go:1365"
+    "source": "common/dynamicconfig/constants.go:1499"
   },
   {
     "key": "matching.emitTaskDispatchLatencyAtPoll",
@@ -3301,7 +3589,7 @@
     "scope": "TaskQueue",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1332"
+    "source": "common/dynamicconfig/constants.go:1466"
   },
   {
     "key": "matching.enableFairness",
@@ -3309,15 +3597,7 @@
     "scope": "TaskQueue",
     "value_kind": "Typed",
     "default_expression": "StaticGradualChange(false)",
-    "source": "common/dynamicconfig/constants.go:1420"
-  },
-  {
-    "key": "matching.enableMigration",
-    "constructor": "NewTaskQueueBoolSetting",
-    "scope": "TaskQueue",
-    "value_kind": "Bool",
-    "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1426"
+    "source": "common/dynamicconfig/constants.go:1576"
   },
   {
     "key": "matching.enablePollerAutoscalingMetrics",
@@ -3325,7 +3605,23 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1463"
+    "source": "common/dynamicconfig/constants.go:1627"
+  },
+  {
+    "key": "matching.enablePollerScalingDecisionMetrics",
+    "constructor": "NewTaskQueueBoolSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1563"
+  },
+  {
+    "key": "matching.enableWorkerDeploymentVersionDemotionSignal",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1508"
   },
   {
     "key": "matching.enableWorkerPluginMetrics",
@@ -3333,7 +3629,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:1456"
+    "source": "common/dynamicconfig/constants.go:1620"
   },
   {
     "key": "matching.ephemeralDataUpdateInterval",
@@ -3341,7 +3637,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1297"
+    "source": "common/dynamicconfig/constants.go:1426"
   },
   {
     "key": "matching.fairnessCounter",
@@ -3349,7 +3645,7 @@
     "scope": "TaskQueue",
     "value_kind": "Typed",
     "default_expression": "counter.DefaultCounterParams",
-    "source": "common/dynamicconfig/constants.go:1441"
+    "source": "common/dynamicconfig/constants.go:1597"
   },
   {
     "key": "matching.fairnessKeyRateLimitCacheSize",
@@ -3357,7 +3653,23 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "2000",
-    "source": "common/dynamicconfig/constants.go:1446"
+    "source": "common/dynamicconfig/constants.go:1610"
+  },
+  {
+    "key": "matching.fairnessPassDither",
+    "constructor": "NewTaskQueueBoolSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1602"
+  },
+  {
+    "key": "matching.forwardPollRetryMaxInterval",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1592"
   },
   {
     "key": "matching.forwarderMaxChildrenPerNode",
@@ -3365,7 +3677,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:1271"
+    "source": "common/dynamicconfig/constants.go:1400"
   },
   {
     "key": "matching.forwarderMaxOutstandingPolls",
@@ -3373,7 +3685,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:1256"
+    "source": "common/dynamicconfig/constants.go:1385"
   },
   {
     "key": "matching.forwarderMaxOutstandingTasks",
@@ -3381,7 +3693,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:1261"
+    "source": "common/dynamicconfig/constants.go:1390"
   },
   {
     "key": "matching.forwarderMaxRatePerSecond",
@@ -3389,7 +3701,7 @@
     "scope": "TaskQueue",
     "value_kind": "Float",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:1266"
+    "source": "common/dynamicconfig/constants.go:1395"
   },
   {
     "key": "matching.getTasksBatchSize",
@@ -3397,7 +3709,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:1148"
+    "source": "common/dynamicconfig/constants.go:1268"
   },
   {
     "key": "matching.getTasksReloadAt",
@@ -3405,7 +3717,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:1153"
+    "source": "common/dynamicconfig/constants.go:1273"
   },
   {
     "key": "matching.getUserDataLongPollTimeout",
@@ -3413,7 +3725,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5*time.Minute - 10*time.Second",
-    "source": "common/dynamicconfig/constants.go:1287"
+    "source": "common/dynamicconfig/constants.go:1416"
   },
   {
     "key": "matching.getUserDataRefresh",
@@ -3421,7 +3733,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1292"
+    "source": "common/dynamicconfig/constants.go:1421"
   },
   {
     "key": "matching.historyMaxPageSize",
@@ -3429,7 +3741,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "primitives.GetHistoryMaxPageSize",
-    "source": "common/dynamicconfig/constants.go:1169"
+    "source": "common/dynamicconfig/constants.go:1289"
   },
   {
     "key": "matching.listNexusEndpointsLongPollTimeout",
@@ -3437,7 +3749,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5*time.Minute - 10*time.Second",
-    "source": "common/dynamicconfig/constants.go:1338"
+    "source": "common/dynamicconfig/constants.go:1472"
   },
   {
     "key": "matching.longPollExpirationInterval",
@@ -3445,7 +3757,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "time.Minute",
-    "source": "common/dynamicconfig/constants.go:1158"
+    "source": "common/dynamicconfig/constants.go:1278"
   },
   {
     "key": "matching.maxDeployments",
@@ -3453,7 +3765,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:1375"
+    "source": "common/dynamicconfig/constants.go:1518"
   },
   {
     "key": "matching.maxFairnessKeyWeightOverrides",
@@ -3461,7 +3773,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:1451"
+    "source": "common/dynamicconfig/constants.go:1615"
   },
   {
     "key": "matching.maxTaskBatchSize",
@@ -3469,7 +3781,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:1202"
+    "source": "common/dynamicconfig/constants.go:1331"
   },
   {
     "key": "matching.maxTaskDeleteBatchSize",
@@ -3477,7 +3789,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:1207"
+    "source": "common/dynamicconfig/constants.go:1336"
   },
   {
     "key": "matching.maxTaskQueueIdleTime",
@@ -3485,7 +3797,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1191"
+    "source": "common/dynamicconfig/constants.go:1320"
   },
   {
     "key": "matching.maxTaskQueuesInDeployment",
@@ -3493,7 +3805,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:1370"
+    "source": "common/dynamicconfig/constants.go:1513"
   },
   {
     "key": "matching.maxTaskQueuesInDeploymentVersion",
@@ -3501,7 +3813,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:1391"
+    "source": "common/dynamicconfig/constants.go:1534"
   },
   {
     "key": "matching.maxVersionsInDeployment",
@@ -3509,7 +3821,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:1380"
+    "source": "common/dynamicconfig/constants.go:1523"
   },
   {
     "key": "matching.maxVersionsInTaskQueue",
@@ -3517,7 +3829,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "200",
-    "source": "common/dynamicconfig/constants.go:1385"
+    "source": "common/dynamicconfig/constants.go:1528"
   },
   {
     "key": "matching.maxWaitForPollerBeforeFwd",
@@ -3525,7 +3837,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "200 * time.Millisecond",
-    "source": "common/dynamicconfig/constants.go:1321"
+    "source": "common/dynamicconfig/constants.go:1450"
   },
   {
     "key": "matching.membershipUnloadDelay",
@@ -3533,7 +3845,15 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "500 * time.Millisecond",
-    "source": "common/dynamicconfig/constants.go:1348"
+    "source": "common/dynamicconfig/constants.go:1482"
+  },
+  {
+    "key": "matching.metadataUpdateOnAppendInterval",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1311"
   },
   {
     "key": "matching.minTaskThrottlingBurstSize",
@@ -3541,7 +3861,15 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:1143"
+    "source": "common/dynamicconfig/constants.go:1263"
+  },
+  {
+    "key": "matching.namespaceRPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1230"
   },
   {
     "key": "matching.nexusEndpointsRefreshInterval",
@@ -3549,7 +3877,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "10 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1343"
+    "source": "common/dynamicconfig/constants.go:1477"
   },
   {
     "key": "matching.numTaskqueueReadPartitions",
@@ -3557,7 +3885,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "defaultNumTaskQueuePartitions",
-    "source": "common/dynamicconfig/constants.go:1227"
+    "source": "common/dynamicconfig/constants.go:1356"
   },
   {
     "key": "matching.numTaskqueueWritePartitions",
@@ -3565,7 +3893,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "defaultNumTaskQueuePartitions",
-    "source": "common/dynamicconfig/constants.go:1222"
+    "source": "common/dynamicconfig/constants.go:1351"
   },
   {
     "key": "matching.outstandingTaskAppendsThreshold",
@@ -3573,7 +3901,31 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "250",
-    "source": "common/dynamicconfig/constants.go:1197"
+    "source": "common/dynamicconfig/constants.go:1326"
+  },
+  {
+    "key": "matching.partitionScaleAllowedDrift",
+    "constructor": "NewTaskQueueTypedSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Typed",
+    "default_expression": "PartitionScaleAllowedDrift{\n\tDelta: 1,\n\tRatio: 1.5,\n}",
+    "source": "common/dynamicconfig/constants.go:1639"
+  },
+  {
+    "key": "matching.partitionScaleManager",
+    "constructor": "NewTaskQueueTypedSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Typed",
+    "default_expression": "PartitionScaleManagerSettings{\n\tMaxRate:               0.33,\n\tShrinkRatio:           0.1,\n\tShrinkDelta:           8,\n\tBatchSize:             100,\n\tBackgroundInterval:    23 * time.Second,\n\tDrainBufferTime:       15 * time.Second,\n\tShadowModeLogInterval: 0,\n}",
+    "source": "common/dynamicconfig/constants.go:1647"
+  },
+  {
+    "key": "matching.partitionScaler",
+    "constructor": "NewTaskQueueTypedSettingWithConverter",
+    "scope": "TaskQueue",
+    "value_kind": "Typed",
+    "default_expression": "SimplePartitionScalerSettings{}",
+    "source": "common/dynamicconfig/constants.go:1660"
   },
   {
     "key": "matching.persistenceDynamicRateLimitingParams",
@@ -3581,7 +3933,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "DefaultDynamicRateLimitingParams",
-    "source": "common/dynamicconfig/constants.go:1136"
+    "source": "common/dynamicconfig/constants.go:1256"
   },
   {
     "key": "matching.persistenceGlobalMaxQPS",
@@ -3589,7 +3941,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1121"
+    "source": "common/dynamicconfig/constants.go:1241"
   },
   {
     "key": "matching.persistenceGlobalNamespaceMaxQPS",
@@ -3597,7 +3949,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1131"
+    "source": "common/dynamicconfig/constants.go:1251"
   },
   {
     "key": "matching.persistenceMaxQPS",
@@ -3605,7 +3957,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "3000",
-    "source": "common/dynamicconfig/constants.go:1116"
+    "source": "common/dynamicconfig/constants.go:1236"
   },
   {
     "key": "matching.persistenceNamespaceMaxQPS",
@@ -3613,7 +3965,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:1126"
+    "source": "common/dynamicconfig/constants.go:1246"
   },
   {
     "key": "matching.pollerScalingDecisionsPerSecond",
@@ -3621,7 +3973,7 @@
     "scope": "TaskQueue",
     "value_kind": "Float",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:1408"
+    "source": "common/dynamicconfig/constants.go:1551"
   },
   {
     "key": "matching.pollerScalingMinimumBacklog",
@@ -3629,7 +3981,15 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "200 * time.Millisecond",
-    "source": "common/dynamicconfig/constants.go:1396"
+    "source": "common/dynamicconfig/constants.go:1539"
+  },
+  {
+    "key": "matching.pollerScalingTaskAddToDispatchRatio",
+    "constructor": "NewTaskQueueFloatSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Float",
+    "default_expression": "1.2",
+    "source": "common/dynamicconfig/constants.go:1557"
   },
   {
     "key": "matching.pollerScalingWaitTime",
@@ -3637,7 +3997,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1402"
+    "source": "common/dynamicconfig/constants.go:1545"
   },
   {
     "key": "matching.priorityBacklogForwarding",
@@ -3645,7 +4005,7 @@
     "scope": "TaskQueue",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1308"
+    "source": "common/dynamicconfig/constants.go:1437"
   },
   {
     "key": "matching.priorityLevels",
@@ -3653,7 +4013,7 @@
     "scope": "TaskQueue",
     "value_kind": "Int",
     "default_expression": "5",
-    "source": "common/dynamicconfig/constants.go:1431"
+    "source": "common/dynamicconfig/constants.go:1582"
   },
   {
     "key": "matching.queryPollerUnavailableWindow",
@@ -3661,7 +4021,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "20 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1327"
+    "source": "common/dynamicconfig/constants.go:1456"
   },
   {
     "key": "matching.queryWorkflowTaskTimeoutLogRate",
@@ -3669,7 +4029,7 @@
     "scope": "TaskQueue",
     "value_kind": "Float",
     "default_expression": "0.0",
-    "source": "common/dynamicconfig/constants.go:1354"
+    "source": "common/dynamicconfig/constants.go:1488"
   },
   {
     "key": "matching.rps",
@@ -3677,7 +4037,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1200",
-    "source": "common/dynamicconfig/constants.go:1111"
+    "source": "common/dynamicconfig/constants.go:1225"
   },
   {
     "key": "matching.shutdownDrainDuration",
@@ -3685,7 +4045,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "0 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1282"
+    "source": "common/dynamicconfig/constants.go:1411"
   },
   {
     "key": "matching.spreadRoutingBatchSize",
@@ -3693,7 +4053,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "StaticGradualChange[int](0)",
-    "source": "common/dynamicconfig/constants.go:1509"
+    "source": "common/dynamicconfig/constants.go:1700"
   },
   {
     "key": "matching.syncMatchWaitDuration",
@@ -3701,7 +4061,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "200 * time.Millisecond",
-    "source": "common/dynamicconfig/constants.go:1164"
+    "source": "common/dynamicconfig/constants.go:1284"
   },
   {
     "key": "matching.taskDeleteInterval",
@@ -3709,7 +4069,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "15 * time.Second",
-    "source": "common/dynamicconfig/constants.go:1212"
+    "source": "common/dynamicconfig/constants.go:1341"
   },
   {
     "key": "matching.throttledLogRPS",
@@ -3717,7 +4077,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:1217"
+    "source": "common/dynamicconfig/constants.go:1346"
   },
   {
     "key": "matching.updateAckInterval",
@@ -3725,7 +4085,7 @@
     "scope": "TaskQueue",
     "value_kind": "Duration",
     "default_expression": "[]TypedConstrainedValue[time.Duration]{\n\n\t{\n\t\tConstraints: Constraints{\n\t\t\tTaskQueueName: primitives.PerNSWorkerTaskQueue,\n\t\t},\n\t\tValue: 5 * time.Minute,\n\t},\n\n\t{\n\t\tValue: 1 * time.Minute,\n\t},\n}",
-    "source": "common/dynamicconfig/constants.go:1174"
+    "source": "common/dynamicconfig/constants.go:1294"
   },
   {
     "key": "matching.useNewMatcher",
@@ -3733,7 +4093,15 @@
     "scope": "TaskQueue",
     "value_kind": "Typed",
     "default_expression": "StaticGradualChange(true)",
-    "source": "common/dynamicconfig/constants.go:1414"
+    "source": "common/dynamicconfig/constants.go:1570"
+  },
+  {
+    "key": "matching.workerControllerNoPollerHookWindow",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1461"
   },
   {
     "key": "matching.workerRegistryEntryTTL",
@@ -3741,7 +4109,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1483"
+    "source": "common/dynamicconfig/constants.go:1674"
   },
   {
     "key": "matching.workerRegistryEvictionInterval",
@@ -3749,7 +4117,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1503"
+    "source": "common/dynamicconfig/constants.go:1694"
   },
   {
     "key": "matching.workerRegistryMaxEntries",
@@ -3757,7 +4125,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1_000_000",
-    "source": "common/dynamicconfig/constants.go:1497"
+    "source": "common/dynamicconfig/constants.go:1688"
   },
   {
     "key": "matching.workerRegistryMinEvictAge",
@@ -3765,7 +4133,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:1490"
+    "source": "common/dynamicconfig/constants.go:1681"
   },
   {
     "key": "matching.workerRegistryNumBuckets",
@@ -3773,7 +4141,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:1477"
+    "source": "common/dynamicconfig/constants.go:1668"
   },
   {
     "key": "matching.wv.DeletedRuleRetentionTime",
@@ -3781,7 +4149,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "14 * 24 * time.Hour",
-    "source": "common/dynamicconfig/constants.go:472"
+    "source": "common/dynamicconfig/constants.go:543"
   },
   {
     "key": "matching.wv.ReachabilityBuildIdVisibilityGracePeriod",
@@ -3789,7 +4157,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "3 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:484"
+    "source": "common/dynamicconfig/constants.go:555"
   },
   {
     "key": "matching.wv.VersionDrainageStatusRefreshInterval",
@@ -3797,7 +4165,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "3 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:498"
+    "source": "common/dynamicconfig/constants.go:569"
   },
   {
     "key": "matching.wv.VersionDrainageStatusVisibilityGracePeriod",
@@ -3805,7 +4173,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "3 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:492"
+    "source": "common/dynamicconfig/constants.go:563"
   },
   {
     "key": "matching.wv.reachabilityCacheClosedWFsTTL",
@@ -3813,7 +4181,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "10 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:521"
+    "source": "common/dynamicconfig/constants.go:592"
   },
   {
     "key": "matching.wv.reachabilityCacheOpenWFsTTL",
@@ -3821,7 +4189,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Minute",
-    "source": "common/dynamicconfig/constants.go:516"
+    "source": "common/dynamicconfig/constants.go:587"
   },
   {
     "key": "metrics.breakdownByBuildID",
@@ -3829,7 +4197,7 @@
     "scope": "TaskQueue",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1247"
+    "source": "common/dynamicconfig/constants.go:1376"
   },
   {
     "key": "metrics.breakdownByPartition",
@@ -3837,7 +4205,7 @@
     "scope": "TaskQueue",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1239"
+    "source": "common/dynamicconfig/constants.go:1368"
   },
   {
     "key": "metrics.breakdownByTaskQueue",
@@ -3845,31 +4213,47 @@
     "scope": "TaskQueue",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:1232"
+    "source": "common/dynamicconfig/constants.go:1361"
   },
   {
     "key": "nexusoperation.callback.endpoint.template",
-    "constructor": "NewGlobalStringSetting",
+    "constructor": "NewGlobalTypedSettingWithConverter",
     "scope": "Global",
-    "value_kind": "String",
-    "default_expression": "\"unset\"",
-    "source": "chasm/lib/nexusoperation/config.go:110"
+    "value_kind": "Typed",
+    "default_expression": "nil",
+    "source": "chasm/lib/nexusoperation/config.go:161"
+  },
+  {
+    "key": "nexusoperation.chasmWorkflowOperationsRolloutPercent",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "chasm/lib/nexusoperation/config.go:45"
   },
   {
     "key": "nexusoperation.disallowedHeaders",
     "constructor": "NewGlobalTypedSettingWithConverter",
     "scope": "Global",
     "value_kind": "Typed",
-    "default_expression": "[]string{\n\t\"request-timeout\",\n\tinterceptor.DCRedirectionApiHeaderName,\n\tinterceptor.DCRedirectionContextHeaderName,\n\theaders.CallerNameHeaderName,\n\theaders.CallerTypeHeaderName,\n\theaders.CallOriginHeaderName,\n}",
-    "source": "chasm/lib/nexusoperation/config.go:79"
+    "default_expression": "[]string{\n\t\"request-timeout\",\n\tinterceptor.DCRedirectionAPIHeaderName,\n\tinterceptor.DCRedirectionSourceCellHeaderName,\n\tinterceptor.DCRedirectionContextHeaderName,\n\theaders.CallerNameHeaderName,\n\theaders.CallerTypeHeaderName,\n\theaders.CallOriginHeaderName,\n\theaders.PrincipalTypeHeaderName,\n\theaders.PrincipalNameHeaderName,\n}",
+    "source": "chasm/lib/nexusoperation/config.go:127"
   },
   {
-    "key": "nexusoperation.enableChasm",
-    "constructor": "NewGlobalBoolSetting",
-    "scope": "Global",
+    "key": "nexusoperation.enableChasmWorkflowOperations",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "chasm/lib/nexusoperation/config.go:13"
+    "source": "chasm/lib/nexusoperation/config.go:38"
+  },
+  {
+    "key": "nexusoperation.enableStandalone",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "chasm/lib/nexusoperation/config.go:32"
   },
   {
     "key": "nexusoperation.limit.dispatch.task.timeout.min",
@@ -3877,7 +4261,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "time.Second",
-    "source": "chasm/lib/nexusoperation/config.go:33"
+    "source": "chasm/lib/nexusoperation/config.go:81"
   },
   {
     "key": "nexusoperation.limit.header.size",
@@ -3885,15 +4269,15 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "8192",
-    "source": "chasm/lib/nexusoperation/config.go:71"
+    "source": "chasm/lib/nexusoperation/config.go:119"
   },
   {
-    "key": "nexusoperation.limit.operation.concurrency",
+    "key": "nexusoperation.limit.operation.concurrencyPerWorkflow.max",
     "constructor": "NewNamespaceIntSetting",
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "2000",
-    "source": "chasm/lib/nexusoperation/config.go:41"
+    "source": "chasm/lib/nexusoperation/config.go:89"
   },
   {
     "key": "nexusoperation.limit.operation.name.length",
@@ -3901,7 +4285,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "chasm/lib/nexusoperation/config.go:55"
+    "source": "chasm/lib/nexusoperation/config.go:103"
   },
   {
     "key": "nexusoperation.limit.operation.token.length",
@@ -3909,7 +4293,15 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "4096",
-    "source": "chasm/lib/nexusoperation/config.go:62"
+    "source": "chasm/lib/nexusoperation/config.go:110"
+  },
+  {
+    "key": "nexusoperation.limit.reasonLength",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "chasm/lib/nexusoperation/config.go:222"
   },
   {
     "key": "nexusoperation.limit.request.timeout.min",
@@ -3917,7 +4309,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "time.Millisecond * 1500",
-    "source": "chasm/lib/nexusoperation/config.go:26"
+    "source": "chasm/lib/nexusoperation/config.go:74"
   },
   {
     "key": "nexusoperation.limit.scheduleToCloseTimeout",
@@ -3925,7 +4317,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "0",
-    "source": "chasm/lib/nexusoperation/config.go:103"
+    "source": "chasm/lib/nexusoperation/config.go:154"
   },
   {
     "key": "nexusoperation.limit.service.name.length",
@@ -3933,7 +4325,23 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "chasm/lib/nexusoperation/config.go:48"
+    "source": "chasm/lib/nexusoperation/config.go:96"
+  },
+  {
+    "key": "nexusoperation.longPollBuffer",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "common.DefaultLongPollBuffer",
+    "source": "chasm/lib/nexusoperation/config.go:24"
+  },
+  {
+    "key": "nexusoperation.longPollTimeout",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "common.DefaultLongPollTimeout",
+    "source": "chasm/lib/nexusoperation/config.go:17"
   },
   {
     "key": "nexusoperation.metrics.tags",
@@ -3941,7 +4349,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "NexusMetricTagConfig{}",
-    "source": "chasm/lib/nexusoperation/config.go:131"
+    "source": "chasm/lib/nexusoperation/config.go:209"
   },
   {
     "key": "nexusoperation.request.timeout",
@@ -3949,23 +4357,15 @@
     "scope": "Destination",
     "value_kind": "Duration",
     "default_expression": "time.Second * 10",
-    "source": "chasm/lib/nexusoperation/config.go:20"
+    "source": "chasm/lib/nexusoperation/config.go:68"
   },
   {
-    "key": "nexusoperation.retryPolicy.initialInterval",
-    "constructor": "NewGlobalDurationSetting",
+    "key": "nexusoperation.retryPolicy",
+    "constructor": "NewGlobalTypedSettingWithConverter",
     "scope": "Global",
-    "value_kind": "Duration",
-    "default_expression": "time.Second",
-    "source": "chasm/lib/nexusoperation/config.go:119"
-  },
-  {
-    "key": "nexusoperation.retryPolicy.maxInterval",
-    "constructor": "NewGlobalDurationSetting",
-    "scope": "Global",
-    "value_kind": "Duration",
-    "default_expression": "time.Hour",
-    "source": "chasm/lib/nexusoperation/config.go:125"
+    "value_kind": "Typed",
+    "default_expression": "defaultRetryPolicyConfig.build()",
+    "source": "chasm/lib/nexusoperation/config.go:196"
   },
   {
     "key": "nexusoperation.useNewFailureWireFormat",
@@ -3973,7 +4373,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "chasm/lib/nexusoperation/config.go:144"
+    "source": "chasm/lib/nexusoperation/config.go:229"
   },
   {
     "key": "rpc.slowRequestLoggingThreshold",
@@ -3981,7 +4381,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:3195"
+    "source": "common/dynamicconfig/constants.go:3585"
   },
   {
     "key": "scheduler.retryPolicy.initialInterval",
@@ -3989,7 +4389,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Second",
-    "source": "chasm/lib/scheduler/config.go:35"
+    "source": "chasm/lib/scheduler/config.go:64"
   },
   {
     "key": "scheduler.retryPolicy.maxInterval",
@@ -3997,7 +4397,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Minute",
-    "source": "chasm/lib/scheduler/config.go:41"
+    "source": "chasm/lib/scheduler/config.go:70"
   },
   {
     "key": "scheduler.serviceCallTimeout",
@@ -4005,7 +4405,23 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "2 * time.Second",
-    "source": "chasm/lib/scheduler/config.go:47"
+    "source": "chasm/lib/scheduler/config.go:76"
+  },
+  {
+    "key": "scheduler.specMaxIterations",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "2 * 7 * 24 * 60 * 60",
+    "source": "common/dynamicconfig/constants.go:3517"
+  },
+  {
+    "key": "scheduler.specWarnIterations",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "24 * 60 * 60",
+    "source": "common/dynamicconfig/constants.go:3524"
   },
   {
     "key": "scheduler.tweakables",
@@ -4013,7 +4429,7 @@
     "scope": "Namespace",
     "value_kind": "Typed",
     "default_expression": "DefaultTweakables",
-    "source": "chasm/lib/scheduler/config.go:30"
+    "source": "chasm/lib/scheduler/config.go:59"
   },
   {
     "key": "system.clusterMetadataRefreshInterval",
@@ -4021,7 +4437,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Minute",
-    "source": "common/dynamicconfig/constants.go:153"
+    "source": "common/dynamicconfig/constants.go:163"
   },
   {
     "key": "system.deadlock.AbortProcess",
@@ -4029,7 +4445,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:291"
+    "source": "common/dynamicconfig/constants.go:352"
   },
   {
     "key": "system.deadlock.DumpGoroutines",
@@ -4037,7 +4453,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:281"
+    "source": "common/dynamicconfig/constants.go:342"
   },
   {
     "key": "system.deadlock.FailHealthCheck",
@@ -4045,7 +4461,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:286"
+    "source": "common/dynamicconfig/constants.go:347"
   },
   {
     "key": "system.deadlock.Interval",
@@ -4053,7 +4469,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "60 * time.Second",
-    "source": "common/dynamicconfig/constants.go:296"
+    "source": "common/dynamicconfig/constants.go:357"
   },
   {
     "key": "system.deadlock.MaxWorkersPerRoot",
@@ -4061,7 +4477,15 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:301"
+    "source": "common/dynamicconfig/constants.go:362"
+  },
+  {
+    "key": "system.disableStreamingAuthorizer",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:149"
   },
   {
     "key": "system.disallowQuery",
@@ -4069,20 +4493,28 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:143"
+    "source": "common/dynamicconfig/constants.go:139"
   },
   {
     "key": "system.enableActivityEagerExecution",
     "constructor": "NewNamespaceBoolSetting",
     "scope": "Namespace",
     "value_kind": "Bool",
-    "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:193"
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:203"
   },
   {
     "key": "system.enableActivityRetryStampIncrement",
     "constructor": "NewGlobalBoolSetting",
     "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:223"
+  },
+  {
+    "key": "system.enableCancelActivityWorkerCommand",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
     "source": "common/dynamicconfig/constants.go:208"
@@ -4093,7 +4525,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:148"
+    "source": "common/dynamicconfig/constants.go:144"
   },
   {
     "key": "system.enableDataLossMetrics",
@@ -4101,7 +4533,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:273"
+    "source": "common/dynamicconfig/constants.go:334"
   },
   {
     "key": "system.enableDeploymentVersions",
@@ -4109,7 +4541,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:914"
+    "source": "common/dynamicconfig/constants.go:1003"
   },
   {
     "key": "system.enableDeployments",
@@ -4117,7 +4549,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:907"
+    "source": "common/dynamicconfig/constants.go:996"
   },
   {
     "key": "system.enableEagerWorkflowStart",
@@ -4125,7 +4557,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:213"
+    "source": "common/dynamicconfig/constants.go:228"
   },
   {
     "key": "system.enableInternodeClientKeepAlive",
@@ -4133,7 +4565,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:261"
+    "source": "common/dynamicconfig/constants.go:322"
   },
   {
     "key": "system.enableInternodeServerKeepAlive",
@@ -4141,15 +4573,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:256"
-  },
-  {
-    "key": "system.enableNamespaceHandoverWait",
-    "constructor": "NewNamespaceBoolSetting",
-    "scope": "Namespace",
-    "value_kind": "Bool",
-    "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:133"
+    "source": "common/dynamicconfig/constants.go:317"
   },
   {
     "key": "system.enableNamespaceNotActiveAutoForwarding",
@@ -4157,7 +4581,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:122"
+    "source": "common/dynamicconfig/constants.go:123"
   },
   {
     "key": "system.enableParentClosePolicyWorker",
@@ -4165,7 +4589,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:183"
+    "source": "common/dynamicconfig/constants.go:193"
   },
   {
     "key": "system.enableReadFromHistoryArchival",
@@ -4173,7 +4597,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:107"
+    "source": "common/dynamicconfig/constants.go:108"
   },
   {
     "key": "system.enableReadFromSecondaryVisibility",
@@ -4181,7 +4605,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:59"
+    "source": "common/dynamicconfig/constants.go:60"
   },
   {
     "key": "system.enableReadFromVisibilityArchival",
@@ -4189,7 +4613,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:117"
+    "source": "common/dynamicconfig/constants.go:118"
   },
   {
     "key": "system.enableRingpopTLS",
@@ -4197,7 +4621,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:165"
+    "source": "common/dynamicconfig/constants.go:175"
   },
   {
     "key": "system.enableSendTargetVersionChanged",
@@ -4205,7 +4629,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:931"
+    "source": "common/dynamicconfig/constants.go:1020"
   },
   {
     "key": "system.enableStickyQuery",
@@ -4213,7 +4637,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:188"
+    "source": "common/dynamicconfig/constants.go:198"
   },
   {
     "key": "system.enableSuggestCaNOnNewTargetVersion",
@@ -4221,7 +4645,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:926"
+    "source": "common/dynamicconfig/constants.go:1015"
   },
   {
     "key": "system.forceNamespaceSelectedAPIAutoForwarding",
@@ -4229,7 +4653,15 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:128"
+    "source": "common/dynamicconfig/constants.go:129"
+  },
+  {
+    "key": "system.forceNexusEndpointRefreshOnRead",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1041"
   },
   {
     "key": "system.forceSearchAttributesCacheRefreshOnRead",
@@ -4237,7 +4669,15 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:158"
+    "source": "common/dynamicconfig/constants.go:168"
+  },
+  {
+    "key": "system.healthCheckHistoryGRPCSettings",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "health.Settings{}",
+    "source": "common/dynamicconfig/constants.go:264"
   },
   {
     "key": "system.historyArchivalState",
@@ -4245,7 +4685,23 @@
     "scope": "Global",
     "value_kind": "String",
     "default_expression": "\"\"",
-    "source": "common/dynamicconfig/constants.go:102"
+    "source": "common/dynamicconfig/constants.go:103"
+  },
+  {
+    "key": "system.historyHealthSignalLatencyWindowCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:249"
+  },
+  {
+    "key": "system.historyHealthSignalLatencyWindowSize",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:254"
   },
   {
     "key": "system.historyHealthSignalMetricsEnabled",
@@ -4253,7 +4709,23 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:229"
+    "source": "common/dynamicconfig/constants.go:244"
+  },
+  {
+    "key": "system.historyHealthSignalPercentileLatencySettings",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "LatencyHealthChecksPerPercentile{}",
+    "source": "common/dynamicconfig/constants.go:259"
+  },
+  {
+    "key": "system.historyHealthSignalUsePercentiles",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:270"
   },
   {
     "key": "system.logAllReqErrors",
@@ -4261,15 +4733,15 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:3177"
+    "source": "common/dynamicconfig/constants.go:3567"
   },
   {
-    "key": "system.maxCHASMCallbacksPerWorkflow",
+    "key": "system.maxCallbacksPerUpdateID",
     "constructor": "NewNamespaceIntSetting",
     "scope": "Namespace",
     "value_kind": "Int",
-    "default_expression": "2000",
-    "source": "common/dynamicconfig/constants.go:1005"
+    "default_expression": "32",
+    "source": "common/dynamicconfig/constants.go:1100"
   },
   {
     "key": "system.maxCallbacksPerWorkflow",
@@ -4277,7 +4749,15 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "32",
-    "source": "common/dynamicconfig/constants.go:998"
+    "source": "common/dynamicconfig/constants.go:1095"
+  },
+  {
+    "key": "system.maxServiceErrorMessageLength",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "4000",
+    "source": "common/dynamicconfig/constants.go:3561"
   },
   {
     "key": "system.namespaceCacheRefreshInterval",
@@ -4285,7 +4765,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "2 * time.Second",
-    "source": "common/dynamicconfig/constants.go:219"
+    "source": "common/dynamicconfig/constants.go:234"
   },
   {
     "key": "system.namespaceMinRetentionGlobal",
@@ -4293,7 +4773,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "24 * time.Hour",
-    "source": "common/dynamicconfig/constants.go:198"
+    "source": "common/dynamicconfig/constants.go:213"
   },
   {
     "key": "system.namespaceMinRetentionLocal",
@@ -4301,7 +4781,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Hour",
-    "source": "common/dynamicconfig/constants.go:203"
+    "source": "common/dynamicconfig/constants.go:218"
   },
   {
     "key": "system.nexusHTTPTraceConfig",
@@ -4317,7 +4797,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:952"
+    "source": "common/dynamicconfig/constants.go:1049"
   },
   {
     "key": "system.nexusReadThroughCacheTTL",
@@ -4325,7 +4805,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "30 * time.Second",
-    "source": "common/dynamicconfig/constants.go:958"
+    "source": "common/dynamicconfig/constants.go:1055"
   },
   {
     "key": "system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute",
@@ -4333,7 +4813,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "5",
-    "source": "common/dynamicconfig/constants.go:307"
+    "source": "common/dynamicconfig/constants.go:368"
   },
   {
     "key": "system.operatorRPSRatio",
@@ -4341,7 +4821,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "0.2",
-    "source": "common/dynamicconfig/constants.go:249"
+    "source": "common/dynamicconfig/constants.go:310"
   },
   {
     "key": "system.persistenceHealthSignalAggregationEnabled",
@@ -4349,7 +4829,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:234"
+    "source": "common/dynamicconfig/constants.go:275"
   },
   {
     "key": "system.persistenceHealthSignalBufferSize",
@@ -4357,7 +4837,23 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "5000",
-    "source": "common/dynamicconfig/constants.go:244"
+    "source": "common/dynamicconfig/constants.go:305"
+  },
+  {
+    "key": "system.persistenceHealthSignalLatencyWindowCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:285"
+  },
+  {
+    "key": "system.persistenceHealthSignalLatencyWindowSize",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:290"
   },
   {
     "key": "system.persistenceHealthSignalMetricsEnabled",
@@ -4365,7 +4861,23 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:224"
+    "source": "common/dynamicconfig/constants.go:239"
+  },
+  {
+    "key": "system.persistenceHealthSignalPercentileLatencySettings",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "LatencyHealthChecksPerPercentile{}",
+    "source": "common/dynamicconfig/constants.go:295"
+  },
+  {
+    "key": "system.persistenceHealthSignalPercentilesEnabled",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:280"
   },
   {
     "key": "system.persistenceHealthSignalWindowSize",
@@ -4373,7 +4885,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "10 * time.Second",
-    "source": "common/dynamicconfig/constants.go:239"
+    "source": "common/dynamicconfig/constants.go:300"
   },
   {
     "key": "system.persistenceQPSBurstRatio",
@@ -4381,7 +4893,15 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "1.0",
-    "source": "common/dynamicconfig/constants.go:267"
+    "source": "common/dynamicconfig/constants.go:328"
+  },
+  {
+    "key": "system.pollWaitForNamespaceRateLimitToken",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:375"
   },
   {
     "key": "system.refreshNexusEndpointsLongPollTimeout",
@@ -4389,7 +4909,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "5 * time.Minute",
-    "source": "common/dynamicconfig/constants.go:942"
+    "source": "common/dynamicconfig/constants.go:1031"
   },
   {
     "key": "system.refreshNexusEndpointsMinWait",
@@ -4397,7 +4917,15 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:947"
+    "source": "common/dynamicconfig/constants.go:1036"
+  },
+  {
+    "key": "system.retryUnboundedOnSystemResourceExhausted",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:154"
   },
   {
     "key": "system.ringpopApproximateMaxPropagationTime",
@@ -4405,7 +4933,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "3 * time.Second",
-    "source": "common/dynamicconfig/constants.go:171"
+    "source": "common/dynamicconfig/constants.go:181"
   },
   {
     "key": "system.ringpopReplicaPoints",
@@ -4413,7 +4941,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:177"
+    "source": "common/dynamicconfig/constants.go:187"
   },
   {
     "key": "system.secondaryVisibilityWritingMode",
@@ -4421,7 +4949,7 @@
     "scope": "Global",
     "value_kind": "String",
     "default_expression": "\"off\"",
-    "source": "common/dynamicconfig/constants.go:69"
+    "source": "common/dynamicconfig/constants.go:70"
   },
   {
     "key": "system.suppressErrorSetSystemSearchAttribute",
@@ -4429,7 +4957,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:89"
+    "source": "common/dynamicconfig/constants.go:90"
   },
   {
     "key": "system.transactionSizeLimit",
@@ -4437,7 +4965,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "primitives.DefaultTransactionSizeLimit",
-    "source": "common/dynamicconfig/constants.go:138"
+    "source": "common/dynamicconfig/constants.go:134"
   },
   {
     "key": "system.useRevisionNumberForWorkerVersioning",
@@ -4445,7 +4973,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:921"
+    "source": "common/dynamicconfig/constants.go:1010"
   },
   {
     "key": "system.visibilityAllowList",
@@ -4453,7 +4981,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:84"
+    "source": "common/dynamicconfig/constants.go:85"
   },
   {
     "key": "system.visibilityArchivalState",
@@ -4461,7 +4989,7 @@
     "scope": "Global",
     "value_kind": "String",
     "default_expression": "\"\"",
-    "source": "common/dynamicconfig/constants.go:112"
+    "source": "common/dynamicconfig/constants.go:113"
   },
   {
     "key": "system.visibilityDisableOrderByClause",
@@ -4469,7 +4997,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:74"
+    "source": "common/dynamicconfig/constants.go:75"
   },
   {
     "key": "system.visibilityEnableManualPagination",
@@ -4477,7 +5005,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:79"
+    "source": "common/dynamicconfig/constants.go:80"
   },
   {
     "key": "system.visibilityEnableShadowReadMode",
@@ -4485,15 +5013,15 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:64"
+    "source": "common/dynamicconfig/constants.go:65"
   },
   {
     "key": "system.visibilityEnableUnifiedQueryConverter",
     "constructor": "NewGlobalBoolSetting",
     "scope": "Global",
     "value_kind": "Bool",
-    "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:95"
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:96"
   },
   {
     "key": "system.visibilityPersistenceMaxReadQPS",
@@ -4501,7 +5029,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "9000",
-    "source": "common/dynamicconfig/constants.go:44"
+    "source": "common/dynamicconfig/constants.go:45"
   },
   {
     "key": "system.visibilityPersistenceMaxWriteQPS",
@@ -4509,7 +5037,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "9000",
-    "source": "common/dynamicconfig/constants.go:49"
+    "source": "common/dynamicconfig/constants.go:50"
   },
   {
     "key": "system.visibilityPersistenceSlowQueryThreshold",
@@ -4517,7 +5045,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Second",
-    "source": "common/dynamicconfig/constants.go:54"
+    "source": "common/dynamicconfig/constants.go:55"
   },
   {
     "key": "worker.ESProcessorAckTimeout",
@@ -4525,7 +5053,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "30 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2982"
+    "source": "common/dynamicconfig/constants.go:3340"
   },
   {
     "key": "worker.ESProcessorBulkActions",
@@ -4533,7 +5061,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "500",
-    "source": "common/dynamicconfig/constants.go:2967"
+    "source": "common/dynamicconfig/constants.go:3325"
   },
   {
     "key": "worker.ESProcessorBulkSize",
@@ -4541,7 +5069,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "16 * 1024 * 1024",
-    "source": "common/dynamicconfig/constants.go:2972"
+    "source": "common/dynamicconfig/constants.go:3330"
   },
   {
     "key": "worker.ESProcessorFlushInterval",
@@ -4549,7 +5077,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "1 * time.Second",
-    "source": "common/dynamicconfig/constants.go:2977"
+    "source": "common/dynamicconfig/constants.go:3335"
   },
   {
     "key": "worker.ESProcessorNumOfWorkers",
@@ -4557,7 +5085,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "2",
-    "source": "common/dynamicconfig/constants.go:2962"
+    "source": "common/dynamicconfig/constants.go:3320"
   },
   {
     "key": "worker.ParentCloseMaxConcurrentActivityExecutionSize",
@@ -4565,7 +5093,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:3090"
+    "source": "common/dynamicconfig/constants.go:3460"
   },
   {
     "key": "worker.ParentCloseMaxConcurrentActivityTaskPollers",
@@ -4573,7 +5101,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "4",
-    "source": "common/dynamicconfig/constants.go:3100"
+    "source": "common/dynamicconfig/constants.go:3470"
   },
   {
     "key": "worker.ParentCloseMaxConcurrentWorkflowTaskExecutionSize",
@@ -4581,7 +5109,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1000",
-    "source": "common/dynamicconfig/constants.go:3095"
+    "source": "common/dynamicconfig/constants.go:3465"
   },
   {
     "key": "worker.ParentCloseMaxConcurrentWorkflowTaskPollers",
@@ -4589,7 +5117,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "4",
-    "source": "common/dynamicconfig/constants.go:3105"
+    "source": "common/dynamicconfig/constants.go:3475"
   },
   {
     "key": "worker.ScannerMaxConcurrentActivityExecutionSize",
@@ -4597,7 +5125,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:2993"
+    "source": "common/dynamicconfig/constants.go:3351"
   },
   {
     "key": "worker.ScannerMaxConcurrentActivityTaskPollers",
@@ -4605,7 +5133,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "8",
-    "source": "common/dynamicconfig/constants.go:3003"
+    "source": "common/dynamicconfig/constants.go:3361"
   },
   {
     "key": "worker.ScannerMaxConcurrentWorkflowTaskExecutionSize",
@@ -4613,7 +5141,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:2998"
+    "source": "common/dynamicconfig/constants.go:3356"
   },
   {
     "key": "worker.ScannerMaxConcurrentWorkflowTaskPollers",
@@ -4621,7 +5149,23 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "8",
-    "source": "common/dynamicconfig/constants.go:3008"
+    "source": "common/dynamicconfig/constants.go:3366"
+  },
+  {
+    "key": "worker.adminBatcherGlobalRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:3453"
+  },
+  {
+    "key": "worker.adminBatcherHostRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:3448"
   },
   {
     "key": "worker.batcherConcurrency",
@@ -4629,7 +5173,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "5",
-    "source": "common/dynamicconfig/constants.go:3085"
+    "source": "common/dynamicconfig/constants.go:3443"
   },
   {
     "key": "worker.batcherRPS",
@@ -4637,7 +5181,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "50",
-    "source": "common/dynamicconfig/constants.go:3080"
+    "source": "common/dynamicconfig/constants.go:3438"
   },
   {
     "key": "worker.buildIdScavengerEnabled",
@@ -4645,7 +5189,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:3048"
+    "source": "common/dynamicconfig/constants.go:3406"
   },
   {
     "key": "worker.buildIdScavengerVisibilityRPS",
@@ -4653,7 +5197,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "1.0",
-    "source": "common/dynamicconfig/constants.go:581"
+    "source": "common/dynamicconfig/constants.go:652"
   },
   {
     "key": "worker.deleteNamespaceActivityLimitsConfig",
@@ -4661,7 +5205,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "sdkworker.Options{}",
-    "source": "common/dynamicconfig/constants.go:3147"
+    "source": "common/dynamicconfig/constants.go:3531"
   },
   {
     "key": "worker.enableHistoryRateLimiter",
@@ -4669,7 +5213,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:3161"
+    "source": "common/dynamicconfig/constants.go:3545"
   },
   {
     "key": "worker.enableNamespaceBatcher",
@@ -4677,7 +5221,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:3075"
+    "source": "common/dynamicconfig/constants.go:3433"
   },
   {
     "key": "worker.enableScheduler",
@@ -4685,7 +5229,7 @@
     "scope": "Namespace",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:3125"
+    "source": "common/dynamicconfig/constants.go:3495"
   },
   {
     "key": "worker.executionDataDurationBuffer",
@@ -4693,7 +5237,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Hour * 24 * 90",
-    "source": "common/dynamicconfig/constants.go:3028"
+    "source": "common/dynamicconfig/constants.go:3386"
   },
   {
     "key": "worker.executionEnableHistoryEventIdValidator",
@@ -4701,7 +5245,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:3038"
+    "source": "common/dynamicconfig/constants.go:3396"
   },
   {
     "key": "worker.executionScannerPerHostQPS",
@@ -4709,7 +5253,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "10",
-    "source": "common/dynamicconfig/constants.go:3018"
+    "source": "common/dynamicconfig/constants.go:3376"
   },
   {
     "key": "worker.executionScannerPerShardQPS",
@@ -4717,7 +5261,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:3023"
+    "source": "common/dynamicconfig/constants.go:3381"
   },
   {
     "key": "worker.executionScannerWorkerCount",
@@ -4725,7 +5269,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "8",
-    "source": "common/dynamicconfig/constants.go:3033"
+    "source": "common/dynamicconfig/constants.go:3391"
   },
   {
     "key": "worker.executionsScannerEnabled",
@@ -4733,7 +5277,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:3058"
+    "source": "common/dynamicconfig/constants.go:3416"
   },
   {
     "key": "worker.generateMigrationTaskViaFrontend",
@@ -4741,7 +5285,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "false",
-    "source": "common/dynamicconfig/constants.go:3156"
+    "source": "common/dynamicconfig/constants.go:3540"
   },
   {
     "key": "worker.historyScannerDataMinAge",
@@ -4749,7 +5293,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "60 * 24 * time.Hour",
-    "source": "common/dynamicconfig/constants.go:3064"
+    "source": "common/dynamicconfig/constants.go:3422"
   },
   {
     "key": "worker.historyScannerEnabled",
@@ -4757,7 +5301,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:3053"
+    "source": "common/dynamicconfig/constants.go:3411"
   },
   {
     "key": "worker.historyScannerVerifyRetention",
@@ -4765,7 +5309,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:3069"
+    "source": "common/dynamicconfig/constants.go:3427"
   },
   {
     "key": "worker.indexerConcurrency",
@@ -4773,7 +5317,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:2957"
+    "source": "common/dynamicconfig/constants.go:3315"
   },
   {
     "key": "worker.perNamespaceWorkerCount",
@@ -4781,7 +5325,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "1",
-    "source": "common/dynamicconfig/constants.go:3110"
+    "source": "common/dynamicconfig/constants.go:3480"
   },
   {
     "key": "worker.perNamespaceWorkerOptions",
@@ -4789,7 +5333,7 @@
     "scope": "Namespace",
     "value_kind": "Typed",
     "default_expression": "sdkworker.Options{}",
-    "source": "common/dynamicconfig/constants.go:3115"
+    "source": "common/dynamicconfig/constants.go:3485"
   },
   {
     "key": "worker.perNamespaceWorkerStartRate",
@@ -4797,7 +5341,7 @@
     "scope": "Global",
     "value_kind": "Float",
     "default_expression": "10.0",
-    "source": "common/dynamicconfig/constants.go:3120"
+    "source": "common/dynamicconfig/constants.go:3490"
   },
   {
     "key": "worker.persistenceDynamicRateLimitingParams",
@@ -4805,7 +5349,7 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "DefaultDynamicRateLimitingParams",
-    "source": "common/dynamicconfig/constants.go:2950"
+    "source": "common/dynamicconfig/constants.go:3308"
   },
   {
     "key": "worker.persistenceGlobalMaxQPS",
@@ -4813,7 +5357,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:2935"
+    "source": "common/dynamicconfig/constants.go:3293"
   },
   {
     "key": "worker.persistenceGlobalNamespaceMaxQPS",
@@ -4821,7 +5365,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:2945"
+    "source": "common/dynamicconfig/constants.go:3303"
   },
   {
     "key": "worker.persistenceMaxQPS",
@@ -4829,7 +5373,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "500",
-    "source": "common/dynamicconfig/constants.go:2930"
+    "source": "common/dynamicconfig/constants.go:3288"
   },
   {
     "key": "worker.persistenceNamespaceMaxQPS",
@@ -4837,7 +5381,7 @@
     "scope": "Namespace",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:2940"
+    "source": "common/dynamicconfig/constants.go:3298"
   },
   {
     "key": "worker.protectedNamespaces",
@@ -4845,7 +5389,15 @@
     "scope": "Global",
     "value_kind": "Typed",
     "default_expression": "([]string)(nil)",
-    "source": "common/dynamicconfig/constants.go:1103"
+    "source": "common/dynamicconfig/constants.go:1217"
+  },
+  {
+    "key": "worker.reactivationSignalDedupCacheMaxSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10000",
+    "source": "common/dynamicconfig/constants.go:3252"
   },
   {
     "key": "worker.removableBuildIdDurationSinceDefault",
@@ -4853,7 +5405,7 @@
     "scope": "Global",
     "value_kind": "Duration",
     "default_expression": "time.Hour",
-    "source": "common/dynamicconfig/constants.go:570"
+    "source": "common/dynamicconfig/constants.go:641"
   },
   {
     "key": "worker.scannerPersistenceMaxQPS",
@@ -4861,7 +5413,15 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "100",
-    "source": "common/dynamicconfig/constants.go:3013"
+    "source": "common/dynamicconfig/constants.go:3371"
+  },
+  {
+    "key": "worker.scheduleInvariantsScannerOptions",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "DefaultScheduleInvariantsScannerParams",
+    "source": "common/dynamicconfig/constants.go:658"
   },
   {
     "key": "worker.schedulerLocalActivitySleepLimit",
@@ -4869,7 +5429,7 @@
     "scope": "Namespace",
     "value_kind": "Duration",
     "default_expression": "5 * time.Second",
-    "source": "common/dynamicconfig/constants.go:3141"
+    "source": "common/dynamicconfig/constants.go:3511"
   },
   {
     "key": "worker.schedulerNamespaceStartWorkflowRPS",
@@ -4877,7 +5437,7 @@
     "scope": "Namespace",
     "value_kind": "Float",
     "default_expression": "30.0",
-    "source": "common/dynamicconfig/constants.go:3136"
+    "source": "common/dynamicconfig/constants.go:3506"
   },
   {
     "key": "worker.stickyCacheSize",
@@ -4885,7 +5445,7 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "0",
-    "source": "common/dynamicconfig/constants.go:3130"
+    "source": "common/dynamicconfig/constants.go:3500"
   },
   {
     "key": "worker.taskQueueScannerEnabled",
@@ -4893,7 +5453,7 @@
     "scope": "Global",
     "value_kind": "Bool",
     "default_expression": "true",
-    "source": "common/dynamicconfig/constants.go:3043"
+    "source": "common/dynamicconfig/constants.go:3401"
   },
   {
     "key": "worker.throttledLogRPS",
@@ -4901,6 +5461,6 @@
     "scope": "Global",
     "value_kind": "Int",
     "default_expression": "20",
-    "source": "common/dynamicconfig/constants.go:2988"
+    "source": "common/dynamicconfig/constants.go:3346"
   }
 ]

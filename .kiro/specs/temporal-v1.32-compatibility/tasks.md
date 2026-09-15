@@ -120,27 +120,50 @@ reviews each PR against Target_Release before the integration seat merges. Delta
       the gitignored `.tokeira-build/` output excluded: the unfiltered check found
       a missing documentation file in a generated scoped-workspace README.
 
-- [ ] 3. F2 — configuration denominator at `v1.32.0` (branch `agent/codex/t132-config-denominator`)
-  - [ ] 3.1 Run the extractor at tag `v1.32.0`; commit
+- [x] 3. F2 — configuration denominator at `v1.32.0` (branch `agent/codex/t132-config-denominator`)
+  - [x] 3.1 Run the extractor at tag `v1.32.0`; commit
     `crates/tokeira-compatibility/data/temporal-v1.32.0-settings.json`; assert the
     declarations outside `constants.go` are present.
     - _Requirements: 6.1, 6.2_
-  - [ ] 3.2 Author `temporal-v1.32.0-classification.json`
+  - [x] 3.2 Author `temporal-v1.32.0-classification.json`
     - Carry forward unchanged keys with re-verified anchors; disposition for every added
       key; change notes for removed and renamed keys; both defaults and the owning delta
       spec for every default flip (Requirement 12).
     - _Requirements: 6.3, 6.4, 6.5, 12.1–12.5_
-  - [ ] 3.3 Switch `configuration.rs` to the `v1.32.0` files; delete the `v1.31.0` files;
+  - [x] 3.3 Switch `configuration.rs` to the `v1.32.0` files; delete the `v1.31.0` files;
     keep the conformance cross-check green.
     - _Requirements: 6.6_
-  - [ ] 3.4 Render `docs/conformance/v1.32.0/temporal-configuration.md` via
+  - [x] 3.4 Render `docs/conformance/v1.32.0/temporal-configuration.md` via
     `tools/compatibility-docs`, labelled as the target-pin denominator.
+    - `write-temporal` and `check-temporal` scope generation to this inventory,
+      preserving the existing v1.31.0 operator reference and configuration example.
     - _Requirements: 6.6_
-  - [ ] 3.5 Property test: Property 8 — denominator exactness at `v1.32.0`
+  - [x] 3.5 Property test: Property 8 — denominator exactness at `v1.32.0`
     - Re-point the existing `configuration-policy` Property 3 and Property 4 tests.
     - Tag: `// Feature: temporal-v1.32-compatibility, Property 8: denominator exactness at v1.32.0`
     - _Requirements: 6.1, 6.3, 6.7_
-  - [ ] 3.6 Checkpoint: bar green.
+  - [x] 3.6 Checkpoint: bar green.
+    - Source audit at `v1.32.0`: 683 declarations (627 in `constants.go`, 56
+      elsewhere), 84 added keys, 14 retired keys, seven rename/consolidation
+      targets, and 12 changed default expressions. Extraction of both `v1.31.0`
+      and `v1.32.0` reproduced their checked snapshots byte for byte; the
+      unchanged extractor's Go tests passed.
+    - Linux x86_64 validation passed on 2026-09-15: all six §10.4 commands,
+      using CI's `nightly-2026-06-16` formatter and nextest `--no-fail-fast`.
+      All 3,371 tests passed (2 existing skips), including the previously
+      intermittent backlog drain property. The generated-provisioner test
+      passed in 174 seconds under its existing longer timeout. Doctests and
+      rustdoc with warnings denied passed; `check-temporal` passed. The Linux
+      code, data, and generated inventory matched the final local files by SHA-256.
+    - Local validation passed: nightly formatting, workspace check, all 49
+      focused compatibility/documentation tests, scoped document generation and
+      drift check, cargo-deny bans/licenses/sources, and source-tree offline links
+      (excluding generated `.tokeira-build` output). The six-command completion
+      bar ran on Linux; it was not duplicated in full on macOS.
+    - The v1.31.0 claim, runtime defaults, and existing v1.31.0 documents remain
+      unchanged. The Nexus and worker-deployment deltas own migration of the two
+      retired keys with live conformance overrides; the ledger verifies those
+      explicitly without counting them as v1.32.0 declarations.
 
 - [ ] 4. F3 (fork side) — `tokeira/conformance-v1.32.0` and the baseline
   - [ ] 4.1 Branch from tag `v1.32.0`; re-apply the Harness_Shim and fork tooling.

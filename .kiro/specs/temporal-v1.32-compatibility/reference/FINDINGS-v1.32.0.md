@@ -145,53 +145,52 @@ history pagination and relay-task timeouts.
   absent from the dynamic outcome count, so its smaller baseline count must not
   be read as equivalent coverage of the previous clean matrix.
 
-## Scope allocation to resolve before implementation
+## Approved scope allocations
 
-Three newly measured public suites are proposed for `v132-lifecycle-fidelity`,
-but their behavior is not explicit in that placeholder: workflow-type encoding
-(`tests/workflow_type_encoding_test.go`), speculative-task history pagination
-(`tests/premature_eos_test.go`), and relay workflow-task timeouts/attempt counts
-(`tests/relay_task_test.go @ v1.32.0`). These are raised for the spec author and
-integration seat; the placeholder has not been expanded. Their measured outcomes
-remain in the suite table even if they pass.
+The integration seat assigned these public suites on 2026-09-15 to
+`v132-lifecycle-fidelity`: workflow-type encoding (`TestWorkflowTypeEncodingSuite`),
+speculative-task history pagination (`TestPrematureEosTestSuite`), relay workflow-task
+timeouts/attempt counts (`TestRelayTaskTestSuite`), and all-nil memo/search-attribute
+message presence (`TestNilSearchAttributeSuite`). Their corpus anchors are
+`tests/workflow_type_encoding_test.go`, `tests/premature_eos_test.go`,
+`tests/relay_task_test.go`, and `tests/nil_search_attribute_test.go @ v1.32.0`.
+The orchestrator's full specs carry these allocations; the placeholder files are
+unchanged. Measured outcomes remain in the table even when they pass.
 
-`TestNilSearchAttributeSuite` also needs lifecycle scope allocation. Its new
-all-nil memo and search-attribute cases receive present-but-empty protobuf
-messages where the corpus expects absent messages. This concerns the public
-serialization contract, outside the query-converter placeholder's scope
-(`tests/nil_search_attribute_test.go @ v1.32.0`).
+`TestTaskQueueStats_Pri_Suite` public `DescribeTaskQueue` statistics belong to
+`v132-batch-operations-and-workers`. Its cache-lifetime method and seven scenario
+groups that force internal forwarding or asynchronous matching receive exact
+registry exclusions, listed in the [addendum](#http-synchronization-and-scope-addendum-2026-09-15).
+The default `NoTaskForwardNoPollForwardAllowSyncSuite` scenario, the non-root
+request validation, and the empty-queue statistics case remain active. These use
+public setup and assertions; the deployment helpers in this file use frontend RPCs,
+not `SyncDeploymentUserData` (`tests/task_queue_stats_test.go @ v1.32.0`).
 
-`TestTaskQueueStats_Pri_Suite` is proposed for
-`v132-batch-operations-and-workers`. It contains public `DescribeTaskQueue`
-statistics assertions alongside internal routing and cache-hook fixtures. The
-whole suite must not be dismissed as an internal matcher test; the public cases
-need explicit scope allocation, and only the internal cases should receive exact
-registry exclusions (`tests/task_queue_stats_test.go @ v1.32.0`).
+`TestHttpApiTestSuite/TestHTTPAPIHeaders` is **`expected-until-flip`**: it expects
+`1.32.0` while the engine correctly advertises its `1.31.0` compatibility claim.
+This is a recorded failure, not a skip, and must be re-verified at Phase 4. The
+suite's captured counts, `regression` classification and lifecycle owner remain
+unchanged because the baseline also contains other failures. The measurement
+manifest has suite-level classifications only, so it receives no header-leaf
+classification or rewritten counts.
 
-Two HTTP findings need parent-campaign gate decisions. The header assertion in
-`TestHttpApiTestSuite/TestHTTPAPIHeaders` expects `1.32.0` while the engine
-correctly preserves its advertised `1.31.0` claim. This expected pre-flip mismatch
-must be distinguished from behavioral failures at the pre-flip gate and verified
-after the eventual claim change; no delta should advance the claim early.
-`TestHTTPAPIBasics_Protojson` also observes an empty close-history result. The
-previous fork added `waitNewEvent=true` to synchronize this read; that corpus-body
-edit was deliberately not ported. The existing release-evidence document explains
-why signal admission is not workflow closure. The observed result is consistent
-with that known race and needs explicit gate treatment or upstream correction
-(`tests/http_api_test.go @ v1.32.0`; the prior synchronization is documented in
-[corpus evidence](../../../../docs/readiness/corpus-evidence.md#one-synchronized-corpus-assertion)).
-The HTTP suite stays assigned to the lifecycle owner for triage; these two cases
-are raised to the parent campaign, with their measured outcomes preserved.
+The close-history HTTP read now carries the single sanctioned
+`waitNewEvent=true` synchronization from the v1.31.0 fork. The baseline deliberately
+omitted it; the integration seat authorized carrying it forward on 2026-09-15.
+Signal admission does not guarantee closure, and long polling requires the flag
+(`tests/http_api_test.go:152` and
+`service/history/api/getworkflowexecutionhistory/api.go:220 @ v1.32.0`). The
+[corpus evidence disclosure](../../../../docs/readiness/corpus-evidence.md#one-synchronized-corpus-assertion)
+records the exception and outstanding upstream submission.
 
-The missing context-metadata trailer is a separate, excluded configuration case.
-`TestActivityApiPause_AttributesToActivityInContextMetadata` enables the
-startup-only `frontend.contextMetadataSetTrailer` flag, whose default is false.
-The configuration denominator already marks that switch architecturally excluded.
-The observed missing trailer therefore does not establish a stock-contract gap
-(`tests/activity_api_pause_test.go`, `common/dynamicconfig/constants.go`,
-`service/frontend/fx.go`, `common/rpc/interceptor/context_metadata_interceptor.go
-@ v1.32.0`). It is a candidate exact registry exclusion, with its observed failure
-retained in this baseline.
+`TestActivityApiPause_AttributesToActivityInContextMetadata` now has an exact
+registry exclusion. It enables the unwired startup-only
+`frontend.contextMetadataSetTrailer` flag, whose default is false and whose value
+is captured when constructing the frontend interceptor. The configuration
+denominator already classifies it as architecturally excluded
+(`tests/activity_api_pause_test.go:990`, `common/dynamicconfig/constants.go:869`,
+`service/frontend/fx.go:525 @ v1.32.0`). Its original failed outcome remains in the
+captured baseline.
 
 ## Measurement contract
 
@@ -287,10 +286,11 @@ their owner must verify the stock rejection separately.
 
 ## Skip-registry migration
 
-The fork's `tests/testcore/tokeira_conformance_skip_audit.json` records a source
+The captured fork's `tests/testcore/tokeira_conformance_skip_audit.json` records a source
 citation and disposition for **all 118 inherited entries**: 99 retained, 12
 removed, six renamed to their HSM and CHASM successors, and one narrowed. This
-produces **112 exact active registry identities**.
+produced **112 exact active registry identities** at capture; the nine later
+additions are recorded separately in the addendum below.
 
 - Both callback modes now run: `history.enableChasm` and
   `history.enableCHASMCallbacks` default to true in
@@ -424,7 +424,7 @@ build and operator-artifact directories excluded.
 | `TestNexusWorkflowTestSuiteCHASM` | new entrypoint/mode | 19 / 12 / 10 / 0 | `new-suite` | `v132-nexus` |
 | `TestNexusWorkflowTestSuiteHSM` | clean (7.37); renamed/split | 19 / 10 / 8 / 12 | `regression` | `v132-nexus` |
 | `TestNexusWorkflowUpdateTestSuite` | new entrypoint/mode | 0 / 16 / 0 / 0 | `new-suite` | `v132-nexus` |
-| `TestNilSearchAttributeSuite` | outside ordered plan | 4 / 3 / 0 / 0 | `new-suite` | `v132-lifecycle-fidelity` (proposed; scope allocation required) |
+| `TestNilSearchAttributeSuite` | outside ordered plan | 4 / 3 / 0 / 0 | `new-suite` | `v132-lifecycle-fidelity` |
 | `TestPartitionScaling_Backlog` | new entrypoint/mode | 1 / 0 / 0 / 0 | `out-of-surface` | `registry-skip` — Asserts Temporal partition topology, forwarding and internal queue statistics. Source: `tests/partition_scaling_test.go @ v1.32.0`. |
 | `TestPartitionScaling_Down` | new entrypoint/mode | 0 / 1 / 0 / 0 | `out-of-surface` | `registry-skip` — Asserts Temporal partition topology, forwarding and internal queue statistics. Source: `tests/partition_scaling_test.go @ v1.32.0`. |
 | `TestPartitionScaling_Down_AndStopPolling` | new entrypoint/mode | 0 / 1 / 0 / 0 | `out-of-surface` | `registry-skip` — Asserts Temporal partition topology, forwarding and internal queue statistics. Source: `tests/partition_scaling_test.go @ v1.32.0`. |
@@ -433,12 +433,12 @@ build and operator-artifact directories excluded.
 | `TestPartitionScaling_Up_FromDC` | new entrypoint/mode | 1 / 0 / 0 / 0 | `out-of-surface` | `registry-skip` — Asserts Temporal partition topology, forwarding and internal queue statistics. Source: `tests/partition_scaling_test.go @ v1.32.0`. |
 | `TestPauseWorkflowExecutionSuite` | outside ordered plan | 1 / 24 / 0 / 0 | `new-suite` | `v132-lifecycle-fidelity` |
 | `TestPollerScalingFunctionalSuite` | clean (4.29) | 5 / 0 / 0 / 0 | `unchanged-clean` | `v132-batch-operations-and-workers` |
-| `TestPrematureEosTestSuite` | outside ordered plan | 2 / 0 / 0 / 0 | `new-suite` | `v132-lifecycle-fidelity` (proposed; scope allocation required) |
+| `TestPrematureEosTestSuite` | outside ordered plan | 2 / 0 / 0 / 0 | `new-suite` | `v132-lifecycle-fidelity` |
 | `TestPrioritySuite` | clean (10.45) | 4 / 0 / 0 / 0 | `unchanged-clean` | `v132-batch-operations-and-workers` |
 | `TestPurgeDLQTasksSuite` | outside ordered plan | 0 / 3 / 0 / 4 | `out-of-surface` | `registry-skip` — Seeds internal history task queues and invokes AdminService.PurgeDLQTasks. Source: `tests/purge_dlq_tasks_api_test.go @ v1.32.0`. |
 | `TestQueryWorkflowSuite` | clean (2.10) | 10 / 0 / 1 / 0 | `unchanged-clean` | `v132-lifecycle-fidelity` |
 | `TestRawHistorySuite` | clean (1.8) | 4 / 0 / 1 / 0 | `unchanged-clean` | `v132-lifecycle-fidelity` |
-| `TestRelayTaskTestSuite` | outside ordered plan | 2 / 0 / 0 / 0 | `new-suite` | `v132-lifecycle-fidelity` (proposed; scope allocation required) |
+| `TestRelayTaskTestSuite` | outside ordered plan | 2 / 0 / 0 / 0 | `new-suite` | `v132-lifecycle-fidelity` |
 | `TestResetWorkflowTestSuite` | clean (3.17) | 16 / 2 / 0 / 0 | `regression` | `v132-lifecycle-fidelity` |
 | `TestScheduleCHASM` | outside ordered plan | 4 / 14 / 1 / 43 | `new-suite` | `v132-lifecycle-fidelity` |
 | `TestScheduleCHASMWorkflowPauseInteraction` | new entrypoint/mode | 10 / 5 / 0 / 0 | `new-suite` | `v132-lifecycle-fidelity` |
@@ -461,7 +461,7 @@ build and operator-artifact directories excluded.
 | `TestStandaloneActivityTestSuite` | clean (6.33) | 1 / 300 / 3 / 0 | `regression` | `v132-standalone-activities` |
 | `TestStickyTqTestSuite` | clean (1.4) | 3 / 0 / 0 / 0 | `unchanged-clean` | `v132-lifecycle-fidelity` |
 | `TestTLSFunctionalSuite` | outside ordered plan | 0 / 3 / 0 / 0 | `out-of-surface` | `registry-skip` — Requires an in-process test cluster provisioned with WithMTLS and TLSConfigProvider; this external baseline is plaintext loopback. Source: `tests/tls_test.go @ v1.32.0`. |
-| `TestTaskQueueStats_Pri_Suite` | outside ordered plan | 0 / 13 / 0 / 10 | `new-suite` | `v132-batch-operations-and-workers` (proposed; scope allocation required) |
+| `TestTaskQueueStats_Pri_Suite` | outside ordered plan | 0 / 13 / 0 / 10 | `new-suite` | `v132-batch-operations-and-workers` |
 | `TestTaskQueueSuite` | clean (4.29) | 6 / 4 / 8 / 0 | `regression` | `v132-batch-operations-and-workers` |
 | `TestTimeSkippingFastForwardFunctionalSuite` | new entrypoint/mode | 0 / 11 / 0 / 0 | `new-suite` | `v132-gated-surfaces` |
 | `TestTimeSkippingPropagationTestSuite` | new entrypoint/mode | 0 / 13 / 0 / 0 | `new-suite` | `v132-gated-surfaces` |
@@ -495,7 +495,7 @@ build and operator-artifact directories excluded.
 | `TestWorkflowTaskTestSuite` | clean (1.2) | 9 / 0 / 1 / 0 | `unchanged-clean` | `v132-lifecycle-fidelity` |
 | `TestWorkflowTestSuite` | clean (1.1) | 34 / 12 / 0 / 0 | `regression` | `v132-lifecycle-fidelity` |
 | `TestWorkflowTimerTestSuite` | clean (1.5) | 3 / 0 / 0 / 0 | `unchanged-clean` | `v132-lifecycle-fidelity` |
-| `TestWorkflowTypeEncodingSuite` | new entrypoint/mode | 23 / 0 / 0 / 0 | `new-suite` | `v132-lifecycle-fidelity` (proposed; scope allocation required) |
+| `TestWorkflowTypeEncodingSuite` | new entrypoint/mode | 23 / 0 / 0 / 0 | `new-suite` | `v132-lifecycle-fidelity` |
 | `TestWorkflowUpdateSuite` | clean (2.12) | 69 / 0 / 9 / 0 | `unchanged-clean` | `v132-lifecycle-fidelity` |
 | `TestWorkflowVisibilityTestSuite` | clean (4.23) | 2 / 0 / 0 / 0 | `unchanged-clean` | `v132-visibility-query-converter` |
 
@@ -516,3 +516,113 @@ build and operator-artifact directories excluded.
 | `TestNexusWorkflowTestSuiteHSM` | `TestNexusWorkflowTestSuite` |
 | `TestNilSearchAttributeSuite` | `TestWorkflowStart_NilSearchAttributesFiltered`, `TestWorkflowStart_AllNilSearchAttributesFiltered`, `TestDescribeWorkflow_NilSearchAttributesNotVisible`, `TestWorkflowStart_NilMemoFiltered`, `TestWorkflowStart_AllNilMemoFiltered`, `TestDescribeWorkflow_NilMemoNotVisible` |
 | `TestSignalWorkflowTestSuiteLegacy` | `TestSignalWorkflowTestSuite` |
+
+## HTTP synchronization and scope addendum — 2026-09-15
+
+The integration seat authorized the synchronization, pre-flip classification and
+scope allocations above on 2026-09-15. This addendum preserves the original
+baseline: all suite counts, classifications and 2,644 captured outcomes are
+unchanged. Only the five approved scope-allocation notes changed in
+`baseline-v1.32.0.json`; that manifest has no per-leaf classification field, so
+`expected-until-flip` is recorded here for the header leaf.
+
+### HTTP rerun
+
+The single-suite runner used engine commit
+`d019b6058d713f1fa4345ad3a2f31617de66e2f0`, built on macOS with
+`cargo build -p tokeirad --features conformance --locked`, and Go `go1.26.8`.
+The engine self-reported `temporal_server 1.31.0` and `git d019b605`.
+Its binary SHA-256 is
+`74b04f9a7c282c89e101668fce2d0055594fef598553cf92a6d8cdaf7e404495`.
+The measured fork commit is `182b30086c399c1803ee3524810cca472864147e`.
+
+```sh
+GOTOOLCHAIN=go1.26.8 TOKEIRA_BIN=/path/to/tokeirad \
+  go run -tags test_dep ./tests/tokeira_conformance_runsuite/ \
+  -timeout 5m '^TestHttpApiTestSuite$'
+```
+
+The runner started a fresh engine, with no preconfigured frontend, metrics,
+control or authorization callback address. **Nine leaves passed, one failed,
+zero skipped and zero unfinished.** The runner's tally includes the failed
+suite parent and therefore reads **PASS 9 / FAIL 2 / SKIP 0**. The sole leaf
+failure is the header's expected `1.32.0` versus actual `1.31.0` assertion
+(`tests/http_api_test.go:361 @ v1.32.0`); it stays active and must pass after the
+Phase 4 claim flip. No whole-corpus rerun was performed.
+
+All leaf names below are beneath `TestHttpApiTestSuite/`:
+
+| Leaf | Outcome | Disposition |
+|---|---|---|
+| `TestHTTPAPIBasics_Protojson` | pass | Explicit close-history wait |
+| `TestHTTPAPIBasics_ProtojsonPretty` | pass | Explicit close-history wait |
+| `TestHTTPAPIBasics_Shorthand` | pass | Explicit close-history wait |
+| `TestHTTPAPIBasics_ShorthandPretty` | pass | Explicit close-history wait |
+| `TestHTTPAPIHeaders` | fail | `expected-until-flip`; re-verify at Phase 4 |
+| `TestHTTPAPI_OperatorService_ListSearchAttributes` | pass | Public operator HTTP API |
+| `TestHTTPAPI_Serves_OpenAPIv2_Docs` | pass | Public API documentation |
+| `TestHTTPAPI_Serves_OpenAPIv3_Docs` | pass | Public API documentation |
+| `TestHTTPAPIPretty` | pass | Public JSON formatting |
+| `TestHTTPHostValidation` | pass | Public HTTP host validation |
+
+Retained runner output and its per-leaf distillation are under the operator
+artifact directory `artifacts/t132-baseline-addenda/`. Their hashes are recorded
+in `SHA256SUMS`; the runner log SHA-256 is `c401db60684c90dfe499316395712a16df5a4b7de3c6aa6497a4719f8422eebf`.
+
+### Exact registry additions
+
+The fork audit's `post_baseline_addenda` section records the following nine new
+identities, separately from its original 118-entry migration review. There are
+now **121 active registry identities**; the captured baseline retains its original
+112 registry-skip outcomes. The seven scenario exclusions each cover six nested
+statistics methods with the same forced internal setup. Their default-scenario
+siblings stay active, along with `TestDescribeTaskQueue_NonRoot` and
+`TestNoTasks_ValidateStats`; the suite remains owned by
+`v132-batch-operations-and-workers`.
+
+Two exact exclusions are:
+
+| Exact test identity | Reason and source at v1.32.0 |
+|---|---|
+| `TestActivityApiPause_AttributesToActivityInContextMetadata` | Enables unwired startup-only `frontend.contextMetadataSetTrailer`, default false (`tests/activity_api_pause_test.go:990`; `service/frontend/fx.go:525`; `common/dynamicconfig/constants.go:869`). |
+| `TestTaskQueueStats_Pri_Suite/TestAddMultipleTasks_ValidateStats_Cached` | Sets `matching.TaskQueueInfoByBuildIdTTL` to one hour and requires stale cached statistics after draining tasks (`tests/task_queue_stats_test.go:137-183`). |
+
+The other seven exact identities all have the prefix
+`TestTaskQueueStats_Pri_Suite/TestVersioningSuite/`:
+
+| Scenario suffix | Internal setup |
+|---|---|
+| `NoTaskForwardNoPollForwardForceAsyncSuite` | Disable synchronous matching |
+| `ForceTaskForwardNoPollForwardAllowSyncSuite` | Force writes to partition 11 |
+| `ForceTaskForwardNoPollForwardForceAsyncSuite` | Force writes to partition 11 and disable synchronous matching |
+| `NoTaskForwardForcePollForwardAllowSyncSuite` | Force polls to partition 5 |
+| `NoTaskForwardForcePollForwardForceAsyncSuite` | Force polls to partition 5 and disable synchronous matching |
+| `ForceTaskForwardForcePollForwardAllowSyncSuite` | Force writes to partition 11 and polls to partition 5 |
+| `ForceTaskForwardForcePollForwardForceAsyncSuite` | Force writes to partition 11, polls to partition 5 and disable synchronous matching |
+
+These scenario names are constructed in `tests/task_queue_stats_test.go:189-197`;
+`tests/testcore/matching_behavior.go:39-73 @ v1.32.0` configures 13 partitions for
+forwarding and installs `MatchingLBForceWritePartition`,
+`MatchingLBForceReadPartition` and `MatchingDisableSyncMatch` hooks. The ordinary
+`NoTaskForwardNoPollForwardAllowSyncSuite` uses public deployment registration and
+current/ramping-version RPCs, so it remains in the public statistics allocation.
+The registry tests verify that the default scenario's six methods and the two
+public top-level cases are not filtered, while the internal groups and startup-only
+trailer case are excluded exactly.
+
+### Addendum validation
+
+The testcore shim and all four conformance-tool packages passed their tests with
+`GOTOOLCHAIN=go1.26.8 go test -tags test_dep`. `go vet -tags test_dep` passed for
+those packages and the flat corpus. Source-integrity checks verified that the
+HTTP query parameter is the only upstream test-body change, and that `go.mod`
+and `go.sum` are unchanged. The audit covers all 121 unique active registry names.
+The full fork `make lint-code` passed with zero new issues, including its
+error-type vet step; the first cold analysis reported zero issues but exceeded
+the ten-minute limit, and the cached rerun completed successfully.
+
+On the engine side, `cargo run -p compatibility-docs --locked -- check-temporal`
+passed, and the source-tree offline link check reported zero errors. All captured
+counts, classifications, provenance and raw outcomes were compared with the base;
+only the five approved manifest allocation notes differ. No engine source,
+dependency file or delta placeholder changed.

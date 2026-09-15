@@ -1500,7 +1500,7 @@
       "new_entrypoint_name": true,
       "owner": "v132-lifecycle-fidelity",
       "out_of_surface_reason": null,
-      "scope_allocation_note": "All-nil memo/search-attribute message presence is a public serialization contract, outside the query-converter placeholder; lifecycle ownership is proposed.",
+      "scope_allocation_note": "Allocated by the integration seat on 2026-09-15 to v132-lifecycle-fidelity: all-nil memo/search-attribute message presence is a public serialization contract.",
       "counts": {
         "pass": 4,
         "fail": 3,
@@ -1677,7 +1677,7 @@
       "new_entrypoint_name": false,
       "owner": "v132-lifecycle-fidelity",
       "out_of_surface_reason": null,
-      "scope_allocation_note": "Speculative workflow-task history pagination is not explicit in the lifecycle placeholder.",
+      "scope_allocation_note": "Allocated by the integration seat on 2026-09-15 to v132-lifecycle-fidelity: speculative workflow-task history pagination.",
       "counts": {
         "pass": 2,
         "fail": 0,
@@ -1787,7 +1787,7 @@
       "new_entrypoint_name": false,
       "owner": "v132-lifecycle-fidelity",
       "out_of_surface_reason": null,
-      "scope_allocation_note": "Relay workflow-task timeout history and attempt counts are not explicit in the lifecycle placeholder.",
+      "scope_allocation_note": "Allocated by the integration seat on 2026-09-15 to v132-lifecycle-fidelity: relay workflow-task timeout history and attempt counts.",
       "counts": {
         "pass": 2,
         "fail": 0,
@@ -2266,7 +2266,7 @@
       "new_entrypoint_name": false,
       "owner": "v132-batch-operations-and-workers",
       "out_of_surface_reason": null,
-      "scope_allocation_note": "Public DescribeTaskQueue statistics need scope allocation under the workers delta; internal routing/cache-hook cases need separate exact exclusions.",
+      "scope_allocation_note": "Allocated by the integration seat on 2026-09-15: public DescribeTaskQueue statistics belong to v132-batch-operations-and-workers. The cached-statistics method and seven forced-forwarding/forced-async scenario groups have exact cited fork registry exclusions; the default scenario and other public cases remain active. Captured counts are unchanged.",
       "counts": {
         "pass": 0,
         "fail": 13,
@@ -3036,7 +3036,7 @@
       "new_entrypoint_name": true,
       "owner": "v132-lifecycle-fidelity",
       "out_of_surface_reason": null,
-      "scope_allocation_note": "Workflow-name control bytes/UTF-8 and binary transport metadata are not explicit in the lifecycle placeholder.",
+      "scope_allocation_note": "Allocated by the integration seat on 2026-09-15 to v132-lifecycle-fidelity: workflow-name control bytes/UTF-8 and binary transport metadata.",
       "counts": {
         "pass": 23,
         "fail": 0,

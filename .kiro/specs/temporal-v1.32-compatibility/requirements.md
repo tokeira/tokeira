@@ -387,7 +387,7 @@ that every default flip between the releases is a recorded decision.
    equality against it.
 4. WHEN a key was added, removed, or renamed between `v1.31.0` and `v1.32.0`, THE ledger
    entry SHALL record the change (including `matching.enableMigration` removed,
-   `nexusoperation.useSystemCallbackURL` removed,
+   `component.nexusoperations.useSystemCallbackURL` removed,
    `component.callbacks.allowedAddresses` → `callback.allowedAddresses`,
    `nexusoperation.enableChasm` → `nexusoperation.enableChasmWorkflowOperations`,
    `frontend.pollWaitForNamespaceRateLimitToken` → `system.pollWaitForNamespaceRateLimitToken`).

@@ -541,6 +541,11 @@ platform code is executed by the release that owns it.
 construct the engine and get a typed handle back, so that my application drives its
 archetype in process without an RPC surface.
 
+Criteria 8.9 and 8.11 define Tokeira-native clock boundaries and have no upstream analog.
+The storage lifetime is enforced by `WorkerTaskProvenanceStore::get` in
+`crates/tokeira-storage/src/memory.rs` and `crates/tokeira-storage/src/dsql/worker_task_provenance.rs`,
+and by the latter's `delete_expired` maintenance sweep.
+
 #### Acceptance Criteria
 1. THE engine crate SHALL expose `Engine::builder()` behind a cargo feature named
    `chasm-extensions`, documented as unstable with no semver promise.
@@ -558,10 +563,16 @@ archetype in process without an RPC surface.
 8. THE clock SHALL be the source of now for every CHASM transition, pure-task deadline,
    delayed dispatch, callback registration time and sweeper pass.
 9. THE clock SHALL be documented as the CHASM plane's clock only; the workflow plane's time
-   source is unchanged.
+   source SHALL remain unchanged; a worker task-token provenance record's lifetime SHALL
+   be a storage lifetime on real time, not a CHASM deadline.
 10. THE engine SHALL re-export the substrate types an extension library needs (`Component`,
     `RootComponent`, `Library`, `RegistryBuilder`, the task handler traits, `TypedEngine`,
     `ComponentRef`, `ChasmError`) under the same feature.
+11. THE CHASM plane SHALL obtain decision time through its configured clock and SHALL NOT
+    read wall time directly; the only sanctioned direct real-time uses SHALL be the
+    component long-poll's transport deadline, which bounds request waiting independently
+    of simulation progress, and the task-token provenance lifetime, whose expiry is enforced
+    by storage on real time.
 
 ### Requirement 9: Acceptance archetype
 

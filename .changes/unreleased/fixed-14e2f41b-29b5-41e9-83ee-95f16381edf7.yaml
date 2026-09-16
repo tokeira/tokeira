@@ -1,0 +1,5 @@
+kind: fixed
+body: A scoped worker can claim a versioned standalone activity when the CHASM clock is a simulation clock; task-token provenance now expires on real time.
+time: 2026-09-16T20:20:57.156664+01:00
+custom:
+    Slice: 14e2f41b-29b5-41e9-83ee-95f16381edf7

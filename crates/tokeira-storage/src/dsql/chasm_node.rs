@@ -35,7 +35,8 @@ use tokeira_chasm::{ChasmNode, ExecutionKey, LifecycleState, VersionedTransition
 use uuid::Uuid;
 
 use crate::{
-    ChasmNodeRepository, CurrentRun, DbClass, ExpectedVersion, NodePersistOutcome, NodeWrite,
+    CHASM_CURRENT_EXECUTION_BACKFILL_MARKER, ChasmNodeRepository, CurrentExecution,
+    CurrentExecutionCursor, CurrentRun, DbClass, ExpectedVersion, NodePersistOutcome, NodeWrite,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, DsqlRunRepository, codec};
@@ -94,7 +95,20 @@ impl DsqlChasmNodeRepository {
         Ok((encoded_path.into_bytes(), ChasmNode { metadata, data }))
     }
 
-    /// Encode a [`LifecycleState`] as the `chasm_current_run.status` SMALLINT
+    fn current_from_row(row: &sqlx::postgres::PgRow) -> Result<CurrentRun> {
+        let run_id: Uuid = row.try_get("run_id")?;
+        Ok(CurrentRun {
+            run_id: run_id.to_string(),
+            request_id: row.try_get("request_id")?,
+            status: Self::decode_status(row.try_get("status")?)?,
+            vt_epoch: VersionedTransition::new(
+                row.try_get("failover_version")?,
+                row.try_get("transition_count")?,
+            ),
+        })
+    }
+
+    /// Encode a [`LifecycleState`] as the `CHASM pointer status` SMALLINT
     /// (0=Running, 1=Completed, 2=Failed). Stable on-disk encoding — extend, never
     /// renumber.
     fn encode_status(status: LifecycleState) -> i16 {
@@ -105,14 +119,14 @@ impl DsqlChasmNodeRepository {
         }
     }
 
-    /// Decode a `chasm_current_run.status` SMALLINT back to a [`LifecycleState`].
+    /// Decode a `CHASM pointer status` SMALLINT back to a [`LifecycleState`].
     fn decode_status(value: i16) -> Result<LifecycleState> {
         match value {
             0 => Ok(LifecycleState::Running),
             1 => Ok(LifecycleState::Completed),
             2 => Ok(LifecycleState::Failed),
             other => Err(anyhow::anyhow!(
-                "chasm_current_run.status `{other}` is not a known LifecycleState"
+                "CHASM pointer status `{other}` is not a known LifecycleState"
             )),
         }
     }
@@ -236,6 +250,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
     async fn persist_new_execution(
         &self,
         key: &ExecutionKey,
+        archetype_id: u32,
         batch: Vec<NodeWrite>,
         current: CurrentRun,
     ) -> Result<NodePersistOutcome> {
@@ -337,14 +352,16 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
 
         // Phase 3 — advance the current-run pointer in the SAME transaction (the
         // analog of v1.31.0's current_executions write inside the entity-create tx),
-        // so the run's root node and its current-run pointer never tear.
+        // so the run's root node and its current-run pointer never tear. Archetype
+        // is part of the key upstream too (schema/postgresql/v12/temporal/versioned/
+        // v1.19/current_chasm_executions.sql @ v1.31.0).
         let current_run_id = Self::parse_uuid("current run_id", &current.run_id)?;
         let pointer = sqlx::query(
-            "INSERT INTO chasm_current_run
+            "INSERT INTO chasm_current_execution
                (namespace_id, business_id, run_id, request_id, status,
-                failover_version, transition_count, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-             ON CONFLICT (namespace_id, business_id) DO UPDATE SET
+                failover_version, transition_count, archetype_id, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+             ON CONFLICT (namespace_id, archetype_id, business_id) DO UPDATE SET
                 run_id = EXCLUDED.run_id,
                 request_id = EXCLUDED.request_id,
                 status = EXCLUDED.status,
@@ -359,6 +376,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         .bind(Self::encode_status(current.status))
         .bind(current.vt_epoch.namespace_failover_version)
         .bind(current.vt_epoch.transition_count)
+        .bind(i64::from(archetype_id))
         .execute(&mut *tx)
         .await;
         if let Err(err) = pointer {
@@ -385,31 +403,155 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
     async fn current_run(
         &self,
         namespace_id: &str,
+        archetype_id: u32,
         business_id: &str,
     ) -> Result<Option<CurrentRun>> {
         let namespace_uuid = Self::parse_uuid("namespace_id", namespace_id)?;
         let mut permit = self.director.acquire(DbClass::Read).await?;
+        // One statement gives the new pointer, marker and legacy fallback the same
+        // snapshot: a concurrent backfill cannot hide a row between those reads.
+        // The legacy key lacks an archetype; its root prevents cross-archetype
+        // aliasing and resurrection of deleted runs without writing the old table.
         let row = sqlx::query(
             "SELECT run_id, request_id, status, failover_version, transition_count
-             FROM chasm_current_run
-             WHERE namespace_id = $1 AND business_id = $2",
+             FROM chasm_current_execution
+             WHERE namespace_id = $1 AND archetype_id = $2 AND business_id = $3
+             UNION ALL
+             SELECT old.run_id, old.request_id, old.status, old.failover_version, old.transition_count
+             FROM chasm_current_run AS old
+             JOIN chasm_node AS root ON root.namespace_id = old.namespace_id
+               AND root.business_id = old.business_id AND root.run_id = old.run_id
+               AND root.encoded_path = '' AND root.archetype_id = $2
+             WHERE old.namespace_id = $1 AND old.business_id = $3
+               AND NOT EXISTS (SELECT 1 FROM chasm_backfill_marker WHERE marker_name = $4)
+               AND NOT EXISTS (SELECT 1 FROM chasm_current_execution
+                 WHERE namespace_id = $1 AND archetype_id = $2 AND business_id = $3)",
         )
         .bind(namespace_uuid)
+        .bind(i64::from(archetype_id))
         .bind(business_id)
+        .bind(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
         .fetch_optional(permit.connection()?)
         .await?;
-        let Some(row) = row else { return Ok(None) };
-        let run_id: Uuid = row.try_get("run_id")?;
-        let request_id: String = row.try_get("request_id")?;
-        let status: i16 = row.try_get("status")?;
-        let failover: i64 = row.try_get("failover_version")?;
-        let count: i64 = row.try_get("transition_count")?;
-        Ok(Some(CurrentRun {
-            run_id: run_id.to_string(),
-            request_id,
-            status: Self::decode_status(status)?,
-            vt_epoch: VersionedTransition::new(failover, count),
-        }))
+        row.as_ref().map(Self::current_from_row).transpose()
+    }
+
+    async fn scan_current_executions(
+        &self,
+        status: LifecycleState,
+        after: Option<CurrentExecutionCursor>,
+        limit: usize,
+    ) -> Result<Vec<CurrentExecution>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let namespace = after
+            .as_ref()
+            .map(|key| Self::parse_uuid("cursor namespace_id", &key.namespace_id))
+            .transpose()?;
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let rows = sqlx::query(
+            "SELECT namespace_id, archetype_id, business_id, run_id, request_id,
+                    status, failover_version, transition_count
+             FROM chasm_current_execution
+             WHERE status = $1 AND ($2::uuid IS NULL OR
+                 (namespace_id, archetype_id, business_id) > ($2, $3, $4))
+             ORDER BY namespace_id, archetype_id, business_id LIMIT $5",
+        )
+        .bind(Self::encode_status(status))
+        .bind(namespace)
+        .bind(after.as_ref().map(|key| i64::from(key.archetype_id)))
+        .bind(after.as_ref().map(|key| key.business_id.as_str()))
+        .bind(i64::try_from(limit)?)
+        .fetch_all(permit.connection()?)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let current = Self::current_from_row(row)?;
+                let namespace: Uuid = row.try_get("namespace_id")?;
+                let business_id: String = row.try_get("business_id")?;
+                let archetype: i64 = row.try_get("archetype_id")?;
+                Ok(CurrentExecution {
+                    key: ExecutionKey::new(namespace.to_string(), business_id, &current.run_id),
+                    archetype_id: u32::try_from(archetype)?,
+                    current,
+                })
+            })
+            .collect()
+    }
+
+    async fn backfill_current_executions(&self, archetype_id: u32, batch: usize) -> Result<usize> {
+        anyhow::ensure!(batch > 0, "CHASM backfill batch must be nonzero");
+        let mut permit = self.director.acquire(DbClass::Commit).await?;
+        let mut tx = permit.connection()?.begin().await?;
+        // Copied keys are durable progress: exclude them before LIMIT, otherwise a
+        // full first page would make the next call return zero prematurely. This
+        // ordered remaining-key scan resumes after crashes without an in-memory
+        // cursor, and never overwrites a newer pointer. Bootstrap runs before
+        // request admission; errors (including OCC) leave the marker unset.
+        let inserted = sqlx::query(
+            "INSERT INTO chasm_current_execution
+               (namespace_id, archetype_id, business_id, run_id, request_id, status,
+                failover_version, transition_count, updated_at)
+             SELECT old.namespace_id, $1, old.business_id, old.run_id, old.request_id,
+                    old.status, old.failover_version, old.transition_count, old.updated_at
+             FROM chasm_current_run AS old
+             JOIN chasm_node AS root ON root.namespace_id = old.namespace_id
+               AND root.business_id = old.business_id AND root.run_id = old.run_id
+               AND root.encoded_path = '' AND root.archetype_id = $1
+             WHERE NOT EXISTS (SELECT 1 FROM chasm_current_execution AS current
+               WHERE current.namespace_id = old.namespace_id AND current.archetype_id = $1
+                 AND current.business_id = old.business_id)
+             ORDER BY old.namespace_id, old.business_id
+             LIMIT $2
+             ON CONFLICT (namespace_id, archetype_id, business_id) DO NOTHING",
+        )
+        .bind(i64::from(archetype_id))
+        .bind(i64::try_from(batch.min(500))?)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(usize::try_from(inserted)?)
+    }
+
+    async fn distinct_archetypes(&self) -> Result<Vec<(u32, u64)>> {
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let rows = sqlx::query(
+            "SELECT archetype_id, COUNT(*) AS count FROM chasm_current_execution
+             GROUP BY archetype_id ORDER BY archetype_id",
+        )
+        .fetch_all(permit.connection()?)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let archetype: i64 = row.try_get("archetype_id")?;
+                let count: i64 = row.try_get("count")?;
+                Ok((u32::try_from(archetype)?, u64::try_from(count)?))
+            })
+            .collect()
+    }
+
+    async fn backfill_marker_set(&self, name: &str) -> Result<bool> {
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        Ok(
+            sqlx::query("SELECT 1 FROM chasm_backfill_marker WHERE marker_name = $1")
+                .bind(name)
+                .fetch_optional(permit.connection()?)
+                .await?
+                .is_some(),
+        )
+    }
+
+    async fn set_backfill_marker(&self, name: &str) -> Result<()> {
+        let mut permit = self.director.acquire(DbClass::Commit).await?;
+        sqlx::query(
+            "INSERT INTO chasm_backfill_marker (marker_name) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(name)
+        .execute(permit.connection()?)
+        .await?;
+        Ok(())
     }
 
     async fn load_execution(&self, key: &ExecutionKey) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
@@ -472,7 +614,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         // Clear the current-run pointer iff it still points at the deleted run
         // (read-your-write; a superseded run leaves a newer pointer intact).
         sqlx::query(
-            "DELETE FROM chasm_current_run
+            "DELETE FROM chasm_current_execution
              WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
         )
         .bind(namespace_id)
@@ -516,6 +658,9 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
 
 #[cfg(test)]
 mod tests {
+    use crate::chasm::pointer_tests;
+    use proptest::{prelude::*, test_runner::TestRunner};
+    use sqlx::{ConnectOptions, Postgres, QueryBuilder};
     use time::Duration;
     use tokeira_chasm::{
         LifecycleState, NodeMetadata, NodeTree, RetainAllValidator,
@@ -544,25 +689,14 @@ mod tests {
 
     async fn ensure_chasm_node_table(database_url: &str) -> anyhow::Result<()> {
         let pool = sqlx::PgPool::connect(database_url).await?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS chasm_node (
-                namespace_id                UUID        NOT NULL,
-                business_id                 TEXT        NOT NULL,
-                run_id                      UUID        NOT NULL,
-                encoded_path                TEXT        NOT NULL,
-                archetype_id                BIGINT      NOT NULL,
-                failover_version            BIGINT      NOT NULL,
-                transition_count            BIGINT      NOT NULL,
-                initial_failover_version    BIGINT      NOT NULL,
-                initial_transition_count    BIGINT      NOT NULL,
-                metadata                    BYTEA       NOT NULL,
-                data                        BYTEA,
-                updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (namespace_id, business_id, run_id, encoded_path)
-            )",
-        )
-        .execute(&pool)
-        .await?;
+        for sql in [
+            include_str!("../../migrations/V049__chasm_node.sql"),
+            include_str!("../../migrations/V056__chasm_current_run.sql"),
+            include_str!("../../migrations/V069__chasm_current_execution.sql"),
+            include_str!("../../migrations/V071__chasm_backfill_marker.sql"),
+        ] {
+            sqlx::query(sql).execute(&pool).await?;
+        }
         pool.close().await;
         Ok(())
     }
@@ -637,7 +771,13 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            repo.persist_dirty(&key, batch).await?,
+            repo.persist_new_execution(
+                &key,
+                7,
+                batch,
+                pointer_tests::current(key.run_id.clone(), "create", LifecycleState::Running)
+            )
+            .await?,
             NodePersistOutcome::Applied
         );
 
@@ -661,10 +801,177 @@ mod tests {
         ));
         assert_eq!(repo.load_execution(&key).await?[0].1.data, Some(vec![1]));
 
+        assert_eq!(
+            repo.current_run(&key.namespace_id, 7, &key.business_id)
+                .await?
+                .unwrap()
+                .run_id,
+            key.run_id
+        );
+        assert!(matches!(
+            repo.persist_new_execution(
+                &key,
+                7,
+                vec![pointer_tests::root(7, LifecycleState::Completed, 1)],
+                pointer_tests::current(
+                    uuid::Uuid::new_v4().to_string(),
+                    "conflict",
+                    LifecycleState::Completed
+                )
+            )
+            .await?,
+            NodePersistOutcome::Conflict { .. }
+        ));
+        assert_eq!(
+            repo.current_run(&key.namespace_id, 7, &key.business_id)
+                .await?
+                .unwrap()
+                .request_id,
+            "create"
+        );
         repo.delete_execution(&key).await?;
         assert!(repo.load_execution(&key).await?.is_empty());
+        assert!(
+            repo.current_run(&key.namespace_id, 7, &key.business_id)
+                .await?
+                .is_none()
+        );
 
         store.shutdown().await?;
         Ok(())
+    }
+
+    #[test]
+    fn pointer_migrations_pass_ddl_validator() {
+        for (name, sql) in [
+            (
+                "V069",
+                include_str!("../../migrations/V069__chasm_current_execution.sql"),
+            ),
+            (
+                "V070",
+                include_str!("../../migrations/V070__idx_chasm_current_execution_status.sql"),
+            ),
+            (
+                "V071",
+                include_str!("../../migrations/V071__chasm_backfill_marker.sql"),
+            ),
+        ] {
+            assert!(
+                crate::dsql::validation::DdlValidator::validate(sql, name).is_empty(),
+                "{name}"
+            );
+            assert_eq!(sql.matches(';').count(), 1, "one statement per migration");
+        }
+    }
+
+    // Feature: chasm-extension-archetypes, Property 8: archetype-scoped business ids
+    // The same independent-pointer model must hold through real SQL and backfill.
+    #[test]
+    fn dsql_archetype_scoped_business_ids() -> anyhow::Result<()> {
+        let Ok(database_url) = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        // The completion marker is global to a schema. Give this property its own
+        // schema so fixture resets never alter another test's or an operator's marker.
+        // All dynamic DDL below uses only this UUID-derived identifier and literal
+        // table names; neither can contain SQL syntax or user input.
+        let schema = format!("chasm_pbt_{}", uuid::Uuid::new_v4().simple());
+        let (admin, pool, store) = runtime.block_on(async {
+            let admin = sqlx::PgPool::connect(&database_url).await?;
+            // SQL safety: schema consists only of a fixed prefix and UUID hex.
+            QueryBuilder::<Postgres>::new("CREATE SCHEMA ")
+                .push(&schema)
+                .build()
+                .execute(&admin)
+                .await?;
+            let options = database_url
+                .parse::<sqlx::postgres::PgConnectOptions>()?
+                .options([("search_path", schema.as_str())]);
+            // SQLx's lossy URL conversion omits startup options. Restore the
+            // search path explicitly before the director opens its connections.
+            let mut url = options.to_url_lossy();
+            url.query_pairs_mut()
+                .append_pair("options", &format!("-c search_path={schema}"));
+            let pool = sqlx::PgPool::connect_with(options).await?;
+            for sql in [
+                include_str!("../../migrations/V049__chasm_node.sql"),
+                include_str!("../../migrations/V056__chasm_current_run.sql"),
+                include_str!("../../migrations/V069__chasm_current_execution.sql"),
+                include_str!("../../migrations/V071__chasm_backfill_marker.sql"),
+            ] {
+                sqlx::query(sql).execute(&pool).await?;
+            }
+            let store =
+                DsqlStore::from_database_url_for_tests(url.to_string(), test_pool_config()).await?;
+            Ok::<_, anyhow::Error>((admin, pool, store))
+        })?;
+        let repo = store.chasm_node_repository();
+        runtime.block_on(async {
+            let mut permit = repo.director.acquire(crate::DbClass::Read).await?;
+            let actual: String = sqlx::query_scalar("SELECT current_schema()")
+                .fetch_one(permit.connection()?)
+                .await?;
+            anyhow::ensure!(actual == schema, "property test schema isolation failed");
+            Ok::<_, anyhow::Error>(())
+        })?;
+        let result = TestRunner::new(ProptestConfig::with_cases(100)).run(
+            &pointer_tests::dsql_scenarios(), |scenario| {
+                runtime.block_on(async {
+                    for sql in ["DELETE FROM chasm_current_execution", "DELETE FROM chasm_current_run",
+                        "DELETE FROM chasm_node", "DELETE FROM chasm_backfill_marker"] {
+                        sqlx::query(sql).execute(&pool).await?;
+                    }
+                    let namespace = uuid::Uuid::new_v4().to_string();
+                    for (key, pointer) in pointer_tests::legacy_rows(&scenario, &namespace) {
+                        repo.persist_dirty(&key, vec![pointer_tests::root(scenario.archetypes[0], pointer.status, 1)]).await?;
+                        sqlx::query("INSERT INTO chasm_current_run
+                            (namespace_id, business_id, run_id, request_id, status, failover_version, transition_count)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7)")
+                            .bind(uuid::Uuid::parse_str(&key.namespace_id)?)
+                            .bind(&key.business_id)
+                            .bind(uuid::Uuid::parse_str(&pointer.run_id)?)
+                            .bind(&pointer.request_id)
+                            .bind(super::DsqlChasmNodeRepository::encode_status(pointer.status))
+                            .bind(pointer.vt_epoch.namespace_failover_version)
+                            .bind(pointer.vt_epoch.transition_count)
+                            .execute(&pool).await?;
+                    }
+                    pointer_tests::exercise(&repo, &scenario, &namespace).await
+                }).map_err(|error| TestCaseError::fail(error.to_string()))
+            },
+        );
+        drop(repo);
+        runtime.block_on(async {
+            store.shutdown().await?;
+            for table in [
+                "chasm_current_execution",
+                "chasm_current_run",
+                "chasm_node",
+                "chasm_backfill_marker",
+            ] {
+                // SQL safety: UUID-derived schema and allowlisted table literal.
+                QueryBuilder::<Postgres>::new("DROP TABLE ")
+                    .push(&schema)
+                    .push(".")
+                    .push(table)
+                    .build()
+                    .execute(&admin)
+                    .await?;
+            }
+            pool.close().await;
+            // SQL safety: this is the same UUID-derived schema created above.
+            QueryBuilder::<Postgres>::new("DROP SCHEMA ")
+                .push(&schema)
+                .build()
+                .execute(&admin)
+                .await?;
+            admin.close().await;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        result.map_err(|error| anyhow::anyhow!("{error}"))
     }
 }

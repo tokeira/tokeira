@@ -19,14 +19,20 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 
 ### Stage 1 — Storage: the archetype-keyed pointer (`tokeira-storage`)
 
-- [ ] 1.1 Add migrations `V069__chasm_current_execution.sql` (the table in `design.md`,
+- [x] 1.1 Add migrations `V069__chasm_current_execution.sql` (the table in `design.md`,
   spread-key `PRIMARY KEY (namespace_id, archetype_id, business_id)`) and
   `V070__idx_chasm_current_execution_status.sql` (`CREATE INDEX ASYNC … ON
   chasm_current_execution (namespace_id, status, archetype_id, business_id)` on one line).
   One statement per file; unit-test both through `DdlValidator::validate`. Update the
   baseline note in `crates/tokeira-storage/AGENTS.md` so "the next schema change" reads V071.
   - _Requirements: 4.2_
-- [ ] 1.2 Extend `ChasmNodeRepository`: `persist_new_execution(key, archetype_id, batch,
+
+  **DONE (2026-09-16):** V069–V071 add the scoped pointer, asynchronous status index
+  and dedicated marker table. V070 includes `IF NOT EXISTS` for the migration runner's
+  restart-safety contract. All three pass `DdlValidator`; all 71 embedded migrations
+  pass the idempotence check. The storage rules now name V072 as next.
+
+- [x] 1.2 Extend `ChasmNodeRepository`: `persist_new_execution(key, archetype_id, batch,
   current)` writing the pointer to the new table; `current_run(namespace_id, archetype_id,
   business_id)` reading the new table first and falling back to `chasm_current_run` while the
   backfill marker is unset; `scan_current_executions(status, after, limit)` in
@@ -35,25 +41,54 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   CONFLICT DO NOTHING` bounded per transaction; `distinct_archetypes()`. Mirror every method
   in the in-memory repository. Update the DSQL `persist_new_execution` upsert to the new key.
   - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6_
-- [ ] 1.3 Add the backfill marker (a row in the existing control table, keyed
+
+  **DONE (2026-09-16):** Both repositories implement scoped atomic pointer writes,
+  exclusive cursor scans, bounded restartable backfill and archetype counts. Legacy
+  fallback requires a matching existing root and an unset marker; a missing or
+  mismatched root is absent. Runtime and bridge call sites pass the archetype id.
+
+- [x] 1.3 Add the backfill marker (a row in `chasm_backfill_marker`, keyed
   `chasm_current_execution_backfill`) and `ChasmNodeRepository::backfill_marker_set()` /
   `set_backfill_marker()`. Unit-test: fallback read served only while the marker is unset.
   - _Requirements: 4.3, 4.4_
-- [ ] 1.4 Record the retirement rule in `crates/tokeira-storage/AGENTS.md`: `chasm_current_run`
+
+  **DONE (2026-09-16):** V071 owns `chasm_backfill_marker`; named marker reads/writes
+  and `run_current_execution_backfill` are implemented. Engine bootstrap invokes the
+  driver before CHASM construction, using the registered activity id and batches of
+  500. Marker-complete boots skip copying; zero-sized batches are rejected.
+
+- [x] 1.4 Record the retirement rule in `crates/tokeira-storage/AGENTS.md`: `chasm_current_run`
   is dropped by a later migration only after a full release with the marker set; add a test
   asserting no code path writes `chasm_current_run` after this stage.
   - _Requirements: 4.7_
-- [ ] 1.5 Property test: Property 8 — archetype-scoped business ids
+
+  **DONE (2026-09-16):** The storage rules require a full release with the marker set
+  and no fallback reads before retirement. `legacy_pointer_sql_is_read_only` guards
+  production SQL; new starts and deletes affect only the scoped pointer table.
+
+- [x] 1.5 Property test: Property 8 — archetype-scoped business ids
   - Reference-model PBT over interleaved starts across two archetype ids sharing business
     ids, with and without pre-seeded `chasm_current_run` rows and the marker toggled; run
     against the in-memory repository, and under `dsql-integration` against DSQL.
   - Tag: `// Feature: chasm-extension-archetypes, Property 8: archetype-scoped business ids`
   - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6_
 
-- [ ] 2. Checkpoint: `cargo clippy -p tokeira-storage --all-targets` clean; `cargo nextest run
+  **DONE (2026-09-16):** The in-memory reference model passes 128 generated traces
+  across independent archetypes, reuse/conflict policies, live root lifecycle changes,
+  legacy seeds and marker positions. The DSQL variant supplies 100 shorter traces in
+  an isolated schema and is environment-gated alongside the round-trip/fencing test.
+  Both live DSQL paths were **not exercised**: `TOKEIRA_DSQL_TEST_DATABASE_URL` was unset.
+
+- [x] 2. Checkpoint: `cargo clippy -p tokeira-storage --all-targets` clean; `cargo nextest run
   -p tokeira-storage` green; migrations validate; `chasm-foundation` visibility properties
   12–14 still green.
   - _Requirements: 4.8_
+
+  **DONE (2026-09-16):** All six root finishing-bar commands pass, with nextest run
+  serially: 3,361 passed and two existing SDK integration tests skipped. This includes
+  the storage suite, migration DDL/restart-safety checks and unchanged CHASM visibility
+  properties 12–14. Live DSQL execution remains unexercised as recorded in 1.5; the
+  earlier parallel-run backlog timeout and successful rerun are recorded in the PR.
 
 ### Stage 3 — Substrate: task identity, typed handlers, registry (`tokeira-chasm`, `tokeira-chasm-derive`)
 

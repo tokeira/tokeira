@@ -361,17 +361,18 @@ impl ChasmEngine {
     /// next commit. The execution clock is reconstructed as the maximum node VT
     /// (every committed transition stamps at least one node with the committing
     /// VT, so the max equals the execution clock).
-    /// Resolve the current run for `(namespace_id, business_id)` — the run a bare-id
+    /// Resolve the current run for `(namespace_id, archetype_id, business_id)` — the run a bare-id
     /// (empty `run_id`) request addresses (`activity-executions-first-class` Req 1).
     /// Authoritative: delegates to the node store's current-run pointer, never the
     /// visibility projection.
     pub async fn current_run(
         &self,
         namespace_id: &str,
+        archetype_id: u32,
         business_id: &str,
     ) -> Result<Option<CurrentRun>, ChasmError> {
         self.repo
-            .current_run(namespace_id, business_id)
+            .current_run(namespace_id, archetype_id, business_id)
             .await
             .map_err(|e| ChasmError::Internal(format!("resolve current run: {e}")))
     }
@@ -566,7 +567,11 @@ impl Engine for ChasmEngine {
         // advisory pointer status — decides live-vs-terminal, so a just-closed run is
         // governed by the reuse policy rather than the conflict policy.
         if let Some(current) = self
-            .current_run(&req.key.namespace_id, &req.key.business_id)
+            .current_run(
+                &req.key.namespace_id,
+                req.archetype_id,
+                &req.key.business_id,
+            )
             .await?
         {
             let current_key = ExecutionKey::new(
@@ -675,7 +680,7 @@ impl Engine for ChasmEngine {
         };
         match self
             .repo
-            .persist_new_execution(&req.key, batch, current)
+            .persist_new_execution(&req.key, req.archetype_id, batch, current)
             .await
             .map_err(|e| ChasmError::Internal(format!("persist new execution: {e}")))?
         {

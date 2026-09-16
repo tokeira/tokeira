@@ -3433,6 +3433,15 @@ where
         let repair_archetype = registry.archetype_id(
             <tokeira_chasm_activity::ActivityExecution as tokeira_chasm::Component>::FQN,
         );
+        // Finish pointer migration before the CHASM engine can admit a start. The
+        // driver skips completed backfills and preserves any newer scoped pointer.
+        tokeira_storage::run_current_execution_backfill(
+            chasm_node_repo.as_ref(),
+            repair_archetype.context("activity CHASM archetype is not registered")?,
+            500,
+        )
+        .await
+        .context("failed to backfill CHASM current executions")?;
         let repair_nodes = chasm_node_repo.clone();
         let dispatch_queue = Arc::new(tokeira_edge::chasm_activity::ActivityDispatchQueue::new());
         // Standalone activities flow into the shared visibility index via the

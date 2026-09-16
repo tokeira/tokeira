@@ -281,7 +281,7 @@ against kiro.dev/docs/cli/v3 when upgrading.
 | `tkw clean [--base <ref>]` | Remove tkw worktrees whose branch is fully merged |
 | `tkw tidy` | Periodic hygiene: clean + prune + `cargo sweep` + machete report + `kache gc` |
 | `tkw hook post-edit\|stop` | The hook bodies Claude/Kiro configs invoke |
-| `tkw devbox sync\|run\|bar` | Offload cargo work for the *current worktree* to a Namespace Devbox ([namespace-devboxes.md](namespace-devboxes.md)) |
+| `tkw devbox sync\|run\|bar\|markers\|down` | Offload cargo work for the *current worktree* to a Namespace Devbox — `--tag` leases one from a pool, `down` stops it ([namespace-devboxes.md](namespace-devboxes.md)) |
 
 The ownership rule, enforced in code: tkw only ever **removes** worktrees it created.
 Claude's and the app's worktrees have their own lifecycles; `tkw tidy` will sweep stale

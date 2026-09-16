@@ -85,6 +85,11 @@ enum Command {
         /// Falls back to $TKW_DEVBOX.
         #[arg(long = "box", value_name = "NAME", global = true)]
         box_name: Option<String>,
+        /// Pool tag to lease a box from for the duration of the command
+        /// (`run` and `bar` only), reusing a warm box when one is free.
+        /// Falls back to $TKW_DEVBOX_TAG.
+        #[arg(long, value_name = "TAG", global = true, conflicts_with = "box_name")]
+        tag: Option<String>,
         #[command(subcommand)]
         command: DevboxCommand,
     },
@@ -102,6 +107,10 @@ enum DevboxCommand {
     },
     /// Sync, then run the §10.4 bar remotely (fmt in --check form), timing each step.
     Bar,
+    /// List the activity markers keeping a box awake (and billable).
+    Markers,
+    /// Stop the box now rather than waiting out its idle timeout.
+    Down,
 }
 
 #[derive(Subcommand)]
@@ -132,11 +141,33 @@ fn main() -> Result<()> {
             };
             std::process::exit(code);
         }
-        Command::Devbox { box_name, command } => {
+        Command::Devbox {
+            box_name,
+            tag,
+            command,
+        } => {
+            // Sync, markers and down address one specific box: leasing a box
+            // only to inspect or stop it would acquire the wrong thing, and
+            // silently ignoring --tag would be worse.
+            if tag.is_some()
+                && matches!(
+                    command,
+                    DevboxCommand::Sync | DevboxCommand::Markers | DevboxCommand::Down
+                )
+            {
+                anyhow::bail!(
+                    "--tag leases a box for the length of a command, so it applies to \
+                     `run` and `bar` only; name the box with --box <name> instead"
+                );
+            }
             let code = match command {
                 DevboxCommand::Sync => devbox::sync(box_name.as_deref()).map(|()| 0)?,
-                DevboxCommand::Run { command } => devbox::run(box_name.as_deref(), &command)?,
-                DevboxCommand::Bar => devbox::bar(box_name.as_deref())?,
+                DevboxCommand::Run { command } => {
+                    devbox::run(box_name.as_deref(), tag.as_deref(), &command)?
+                }
+                DevboxCommand::Bar => devbox::bar(box_name.as_deref(), tag.as_deref())?,
+                DevboxCommand::Markers => devbox::markers(box_name.as_deref()).map(|()| 0)?,
+                DevboxCommand::Down => devbox::down(box_name.as_deref()).map(|()| 0)?,
             };
             // The remote command's exit code is the verdict; mirror it so
             // `tkw devbox run -- cargo test` composes in scripts and CI alike.

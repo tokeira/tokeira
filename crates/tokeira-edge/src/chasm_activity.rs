@@ -485,6 +485,22 @@ pub(crate) struct DispatchEntry {
     pub(crate) fire_at: Option<i64>,
 }
 
+/// Owned diagnostic of a queued standalone activity. This is disposable derived
+/// state, never authority: the durable outbox and pickup fence decide validity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityDispatchSnapshot {
+    /// Queue containing the entry.
+    pub task_queue: String,
+    /// Durable execution identity consulted at pickup.
+    pub key: ExecutionKey,
+    /// Attempt fence captured by dispatch.
+    pub stamp: i64,
+    /// Exact worker release, or an unscoped entry when absent.
+    pub target: Option<DeploymentVersionTarget>,
+    /// Earliest pollable CHASM time; absent means immediately eligible.
+    pub fire_at: Option<i64>,
+}
+
 /// Disposable matching queues populated by [`ActivityDispatchExecutor`]. Durable
 /// outboxes reconstruct them after loss; pickup still checks the committed attempt.
 #[derive(Debug, Default)]
@@ -504,6 +520,30 @@ impl ActivityDispatchQueue {
     /// Construct an empty queue.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Copy the disposable derived queue state without mutating it or notifying
+    /// pollers. Entries are ordered by queue name, then their FIFO position; the
+    /// copy is a point-in-time diagnostic and conveys no authority to execute.
+    pub fn snapshot(&self) -> Vec<ActivityDispatchSnapshot> {
+        let state = self
+            .state
+            .lock()
+            .expect("activity dispatch queue lock poisoned");
+        let mut queues: Vec<_> = state.queues.iter().collect();
+        queues.sort_by_key(|(name, _)| *name);
+        queues
+            .into_iter()
+            .flat_map(|(name, queue)| {
+                queue.iter().map(|entry| ActivityDispatchSnapshot {
+                    task_queue: name.clone(),
+                    key: entry.key.clone(),
+                    stamp: entry.stamp,
+                    target: entry.target.clone(),
+                    fire_at: entry.fire_at,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn enqueue(&self, task_queue: String, entry: DispatchEntry) {
@@ -1893,6 +1933,49 @@ impl TimeoutEvaluator for ActivityBridge {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn dispatch_snapshot_is_owned_ordered_and_observational() {
+        let queue = ActivityDispatchQueue::new();
+        for (name, id) in [("z", "third"), ("a", "second"), ("a", "first")] {
+            queue.enqueue(
+                name.into(),
+                DispatchEntry {
+                    key: ExecutionKey::new("ns", id, "run"),
+                    stamp: 1,
+                    target: None,
+                    fire_at: Some(42),
+                },
+            );
+        }
+        let mut notified = Box::pin(queue.dispatch_available.notified());
+        notified.as_mut().enable();
+        let snapshot = queue.snapshot();
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|entry| (entry.task_queue.as_str(), entry.key.business_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("a", "second"), ("a", "first"), ("z", "third")]
+        );
+        assert_eq!(queue.snapshot(), snapshot);
+        tokio::select! {
+            biased;
+            _ = &mut notified => panic!("snapshot must not wake pollers"),
+            _ = std::future::ready(()) => {}
+        }
+        let mut detached = snapshot.clone();
+        detached[0].key.business_id = "mutated copy".into();
+        assert_eq!(queue.snapshot(), snapshot);
+        for entry in snapshot {
+            let picked = queue.dequeue_due(&entry.task_queue, 42, None).unwrap();
+            assert_eq!(picked.key, entry.key);
+            assert_eq!(picked.stamp, entry.stamp);
+            assert_eq!(picked.fire_at, entry.fire_at);
+            assert_eq!(picked.target, entry.target);
+        }
+        assert!(queue.snapshot().is_empty());
+    }
+
     mod extension_properties;
     use super::*;
     use tokeira_chasm::{Library, Registry};

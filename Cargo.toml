@@ -18,6 +18,7 @@ members = [
     "crates/tokeira-chasm-derive",
     "crates/tokeira-chasm",
     "crates/tokeira-chasm-activity",
+    "crates/tokeira-chasm-acceptance",
     "crates/tokeira-state",
     "crates/tokeira-deployment",
     "crates/tokeira-tkp",

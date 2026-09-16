@@ -1,0 +1,37 @@
+[package]
+name = "tokeira-chasm-acceptance"
+description = "Test-only resource archetype proving the CHASM extension contract"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+prost = "0.14"
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+tokeira-chasm = { path = "../tokeira-chasm", version = "0.3.1" }
+tokeira-chasm-derive = { path = "../tokeira-chasm-derive", version = "0.3.1" }
+tokeira-types = { path = "../tokeira-types", version = "0.3.1" }
+tokeira-proto = { path = "../tokeira-proto", version = "0.3.1" }
+
+[dev-dependencies]
+tokeira-engine = { path = "../tokeira-engine", features = ["chasm-extensions"] }
+tokeira-runtime = { path = "../tokeira-runtime" }
+tokeira-edge = { path = "../tokeira-edge" }
+tokeira-storage = { path = "../tokeira-storage" }
+tokeira-projection = { path = "../tokeira-projection" }
+tokeira-chasm-activity = { path = "../tokeira-chasm-activity" }
+tokeira-auth = { path = "../tokeira-auth" }
+tokio.workspace = true
+proptest = "1.6"
+anyhow.workspace = true
+uuid.workspace = true
+http = "1"
+
+[lints]
+workspace = true

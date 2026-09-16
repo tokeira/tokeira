@@ -8772,6 +8772,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-chasm-acceptance"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "http 1.4.0",
+ "postcard",
+ "proptest",
+ "prost",
+ "serde",
+ "thiserror 2.0.18",
+ "tokeira-auth",
+ "tokeira-chasm",
+ "tokeira-chasm-activity",
+ "tokeira-chasm-derive",
+ "tokeira-edge",
+ "tokeira-engine",
+ "tokeira-projection",
+ "tokeira-proto",
+ "tokeira-runtime",
+ "tokeira-storage",
+ "tokeira-types",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "tokeira-chasm-activity"
 version = "0.3.1"
 dependencies = [

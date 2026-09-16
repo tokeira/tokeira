@@ -647,51 +647,126 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 
 ### Stage 13 — Acceptance archetype (`crates/tokeira-chasm-acceptance`, publish = false)
 
-- [ ] 13.1 Crate skeleton in the activity crate's shape: `ResourceState` proto, `Resource`
+- [x] 13.1 Crate skeleton in the activity crate's shape: `ResourceState` proto, `Resource`
   root component, `AcceptanceLibrary` registering the component, `ReconcileHandler`
   (`SideEffectTaskHandler` over `StartActivityTask`), `RetryHandler` (`PureTaskHandler` over
   `RetryTimer`), and `DeploymentStatus`, `DesiredGeneration`, `ObservedGeneration` search
   attributes. Dev-dependency on `tokeira-engine` with `chasm-extensions`; no dependency on
   the activity crate's test modules (assert with a workspace test).
   - _Requirements: 9.1, 9.17_
-- [ ] 13.2 Command semantics through the typed handle: create with request id and digest
+
+  **DONE (2026-09-16):** Added the unpublished workspace crate, prost resource/operation
+  state, root registration, typed visibility attributes and the two handlers. Library
+  dependencies remain substrate-only; the source-isolation test checks that path includes
+  stay inside this crate and the activity library is a feature-free dev-dependency.
+  Cargo.lock adds only this crate's package entry; no new resolved packages.
+
+- [x] 13.2 Pure command decisions in the library, composed with the typed handle by
+  `tests/support/commands.rs`: create with request id and immutable create digest
   (idempotent repeat, conflicting repeat, second request id → already-started), update with
-  expected generation (match / mismatch), read.
+  expected generation (match / mismatch) and separate desired digest (field 11), read.
   - _Requirements: 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8_
-- [ ] 13.3 Reconcile: an update raising desired above observed stages `StartActivityTask`
+
+  **DONE (2026-09-16):** Pure create/repeat/update/read decisions live in the library;
+  the embedding test application owns async typed-handle composition. Generation checks
+  abort the transaction on mismatch. `desired_digest` is field 11 and updates preserve
+  `create_digest`, so a create retry still compares against the original input.
+
+- [x] 13.3 Reconcile: an update raising desired above observed stages `StartActivityTask`
   with a version target and the internal callback; `on_outcome` advances observed on
   completion or records the failure and stages `RetryTimer` on terminal failure;
   `RetryHandler` re-stages the start; history bounded to 8 entries by the appending
   transition.
   - _Requirements: 9.9, 9.12, 9.13_
-- [ ] 13.4 Integration scenario (`tests/acceptance.rs`): `Engine::builder(in-memory config)
+
+  **DONE (2026-09-16):** Every staging uses its generation/attempt activity id, persisted
+  queue/target, one encoded ReconcileInput payload and activity maximum-attempts one.
+  Completion advances only the captured generation and stages any newer desired input;
+  unsuccessful outcomes retain structured failures and stage the component's capped
+  exponential retry. Unit tests cover stale validators, all outcome kinds, bounded
+  history, older-generation completion and long-lived termination behavior.
+
+- [x] 13.4 Two integration harnesses: `tests/acceptance.rs` uses `Engine::builder(in-memory config)
   .library::<AcceptanceLibrary>().clock(virtual)`; a scoped worker of the target version, an
   unscoped worker and a scoped worker of another version polling through the in-process
-  gRPC service; admission proofs; completion and failure paths; restart proof A (drop the
-  engine after the activity's terminal commit, rebuild over the same `Arc` repository, no
-  request issued, observed advances); restart proof B (drop with a retry timer armed,
-  rebuild, timer fires at its deadline under the virtual clock).
+  gRPC service; admission proofs; completion and failure paths; seeded keys accepted by
+  workflow visibility without listing extension rows. `tests/runtime.rs` uses a shared
+  node store, both libraries, real executors, activity evaluator and single-pass scanners:
+  restart proof A (drop after the activity's terminal commit, rebuild over the same `Arc`
+  repository, no request issued, observed advances); restart proof B (drop with a retry
+  timer armed, rebuild, timer fires at its deadline); resource visibility through the
+  real projection adapter/store. Embedded snapshots omit CHASM state; closing that gap
+  is a separate integration-seat item.
   - _Requirements: 9.10, 9.11, 9.14, 9.15, 9.16_
-- [ ] 13.5 Property test: Property 15 — acceptance reference model
+
+  **DONE (2026-09-16):** The public builder scenario uses the real policy authenticator,
+  scoped v1/v2 workers and an authenticated unscoped worker. Only v1 receives the task;
+  v2 cannot complete its token. Completion/failure return only after the internal outcome
+  reaches the parent, with public callbacks disabled. Paused Tokio time expires empty
+  transport polls while CHASM uses its injected clock. Restart A delivers pending work
+  without a request; restart B re-arms the retry, does nothing before its deadline and
+  starts a fresh try-2 run exactly at it. The builder accepts seeded query keys while
+  workflow listing stays empty; the real projection adapter/store returns the resource's
+  typed attributes. Projection is an approved workspace-pinned dev-dependency.
+
+- [x] 13.5 Property test: Property 15 — acceptance reference model
   - Generated command sequences against a generation reference model; responses equal the
     model's at every step.
   - Tag: `// Feature: chasm-extension-archetypes, Property 15: acceptance reference model`
   - _Requirements: 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8_
-- [ ] 13.6 Property test: Property 11 — internal delivery exactly once
+
+  **DONE (2026-09-16):** 128 generated command sequences pass against an independent
+  generation/idempotency model with no executors. Responses, reads, the single retained
+  run and its current pointer agree, including create retries after updates.
+
+- [x] 13.6 Property test: Property 11 — internal delivery exactly once
   - Generated crash points between the activity's terminal commit and the delivery commit;
     the target receives the outcome exactly once; a missing target marks the callback
     `FAILED` non-retryably.
   - Tag: `// Feature: chasm-extension-archetypes, Property 11: internal delivery exactly once`
   - _Requirements: 6.1, 6.3, 6.4, 6.5, 6.8, 6.10_
-- [ ] 13.7 Property test: Property 14 — clock determinism
+
+  **DONE (2026-09-16):** 128 cases cross completed/failed outcomes with crashes before
+  delivery, between parent and callback commits, and after both. Rebuild leaves one
+  parent history entry and a succeeded callback; deleting a pending target fails delivery
+  non-retryably with its full key. A callback settled before deletion remains succeeded.
+  A second rebuild leaves the parent unchanged and the activity outbox is empty.
+
+- [x] 13.7 Property test: Property 14 — clock determinism
   - Generated seeds; the scenario run twice under the injected clock with `sweep_once` and
-    `rebuild_once` yields identical transition sequences; every observed deadline,
-    registration time and delayed dispatch equals a value read from the injected clock.
+    `rebuild_once` yields identical transition sequences up to relabelling executor-minted
+    run UUIDs by staged activity ids. Unknown identities fail normalization; root bytes,
+    transition counts, lifecycle, deadlines, timestamps and queue order compare exactly.
+    Registration/transition times equal clock readings; deadlines and delayed dispatch
+    equal clock-derived anchors plus the specified timeout/backoff.
   - Tag: `// Feature: chasm-extension-archetypes, Property 14: clock determinism`
   - _Requirements: 8.8, 8.9, 9.16_
 
-- [ ] 14. Checkpoint: `cargo clippy -p tokeira-chasm-acceptance --all-targets` clean; `cargo
+  **DONE (2026-09-16):** 128 generated scripts replay over fresh stores through the real
+  executors, bridge, sweeper and rebuild. Sequences are identical up to relabelling only
+  executor-minted run UUIDs by each unique staged activity id: that is the full claim
+  because production starts intentionally mint random identities. Unmapped identities
+  fail normalization. Root bytes/metadata, transition counts, lifecycle, clock timestamps,
+  armed deadlines and actual FIFO queue entries compare exactly. A mandatory retry path
+  and delayed-dispatch probe prevent vacuous clock checks. The approved owned queue
+  snapshot sorts by queue name then FIFO and has an observational/no-notification test.
+
+- [x] 14. Checkpoint: `cargo clippy -p tokeira-chasm-acceptance --all-targets` clean; `cargo
   nextest run -p tokeira-chasm-acceptance` green; the workspace bar green.
+
+  **DONE (2026-09-16):** Focused all-target clippy is clean and acceptance nextest passes
+  all 15 tests, including 128 cases each for Properties 11/14/15. The workspace bar passes:
+  nightly format, `cargo lint --locked` with zero warnings, `cargo check --workspace
+  --locked`, nextest (3456 passed, 2 skipped), doctests (1 passed, 20 ignored), and
+  documentation with warnings denied. The four engine `chasm-extensions` checks also
+  pass: all-target clippy with zero warnings, check, nextest (108 passed), and documentation
+  with warnings denied. All cargo checks use `--locked`; formatting uses nightly.
+  No backlog timeout or serial rerun was needed. Existing native-library macOS linker
+  deployment-target warnings remain; no toolchain/cache settings changed. Changelog
+  dry-run, exact lockfile comparison and diff checks pass. The internal fragment has no
+  body because the repository's `skipBody: true` rejects one. Stage 15 documentation and
+  sibling amendments, stage 16 corpus execution, live DSQL and embedded CHASM snapshot
+  persistence remain outside this slice. Requirements are unchanged.
 
 ### Stage 15 — Documentation and sibling amendments
 

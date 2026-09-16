@@ -817,17 +817,41 @@ A pure library in the activity crate's shape with no shared test code (Requireme
 pub struct Resource { #[chasm(data)] state: Field<ResourceState>, #[chasm(transient)] meta: ContextMetadata }
 // ResourceState (prost): create_request_id=1, create_digest=2, desired_generation=3,
 //   observed_generation=4, active_operation=5 (Operation), history=6 (repeated Operation, bounded 8),
-//   retry_attempt=7, last_failure=8
-pub enum Command { Create { request_id, digest }, Update { expected_generation, digest }, Read }
+//   retry_attempt=7, last_failure=8, target=9 (DeploymentVersionTarget), task_queue=10,
+//   desired_digest=11 (updates never overwrite the original create_digest)
+pub enum Command { Create { request_id, digest, target, task_queue }, Update { expected_generation, digest }, Read }
 pub struct ReconcileHandler;   // SideEffectTaskHandler<Component = Resource, Task = StartActivityTask>
 pub struct RetryHandler;       // PureTaskHandler<Component = Resource, Task = RetryTimer>
 impl Library for AcceptanceLibrary { const NAME: &'static str = "acceptance"; /* registers all three */ }
 ```
 
-Integration tests build the engine with `Engine::builder(..).library::<AcceptanceLibrary>()
-.clock(virtual)` over the in-memory repository, serve a scoped worker through the in-process
-gRPC service, and implement Requirement 9 end to end, including the two restart proofs by
-dropping the engine and rebuilding over the same `Arc` repository.
+`src/commands.rs` owns pure transitions and decisions; `tests/support/commands.rs`
+composes them with `TypedEngine<Resource>`, keeping runtime and engine dependencies
+dev-only. Create starts converged at generation one and preserves its original digest
+for idempotency after updates; field 11 holds the latest desired digest. Each staging
+uses activity id `<business_id>/gen-<generation>/try-<attempt>`, avoiding the start
+executor's permanent live-id conflict rejection. The staged retry policy permits one
+activity attempt so terminal failure reaches the component, whose own timer uses one
+second doubling to a sixty-second cap.
+
+Two independent harnesses implement Requirement 9. `tests/acceptance.rs` builds with
+`Engine::builder(..).library::<AcceptanceLibrary>().clock(virtual)`, serves scoped workers
+through the in-process gRPC endpoint, and checks synchronous command/start/outcome paths.
+Its workflow visibility query accepts the seeded keys but remains empty, preserving
+`VisibilityQueryService::list_workflows` in `crates/tokeira-projection/src/query_service.rs`.
+The workflow/CHASM query split follows `common/persistence/visibility/store/query/converter.go`
+and `common/persistence/visibility/store/elasticsearch/visibility_store.go @ v1.31.0`.
+`tests/runtime.rs` assembles both libraries, the three real edge
+executors, the activity evaluator and single-pass sweeper/rebuild over one shared
+`Arc<InMemoryChasmNodeStore>`. It owns the two restart proofs and queries the resource
+through the real projection adapter/store. This split is necessary because embedded
+in-memory restart creates a fresh CHASM store, snapshots do not include CHASM state,
+and `Engine` exposes neither scanner's single-pass entry. Embedded snapshot persistence
+is a separate integration-seat follow-up, outside this slice.
+
+`ActivityDispatchQueue::snapshot` returns owned `ActivityDispatchSnapshot` values,
+ordered by queue name then FIFO position, without mutation or notification. It is a
+diagnostic of disposable derived state, never execution authority.
 
 ## Data Models
 
@@ -1003,8 +1027,12 @@ names the first unregistered id and its execution count.
 ### Property 14: Clock determinism
 *For any* seed, running the acceptance scenario twice under the injected clock with the
 sweeper and rebuild driven by their single-pass entries yields identical transition
-sequences, and every deadline, registration time and delayed dispatch observed equals a
-value read from the injected clock.
+sequences up to relabelling executor-minted run UUIDs by their staged activity ids.
+The normalizer fails on any run id it cannot map; root bytes, transition counts,
+lifecycle, deadlines, timestamps and queue order compare exactly. Registration and
+transition times equal injected-clock readings; deadlines and delayed-dispatch release
+times equal their clock-derived anchors plus the specified timeout/backoff. Production
+run-id generation remains unchanged.
 
 **Validates: Requirements 8.8, 8.9, 9.16**
 
@@ -1075,15 +1103,17 @@ A 128-case generated test compares callback-bearing gate-off starts against empt
   `tokeira-edge/src/chasm_activity.rs` over the bridge; 10 in the activity crate's pure
   callback state machine (128 cases); 8 in `tokeira-storage/src/chasm.rs`
   (in-memory) and the DSQL integration suite (`dsql-integration`); 11, 14, 15 in the
-  acceptance crate's integration tests; 13 and 16 in `tokeira-engine` over comparison
+  acceptance crate (`tests/runtime.rs` for 11/14 with its shared-store fixture,
+  `tests/model.rs` for 15 with a collecting sink and no executors); 13 and 16 in `tokeira-engine` over comparison
   helpers and the in-memory projection store, with real-start wiring examples; 17 as a
   differential test in `tokeira-edge` replaying the recorded v1.31.0
   standalone-activity request set against the pre-change and post-change bridge.
 - **Unit tests (example-based):** exact error messages for the cap and the closed-activity
   attach (`activity.go:439-448 @ v1.32.0`), the `Internal` rejection text, the config
   validation message, the reserved-name error, and each migration through `DdlValidator`.
-- **Integration tests:** the acceptance crate implements Requirement 9 end to end, with a
-  scoped worker over the in-process gRPC service and the two restart proofs; the engine's
+- **Integration tests:** the acceptance crate implements Requirement 9 with a public-builder
+  scoped-worker scenario and a separate runtime harness for the two restart proofs and
+  resource projection query, as described above; the engine's
   existing standalone-activity integration tests run unchanged as the regression guard.
 - **Conformance check:** the functional harness's standalone-activity tier at v1.31.0
   reruns with gates at default before the change is declared done.

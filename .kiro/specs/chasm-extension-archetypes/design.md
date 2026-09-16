@@ -71,14 +71,13 @@ flowchart LR
         CE -->|after commit| MX[Dispatch multiplexer]
         MX --> EX1[ActivityDispatchExecutor]
         MX --> EX2[StartActivityExecutor]
-        MX --> EX3[NexusCallbackExecutor]
-        MX --> EX4[InternalCallbackExecutor]
+        MX --> EX3[DeliverCallbackExecutor: Nexus / Internal]
         SW[Sweeper: sweep_once] -->|due pure tasks via handler| CE
         RB[Rebuild scan: on start + periodic] -->|re-arm deadlines, re-execute pending effects| MX
         RB --> SW
         ST --> RB
         EX2 -->|start SA with internal callback + version target| CE
-        EX4 -->|apply_side_effect_outcome on target| CE
+        EX3 -->|Internal outcome on target; both arms record on activity| CE
         EX1 --> Q[Bridge queue, per task queue + version]
     end
     subgraph Worker
@@ -476,12 +475,11 @@ The engine bootstrap calls `rebuild_once` before the gRPC adapter starts serving
 | Executor | Task type | Effect | Idempotence fence |
 |---|---|---|---|
 | `ActivityDispatchExecutor` | `activity.dispatch` (1) | Enqueue on the bridge queue under `(task_queue, version_target)` | Queue dedupes on `(key, stamp)`; a served or superseded stamp is inert |
-| `StartActivityExecutor` | `chasm.start_activity` (derived) | Start an activity execution with request id = staging task id, internal callback = staging component and task, version target from payload | Same request id returns the existing run (`engine.rs:586-590`) |
-| `NexusCallbackExecutor` | `activity.deliver_callback` (6), Nexus variant | POST via the shared invoker; then `TypedEngine<ActivityExecution>::update` with `CallbackAttempted` | Callback state: only `SCHEDULED` with the task's stamp is delivered |
-| `InternalCallbackExecutor` | `activity.deliver_callback` (6), internal variant | `apply_side_effect_outcome` on the target; then `CallbackAttempted` on the activity | Target outbox drop; then `SUCCEEDED` on the activity |
+| `StartActivityExecutor` | `chasm.start_activity` (derived) | Atomically start and schedule with the staging task's deterministic request id, Internal return address and payload version target | Same request id returns the existing run without reinitializing |
+| `DeliverCallbackExecutor` | `activity.deliver_callback` (6), two target arms | Nexus: shared invoker POST. Internal: `apply_side_effect_outcome` on the target. Both record the attempt through `apply_side_effect_outcome` on the activity's held delivery task | Matching scheduled callback stamp; the target's held-task fence makes Internal replay inert after its first commit |
 
 The executor trait, the multiplexer, `apply_side_effect_outcome`, the sweeper and the
-rebuild scan live in the runtime. The four executors live in the edge beside the bridge,
+rebuild scan live in the runtime. The three executors (four roles) live in the edge beside the bridge,
 because starting an activity is the bridge's logic and the edge already depends on both
 the runtime and the activity library (the reverse edge would be new). `StartActivityExecutor`
 is nonetheless generic: its payload type is defined in the substrate so any library can
@@ -503,12 +501,36 @@ pub struct DeploymentVersionTarget { pub deployment_name: String, pub build_id: 
 A component that stages `StartActivityTask` registers a `SideEffectTaskHandler` for it;
 its `on_outcome` receives the activity's terminal `TaskOutcome`.
 
+Executors hold `Weak<ChasmEngine>`; a stopped engine is a logged no-op. The multiplexer
+uses late-bound `register(&self, ...)` behind an `RwLock`, cloning the selected executor
+and releasing the guard before awaiting it, including nested dispatch. Bootstrap constructs
+the multiplexer, then the engine, then registers every executor before rebuilding or serving.
+An unknown type stays in the durable outbox for the next rebuild pass.
+Post-commit timer hints are published before invoking executors, so nested outcome commits
+retain their newer retry deadlines.
+
+Staged-start request ids explicitly render the TaskId's failover version, transition count
+and offset, prefixed `chasm.start_activity:`. Length-prefixed parent execution identity also
+participates because TaskIds are unique within a node, not across parents. Activity-owned
+`callbacks::encode_task_id` / `decode_task_id` share the postcard codec with both executors;
+the edge gains no dependency. Permanent business-id and validation rejections resolve the
+parent's task with a non-retryable encoded Failure; transient failures remain pending.
+
+Nexus success carries only the first result payload, matching
+`chasm/lib/activity/activity.go:549-556 @ v1.32.0` (the workflow publisher retains its own
+collection behavior). The callback executor shares the workflow service's namespace cache:
+`get_by_id` supplies the activity back-link's namespace name; missing/tombstoned entries
+omit that best-effort link at debug level, while cache errors use shared retry backoff.
+Stored callback links remain intact. Internal delivery uses the activity's pure
+`terminal_outcome`; a missing target fails permanently, `NotHeld` succeeds after a replay,
+and exhausted commit retries use the same backoff and attempt limit as Nexus delivery.
+
 **Shared callback invocation.** `deliver_completion_callback` keeps its signature; its
 HTTP core is extracted:
 
 ```rust
 // publisher.rs
-pub(crate) async fn invoke_nexus_callback(
+pub async fn invoke_nexus_callback(
     client: &dyn NexusCompletionClient,
     config: &NexusCompletionRuntimeConfig,
     url: &str, header: &HashMap<String, String>,
@@ -516,7 +538,7 @@ pub(crate) async fn invoke_nexus_callback(
 ) -> Result<CompletionDeliveryOutcome>;
 ```
 
-Both the workflow path and `NexusCallbackExecutor` call it; retry classification and
+Both the workflow path and the Nexus arm of `DeliverCallbackExecutor` call it; retry classification and
 backoff use `nexus_completion_backoff` and the existing config (Requirement 5.7).
 
 **Typed handle.** `TypedEngine` drops its lifetime and owns the engine:
@@ -619,24 +641,48 @@ otherwise; the branch at `grpc/workflow_service.rs:976-988` changes from "not sc
 because an untargeted entry never matches a `Some` (Requirements 7.4–7.8).
 
 **Token and provenance.** `ProtoTaskToken` gains field 15 `version_target`
-(`DeploymentVersionTarget`, optional). When the bridge serves a targeted task it records
+(`DeploymentVersionTarget`, optional); absent targets preserve the existing token bytes.
+When the gRPC adapter serves a targeted task it records
 the token digest in `worker_task_provenance` with origin `{namespace, normal task queue,
 task_class: Activity, deployment, build_id}`, exactly what `authorize_scoped_task_token`
-(`workflow_service.rs:2044-2093`) consumes. The standalone completion, failure, cancel and
-heartbeat RPC paths call `authorize_scoped_task_token` before entering the bridge, so a
+consumes, through `register_standalone_task_provenance`, expiring at start time plus
+start-to-close. The standalone completion, failure, cancel and heartbeat RPC paths run
+worker preflight, then `authorize_standalone_task_token` (wrapping
+`authorize_scoped_task_token`) before entering the bridge, so a
 scoped worker of the wrong version is denied with the existing `scoped_worker_denied()`
 mapping (Requirements 7.9, 7.10). Untargeted tokens have no provenance record and, being
 served only to unscoped workers, never reach that check.
+Successful completion, failure and cancellation consume provenance; heartbeat retains it.
+Only authenticated scope supplies poll admission; unscoped deployment/build request fields
+cannot admit a targeted entry. Waiting pollers filter deadlines by the same exact target.
 
 **Callbacks on start and describe.** `start_activity_execution` validates
-`completion_callbacks` with `validate_completion_callbacks` when the gate is on and passes
+`completion_callbacks` with shared per-callback `validate_callback_specs` when the gate is on and passes
 them to `validate_and_normalize`; `describe_activity_execution` maps persisted callbacks to
 `activity.v1.CallbackInfo` with the workflow path's `CallbackInfo` mapping and skips
 internal targets (Requirements 5.2–5.4, 5.9, 5.10). With the gate off the request field is
-never read (5.1).
+never read (5.1). `ActivityConfig.enable_callbacks` defaults to false
+(`chasm/lib/activity/config.go:37-40 @ v1.32.0`); stage 11 maps the external config flag.
+The workflow wrapper retains its own cap; the activity's attach transition enforces its
+cap. Nexus headers are stored verbatim (`activity.go:462-465 @ v1.32.0`), while the shared
+invoker looks up tokens case-insensitively. Describe preserves attach order, activity-closed
+triggers, links and attempt metadata; zero attempt timestamps and empty failures are absent.
 
 **Bridge and engine.** `ActivityBridge::new` takes the engine and config as today;
 `with_dispatch_queue` is replaced by `with_dispatch_executor(Arc<ActivityDispatchExecutor>)`.
+All public and executor starts use `TypedEngine::start_with(key, data, request_id, policy,
+initializer)`: only the creating transaction attaches callbacks and schedules the activity,
+then closes, commits, dispatches and arms tasks. Rejected attachment persists neither root
+nor current pointer; an idempotent repeat does not run the initializer. Both pinned handlers
+schedule within `chasm.StartExecution` (`chasm/lib/activity/handler.go:66-90 @ v1.31.0`,
+`handler.go:65-100 @ v1.32.0`). This corrects the public
+`ActivityExecutionInfo.state_transition_count` after start from two to one; describes expose
+the execution count (`activity.go:690 @ v1.31.0`, vendored activity proto field 27).
+
+The activity evaluator applies due callback retries in attach order in one typed update,
+including terminal activities, then returns the minimum activity/callback deadline. Callback
+timer validation removes the superseded timer at that close. No-callback evaluation retains
+the existing timeout/retry path.
 
 ### Config: `crates/tokeira-config`
 
@@ -690,11 +736,14 @@ impl EngineBuilder {
 
 `build` performs, in order: register built-in libraries, `seal_built_ins`, register
 extension libraries, freeze the registry, construct storage, run the pointer backfill until
-zero, `distinct_archetypes` fail-closed check, construct the multiplexer with built-in
-executors then extension executors, construct `ChasmEngine` with the clock, seed search
+zero, `distinct_archetypes` fail-closed check, construct the empty multiplexer, construct
+`ChasmEngine` with the clock, register built-in executors with weak engine handles then
+extension executors, seed search
 attributes, `rebuild_once`, then everything `start_with_embedded_config` does today.
 `start_with_embedded_config` becomes `Engine::builder(config).build()`. `Engine` gains the
 fields `chasm_engine: Arc<ChasmEngine>` and `registry: Arc<Registry>`.
+Every executor must be registered before `rebuild_once` and before serving; stage 9's
+bootstrap and stage 11's builder share this ordering.
 
 ### Acceptance archetype: `crates/tokeira-chasm-acceptance` (publish = false, dev-only)
 
@@ -914,8 +963,17 @@ declared key exists with a different type.
 
 ### Property 17: Gate-off invariance
 *For any* standalone-activity request in the v1.31.0 surface, issued with every gate at its
-default, the response and the subsequent describe are byte-identical to those of the engine
-before this design, including a start that carries `completion_callbacks`.
+default, the response and subsequent describe are byte-identical to the recorded engine
+after the normalization below, including a start carrying `completion_callbacks`.
+
+The stage 9 realization records a fixed-clock bridge lifecycle plus idempotent gRPC repeats
+and fresh gRPC starts as the branch's first commit, before production changes. Fresh starts
+normalize only their minted UUID; describes also normalize the approved atomic-start
+correction: omit `info.state_transition_count` and decode the long-poll token to its execution
+key, omitting its transition. Every other response byte must match the recorded engine.
+Dedicated wire tests assert count 1 after start, no increment on an idempotent repeat, and
+increments on later transitions; existing long-poll tests guard token round-trip and wakes.
+A 128-case generated test compares callback-bearing gate-off starts against empty callbacks.
 
 **Validates: Requirements 5.1, 10.1**
 
@@ -936,7 +994,7 @@ before this design, including a start that carries `completion_callbacks`.
 | `chasm::<C>()` for an unregistered `C` | `ChasmError::Internal("archetype `{fqn}` is not registered")` | Embedder error |
 | Callbacks gate on, standalone gate off | `ValidationError::Field { field: "policy.compatibility.enable_standalone_activity_callbacks", .. }` | Config load fails |
 | Gate on, invalid Nexus callback | existing edge validation error | INVALID_ARGUMENT |
-| Gate on, `Internal` variant on the wire | `EdgeError::InvalidArgument("unsupported callback variant")` | INVALID_ARGUMENT |
+| Gate on, `Internal` variant on the wire | `EdgeError::BadRequest("unsupported callback variant: *common.Callback_Internal_")` | INVALID_ARGUMENT |
 | Gate on, over the callback cap | `ChasmError::FailedPrecondition` from attachment | FAILED_PRECONDITION |
 | Gate on, attach to a closed activity | `ChasmError::FailedPrecondition` | FAILED_PRECONDITION (`activity.go:439 @ v1.32.0`) |
 | Targeted token completed by a wrong-version scoped worker | `scoped_worker_denied()` | PERMISSION_DENIED |

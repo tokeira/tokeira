@@ -1992,6 +1992,36 @@ impl WorkflowService {
         self
     }
 
+    /// Record server-authored standalone task evidence after exact-version pickup.
+    pub(crate) async fn register_standalone_task_provenance(
+        &self,
+        context: &EdgeContext,
+        token: &[u8],
+        origin: &tokeira_types::WorkerTaskOrigin,
+        expires_at: OffsetDateTime,
+    ) -> EdgeResult<()> {
+        self.register_scoped_task_provenance(
+            context,
+            Action::PollActivityTaskQueue,
+            token,
+            origin,
+            expires_at,
+        )
+        .await
+    }
+
+    /// Enforce the same scoped token provenance as workflow-backed activities.
+    /// Unscoped callers retain the existing token-validation path.
+    pub(crate) async fn authorize_standalone_task_token(
+        &self,
+        context: &EdgeContext,
+        action: Action,
+        token: &[u8],
+    ) -> EdgeResult<Option<[u8; 32]>> {
+        self.authorize_scoped_task_token(context, action, token)
+            .await
+    }
+
     async fn register_scoped_task_provenance(
         &self,
         context: &EdgeContext,
@@ -2149,7 +2179,13 @@ impl WorkflowService {
         }
     }
 
-    async fn delete_consumed_task_provenance(&self, digest: Option<[u8; 32]>, action: Action) {
+    /// Best-effort removal after a successful terminal token response. A cleanup
+    /// failure must not turn an already-committed activity result into an error.
+    pub(crate) async fn delete_consumed_task_provenance(
+        &self,
+        digest: Option<[u8; 32]>,
+        action: Action,
+    ) {
         let Some(digest) = digest else {
             return;
         };

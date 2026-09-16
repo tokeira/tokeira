@@ -38,20 +38,24 @@ use std::{
 
 use prost::Message as _;
 use tokeira_chasm::{
-    BusinessIdPolicy, ChasmError, Component as _, ComponentRef, DispatchableTask, ExecutionKey,
-    VersionedTransition,
+    BusinessIdPolicy, ChasmError, Component as _, ComponentRef, DeploymentVersionTarget,
+    ExecutionKey, VersionedTransition,
 };
 use tokeira_chasm_activity::{
-    ActivityConfig, ActivityEvent, ActivityExecution, ActivityRequest, ActivityState,
-    ActivityStatus, DISPATCH_TASK_ID, DispatchTask, RetryOutcome, due_timeout,
-    next_timeout_deadline, retry_decision, timeout_event, validate_and_normalize,
+    ActivityCallback, ActivityConfig, ActivityEvent, ActivityExecution, ActivityRequest,
+    ActivityState, ActivityStatus, CallbackSpec, RetryOutcome, due_callback_retries, due_timeout,
+    next_callback_retry_deadline, next_timeout_deadline, retry_decision, timeout_event,
+    validate_and_normalize,
 };
 use tokeira_runtime::chasm::{
-    ChasmEngine, DispatchSink, Engine, PollOutcome, PollRequest, TimeoutEvaluator, TypedEngine,
+    ChasmEngine, Engine, PollOutcome, PollRequest, TimeoutEvaluator, TypedEngine,
 };
 use tokeira_types::ArchetypeId;
 
-use crate::errors::{EdgeError, EdgeResult};
+use crate::{
+    chasm_executors::ActivityDispatchExecutor,
+    errors::{EdgeError, EdgeResult},
+};
 
 /// Temporal's namespace-scoped standalone-activity admission setting.
 ///
@@ -107,6 +111,10 @@ fn activity_long_poll_buffer(configured: std::time::Duration) -> std::time::Dura
 /// handler translates the proto request into).
 #[derive(Debug, Clone)]
 pub struct StartActivity {
+    /// Validated completion destinations; Internal destinations are authored by executors.
+    pub callbacks: Vec<CallbackSpec>,
+    /// Exact worker release for internally staged work; public starts leave it absent.
+    pub version_target: Option<DeploymentVersionTarget>,
     /// Namespace id (UUID string for DSQL; any string for the in-memory store).
     pub namespace_id: String,
     /// Application-level activity id (the execution's business id).
@@ -183,6 +191,8 @@ pub struct StartActivityOutcome {
 /// responses).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActivityDescription {
+    /// Persisted callback state in attach order; the wire gate controls disclosure.
+    pub callbacks: Vec<ActivityCallback>,
     /// Current status.
     pub status: ActivityStatus,
     /// Current attempt.
@@ -262,6 +272,8 @@ pub struct ActivityDescription {
 /// matching + `RecordActivityTaskStarted` do server-side).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolledActivityTask {
+    /// Exact release admitted for this task, if internally targeted.
+    pub version_target: Option<DeploymentVersionTarget>,
     /// Opaque token the worker echoes back on completion/failure; encodes the
     /// execution key and the attempt stamp it was issued for.
     pub task_token: Vec<u8>,
@@ -315,6 +327,8 @@ pub struct PolledActivityTask {
 /// encoding in `grpc/errors.rs`.
 #[derive(Debug, Clone)]
 struct ActivityTaskToken {
+    /// Server-authored release target; provenance authorizes scoped token use.
+    version_target: Option<DeploymentVersionTarget>,
     /// Top-level `Task.namespace_id` (field 1) — the namespace-validator
     /// interceptor's check (`errTaskTokenNamespaceMismatch`,
     /// `common/rpc/interceptor/namespace_validator.go:354 @ v1.31.0`). Issued equal
@@ -349,6 +363,7 @@ impl ActivityTaskToken {
         run_id: &str,
         attempt: i32,
         archetype_id: u32,
+        version_target: Option<DeploymentVersionTarget>,
     ) -> EdgeResult<Vec<u8>> {
         let component_ref = ProtoComponentRef {
             namespace_id: namespace_id.to_owned(),
@@ -363,6 +378,7 @@ impl ActivityTaskToken {
             attempt,
             activity_id: activity_id.to_owned(),
             component_ref,
+            version_target,
         }
         .encode_to_vec())
     }
@@ -379,6 +395,7 @@ impl ActivityTaskToken {
             activity_id: component_ref.business_id,
             run_id: component_ref.run_id,
             attempt: task.attempt,
+            version_target: task.version_target,
         })
     }
 
@@ -426,6 +443,10 @@ struct ProtoTaskToken {
     activity_id: String,
     #[prost(bytes = "vec", tag = "14")]
     component_ref: Vec<u8>,
+    // Upstream Task ends at tag 14 (`token/v1/message.proto @ v1.31.0`).
+    // An absent extension emits no bytes, preserving every existing worker token.
+    #[prost(message, optional, tag = "15")]
+    version_target: Option<DeploymentVersionTarget>,
 }
 
 /// Minimal mirror of `temporal.server.api.persistence.v1.ChasmComponentRef`
@@ -450,25 +471,22 @@ struct ProtoComponentRef {
 /// stale entries (stamp/status no longer current) and skips not-yet-due entries
 /// (a backoff-delayed retry dispatch) rather than dispatching them.
 #[derive(Debug, Clone)]
-struct DispatchEntry {
-    key: ExecutionKey,
-    stamp: i64,
+pub(crate) struct DispatchEntry {
+    /// Durable execution identity used to reload and fence pickup.
+    pub(crate) key: ExecutionKey,
+    /// Only the corresponding still-scheduled attempt may be served.
+    pub(crate) stamp: i64,
+    /// Exact scoped release; absent targets admit only unscoped workers.
+    pub(crate) target: Option<DeploymentVersionTarget>,
     /// Earliest Unix-nanosecond time this dispatch may be handed to a worker. A
     /// retry stages this at `now + backoff` so the new attempt is not pollable until
     /// its backoff elapses (`statemachine.go:119 @ v1.31.0`); the first attempt
     /// carries `None` (immediate).
-    fire_at: Option<i64>,
+    pub(crate) fire_at: Option<i64>,
 }
 
-/// The matching-side activity queue: a [`DispatchSink`] the CHASM engine hands
-/// committed dispatch tasks, fanned out into per-task-queue FIFOs that a worker
-/// drains via [`ActivityBridge::poll_activity_task`].
-///
-/// It is shared (behind an `Arc`) between the engine — which holds it as its
-/// dispatch sink — and the [`ActivityBridge`], which drains it. This is the
-/// derived-effect boundary: history is authority; this queue is disposable and can
-/// be rebuilt from the durable `Scheduled` state, so losing it costs at most a
-/// redispatch, never correctness.
+/// Disposable matching queues populated by [`ActivityDispatchExecutor`]. Durable
+/// outboxes reconstruct them after loss; pickup still checks the committed attempt.
 #[derive(Debug, Default)]
 pub struct ActivityDispatchQueue {
     state: Mutex<DispatchQueueState>,
@@ -479,6 +497,7 @@ pub struct ActivityDispatchQueue {
 struct DispatchQueueState {
     queues: HashMap<String, VecDeque<DispatchEntry>>,
     seen: HashSet<(ExecutionKey, i64)>,
+    seen_targets: HashMap<String, Vec<Option<DeploymentVersionTarget>>>,
 }
 
 impl ActivityDispatchQueue {
@@ -487,17 +506,21 @@ impl ActivityDispatchQueue {
         Self::default()
     }
 
-    fn enqueue(&self, task_queue: String, entry: DispatchEntry) {
+    pub(crate) fn enqueue(&self, task_queue: String, entry: DispatchEntry) {
         if let Ok(mut state) = self.state.lock() {
             // The set and queue share a lock: a concurrent rebuild cannot insert
             // the same committed attempt between the check and enqueue.
             if !state.seen.insert((entry.key.clone(), entry.stamp)) {
                 return;
             }
+            let targets = state.seen_targets.entry(task_queue.clone()).or_default();
+            if !targets.contains(&entry.target) {
+                targets.push(entry.target.clone());
+            }
             state.queues.entry(task_queue).or_default().push_back(entry);
-            // A timeout may produce a retry while a worker is long-polling this
-            // standalone queue. One committed dispatch wakes one poller.
-            self.dispatch_available.notify_one();
+            // A single wake can select the wrong release and strand matching work.
+            // All waiters recheck the version predicate under the queue lock.
+            self.dispatch_available.notify_waiters();
         }
     }
 
@@ -525,7 +548,7 @@ impl ActivityDispatchQueue {
                 .entry(task_queue.to_owned())
                 .or_default()
                 .push_front(entry);
-            self.dispatch_available.notify_one();
+            self.dispatch_available.notify_waiters();
         }
     }
 
@@ -535,59 +558,43 @@ impl ActivityDispatchQueue {
     /// backoff observes it; this is the pull-side of the backoff-delayed dispatch
     /// (Stage 3.2), so the runtime sweeper does not need to "release" delayed
     /// dispatches separately.
-    fn dequeue_due(&self, task_queue: &str, now: i64) -> Option<DispatchEntry> {
+    fn dequeue_due(
+        &self,
+        task_queue: &str,
+        now: i64,
+        admitted: Option<&DeploymentVersionTarget>,
+    ) -> Option<DispatchEntry> {
         let mut state = self.state.lock().ok()?;
         let queue = state.queues.get_mut(task_queue)?;
-        let pos = queue
-            .iter()
-            .position(|entry| entry.fire_at.is_none_or(|at| at <= now))?;
+        let pos = queue.iter().position(|entry| {
+            entry.target.as_ref() == admitted && entry.fire_at.is_none_or(|at| at <= now)
+        })?;
         queue.remove(pos)
     }
 
     /// Return the earliest delayed dispatch deadline on `task_queue`.
-    fn next_due_at(&self, task_queue: &str) -> Option<i64> {
+    fn next_due_at(
+        &self,
+        task_queue: &str,
+        admitted: Option<&DeploymentVersionTarget>,
+    ) -> Option<i64> {
         let state = self.state.lock().ok()?;
         state
             .queues
             .get(task_queue)?
             .iter()
+            .filter(|entry| entry.target.as_ref() == admitted)
             .filter_map(|entry| entry.fire_at)
             .min()
     }
 
-    fn has_seen_queue(&self, task_queue: &str) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|state| state.queues.contains_key(task_queue))
-    }
-}
-
-#[async_trait::async_trait]
-impl DispatchSink for ActivityDispatchQueue {
-    async fn dispatch(
-        &self,
-        key: &ExecutionKey,
-        tasks: Vec<DispatchableTask>,
-    ) -> anyhow::Result<()> {
-        for task in tasks {
-            // Only the activity dispatch side-effect task routes to a worker queue;
-            // any other side-effect id is not ours to enqueue.
-            if task.task.task_type_id == DISPATCH_TASK_ID {
-                let dispatch = DispatchTask::decode(&task.task.payload)
-                    .map_err(|e| anyhow::anyhow!("decode dispatch task: {e}"))?;
-                self.enqueue(
-                    dispatch.task_queue,
-                    DispatchEntry {
-                        key: key.clone(),
-                        stamp: dispatch.stamp,
-                        // A retry dispatch carries its backoff release time as the
-                        // scheduled task's `fire_at`; the first attempt has none.
-                        fire_at: task.task.fire_at_unix_nanos,
-                    },
-                );
-            }
-        }
-        Ok(())
+    fn has_seen_queue(&self, task_queue: &str, admitted: Option<&DeploymentVersionTarget>) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .seen_targets
+                .get(task_queue)
+                .is_some_and(|targets| targets.iter().any(|target| target.as_ref() == admitted))
+        })
     }
 }
 
@@ -597,7 +604,7 @@ pub struct ActivityBridge {
     config: ActivityConfig,
     max_id_length: usize,
     archetype_id: u32,
-    dispatch_queue: Option<Arc<ActivityDispatchQueue>>,
+    dispatch_executor: Option<Arc<ActivityDispatchExecutor>>,
 }
 
 impl std::fmt::Debug for ActivityBridge {
@@ -622,16 +629,20 @@ impl ActivityBridge {
             config,
             max_id_length,
             archetype_id,
-            dispatch_queue: None,
+            dispatch_executor: None,
         }
     }
 
-    /// Attach the dispatch queue the engine routes committed dispatch tasks into,
-    /// enabling the worker poll path. The same `Arc` must be the engine's
-    /// [`DispatchSink`] so that what `start` enqueues is what `poll` drains.
-    pub fn with_dispatch_queue(mut self, queue: Arc<ActivityDispatchQueue>) -> Self {
-        self.dispatch_queue = Some(queue);
+    /// Attach the executor registered with this engine's multiplexer, so polls
+    /// drain precisely the queue receiving its committed dispatches.
+    pub fn with_dispatch_executor(mut self, executor: Arc<ActivityDispatchExecutor>) -> Self {
+        self.dispatch_executor = Some(executor);
         self
+    }
+
+    /// Whether the v1.32.0 completion callback wire surface is exposed.
+    pub fn callbacks_enabled(&self) -> bool {
+        self.config.enable_callbacks
     }
 
     /// Whether standalone activities are enabled.
@@ -690,81 +701,11 @@ impl ActivityBridge {
 
     /// Start (and schedule) a standalone activity, returning a fresh reference to
     /// the scheduled execution (Requirement 11.8). Validates and normalizes the
-    /// request first (Requirement 11.9), then creates the root and runs the initial
-    /// `Scheduled` transition (which enqueues the dispatch task and the relevant
-    /// timers).
+    /// request first (Requirement 11.9), then atomically creates the root, attaches
+    /// callbacks and schedules dispatch/timers. An idempotent repeat reuses the run.
     pub async fn start(&self, req: StartActivity) -> EdgeResult<StartActivityOutcome> {
         self.ensure_enabled()?;
-
-        let normalized = validate_and_normalize(&ActivityRequest {
-            callbacks: Vec::new(),
-            version_target: None,
-            activity_id: req.activity_id.clone(),
-            activity_type: req.activity_type.clone(),
-            task_queue: req.task_queue.clone(),
-            schedule_to_start_nanos: req.schedule_to_start_nanos,
-            schedule_to_close_nanos: req.schedule_to_close_nanos,
-            start_to_close_nanos: req.start_to_close_nanos,
-            heartbeat_nanos: req.heartbeat_nanos,
-            run_timeout_nanos: req.run_timeout_nanos,
-            max_id_length: self.max_id_length,
-        })
-        .map_err(map_chasm_err)?;
-
-        let key = ExecutionKey::new(
-            req.namespace_id.clone(),
-            req.activity_id.clone(),
-            req.run_id.clone(),
-        );
-        let state = ActivityState {
-            activity_id: req.activity_id,
-            activity_type: req.activity_type,
-            task_queue: req.task_queue,
-            input: req.input,
-            schedule_to_start_nanos: normalized.schedule_to_start_nanos,
-            schedule_to_close_nanos: normalized.schedule_to_close_nanos,
-            start_to_close_nanos: normalized.start_to_close_nanos,
-            heartbeat_nanos: normalized.heartbeat_nanos,
-            header: req.header,
-            retry_policy: req.retry_policy,
-            retry_initial_interval_nanos: req.retry_initial_interval_nanos,
-            retry_backoff_coefficient: req.retry_backoff_coefficient,
-            retry_maximum_interval_nanos: req.retry_maximum_interval_nanos,
-            maximum_attempts: req.maximum_attempts,
-            priority: req.priority,
-            search_attributes: req.search_attributes,
-            user_metadata: req.user_metadata,
-            ..ActivityState::default()
-        };
-
-        let typed = TypedEngine::<ActivityExecution>::new(self.engine.clone());
-        let outcome = typed
-            .start(key, state, req.request_id, req.policy)
-            .await
-            .map_err(map_chasm_err)?;
-        if !outcome.created {
-            // UseExisting / same-request-id idempotency: the policy returned an
-            // existing run, which is already scheduled — do NOT re-run the Scheduled
-            // transition (it would illegally re-schedule a live activity). `started`
-            // is false, mirroring `result.Created == false` →
-            // `StartActivityExecutionResponse.started` (`handler.go:101 @ v1.31.0`).
-            return Ok(StartActivityOutcome {
-                reference: outcome.reference,
-                started: false,
-            });
-        }
-        // A fresh run: the initial Scheduled transition bumps attempt/stamp and
-        // schedules the dispatch task + schedule-to-start/close timers.
-        let (_, scheduled) = typed
-            .update(&outcome.reference, |activity, ctx| {
-                activity.apply(ActivityEvent::Scheduled, ctx)
-            })
-            .await
-            .map_err(map_chasm_err)?;
-        Ok(StartActivityOutcome {
-            reference: scheduled.reference,
-            started: true,
-        })
+        start_activity(&self.engine, &self.config, self.max_id_length, req).await
     }
 
     /// Describe an activity execution (Requirement 11.8).
@@ -1081,16 +1022,21 @@ impl ActivityBridge {
         &self,
         task_queue: &str,
         worker_identity: &str,
+        admitted: Option<&DeploymentVersionTarget>,
     ) -> EdgeResult<Option<PolledActivityTask>> {
         self.ensure_enabled()?;
-        let queue = self.dispatch_queue.as_ref().ok_or_else(|| {
-            EdgeError::Internal("activity dispatch queue not attached".to_owned())
-        })?;
+        let queue = self
+            .dispatch_executor
+            .as_ref()
+            .map(|executor| executor.queue())
+            .ok_or_else(|| {
+                EdgeError::Internal("activity dispatch queue not attached".to_owned())
+            })?;
         // Pull only dispatches that are due now: a backoff-delayed retry dispatch is
         // skipped until its release time, so a worker cannot pick up the next attempt
         // before its backoff elapses (Stage 3.2).
         let now = self.engine.now();
-        while let Some(entry) = queue.dequeue_due(task_queue, now) {
+        while let Some(entry) = queue.dequeue_due(task_queue, now, admitted) {
             let snapshot = match self.engine.read_component(&entry.key).await {
                 Ok(snapshot) => snapshot,
                 // A deleted execution leaves a dangling dispatch; drop and continue.
@@ -1141,8 +1087,10 @@ impl ActivityBridge {
                 &entry.key.run_id,
                 state.attempt,
                 self.archetype_id,
+                state.version_target.clone(),
             )?;
             return Ok(Some(PolledActivityTask {
+                version_target: state.version_target,
                 task_token,
                 activity_id: state.activity_id,
                 run_id: entry.key.run_id.clone(),
@@ -1173,29 +1121,41 @@ impl ActivityBridge {
         &self,
         task_queue: &str,
         worker_identity: &str,
+        admitted: Option<&DeploymentVersionTarget>,
     ) -> EdgeResult<Option<PolledActivityTask>> {
-        let queue = self.dispatch_queue.as_ref().ok_or_else(|| {
-            EdgeError::Internal("activity dispatch queue not attached".to_owned())
-        })?;
+        let queue = self
+            .dispatch_executor
+            .as_ref()
+            .map(|executor| executor.queue())
+            .ok_or_else(|| {
+                EdgeError::Internal("activity dispatch queue not attached".to_owned())
+            })?;
         loop {
-            // Register before the empty check so a racing enqueue leaves a permit
-            // instead of stranding this long poll.
+            // Register before the empty check so a racing notify_waiters includes
+            // this poller; unlike notify_one it does not retain a permit.
             let dispatch_available = queue.dispatch_available.notified();
-            if let Some(task) = self.poll_activity_task(task_queue, worker_identity).await? {
+            tokio::pin!(dispatch_available);
+            dispatch_available.as_mut().enable();
+            if let Some(task) = self
+                .poll_activity_task(task_queue, worker_identity, admitted)
+                .await?
+            {
                 return Ok(Some(task));
             }
-            if let Some(due_at) = queue.next_due_at(task_queue) {
+            if let Some(due_at) = queue.next_due_at(task_queue, admitted) {
                 let remaining = due_at.saturating_sub(self.engine.now());
                 if remaining <= 0 {
                     continue;
                 }
                 // A retry is committed before it is advertised to matching. Waiting
                 // for its release instant prevents an early empty response.
-                tokio::time::sleep(std::time::Duration::from_nanos(
-                    u64::try_from(remaining).unwrap_or(u64::MAX),
-                ))
-                .await;
-            } else if queue.has_seen_queue(task_queue) {
+                tokio::select! {
+                    _ = &mut dispatch_available => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_nanos(
+                        u64::try_from(remaining).unwrap_or(u64::MAX),
+                    )) => {},
+                }
+            } else if queue.has_seen_queue(task_queue, admitted) {
                 // A started attempt can time out and enqueue its retry later.
                 dispatch_available.await;
             } else {
@@ -1308,6 +1268,7 @@ impl ActivityBridge {
             &resolved_run,
             1,
             self.archetype_id,
+            None,
         )
     }
 
@@ -1497,12 +1458,21 @@ impl ActivityBridge {
         if state.attempt != token.attempt || state.status().is_terminal() {
             return Err(not_found());
         }
+        // A present extension must describe the run that issued it. Legacy and
+        // by-id tokens omit it; scoped callers are independently provenance-fenced.
+        if token
+            .version_target
+            .as_ref()
+            .is_some_and(|target| Some(target) != state.version_target.as_ref())
+        {
+            return Err(not_found());
+        }
         Ok(())
     }
 
     fn forget_dispatch(&self, key: &ExecutionKey) {
-        if let Some(queue) = &self.dispatch_queue {
-            queue.forget(key);
+        if let Some(executor) = &self.dispatch_executor {
+            executor.queue().forget(key);
         }
     }
 
@@ -1560,8 +1530,8 @@ impl ActivityBridge {
         }
     }
 
-    /// Fire any due activity timeout for `key` at `now`, returning the next timeout
-    /// deadline to re-arm (`None` when terminal/gone/no timeout). This is the edge
+    /// Fire due activity timeouts and callback retries, returning their next
+    /// deadline (`None` when gone or no deadline remains). This is the edge
     /// half of the runtime timer sweeper (`chasm-activity-timeouts-and-retry`): it
     /// re-derives the due timeout from durable state (history is authority; the armed
     /// timer is a derived hint), then applies it under one fenced transition with
@@ -1577,18 +1547,15 @@ impl ActivityBridge {
     /// The decision is recomputed inside the closure against committed state, so a
     /// timeout that is no longer due (a heartbeat raced in, the attempt advanced) is a
     /// validate-then-drop no-op. The fenced update is issued only when a timeout is
-    /// due, so a not-due sweep does not churn the execution's VT.
+    /// or callback retry is due, so a not-due sweep does not churn the execution's VT.
     pub async fn evaluate_timeouts(&self, key: &ExecutionKey, now: i64) -> EdgeResult<Option<i64>> {
         self.ensure_enabled()?;
         let Some(state) = self.load_state(key).await? else {
             return Ok(None);
         };
-        if state.status().is_terminal() {
-            return Ok(None);
-        }
         // Nothing due yet: re-arm to the earliest future deadline without a commit.
-        if due_timeout(&state, now).is_none() {
-            return Ok(next_timeout_deadline(&state));
+        if due_timeout(&state, now).is_none() && due_callback_retries(&state, now).is_empty() {
+            return Ok(activity_and_callback_deadline(&state));
         }
 
         let reference = self.activity_ref(key.clone());
@@ -1597,6 +1564,11 @@ impl ActivityBridge {
             .update(&reference, move |activity, ctx| {
                 let state = activity.activity_state().cloned().unwrap_or_default();
                 let now = ctx.now_unix_nanos();
+                // Public activity completion does not end callback delivery. Apply
+                // due retries in attach order, under the same fence as timeout work.
+                for id in due_callback_retries(&state, now) {
+                    activity.apply(ActivityEvent::CallbackRetryDue { id }, ctx)?;
+                }
                 // Re-derive against committed state; a raced advance makes this a
                 // no-op (validate-then-drop) rather than a wrong timeout.
                 let Some(timeout_type) = due_timeout(&state, now) else {
@@ -1616,10 +1588,149 @@ impl ActivityBridge {
         let next = self
             .load_state(key)
             .await?
-            .filter(|s| !s.status().is_terminal())
-            .and_then(|s| next_timeout_deadline(&s));
+            .and_then(|s| activity_and_callback_deadline(&s));
         Ok(next)
     }
+}
+
+/// Return the normalized standalone-activity retry policy that v1.31.0 persists and
+/// exposes through Describe. Tokeira uses the release defaults as constants rather
+/// than dynamic configuration (`chasm/lib/activity/frontend.go:362-419 @ v1.31.0`).
+pub(crate) fn defaulted_retry_policy(
+    policy: Option<&tokeira_proto::common::RetryPolicy>,
+) -> tokeira_proto::common::RetryPolicy {
+    // EnsureDefaults: InitialInterval 1s, BackoffCoefficient 2.0, MaximumInterval
+    // 100 × InitialInterval, MaximumAttempts 0 (unlimited).
+    let mut normalized = policy.cloned().unwrap_or_default();
+    if retry_duration_nanos(normalized.initial_interval.as_ref()) == 0 {
+        normalized.initial_interval = Some(prost_types::Duration {
+            seconds: 1,
+            nanos: 0,
+        });
+    }
+    if normalized.backoff_coefficient == 0.0 {
+        normalized.backoff_coefficient = 2.0;
+    }
+    if retry_duration_nanos(normalized.maximum_interval.as_ref()) == 0 {
+        // DefaultDefaultRetrySettings.MaximumIntervalCoefficient = 100.
+        let maximum =
+            retry_duration_nanos(normalized.initial_interval.as_ref()).saturating_mul(100);
+        normalized.maximum_interval = Some(prost_types::Duration {
+            seconds: maximum / 1_000_000_000,
+            nanos: (maximum % 1_000_000_000) as i32,
+        });
+    }
+    normalized
+}
+
+fn retry_duration_nanos(duration: Option<&prost_types::Duration>) -> i64 {
+    duration.map_or(0, |value| {
+        value
+            .seconds
+            .saturating_mul(1_000_000_000)
+            .saturating_add(i64::from(value.nanos))
+    })
+}
+
+/// Fold the normalized policy exactly once for both wire and executor starts.
+pub(crate) fn retry_policy_fields(
+    policy: &tokeira_proto::common::RetryPolicy,
+) -> (i64, f64, i64, i32) {
+    (
+        retry_duration_nanos(policy.initial_interval.as_ref()),
+        policy.backoff_coefficient,
+        retry_duration_nanos(policy.maximum_interval.as_ref()),
+        policy.maximum_attempts,
+    )
+}
+
+/// Shared admission and creation path for public starts and staged activity tasks.
+pub(crate) async fn start_activity(
+    engine: &Arc<ChasmEngine>,
+    config: &ActivityConfig,
+    max_id_length: usize,
+    req: StartActivity,
+) -> EdgeResult<StartActivityOutcome> {
+    let normalized = validate_and_normalize(&ActivityRequest {
+        callbacks: req.callbacks.clone(),
+        version_target: req.version_target.clone(),
+        activity_id: req.activity_id.clone(),
+        activity_type: req.activity_type.clone(),
+        task_queue: req.task_queue.clone(),
+        schedule_to_start_nanos: req.schedule_to_start_nanos,
+        schedule_to_close_nanos: req.schedule_to_close_nanos,
+        start_to_close_nanos: req.start_to_close_nanos,
+        heartbeat_nanos: req.heartbeat_nanos,
+        run_timeout_nanos: req.run_timeout_nanos,
+        max_id_length,
+    })
+    .map_err(map_chasm_err)?;
+
+    let key = ExecutionKey::new(
+        req.namespace_id.clone(),
+        req.activity_id.clone(),
+        req.run_id.clone(),
+    );
+    let state = ActivityState {
+        version_target: req.version_target,
+        activity_id: req.activity_id,
+        activity_type: req.activity_type,
+        task_queue: req.task_queue,
+        input: req.input,
+        schedule_to_start_nanos: normalized.schedule_to_start_nanos,
+        schedule_to_close_nanos: normalized.schedule_to_close_nanos,
+        start_to_close_nanos: normalized.start_to_close_nanos,
+        heartbeat_nanos: normalized.heartbeat_nanos,
+        header: req.header,
+        retry_policy: req.retry_policy,
+        retry_initial_interval_nanos: req.retry_initial_interval_nanos,
+        retry_backoff_coefficient: req.retry_backoff_coefficient,
+        retry_maximum_interval_nanos: req.retry_maximum_interval_nanos,
+        maximum_attempts: req.maximum_attempts,
+        priority: req.priority,
+        search_attributes: req.search_attributes,
+        user_metadata: req.user_metadata,
+        ..ActivityState::default()
+    };
+
+    let typed = TypedEngine::<ActivityExecution>::new(engine.clone());
+    let request_id = req.request_id.clone().unwrap_or_default();
+    // Both pinned handlers schedule inside StartExecution, not in a later commit
+    // (`chasm/lib/activity/handler.go @ v1.31.0` and `@ v1.32.0`). An attach
+    // rejection aborts creation; idempotent starts never reapply this initializer.
+    let outcome = typed
+        .start_with(
+            key,
+            state,
+            req.request_id,
+            req.policy,
+            move |activity, ctx| {
+                if !req.callbacks.is_empty() {
+                    activity.apply(
+                        ActivityEvent::CallbacksAttached {
+                            request_id,
+                            callbacks: req.callbacks,
+                            max_callbacks: config.max_callbacks_per_execution,
+                        },
+                        ctx,
+                    )?;
+                }
+                activity.apply(ActivityEvent::Scheduled, ctx)
+            },
+        )
+        .await
+        .map_err(map_chasm_err)?;
+    Ok(StartActivityOutcome {
+        reference: outcome.reference,
+        started: outcome.created,
+    })
+}
+
+fn activity_and_callback_deadline(state: &ActivityState) -> Option<i64> {
+    next_timeout_deadline(state)
+        .into_iter()
+        .chain(next_callback_retry_deadline(state))
+        .min()
 }
 
 /// Decode an activity snapshot into an [`ActivityDescription`].
@@ -1633,6 +1744,7 @@ fn description_from(
         .map_err(|e| EdgeError::Internal(format!("decode activity state: {e}")))?;
     Ok(ActivityDescription {
         status: state.status(),
+        callbacks: state.callbacks,
         attempt: state.attempt,
         activity_type: state.activity_type,
         task_queue: state.task_queue,
@@ -1781,6 +1893,7 @@ impl TimeoutEvaluator for ActivityBridge {
 
 #[cfg(test)]
 mod tests {
+    mod extension_properties;
     use super::*;
     use tokeira_chasm::{Library, Registry};
 
@@ -1791,18 +1904,19 @@ mod tests {
             key: ExecutionKey::new("ns", "id", "run"),
             stamp: 1,
             fire_at: None,
+            target: None,
         };
         queue.enqueue("q".into(), entry.clone());
         queue.enqueue("q".into(), entry.clone());
-        let popped = queue.dequeue_due("q", 0).unwrap();
-        assert!(queue.dequeue_due("q", 0).is_none());
+        let popped = queue.dequeue_due("q", 0, None).unwrap();
+        assert!(queue.dequeue_due("q", 0, None).is_none());
         queue.enqueue("q".into(), entry.clone());
-        assert!(queue.dequeue_due("q", 0).is_none());
+        assert!(queue.dequeue_due("q", 0, None).is_none());
         queue.retry_pickup("q", popped);
-        assert!(queue.dequeue_due("q", 0).is_some());
+        assert!(queue.dequeue_due("q", 0, None).is_some());
         queue.forget(&entry.key);
         queue.enqueue("q".into(), entry.clone());
-        assert!(queue.dequeue_due("q", 0).is_some());
+        assert!(queue.dequeue_due("q", 0, None).is_some());
         queue.enqueue(
             "q".into(),
             DispatchEntry {
@@ -1811,11 +1925,13 @@ mod tests {
             },
         );
         queue.forget(&entry.key);
-        assert!(queue.dequeue_due("q", 0).is_none());
+        assert!(queue.dequeue_due("q", 0, None).is_none());
     }
 
     use tokeira_chasm_activity::ActivityLibrary;
-    use tokeira_runtime::chasm::{CollectingDispatchSink, CollectingVisibilitySink};
+    use tokeira_runtime::chasm::{
+        CollectingDispatchSink, CollectingVisibilitySink, DispatchMultiplexer,
+    };
     use tokeira_storage::InMemoryChasmNodeStore;
 
     const SEC: i64 = 1_000_000_000;
@@ -1847,6 +1963,8 @@ mod tests {
 
     fn start_request() -> StartActivity {
         StartActivity {
+            callbacks: Vec::new(),
+            version_target: None,
             namespace_id: uuid::Uuid::new_v4().to_string(),
             activity_id: "act-1".to_owned(),
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -1882,6 +2000,8 @@ mod tests {
         policy: BusinessIdPolicy,
     ) -> StartActivity {
         StartActivity {
+            callbacks: Vec::new(),
+            version_target: None,
             namespace_id: namespace_id.to_owned(),
             activity_id: activity_id.to_owned(),
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -2426,12 +2546,18 @@ mod tests {
         ActivityLibrary::register(&mut builder).expect("register activity library");
         let registry = Arc::new(builder.build());
         let queue = Arc::new(ActivityDispatchQueue::new());
+        let mux = Arc::new(DispatchMultiplexer::default());
         let engine = Arc::new(ChasmEngine::new(
             Arc::new(InMemoryChasmNodeStore::new()),
             registry,
-            queue.clone(),
+            mux.clone(),
             Arc::new(CollectingVisibilitySink::default()),
         ));
+        let executor = Arc::new(ActivityDispatchExecutor::new(
+            Arc::downgrade(&engine),
+            queue,
+        ));
+        mux.register(executor.clone()).unwrap();
         ActivityBridge::new(
             engine,
             ActivityConfig {
@@ -2440,7 +2566,7 @@ mod tests {
             },
             1000,
         )
-        .with_dispatch_queue(queue)
+        .with_dispatch_executor(executor)
     }
 
     #[tokio::test]
@@ -2454,7 +2580,7 @@ mod tests {
         // The committed dispatch task is queued; a worker poll picks it up, which
         // records the start (Scheduled → Started) before returning the task.
         let task = bridge
-            .poll_activity_task(&task_queue, "worker-1")
+            .poll_activity_task(&task_queue, "worker-1", None)
             .await
             .expect("poll")
             .expect("a queued task");
@@ -2481,7 +2607,7 @@ mod tests {
         // The queue is drained — a second poll finds nothing.
         assert!(
             bridge
-                .poll_activity_task(&task_queue, "worker-1")
+                .poll_activity_task(&task_queue, "worker-1", None)
                 .await
                 .expect("poll empty")
                 .is_none()
@@ -2497,7 +2623,7 @@ mod tests {
         bridge.start(req).await.expect("start");
 
         let task = bridge
-            .poll_activity_task(&task_queue, "worker-1")
+            .poll_activity_task(&task_queue, "worker-1", None)
             .await
             .expect("poll")
             .expect("a queued task");
@@ -2534,7 +2660,7 @@ mod tests {
         let bridge = worker_bridge();
         assert!(
             bridge
-                .poll_activity_task("idle-queue", "worker-1")
+                .poll_activity_task("idle-queue", "worker-1", None)
                 .await
                 .expect("poll")
                 .is_none()
@@ -2554,7 +2680,7 @@ mod tests {
         bridge.start(req).await.expect("start");
 
         let task = bridge
-            .poll_activity_task(&task_queue, "worker-1")
+            .poll_activity_task(&task_queue, "worker-1", None)
             .await
             .expect("poll")
             .expect("a queued task");
@@ -2630,7 +2756,7 @@ mod tests {
         let task_queue = req.task_queue.clone();
         bridge.start(req).await.expect("start");
         bridge
-            .poll_activity_task(&task_queue, "w")
+            .poll_activity_task(&task_queue, "w", None)
             .await
             .expect("poll")
             .expect("task");
@@ -2722,7 +2848,7 @@ mod tests {
         let task_queue = req.task_queue.clone();
         bridge.start(req).await.expect("start");
         bridge
-            .poll_activity_task(&task_queue, "worker-1")
+            .poll_activity_task(&task_queue, "worker-1", None)
             .await
             .expect("poll")
             .expect("a queued task");
@@ -2756,7 +2882,7 @@ mod tests {
         let task_queue = req.task_queue.clone();
         bridge.start(req).await.expect("start");
         let task = bridge
-            .poll_activity_task(&task_queue, "w")
+            .poll_activity_task(&task_queue, "w", None)
             .await
             .expect("poll")
             .expect("task");
@@ -2784,7 +2910,7 @@ mod tests {
         let task_queue = req.task_queue.clone();
         bridge.start(req).await.expect("start");
         let task = bridge
-            .poll_activity_task(&task_queue, "worker-1")
+            .poll_activity_task(&task_queue, "worker-1", None)
             .await
             .expect("poll")
             .expect("a queued task");
@@ -2820,7 +2946,7 @@ mod tests {
         bridge.start(req).await.expect("start");
 
         let task = bridge
-            .poll_activity_task(&task_queue, "worker-1")
+            .poll_activity_task(&task_queue, "worker-1", None)
             .await
             .expect("poll")
             .expect("a queued task");
@@ -2856,7 +2982,7 @@ mod tests {
         bridge.start(req).await.expect("start");
 
         let task = bridge
-            .poll_activity_task(&task_queue, "worker-1")
+            .poll_activity_task(&task_queue, "worker-1", None)
             .await
             .expect("poll")
             .expect("a queued task");
@@ -2888,7 +3014,7 @@ mod tests {
         bridge.start(req).await.expect("start");
 
         let task = bridge
-            .poll_activity_task(&task_queue, "worker-1")
+            .poll_activity_task(&task_queue, "worker-1", None)
             .await
             .expect("poll")
             .expect("a queued task");
@@ -2928,7 +3054,7 @@ mod tests {
         bridge.start(req).await.expect("start");
 
         let task = bridge
-            .poll_activity_task(&task_queue, "worker-1")
+            .poll_activity_task(&task_queue, "worker-1", None)
             .await
             .expect("poll")
             .expect("a queued task");

@@ -568,7 +568,7 @@ impl ChasmEngine {
 
     /// Snapshot a root for archetype routing; callers must still fence any writes
     /// because this read is only a derived scheduling hint.
-    pub(super) async fn root_node(
+    pub async fn root_node(
         &self,
         key: &ExecutionKey,
     ) -> Result<Option<tokeira_chasm::ChasmNode>, ChasmError> {
@@ -680,6 +680,10 @@ impl ChasmEngine {
         version: VersionedTransition,
         visibility: Option<VisibilitySnapshot>,
     ) -> Result<(), ChasmError> {
+        // Executors can synchronously commit an outcome on this same execution.
+        // Publish our timer hint first, so a nested transition's newer retry timer
+        // is not replaced by this transition's already-obsolete deadline.
+        self.arm_timer(key, result.earliest_pure_deadline_unix_nanos);
         if !result.side_effect_tasks.is_empty()
             && let Err(error) = self.dispatch.dispatch(key, result.side_effect_tasks).await
         {
@@ -691,7 +695,6 @@ impl ChasmEngine {
                 "CHASM dispatch failed; committed tasks remain pending"
             );
         }
-        self.arm_timer(key, result.earliest_pure_deadline_unix_nanos);
         if let Some(snapshot) = visibility {
             // The snapshot carries the close time from the component's persisted state
             // (recorded on the terminal transition), so the runtime no longer stamps
@@ -773,41 +776,16 @@ impl ChasmEngine {
     }
 }
 
-/// Build the typed already-started error from the current run, carrying its run id
-/// and create request id so the edge can surface the targeted release's
-/// `ActivityExecutionAlreadyStarted` with `RunId`/`StartRequestId`
-/// (`chasm/lib/activity/handler.go:91 @ v1.31.0`). The message mirrors the
-/// serviceerror's fixed text; the structured ids are the load-bearing detail.
-fn already_started(current: &CurrentRun) -> ChasmError {
-    ChasmError::BusinessIdAlreadyStarted {
-        run_id: current.run_id.clone(),
-        request_id: current.request_id.clone(),
-        message: "activity execution already started".to_owned(),
-    }
-}
-
-/// Compute the next execution VT: same failover version, transition count + 1. The
-/// MVP keeps `namespace_failover_version` constant; namespace-failover bumps ride
-/// the same clock when wired (Requirement 5.4).
-fn next_vt(current: VersionedTransition) -> VersionedTransition {
-    VersionedTransition::new(
-        current.namespace_failover_version,
-        current.transition_count + 1,
-    )
-}
-
-/// Default logical clock: wall-clock Unix nanoseconds.
-fn default_now_unix_nanos() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
-
-#[async_trait]
-impl Engine for ChasmEngine {
-    async fn start_execution(&self, req: StartRequest) -> Result<StartOutcome, ChasmError> {
+impl ChasmEngine {
+    pub(super) async fn start_with_initializer(
+        &self,
+        mut req: StartRequest,
+        initialize: impl FnOnce(
+            &mut StartRequest,
+            &mut TransitionContext,
+        ) -> Result<LifecycleState, ChasmError>
+        + Send,
+    ) -> Result<StartOutcome, ChasmError> {
         // Business-id reuse/conflict enforcement against the current run for this id
         // (`service/history/chasm_engine.go:1014-1090 @ v1.31.0`). The current-run
         // pointer is the authority; the run's *live* root lifecycle — not the
@@ -897,14 +875,19 @@ impl Engine for ChasmEngine {
         // below also reject a same-(namespace, business, run) collision. The pointer
         // advance is co-transactional with the root-node create
         // (`activity-executions-first-class` Req 1, 2).
+        // The initializer runs only after policy/idempotency admission and before
+        // any write. Its state and tasks share the atomic root/pointer create, so
+        // rejection or failed persistence cannot leave a half-initialized run.
+        let mut ctx = TransitionContext::new(req.key.clone(), tree.execution_vt(), self.now());
+        let lifecycle = initialize(&mut req, &mut ctx)?;
         tree.create_node(
             ROOT_PATH.to_vec(),
             req.archetype_id,
-            Some(LifecycleState::Running),
+            Some(lifecycle),
             Some(req.data),
         )?;
+        self.apply_context(&mut tree, &mut ctx)?;
         let committed_vt = next_vt(tree.execution_vt());
-        let ctx = TransitionContext::new(req.key.clone(), tree.execution_vt(), self.now());
         let result = self.close_root(&mut tree, committed_vt, &ctx)?;
         let batch: Vec<NodeWrite> = result
             .dirty_nodes
@@ -923,7 +906,7 @@ impl Engine for ChasmEngine {
             // The create request id pins id-reuse idempotency and the AlreadyStarted
             // `StartRequestId`; an absent originating id records as empty (no idempotency key).
             request_id: req.request_id.clone().unwrap_or_default(),
-            status: LifecycleState::Running,
+            status: lifecycle,
             vt_epoch: committed_vt,
         };
         match self
@@ -937,6 +920,7 @@ impl Engine for ChasmEngine {
                 return Err(ChasmError::BusinessIdConflict(reason));
             }
         }
+
         self.post_commit(
             &req.key,
             result,
@@ -949,6 +933,46 @@ impl Engine for ChasmEngine {
             reference: self.root_ref(&req.key, req.archetype_id, committed_vt, committed_vt),
             created: true,
         })
+    }
+}
+
+/// Build the typed already-started error from the current run, carrying its run id
+/// and create request id so the edge can surface the targeted release's
+/// `ActivityExecutionAlreadyStarted` with `RunId`/`StartRequestId`
+/// (`chasm/lib/activity/handler.go:91 @ v1.31.0`). The message mirrors the
+/// serviceerror's fixed text; the structured ids are the load-bearing detail.
+fn already_started(current: &CurrentRun) -> ChasmError {
+    ChasmError::BusinessIdAlreadyStarted {
+        run_id: current.run_id.clone(),
+        request_id: current.request_id.clone(),
+        message: "activity execution already started".to_owned(),
+    }
+}
+
+/// Compute the next execution VT: same failover version, transition count + 1. The
+/// MVP keeps `namespace_failover_version` constant; namespace-failover bumps ride
+/// the same clock when wired (Requirement 5.4).
+fn next_vt(current: VersionedTransition) -> VersionedTransition {
+    VersionedTransition::new(
+        current.namespace_failover_version,
+        current.transition_count + 1,
+    )
+}
+
+/// Default logical clock: wall-clock Unix nanoseconds.
+fn default_now_unix_nanos() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+#[async_trait]
+impl Engine for ChasmEngine {
+    async fn start_execution(&self, req: StartRequest) -> Result<StartOutcome, ChasmError> {
+        self.start_with_initializer(req, |_, _| Ok(LifecycleState::Running))
+            .await
     }
 
     async fn update_component(&self, req: UpdateRequest) -> Result<CommitOutcome, ChasmError> {

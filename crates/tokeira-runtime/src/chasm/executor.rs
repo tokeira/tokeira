@@ -2,7 +2,10 @@
 //! outbox remains the authority for pending work; a rebuild may deliver it again.
 //! Failures are logged per task and never turn a successful commit into a failure.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use async_trait::async_trait;
 use tokeira_chasm::{ChasmError, DispatchableTask, ExecutionKey, ScheduledTask};
@@ -25,33 +28,48 @@ pub trait SideEffectExecutor: Send + Sync {
 /// dispatch preserves the caller's order and isolates failures between tasks.
 #[derive(Default)]
 pub struct DispatchMultiplexer {
-    executors: HashMap<u32, Arc<dyn SideEffectExecutor>>,
+    executors: RwLock<HashMap<u32, Arc<dyn SideEffectExecutor>>>,
 }
 
 impl std::fmt::Debug for DispatchMultiplexer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DispatchMultiplexer")
-            .field("executors", &self.executors.len())
+            .field(
+                "executors",
+                &self
+                    .executors
+                    .read()
+                    .expect("executor registry poisoned")
+                    .len(),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl DispatchMultiplexer {
     /// Register one executor, rejecting a duplicate id without replacing it.
-    pub fn register(&mut self, executor: Arc<dyn SideEffectExecutor>) -> Result<(), ChasmError> {
+    /// Bootstrap must finish registration before rebuilding outboxes or serving.
+    pub fn register(&self, executor: Arc<dyn SideEffectExecutor>) -> Result<(), ChasmError> {
+        let mut executors = self.executors.write().expect("executor registry poisoned");
         let id = executor.task_type_id();
-        if self.executors.contains_key(&id) {
+        if executors.contains_key(&id) {
             return Err(ChasmError::Validation(format!(
                 "executor for task type {id} is already registered"
             )));
         }
-        self.executors.insert(id, executor);
+        executors.insert(id, executor);
         Ok(())
     }
 
     /// Executor for a task type, or `None` when this runtime cannot deliver it.
-    pub fn executor(&self, task_type_id: u32) -> Option<&Arc<dyn SideEffectExecutor>> {
-        self.executors.get(&task_type_id)
+    pub fn executor(&self, task_type_id: u32) -> Option<Arc<dyn SideEffectExecutor>> {
+        // An executor may commit another transition and dispatch recursively. Drop
+        // the registry guard before awaiting it, so nested dispatch cannot deadlock.
+        self.executors
+            .read()
+            .expect("executor registry poisoned")
+            .get(&task_type_id)
+            .cloned()
     }
 }
 
@@ -71,6 +89,8 @@ impl DispatchSink for DispatchMultiplexer {
                             "CHASM effect failed; committed task remains pending");
                     }
                 }
+                // Unknown types stay durable; the next rebuild retries delivery
+                // after this runtime has registered the corresponding executor.
                 None => tracing::warn!(?key, task_id = ?task.id, task_type_id = task.task_type_id,
                     "CHASM executor missing; committed task remains pending"),
             }
@@ -104,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn routes_in_order_and_isolates_unknown_and_failed_effects() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut mux = DispatchMultiplexer::default();
+        let mux = Arc::new(DispatchMultiplexer::default());
         for (id, fail) in [(10, true), (20, false)] {
             mux.register(Arc::new(RecordingExecutor {
                 id,

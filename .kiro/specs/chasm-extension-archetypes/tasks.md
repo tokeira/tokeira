@@ -397,64 +397,138 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 
 ### Stage 9 — Edge: executors, versioned queue, provenance, RPC surface (`tokeira-edge`)
 
-- [ ] 9.1 `ActivityDispatchExecutor` (task type 1) wrapping the queue: entries carry
+- [x] 9.1 `ActivityDispatchExecutor` (task type 1) wrapping the queue: entries carry
   `target`; a served-stamp set makes re-execution a no-op; `ActivityBridge::with_dispatch_executor`
   replaces `with_dispatch_queue`; delete the `DISPATCH_TASK_ID`-only `DispatchSink` impl.
   - _Requirements: 3.11, 3.14, 7.3_
+
+  **DONE (stage 9):** `ActivityDispatchExecutor` reads the root target without changing the
+  persisted DispatchTask payload. The queue sink is removed; bootstrap and rebuild share the
+  late-bound multiplexer. `executor_dedupes_before_and_after_pickup` proves one delivery
+  across replay.
+
 - [ ] 9.2 `StartActivityExecutor` (`chasm.start_activity`): map every `StartActivityTask`
   field onto the bridge's start path with request id = the staging task id, attach the
   `InternalTarget { component_ref, task_type_id, task_id }`, carry `version_target`.
-  `NexusCallbackExecutor` and `InternalCallbackExecutor` (task type 6, routed by variant):
-  the first calls `invoke_nexus_callback` then records the attempt through
-  `TypedEngine<ActivityExecution>`; the second calls `apply_side_effect_outcome` with the
-  activity's terminal `TaskOutcome`, then records `SUCCEEDED`, `FAILED` (non-retryable, missing
-  target) or a retryable attempt on `RetriesExhausted`.
+  `DeliverCallbackExecutor` (task type 6) branches on Nexus/Internal: the first calls
+  `invoke_nexus_callback`, the second applies the activity's terminal `TaskOutcome` to the
+  target. Both record the attempt through `apply_side_effect_outcome` on the activity's
+  held task; missing targets fail permanently, exhausted commit retries back off.
   - _Requirements: 3.12, 5.7, 5.8, 6.3, 6.4, 6.5, 6.8, 6.10_
-- [ ] 9.3 Poll admission: `poll_activity_task_waiting(task_queue, identity, admitted:
+
+  **IN PROGRESS (stage 9):** All four roles execute through three weak-engine executors. Tests
+  cover idempotent staged starts and field mapping, permanent start rejection classes,
+  Internal applied/already-applied/missing/rejected/conflict outcomes, Nexus first-payload
+  success, shared backoff/limits and all three namespace-cache results. The executor shares
+  the edge cache; absent/tombstoned namespaces omit only the back-link, cache errors retry.
+  Accepted addenda: TaskId codecs live in activity callbacks (round-trip tested, no edge
+  postcard dependency); every start uses atomic `TypedEngine::start_with`, so rejected
+  attachment persists nothing. Timer hints are armed before nested dispatch so a newer
+  callback retry survives; a dedicated regression covers that ordering.
+
+  Concurrent-create verification exposed a missing current-pointer fence in both
+  repositories. The approved pointer-fence correction follows in its own commit, with
+  repository and engine race tests.
+
+- [x] 9.3 Poll admission: `poll_activity_task_waiting(task_queue, identity, admitted:
   Option<&DeploymentVersionTarget>)` selects the first due entry whose target equals
   `admitted`; the gRPC branch at `grpc/workflow_service.rs:976-988` passes the scoped
   worker's exact version (`Some`) or `None`; an untargeted entry never matches `Some`.
   - _Requirements: 7.3, 7.4, 7.5, 7.6, 7.7, 7.8_
-- [ ] 9.4 Token and provenance: `ProtoTaskToken` field 15 `version_target`; when a targeted
+
+  **DONE (stage 9):** Queue selection, due deadlines and waiting admission use exact
+  optional target equality. Authenticated worker scope supplies the target; raw unscoped
+  deployment fields cannot admit targeted work
+  (`unscoped_poll_fields_do_not_admit_targeted_work_and_internal_callbacks_are_hidden`).
+
+- [x] 9.4 Token and provenance: `ProtoTaskToken` field 15 `version_target`; when a targeted
   task is served, write the token digest to `worker_task_provenance` with origin
   `{namespace, normal task queue, task_class: Activity, deployment, build_id}`; call
   `authorize_scoped_task_token` on the standalone completed / failed / canceled / heartbeat
   paths before the bridge.
   - _Requirements: 7.9, 7.10_
-- [ ] 9.5 RPC surface: with the gate on, `start_activity_execution` validates
-  `completion_callbacks` through `validate_completion_callbacks`, rejects `Internal` with
-  INVALID_ARGUMENT "unsupported callback variant" (`activity.go:466-467 @ v1.32.0`) and passes
+
+  **DONE (stage 9):** Field 15 round-trips targets and absent targets preserve literal v1.31
+  token bytes. Scoped pickup writes expiring provenance; all four token handlers use worker
+  preflight followed by provenance authorization. Completion/failure/cancellation consume
+  evidence; heartbeat retains it. Wrong-release calls leave state and VT unchanged.
+
+- [x] 9.5 RPC surface: with the gate on, `start_activity_execution` validates
+  `completion_callbacks` through `validate_callback_specs`, rejects `Internal` with
+  INVALID_ARGUMENT "unsupported callback variant: *common.Callback_Internal_" (`activity.go:466-467 @ v1.32.0`) and passes
   the rest to the library; with the gate off the field is never read.
   `describe_activity_execution` maps persisted Nexus callbacks to `activity.v1.CallbackInfo`
   through the workflow path's `CallbackInfo` mapping and never lists internal targets. The
   edge never populates `version_target`.
   - _Requirements: 5.1, 5.2, 5.3, 5.9, 5.10, 6.2, 7.2_
-- [ ] 9.6 Property test: Property 7 — activity dispatch equivalence
+
+  **DONE (stage 9):** Default-false ActivityConfig gate, shared per-callback validation and
+  component-owned cap are wired. Headers and links round-trip verbatim; public starts never
+  set a target and describe hides Internal callbacks. The evaluator folds due callback
+  retries and returns the minimum live deadline, including after activity completion.
+
+- [x] 9.6 Property test: Property 7 — activity dispatch equivalence
   - Generated standalone-activity lifecycle sequences; the executor-backed bridge produces
     the same worker-visible task sequence and describe outcomes as a recorded pre-change
     model (`CollectingDispatchSink` snapshot of the old queue semantics).
   - Tag: `// Feature: chasm-extension-archetypes, Property 7: activity dispatch equivalence`
   - _Requirements: 2.8, 3.11, 3.13, 3.14_
-- [ ] 9.7 Property test: Property 9 — callback attachment model
+
+  **DONE (stage 9):** `dispatch_matches_legacy_lifecycle_scripts` runs 128 generated scripts
+  against executor and test-only legacy sinks, comparing served tokens/describes after every
+  step and inserting a rebuild at a generated point.
+
+- [x] 9.7 Property test: Property 9 — callback attachment model
   - Generated callback lists with the gate off and on; gate off ≡ no-callback start; gate on
     matches the v1.32.0 attach model and describe lists exactly the Nexus callbacks.
   - Tag: `// Feature: chasm-extension-archetypes, Property 9: callback attachment model`
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.9, 5.10, 6.2_
-- [ ] 9.8 Property test: Property 12 — versioned admission
+
+  **DONE (stage 9):** `callback_attachment_matches_wire_model` runs 128 generated gRPC
+  lists, checking cap rollback, exact Internal error, ids, standby state, order,
+  activity-closed trigger, links and headers; gate-off generated starts independently check
+  persisted bytes and describes.
+
+- [x] 9.8 Property test: Property 12 — versioned admission
   - Generated queues mixing untargeted and targeted entries and generated pollers
     (unscoped, scoped to random versions); served target always equals the admitted version;
     completion with a mismatched targeted token is denied.
   - Tag: `// Feature: chasm-extension-archetypes, Property 12: versioned admission`
   - _Requirements: 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 7.10_
-- [ ] 9.9 Property test: Property 17 — gate-off invariance
+
+  **DONE (stage 9):** `queue_admission_matches_reference_model` runs 128 generated
+  queues/poll sequences. `scoped_wire_tokens_reject_other_releases` runs 128 real scoped
+  pickups and completion/failure/cancellation/heartbeat attempts, proving wrong-version
+  denial before mutation and correct provenance lifetime.
+
+- [x] 9.9 Property test: Property 17 — gate-off invariance
   - Differential test: the recorded v1.31.0 standalone-activity request set, plus generated
     starts carrying `completion_callbacks`, replayed with gates at default against the
     pre-change and post-change bridge; responses and describes byte-identical.
   - Tag: `// Feature: chasm-extension-archetypes, Property 17: gate-off invariance`
   - _Requirements: 5.1, 10.1_
 
+
+  **DONE (stage 9):** The first commit records 42 fixed-clock responses from the pre-change
+  engine, including bridge lifecycle, idempotent gRPC repeats and fresh gRPC starts. Fresh
+  UUIDs normalize to a placeholder; the approved atomic-start correction normalizes public
+  state_transition_count and the opaque token VT while retaining the execution key. The
+  golden preserves every other byte.
+  `atomic_wire_start_reports_one_transition_and_advances_on_updates` checks 1 after start,
+  idempotent stability and later increments; the existing long-poll tests remain guards.
+  `gate_off_generated_starts_ignore_callbacks` adds 128 generated cases. The count
+  correction has a separate fixed changie fragment alongside the slice's added entry.
+
 - [ ] 10. Checkpoint: `cargo clippy -p tokeira-edge --all-targets` clean; `cargo nextest run
   -p tokeira-edge` green including every existing standalone-activity and scoped-worker test.
+
+  **IN PROGRESS (2026-09-16):** Formatting, workspace lint (zero warnings), workspace
+  check, doctests (1 passed, 20 ignored) and docs with warnings denied pass. Full workspace
+  nextest: 3420 passed, 1 failed, 2 skipped; the only failure is the new concurrent-start
+  regression exposing the missing repository pointer fence in 9.2. The earlier four-crate
+  run hit the known backlog property flake; its serial rerun and the full workspace rerun
+  pass that property. Golden, all edge tests and the nested callback timer regression pass.
+  No dependency changes; the approved pointer-fence correction and final bar follow.
 
 ### Stage 11 — Config and engine: gate, builder, handle, clock, seeding (`tokeira-config`, `tokeira-engine`)
 

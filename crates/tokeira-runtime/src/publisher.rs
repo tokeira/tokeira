@@ -71,7 +71,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 /// Invoke a Nexus completion with the workflow plane's header and local-listener
 /// rules (`components/callbacks/nexus_invocation.go @ v1.31.0`). Classification and
 /// attempt persistence remain with the calling state machine.
-pub(crate) async fn invoke_nexus_callback(
+pub async fn invoke_nexus_callback(
     client: &dyn NexusCompletionClient,
     config: &NexusCompletionRuntimeConfig,
     url: &str,

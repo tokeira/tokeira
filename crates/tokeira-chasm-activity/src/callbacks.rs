@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use tokeira_chasm::{ChasmError, MutableContext, Task, TaskOutcome};
+use tokeira_chasm::{ChasmError, MutableContext, Task, TaskId, TaskOutcome};
 use tokeira_proto::enums::CallbackState;
 
 use crate::{
@@ -15,6 +15,20 @@ use crate::{
         CALLBACK_RETRY_TASK_ID, CallbackRetryTimer, DELIVER_CALLBACK_TASK_ID, DeliverCallback,
     },
 };
+
+/// Encode an Internal callback's return task with the persisted postcard codec.
+/// Keeping the codec beside the callback envelope prevents executors from growing
+/// their own serialization dependency or changing the durable return address.
+pub fn encode_task_id(id: TaskId) -> Result<Vec<u8>, ChasmError> {
+    postcard::to_allocvec(&id)
+        .map_err(|error| ChasmError::Validation(format!("encode callback task id: {error}")))
+}
+
+/// Decode an Internal callback's return task, rejecting malformed addresses.
+pub fn decode_task_id(bytes: &[u8]) -> Result<TaskId, ChasmError> {
+    postcard::from_bytes(bytes)
+        .map_err(|error| ChasmError::Validation(format!("decode callback task id: {error}")))
+}
 
 /// Attachment input; identity and registration time are assigned by the component.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,3 +312,18 @@ pub(crate) fn retry_due(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod task_id_codec_tests {
+    use super::*;
+    use tokeira_chasm::VersionedTransition;
+
+    #[test]
+    fn task_id_round_trips_every_numeric_field() {
+        for (version, count, offset) in [(0, 0, 0), (-1, 23, 17), (i64::MAX, i64::MAX, u32::MAX)] {
+            let id = TaskId::new(VersionedTransition::new(version, count), offset);
+            assert_eq!(decode_task_id(&encode_task_id(id).unwrap()).unwrap(), id);
+        }
+        assert!(decode_task_id(&[]).is_err());
+    }
+}

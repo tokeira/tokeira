@@ -77,6 +77,44 @@ where
             .await
     }
 
+    /// Create and initialize a root in one atomic start transaction. The initializer
+    /// runs only when policy admits a new run; returning an existing request/run
+    /// never repeats it. A rejected initializer persists neither root nor pointer.
+    /// Staged tasks are validated, persisted, dispatched and armed by normal close.
+    pub async fn start_with(
+        &self,
+        key: ExecutionKey,
+        data: C::Data,
+        request_id: Option<String>,
+        policy: BusinessIdPolicy,
+        initialize: impl FnOnce(&mut C, &mut dyn MutableContext) -> Result<(), ChasmError> + Send,
+    ) -> Result<StartOutcome, ChasmError> {
+        let archetype_id = self.engine.registry().archetype_id(C::FQN).ok_or_else(|| {
+            ChasmError::Internal(format!("archetype `{}` is not registered", C::FQN))
+        })?;
+        let request = StartRequest {
+            key,
+            archetype_id,
+            data: data.encode_to_vec(),
+            request_id,
+            policy,
+            visibility: None,
+        };
+        self.engine
+            .start_with_initializer(request, move |request, ctx| {
+                let data = C::Data::decode(request.data.as_slice()).map_err(|error| {
+                    ChasmError::Validation(format!("decode initial component: {error}"))
+                })?;
+                let mut component = C::from_data(data);
+                initialize(&mut component, ctx)?;
+                let lifecycle = component.lifecycle_state(ctx);
+                request.visibility = component.visibility_snapshot();
+                request.data = component.into_data().encode_to_vec();
+                Ok(lifecycle)
+            })
+            .await
+    }
+
     /// Run a typed mutation inside a transition, reloading and re-running on a
     /// fenced-commit conflict up to the configured bound (Requirement 6.1, 9.5).
     ///
@@ -392,6 +430,86 @@ mod tests {
 
     fn key() -> ExecutionKey {
         ExecutionKey::new("ns", "counter-1", "run-1")
+    }
+
+    #[tokio::test]
+    async fn atomic_start_initializes_tasks_once_and_rejection_writes_nothing() {
+        let fx = fixture();
+        let typed = TypedEngine::<Counter>::new(fx.engine.clone());
+        let rejected = typed
+            .start_with(
+                key(),
+                CounterData::default(),
+                Some("request".into()),
+                BusinessIdPolicy::default(),
+                |component, ctx| {
+                    component.data.counter = 9;
+                    ctx.add_task(TaskKind::SideEffect, 11, vec![], None)?;
+                    Err(ChasmError::FailedPrecondition("attach rejected".into()))
+                },
+            )
+            .await;
+        assert!(matches!(rejected, Err(ChasmError::FailedPrecondition(_))));
+        assert!(fx.engine.root_node(&key()).await.unwrap().is_none());
+        let id = fx.engine.registry().archetype_id(Counter::FQN).unwrap();
+        assert!(
+            fx.engine
+                .current_run("ns", id, "counter-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(fx.dispatch.dispatched.lock().unwrap().is_empty());
+
+        let created = typed
+            .start_with(
+                key(),
+                CounterData::default(),
+                Some("request".into()),
+                BusinessIdPolicy::default(),
+                |component, ctx| {
+                    component.data.counter = 7;
+                    ctx.add_task(TaskKind::SideEffect, 11, vec![], None)?;
+                    ctx.add_task(TaskKind::Pure, 20, vec![], Some(9_000))
+                },
+            )
+            .await
+            .unwrap();
+        assert!(created.created);
+        assert_eq!(
+            created
+                .reference
+                .execution_versioned_transition
+                .transition_count,
+            1
+        );
+        assert_eq!(fx.engine.armed_timer(&key()), Some(9_000));
+        assert_eq!(fx.dispatch.dispatched.lock().unwrap().len(), 1);
+        assert_eq!(
+            typed
+                .read(&created.reference, |component, _| Ok(component
+                    .data
+                    .counter))
+                .await
+                .unwrap(),
+            7
+        );
+        let existing = typed
+            .start_with(
+                ExecutionKey::new("ns", "counter-1", "different-run"),
+                CounterData::default(),
+                Some("request".into()),
+                BusinessIdPolicy::default(),
+                |_, _| panic!("idempotent start must not initialize again"),
+            )
+            .await
+            .unwrap();
+        assert!(!existing.created);
+        assert_eq!(
+            existing.reference.execution_key,
+            created.reference.execution_key
+        );
+        assert_eq!(fx.dispatch.dispatched.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

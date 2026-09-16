@@ -777,6 +777,27 @@ impl ChasmEngine {
 }
 
 impl ChasmEngine {
+    async fn check_current_run_collision(&self, req: &StartRequest) -> Result<(), ChasmError> {
+        // Creation may have won after admission but before the node load. Only a
+        // current run can resolve on policy reload; an older run id cannot become
+        // fresh through retries and must report the original business-id conflict.
+        if self
+            .current_run(
+                &req.key.namespace_id,
+                req.archetype_id,
+                &req.key.business_id,
+            )
+            .await?
+            .is_some_and(|current| current.run_id == req.key.run_id)
+        {
+            return Ok(());
+        }
+        Err(ChasmError::BusinessIdConflict(format!(
+            "run id `{}` already exists for business id `{}` and is not current",
+            req.key.run_id, req.key.business_id,
+        )))
+    }
+
     pub(super) async fn start_with_initializer(
         &self,
         req: StartRequest,
@@ -878,8 +899,7 @@ impl ChasmEngine {
 
             let (mut tree, baseline) = self.load_tree(&req.key).await?;
             if tree.node(ROOT_PATH).is_some() {
-                // A concurrent same-run create may commit after admission but before
-                // this read. Re-enter policy evaluation rather than initialize its root.
+                self.check_current_run_collision(&req).await?;
                 continue;
             }
             // A fresh run_id means the node tree is empty, so the Absent node fences
@@ -1109,6 +1129,62 @@ mod tests {
         atomic::{AtomicI64, Ordering},
     };
     use tokeira_chasm::{BusinessIdPolicy, Task, TaskKind, task_type_id_for_fqn};
+
+    #[tokio::test]
+    async fn reused_run_id_conflicts_but_a_current_collision_reloads() {
+        let repo = Arc::new(ConflictingStore::default());
+        let engine = ts::engine(repo, Arc::new(AtomicI64::new(0)), ts::sink());
+        let key = ts::key(0);
+        let first = ts::start(&engine, key.clone()).await;
+        TypedEngine::<Root>::new(engine.clone())
+            .update(&first, |root, _| {
+                root.data.closed = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let next = ExecutionKey::new(&key.namespace_id, &key.business_id, "next");
+        let winner = TypedEngine::<Root>::new(engine.clone())
+            .start(
+                next.clone(),
+                ts::Data::default(),
+                Some("winner".into()),
+                BusinessIdPolicy::default(),
+            )
+            .await
+            .unwrap();
+        TypedEngine::<Root>::new(engine.clone())
+            .update(&winner.reference, |root, _| {
+                root.data.closed = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = TypedEngine::<Root>::new(engine.clone())
+            .start(
+                key.clone(),
+                ts::Data::default(),
+                Some("new-request".into()),
+                BusinessIdPolicy::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ChasmError::BusinessIdConflict(message) if message.contains(&key.run_id) && message.contains(&key.business_id))
+        );
+        let request = StartRequest {
+            key: next.clone(),
+            archetype_id: winner.reference.archetype_id,
+            data: Vec::new(),
+            request_id: Some("winner".into()),
+            policy: BusinessIdPolicy::default(),
+            visibility: None,
+        };
+        engine.check_current_run_collision(&request).await.unwrap();
+        let repeated = engine.start_execution(request).await.unwrap();
+        assert!(!repeated.created);
+        assert_eq!(repeated.reference.execution_key, next);
+    }
 
     #[tokio::test]
     async fn atomic_start_retries_pristine_input_and_stops_at_bound() {

@@ -51,6 +51,15 @@ use crate::{
 const DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED: &str =
     "Deployments are deprecated and no longer supported, use Worker Deployments instead";
 
+fn standalone_provenance_expiry(
+    served_at: OffsetDateTime,
+    start_to_close_nanos: i64,
+) -> Option<OffsetDateTime> {
+    served_at
+        .checked_add(time::Duration::nanoseconds(start_to_close_nanos))
+        .filter(|expires_at| *expires_at > served_at)
+}
+
 fn shutdown_worker_task_classes(task_queue_types: &[i32]) -> Vec<WorkerTaskClass> {
     if task_queue_types.is_empty() {
         return vec![WorkerTaskClass::Workflow, WorkerTaskClass::Activity];
@@ -1080,12 +1089,19 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             {
                 if let Some(target) = &task.version_target {
                     let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
-                    let expires_at = OffsetDateTime::from_unix_timestamp_nanos(
-                        i128::from(task.started_time_nanos) + i128::from(task.start_to_close_nanos),
+                    // Provenance is a real-time storage lifetime: get() in
+                    // crates/tokeira-storage/src/memory.rs and
+                    // crates/tokeira-storage/src/dsql/worker_task_provenance.rs filters
+                    // expiry; DSQL's delete_expired also purges it. Sample after pickup:
+                    // neither a simulated CHASM start nor admission before a waiting poll
+                    // can anchor the lifetime of the task just served to this worker.
+                    let expires_at = standalone_provenance_expiry(
+                        OffsetDateTime::now_utc(),
+                        task.start_to_close_nanos,
                     )
-                    .map_err(|_| {
-                        Status::internal("standalone activity deadline is out of range")
-                    })?;
+                    // Invalid/overflowing durations reach the common expired-provenance
+                    // guard, preserving its standard denial and authorization metric.
+                    .unwrap_or(context.received_at);
                     self.inner
                         .register_standalone_task_provenance(
                             &context,

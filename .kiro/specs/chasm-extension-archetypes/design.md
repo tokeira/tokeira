@@ -383,6 +383,15 @@ the cap and closed rule. Stage 7 leaves the edge request's callbacks empty.
 
 ### Runtime: `crates/tokeira-runtime/src/chasm`
 
+**Clock ownership.** The injected clock supplies every CHASM transition, pure-task
+deadline, delayed dispatch, callback registration time and sweeper pass. No CHASM decision
+reads wall time directly outside the configured clock (Requirement 8.11). The two sanctioned
+direct real-time uses are the component long-poll's transport deadline, which must bound
+request waiting even when simulation time does not advance, and the task-token provenance
+lifetime, which storage enforces on real time. Neither changes CHASM execution time;
+the workflow plane's time source remains unchanged (Requirement 8.9). These boundaries
+are Tokeira-native, with no upstream analog.
+
 **Executors and the multiplexer.**
 
 ```rust
@@ -679,8 +688,15 @@ because an untargeted entry never matches a `Some` (Requirements 7.4–7.8).
 When the gRPC adapter serves a targeted task it records
 the token digest in `worker_task_provenance` with origin `{namespace, normal task queue,
 task_class: Activity, deployment, build_id}`, exactly what `authorize_scoped_task_token`
-consumes, through `register_standalone_task_provenance`, expiring at start time plus
-start-to-close. The standalone completion, failure, cancel and heartbeat RPC paths run
+consumes, through `register_standalone_task_provenance`. The record expires at real time
+sampled after pickup plus the activity's start-to-close timeout, independently of its CHASM
+start time. Admission time cannot anchor it: a poll can wait longer than this timeout
+before serving a delayed retry, consuming the lifetime before the worker receives its task.
+This is a storage lifetime: `WorkerTaskProvenanceStore::get`
+in `crates/tokeira-storage/src/memory.rs` and `crates/tokeira-storage/src/dsql/worker_task_provenance.rs`
+filters expiry against real time; DSQL's `delete_expired` also purges on real time.
+Non-positive durations and checked-add overflow retain the existing provenance denial.
+The standalone completion, failure, cancel and heartbeat RPC paths run
 worker preflight, then `authorize_standalone_task_token` (wrapping
 `authorize_scoped_task_token`) before entering the bridge, so a
 scoped worker of the wrong version is denied with the existing `scoped_worker_denied()`
@@ -837,6 +853,8 @@ second doubling to a sixty-second cap.
 Two independent harnesses implement Requirement 9. `tests/acceptance.rs` builds with
 `Engine::builder(..).library::<AcceptanceLibrary>().clock(virtual)`, serves scoped workers
 through the in-process gRPC endpoint, and checks synchronous command/start/outcome paths.
+Its simulated clock starts one hundred seconds after the epoch, independently of wall
+time; scoped provenance registration and token authorization must still succeed.
 Its workflow visibility query accepts the seeded keys but remains empty, preserving
 `VisibilityQueryService::list_workflows` in `crates/tokeira-projection/src/query_service.rs`.
 The workflow/CHASM query split follows `common/persistence/visibility/store/query/converter.go`

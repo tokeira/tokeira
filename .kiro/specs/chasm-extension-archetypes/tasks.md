@@ -770,6 +770,54 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 
 ### Stage 15 — Documentation and sibling amendments
 
+- [x] 15.4 Clarify Requirements 8.9 and 8.11 and the design's clock/provenance boundary:
+  CHASM decisions use the injected clock; component long-poll transport deadlines and
+  task-token provenance storage lifetimes use real time. Anchor targeted-pickup provenance
+  expiry at real time sampled after pickup plus start-to-close, guarding non-positive
+  durations and overflow through the existing denial. This correction precedes
+  documentation tasks 15.1–15.3 so they describe the corrected contract. Storage behavior
+  is unchanged.
+  - _Requirements: 7.9, 7.10, 8.9, 8.11_
+
+  **DONE (2026-09-16):** Requirements 8.9/8.11 and the design distinguish CHASM decision
+  time from transport waiting and provenance storage lifetime. The targeted-pickup path
+  samples real time after pickup, then adds start-to-close with checked arithmetic.
+  The approved refinement uses serving time, because admission time can precede a waiting
+  poll by more than the timeout. Invalid durations reach the existing provenance denial
+  and metric. This lands before 15.1–15.3 so the documentation describes the corrected
+  contract. The handoff's reported store disagreement was checked and is not present:
+  both memory and DSQL `WorkerTaskProvenanceStore::get` filter expired rows on real time;
+  DSQL's unfiltered private `load_any` is wrapped by that public read filter. Storage code
+  and dependency manifests remain unchanged.
+
+- [x] 15.5 Prove the provenance anchor beside the scoped-worker tests: a pickup with CHASM
+  time far from wall time records serving-based expiry; a stale admission instant cannot
+  spend the lifetime, and non-positive start-to-close/overflow are denied. Remove the
+  acceptance scenario's wall-time freeze and use a simulated clock;
+  retain all scoped admission, completion and failure assertions. Run the workspace bar
+  and the four engine `chasm-extensions` checks.
+  - _Requirements: 7.9, 7.10, 8.8, 8.9, 8.11, 9.10, 9.11_
+
+  **DONE (2026-09-16):** Both simulated-clock tests first failed with PermissionDenied
+  against the pre-fix computation. After correction, the real scoped pickup registers
+  readable provenance anchored to serving time while CHASM remains at 1,000 seconds after
+  the epoch; zero and negative timeouts retain the standard denial. A deterministic
+  boundary test covers serving after stale admission, non-positive durations and timestamp
+  overflow. The acceptance scenario's wall-time freeze is gone: its atomic clock starts
+  at 100 seconds after the epoch, and matching-release admission, wrong-release denial,
+  completion and failure pass unchanged.
+
+  Edge check/all-target clippy and all 558 edge tests pass; all 15 acceptance tests pass.
+  The workspace bar passes: nightly format, lint with zero warnings, check, nextest
+  (3458 passed, 2 skipped), doctests (1 passed, 20 ignored), and documentation with warnings
+  denied. The engine passes nextest without the feature (106 tests) and all four
+  `chasm-extensions` steps: all-target clippy with zero warnings, check, nextest (108 tests),
+  and documentation with warnings denied. Cargo steps use `--locked`; no backlog timeout
+  or serial rerun occurred. Existing native-library macOS linker warnings remain; no
+  toolchain/cache settings changed. Changelog dry-run and diff checks pass; the fixed
+  fragment is 149 characters. No dependency or storage changes. Live DSQL, stage 15.1–15.3
+  documentation/sibling amendments and the stage 16 corpus rerun remain outside this slice.
+
 - [ ] 15.1 Crate docs: `docs/crates/chasm.md` (handlers, ids, the sealed built-in rule),
   `docs/crates/chasm-activity.md` (callbacks, version target), `docs/crates/runtime.md`
   (executors, multiplexer, rebuild scan, outcome primitive), `docs/crates/storage.md` (the
@@ -810,7 +858,7 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 6, 8 → 9.1 → 9.2 → 9.3 → 9.4 → 9.5 → 9.6, 9.7, 9.8, 9.9 → 10
 10 → 11.1 → 11.2 → 11.3 → 11.4 → 11.5 → 11.6, 11.7 → 12
 12 → 13.1 → 13.2 → 13.3 → 13.4 → 13.5, 13.6, 13.7 → 14
-14 → 15.1, 15.2, 15.3 → 16.1 → 16.2
+14 → 15.4 → 15.5 → 15.1, 15.2, 15.3 → 16.1 → 16.2
 ```
 
 Stages 1 and 3 are independent and may run in parallel; stage 7 depends on stage 3 only;

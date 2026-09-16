@@ -8,8 +8,10 @@ mod commands;
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
 };
 
 use http::HeaderMap;
@@ -145,15 +147,10 @@ async fn resource_reconciles_through_scoped_workers_and_the_public_builder() {
             .compatibility
             .enable_standalone_activity_callbacks
     );
-    // Token provenance expires against wall time. Freeze CHASM at this test's
-    // start; deterministic replay itself uses the runtime harness's virtual time.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64;
+    let clock = Arc::new(AtomicI64::new(100_000_000_000));
     let engine = Engine::builder(config)
         .library::<AcceptanceLibrary>()
-        .clock(Arc::new(move || now))
+        .clock(Arc::new(move || clock.load(Ordering::SeqCst)))
         .build()
         .await
         .unwrap();

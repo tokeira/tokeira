@@ -14,6 +14,7 @@ use tokeira_chasm::{BusinessIdPolicy, ExecutionKey, Library, Registry};
 use tokeira_chasm_activity::{ActivityConfig, ActivityExecution, ActivityLibrary, ActivityState};
 use tokeira_runtime::chasm::{
     ChasmEngine, ChasmTimerSweeper, CollectingVisibilitySink, DispatchMultiplexer, Engine,
+    TypedEngine,
 };
 use tokeira_storage::{InMemoryChasmNodeStore, WorkerTaskProvenanceStore};
 
@@ -966,6 +967,92 @@ async fn token_action(
             .await
             .map(|_| ()),
     }
+}
+
+#[tokio::test]
+async fn scoped_pickup_provenance_uses_serving_time_with_a_simulated_chasm_clock() {
+    for timeout in [10 * SEC, 0, -SEC] {
+        let h = Harness::new();
+        let target = DeploymentVersionTarget {
+            deployment_name: "simulation".into(),
+            build_id: "v1".into(),
+        };
+        let provenance = Arc::new(tokeira_storage::InMemoryStore::default());
+        let own = scoped_grpc(&h, &target, provenance.clone());
+        let mut start = h.start_request("simulated", "00000000-0000-4000-8000-000000000015");
+        start.version_target = Some(target.clone());
+        let started = h.bridge.start(start).await.unwrap();
+        // Public normalization prevents non-positive timeouts. Inject anomalous
+        // persisted state to exercise the pickup's independent fail-closed guard.
+        if timeout <= 0 {
+            TypedEngine::<ActivityExecution>::new(h.engine.clone())
+                .update(&started.reference, |activity, _| {
+                    let mut state = activity.activity_state().unwrap().clone();
+                    state.start_to_close_nanos = timeout;
+                    *activity = ActivityExecution::new(state);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        let before = OffsetDateTime::now_utc();
+        let result = own
+            .poll_activity_task_queue(Request::new(
+                workflowservice::PollActivityTaskQueueRequest {
+                    namespace: "default".into(),
+                    task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                        name: QUEUE.into(),
+                        ..Default::default()
+                    }),
+                    identity: "worker".into(),
+                    worker_instance_key: "instance".into(),
+                    deployment_options: Some(WorkerDeploymentOptions {
+                        worker_versioning_mode: WorkerVersioningMode::Versioned as i32,
+                        deployment_name: target.deployment_name,
+                        build_id: target.build_id,
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .await;
+        let after = OffsetDateTime::now_utc();
+        if timeout <= 0 {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+            assert_eq!(error.message(), "Request unauthorized.");
+        } else {
+            let task = result.unwrap().into_inner();
+            assert_eq!(task.started_time.unwrap().seconds, 1_000);
+            let record = provenance
+                .get(tokeira_storage::worker_task_token_digest(&task.task_token))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!((before..=after).contains(&record.created_at));
+            let lifetime = time::Duration::nanoseconds(timeout);
+            assert!((before + lifetime..=after + lifetime).contains(&record.expires_at));
+            assert!(record.expires_at > after);
+        }
+    }
+}
+
+#[test]
+fn provenance_lifetime_starts_at_serving_and_rejects_invalid_durations() {
+    let admitted_at = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+    let served_at = admitted_at + time::Duration::minutes(2);
+    let lifetime = 10 * SEC;
+    assert!(admitted_at + time::Duration::nanoseconds(lifetime) < served_at);
+    assert_eq!(
+        standalone_provenance_expiry(served_at, lifetime),
+        Some(served_at + time::Duration::seconds(10))
+    );
+    for invalid in [0, -1, i64::MIN] {
+        assert_eq!(standalone_provenance_expiry(served_at, invalid), None);
+    }
+    assert_eq!(
+        standalone_provenance_expiry(time::PrimitiveDateTime::MAX.assume_utc(), 1),
+        None
+    );
 }
 
 proptest! {

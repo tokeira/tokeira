@@ -62,6 +62,8 @@ http = "1"
 temporalio-client = { version = "1.0.0", default-features = false, optional = true }
 
 [features]
+# Unstable embedder surface; no semver compatibility promise.
+chasm-extensions = []
 default = ["temporalio-client"]
 temporalio-client = ["dep:temporalio-client"]
 # Opt-in SQL integration boundary shared with storage and projection. The live

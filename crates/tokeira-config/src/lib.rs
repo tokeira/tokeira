@@ -825,6 +825,12 @@ pub struct CompatibilityConfig {
     /// tokeira serves them — a deliberate deviation ahead of the baseline.
     #[serde(default)]
     pub enable_standalone_activities: bool,
+    /// Allow standalone-activity completion callbacks, matching
+    /// `activity.enableCallbacks` (default false) in
+    /// `chasm/lib/activity/config.go @ v1.32.0`. Requires
+    /// `enable_standalone_activities` to be enabled.
+    #[serde(default)]
+    pub enable_standalone_activity_callbacks: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1133,6 +1139,19 @@ impl TokeiraConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
+
+        if self
+            .policy
+            .compatibility
+            .enable_standalone_activity_callbacks
+            && !self.policy.compatibility.enable_standalone_activities
+        {
+            errors.push(ValidationError::Field {
+                field: "policy.compatibility.enable_standalone_activity_callbacks".to_owned(),
+                message: "requires policy.compatibility.enable_standalone_activities = true"
+                    .to_owned(),
+            });
+        }
 
         let retention = self.policy.default_retention_days;
         if !(1..=36_500).contains(&retention) {
@@ -1604,6 +1623,30 @@ mod tests {
     use std::{path::PathBuf, sync::Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn standalone_callbacks_require_standalone_activities() {
+        for (activities, callbacks) in [(false, false), (true, false), (true, true), (false, true)]
+        {
+            let mut config = TokeiraConfig::default();
+            config.policy.compatibility.enable_standalone_activities = activities;
+            config
+                .policy
+                .compatibility
+                .enable_standalone_activity_callbacks = callbacks;
+            let encoded = config.to_toml().unwrap();
+            let decoded: TokeiraConfig = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded, config);
+            if callbacks && !activities {
+                let ConfigError::Validation(errors) = config.validate().unwrap_err() else {
+                    panic!("expected validation error")
+                };
+                assert!(errors.iter().any(|error| matches!(error, ValidationError::Field { field, message } if field == "policy.compatibility.enable_standalone_activity_callbacks" && message == "requires policy.compatibility.enable_standalone_activities = true")));
+            } else {
+                config.validate().unwrap();
+            }
+        }
+    }
 
     // Feature: scoped-worker-authorization, Property 11: Configuration validation and round-trip
     proptest! {

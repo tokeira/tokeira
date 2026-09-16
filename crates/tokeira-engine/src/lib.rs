@@ -53,6 +53,17 @@ use tonic_web::GrpcWebLayer;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
+#[cfg(feature = "chasm-extensions")]
+pub mod chasm;
+mod chasm_extensions;
+#[cfg(feature = "chasm-extensions")]
+pub use chasm_extensions::EngineBuilder;
+use chasm_extensions::{
+    ChasmExtensions, check_rebuilt_outboxes, check_registered_archetypes,
+    declared_search_attributes, embedded_stack_error, registry_start_error,
+    seed_declared_search_attributes, seed_start_error,
+};
+
 pub mod correlation_format;
 #[cfg(test)]
 mod embedded_dsql_tests;
@@ -296,6 +307,7 @@ pub enum BootstrapNexusEndpointTarget {
 struct VisibilityRegistryOperatorApi<V> {
     inner: InMemoryOperatorApi,
     visibility_store: V,
+    declared_search_attributes: Vec<(String, SearchAttrType)>,
 }
 
 impl<V> VisibilityRegistryOperatorApi<V> {
@@ -303,7 +315,13 @@ impl<V> VisibilityRegistryOperatorApi<V> {
         Self {
             inner,
             visibility_store,
+            declared_search_attributes: Vec::new(),
         }
+    }
+
+    fn with_declared_search_attributes(mut self, declared: Vec<(String, SearchAttrType)>) -> Self {
+        self.declared_search_attributes = declared;
+        self
     }
 }
 
@@ -355,7 +373,17 @@ where
             &self.visibility_store,
             namespace_id_for(namespace),
         )
-        .await
+        .await?;
+        // Resolve before register: the projection's idempotent registration does
+        // not reject an existing key of another type. New namespaces get the same
+        // declarations as namespaces present at startup.
+        seed_declared_search_attributes(
+            &self.visibility_store,
+            namespace_id_for(namespace),
+            &self.declared_search_attributes,
+        )
+        .await?;
+        Ok(())
     }
 }
 
@@ -417,6 +445,11 @@ pub struct BootstrapNexusEndpointConfig {
 /// perform asynchronous file I/O.
 #[derive(Debug)]
 pub struct Engine {
+    // Owned in every deployment; typed access is an opt-in public surface.
+    #[cfg_attr(not(feature = "chasm-extensions"), allow(dead_code))]
+    chasm_engine: Arc<tokeira_runtime::chasm::ChasmEngine>,
+    #[cfg_attr(not(feature = "chasm-extensions"), allow(dead_code))]
+    registry: Arc<tokeira_chasm::Registry>,
     endpoint: TemporalEndpoint,
     background_cancel: CancellationToken,
     log_broadcast: broadcast::Sender<LogEvent>,
@@ -553,6 +586,26 @@ impl std::fmt::Display for EmbeddedStartupPhase {
 /// Redacted failure from explicit embedded startup.
 #[derive(Debug)]
 pub enum EmbeddedEngineStartError {
+    /// A library or executor conflicts with the immutable registry.
+    Registry(tokeira_chasm::ChasmError),
+    /// Persisted executions require a library absent from this deployment.
+    UnregisteredArchetype {
+        /// Persisted root component type.
+        archetype_id: u32,
+        /// Stored executions requiring it.
+        executions: u64,
+    },
+    /// A declared search attribute conflicts with the namespace's registered type.
+    SearchAttributeType {
+        /// Namespace whose registry conflicts.
+        namespace: NamespaceId,
+        /// Declared attribute name.
+        key: String,
+        /// Type required by the library.
+        declared: SearchAttrType,
+        /// Type already registered in projection storage.
+        existing: SearchAttrType,
+    },
     /// Startup rebuild isolated executions this deployment cannot serve.
     UnserviceableOutbox {
         /// Archetype of the first failing execution in scan order.
@@ -579,6 +632,27 @@ pub enum EmbeddedEngineStartError {
 impl std::fmt::Display for EmbeddedEngineStartError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Registry(error) => write!(
+                formatter,
+                "CHASM registration failed: {error}; correct the conflicting library or executor before restarting"
+            ),
+            Self::UnregisteredArchetype {
+                archetype_id,
+                executions,
+            } => write!(
+                formatter,
+                "CHASM archetype {archetype_id} is not registered but has {executions} stored executions; load its library before restarting"
+            ),
+            Self::SearchAttributeType {
+                namespace,
+                key,
+                declared,
+                existing,
+            } => write!(
+                formatter,
+                "namespace {} search attribute `{key}` declares {declared:?} but storage has {existing:?}; restore the matching declaration or correct the registered type before restarting",
+                namespace.0
+            ),
             Self::UnserviceableOutbox {
                 archetype_id,
                 cause,
@@ -604,32 +678,6 @@ impl std::fmt::Display for EmbeddedEngineStartError {
 }
 
 impl std::error::Error for EmbeddedEngineStartError {}
-
-fn check_rebuilt_outboxes(
-    stats: tokeira_runtime::chasm::RebuildStats,
-) -> Result<(), EmbeddedEngineStartError> {
-    if stats.unserviceable > 0 {
-        let (archetype_id, cause) = stats
-            .first_unserviceable
-            .expect("unserviceable execution records its first cause");
-        return Err(EmbeddedEngineStartError::UnserviceableOutbox {
-            archetype_id,
-            cause,
-            executions: stats.unserviceable,
-        });
-    }
-    Ok(())
-}
-
-// Preserve only the deliberately public CHASM diagnostics. All other stack
-// failures retain the embedded boundary's existing phase-only redaction.
-fn embedded_stack_error(error: anyhow::Error) -> EmbeddedEngineStartError {
-    error
-        .downcast::<EmbeddedEngineStartError>()
-        .unwrap_or(EmbeddedEngineStartError::Phase {
-            phase: EmbeddedStartupPhase::RuntimeRestore,
-        })
-}
 
 impl From<tokeira_config::EmbeddedConfigError> for EmbeddedEngineStartError {
     fn from(error: tokeira_config::EmbeddedConfigError) -> Self {
@@ -790,6 +838,38 @@ pub struct TemporalEndpoint {
 }
 
 impl Engine {
+    /// Configure unstable CHASM libraries, executors and time before startup.
+    #[cfg(feature = "chasm-extensions")]
+    pub fn builder(config: EmbeddedEngineConfig) -> EngineBuilder {
+        EngineBuilder {
+            config,
+            extensions: ChasmExtensions::default(),
+        }
+    }
+
+    /// Return a typed handle only for a registered component. The built-in
+    /// activity archetype is always reachable, including with no extension libraries.
+    #[cfg(feature = "chasm-extensions")]
+    pub fn chasm<C>(
+        &self,
+    ) -> Result<tokeira_runtime::chasm::TypedEngine<C>, tokeira_chasm::ChasmError>
+    where
+        C: tokeira_chasm::EngineComponent
+            + tokeira_chasm::RootComponent
+            + tokeira_chasm::SearchAttributeProvider
+            + tokeira_chasm::VisibilityContributor,
+    {
+        if self.registry.archetype_id(C::FQN).is_none() {
+            return Err(tokeira_chasm::ChasmError::Internal(format!(
+                "archetype `{}` is not registered",
+                C::FQN
+            )));
+        }
+        Ok(tokeira_runtime::chasm::TypedEngine::new(
+            self.chasm_engine.clone(),
+        ))
+    }
+
     /// Start a zero-listener engine with the default in-memory configuration.
     pub async fn start() -> Result<Self> {
         Self::start_with_config(TokeiraConfig::default()).await
@@ -806,10 +886,17 @@ impl Engine {
     /// placement are daemon concerns, while this facade guarantees process-local
     /// ownership and no bound sockets.
     pub async fn start_with_config(config: TokeiraConfig) -> Result<Self> {
+        Self::start_in_memory_with_extensions(config, ChasmExtensions::default()).await
+    }
+
+    async fn start_in_memory_with_extensions(
+        config: TokeiraConfig,
+        extensions: ChasmExtensions,
+    ) -> Result<Self> {
         let config = embedded_config(config)?;
         let snapshot_config = config.policy.snapshot.clone();
         let (store, restored) = restore_snapshot_store(&config).await?;
-        let stack = build_embedded(Arc::new(config), store.clone(), restored).await?;
+        let stack = build_embedded(Arc::new(config), store.clone(), restored, extensions).await?;
         let snapshot_policy = snapshot_config.map(|config| {
             EngineSnapshotPolicy::start(store, config, stack.background_cancel.clone())
         });
@@ -823,6 +910,8 @@ impl Engine {
             ownership: None,
         };
         let engine = Self {
+            chasm_engine: stack.chasm_engine,
+            registry: stack.registry,
             endpoint: TemporalEndpoint {
                 service: stack.service,
                 shutdown: stack.background_cancel.clone(),
@@ -847,6 +936,13 @@ impl Engine {
     pub async fn start_with_embedded_config(
         config: EmbeddedEngineConfig,
     ) -> Result<Self, EmbeddedEngineStartError> {
+        Self::start_with_extensions(config, ChasmExtensions::default()).await
+    }
+
+    async fn start_with_extensions(
+        config: EmbeddedEngineConfig,
+        extensions: ChasmExtensions,
+    ) -> Result<Self, EmbeddedEngineStartError> {
         if !matches!(config.storage, EmbeddedStorageConfig::InMemory)
             && config.server.policy.snapshot.is_some()
         {
@@ -856,11 +952,11 @@ impl Engine {
         }
         config.validate()?;
         if matches!(config.storage, EmbeddedStorageConfig::InMemory) {
-            return Self::start_with_config(config.server)
+            return Self::start_in_memory_with_extensions(config.server, extensions)
                 .await
                 .map_err(embedded_stack_error);
         }
-        start_embedded_dsql(config).await
+        start_embedded_dsql(config, extensions).await
     }
 
     /// Return the complete redacted report for the startup that produced this engine.
@@ -1002,6 +1098,7 @@ impl EmbeddedShutdownCoordinator {
 
 async fn start_embedded_dsql(
     config: EmbeddedEngineConfig,
+    extensions: ChasmExtensions,
 ) -> Result<Engine, EmbeddedEngineStartError> {
     let deadline = Instant::now() + StdDuration::from_millis(config.startup_timeout_ms);
     let storage_mode = match &config.storage {
@@ -1111,6 +1208,7 @@ async fn start_embedded_dsql(
                 Arc::new(server),
                 dsql_store,
                 connection_endpoint.clone(),
+                extensions,
             )
             .await
             .map_err(embedded_stack_error)
@@ -1153,6 +1251,8 @@ async fn start_embedded_dsql(
         ownership: Some(ownership),
     };
     let engine = Engine {
+        chasm_engine: stack.chasm_engine,
+        registry: stack.registry,
         endpoint: TemporalEndpoint {
             service: stack.service,
             shutdown: stack.background_cancel.clone(),
@@ -2561,6 +2661,8 @@ enum ConstructedStack {
 }
 
 struct EmbeddedStack {
+    chasm_engine: Arc<tokeira_runtime::chasm::ChasmEngine>,
+    registry: Arc<tokeira_chasm::Registry>,
     service: InProcessGrpcService,
     background_cancel: CancellationToken,
     log_broadcast: broadcast::Sender<LogEvent>,
@@ -2658,6 +2760,7 @@ async fn build_and_serve(
                 effective_config,
                 store,
                 restored,
+                ChasmExtensions::default(),
             )
             .await
         }
@@ -2681,6 +2784,7 @@ async fn build_and_serve(
                 effective_config,
                 dsql_store,
                 endpoint,
+                ChasmExtensions::default(),
             )
             .await
         }
@@ -2705,6 +2809,7 @@ async fn build_dsql_stack(
     effective_config: Arc<TokeiraConfig>,
     dsql_store: DsqlStore,
     endpoint: String,
+    extensions: ChasmExtensions,
 ) -> Result<ConstructedStack> {
     let (director, run_repository, projection_log, worker_deployment_repository, _migration_runner) =
         dsql_store.into_parts();
@@ -2749,6 +2854,7 @@ async fn build_dsql_stack(
         chasm_node_repo,
         false,
         budget_applier,
+        extensions,
     )
     .await
 }
@@ -2757,12 +2863,14 @@ async fn build_embedded(
     effective_config: Arc<TokeiraConfig>,
     store: InMemoryStore,
     recover_self_assigned_shard: bool,
+    extensions: ChasmExtensions,
 ) -> Result<EmbeddedStack> {
     match build_in_memory_stack(
         StackTransport::Embedded,
         effective_config,
         store,
         recover_self_assigned_shard,
+        extensions,
     )
     .await?
     {
@@ -2778,8 +2886,16 @@ async fn build_in_memory_stack(
     effective_config: Arc<TokeiraConfig>,
     store: InMemoryStore,
     recover_self_assigned_shard: bool,
+    extensions: ChasmExtensions,
 ) -> Result<ConstructedStack> {
     let visibility_store = InMemoryVisibilityStore::default();
+    let chasm_node_repo: Arc<dyn tokeira_storage::ChasmNodeRepository> =
+        Arc::new(tokeira_storage::InMemoryChasmNodeStore::new());
+    #[cfg(test)]
+    let (chasm_node_repo, visibility_store) = extensions
+        .test_storage
+        .clone()
+        .unwrap_or((chasm_node_repo, visibility_store));
     let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> = Arc::new(store.clone());
     let worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore> = Arc::new(store.clone());
     let worker_compute_repository = effective_config.policy.worker_compute.enabled.then(|| {
@@ -2800,10 +2916,11 @@ async fn build_in_memory_stack(
             move || VisibilitySink::new(visibility_store.clone())
         },
         None,
-        Arc::new(tokeira_storage::InMemoryChasmNodeStore::new()),
+        chasm_node_repo,
         recover_self_assigned_shard,
         // The in-memory store has no connection reservoir to budget.
         Arc::new(NoopConnectionBudgetApplier),
+        extensions,
     )
     .await
 }
@@ -2951,7 +3068,8 @@ const CHASM_TIMER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// deadline. Runtime-only (clock + loop); all timeout/retry semantics are pure
 /// (`tokeira-chasm-activity`) behind the evaluator, so the kernel-purity and
 /// history-authority invariants hold. Runs until `cancel` fires. Gated on standalone
-/// activities being enabled, since only they arm activity timers today.
+/// activities or extension libraries being enabled; generic registered handlers
+/// drive extension timers while the activity evaluator keeps its existing path.
 fn spawn_chasm_timer_sweeper(
     tasks: &RuntimeShutdownHandle,
     engine: Arc<tokeira_runtime::chasm::ChasmEngine>,
@@ -2990,6 +3108,7 @@ async fn build_service_stack_with_storage<R, L, S, V, F>(
     chasm_node_repo: Arc<dyn tokeira_storage::ChasmNodeRepository>,
     recover_self_assigned_shard: bool,
     budget_applier: Arc<dyn ConnectionBudgetApplier>,
+    extensions: ChasmExtensions,
 ) -> Result<ConstructedStack>
 where
     R: LeaseRepository + RunRepository + 'static,
@@ -2998,6 +3117,19 @@ where
     V: VisibilityStore + Clone + 'static,
     F: Fn() -> S + Clone + Send + Sync + 'static,
 {
+    // Freeze declarations before constructing the operator wrapper, so later
+    // namespaces receive the same set as startup. Stateful CHASM admission stays
+    // in its existing block below, shared by both storage paths.
+    let has_extensions = !extensions.libraries.is_empty();
+    let mut registry_builder = tokeira_chasm::Registry::builder();
+    tokeira_chasm_activity::ActivityLibrary::register(&mut registry_builder)
+        .map_err(registry_start_error)?;
+    registry_builder.seal_built_ins();
+    for library in extensions.libraries {
+        library(&mut registry_builder).map_err(registry_start_error)?;
+    }
+    let registry = Arc::new(registry_builder.build());
+    let declared = declared_search_attributes(&registry);
     // Build the authoritative store first, then wrap it with the
     // history-notifying repository used by edge long-poll.
     let node_id = IncarnationId::new();
@@ -3397,12 +3529,15 @@ where
     .await
     .context("failed to seed Temporal predefined search attributes")?;
     let operator_visibility_store = visibility_query_store.clone();
-    let visibility = Arc::new(VisibilityQueryService::new(visibility_query_store));
+    let visibility = Arc::new(VisibilityQueryService::new(visibility_query_store.clone()));
     let long_polls = LongPollGate::new(LongPollConfig::default());
-    let operator_api = Arc::new(VisibilityRegistryOperatorApi::new(
-        InMemoryOperatorApi::new("tokeira-local", tokeira_build_info::SERVER_VERSION),
-        operator_visibility_store,
-    ));
+    let operator_api = Arc::new(
+        VisibilityRegistryOperatorApi::new(
+            InMemoryOperatorApi::new("tokeira-local", tokeira_build_info::SERVER_VERSION),
+            operator_visibility_store,
+        )
+        .with_declared_search_attributes(declared.clone()),
+    );
 
     for partition_id in 0..effective_config.infrastructure.placement.partition_count {
         let projection_worker = ProjectionWorker {
@@ -3510,11 +3645,7 @@ where
     // worker poll drains. The enable gate is operator config — off by default, so an
     // unconfigured server matches the `v1.31.0` baseline (RPCs answer
     // `UNIMPLEMENTED`); enabling it is a declared deviation (`AGENTS §8`).
-    let workflow_grpc = {
-        let mut registry_builder = tokeira_chasm::Registry::builder();
-        tokeira_chasm_activity::ActivityLibrary::register(&mut registry_builder)
-            .context("failed to register the activity CHASM library")?;
-        let registry = Arc::new(registry_builder.build());
+    let (workflow_grpc, chasm_engine) = {
         // Capture what the visibility repair scanner needs before the engine consumes
         // the node repo + registry: the activity id selects the legacy evaluator;
         // registered root adapters rebuild visibility for every archetype.
@@ -3530,6 +3661,8 @@ where
         )
         .await
         .context("failed to backfill CHASM current executions")?;
+        check_registered_archetypes(&chasm_node_repo.distinct_archetypes().await?, &registry)
+            .map_err(registry_start_error)?;
         let repair_nodes = chasm_node_repo.clone();
         let dispatch_queue = Arc::new(tokeira_edge::chasm_activity::ActivityDispatchQueue::new());
         let multiplexer = Arc::new(tokeira_runtime::chasm::DispatchMultiplexer::default());
@@ -3542,17 +3675,25 @@ where
                 Arc::new(projection_sink()),
                 effective_config.infrastructure.placement.partition_count,
             ));
-        let chasm_engine = Arc::new(tokeira_runtime::chasm::ChasmEngine::new(
+        let mut chasm_engine = tokeira_runtime::chasm::ChasmEngine::new(
             chasm_node_repo.clone(),
             registry.clone(),
             multiplexer.clone(),
             chasm_visibility_sink,
-        ));
+        );
+        if let Some(clock) = extensions.clock {
+            chasm_engine = chasm_engine.with_clock(clock);
+        }
+        let chasm_engine = Arc::new(chasm_engine);
         let activity_config = tokeira_chasm_activity::ActivityConfig {
             enable_standalone: effective_config
                 .policy
                 .compatibility
                 .enable_standalone_activities,
+            enable_callbacks: effective_config
+                .policy
+                .compatibility
+                .enable_standalone_activity_callbacks,
             ..tokeira_chasm_activity::ActivityConfig::default()
         };
         let standalone_enabled = activity_config.enable_standalone;
@@ -3573,23 +3714,45 @@ where
             .with_dispatch_executor(dispatch_executor.clone()),
         );
         // Weak engine handles break the ownership cycle. Register every role before
-        // rebuild/serve; stage 11's builder must preserve this bootstrap order.
-        multiplexer.register(dispatch_executor)?;
-        multiplexer.register(Arc::new(
-            tokeira_edge::chasm_executors::StartActivityExecutor::new(
-                Arc::downgrade(&chasm_engine),
-                activity_config,
-                DEFAULT_MAX_ID_LENGTH,
-            ),
-        ))?;
-        multiplexer.register(Arc::new(
-            tokeira_edge::chasm_executors::DeliverCallbackExecutor::new(
-                Arc::downgrade(&chasm_engine),
-                chasm_nexus_client,
-                chasm_nexus_config,
-                namespaces.clone(),
-            ),
-        ))?;
+        // rebuild/serve; extension executors join the same multiplexer below.
+        multiplexer
+            .register(dispatch_executor)
+            .map_err(registry_start_error)?;
+        multiplexer
+            .register(Arc::new(
+                tokeira_edge::chasm_executors::StartActivityExecutor::new(
+                    Arc::downgrade(&chasm_engine),
+                    activity_config,
+                    DEFAULT_MAX_ID_LENGTH,
+                ),
+            ))
+            .map_err(registry_start_error)?;
+        multiplexer
+            .register(Arc::new(
+                tokeira_edge::chasm_executors::DeliverCallbackExecutor::new(
+                    Arc::downgrade(&chasm_engine),
+                    chasm_nexus_client,
+                    chasm_nexus_config,
+                    namespaces.clone(),
+                ),
+            ))
+            .map_err(registry_start_error)?;
+        for executor in extensions.executors {
+            multiplexer
+                .register(executor)
+                .map_err(registry_start_error)?;
+        }
+        // Resolve before registering: projection registration alone silently
+        // preserves an existing id even if its type differs from the declaration.
+        for namespace in namespaces.list_all().await? {
+            seed_declared_search_attributes(
+                &visibility_query_store,
+                namespace_id_for(&namespace.name),
+                &declared,
+            )
+            .await
+            .map_err(seed_start_error)?;
+        }
         let rebuild = tokeira_runtime::chasm::OutboxRebuildScanner::new(
             chasm_node_repo,
             chasm_engine.clone(),
@@ -3610,7 +3773,7 @@ where
             &engine_tasks,
             repair_nodes,
             Arc::new(projection_sink()),
-            registry,
+            registry.clone(),
             effective_config.infrastructure.placement.partition_count,
             background_cancel.clone(),
         );
@@ -3618,10 +3781,10 @@ where
         // else fires armed activity timeouts. A conformance harness must keep it ready
         // even when the boot-time default is off, because the corpus enables
         // `activity.enableStandalone` live after server startup. Production retains
-        // the configured gate and pays no idle sweep cost.
+        // the configured gate; registered extension libraries also need generic timers.
         let sweeper_forced =
             harness::installed().is_some_and(|hooks| hooks.force_chasm_timer_sweeper);
-        if standalone_enabled || sweeper_forced {
+        if standalone_enabled || sweeper_forced || has_extensions {
             spawn_chasm_timer_sweeper(
                 &engine_tasks,
                 sweeper_engine,
@@ -3630,7 +3793,10 @@ where
                 background_cancel.clone(),
             );
         }
-        WorkflowServiceGrpc::new(workflow_service.clone()).with_chasm_activity(activity_bridge)
+        (
+            WorkflowServiceGrpc::new(workflow_service.clone()).with_chasm_activity(activity_bridge),
+            chasm_engine,
+        )
     };
     // Minimal AdminService (DescribeMutableState) shares the WorkflowService's
     // run repository — the reset conformance suite reads a run's ResetRunId/status.
@@ -3677,6 +3843,8 @@ where
         StackTransport::Embedded => {
             startup_guard.disarm();
             return Ok(ConstructedStack::Embedded(EmbeddedStack {
+                chasm_engine,
+                registry,
                 service: InProcessGrpcService::new(workflow_grpc, operator_grpc, admin_grpc),
                 background_cancel,
                 log_broadcast,

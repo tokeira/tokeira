@@ -539,44 +539,111 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 
 ### Stage 11 — Config and engine: gate, builder, handle, clock, seeding (`tokeira-config`, `tokeira-engine`)
 
-- [ ] 11.1 `CompatibilityConfig::enable_standalone_activity_callbacks` (default false, doc
+- [x] 11.1 `CompatibilityConfig::enable_standalone_activity_callbacks` (default false, doc
   citing `activity.enableCallbacks @ v1.32.0`); `TokeiraConfig::validate` emits
   `ValidationError::Field` when callbacks are on and standalone activities off; `field!`
   catalog entry and fixture line; the two catalog tests pass.
   - _Requirements: 5.11_
-- [ ] 11.2 Feature `chasm-extensions` in `crates/tokeira-engine/Cargo.toml` and the
+
+  **DONE (stage 11):** The default-false key, catalog and fixture are wired to
+  `ActivityConfig.enable_callbacks`. The four gate combinations round-trip TOML, and the
+  invalid combination names the exact field and prerequisite. All 68 config tests pass.
+
+- [x] 11.2 Feature `chasm-extensions` in `crates/tokeira-engine/Cargo.toml` and the
   `pub mod chasm` re-export module under it.
   - _Requirements: 8.1, 8.10_
-- [ ] 11.3 `EngineBuilder` and `Engine::builder(config)`: `library::<L>()`,
+
+  **DONE (stage 11):** The empty opt-in feature gates the public builder, typed handle and
+  `chasm` re-exports, including `SearchAttrKind` and `TaskOutcome`; its instability is
+  documented. No dependency or lockfile changes.
+
+- [x] 11.3 `EngineBuilder` and `Engine::builder(config)`: `library::<L>()`,
   `side_effect_executor`, `clock`, `build` in the design's order (built-ins, `seal_built_ins`,
-  extensions, freeze, storage, backfill until zero, `distinct_archetypes` fail-closed check,
-  multiplexer with the four edge executors then extensions, `ChasmEngine::with_clock`,
-  search-attribute seeding, `rebuild_once`, then the existing start path);
-  `start_with_embedded_config` delegates to it. `Engine` gains `chasm_engine` and `registry`.
+  extensions, freeze, backfill until zero, `distinct_archetypes` fail-closed check,
+  empty multiplexer, `ChasmEngine::with_clock`, bridge and three built-in executors then
+  extensions, search-attribute seeding, `rebuild_once`, spawns). Private `ChasmExtensions`
+  threads through both existing start paths; the public start supplies an empty value.
+  `Engine` gains unconditional `chasm_engine` and `registry` fields.
   - _Requirements: 1.8, 1.9, 2.4, 3.4, 8.2, 8.3, 8.4, 8.5, 8.8, 8.9_
-- [ ] 11.4 `Engine::chasm::<C>()` returning `TypedEngine<C>`, error naming `C::FQN` when
+
+  **DONE (stage 11):** The private extensions value feeds both existing storage paths.
+  Built-ins are sealed before extensions; executors precede seeding and rebuild. The optional
+  clock reaches CHASM while workflow time stays unchanged. Named registration, archetype,
+  attribute and outbox errors survive embedded error redaction. Unserviceable outboxes carry
+  an explicit cause, never a sentinel task id. Integration tests prove reserved-name and
+  duplicate-executor rejection and activity scheduling at the supplied clock.
+
+- [x] 11.4 `Engine::chasm::<C>()` returning `TypedEngine<C>`, error naming `C::FQN` when
   unregistered.
   - _Requirements: 8.6, 8.7_
-- [ ] 11.5 Search-attribute seeding: at start for every namespace and inside
+
+  **DONE (stage 11):** Registered roots start and read through the typed handle; an absent
+  root names its FQN. The built-in activity handle remains available with no extension
+  libraries. The approved builder fixture defines a prost-backed root and no task types; stage
+  13 retains the extension-task and Property 14 clock proofs.
+
+- [x] 11.5 Search-attribute seeding: at start for every namespace and inside
   `seed_predefined_search_attributes` for later namespaces, register each declared
-  definition via the projection store's `register_attr`; a type mismatch aborts start with
+  definition by resolving its existing type before `register_attr`; a mismatch aborts start with
   namespace, key and both types.
   - _Requirements: 1.8, 1.9_
-- [ ] 11.6 Property test: Property 13 — fail-closed build
+
+  **DONE (stage 11):** Projection keys resolve before registration, preserving matching ids
+  and rejecting mismatched types. Startup seeds every listed namespace; the operator wrapper
+  carries the same declarations for later namespaces. Real-start and operator tests cover both
+  paths, including later-namespace conflicts.
+
+- [x] 11.6 Property test: Property 13 — fail-closed build
   - Generated storage pointer sets over archetype ids and generated registered library
-    sets; `build` succeeds iff every stored id is registered; the error names the first
-    unregistered id and its count.
+    sets drive `check_registered_archetypes` for 128 cases; admission succeeds iff every
+    stored id is registered; the error names the first unregistered id and its count.
+    A focused real-start example proves the wiring without building engines per case.
   - Tag: `// Feature: chasm-extension-archetypes, Property 13: fail-closed build`
   - _Requirements: 8.4, 8.5, 8.7_
-- [ ] 11.7 Property test: Property 16 — search-attribute registration
+
+  **DONE (stage 11):** `stored_archetypes_require_registered_libraries` runs 128 generated
+  storage/registry cases against the pure check. One real-start example rejects an
+  unregistered persisted root with its count. The seeding example independently accepts
+  persisted state with the matching library; generated cases never build engines.
+
+- [x] 11.7 Property test: Property 16 — search-attribute registration
   - Generated definitions and pre-existing registry states across restarts and namespace
-    creations; seeding idempotent; start fails iff a declared key exists with another type.
+    creations drive the seeding helper for 128 cases; seeding is idempotent and fails iff a
+    declared key exists with another type. A real-start example proves mismatch propagation.
   - Tag: `// Feature: chasm-extension-archetypes, Property 16: search-attribute registration`
   - _Requirements: 1.6, 1.8, 1.9_
 
-- [ ] 12. Checkpoint: the full root `AGENTS.md §10.4` bar on the workspace, with
+  **DONE (stage 11):** `declared_attributes_seed_idempotently` runs 128 cases across all seven
+  kinds, three existing namespaces and a fresh namespace. It checks ids/types on repeats and
+  exact mismatch details; a real-start example checks propagation of a pre-registered
+  conflicting type.
+
+  **Review corrections (stage 11):** The live-suite table and storage filter include the
+  stage-9 concurrent-start test. A superseded reused run id now reports a business-id
+  conflict; current-run collisions reload policy. Both generic paths reject anomalous
+  held work on a closed root while stale delivery stays inert. The existing internal
+  callback completion test confirms that pending activity callbacks still apply. Rebuild
+  checks all persisted tasks before publishing work, isolates missing data/unknown
+  handlers/undecodable payloads with an explicit cause and count, and continues healing
+  healthy executions. Runtime regressions cover all three causes and both conflict/guard
+  branches; startup refuses a nonzero unserviceable count while periodic passes log it.
+
+- [x] 12. Checkpoint: the full root `AGENTS.md §10.4` bar on the workspace, with
   `--features chasm-extensions` added to the lint, check, test and doc steps for
   `tokeira-engine`.
+
+  **DONE (2026-09-16):** Workspace nightly formatting, `cargo lint --locked` (zero
+  warnings), `cargo check --workspace --locked`, nextest (3438 passed, 2 skipped),
+  doctests (1 passed, 20 ignored), and documentation with warnings denied all pass.
+  The workspace run marked `tui::tests::non_terminal_mode_omits_spinner` leaky; its isolated
+  serial nextest rerun passed cleanly. No backlog timeout occurred. The four engine steps
+  with `chasm-extensions` also pass: all-target clippy with zero warnings, check, nextest
+  (108 passed), and documentation with warnings denied. The documented storage filter
+  selects all three CHASM tests; database work is skipped because
+  `TOKEIRA_DSQL_TEST_DATABASE_URL` is unset. Test links emit existing native-library macOS
+  deployment-target warnings; no toolchain or cache settings changed. Changelog dry-run and
+  diff checks pass. The four review corrections have separate commits; the slice carries
+  one added and one fixed fragment. Requirements, dependencies and Cargo.lock are unchanged.
 
 ### Stage 13 — Acceptance archetype (`crates/tokeira-chasm-acceptance`, publish = false)
 

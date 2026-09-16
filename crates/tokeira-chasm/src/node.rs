@@ -385,6 +385,28 @@ impl NodeTree {
         Ok(())
     }
 
+    /// Resolve a persisted task in this transition, preserving the prior outbox
+    /// for rollback if close fails. Returns `false` without dirtying the node when
+    /// the id is absent. Newly staged tasks receive ids only at close.
+    ///
+    /// Returns [`ChasmError::Internal`] when the owning node is absent.
+    pub fn resolve_task(&mut self, encoded_path: &[u8], id: TaskId) -> Result<bool, ChasmError> {
+        let node = self.nodes.get(encoded_path).ok_or_else(|| {
+            ChasmError::Internal(format!("resolve_task: no node at path {encoded_path:?}"))
+        })?;
+        if !node.metadata.outbox.iter().any(|task| task.id == id) {
+            return Ok(false);
+        }
+        let node = self.node_mut(encoded_path)?;
+        node.metadata.outbox.pure_tasks.retain(|task| task.id != id);
+        node.metadata
+            .outbox
+            .side_effect_tasks
+            .retain(|task| task.id != id);
+        self.dirty.insert(encoded_path.to_vec());
+        Ok(true)
+    }
+
     /// Iterate the nodes in the subtree rooted at `encoded_prefix` (the node itself
     /// and all descendants), in encoded-path order — a single contiguous range
     /// scan (Requirement 4.4). Pass the root's encoding (the empty slice) to walk
@@ -596,6 +618,48 @@ mod tests {
 
     use super::*;
     use crate::task::RetainAllValidator;
+
+    #[test]
+    fn resolve_task_is_idempotent_and_rolls_back_with_a_rejected_close() {
+        let mut tree = NodeTree::new();
+        tree.create_node(vec![], 7, Some(LifecycleState::Running), Some(vec![]))
+            .unwrap();
+        for kind in [TaskKind::Pure, TaskKind::SideEffect] {
+            tree.add_task(b"", kind, 10, vec![], Some(20)).unwrap();
+        }
+        tree.close_transaction(vt(0, 1), &RetainAllValidator)
+            .unwrap();
+        let original = tree.node(b"").unwrap().clone();
+        let id = original.metadata.outbox.pure_tasks[0].id;
+        assert!(tree.resolve_task(b"missing", id).is_err());
+        assert!(tree.resolve_task(b"", id).unwrap());
+        assert!(!tree.resolve_task(b"", id).unwrap());
+        assert!(
+            tree.close_transaction(vt(0, 1), &RetainAllValidator)
+                .is_err()
+        );
+        assert_eq!(tree.node(b""), Some(&original));
+        assert!(tree.dirty.is_empty());
+        assert!(!tree.resolve_task(b"", TaskId::new(vt(9, 9), 9)).unwrap());
+        assert!(tree.dirty.is_empty());
+        assert!(tree.resolve_task(b"", id).unwrap());
+        let result = tree
+            .close_transaction(vt(0, 2), &RetainAllValidator)
+            .unwrap();
+        assert_eq!(result.dirty_nodes.len(), 1);
+        assert!(
+            tree.node(b"")
+                .unwrap()
+                .metadata
+                .outbox
+                .pure_tasks
+                .is_empty()
+        );
+        assert_eq!(
+            tree.node(b"").unwrap().metadata.outbox.side_effect_tasks,
+            original.metadata.outbox.side_effect_tasks
+        );
+    }
 
     #[test]
     fn execution_key_round_trips() {

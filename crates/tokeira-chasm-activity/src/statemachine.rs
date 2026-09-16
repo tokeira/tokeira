@@ -368,20 +368,22 @@ pub fn apply(
             state.terminate_request_id = request_id.clone();
             state.terminate_identity = identity.clone();
         }
-        // Record the latest heartbeat details and time; status is unchanged (the
-        // `to == from` target above), so the attempt is untouched. The heartbeat
-        // does NOT schedule a fresh pure timer: the heartbeat-timeout deadline is
-        // re-derived from `max(last_heartbeat, started)` by the runtime sweeper
-        // (`timeouts::due_timeout`), so pushing `last_heartbeat_time_nanos` out is
-        // what keeps the activity alive between heartbeats. Re-deriving (rather than
-        // arming a new per-heartbeat task) keeps the node outbox bounded — a long
-        // run of heartbeats does not accumulate timer tasks. This mirrors the v1.31.0
-        // *effect* (`activity.go:577-585` re-anchors the heartbeat timeout), with the
-        // anchor carried on state instead of on a fresh task (a deliberate
-        // history-is-authority simplification; the timer is a derived effect).
+        // Persist a replacement deadline so restart recovery needs only the
+        // outbox. At close, validation drops timers anchored before this heartbeat
+        // (`activity.go:576-585`, `activity_tasks.go:236-247 @ v1.31.0`).
         ActivityEvent::Heartbeat { details } => {
             state.last_heartbeat_details = details.clone();
             state.last_heartbeat_time_nanos = now;
+            if state.heartbeat_nanos > 0 {
+                schedule_pure(
+                    ctx,
+                    HEARTBEAT_TASK_ID,
+                    &HeartbeatTimer {
+                        stamp: state.stamp,
+                        fire_at_nanos: now + state.heartbeat_nanos,
+                    },
+                )?;
+            }
         }
         ActivityEvent::TimedOut {
             timeout_type,
@@ -391,7 +393,7 @@ pub fn apply(
             // `FailureReasonActivityTimeout = "activity %v timeout"`
             // (`common/util.go:95 @ v1.31.0`) with the timeout type's enum name.
             state.failure = format!("activity {} timeout", timeout_type.as_str());
-            // The edge supplies the structured `Failure` (with `TimeoutFailureInfo`);
+            // The timeout event supplies the structured `Failure` (with `TimeoutFailureInfo`);
             // store it so the describe/poll outcome round-trips the timeout type.
             if !failure_payload.is_empty() {
                 state.failure_payload = failure_payload.clone();

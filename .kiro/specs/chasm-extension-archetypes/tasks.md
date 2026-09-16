@@ -177,66 +177,135 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 
 ### Stage 5 — Runtime: executors, outcome application, execution, rebuild (`tokeira-runtime`)
 
-- [ ] 5.1 New `chasm/executor.rs`: `SideEffectExecutor` trait and `DispatchMultiplexer`
+- [x] 5.1 New `chasm/executor.rs`: `SideEffectExecutor` trait and `DispatchMultiplexer`
   implementing `DispatchSink`, duplicate task type rejected at registration, unknown task
   type at dispatch logged and left pending. Keep `CollectingDispatchSink` for tests.
   - _Requirements: 3.1, 3.2, 3.13_
-- [ ] 5.2 Close-time validation: replace `RetainAllValidator` at `engine.rs:655` and `:734`
+
+  **DONE (2026-09-16):** The executor contract requires idempotent effects. The multiplexer
+  rejects duplicate ids and logs failed or unknown dispatches without failing an already
+  committed transition. Its two-executor/unknown-type regression passes; bootstrap keeps
+  `ActivityDispatchQueue` until stage 9.
+
+- [x] 5.2 Close-time validation: replace `RetainAllValidator` at `engine.rs:655` and `:734`
   with `RegistryOutboxValidator`; return `ChasmError::UnknownTaskType` before any persist
   when a staged task has no entry; implement `resolve_task` on `TransitionContext` and
   honour it at close.
   - _Requirements: 1.10, 1.11, 1.12, 3.2_
-- [ ] 5.3 `ChasmEngine::apply_side_effect_outcome(target, task_type_id, task_id, outcome) ->
+
+  **DONE (2026-09-16):** Start/update and generic transitions validate final root bytes
+  through the registry. `UpdateRequest.resolved`, typed context draining and journaled
+  `NodeTree::resolve_task` make explicit resolutions durable. Regression tests verify
+  unknown-task atomic rejection, idempotent removal and before-image rollback.
+
+- [x] 5.3 `ChasmEngine::apply_side_effect_outcome(target, task_type_id, task_id, outcome) ->
   OutcomeApplied`: load, `NotHeld` if the outbox lacks the id, `ExecutionMissing` if absent,
   otherwise `Registry::apply_outcome` with `resolve_task(task_id)` in the same transition,
   reload-and-rerun on `Conflict` up to `max_commit_retries`.
   - _Requirements: 3.9, 3.10, 6.6, 6.7, 6.9_
-- [ ] 5.4 Sweeper: `ChasmTimerSweeper::new(engine)` + `with_evaluator(archetype_id,
+
+  **DONE (2026-09-16):** Outcome handlers run inside bounded CAS retries; the engine
+  resolves the exact held task in the same commit. Missing, mismatched and duplicate
+  deliveries are inert, and handler errors persist nothing. `register_root` now supplies
+  visibility, search-attribute and lifecycle adapters; the accepted lifecycle addendum
+  is covered by roots that close while returning no visibility snapshot.
+
+- [x] 5.4 Sweeper: `ChasmTimerSweeper::new(engine)` + `with_evaluator(archetype_id,
   evaluator)`; in `sweep_once`, use the evaluator when one is installed for the execution's
   archetype (unchanged behaviour), otherwise execute due, valid pure tasks through
   `Registry::execute_pure` in one fenced transition, resolving each, and re-arm to the
   earliest remaining deadline. Update the engine bootstrap call site.
   - _Requirements: 2.1, 2.2, 2.3, 2.6, 2.8, 2.9, 2.10_
-- [ ] 5.5 New `chasm/rebuild.rs`: `OutboxRebuildScanner::rebuild_once` over
+
+  **DONE (2026-09-16):** The sweeper routes by root archetype. The installed activity
+  evaluator retains its path; other roots execute due tasks in deadline/id order with
+  validation against each preceding mutation, resolution, rollback and conflict retry.
+  Newly staged tasks wait for the next pass, and the surviving earliest timer is re-armed.
+
+- [x] 5.5 New `chasm/rebuild.rs`: `OutboxRebuildScanner::rebuild_once` over
   `scan_current_executions(Running)` in deterministic order: set the armed timer to the
   outbox's earliest pure deadline; hand every pending side-effect task whose validator holds
-  and whose `fire_at` has elapsed to the multiplexer. Add `CHASM_REBUILD_INTERVAL` beside
+  and whose `fire_at` has elapsed to the dispatch sink. Add `CHASM_REBUILD_INTERVAL` beside
   `VISIBILITY_REPAIR_INTERVAL` and a `spawn_outbox_rebuild` helper mirroring
   `spawn_visibility_repair`.
   - _Requirements: 2.4, 2.5, 2.7, 3.4, 3.5, 3.15_
-- [ ] 5.6 Extract `invoke_nexus_callback(client, config, url, header, completion, links)` from
+
+  **DONE (2026-09-16):** Ordered 500-pointer pages reconstruct timers and due validated
+  effects from committed roots before adapter startup and every 30 seconds thereafter.
+  Visibility repair uses registry adapters. The task 9.1 queue dedupe portion moved into
+  this slice: `(execution, stamp)` stays seen through pickup, failed pickups are requeued,
+  and terminal/deleted observations forget entries. Queue and paged rebuild tests pass.
+
+- [x] 5.6 Extract `invoke_nexus_callback(client, config, url, header, completion, links)` from
   `deliver_completion_callback` in `publisher.rs`; the workflow path calls it; behaviour and
   its `components/callbacks/nexus_invocation.go @ v1.31.0` citation unchanged. Make
   `nexus_completion_backoff` reachable from the edge (`pub`).
   - _Requirements: 5.7_
-- [ ] 5.7 `TypedEngine<C>` owns `Arc<ChasmEngine>` (drop the lifetime); update the bridge's
+
+  **DONE (2026-09-16):** The shared invocation preserves case-insensitive token lookup,
+  deterministic duplicate-header selection, system-URL resolution and completion links.
+  Workflow retry/outcome recording remains in the publisher. Completion config and
+  backoff remain available through the existing runtime exports.
+
+- [x] 5.7 `TypedEngine<C>` owns `Arc<ChasmEngine>` (drop the lifetime); update the bridge's
   construction sites.
   - _Requirements: 8.6_
-- [ ] 5.8 Property test: Property 3 — pure-task execution model
+
+  **DONE (2026-09-16):** The typed engine owns an `Arc`; activity bridge construction
+  sites and typed-engine fixtures use shared ownership and registry-backed handlers.
+
+- [x] 5.8 Property test: Property 3 — pure-task execution model
   - Generated staged pure tasks with deadlines and monotone clock sequences against a
     reference model; each executed once, in deadline order, never early; run with the
     injected clock and `sweep_once` over the in-memory repository.
   - Tag: `// Feature: chasm-extension-archetypes, Property 3: pure-task execution model`
   - _Requirements: 2.1, 2.2, 2.3, 2.6, 2.9, 2.10_
-- [ ] 5.9 Property test: Property 4 — timer rehydration round-trip
+
+  **DONE (2026-09-16):** Property 3 passes 128 generated deadline/expiry/monotone-clock
+  traces against an independent ordered model over the runtime's own test root.
+
+- [x] 5.9 Property test: Property 4 — timer rehydration round-trip
   - Generated committed states and crash points; rebuild over the same repository re-arms
     the model's earliest deadline; executed tasks never re-execute.
   - Tag: `// Feature: chasm-extension-archetypes, Property 4: timer rehydration round-trip`
   - _Requirements: 2.4, 2.5, 2.7_
-- [ ] 5.10 Property test: Property 5 — dispatch derived from state
+
+  **DONE (2026-09-16):** Property 4 passes 128 generated commit/crash/restart sequences,
+  reconstructing the model's earliest deadline over the same repository and proving
+  consumed tasks never execute again.
+
+- [x] 5.10 Property test: Property 5 — dispatch derived from state
   - Generated committed states and in-memory losses; `rebuild_once` hands the sink exactly
     the model's pending effects in deterministic order; re-executing a `CollectingDispatchSink`
     counterpart of each shipped executor with an unchanged task is a no-op.
   - Tag: `// Feature: chasm-extension-archetypes, Property 5: dispatch derived from state`
   - _Requirements: 3.1, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.15_
-- [ ] 5.11 Property test: Property 6 — outcome application fence
+
+  **DONE (2026-09-16):** Property 5 passes 128 generated pending-effect sets across
+  reversed insertion order, paged scans and lost in-memory state. Unchanged scans yield
+  the same ordered set; a fake idempotent executor records each task's effect once.
+
+- [x] 5.11 Property test: Property 6 — outcome application fence
   - Generated delivery sequences (duplicates, after-drop, under injected conflicts);
     `on_outcome` applies at most once; other deliveries leave the node bytes unchanged.
   - Tag: `// Feature: chasm-extension-archetypes, Property 6: outcome application fence`
   - _Requirements: 3.9, 3.10, 6.6, 6.7, 6.9_
 
-- [ ] 6. Checkpoint: `cargo clippy -p tokeira-runtime --all-targets` clean; `cargo nextest run
+  **DONE (2026-09-16):** Property 6 passes 128 generated delivery traces covering
+  duplicates, dropped/missing tasks, mismatched types and injected conflicts through
+  retry exhaustion. Only held tasks mutate the root, at most once per task id.
+
+- [x] 6. Checkpoint: `cargo clippy -p tokeira-runtime --all-targets` clean; `cargo nextest run
   -p tokeira-runtime` green including every existing `chasm` and `publisher` test.
+
+  **DONE (2026-09-16):** All six root finishing-bar commands pass (`--locked` where
+  applicable): nightly fmt, workspace lint/check, 3,382 nextest tests passed in the
+  parallel run (two existing SDK integration tests skipped), workspace doctests and
+  documentation with warnings denied. The focused CHASM/activity suite passes 168 tests,
+  including Properties 3–6 at 128 cases each. Nextest flagged one passing callback test
+  as leaky; its isolated rerun passed without the flag. Live DSQL and the operator-invoked
+  functional corpus were not run; this slice changes no storage, and the corpus rerun
+  remains task 16.1. The changed fragment renders in the `0.4.0` dry run.
 
 ### Stage 7 — Activity library: handlers, callbacks, version target (`tokeira-chasm-activity`)
 
@@ -244,11 +313,23 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   `DeploymentVersionTarget`, `ActivityCallback`, `NexusTarget`, `InternalTarget` as in
   `design.md`; `lifecycle_for` unchanged. Cite `activity.go:111-113 @ v1.32.0` at the field.
   - _Requirements: 5.5, 7.1_
-- [ ] 7.2 Register the existing task types as reserved handlers in `ActivityLibrary::register`
+- [x] 7.2 Register the existing task types as reserved handlers in `ActivityLibrary::register`
   (validators = the crate's existing validators; `execute` = the existing `apply` events).
   Existing timeout behaviour is unchanged because the evaluator path remains installed
   (stage 5.4).
   - _Requirements: 1.13, 2.8_
+
+  **DONE (2026-09-16, stage 5):** Pulled forward because registry validation at close
+  would otherwise reject every existing activity task. Reserved ids 1–5 are registered;
+  all timer handlers and the unchanged evaluator share `timeout_event`. The accepted
+  validator addendum retains start-to-close/heartbeat timers during `CancelRequested`,
+  rejects stale stamps and superseded heartbeat anchors, and stages a replacement on
+  every positive-timeout heartbeat. `started_time_nanos` is the per-attempt start (set by
+  `Started`, reset on retry); the anchor uses the later of it and the last heartbeat.
+  Unit tests cover Started/CancelRequested, stale stamps, supersession, bounded
+  replacement and evaluator-equivalent events, grounded in
+  `chasm/lib/activity/activity_tasks.go:166–168,227–247` and
+  `chasm/lib/activity/activity.go:576–585 @ v1.31.0`. The slice's changed fragment covers it.
 - [ ] 7.3 Callback state machine: events `CallbacksAttached`, `CallbackAttempted`,
   `CallbackRetryDue`; terminal transitions set `STANDBY → SCHEDULED` and stage one
   `DeliverCallback` per callback (`activity.go:421-426 @ v1.32.0`); `DeliverCallbackHandler`
@@ -457,10 +538,10 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 ```text
 1.1 → 1.2 → 1.3 → 1.4 → 1.5 → 2
 3.1 → 3.2 → 3.3 → 3.4 → 3.5, 3.6 → 4
-2, 4 → 5.1 → 5.2 → 5.3 → 5.4 → 5.5
+2, 4 → 5.1 ; 4 → 7.2 ; 5.1, 7.2 → 5.2 → 5.3 → 5.4 → 5.5
 4 → 5.6 ; 4 → 5.7
 5.1–5.7 → 5.8, 5.9, 5.10, 5.11 → 6
-4 → 7.1 → 7.2 → 7.3 → 7.4 → 7.5 → 8
+4 → 7.1 ; 7.1, 7.2 → 7.3 → 7.4 → 7.5 → 8
 6, 8 → 9.1 → 9.2 → 9.3 → 9.4 → 9.5 → 9.6, 9.7, 9.8, 9.9 → 10
 10 → 11.1 → 11.2 → 11.3 → 11.4 → 11.5 → 11.6, 11.7 → 12
 12 → 13.1 → 13.2 → 13.3 → 13.4 → 13.5, 13.6, 13.7 → 14
@@ -468,7 +549,7 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 ```
 
 Stages 1 and 3 are independent and may run in parallel; stage 7 depends on stage 3 only;
-stage 5 depends on stages 1 and 3; everything from stage 9 on is serial.
+stage 5 depends on stages 1 and 3 and includes 7.2; everything from stage 9 on is serial.
 
 ## Notes
 
@@ -483,7 +564,7 @@ stage 5 depends on stages 1 and 3; everything from stage 9 on is serial.
 - **Reserved ids.** The activity library's ids 1–7 are explicit because outboxes persisted
   before this plan already carry 1–5; derived ids never collide with them by construction
   (the reserved range is rejected for derived ids).
-- **Evaluator path stays.** Stage 7.2 registers the activity's timer handlers so its
+- **Evaluator path stays.** Task 7.2, delivered in stage 5, registers the activity's timer handlers so its
   outboxes become bounded, but stage 5.4 keeps the evaluator serving activity executions;
   timing behaviour must not change and Property 7 is the guard.
 - **Storage rules.** V069 and V070 follow `crates/tokeira-storage/AGENTS.md`: one statement

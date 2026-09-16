@@ -11,7 +11,7 @@
 //! closure here (not on the object-safe `Engine` trait) is what makes that loop
 //! possible.
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 use prost::Message as _;
 use tokeira_chasm::{
@@ -31,17 +31,17 @@ use super::{
 /// `C`'s archetype id from the engine registry, (de)serializes `C::Data` at the
 /// node boundary, and runs the caller's typed closures inside a transition.
 #[derive(Debug)]
-pub struct TypedEngine<'e, C> {
-    engine: &'e ChasmEngine,
+pub struct TypedEngine<C> {
+    engine: Arc<ChasmEngine>,
     _marker: PhantomData<fn() -> C>,
 }
 
-impl<'e, C> TypedEngine<'e, C>
+impl<C> TypedEngine<C>
 where
     C: EngineComponent + RootComponent + SearchAttributeProvider + VisibilityContributor,
 {
     /// Wrap an engine for component-typed access.
-    pub fn new(engine: &'e ChasmEngine) -> Self {
+    pub fn new(engine: Arc<ChasmEngine>) -> Self {
         Self {
             engine,
             _marker: PhantomData,
@@ -117,6 +117,7 @@ where
                 new_root_data,
                 new_lifecycle: lifecycle,
                 tasks,
+                resolved: ctx.take_resolved_tasks(),
                 search_attributes,
                 visibility,
             };
@@ -309,15 +310,65 @@ mod tests {
         }
     }
 
+    struct CounterEffect;
+    impl tokeira_chasm::SideEffectTaskHandler for CounterEffect {
+        type Component = Counter;
+        type Task = crate::chasm::test_support::Work<true>;
+        fn validate(
+            &self,
+            _: &Counter,
+            _: &Self::Task,
+            _: &dyn Context,
+        ) -> tokeira_chasm::TaskValidity {
+            tokeira_chasm::TaskValidity::Valid
+        }
+        fn on_outcome(
+            &self,
+            _: &mut Counter,
+            _: &Self::Task,
+            _: &tokeira_chasm::TaskOutcome,
+            _: &mut dyn MutableContext,
+        ) -> Result<(), ChasmError> {
+            Ok(())
+        }
+    }
+    struct CounterPure;
+    impl tokeira_chasm::PureTaskHandler for CounterPure {
+        type Component = Counter;
+        type Task = crate::chasm::test_support::Work<false>;
+        fn validate(
+            &self,
+            _: &Counter,
+            _: &Self::Task,
+            _: &dyn Context,
+        ) -> tokeira_chasm::TaskValidity {
+            tokeira_chasm::TaskValidity::Valid
+        }
+        fn execute(
+            &self,
+            _: &mut Counter,
+            _: &Self::Task,
+            _: &mut dyn MutableContext,
+        ) -> Result<(), ChasmError> {
+            Ok(())
+        }
+    }
+
     struct Fixture {
-        engine: ChasmEngine,
+        engine: Arc<ChasmEngine>,
         dispatch: Arc<CollectingDispatchSink>,
         visibility: Arc<CollectingVisibilitySink>,
     }
 
     fn fixture() -> Fixture {
         let mut builder = Registry::builder();
-        builder.register::<Counter>("test").expect("register");
+        builder
+            .register_root::<Counter>("test")
+            .expect("register")
+            .register_reserved_side_effect_task("test", 11, CounterEffect)
+            .unwrap()
+            .register_reserved_pure_task("test", 20, CounterPure)
+            .unwrap();
         let registry = Arc::new(builder.build());
         let dispatch = Arc::new(CollectingDispatchSink::default());
         let visibility = Arc::new(CollectingVisibilitySink::default());
@@ -333,7 +384,7 @@ mod tests {
             max_commit_retries: 8,
         });
         Fixture {
-            engine,
+            engine: Arc::new(engine),
             dispatch,
             visibility,
         }
@@ -346,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn start_update_read_round_trip() {
         let fx = fixture();
-        let typed = TypedEngine::<Counter>::new(&fx.engine);
+        let typed = TypedEngine::<Counter>::new(fx.engine.clone());
         let reference = typed
             .start(
                 key(),
@@ -383,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn side_effect_task_is_dispatched_post_commit() {
         let fx = fixture();
-        let typed = TypedEngine::<Counter>::new(&fx.engine);
+        let typed = TypedEngine::<Counter>::new(fx.engine.clone());
         let reference = typed
             .start(
                 key(),
@@ -397,7 +448,7 @@ mod tests {
         typed
             .update(&reference, |c, ctx| {
                 c.data.counter += 1;
-                ctx.add_task(TaskKind::SideEffect, 11, vec![7], None)?;
+                ctx.add_task(TaskKind::SideEffect, 11, vec![], None)?;
                 Ok(())
             })
             .await
@@ -414,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn pure_task_arms_single_timer() {
         let fx = fixture();
-        let typed = TypedEngine::<Counter>::new(&fx.engine);
+        let typed = TypedEngine::<Counter>::new(fx.engine.clone());
         let reference = typed
             .start(
                 key(),
@@ -439,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_close_blocks_further_mutation() {
         let fx = fixture();
-        let typed = TypedEngine::<Counter>::new(&fx.engine);
+        let typed = TypedEngine::<Counter>::new(fx.engine.clone());
         let reference = typed
             .start(
                 key(),
@@ -472,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn poll_advances_then_empties() {
         let fx = fixture();
-        let typed = TypedEngine::<Counter>::new(&fx.engine);
+        let typed = TypedEngine::<Counter>::new(fx.engine.clone());
         let reference = typed
             .start(
                 key(),
@@ -522,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_execution_and_visibility_is_recorded() {
         let fx = fixture();
-        let typed = TypedEngine::<Counter>::new(&fx.engine);
+        let typed = TypedEngine::<Counter>::new(fx.engine.clone());
         let reference = typed
             .start(
                 key(),
@@ -557,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn update_with_start_creates_then_mutates() {
         let fx = fixture();
-        let typed = TypedEngine::<Counter>::new(&fx.engine);
+        let typed = TypedEngine::<Counter>::new(fx.engine.clone());
         let (_r, outcome) = typed
             .update_with_start(key(), CounterData::default(), None, |c, _ctx| {
                 c.data.counter += 5;

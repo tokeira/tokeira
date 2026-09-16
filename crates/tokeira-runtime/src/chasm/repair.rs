@@ -24,9 +24,9 @@ use super::visibility_adapter::build_record;
 
 /// Rebuilds a component's [`VisibilitySnapshot`] from its persisted root-node data,
 /// dispatched on archetype id. The bootstrap supplies this (it knows the concrete
-/// component types); it returns `None` for an archetype it does not handle or a node
-/// that contributes no visibility. Keeping the decode here (rather than a registry
-/// vtable) avoids forcing every registered component to be a `VisibilityContributor`.
+/// component registry); it returns `None` for a component registered without root
+/// adapters or a node that contributes no visibility. Only registered roots need
+/// visibility adapters; ordinary child component registration remains unchanged.
 pub type SnapshotRebuilder = Arc<dyn Fn(u32, &[u8]) -> Option<VisibilitySnapshot> + Send + Sync>;
 
 /// What one [`VisibilityRepairScanner::repair_once`] pass did.

@@ -32,7 +32,7 @@
 //!   [`record_failed`](ActivityBridge::record_failed).
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -43,8 +43,8 @@ use tokeira_chasm::{
 };
 use tokeira_chasm_activity::{
     ActivityConfig, ActivityEvent, ActivityExecution, ActivityRequest, ActivityState,
-    ActivityStatus, DISPATCH_TASK_ID, DispatchTask, RetryOutcome, TimeoutType, due_timeout,
-    next_timeout_deadline, retry_decision, validate_and_normalize,
+    ActivityStatus, DISPATCH_TASK_ID, DispatchTask, RetryOutcome, due_timeout,
+    next_timeout_deadline, retry_decision, timeout_event, validate_and_normalize,
 };
 use tokeira_runtime::chasm::{
     ChasmEngine, DispatchSink, Engine, PollOutcome, PollRequest, TimeoutEvaluator, TypedEngine,
@@ -471,8 +471,14 @@ struct DispatchEntry {
 /// redispatch, never correctness.
 #[derive(Debug, Default)]
 pub struct ActivityDispatchQueue {
-    queues: Mutex<HashMap<String, VecDeque<DispatchEntry>>>,
+    state: Mutex<DispatchQueueState>,
     dispatch_available: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct DispatchQueueState {
+    queues: HashMap<String, VecDeque<DispatchEntry>>,
+    seen: HashSet<(ExecutionKey, i64)>,
 }
 
 impl ActivityDispatchQueue {
@@ -482,10 +488,43 @@ impl ActivityDispatchQueue {
     }
 
     fn enqueue(&self, task_queue: String, entry: DispatchEntry) {
-        if let Ok(mut queues) = self.queues.lock() {
-            queues.entry(task_queue).or_default().push_back(entry);
+        if let Ok(mut state) = self.state.lock() {
+            // The set and queue share a lock: a concurrent rebuild cannot insert
+            // the same committed attempt between the check and enqueue.
+            if !state.seen.insert((entry.key.clone(), entry.stamp)) {
+                return;
+            }
+            state.queues.entry(task_queue).or_default().push_back(entry);
             // A timeout may produce a retry while a worker is long-polling this
             // standalone queue. One committed dispatch wakes one poller.
+            self.dispatch_available.notify_one();
+        }
+    }
+
+    /// Release all volatile entries for an execution observed terminal or deleted.
+    /// A future explicit enqueue is permitted; its durable attempt fence still
+    /// governs whether the bridge may serve it.
+    pub fn forget(&self, key: &ExecutionKey) {
+        if let Ok(mut state) = self.state.lock() {
+            state.seen.retain(|(seen, _)| seen != key);
+            for queue in state.queues.values_mut() {
+                queue.retain(|entry| &entry.key != key);
+            }
+        }
+    }
+
+    // A failed pickup has not delivered work. Keep its queue slot retryable even
+    // though rebuilds dedupe the attempt, otherwise a transient read/commit error
+    // could strand a pending effect until process restart.
+    fn retry_pickup(&self, task_queue: &str, entry: DispatchEntry) {
+        if let Ok(mut state) = self.state.lock()
+            && state.seen.contains(&(entry.key.clone(), entry.stamp))
+        {
+            state
+                .queues
+                .entry(task_queue.to_owned())
+                .or_default()
+                .push_front(entry);
             self.dispatch_available.notify_one();
         }
     }
@@ -497,8 +536,8 @@ impl ActivityDispatchQueue {
     /// (Stage 3.2), so the runtime sweeper does not need to "release" delayed
     /// dispatches separately.
     fn dequeue_due(&self, task_queue: &str, now: i64) -> Option<DispatchEntry> {
-        let mut queues = self.queues.lock().ok()?;
-        let queue = queues.get_mut(task_queue)?;
+        let mut state = self.state.lock().ok()?;
+        let queue = state.queues.get_mut(task_queue)?;
         let pos = queue
             .iter()
             .position(|entry| entry.fire_at.is_none_or(|at| at <= now))?;
@@ -507,8 +546,9 @@ impl ActivityDispatchQueue {
 
     /// Return the earliest delayed dispatch deadline on `task_queue`.
     fn next_due_at(&self, task_queue: &str) -> Option<i64> {
-        let queues = self.queues.lock().ok()?;
-        queues
+        let state = self.state.lock().ok()?;
+        state
+            .queues
             .get(task_queue)?
             .iter()
             .filter_map(|entry| entry.fire_at)
@@ -516,9 +556,9 @@ impl ActivityDispatchQueue {
     }
 
     fn has_seen_queue(&self, task_queue: &str) -> bool {
-        self.queues
+        self.state
             .lock()
-            .is_ok_and(|queues| queues.contains_key(task_queue))
+            .is_ok_and(|state| state.queues.contains_key(task_queue))
     }
 }
 
@@ -695,7 +735,7 @@ impl ActivityBridge {
             ..ActivityState::default()
         };
 
-        let typed = TypedEngine::<ActivityExecution>::new(&self.engine);
+        let typed = TypedEngine::<ActivityExecution>::new(self.engine.clone());
         let outcome = typed
             .start(key, state, req.request_id, req.policy)
             .await
@@ -733,7 +773,11 @@ impl ActivityBridge {
             .read_component(&key)
             .await
             .map_err(|e| map_activity_not_found(e, &key))?;
-        description_from(snapshot.data, snapshot.execution_vt)
+        let description = description_from(snapshot.data, snapshot.execution_vt)?;
+        if description.status.is_terminal() {
+            self.forget_dispatch(&key);
+        }
+        Ok(description)
     }
 
     /// Monotonic long-poll: resolve when the activity's VT advances past `since`,
@@ -746,12 +790,19 @@ impl ActivityBridge {
         self.ensure_enabled()?;
         match self
             .engine
-            .poll_component(PollRequest { key, since })
+            .poll_component(PollRequest {
+                key: key.clone(),
+                since,
+            })
             .await
             .map_err(map_chasm_err)?
         {
             PollOutcome::Advanced(read) => {
-                Ok(Some(description_from(read.data, read.execution_vt)?))
+                let description = description_from(read.data, read.execution_vt)?;
+                if description.status.is_terminal() {
+                    self.forget_dispatch(&key);
+                }
+                Ok(Some(description))
             }
             PollOutcome::Empty => Ok(None),
         }
@@ -898,7 +949,9 @@ impl ActivityBridge {
         self.engine
             .delete_execution(&key)
             .await
-            .map_err(map_chasm_err)
+            .map_err(map_chasm_err)?;
+        self.forget_dispatch(&key);
+        Ok(())
     }
 
     /// Worker-facing: record that a worker started the activity attempt. Used by
@@ -947,7 +1000,7 @@ impl ActivityBridge {
     ) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let reference = self.activity_ref(key);
-        let typed = TypedEngine::<ActivityExecution>::new(&self.engine);
+        let typed = TypedEngine::<ActivityExecution>::new(self.engine.clone());
         // The retry-vs-terminal decision is made INSIDE the fenced closure so it runs
         // against the committed live state and re-runs on a conflict. A worker failure
         // is retryable iff it carries an `ApplicationFailureInfo` that is not marked
@@ -955,7 +1008,7 @@ impl ActivityBridge {
         // (`HandleFailed @ v1.31.0`); a retryable failure then defers to the pure
         // `retry_decision` (`shouldRetry`), honouring `NextRetryDelay` as the
         // override interval. Non-retryable, or no retry budget, goes terminal.
-        typed
+        let (_, committed) = typed
             .update(&reference, move |activity, ctx| {
                 let state = activity.activity_state().cloned().unwrap_or_default();
                 let now = ctx.now_unix_nanos();
@@ -980,6 +1033,9 @@ impl ActivityBridge {
             })
             .await
             .map_err(map_chasm_err)?;
+        if committed.closed {
+            self.forget_dispatch(&reference.execution_key);
+        }
         Ok(())
     }
 
@@ -1036,14 +1092,30 @@ impl ActivityBridge {
             let snapshot = match self.engine.read_component(&entry.key).await {
                 Ok(snapshot) => snapshot,
                 // A deleted execution leaves a dangling dispatch; drop and continue.
-                Err(ChasmError::ExecutionNotFound) => continue,
-                Err(error) => return Err(map_chasm_err(error)),
+                Err(ChasmError::ExecutionNotFound) => {
+                    queue.forget(&entry.key);
+                    continue;
+                }
+                Err(error) => {
+                    queue.retry_pickup(task_queue, entry);
+                    return Err(map_chasm_err(error));
+                }
             };
             let Some(bytes) = snapshot.data else { continue };
-            let state = ActivityState::decode(bytes.as_slice())
-                .map_err(|e| EdgeError::Internal(format!("decode activity state: {e}")))?;
+            let state = match ActivityState::decode(bytes.as_slice()) {
+                Ok(state) => state,
+                Err(error) => {
+                    queue.retry_pickup(task_queue, entry);
+                    return Err(EdgeError::Internal(format!(
+                        "decode activity state: {error}"
+                    )));
+                }
+            };
             // Only dispatch the exact attempt the task was scheduled for, and only
             // while still awaiting pickup; anything else is a superseded dispatch.
+            if state.status().is_terminal() {
+                queue.forget(&entry.key);
+            }
             if state.stamp != entry.stamp || state.status() != ActivityStatus::Scheduled {
                 continue;
             }
@@ -1051,8 +1123,13 @@ impl ActivityBridge {
             // pickup even if the worker never responds (the start-to-close timer
             // then fences the lost attempt).
             let started_at = self.engine.now();
-            self.record_started(entry.key.clone(), started_at, worker_identity.to_owned())
-                .await?;
+            if let Err(error) = self
+                .record_started(entry.key.clone(), started_at, worker_identity.to_owned())
+                .await
+            {
+                queue.retry_pickup(task_queue, entry);
+                return Err(error);
+            }
             // The token carries the attempt (== stamp here) as the fence and the
             // activity archetype id in the embedded component ref, so it round-trips
             // through the SDK / Temporal's tasktoken serializer (see ActivityTaskToken).
@@ -1399,7 +1476,10 @@ impl ActivityBridge {
             || EdgeError::NotFound(format!("activity not found for ID: {}", token.activity_id));
         let snapshot = match self.engine.read_component(&token.execution_key()).await {
             Ok(snapshot) => snapshot,
-            Err(ChasmError::ExecutionNotFound) => return Err(not_found()),
+            Err(ChasmError::ExecutionNotFound) => {
+                self.forget_dispatch(&token.execution_key());
+                return Err(not_found());
+            }
             Err(error) => return Err(map_chasm_err(error)),
         };
         let bytes = snapshot.data.ok_or_else(not_found)?;
@@ -1409,25 +1489,37 @@ impl ActivityBridge {
         // retry advanced the live attempt, or the activity is terminal, so the
         // attempt the token named is no longer live. tokeira's `attempt` and `stamp`
         // move together, so this is the same fence the dispatch/timers use.
+        if state.status().is_terminal() {
+            self.forget_dispatch(&token.execution_key());
+        }
         if state.attempt != token.attempt || state.status().is_terminal() {
             return Err(not_found());
         }
         Ok(())
     }
 
+    fn forget_dispatch(&self, key: &ExecutionKey) {
+        if let Some(queue) = &self.dispatch_queue {
+            queue.forget(key);
+        }
+    }
+
     /// Drive one activity event through a fenced transition.
     async fn apply_event(&self, key: ExecutionKey, event: ActivityEvent) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let reference = self.activity_ref(key);
-        let typed = TypedEngine::<ActivityExecution>::new(&self.engine);
+        let typed = TypedEngine::<ActivityExecution>::new(self.engine.clone());
         // `update` reads the live state by execution key; the closure is the only
         // place the event is applied, and it may re-run on a fenced conflict.
-        typed
+        let (_, committed) = typed
             .update(&reference, move |activity, ctx| {
                 activity.apply(event.clone(), ctx)
             })
             .await
             .map_err(map_chasm_err)?;
+        if committed.closed {
+            self.forget_dispatch(&reference.execution_key);
+        }
         Ok(())
     }
 
@@ -1448,12 +1540,20 @@ impl ActivityBridge {
     async fn load_state(&self, key: &ExecutionKey) -> EdgeResult<Option<ActivityState>> {
         match self.engine.read_component(key).await {
             Ok(snapshot) => match snapshot.data {
-                Some(bytes) => ActivityState::decode(bytes.as_slice())
-                    .map(Some)
-                    .map_err(|e| EdgeError::Internal(format!("decode activity state: {e}"))),
+                Some(bytes) => {
+                    let state = ActivityState::decode(bytes.as_slice())
+                        .map_err(|e| EdgeError::Internal(format!("decode activity state: {e}")))?;
+                    if state.status().is_terminal() {
+                        self.forget_dispatch(key);
+                    }
+                    Ok(Some(state))
+                }
                 None => Ok(None),
             },
-            Err(ChasmError::ExecutionNotFound) => Ok(None),
+            Err(ChasmError::ExecutionNotFound) => {
+                self.forget_dispatch(key);
+                Ok(None)
+            }
             Err(error) => Err(map_chasm_err(error)),
         }
     }
@@ -1490,8 +1590,8 @@ impl ActivityBridge {
         }
 
         let reference = self.activity_ref(key.clone());
-        let typed = TypedEngine::<ActivityExecution>::new(&self.engine);
-        typed
+        let typed = TypedEngine::<ActivityExecution>::new(self.engine.clone());
+        let (_, committed) = typed
             .update(&reference, move |activity, ctx| {
                 let state = activity.activity_state().cloned().unwrap_or_default();
                 let now = ctx.now_unix_nanos();
@@ -1500,34 +1600,14 @@ impl ActivityBridge {
                 let Some(timeout_type) = due_timeout(&state, now) else {
                     return Ok(());
                 };
-                let timed_out = |tt: TimeoutType| ActivityEvent::TimedOut {
-                    stamp: state.stamp,
-                    timeout_type: tt,
-                    failure_payload: build_timeout_failure(tt),
-                };
-                let event = match timeout_type {
-                    // schedule-to-start / schedule-to-close never retry.
-                    TimeoutType::ScheduleToStart | TimeoutType::ScheduleToClose => {
-                        timed_out(timeout_type)
-                    }
-                    // start-to-close / heartbeat reschedule when the retry budget
-                    // allows, else time out (`tryReschedule` @ v1.31.0).
-                    TimeoutType::StartToClose | TimeoutType::Heartbeat => {
-                        match retry_decision(&state, now, 0) {
-                            RetryOutcome::Reschedule(interval) => ActivityEvent::Rescheduled {
-                                failure: format!("activity {} timeout", timeout_type.as_str()),
-                                identity: state.last_worker_identity.clone(),
-                                last_heartbeat_details: Vec::new(),
-                                interval_nanos: interval,
-                            },
-                            RetryOutcome::Terminal => timed_out(timeout_type),
-                        }
-                    }
-                };
+                let event = timeout_event(&state, timeout_type, now);
                 activity.apply(event, ctx)
             })
             .await
             .map_err(map_chasm_err)?;
+        if committed.closed {
+            self.forget_dispatch(&reference.execution_key);
+        }
 
         // Re-arm to the post-transition next deadline (a retry's new attempt, or
         // `None` once terminal).
@@ -1683,34 +1763,6 @@ fn classify_worker_failure(failure_payload: &[u8], retry_policy_bytes: &[u8]) ->
     (true, override_nanos)
 }
 
-/// Build the encoded `Failure` (with `TimeoutFailureInfo`) recorded when a timeout
-/// fires, so the describe/poll outcome surfaces the structured timeout type
-/// (`createStartToCloseTimeoutFailure` et al. `@ v1.31.0`). Built at the edge because
-/// the pure crate is proto-free.
-fn build_timeout_failure(timeout_type: TimeoutType) -> Vec<u8> {
-    use tokeira_proto::failure::{Failure, TimeoutFailureInfo, failure::FailureInfo};
-    Failure {
-        message: format!("activity {} timeout", timeout_type.as_str()),
-        failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
-            timeout_type: timeout_type_to_proto(timeout_type) as i32,
-            ..Default::default()
-        })),
-        ..Default::default()
-    }
-    .encode_to_vec()
-}
-
-/// Map the pure [`TimeoutType`] to the proto `enums.TimeoutType`.
-fn timeout_type_to_proto(timeout_type: TimeoutType) -> tokeira_proto::enums::TimeoutType {
-    use tokeira_proto::enums::TimeoutType as T;
-    match timeout_type {
-        TimeoutType::ScheduleToStart => T::ScheduleToStart,
-        TimeoutType::ScheduleToClose => T::ScheduleToClose,
-        TimeoutType::StartToClose => T::StartToClose,
-        TimeoutType::Heartbeat => T::Heartbeat,
-    }
-}
-
 /// The bridge is the runtime sweeper's [`TimeoutEvaluator`]: it owns the activity
 /// timeout semantics (over the pure crate), so the runtime fires timers without
 /// depending on the edge. Delegates to the inherent
@@ -1728,6 +1780,37 @@ impl TimeoutEvaluator for ActivityBridge {
 mod tests {
     use super::*;
     use tokeira_chasm::{Library, Registry};
+
+    #[test]
+    fn dispatch_queue_dedupes_until_forget_and_preserves_failed_pickups() {
+        let queue = ActivityDispatchQueue::new();
+        let entry = DispatchEntry {
+            key: ExecutionKey::new("ns", "id", "run"),
+            stamp: 1,
+            fire_at: None,
+        };
+        queue.enqueue("q".into(), entry.clone());
+        queue.enqueue("q".into(), entry.clone());
+        let popped = queue.dequeue_due("q", 0).unwrap();
+        assert!(queue.dequeue_due("q", 0).is_none());
+        queue.enqueue("q".into(), entry.clone());
+        assert!(queue.dequeue_due("q", 0).is_none());
+        queue.retry_pickup("q", popped);
+        assert!(queue.dequeue_due("q", 0).is_some());
+        queue.forget(&entry.key);
+        queue.enqueue("q".into(), entry.clone());
+        assert!(queue.dequeue_due("q", 0).is_some());
+        queue.enqueue(
+            "q".into(),
+            DispatchEntry {
+                stamp: 2,
+                ..entry.clone()
+            },
+        );
+        queue.forget(&entry.key);
+        assert!(queue.dequeue_due("q", 0).is_none());
+    }
+
     use tokeira_chasm_activity::ActivityLibrary;
     use tokeira_runtime::chasm::{CollectingDispatchSink, CollectingVisibilitySink};
     use tokeira_storage::InMemoryChasmNodeStore;

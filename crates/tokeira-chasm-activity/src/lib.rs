@@ -60,5 +60,5 @@ pub use tasks::{
     SCHEDULE_TO_START_TASK_ID, START_TO_CLOSE_TASK_ID, ScheduleToCloseTimer, ScheduleToStartTimer,
     StartToCloseTimer,
 };
-pub use timeouts::{due_timeout, next_timeout_deadline};
+pub use timeouts::{due_timeout, next_timeout_deadline, timeout_event};
 pub use validator::{ActivityRequest, NormalizedTimeouts, validate_and_normalize};

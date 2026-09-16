@@ -22,6 +22,11 @@ use tokeira_chasm_derive::Component;
 use crate::{
     state::{ActivityState, ActivityStatus, lifecycle_for},
     statemachine::{self, ActivityEvent},
+    tasks::{
+        DISPATCH_TASK_ID, DispatchHandler, HEARTBEAT_TASK_ID, HeartbeatHandler,
+        SCHEDULE_TO_CLOSE_TASK_ID, SCHEDULE_TO_START_TASK_ID, START_TO_CLOSE_TASK_ID,
+        ScheduleToCloseHandler, ScheduleToStartHandler, StartToCloseHandler,
+    },
 };
 
 /// The standalone-activity root component (archetype `"activity.activity"`).
@@ -229,7 +234,21 @@ impl Library for ActivityLibrary {
     const NAME: &'static str = "activity";
 
     fn register(builder: &mut RegistryBuilder) -> Result<(), ChasmError> {
-        builder.register::<ActivityExecution>(Self::NAME)?;
+        builder
+            .register_root::<ActivityExecution>(Self::NAME)?
+            .register_reserved_side_effect_task(Self::NAME, DISPATCH_TASK_ID, DispatchHandler)?
+            .register_reserved_pure_task(
+                Self::NAME,
+                SCHEDULE_TO_START_TASK_ID,
+                ScheduleToStartHandler,
+            )?
+            .register_reserved_pure_task(
+                Self::NAME,
+                SCHEDULE_TO_CLOSE_TASK_ID,
+                ScheduleToCloseHandler,
+            )?
+            .register_reserved_pure_task(Self::NAME, START_TO_CLOSE_TASK_ID, StartToCloseHandler)?
+            .register_reserved_pure_task(Self::NAME, HEARTBEAT_TASK_ID, HeartbeatHandler)?;
         Ok(())
     }
 }

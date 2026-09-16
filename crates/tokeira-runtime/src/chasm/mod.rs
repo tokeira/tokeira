@@ -30,15 +30,21 @@
 //! seam explicit. This is a deliberate, documented MVP boundary (`AGENTS §9`).
 
 mod engine;
+mod executor;
+mod rebuild;
 mod repair;
 mod sweeper;
+#[cfg(test)]
+mod test_support;
 mod typed;
 mod visibility_adapter;
 
 pub use engine::{
     ChasmEngine, ChasmEngineConfig, CollectingDispatchSink, CollectingVisibilitySink, DispatchSink,
-    NoopVisibilitySink, ROOT_PATH, VisibilitySink,
+    NoopVisibilitySink, OutcomeApplied, ROOT_PATH, VisibilitySink,
 };
+pub use executor::{DispatchMultiplexer, SideEffectExecutor};
+pub use rebuild::{OutboxRebuildScanner, RebuildStats};
 pub use repair::{RepairStats, SnapshotRebuilder, VisibilityRepairScanner};
 pub use sweeper::{ChasmTimerSweeper, TimeoutEvaluator};
 pub use typed::TypedEngine;
@@ -133,6 +139,8 @@ pub struct UpdateRequest {
     pub new_lifecycle: LifecycleState,
     /// Tasks scheduled by the mutation.
     pub tasks: Vec<StagedTask>,
+    /// Persisted tasks resolved atomically with the root mutation; absent ids are inert.
+    pub resolved: Vec<tokeira_chasm::TaskId>,
     /// Search attributes contributed by the mutation, emitted to visibility on
     /// commit (Requirement 10).
     pub search_attributes: SearchAttributes,

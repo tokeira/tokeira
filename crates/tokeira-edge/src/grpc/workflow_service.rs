@@ -3653,6 +3653,8 @@ mod tests {
     // RespondNexusTaskFailed error); exercising them is required for v1.31.0.
     #![allow(deprecated)]
 
+    mod standalone;
+
     use std::{
         collections::BTreeMap,
         sync::{Arc, Mutex},

@@ -44,7 +44,7 @@ pub use engine::{
     NoopVisibilitySink, OutcomeApplied, ROOT_PATH, VisibilitySink,
 };
 pub use executor::{DispatchMultiplexer, SideEffectExecutor};
-pub use rebuild::{OutboxRebuildScanner, RebuildStats};
+pub use rebuild::{OutboxRebuildScanner, RebuildFailure, RebuildStats};
 pub use repair::{RepairStats, SnapshotRebuilder, VisibilityRepairScanner};
 pub use sweeper::{ChasmTimerSweeper, TimeoutEvaluator};
 pub use typed::TypedEngine;

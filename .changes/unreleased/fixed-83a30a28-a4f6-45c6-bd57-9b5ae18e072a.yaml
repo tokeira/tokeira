@@ -1,0 +1,5 @@
+kind: fixed
+body: The CHASM rebuild pass isolates an execution it cannot serve instead of stalling every other one; start refuses storage it cannot serve and names why.
+time: 2026-09-16T17:07:33.553932+01:00
+custom:
+    Slice: 83a30a28-a4f6-45c6-bd57-9b5ae18e072a

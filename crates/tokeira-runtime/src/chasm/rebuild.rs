@@ -10,6 +10,40 @@ use tokeira_storage::{ChasmNodeRepository, CurrentExecutionCursor};
 
 use super::{ChasmEngine, DispatchSink, ROOT_PATH, engine::TransitionContext};
 
+/// Why a persisted execution cannot be reconstructed by the loaded library.
+/// Each cause carries a task identity only when one exists in stored work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildFailure {
+    /// The root exists but has no component bytes.
+    MissingRootData,
+    /// The registry has no handler for this persisted task type.
+    UnknownTaskType {
+        /// Type id persisted in the unserviceable task.
+        task_type_id: u32,
+    },
+    /// The registered handler cannot decode the persisted component or task bytes.
+    UndecodablePayload {
+        /// Type id whose handler rejected the persisted bytes.
+        task_type_id: u32,
+    },
+}
+
+impl std::fmt::Display for RebuildFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingRootData => formatter.write_str("root component data is missing"),
+            Self::UnknownTaskType { task_type_id } => write!(
+                formatter,
+                "persisted task type {task_type_id} has no registered handler"
+            ),
+            Self::UndecodablePayload { task_type_id } => write!(
+                formatter,
+                "the handler for task type {task_type_id} cannot decode its persisted payload"
+            ),
+        }
+    }
+}
+
 /// Work attempted by one rebuild pass, including repeated derived delivery.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RebuildStats {
@@ -19,6 +53,10 @@ pub struct RebuildStats {
     pub timers_armed: usize,
     /// Due, valid effects handed to the sink, including idempotent repeats.
     pub effects_dispatched: usize,
+    /// Executions whose root data or task handlers could not be validated.
+    pub unserviceable: usize,
+    /// First failing archetype and its explicit cause in deterministic scan order.
+    pub first_unserviceable: Option<(u32, RebuildFailure)>,
 }
 
 /// Startup and periodic recovery of derived CHASM delivery state.
@@ -55,7 +93,9 @@ impl OutboxRebuildScanner {
 
     /// Rebuild from one clock reading. No component state changes here: a raced
     /// snapshot can only produce a stale delivery, which executors/transitions
-    /// must reject under their own fence. Storage or validation errors propagate.
+    /// must reject under their own fence. Storage errors propagate; malformed
+    /// root data and task-validation errors isolate one execution and are counted
+    /// so startup can fail closed while periodic passes continue healing others.
     pub async fn rebuild_once(&self) -> anyhow::Result<RebuildStats> {
         let now = self.engine.now();
         let mut cursor = None;
@@ -89,31 +129,77 @@ impl OutboxRebuildScanner {
                     self.engine.set_armed_timer(&key, None);
                     continue;
                 }
-                let deadline = root.metadata.outbox.earliest_pure_deadline();
-                self.engine.set_armed_timer(&key, deadline);
-                stats.timers_armed += usize::from(deadline.is_some());
-                let data = root
-                    .data
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("CHASM root has no data: {key:?}"))?;
+                let archetype_id = root.metadata.component_type_id;
+                let Some(data) = root.data.as_deref() else {
+                    self.engine.set_armed_timer(&key, None);
+                    stats.unserviceable += 1;
+                    stats
+                        .first_unserviceable
+                        .get_or_insert((archetype_id, RebuildFailure::MissingRootData));
+                    tracing::error!(
+                        ?key,
+                        archetype_id,
+                        "CHASM rebuild cannot serve root with missing data"
+                    );
+                    continue;
+                };
                 let ctx =
                     TransitionContext::new(key.clone(), root.metadata.versioned_transition, now);
                 let mut tasks = Vec::new();
-                for task in root.metadata.outbox.side_effect_tasks {
-                    if task.fire_at_unix_nanos.is_none_or(|at| at <= now)
-                        && self.engine.registry().validate_task(
-                            root.metadata.component_type_id,
-                            data,
-                            &task,
-                            &ctx,
-                        )? == TaskValidity::Valid
+                let mut failure = None;
+                // Validate future and pure tasks too: startup must not silently
+                // admit storage whose missing handler is hidden by a later deadline.
+                // Publish no derived work from an execution until every task checks.
+                for task in root
+                    .metadata
+                    .outbox
+                    .pure_tasks
+                    .iter()
+                    .chain(&root.metadata.outbox.side_effect_tasks)
+                {
+                    match self
+                        .engine
+                        .registry()
+                        .validate_task(archetype_id, data, task, &ctx)
                     {
-                        tasks.push(DispatchableTask {
-                            node_path: ROOT_PATH.to_vec(),
-                            task,
-                        });
+                        Ok(TaskValidity::Valid)
+                            if task.kind == tokeira_chasm::TaskKind::SideEffect
+                                && task.fire_at_unix_nanos.is_none_or(|at| at <= now) =>
+                        {
+                            tasks.push(DispatchableTask {
+                                node_path: ROOT_PATH.to_vec(),
+                                task: task.clone(),
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let cause = match error {
+                                tokeira_chasm::ChasmError::UnknownTaskType { .. } => {
+                                    RebuildFailure::UnknownTaskType {
+                                        task_type_id: task.task_type_id,
+                                    }
+                                }
+                                _ => RebuildFailure::UndecodablePayload {
+                                    task_type_id: task.task_type_id,
+                                },
+                            };
+                            failure = Some((cause, error));
+                            break;
+                        }
                     }
                 }
+                if let Some((cause, error)) = failure {
+                    self.engine.set_armed_timer(&key, None);
+                    stats.unserviceable += 1;
+                    stats
+                        .first_unserviceable
+                        .get_or_insert((archetype_id, cause));
+                    tracing::error!(?key, archetype_id, %cause, ?error, "CHASM rebuild cannot serve execution; continuing pass");
+                    continue;
+                }
+                let deadline = root.metadata.outbox.earliest_pure_deadline();
+                self.engine.set_armed_timer(&key, deadline);
+                stats.timers_armed += usize::from(deadline.is_some());
                 stats.effects_dispatched += tasks.len();
                 if !tasks.is_empty()
                     && let Err(error) = self.sink.dispatch(&key, tasks).await
@@ -144,6 +230,71 @@ mod tests {
     };
     use tokeira_chasm::Task;
     use tokeira_storage::InMemoryChasmNodeStore;
+
+    #[tokio::test]
+    async fn unserviceable_execution_does_not_block_healthy_rebuild() {
+        for failure_kind in 0..3 {
+            let repo = Arc::new(InMemoryChasmNodeStore::new());
+            let engine = ts::engine(repo.clone(), Arc::new(AtomicI64::new(2)), ts::sink());
+            for index in 0..2 {
+                let reference = ts::start(&engine, ts::key(index)).await;
+                ts::stage(
+                    &engine,
+                    &reference,
+                    &[Work::<false> {
+                        deadline: 10,
+                        ..Default::default()
+                    }],
+                )
+                .await;
+                ts::stage(&engine, &reference, &[Work::<true>::default()]).await;
+            }
+            let mut root = engine.root_node(&ts::key(0)).await.unwrap().unwrap();
+            let archetype = root.metadata.component_type_id;
+            let expected = tokeira_storage::ExpectedVersion::Vt(root.metadata.versioned_transition);
+            let unknown = u32::MAX;
+            if failure_kind == 0 {
+                root.data = None;
+                root.metadata.outbox.pure_tasks.clear();
+                root.metadata.outbox.side_effect_tasks.clear();
+            } else if failure_kind == 1 {
+                root.metadata.outbox.pure_tasks[0].task_type_id = unknown;
+            } else {
+                root.metadata.outbox.pure_tasks[0].payload = vec![0xff];
+            }
+            let cause = match failure_kind {
+                0 => RebuildFailure::MissingRootData,
+                1 => RebuildFailure::UnknownTaskType {
+                    task_type_id: unknown,
+                },
+                _ => RebuildFailure::UndecodablePayload {
+                    task_type_id: root.metadata.outbox.pure_tasks[0].task_type_id,
+                },
+            };
+            repo.persist_dirty(
+                &ts::key(0),
+                vec![tokeira_storage::NodeWrite {
+                    encoded_path: ROOT_PATH.to_vec(),
+                    node: root,
+                    expected,
+                }],
+            )
+            .await
+            .unwrap();
+            let sink = ts::sink();
+            let engine = ts::engine(repo.clone(), Arc::new(AtomicI64::new(2)), sink.clone());
+            let scanner = OutboxRebuildScanner::new(repo, engine.clone(), sink.clone());
+            let stats = scanner.rebuild_once().await.unwrap();
+            assert_eq!(stats.scanned, 2);
+            assert_eq!(stats.unserviceable, 1);
+            assert_eq!(stats.first_unserviceable, Some((archetype, cause)));
+            assert_eq!(stats.timers_armed, 1);
+            assert_eq!(stats.effects_dispatched, 1);
+            assert_eq!(engine.armed_timer(&ts::key(0)), None);
+            assert_eq!(engine.armed_timer(&ts::key(1)), Some(10));
+            assert_eq!(sink.dispatched.lock().unwrap()[0].0, ts::key(1));
+        }
+    }
 
     // Feature: chasm-extension-archetypes, Property 4: timer rehydration round-trip
     // Restart re-arms exactly the unconsumed timers; committed executions never repeat.

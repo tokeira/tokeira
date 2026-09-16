@@ -553,6 +553,15 @@ impl std::fmt::Display for EmbeddedStartupPhase {
 /// Redacted failure from explicit embedded startup.
 #[derive(Debug)]
 pub enum EmbeddedEngineStartError {
+    /// Startup rebuild isolated executions this deployment cannot serve.
+    UnserviceableOutbox {
+        /// Archetype of the first failing execution in scan order.
+        archetype_id: u32,
+        /// Missing data, handler or undecodable payload encountered first.
+        cause: tokeira_runtime::chasm::RebuildFailure,
+        /// Number of executions isolated during the pass.
+        executions: usize,
+    },
     /// Configuration failed before any external resource was touched.
     InvalidConfiguration(tokeira_config::EmbeddedConfigError),
     /// One startup phase failed; the nested cause is deliberately discarded.
@@ -570,6 +579,14 @@ pub enum EmbeddedEngineStartError {
 impl std::fmt::Display for EmbeddedEngineStartError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnserviceableOutbox {
+                archetype_id,
+                cause,
+                executions,
+            } => write!(
+                formatter,
+                "CHASM rebuild cannot serve {executions} executions; first failure in archetype {archetype_id}: {cause}; restore the matching library or repair its persisted data before restarting"
+            ),
             Self::InvalidConfiguration(error) => {
                 write!(formatter, "invalid embedded engine configuration: {error}")
             }
@@ -587,6 +604,32 @@ impl std::fmt::Display for EmbeddedEngineStartError {
 }
 
 impl std::error::Error for EmbeddedEngineStartError {}
+
+fn check_rebuilt_outboxes(
+    stats: tokeira_runtime::chasm::RebuildStats,
+) -> Result<(), EmbeddedEngineStartError> {
+    if stats.unserviceable > 0 {
+        let (archetype_id, cause) = stats
+            .first_unserviceable
+            .expect("unserviceable execution records its first cause");
+        return Err(EmbeddedEngineStartError::UnserviceableOutbox {
+            archetype_id,
+            cause,
+            executions: stats.unserviceable,
+        });
+    }
+    Ok(())
+}
+
+// Preserve only the deliberately public CHASM diagnostics. All other stack
+// failures retain the embedded boundary's existing phase-only redaction.
+fn embedded_stack_error(error: anyhow::Error) -> EmbeddedEngineStartError {
+    error
+        .downcast::<EmbeddedEngineStartError>()
+        .unwrap_or(EmbeddedEngineStartError::Phase {
+            phase: EmbeddedStartupPhase::RuntimeRestore,
+        })
+}
 
 impl From<tokeira_config::EmbeddedConfigError> for EmbeddedEngineStartError {
     fn from(error: tokeira_config::EmbeddedConfigError) -> Self {
@@ -813,11 +856,9 @@ impl Engine {
         }
         config.validate()?;
         if matches!(config.storage, EmbeddedStorageConfig::InMemory) {
-            return Self::start_with_config(config.server).await.map_err(|_| {
-                EmbeddedEngineStartError::Phase {
-                    phase: EmbeddedStartupPhase::RuntimeRestore,
-                }
-            });
+            return Self::start_with_config(config.server)
+                .await
+                .map_err(embedded_stack_error);
         }
         start_embedded_dsql(config).await
     }
@@ -1063,30 +1104,32 @@ async fn start_embedded_dsql(
         });
     }
 
-    let stack = match startup_phase(
-        deadline,
-        EmbeddedStartupPhase::RuntimeRestore,
-        build_dsql_stack(
-            StackTransport::Embedded,
-            Arc::new(server),
-            dsql_store,
-            connection_endpoint.clone(),
-        ),
-    )
-    .await
-    {
-        Ok(ConstructedStack::Embedded(stack)) => stack,
-        Ok(ConstructedStack::Network(_)) => {
-            rollback_embedded_dsql(&ownership, &director, deadline).await;
-            return Err(EmbeddedEngineStartError::Phase {
-                phase: EmbeddedStartupPhase::RuntimeRestore,
-            });
-        }
-        Err(error) => {
-            rollback_embedded_dsql(&ownership, &director, deadline).await;
-            return Err(error);
-        }
-    };
+    let stack =
+        match startup_infallible_phase(deadline, EmbeddedStartupPhase::RuntimeRestore, async {
+            build_dsql_stack(
+                StackTransport::Embedded,
+                Arc::new(server),
+                dsql_store,
+                connection_endpoint.clone(),
+            )
+            .await
+            .map_err(embedded_stack_error)
+        })
+        .await
+        .and_then(|result| result)
+        {
+            Ok(ConstructedStack::Embedded(stack)) => stack,
+            Ok(ConstructedStack::Network(_)) => {
+                rollback_embedded_dsql(&ownership, &director, deadline).await;
+                return Err(EmbeddedEngineStartError::Phase {
+                    phase: EmbeddedStartupPhase::RuntimeRestore,
+                });
+            }
+            Err(error) => {
+                rollback_embedded_dsql(&ownership, &director, deadline).await;
+                return Err(error);
+            }
+        };
 
     spawn_ownership_renewal(
         &stack.engine_tasks,
@@ -2883,8 +2926,10 @@ fn spawn_outbox_rebuild(
                     tokio::select! {
                         _ = cancel.cancelled() => break,
                         result = scanner.rebuild_once() => {
-                            if let Err(error) = result {
-                                tracing::warn!(?error, "CHASM outbox rebuild pass failed");
+                            match result {
+                                Ok(stats) if stats.unserviceable > 0 => tracing::error!(unserviceable = stats.unserviceable, first = ?stats.first_unserviceable, "CHASM rebuild isolated executions; healthy executions were rebuilt"),
+                                Ok(_) => {},
+                                Err(error) => tracing::warn!(?error, "CHASM outbox rebuild pass failed"),
                             }
                         }
                     }
@@ -3550,10 +3595,11 @@ where
             chasm_engine.clone(),
             multiplexer.clone(),
         );
-        rebuild
+        let rebuild_stats = rebuild
             .rebuild_once()
             .await
             .context("failed to rebuild CHASM outboxes before serving")?;
+        check_rebuilt_outboxes(rebuild_stats)?;
         spawn_outbox_rebuild(&engine_tasks, rebuild, background_cancel.clone());
         // Spawn the visibility repair scanner (Req 10.11): a committed transition can
         // never permanently lack a projection — the scanner rebuilds each execution's

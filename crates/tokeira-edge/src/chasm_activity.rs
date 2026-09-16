@@ -697,6 +697,8 @@ impl ActivityBridge {
         self.ensure_enabled()?;
 
         let normalized = validate_and_normalize(&ActivityRequest {
+            callbacks: Vec::new(),
+            version_target: None,
             activity_id: req.activity_id.clone(),
             activity_type: req.activity_type.clone(),
             task_queue: req.task_queue.clone(),
@@ -1683,6 +1685,7 @@ fn map_activity_not_found(error: ChasmError, key: &ExecutionKey) -> EdgeError {
 fn map_chasm_err(error: ChasmError) -> EdgeError {
     match error {
         ChasmError::Validation(message) => EdgeError::BadRequest(message),
+        ChasmError::FailedPrecondition(message) => EdgeError::FailedPrecondition(message),
         ChasmError::ExecutionNotFound => {
             EdgeError::NotFound("activity execution not found".to_owned())
         }

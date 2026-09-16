@@ -20,12 +20,19 @@
 //! Go source is `min(DurationValue(d1), DurationValue(d2))` with `nil → 0`, so plain
 //! integer `min` reproduces it (the `> 0` guards ensure only set values are mined).
 
-use tokeira_chasm::ChasmError;
+use crate::{CallbackSpec, CallbackTarget};
+use tokeira_chasm::{ChasmError, DeploymentVersionTarget};
 
 /// The activity attributes to validate and normalize. Durations are nanoseconds
 /// (`0` = unset).
 #[derive(Debug, Clone)]
 pub struct ActivityRequest {
+    /// Attachments admitted by the caller. Internal targets arrive only from the
+    /// start executor; the public edge rejects that variant before constructing this input.
+    pub callbacks: Vec<CallbackSpec>,
+    /// D1: only the runtime's start executor populates this target; the public path
+    /// always supplies `None` (Requirement 7.2).
+    pub version_target: Option<DeploymentVersionTarget>,
     /// Application-level activity id (required, length-limited).
     pub activity_id: String,
     /// Application-level activity type (required, length-limited).
@@ -90,6 +97,36 @@ pub fn validate_and_normalize(req: &ActivityRequest) -> Result<NormalizedTimeout
         )));
     }
 
+    if req
+        .version_target
+        .as_ref()
+        .is_some_and(|target| target.deployment_name.is_empty() || target.build_id.is_empty())
+    {
+        return Err(ChasmError::Validation(
+            "deployment version target requires deployment_name and build_id".to_owned(),
+        ));
+    }
+    for (index, callback) in req.callbacks.iter().enumerate() {
+        // These are shape checks for internal inputs. URL/header policy belongs
+        // to edge admission; the cap and closed rule belong to attachment.
+        match &callback.target {
+            CallbackTarget::Nexus { url, .. } if url.is_empty() => {
+                return Err(ChasmError::Validation(format!(
+                    "callback {index}: Nexus target requires a URL"
+                )));
+            }
+            CallbackTarget::Internal {
+                component_ref,
+                task_type_id,
+                ..
+            } if component_ref.is_empty() || *task_type_id == 0 => {
+                return Err(ChasmError::Validation(format!(
+                    "callback {index}: Internal target requires component_ref and a non-zero task_type_id"
+                )));
+            }
+            _ => {}
+        }
+    }
     normalize_timeouts(req)
 }
 
@@ -158,6 +195,8 @@ mod tests {
 
     fn base() -> ActivityRequest {
         ActivityRequest {
+            callbacks: Vec::new(),
+            version_target: None,
             activity_id: "act-1".to_owned(),
             activity_type: "Type".to_owned(),
             task_queue: "queue".to_owned(),
@@ -267,5 +306,99 @@ mod tests {
         };
         let n = validate_and_normalize(&req).expect("normalize");
         assert_eq!(n.heartbeat_nanos, 0);
+    }
+
+    #[test]
+    fn version_target_requires_both_names() {
+        for (deployment_name, build_id) in [("", ""), ("deployment", ""), ("", "build")] {
+            let request = ActivityRequest {
+                start_to_close_nanos: SEC,
+                version_target: Some(DeploymentVersionTarget {
+                    deployment_name: deployment_name.to_owned(),
+                    build_id: build_id.to_owned(),
+                }),
+                ..base()
+            };
+            assert!(
+                matches!(validate_and_normalize(&request), Err(ChasmError::Validation(message))
+                if message == "deployment version target requires deployment_name and build_id")
+            );
+        }
+        let request = ActivityRequest {
+            start_to_close_nanos: SEC,
+            version_target: Some(DeploymentVersionTarget {
+                deployment_name: "deployment".to_owned(),
+                build_id: "build".to_owned(),
+            }),
+            ..base()
+        };
+        assert!(validate_and_normalize(&request).is_ok());
+    }
+
+    #[test]
+    fn callback_validation_identifies_the_invalid_index() {
+        let valid = CallbackSpec {
+            target: CallbackTarget::Nexus {
+                url: "https://example.test/completion".to_owned(),
+                header: Default::default(),
+            },
+            links: Vec::new(),
+        };
+        for target in [
+            CallbackTarget::Nexus {
+                url: String::new(),
+                header: Default::default(),
+            },
+            CallbackTarget::Internal {
+                component_ref: Vec::new(),
+                task_type_id: 1,
+                task_id: vec![1],
+            },
+            CallbackTarget::Internal {
+                component_ref: vec![1],
+                task_type_id: 0,
+                task_id: vec![1],
+            },
+        ] {
+            let request = ActivityRequest {
+                start_to_close_nanos: SEC,
+                callbacks: vec![
+                    valid.clone(),
+                    CallbackSpec {
+                        target,
+                        links: Vec::new(),
+                    },
+                ],
+                ..base()
+            };
+            assert!(
+                matches!(validate_and_normalize(&request), Err(ChasmError::Validation(message))
+                if message.contains("callback 1"))
+            );
+        }
+        let request = ActivityRequest {
+            start_to_close_nanos: SEC,
+            callbacks: vec![
+                valid,
+                CallbackSpec {
+                    target: CallbackTarget::Internal {
+                        component_ref: vec![1],
+                        task_type_id: 1,
+                        task_id: vec![1],
+                    },
+                    links: vec![vec![2], vec![3]],
+                },
+            ],
+            ..base()
+        };
+        let expected = validate_and_normalize(&ActivityRequest {
+            start_to_close_nanos: SEC,
+            ..base()
+        })
+        .expect("original timeouts");
+        assert_eq!(
+            validate_and_normalize(&request).expect("valid targets"),
+            expected
+        );
     }
 }

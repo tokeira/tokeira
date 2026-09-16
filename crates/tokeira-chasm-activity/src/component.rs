@@ -20,10 +20,11 @@ use tokeira_chasm::{
 use tokeira_chasm_derive::Component;
 
 use crate::{
-    state::{ActivityState, ActivityStatus, lifecycle_for},
+    state::{ActivityState, ActivityStatus, lifecycle_of},
     statemachine::{self, ActivityEvent},
     tasks::{
-        DISPATCH_TASK_ID, DispatchHandler, HEARTBEAT_TASK_ID, HeartbeatHandler,
+        CALLBACK_RETRY_TASK_ID, CallbackRetryHandler, DELIVER_CALLBACK_TASK_ID, DISPATCH_TASK_ID,
+        DeliverCallbackHandler, DispatchHandler, HEARTBEAT_TASK_ID, HeartbeatHandler,
         SCHEDULE_TO_CLOSE_TASK_ID, SCHEDULE_TO_START_TASK_ID, START_TO_CLOSE_TASK_ID,
         ScheduleToCloseHandler, ScheduleToStartHandler, StartToCloseHandler,
     },
@@ -83,7 +84,13 @@ impl ActivityExecution {
 
 impl Lifecycle for ActivityExecution {
     fn lifecycle_state(&self, _ctx: &dyn Context) -> LifecycleState {
-        lifecycle_for(self.status())
+        // CHASM rebuild scans only Running roots, unlike upstream's persisted
+        // callback queues. Keep terminal activities reachable until delivery
+        // settles. An endpoint that never answers retains Running lifecycle under
+        // the executor's 1-hour backoff cap; public activity status remains terminal.
+        self.activity_state()
+            .map(lifecycle_of)
+            .unwrap_or(LifecycleState::Running)
     }
 }
 
@@ -150,7 +157,7 @@ impl VisibilityContributor for ActivityExecution {
             // attributes remain EAV rows and must be decoded into the projection
             // snapshot so List/Count can query them (`activity.go @ v1.31.0`).
             status_keyword: api_status_name(status).to_owned(),
-            lifecycle_state: lifecycle_for(status),
+            lifecycle_state: lifecycle_of(state),
             execution_type: (!state.activity_type.is_empty()).then(|| state.activity_type.clone()),
             task_queue: (!state.task_queue.is_empty()).then(|| state.task_queue.clone()),
             start_time_unix_nanos: (state.scheduled_time_nanos != 0)
@@ -248,7 +255,17 @@ impl Library for ActivityLibrary {
                 ScheduleToCloseHandler,
             )?
             .register_reserved_pure_task(Self::NAME, START_TO_CLOSE_TASK_ID, StartToCloseHandler)?
-            .register_reserved_pure_task(Self::NAME, HEARTBEAT_TASK_ID, HeartbeatHandler)?;
+            .register_reserved_pure_task(Self::NAME, HEARTBEAT_TASK_ID, HeartbeatHandler)?
+            .register_reserved_side_effect_task(
+                Self::NAME,
+                DELIVER_CALLBACK_TASK_ID,
+                DeliverCallbackHandler,
+            )?
+            .register_reserved_pure_task(
+                Self::NAME,
+                CALLBACK_RETRY_TASK_ID,
+                CallbackRetryHandler,
+            )?;
         Ok(())
     }
 }
@@ -273,6 +290,27 @@ mod tests {
             Some("activity")
         );
         assert_eq!(ActivityExecution::FQN, "activity.activity");
+        let component_id = registry
+            .archetype_id(ActivityExecution::FQN)
+            .expect("activity");
+        for (id, fqn, kind) in [
+            (
+                DELIVER_CALLBACK_TASK_ID,
+                "activity.deliver_callback",
+                tokeira_chasm::TaskKind::SideEffect,
+            ),
+            (
+                CALLBACK_RETRY_TASK_ID,
+                "activity.callback_retry",
+                tokeira_chasm::TaskKind::Pure,
+            ),
+        ] {
+            let entry = registry
+                .task_for_id(component_id, id)
+                .expect("callback task");
+            assert_eq!(entry.fqn, fqn);
+            assert_eq!(entry.kind, kind);
+        }
     }
 
     #[test]

@@ -26,6 +26,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ChasmError {
+    /// A component operation failed a lifecycle or capacity precondition. Preserve
+    /// the message at the edge while mapping to FAILED_PRECONDITION, not INVALID_ARGUMENT.
+    #[error("{0}")]
+    FailedPrecondition(String),
     /// No handler of the requested discipline owns this component/task pair.
     /// Transition close must abort rather than silently retaining unknown work.
     #[error("unknown task type {task_type_id} for component {component_type_id}")]

@@ -17,14 +17,20 @@
 //!
 //! Each task type has a stable `u32` id the engine threads through
 //! `MutableContext::add_task`; the activity library owns this small id space.
+//! Reserved ids 1–5 are activity work; ids 6–7 are callback delivery/backoff,
+//! fenced by callback attempt (`chasm/lib/callback/tasks.go @ v1.32.0`).
 
 use serde::{Deserialize, Serialize};
 use tokeira_chasm::{
     ChasmError, Context, MutableContext, PureTaskHandler, SideEffectTaskHandler, Task, TaskKind,
     TaskOutcome, TaskValidator, TaskValidity,
 };
+use tokeira_proto::enums::CallbackState;
 
-use crate::{TimeoutType, component::ActivityExecution, state::ActivityStatus, timeout_event};
+use crate::{
+    ActivityEvent, TimeoutType, callback_attempt_outcome, component::ActivityExecution,
+    state::ActivityStatus, timeout_event,
+};
 
 /// Registry id of the [`DispatchTask`] side-effect task.
 pub const DISPATCH_TASK_ID: u32 = 1;
@@ -36,6 +42,189 @@ pub const SCHEDULE_TO_CLOSE_TASK_ID: u32 = 3;
 pub const START_TO_CLOSE_TASK_ID: u32 = 4;
 /// Registry id of the [`HeartbeatTimer`] pure task.
 pub const HEARTBEAT_TASK_ID: u32 = 5;
+/// Registered delivery task, independent of the callback target variant.
+pub const DELIVER_CALLBACK_TASK_ID: u32 = 6;
+/// Registered callback backoff timer.
+pub const CALLBACK_RETRY_TASK_ID: u32 = 7;
+
+/// Side effect delivering a callback's persisted target after activity completion.
+/// The executor selects Nexus or Internal by reading that target; both share this id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverCallback {
+    /// Attached callback identity.
+    pub callback_id: String,
+    /// Completed-attempt count when staged (`InvocationTask.Attempt @ v1.32.0`).
+    pub stamp: i32,
+}
+
+impl Task for DeliverCallback {
+    const KIND: TaskKind = TaskKind::SideEffect;
+    const FQN: &'static str = "activity.deliver_callback";
+    fn fire_at(&self) -> Option<i64> {
+        None
+    }
+    fn encode(&self) -> Result<Vec<u8>, ChasmError> {
+        postcard::to_allocvec(self)
+            .map_err(|error| ChasmError::Internal(format!("encode {}: {error}", Self::FQN)))
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, ChasmError> {
+        postcard::from_bytes(bytes)
+            .map_err(|error| ChasmError::Validation(format!("decode {}: {error}", Self::FQN)))
+    }
+}
+
+/// Pure callback retry timer, fenced by the failed delivery's attempt count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallbackRetryTimer {
+    /// Attached callback identity.
+    pub callback_id: String,
+    /// Completed-attempt count after recording the retryable failure.
+    pub attempt: i32,
+    /// Executor-supplied absolute retry time.
+    pub fire_at_nanos: i64,
+}
+
+impl Task for CallbackRetryTimer {
+    const KIND: TaskKind = TaskKind::Pure;
+    const FQN: &'static str = "activity.callback_retry";
+    fn fire_at(&self) -> Option<i64> {
+        Some(self.fire_at_nanos)
+    }
+    fn encode(&self) -> Result<Vec<u8>, ChasmError> {
+        postcard::to_allocvec(self)
+            .map_err(|error| ChasmError::Internal(format!("encode {}: {error}", Self::FQN)))
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, ChasmError> {
+        postcard::from_bytes(bytes)
+            .map_err(|error| ChasmError::Validation(format!("decode {}: {error}", Self::FQN)))
+    }
+}
+
+/// Accept only the currently scheduled callback generation
+/// (`chasm/lib/callback/tasks.go:107–109 @ v1.32.0`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeliverCallbackValidator;
+
+impl TaskValidator<ActivityExecution, DeliverCallback> for DeliverCallbackValidator {
+    fn validate(
+        &self,
+        component: &ActivityExecution,
+        task: &DeliverCallback,
+        _: &dyn Context,
+    ) -> TaskValidity {
+        if callback_matches(
+            component,
+            &task.callback_id,
+            task.stamp,
+            CallbackState::Scheduled,
+        ) {
+            TaskValidity::Valid
+        } else {
+            TaskValidity::Drop
+        }
+    }
+}
+
+/// Accept only the backoff generation that staged this timer
+/// (`chasm/lib/callback/tasks.go:175–182 @ v1.32.0`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallbackRetryValidator;
+
+impl TaskValidator<ActivityExecution, CallbackRetryTimer> for CallbackRetryValidator {
+    fn validate(
+        &self,
+        component: &ActivityExecution,
+        task: &CallbackRetryTimer,
+        _: &dyn Context,
+    ) -> TaskValidity {
+        if callback_matches(
+            component,
+            &task.callback_id,
+            task.attempt,
+            CallbackState::BackingOff,
+        ) {
+            TaskValidity::Valid
+        } else {
+            TaskValidity::Drop
+        }
+    }
+}
+
+fn callback_matches(
+    component: &ActivityExecution,
+    id: &str,
+    attempt: i32,
+    status: CallbackState,
+) -> bool {
+    component.activity_state().is_some_and(|state| {
+        state.callbacks.iter().any(|callback| {
+            callback.id == id && callback.attempt == attempt && callback.state() == status
+        })
+    })
+}
+
+/// Apply the executor's delivery envelope as pure callback bookkeeping. The engine
+/// removes the held delivery task in the same commit; the handler need not resolve it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeliverCallbackHandler;
+
+impl SideEffectTaskHandler for DeliverCallbackHandler {
+    type Component = ActivityExecution;
+    type Task = DeliverCallback;
+    fn validate(
+        &self,
+        c: &ActivityExecution,
+        t: &DeliverCallback,
+        ctx: &dyn Context,
+    ) -> TaskValidity {
+        DeliverCallbackValidator.validate(c, t, ctx)
+    }
+    fn on_outcome(
+        &self,
+        c: &mut ActivityExecution,
+        t: &DeliverCallback,
+        outcome: &TaskOutcome,
+        ctx: &mut dyn MutableContext,
+    ) -> Result<(), ChasmError> {
+        c.apply(
+            ActivityEvent::CallbackAttempted {
+                id: t.callback_id.clone(),
+                outcome: callback_attempt_outcome(outcome)?,
+            },
+            ctx,
+        )
+    }
+}
+
+/// End a validated callback backoff and stage the next delivery generation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallbackRetryHandler;
+
+impl PureTaskHandler for CallbackRetryHandler {
+    type Component = ActivityExecution;
+    type Task = CallbackRetryTimer;
+    fn validate(
+        &self,
+        c: &ActivityExecution,
+        t: &CallbackRetryTimer,
+        ctx: &dyn Context,
+    ) -> TaskValidity {
+        CallbackRetryValidator.validate(c, t, ctx)
+    }
+    fn execute(
+        &self,
+        c: &mut ActivityExecution,
+        t: &CallbackRetryTimer,
+        ctx: &mut dyn MutableContext,
+    ) -> Result<(), ChasmError> {
+        c.apply(
+            ActivityEvent::CallbackRetryDue {
+                id: t.callback_id.clone(),
+            },
+            ctx,
+        )
+    }
+}
 
 /// The side-effect task that enqueues the activity to matching for a worker to poll
 /// (`ActivityDispatchTask @ v1.31.0`). Stamp-fenced: dropped once the attempt

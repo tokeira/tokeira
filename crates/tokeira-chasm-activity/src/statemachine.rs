@@ -30,6 +30,7 @@
 use tokeira_chasm::{ChasmError, MutableContext, Task, TaskKind};
 
 use crate::{
+    callbacks::{self, CallbackAttemptOutcome, CallbackSpec},
     state::{ActivityState, ActivityStatus},
     tasks::{
         DISPATCH_TASK_ID, DispatchTask, HEARTBEAT_TASK_ID, HeartbeatTimer,
@@ -69,6 +70,28 @@ impl TimeoutType {
 /// needs; richer provenance (worker identity, deployment) rides later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivityEvent {
+    /// Attach callbacks before completion; Internal targets are executor-only at
+    /// the edge, since this pure component cannot identify the caller (decision D2).
+    CallbacksAttached {
+        /// Seeds `<request_id>-<index>` identities for idempotent upsert.
+        request_id: String,
+        /// Destinations in attach order; the component assigns state and time.
+        callbacks: Vec<CallbackSpec>,
+        /// Caller-supplied cap, including existing ids before upsert.
+        max_callbacks: usize,
+    },
+    /// Record one delivery result while preserving the activity's terminal status.
+    CallbackAttempted {
+        /// Attached callback identity.
+        id: String,
+        /// Classified delivery result with any retry deadline supplied by the executor.
+        outcome: CallbackAttemptOutcome,
+    },
+    /// Finish callback backoff and stage another delivery with the new attempt fence.
+    CallbackRetryDue {
+        /// Attached callback identity.
+        id: String,
+    },
     /// Initial scheduling (begins attempt 1).
     Scheduled,
     /// Retry after a failed attempt (begins the next attempt).
@@ -173,6 +196,9 @@ impl ActivityEvent {
     /// A short stable name for the event, used in [`ChasmError::IllegalTransition`].
     fn name(&self) -> &'static str {
         match self {
+            ActivityEvent::CallbacksAttached { .. } => "CallbacksAttached",
+            ActivityEvent::CallbackAttempted { .. } => "CallbackAttempted",
+            ActivityEvent::CallbackRetryDue { .. } => "CallbackRetryDue",
             ActivityEvent::Scheduled => "Scheduled",
             ActivityEvent::Rescheduled { .. } => "Rescheduled",
             ActivityEvent::Started { .. } => "Started",
@@ -195,6 +221,12 @@ pub fn legal_target(from: ActivityStatus, event: &ActivityEvent) -> Option<Activ
     let legal =
         |allowed: &[ActivityStatus], to: ActivityStatus| allowed.contains(&from).then_some(to);
     match event {
+        ActivityEvent::CallbacksAttached { .. } => {
+            legal(&[Unspecified, Scheduled, Started, CancelRequested], from)
+        }
+        ActivityEvent::CallbackAttempted { .. } | ActivityEvent::CallbackRetryDue { .. } => {
+            Some(from)
+        }
         ActivityEvent::Scheduled => legal(&[Unspecified], Scheduled),
         ActivityEvent::Rescheduled { .. } => legal(&[Started], Scheduled),
         ActivityEvent::Started { .. } => legal(&[Scheduled], Started),
@@ -223,14 +255,27 @@ pub fn legal_target(from: ActivityStatus, event: &ActivityEvent) -> Option<Activ
 ///   returning `Ok(())` (Requirement 11.6).
 /// - On `Scheduled`/`Rescheduled` the dispatch task and the relevant pure timers
 ///   are scheduled; on `Started` the start-to-close and heartbeat timers are
-///   scheduled. Terminal transitions schedule nothing; validate-then-drop reaps the
-///   outstanding timers.
+///   scheduled. Terminal transitions stage standby callbacks and validate-then-drop
+///   reaps the outstanding activity timers. Callback bookkeeping preserves activity status.
 pub fn apply(
     state: &mut ActivityState,
     event: ActivityEvent,
     ctx: &mut dyn MutableContext,
 ) -> Result<(), ChasmError> {
     let from = state.status();
+
+    if let ActivityEvent::CallbacksAttached { callbacks, .. } = &event {
+        // Empty attachment precedes the closed check upstream, including on a
+        // closed activity (chasm/lib/activity/activity.go:435–441 @ v1.32.0).
+        if callbacks.is_empty() {
+            return Ok(());
+        }
+        if from.is_terminal() {
+            return Err(ChasmError::FailedPrecondition(
+                "cannot attach callbacks to a closed activity".to_owned(),
+            ));
+        }
+    }
 
     // Stamp fence: a timeout for a superseded attempt is a no-op (Requirement 11.6).
     if let ActivityEvent::TimedOut { stamp, .. } = &event
@@ -246,6 +291,17 @@ pub fn apply(
 
     let now = ctx.now_unix_nanos();
     match &event {
+        ActivityEvent::CallbacksAttached {
+            request_id,
+            callbacks,
+            max_callbacks,
+        } => {
+            callbacks::attach(state, request_id, callbacks, *max_callbacks, now)?;
+        }
+        ActivityEvent::CallbackAttempted { id, outcome } => {
+            callbacks::record_attempt(state, id, outcome, ctx, now)?
+        }
+        ActivityEvent::CallbackRetryDue { id } => callbacks::retry_due(state, id, ctx)?,
         ActivityEvent::Scheduled => {
             state.attempt += 1;
             state.stamp += 1;
@@ -402,11 +458,16 @@ pub fn apply(
     }
 
     state.set_status(to);
+    if to.is_terminal() {
+        callbacks::schedule_standby(state, ctx)?;
+    }
     // Record the close time on the first terminal transition (`now` is the
     // transition's logical clock). This persists it on the node so the visibility
     // snapshot's close time is recomputable from state alone — the repair scanner's
     // precondition (Req 10.11).
-    if to.is_terminal() && state.close_time_nanos == 0 {
+    // Delivery bookkeeping must not move the activity's close time, even if its
+    // original terminal transition used the injected clock's zero value.
+    if to.is_terminal() && !from.is_terminal() && state.close_time_nanos == 0 {
         state.close_time_nanos = now;
     }
     Ok(())
@@ -490,6 +551,20 @@ fn encode_task<T: serde::Serialize>(task: &T) -> Result<Vec<u8>, ChasmError> {
 mod tests {
     use super::*;
     use tokeira_chasm::{Context, ExecutionInfo, ExecutionKey};
+
+    fn apply(
+        state: &mut ActivityState,
+        event: ActivityEvent,
+        ctx: &mut dyn MutableContext,
+    ) -> Result<(), ChasmError> {
+        let result = super::apply(state, event, ctx);
+        assert!(state.callbacks.is_empty());
+        assert_eq!(
+            crate::lifecycle_of(state),
+            crate::lifecycle_for(state.status())
+        );
+        result
+    }
 
     /// Decode a postcard-encoded task payload (test-only; the runtime will use the
     /// validators directly once wired).

@@ -309,10 +309,18 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 
 ### Stage 7 — Activity library: handlers, callbacks, version target (`tokeira-chasm-activity`)
 
-- [ ] 7.1 `ActivityState` fields 39 `version_target` and 40 `callbacks`; messages
+- [x] 7.1 `ActivityState` fields 39 `version_target` and 40 `callbacks`; messages
   `DeploymentVersionTarget`, `ActivityCallback`, `NexusTarget`, `InternalTarget` as in
   `design.md`; `lifecycle_for` unchanged. Cite `activity.go:111-113 @ v1.32.0` at the field.
   - _Requirements: 5.5, 7.1_
+
+  **DONE (2026-09-16, stage 7):** Field 39 reuses the substrate's version target;
+  field 40 stores attach-ordered callbacks, repeated encoded links and deterministic
+  BTreeMap Nexus headers, with opaque ComponentRef/TaskId codecs documented for Internal
+  targets. Proto round trips cover both variants and legacy bytes omit both fields.
+  `lifecycle_for` is unchanged; `lifecycle_of` retains Running until all callbacks settle,
+  shared by Lifecycle and visibility. Tests cover every activity status with no callbacks,
+  pending callbacks and all-settled callbacks, plus terminal status/close-time visibility.
 - [x] 7.2 Register the existing task types as reserved handlers in `ActivityLibrary::register`
   (validators = the crate's existing validators; `execute` = the existing `apply` events).
   Existing timeout behaviour is unchanged because the evaluator path remains installed
@@ -330,7 +338,7 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   replacement and evaluator-equivalent events, grounded in
   `chasm/lib/activity/activity_tasks.go:166–168,227–247` and
   `chasm/lib/activity/activity.go:576–585 @ v1.31.0`. The slice's changed fragment covers it.
-- [ ] 7.3 Callback state machine: events `CallbacksAttached`, `CallbackAttempted`,
+- [x] 7.3 Callback state machine: events `CallbacksAttached`, `CallbackAttempted`,
   `CallbackRetryDue`; terminal transitions set `STANDBY → SCHEDULED` and stage one
   `DeliverCallback` per callback (`activity.go:421-426 @ v1.32.0`); `DeliverCallbackHandler`
   and `CallbackRetryHandler` with ids 6 and 7; attempt recording per the design's state
@@ -339,19 +347,53 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   `<request_id>-<idx>`, registration time from the context clock (`activity.go:429-475 @
   v1.32.0`).
   - _Requirements: 5.4, 5.5, 5.6, 5.8_
-- [ ] 7.4 `validate_and_normalize` gains `callbacks` and `version_target`; the `Internal`
+
+  **DONE (2026-09-16, stage 7):** Pure attachment derives ids/time and preserves upstream
+  empty-batch, closed-status, cap-before-upsert and replacement behavior. Added the
+  default-2000 config cap and message-preserving FailedPrecondition error/edge mapping.
+  All five terminal transitions schedule Standby callbacks; reserved handlers 6/7 validate
+  callback state and attempt, record outcomes and retry deadlines, and stage the next task.
+  The exported postcard outcome envelope carries executor-computed deadlines; pure retry
+  helpers support stage 9's evaluator without changing activity timeout helpers. Exact
+  errors, task codecs, stale/invalid states, absorption and original close time are tested.
+  Ground truth: `chasm/lib/activity/activity.go:421–475` and
+  `chasm/lib/callback/{statemachine.go,component.go,tasks.go,config.go} @ v1.32.0`.
+- [x] 7.4 `validate_and_normalize` gains `callbacks` and `version_target`; the `Internal`
   wire variant is never constructed here (the edge rejects it); an `InternalTarget` is
   accepted only through the executor path. `ActivityRequest` documents both fields.
   - _Requirements: 5.2, 5.3, 6.1, 7.1_
-- [ ] 7.5 Property test: Property 10 — callback delivery state machine
+
+  **DONE (2026-09-16, stage 7):** ActivityRequest documents D1/D2 and validates the
+  deployment/build pair and callback target shape, naming invalid callback indices.
+  Internal plain event inputs are accepted here; stage 9 enforces executor-only provenance
+  at edge admission and rejects the public wire variant. The edge request still supplies
+  an empty callback list and no version target. Existing timeout normalization is unchanged.
+- [x] 7.5 Property test: Property 10 — callback delivery state machine
   - Generated terminal transitions and per-callback outcome sequences against the kernel
     callback model's state graph; attempts counted once; next attempt time equals the shared
     backoff; non-retryable is terminal.
   - Tag: `// Feature: chasm-extension-archetypes, Property 10: callback delivery state machine`
   - _Requirements: 5.6, 5.7, 5.8_
 
-- [ ] 8. Checkpoint: `cargo clippy -p tokeira-chasm-activity --all-targets` clean; `cargo
+  **DONE (2026-09-16, stage 7):** 128 generated cases in `callbacks/tests.rs` cover 1–5
+  mixed-target callbacks, all five legal terminal paths and 0–4 retries followed by pending,
+  success or permanent failure. The model is the upstream callback graph at v1.32.0;
+  assertions cover exactly staged tasks, attempts, stale fences, failures, settlement,
+  lifecycle and supplied retry deadlines recorded verbatim. Shared-backoff calculation is
+  the executor's responsibility in stage 9, not performed by the pure component.
+
+- [x] 8. Checkpoint: `cargo clippy -p tokeira-chasm-activity --all-targets` clean; `cargo
   nextest run -p tokeira-chasm-activity` green; every existing statemachine test unchanged.
+
+  **DONE (2026-09-16, stage 7):** Locked check and all-target Clippy pass for activity,
+  substrate, edge and runtime. Their focused nextest suite passes all 1,232 tests, including
+  Property 10, extension Properties 1–6 and visibility repair Property 14. Existing activity
+  tests retain their state/task assertions and now also assert callbacks remain absent and
+  lifecycle equals `lifecycle_for(status)`. The full workspace bar passes: fmt, lint,
+  check, nextest (3,396 passed, 2 skipped; one subprocess-leak diagnostic in an existing
+  architecture test), doctests and warnings-denied docs. The unchanged visibility
+  Properties 12–14 all pass. Live DSQL and the functional Go corpus were not run for this
+  pure-library slice; executor/wire integration remains stage 9.
 
 ### Stage 9 — Edge: executors, versioned queue, provenance, RPC surface (`tokeira-edge`)
 

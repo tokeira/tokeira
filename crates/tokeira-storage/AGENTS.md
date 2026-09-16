@@ -25,11 +25,18 @@ Migration* (the root keeps the name and points here). The rules:
   supported, idempotent `ALTER TABLE` operation.
 - **Contiguous versions.** No gaps or duplicate `VNNN`; the baseline ends at V067,
   V068 (the per-run history size) is the first forward-only migration above it, and the
-  next schema change is V069.
+  next schema change is V072 (V069–V071 add the archetype pointer and backfill marker).
 - **DSQL DDL subset always.** One statement per file; secondary indexes created `ASYNC`;
   no `CHECK` constraints (validate in the application); no `BIGSERIAL` (generate IDs
   in-app). `src/dsql/validation.rs` (`DdlValidator`) enforces the safe subset — if it
   rejects your DDL, the DDL is wrong, not the validator.
+
+## CHASM pointer retirement
+
+`chasm_current_run` is read-only compatibility state. Retire it only through a later
+migration after a full release with `chasm_current_execution_backfill` set in
+`chasm_backfill_marker` and no fallback reads served during that release. Never write
+legacy pointers; new starts and deletes use `chasm_current_execution`.
 
 ## Connection management is a DSQL survival invariant
 

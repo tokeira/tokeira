@@ -879,7 +879,7 @@ impl ActivityBridge {
         self.ensure_enabled()?;
         Ok(self
             .engine
-            .current_run(namespace_id, activity_id)
+            .current_run(namespace_id, self.archetype_id, activity_id)
             .await
             .map_err(map_chasm_err)?
             .map(|current| current.run_id))

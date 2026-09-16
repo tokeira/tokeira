@@ -14,7 +14,10 @@
 //! verification vehicle the CHASM engine integration tests run over (design
 //! Verification; spec task 15.1); the DSQL implementation persists the same
 //! semantics against the `chasm_node` table (migration `V049`) and lives behind the
-//! `dsql` feature.
+//! `dsql` feature. Current-run pointers are keyed by namespace, archetype and
+//! business id, and are committed with new nodes. During migration, root-checked
+//! legacy fallback keeps activities reachable until the bootstrap backfill's
+//! durable completion marker disables it.
 //!
 //! ## The CAS-fenced, all-or-nothing batch
 //!
@@ -27,10 +30,14 @@
 //! the same fenced-commit posture as the workflow `RunRepository`, specialized to
 //! the per-node VT stamp.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Mutex,
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokeira_chasm::{ChasmNode, ExecutionKey, LifecycleState, VersionedTransition};
 
 /// The compare-and-set precondition for persisting one dirty node (Requirement
@@ -73,14 +80,14 @@ pub enum NodePersistOutcome {
     },
 }
 
-/// The authoritative current-run pointer value for one `(namespace_id, business_id)`
+/// The authoritative current-run pointer value for one `(namespace_id, archetype_id, business_id)`
 /// — the CHASM analog of the workflow `current_execution` row (migration `V003`;
 /// `activity-executions-first-class` design Item 1). Resolves a bare-id (empty
-/// `run_id`) request to a concrete run. `status` lets the Start path apply the id
-/// reuse/conflict policy without loading the run; `vt_epoch` is the run's committing
+/// `run_id`) request to a concrete run. `status` is advisory for scans; the Start
+/// path reads the live root for reuse/conflict policy. `vt_epoch` is the run's committing
 /// `VersionedTransition` — the optimistic fence for a superseding advance, the analog
 /// of v1.31.0's `last_write_version` conditional update on the current-execution row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrentRun {
     /// The current run's id.
     pub run_id: String,
@@ -99,6 +106,64 @@ pub struct CurrentRun {
     pub status: LifecycleState,
     /// The current run's committing VersionedTransition (the advance fence).
     pub vt_epoch: VersionedTransition,
+}
+
+/// Durable proof that legacy pointers have been copied before request admission.
+pub const CHASM_CURRENT_EXECUTION_BACKFILL_MARKER: &str = "chasm_current_execution_backfill";
+
+/// A scoped pointer and the execution it addresses. Pointer status is advisory,
+/// as on [`CurrentRun`]; callers deciding lifecycle policy must load the root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentExecution {
+    /// Namespace, business id and current run id.
+    pub key: ExecutionKey,
+    /// Root archetype owning this business-id space.
+    pub archetype_id: u32,
+    /// Persisted pointer value.
+    pub current: CurrentRun,
+}
+
+/// Exclusive keyset position for a current-pointer scan. The next page starts
+/// strictly after this key, including when the cursor's row no longer exists.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CurrentExecutionCursor {
+    /// Namespace owning the pointer.
+    pub namespace_id: String,
+    /// Root archetype owning the business-id space.
+    pub archetype_id: u32,
+    /// Business id within the namespace and archetype.
+    pub business_id: String,
+}
+
+/// Complete the legacy activity-pointer copy before serving requests. Existing
+/// scoped pointers win, so restarting a partially finished backfill is harmless.
+/// A failed batch leaves the marker unset; callers may retry the whole driver.
+/// Returns this invocation's copied rows (zero when already marked complete).
+/// `batch` must be nonzero; zero must never masquerade as a completed backfill.
+pub async fn run_current_execution_backfill(
+    repo: &dyn ChasmNodeRepository,
+    archetype_id: u32,
+    batch: usize,
+) -> Result<u64> {
+    anyhow::ensure!(batch > 0, "CHASM backfill batch must be nonzero");
+    if repo
+        .backfill_marker_set(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
+        .await?
+    {
+        return Ok(0);
+    }
+    let mut copied = 0;
+    loop {
+        let count = repo
+            .backfill_current_executions(archetype_id, batch)
+            .await?;
+        if count == 0 {
+            repo.set_backfill_marker(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
+                .await?;
+            return Ok(copied);
+        }
+        copied += u64::try_from(count)?;
+    }
 }
 
 /// The durable store for CHASM execution node trees (Requirement 9).
@@ -120,7 +185,7 @@ pub trait ChasmNodeRepository: Send + Sync {
     ) -> Result<NodePersistOutcome>;
 
     /// Persist the dirty-node batch for a **new run** and set the
-    /// `(namespace_id, business_id)` current-run pointer to it, in one atomic unit
+    /// `(namespace_id, archetype_id, business_id)` current-run pointer to it, in one atomic unit
     /// (`activity-executions-first-class` Req 1, 2). The pointer write is
     /// co-transactional with the node batch — the analog of v1.31.0 writing the
     /// `current_executions` row inside the entity-create transaction — so a run's
@@ -130,19 +195,48 @@ pub trait ChasmNodeRepository: Send + Sync {
     async fn persist_new_execution(
         &self,
         key: &ExecutionKey,
+        archetype_id: u32,
         batch: Vec<NodeWrite>,
         current: CurrentRun,
     ) -> Result<NodePersistOutcome>;
 
-    /// Resolve the current run for `(namespace_id, business_id)` — the run a bare-id
+    /// Resolve the current run for `(namespace_id, archetype_id, business_id)` — the run a bare-id
     /// (empty `run_id`) request addresses (Req 1). `None` when the id has never had a
     /// run or its run was deleted. Authoritative; never derived from the visibility
     /// projection (a bare-id read is a read-your-write against authoritative state).
+    /// Before the backfill marker is set, an absent scoped pointer falls back to
+    /// the legacy table only if its root exists and has the requested archetype.
     async fn current_run(
         &self,
         namespace_id: &str,
+        archetype_id: u32,
         business_id: &str,
     ) -> Result<Option<CurrentRun>>;
+
+    /// Scan scoped pointers with the given advisory status, ordered by namespace,
+    /// archetype and business id. `after` is exclusive; zero limit returns no rows.
+    /// Pages observe current state independently, not a snapshot across calls.
+    async fn scan_current_executions(
+        &self,
+        status: LifecycleState,
+        after: Option<CurrentExecutionCursor>,
+        limit: usize,
+    ) -> Result<Vec<CurrentExecution>>;
+
+    /// Copy at most `batch` (capped at 500) remaining legacy pointers under the activity archetype,
+    /// in old-key order, without overwriting scoped pointers. Returns rows copied;
+    /// zero means exhausted. Rejects a zero batch. Call only during bootstrap,
+    /// before admitting mutations; legacy writers must have stopped.
+    async fn backfill_current_executions(&self, archetype_id: u32, batch: usize) -> Result<usize>;
+
+    /// Count scoped pointers per archetype, in ascending archetype-id order.
+    async fn distinct_archetypes(&self) -> Result<Vec<(u32, u64)>>;
+
+    /// Whether a named durable backfill completion marker exists.
+    async fn backfill_marker_set(&self, name: &str) -> Result<bool>;
+
+    /// Idempotently record completion, only after every backfill batch committed.
+    async fn set_backfill_marker(&self, name: &str) -> Result<()>;
 
     /// Load every node of an execution, in encoded-path order (a whole-tree range
     /// scan). Empty when the execution does not exist.
@@ -185,11 +279,17 @@ pub struct InMemoryChasmNodeStore {
     // the inner per-execution map is a `BTreeMap` so encoded-path range scans are
     // contiguous and ordered.
     executions: Mutex<HashMap<ExecutionKey, std::collections::BTreeMap<Vec<u8>, ChasmNode>>>,
-    // The current-run pointer: `(namespace_id, business_id) -> CurrentRun`. Held under
-    // its own lock; the only path that writes nodes and the pointer together
-    // (`persist_new_execution`) acquires `executions` first, then `current_runs`, so
-    // the two never tear and the consistent lock order rules out deadlock.
-    current_runs: Mutex<HashMap<(String, String), CurrentRun>>,
+    // Every path needing both locks acquires executions before pointers. Acquire
+    // both before changing either so a failed lock/fence cannot partially commit.
+    pointers: Mutex<InMemoryPointers>,
+}
+
+#[derive(Debug, Default)]
+struct InMemoryPointers {
+    current: BTreeMap<CurrentExecutionCursor, CurrentRun>,
+    // Read-only legacy state; only test fixtures populate this map.
+    legacy: BTreeMap<(String, String), CurrentRun>,
+    markers: HashSet<String>,
 }
 
 impl InMemoryChasmNodeStore {
@@ -261,40 +361,171 @@ impl ChasmNodeRepository for InMemoryChasmNodeStore {
     async fn persist_new_execution(
         &self,
         key: &ExecutionKey,
+        archetype_id: u32,
         batch: Vec<NodeWrite>,
         current: CurrentRun,
     ) -> Result<NodePersistOutcome> {
-        // Lock order: `executions` first, then `current_runs`. This is the only path
-        // that holds both, so the node batch and the pointer write land as one atomic
-        // unit and the consistent order rules out deadlock.
         let mut executions = self
             .executions
             .lock()
             .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
+        let mut pointers = self
+            .pointers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm pointer store mutex poisoned"))?;
         let tree = executions.entry(key.clone()).or_default();
         if let Some(reason) = check_and_apply_node_batch(tree, batch) {
             return Ok(NodePersistOutcome::Conflict { reason });
         }
-        let mut current_runs = self
-            .current_runs
-            .lock()
-            .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
-        current_runs.insert((key.namespace_id.clone(), key.business_id.clone()), current);
+        pointers.current.insert(
+            CurrentExecutionCursor {
+                namespace_id: key.namespace_id.clone(),
+                archetype_id,
+                business_id: key.business_id.clone(),
+            },
+            current,
+        );
         Ok(NodePersistOutcome::Applied)
     }
 
     async fn current_run(
         &self,
         namespace_id: &str,
+        archetype_id: u32,
         business_id: &str,
     ) -> Result<Option<CurrentRun>> {
-        let current_runs = self
-            .current_runs
+        let executions = self
+            .executions
             .lock()
             .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
-        Ok(current_runs
+        let pointers = self
+            .pointers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm pointer store mutex poisoned"))?;
+        let cursor = CurrentExecutionCursor {
+            namespace_id: namespace_id.to_owned(),
+            archetype_id,
+            business_id: business_id.to_owned(),
+        };
+        if let Some(current) = pointers.current.get(&cursor) {
+            return Ok(Some(current.clone()));
+        }
+        if pointers
+            .markers
+            .contains(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
+        {
+            return Ok(None);
+        }
+        // The legacy key has no archetype. The root supplies it so fallback never
+        // leaks another archetype's run, and a deleted legacy run stays absent.
+        Ok(pointers
+            .legacy
             .get(&(namespace_id.to_owned(), business_id.to_owned()))
+            .filter(|current| {
+                executions
+                    .get(&ExecutionKey::new(
+                        namespace_id,
+                        business_id,
+                        &current.run_id,
+                    ))
+                    .and_then(|tree| tree.get(b"".as_slice()))
+                    .is_some_and(|root| root.metadata.component_type_id == archetype_id)
+            })
             .cloned())
+    }
+
+    async fn scan_current_executions(
+        &self,
+        status: LifecycleState,
+        after: Option<CurrentExecutionCursor>,
+        limit: usize,
+    ) -> Result<Vec<CurrentExecution>> {
+        let pointers = self
+            .pointers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm pointer store mutex poisoned"))?;
+        Ok(pointers
+            .current
+            .iter()
+            .filter(|(key, current)| {
+                after.as_ref().is_none_or(|after| *key > after) && current.status == status
+            })
+            .take(limit)
+            .map(|(key, current)| CurrentExecution {
+                key: ExecutionKey::new(&key.namespace_id, &key.business_id, &current.run_id),
+                archetype_id: key.archetype_id,
+                current: current.clone(),
+            })
+            .collect())
+    }
+
+    async fn backfill_current_executions(&self, archetype_id: u32, batch: usize) -> Result<usize> {
+        anyhow::ensure!(batch > 0, "CHASM backfill batch must be nonzero");
+        let executions = self
+            .executions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
+        let mut pointers = self
+            .pointers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm pointer store mutex poisoned"))?;
+        // Already copied keys are the durable progress record. Filtering before
+        // limiting both resumes after a crash and advances past a full first page.
+        let rows: Vec<_> = pointers
+            .legacy
+            .iter()
+            .filter_map(|((namespace_id, business_id), current)| {
+                let cursor = CurrentExecutionCursor {
+                    namespace_id: namespace_id.clone(),
+                    archetype_id,
+                    business_id: business_id.clone(),
+                };
+                let root_matches = executions
+                    .get(&ExecutionKey::new(
+                        namespace_id,
+                        business_id,
+                        &current.run_id,
+                    ))
+                    .and_then(|tree| tree.get(b"".as_slice()))
+                    .is_some_and(|root| root.metadata.component_type_id == archetype_id);
+                (!pointers.current.contains_key(&cursor) && root_matches)
+                    .then(|| (cursor, current.clone()))
+            })
+            .take(batch.min(500))
+            .collect();
+        let count = rows.len();
+        pointers.current.extend(rows);
+        Ok(count)
+    }
+
+    async fn distinct_archetypes(&self) -> Result<Vec<(u32, u64)>> {
+        let pointers = self
+            .pointers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm pointer store mutex poisoned"))?;
+        let mut counts = BTreeMap::new();
+        for key in pointers.current.keys() {
+            *counts.entry(key.archetype_id).or_insert(0) += 1;
+        }
+        Ok(counts.into_iter().collect())
+    }
+
+    async fn backfill_marker_set(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .pointers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm pointer store mutex poisoned"))?
+            .markers
+            .contains(name))
+    }
+
+    async fn set_backfill_marker(&self, name: &str) -> Result<()> {
+        self.pointers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm pointer store mutex poisoned"))?
+            .markers
+            .insert(name.to_owned());
+        Ok(())
     }
 
     async fn load_execution(&self, key: &ExecutionKey) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
@@ -333,21 +564,18 @@ impl ChasmNodeRepository for InMemoryChasmNodeStore {
             .executions
             .lock()
             .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
-        executions.remove(key);
-        // Clear the current-run pointer iff it points at the deleted run, so a
-        // subsequent bare-id read is NotFound (read-your-write; Req 1.5). Deleting a
-        // superseded (non-current) run leaves the pointer untouched.
-        let mut current_runs = self
-            .current_runs
+        let mut pointers = self
+            .pointers
             .lock()
-            .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
-        let ptr_key = (key.namespace_id.clone(), key.business_id.clone());
-        if current_runs
-            .get(&ptr_key)
-            .is_some_and(|c| c.run_id == key.run_id)
-        {
-            current_runs.remove(&ptr_key);
-        }
+            .map_err(|_| anyhow::anyhow!("chasm pointer store mutex poisoned"))?;
+        executions.remove(key);
+        // A delete has no archetype argument: the full run key identifies its
+        // pointer. Superseded runs and other archetypes' runs remain untouched.
+        pointers.current.retain(|cursor, current| {
+            cursor.namespace_id != key.namespace_id
+                || cursor.business_id != key.business_id
+                || current.run_id != key.run_id
+        });
         Ok(())
     }
 
@@ -558,5 +786,667 @@ mod tests {
         store.persist_dirty(&key, batch).await.unwrap();
         store.delete_execution(&key).await.unwrap();
         assert!(store.load_execution(&key).await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod pointer_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use tokeira_chasm::{BusinessIdConflictPolicy, BusinessIdReusePolicy, NodeMetadata};
+    use uuid::Uuid;
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct Scenario {
+        pub(crate) archetypes: [u32; 2],
+        pub(crate) legacy: Vec<Option<LifecycleState>>,
+        starts: Vec<Start>,
+        marker_at: usize,
+        batch: usize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Start {
+        second: bool,
+        business: usize,
+        request: String,
+        reuse: u8,
+        conflict: u8,
+        close: Option<LifecycleState>,
+    }
+
+    fn lifecycle() -> impl Strategy<Value = LifecycleState> {
+        prop_oneof![
+            Just(LifecycleState::Running),
+            Just(LifecycleState::Completed),
+            Just(LifecycleState::Failed)
+        ]
+    }
+
+    pub(crate) fn scenarios() -> impl Strategy<Value = Scenario> {
+        scenario_strategy(6, 32)
+    }
+
+    #[cfg(feature = "dsql")]
+    pub(crate) fn dsql_scenarios() -> impl Strategy<Value = Scenario> {
+        // Keep 100 real-database cases within the integration test time budget;
+        // the same model covers all policies and marker positions with short traces.
+        scenario_strategy(3, 6)
+    }
+
+    fn scenario_strategy(businesses: usize, steps: usize) -> impl Strategy<Value = Scenario> {
+        (
+            any::<u32>(),
+            1_u32..=u32::MAX,
+            prop::collection::vec(prop::option::of(lifecycle()), 1..businesses),
+            prop::collection::vec(
+                (
+                    any::<bool>(),
+                    0_usize..5,
+                    "[a-c]{0,2}",
+                    0_u8..3,
+                    0_u8..3,
+                    prop::option::of(lifecycle()),
+                ),
+                1..steps,
+            ),
+            any::<usize>(),
+            1_usize..4,
+        )
+            .prop_map(|(first, mask, legacy, starts, marker_at, batch)| Scenario {
+                archetypes: [first, first ^ mask],
+                marker_at: marker_at % (starts.len() + 1),
+                legacy,
+                starts: starts
+                    .into_iter()
+                    .map(
+                        |(second, business, request, reuse, conflict, close)| Start {
+                            second,
+                            business,
+                            request,
+                            reuse,
+                            conflict,
+                            close,
+                        },
+                    )
+                    .collect(),
+                batch,
+            })
+    }
+
+    pub(crate) fn root(archetype: u32, status: LifecycleState, count: i64) -> NodeWrite {
+        NodeWrite {
+            encoded_path: Vec::new(),
+            node: ChasmNode {
+                metadata: NodeMetadata::new(
+                    archetype,
+                    Some(status),
+                    VersionedTransition::new(1, count),
+                ),
+                data: Some(vec![42]),
+            },
+            expected: ExpectedVersion::Absent,
+        }
+    }
+
+    pub(crate) fn current(run_id: String, request_id: &str, status: LifecycleState) -> CurrentRun {
+        CurrentRun {
+            run_id,
+            request_id: request_id.to_owned(),
+            status,
+            vt_epoch: VersionedTransition::new(1, 1),
+        }
+    }
+
+    pub(crate) fn legacy_rows(
+        scenario: &Scenario,
+        namespace: &str,
+    ) -> Vec<(ExecutionKey, CurrentRun)> {
+        scenario
+            .legacy
+            .iter()
+            .enumerate()
+            .filter_map(|(index, status)| {
+                status.map(|status| {
+                    let run_id = Uuid::from_u128(index as u128 + 1).to_string();
+                    let key = ExecutionKey::new(namespace, format!("business-{index}"), &run_id);
+                    (key, current(run_id, "a", status))
+                })
+            })
+            .collect()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        Created,
+        Existing(String),
+        Rejected(String),
+        Unsupported,
+    }
+
+    // Policy is deliberately a test-side adapter: storage owns identity, never
+    // lifecycle semantics. The table model below is independent of repository reads.
+    async fn start(
+        repo: &dyn ChasmNodeRepository,
+        key: &ExecutionKey,
+        archetype: u32,
+        request: &str,
+        reuse: u8,
+        conflict: u8,
+    ) -> Result<Outcome> {
+        if let Some(pointer) = repo
+            .current_run(&key.namespace_id, archetype, &key.business_id)
+            .await?
+        {
+            let existing = ExecutionKey::new(&key.namespace_id, &key.business_id, &pointer.run_id);
+            let nodes = repo.load_execution(&existing).await?;
+            let node = &nodes
+                .iter()
+                .find(|(path, _)| path.is_empty())
+                .expect("current root")
+                .1;
+            anyhow::ensure!(
+                node.metadata.component_type_id == archetype,
+                "cross-archetype root"
+            );
+            if !request.is_empty() && pointer.request_id == request {
+                return Ok(Outcome::Existing(pointer.run_id));
+            }
+            let reuse = [
+                BusinessIdReusePolicy::AllowDuplicate,
+                BusinessIdReusePolicy::AllowDuplicateFailedOnly,
+                BusinessIdReusePolicy::RejectDuplicate,
+            ][usize::from(reuse)];
+            let conflict = [
+                BusinessIdConflictPolicy::Fail,
+                BusinessIdConflictPolicy::UseExisting,
+                BusinessIdConflictPolicy::TerminateExisting,
+            ][usize::from(conflict)];
+            if node.metadata.lifecycle_state == Some(LifecycleState::Running) {
+                return Ok(match conflict {
+                    BusinessIdConflictPolicy::Fail => Outcome::Rejected(pointer.run_id),
+                    BusinessIdConflictPolicy::UseExisting => Outcome::Existing(pointer.run_id),
+                    BusinessIdConflictPolicy::TerminateExisting => Outcome::Unsupported,
+                });
+            }
+            if reuse == BusinessIdReusePolicy::RejectDuplicate
+                || (reuse == BusinessIdReusePolicy::AllowDuplicateFailedOnly
+                    && node.metadata.lifecycle_state == Some(LifecycleState::Completed))
+            {
+                return Ok(Outcome::Rejected(pointer.run_id));
+            }
+        }
+        let pointer = current(key.run_id.clone(), request, LifecycleState::Running);
+        anyhow::ensure!(
+            repo.persist_new_execution(
+                key,
+                archetype,
+                vec![root(archetype, LifecycleState::Running, 1)],
+                pointer
+            )
+            .await?
+                == NodePersistOutcome::Applied,
+            "start fence"
+        );
+        Ok(Outcome::Created)
+    }
+
+    pub(crate) async fn exercise(
+        repo: &dyn ChasmNodeRepository,
+        scenario: &Scenario,
+        namespace: &str,
+    ) -> Result<()> {
+        let mut model: BTreeMap<(u32, String), (CurrentRun, LifecycleState)> =
+            legacy_rows(scenario, namespace)
+                .into_iter()
+                .map(|(key, pointer)| {
+                    (
+                        (scenario.archetypes[0], key.business_id),
+                        (pointer.clone(), pointer.status),
+                    )
+                })
+                .collect();
+        for step in 0..=scenario.starts.len() {
+            if step == scenario.marker_at {
+                run_current_execution_backfill(repo, scenario.archetypes[0], scenario.batch)
+                    .await?;
+                anyhow::ensure!(
+                    repo.backfill_marker_set(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
+                        .await?,
+                    "missing marker"
+                );
+                anyhow::ensure!(
+                    run_current_execution_backfill(repo, scenario.archetypes[0], scenario.batch)
+                        .await?
+                        == 0,
+                    "driver not idempotent"
+                );
+            }
+            for archetype in scenario.archetypes {
+                for business in 0..scenario.legacy.len() {
+                    let business = format!("business-{business}");
+                    let expected = model
+                        .get(&(archetype, business.clone()))
+                        .map(|(pointer, _)| pointer.clone());
+                    anyhow::ensure!(
+                        repo.current_run(namespace, archetype, &business).await? == expected,
+                        "pointer mismatch at step {step}, archetype {archetype}, business {business}"
+                    );
+                }
+            }
+            let Some(Start {
+                second,
+                business,
+                request,
+                reuse,
+                conflict,
+                close,
+            }) = scenario.starts.get(step)
+            else {
+                break;
+            };
+            let archetype = scenario.archetypes[usize::from(*second)];
+            let business = format!("business-{}", business % scenario.legacy.len());
+            let key = ExecutionKey::new(
+                namespace,
+                &business,
+                Uuid::from_u128(step as u128 + 100).to_string(),
+            );
+            // service/history/chasm_engine.go @ v1.31.0: request-id idempotence
+            // precedes the live-conflict / terminal-reuse matrix.
+            let expected = match model.get(&(archetype, business.clone())) {
+                None => Outcome::Created,
+                Some((pointer, _)) if !request.is_empty() && request == &pointer.request_id => {
+                    Outcome::Existing(pointer.run_id.clone())
+                }
+                Some((pointer, LifecycleState::Running)) => match conflict {
+                    0 => Outcome::Rejected(pointer.run_id.clone()),
+                    1 => Outcome::Existing(pointer.run_id.clone()),
+                    _ => Outcome::Unsupported,
+                },
+                Some((pointer, state)) => match (reuse, state) {
+                    (0, _) | (1, LifecycleState::Failed) => Outcome::Created,
+                    _ => Outcome::Rejected(pointer.run_id.clone()),
+                },
+            };
+            let outcome = start(repo, &key, archetype, request, *reuse, *conflict).await?;
+            anyhow::ensure!(
+                outcome == expected,
+                "outcome mismatch at step {step}: {outcome:?} != {expected:?}"
+            );
+            if outcome == Outcome::Created {
+                model.insert(
+                    (archetype, business.clone()),
+                    (
+                        current(key.run_id.clone(), request, LifecycleState::Running),
+                        LifecycleState::Running,
+                    ),
+                );
+            }
+            if let (Some(status), Some((pointer, lifecycle))) =
+                (close, model.get_mut(&(archetype, business)))
+            {
+                let current_key = ExecutionKey::new(namespace, &key.business_id, &pointer.run_id);
+                let nodes = repo.load_execution(&current_key).await?;
+                let prior = nodes[0].1.metadata.versioned_transition;
+                let mut write = root(archetype, *status, prior.transition_count + 1);
+                write.expected = ExpectedVersion::Vt(prior);
+                anyhow::ensure!(
+                    repo.persist_dirty(&current_key, vec![write]).await?
+                        == NodePersistOutcome::Applied,
+                    "close fence"
+                );
+                *lifecycle = *status;
+            }
+        }
+        let scanned = repo
+            .scan_current_executions(LifecycleState::Running, None, usize::MAX / 2)
+            .await?;
+        let expected_running = model
+            .values()
+            .filter(|(pointer, _)| pointer.status == LifecycleState::Running)
+            .count();
+        anyhow::ensure!(scanned.len() == expected_running, "scan status mismatch");
+        let mut after = None;
+        let mut paged = Vec::new();
+        loop {
+            let page = repo
+                .scan_current_executions(LifecycleState::Running, after, scenario.batch)
+                .await?;
+            let Some(last) = page.last() else { break };
+            after = Some(CurrentExecutionCursor {
+                namespace_id: last.key.namespace_id.clone(),
+                archetype_id: last.archetype_id,
+                business_id: last.key.business_id.clone(),
+            });
+            paged.extend(page);
+            anyhow::ensure!(
+                paged.len() <= model.len(),
+                "keyset cursor failed to advance"
+            );
+        }
+        anyhow::ensure!(
+            paged == scanned,
+            "keyset scan skipped or repeated a pointer"
+        );
+        let mut counts = BTreeMap::new();
+        for (archetype, _) in model.keys() {
+            *counts.entry(*archetype).or_insert(0_u64) += 1;
+        }
+        anyhow::ensure!(
+            repo.distinct_archetypes().await? == counts.into_iter().collect::<Vec<_>>(),
+            "archetype counts mismatch"
+        );
+        Ok(())
+    }
+
+    async fn seed(
+        store: &InMemoryChasmNodeStore,
+        key: &ExecutionKey,
+        archetype: u32,
+        pointer: CurrentRun,
+    ) {
+        store
+            .persist_dirty(key, vec![root(archetype, pointer.status, 1)])
+            .await
+            .unwrap();
+        store
+            .pointers
+            .lock()
+            .unwrap()
+            .legacy
+            .insert((key.namespace_id.clone(), key.business_id.clone()), pointer);
+    }
+
+    // Feature: chasm-extension-archetypes, Property 8: archetype-scoped business ids
+    // Interleaving archetypes and backfill preserves independent single-archetype outcomes.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn archetype_scoped_business_ids(scenario in scenarios()) {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let store = InMemoryChasmNodeStore::new();
+                let namespace = Uuid::new_v4().to_string();
+                for (key, pointer) in legacy_rows(&scenario, &namespace) {
+                    seed(&store, &key, scenario.archetypes[0], pointer).await;
+                }
+                exercise(&store, &scenario, &namespace).await.unwrap();
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_resumes_and_preserves_newer_pointers() {
+        let store = InMemoryChasmNodeStore::new();
+        for id in 0..7 {
+            let key = ExecutionKey::new("ns", id.to_string(), "old");
+            seed(
+                &store,
+                &key,
+                7,
+                current("old".into(), "old-request", LifecycleState::Running),
+            )
+            .await;
+        }
+        assert_eq!(store.backfill_current_executions(7, 2).await.unwrap(), 2);
+        assert!(
+            !store
+                .backfill_marker_set(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
+                .await
+                .unwrap()
+        );
+        let key = ExecutionKey::new("ns", "3", "new");
+        let new = current("new".into(), "new-request", LifecycleState::Failed);
+        store
+            .persist_new_execution(
+                &key,
+                7,
+                vec![root(7, LifecycleState::Failed, 1)],
+                new.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            run_current_execution_backfill(&store, 7, 2).await.unwrap(),
+            4
+        );
+        assert_eq!(store.current_run("ns", 7, "3").await.unwrap(), Some(new));
+        assert_eq!(store.distinct_archetypes().await.unwrap(), vec![(7, 7)]);
+        assert_eq!(
+            run_current_execution_backfill(&store, 7, 2).await.unwrap(),
+            0
+        );
+        assert_eq!(store.pointers.lock().unwrap().legacy.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn fallback_requires_matching_root_and_unset_marker() {
+        let store = InMemoryChasmNodeStore::new();
+        let key = ExecutionKey::new("ns", "business", "old");
+        let pointer = current("old".into(), "request", LifecycleState::Completed);
+        seed(&store, &key, 7, pointer.clone()).await;
+        assert_eq!(
+            store.current_run("ns", 7, "business").await.unwrap(),
+            Some(pointer)
+        );
+        assert_eq!(store.current_run("ns", 8, "business").await.unwrap(), None);
+        store
+            .set_backfill_marker(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
+            .await
+            .unwrap();
+        store
+            .set_backfill_marker(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
+            .await
+            .unwrap();
+        assert_eq!(store.current_run("ns", 7, "business").await.unwrap(), None);
+        assert!(!store.backfill_marker_set("different-marker").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn deleted_legacy_root_cannot_be_resurrected() {
+        let store = InMemoryChasmNodeStore::new();
+        let key = ExecutionKey::new("ns", "business", "old");
+        seed(
+            &store,
+            &key,
+            7,
+            current("old".into(), "request", LifecycleState::Running),
+        )
+        .await;
+        store.delete_execution(&key).await.unwrap();
+        assert_eq!(store.current_run("ns", 7, "business").await.unwrap(), None);
+        assert_eq!(
+            run_current_execution_backfill(&store, 7, 1).await.unwrap(),
+            0
+        );
+        assert_eq!(store.pointers.lock().unwrap().legacy.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pointer_and_nodes_commit_atomically_and_delete_by_run() {
+        let store = InMemoryChasmNodeStore::new();
+        let old = ExecutionKey::new("ns", "business", "old");
+        for (archetype, run) in [(7, "old"), (8, "other"), (7, "new")] {
+            let key = ExecutionKey::new("ns", "business", run);
+            let pointer = current(run.into(), run, LifecycleState::Running);
+            assert_eq!(
+                store
+                    .persist_new_execution(
+                        &key,
+                        archetype,
+                        vec![root(archetype, LifecycleState::Running, 1)],
+                        pointer
+                    )
+                    .await
+                    .unwrap(),
+                NodePersistOutcome::Applied
+            );
+        }
+        let invalid = current("bad".into(), "bad", LifecycleState::Completed);
+        assert!(matches!(
+            store
+                .persist_new_execution(
+                    &old,
+                    7,
+                    vec![root(7, LifecycleState::Completed, 1)],
+                    invalid
+                )
+                .await
+                .unwrap(),
+            NodePersistOutcome::Conflict { .. }
+        ));
+        store.delete_execution(&old).await.unwrap();
+        assert_eq!(
+            store
+                .current_run("ns", 7, "business")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_id,
+            "new"
+        );
+        store
+            .delete_execution(&ExecutionKey::new("ns", "business", "new"))
+            .await
+            .unwrap();
+        assert_eq!(store.current_run("ns", 7, "business").await.unwrap(), None);
+        assert_eq!(
+            store
+                .current_run("ns", 8, "business")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_id,
+            "other"
+        );
+        assert!(store.pointers.lock().unwrap().legacy.is_empty());
+        assert!(
+            store
+                .scan_current_executions(LifecycleState::Running, None, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_orders_namespaces_archetypes_and_business_ids_with_exclusive_cursors() {
+        let store = InMemoryChasmNodeStore::new();
+        for (namespace, archetype, business, status) in [
+            ("b", 1, "a", LifecycleState::Running),
+            ("a", u32::MAX, "a", LifecycleState::Running),
+            ("a", 0, "z", LifecycleState::Running),
+            ("a", 0, "a", LifecycleState::Running),
+            ("a", 0, "b", LifecycleState::Completed),
+        ] {
+            let key = ExecutionKey::new(namespace, business, format!("{archetype}-{business}"));
+            store
+                .persist_new_execution(
+                    &key,
+                    archetype,
+                    vec![root(archetype, status, 1)],
+                    current(key.run_id.clone(), "request", status),
+                )
+                .await
+                .unwrap();
+        }
+        let all = store
+            .scan_current_executions(LifecycleState::Running, None, 10)
+            .await
+            .unwrap();
+        let keys: Vec<_> = all
+            .iter()
+            .map(|row| {
+                (
+                    row.key.namespace_id.as_str(),
+                    row.archetype_id,
+                    row.key.business_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("a", 0, "a"),
+                ("a", 0, "z"),
+                ("a", u32::MAX, "a"),
+                ("b", 1, "a")
+            ]
+        );
+        let after = CurrentExecutionCursor {
+            namespace_id: "a".into(),
+            archetype_id: 0,
+            business_id: "missing".into(),
+        };
+        assert_eq!(
+            store
+                .scan_current_executions(LifecycleState::Running, Some(after), 2)
+                .await
+                .unwrap(),
+            all[1..3]
+        );
+        assert_eq!(
+            store
+                .scan_current_executions(LifecycleState::Completed, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .scan_current_executions(LifecycleState::Failed, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_batch_cannot_mark_an_incomplete_backfill() {
+        let store = InMemoryChasmNodeStore::new();
+        assert!(store.backfill_current_executions(7, 0).await.is_err());
+        assert!(run_current_execution_backfill(&store, 7, 0).await.is_err());
+        assert!(
+            !store
+                .backfill_marker_set(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_pointer_sql_is_read_only() {
+        fn check(path: &std::path::Path) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    check(&path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    let production = source.split("#[cfg(test)]").next().unwrap();
+                    let normalized = production
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_ascii_lowercase();
+                    for verb in [
+                        "insert into",
+                        "update",
+                        "delete from",
+                        "truncate",
+                        "merge into",
+                    ] {
+                        assert!(
+                            !normalized.contains(&format!("{verb} chasm_current_run")),
+                            "legacy write in {}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        check(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     }
 }

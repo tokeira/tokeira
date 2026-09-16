@@ -455,6 +455,14 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         "Enable the v1.31.0 preview standalone-activity surface."
     ),
     field!(
+        "policy.compatibility.enable_standalone_activity_callbacks",
+        ConfiguredParity,
+        "false",
+        false,
+        Some("activity-executions"),
+        "Enable standalone-activity callbacks; requires standalone activities."
+    ),
+    field!(
         "policy.task_queues.enable_fairness",
         ConfiguredParity,
         "false",
@@ -910,6 +918,7 @@ max_signal_payload_bytes = 4194304
 
 [policy.compatibility]
 enable_standalone_activities = false
+enable_standalone_activity_callbacks = false
 
 [policy.task_queues]
 # Priority remains enabled when this field is absent; User Fairness does not.

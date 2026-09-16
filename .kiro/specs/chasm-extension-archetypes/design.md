@@ -436,6 +436,10 @@ impl ChasmEngine {
 pub enum OutcomeApplied { Applied(UpdateOutcome), NotHeld, ExecutionMissing }
 ```
 
+Both generic paths reject a closed root with `ExecutionClosed` after checking held/due
+work, preserving `NotHeld` for stale delivery; pending activity callbacks keep lifecycle
+Running, so this guard exposes anomalous stored work without blocking callback completion.
+
 **Pure-task execution and the sweeper.** `ChasmTimerSweeper` keeps `sweep_once` and its
 evaluator. Per execution it now does: if an evaluator is installed for the execution's
 archetype, call it (unchanged); otherwise load the root node, select pure tasks with
@@ -456,7 +460,15 @@ impl ChasmTimerSweeper {
 ```rust
 // rebuild.rs (new)
 pub struct OutboxRebuildScanner { nodes: Arc<dyn ChasmNodeRepository>, engine: Arc<ChasmEngine>, sink: Arc<dyn DispatchSink>, page: usize }
-pub struct RebuildStats { pub scanned: usize, pub timers_armed: usize, pub effects_dispatched: usize }
+pub enum RebuildFailure {
+    MissingRootData,
+    UnknownTaskType { task_type_id: u32 },
+    UndecodablePayload { task_type_id: u32 },
+}
+pub struct RebuildStats {
+    pub scanned: usize, pub timers_armed: usize, pub effects_dispatched: usize,
+    pub unserviceable: usize, pub first_unserviceable: Option<(u32, RebuildFailure)>,
+}
 impl OutboxRebuildScanner {
     pub fn new(nodes: Arc<dyn ChasmNodeRepository>, engine: Arc<ChasmEngine>, sink: Arc<dyn DispatchSink>) -> Self;
     /// One pass: list running pointers (deterministic order), load each root node,
@@ -468,7 +480,14 @@ impl OutboxRebuildScanner {
 
 The engine bootstrap calls `rebuild_once` before the gRPC adapter starts serving
 (Requirements 2.4, 3.4) and then spawns it on `CHASM_REBUILD_INTERVAL` (a constant beside
-`VISIBILITY_REPAIR_INTERVAL`).
+`VISIBILITY_REPAIR_INTERVAL`). Before publishing derived work, the pass validates every
+persisted pure and side-effect task, including future deadlines. A missing root payload,
+unknown task handler or undecodable component/task payload isolates that execution: clear
+its armed timer, log the cause at error level, increment `unserviceable` and remember the
+first archetype and explicit `RebuildFailure`, then continue healing other executions.
+Storage page/load errors still abort the pass. Startup refuses a nonzero count with
+`EmbeddedEngineStartError::UnserviceableOutbox`; periodic passes only log the diagnostic.
+Each cause renders its own sentence, and only task-related causes contain a task type id.
 
 **Executors shipped by this design.**
 
@@ -555,9 +574,14 @@ impl<C> TypedEngine<C> where C: EngineComponent + RootComponent + SearchAttribut
 
 **Search-attribute seeding.** At start, for every namespace, and inside
 `seed_predefined_search_attributes` for namespaces created later, the engine registers each
-`(component, SearchAttributeDef)` through the projection store's `register_attr`; a type
-mismatch aborts start with `UnregisteredArchetype`-style detail naming namespace, key and
-both types (Requirements 1.8, 1.9).
+`(component, SearchAttributeDef)` through the projection store. The engine maps every
+`SearchAttrKind` one-to-one onto `SearchAttrType`, then resolves the existing key before
+registering: matching types are a no-op, missing keys register, and conflicting types
+produce `SearchAttributeSeedError` naming namespace, key, declared and existing types.
+This order matters because projection registration returns an existing id without checking
+type. Startup maps a mismatch to `EmbeddedEngineStartError::SearchAttributeType`; the
+operator wrapper receives the frozen declarations at construction and surfaces the same
+seed error when creating a later namespace (Requirements 1.8, 1.9).
 
 ### Storage: `crates/tokeira-storage`
 
@@ -724,13 +748,19 @@ chasm-extensions = []   # unstable embedder surface; no semver promise
 #[cfg(feature = "chasm-extensions")]
 pub mod chasm {
     pub use tokeira_chasm::{ChasmError, Component, ComponentRef, Context, EngineComponent, Library,
-        MutableContext, PureTaskHandler, RegistryBuilder, RootComponent, SearchAttributeDef,
+        MutableContext, PureTaskHandler, RegistryBuilder, RootComponent, SearchAttributeDef, SearchAttrKind,
         SideEffectTaskHandler, StartActivityTask, Task, TaskId, TaskKind, TaskOutcome, TaskValidity,
         DeploymentVersionTarget};
     pub use tokeira_runtime::chasm::{SideEffectExecutor, TypedEngine};
 }
 
-pub struct EngineBuilder { /* config, libraries: Vec<fn(&mut RegistryBuilder) -> Result<(), ChasmError>>, executors, clock */ }
+struct ChasmExtensions {
+    libraries: Vec<fn(&mut RegistryBuilder) -> Result<(), ChasmError>>,
+    executors: Vec<Arc<dyn SideEffectExecutor>>,
+    clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
+}
+#[cfg(feature = "chasm-extensions")]
+pub struct EngineBuilder { config: EmbeddedEngineConfig, extensions: ChasmExtensions }
 impl Engine {
     #[cfg(feature = "chasm-extensions")]
     pub fn builder(config: EmbeddedEngineConfig) -> EngineBuilder;
@@ -746,16 +776,37 @@ impl EngineBuilder {
 }
 ```
 
-`build` performs, in order: register built-in libraries, `seal_built_ins`, register
-extension libraries, freeze the registry, construct storage, run the pointer backfill until
-zero, `distinct_archetypes` fail-closed check, construct the empty multiplexer, construct
-`ChasmEngine` with the clock, register built-in executors with weak engine handles then
-extension executors, seed search
-attributes, `rebuild_once`, then everything `start_with_embedded_config` does today.
-`start_with_embedded_config` becomes `Engine::builder(config).build()`. `Engine` gains the
-fields `chasm_engine: Arc<ChasmEngine>` and `registry: Arc<Registry>`.
-Every executor must be registered before `rebuild_once` and before serving; stage 9's
-bootstrap and stage 11's builder share this ordering.
+The builder is a thin front over the existing bootstrap. A private `ChasmExtensions`
+threads libraries, executors and the optional clock through both the in-memory and DSQL
+start paths into `build_service_stack_with_storage`. The public
+`start_with_embedded_config` keeps its signature and supplies an empty extensions value.
+The feature gates the builder, typed handle and re-exports; seeding, fail-closed checks and
+`Engine` fields `chasm_engine: Arc<ChasmEngine>` and `registry: Arc<Registry>` exist in
+every deployment.
+
+Within the shared bootstrap, register the activity library, `seal_built_ins`, register
+extensions and freeze. This pure registration precedes construction of the operator wrapper
+so it can retain the immutable declarations. The stateful CHASM block keeps this order:
+pointer backfill until zero, `distinct_archetypes` fail-closed check, empty multiplexer,
+`ChasmEngine` with the optional clock, bridge and three built-in executors, extension
+executors, search-attribute seeding, `rebuild_once`, then the background spawns. Every
+executor is registered before rebuild and serving. Extension libraries enable the generic
+timer sweeper even when standalone activities are disabled; activities keep their evaluator.
+
+`check_registered_archetypes` compares ordered stored pairs to the frozen registry. Named
+startup errors preserve operator diagnostics: `Registry(ChasmError)`,
+`UnregisteredArchetype { archetype_id, executions }`,
+`SearchAttributeType { namespace, key, declared, existing }` and
+`UnserviceableOutbox { archetype_id, cause: RebuildFailure, executions }`. Their messages
+name the failure and remedy; unrelated startup failures retain phase-only redaction.
+
+Properties 13 and 16 drive the comparison/seeding helpers for 128 generated cases, with
+focused real-start wiring examples. The builder integration library defines a root over
+a prost data message and one declared key, with no task payloads or new dependencies.
+It proves typed access, missing/reserved registration errors, a duplicate executor stub
+naming the dispatch id, seeding, and the clock through an activity's scheduled time.
+Extension tasks and a pure task fired at the injected clock belong to stage 13's acceptance
+crate and Property 14.
 
 ### Acceptance archetype: `crates/tokeira-chasm-acceptance` (publish = false, dev-only)
 
@@ -997,7 +1048,10 @@ A 128-case generated test compares callback-bearing gate-off starts against empt
 | Task FQN or id collision, derived id in reserved range | `ChasmError::TaskTypeCollision` | Build fails |
 | Declared search attribute is a reserved field | `ChasmError::ReservedSearchAttribute` | Build fails |
 | Declared key exists in a namespace with another type | `EmbeddedEngineStartError::SearchAttributeType { namespace, key, declared, existing }` | Build fails |
-| Storage holds an unregistered archetype | `ChasmError::UnregisteredArchetype { archetype_id, executions }` | Build fails |
+| Storage holds an unregistered archetype | `EmbeddedEngineStartError::UnregisteredArchetype { archetype_id, executions }` | Build fails |
+| Rebuild finds missing root data, an unknown task type or undecodable payload | `RebuildStats` records count and first `(archetype_id, RebuildFailure)`; startup maps to `EmbeddedEngineStartError::UnserviceableOutbox` | Build fails; periodic rebuild isolates the execution and continues |
+| Held generic task on a closed root | `ChasmError::ExecutionClosed` | Anomaly is reported; stale delivery still returns `NotHeld` |
+| Reused run id belongs to a superseded run | `ChasmError::BusinessIdConflict` naming run and business id | Conflict; only a collision with the current run reloads policy evaluation |
 | Staged task with no handler | `ChasmError::UnknownTaskType` | Transition aborts; embedder sees the error; nothing persisted |
 | Staged side-effect task with no executor | `ChasmError::UnknownTaskType` at close | Same |
 | Executor failure after commit | logged `anyhow::Error`; task stays pending | None; rebuild retries |
@@ -1020,9 +1074,10 @@ A 128-case generated test compares callback-bearing gate-off starts against empt
   (`sweeper.rs`, `rebuild.rs`, `engine.rs`) over the in-memory repository; 7, 9, 12 in
   `tokeira-edge/src/chasm_activity.rs` over the bridge; 10 in the activity crate's pure
   callback state machine (128 cases); 8 in `tokeira-storage/src/chasm.rs`
-  (in-memory) and the DSQL integration suite (`dsql-integration`); 11, 13, 14, 15 in the
-  acceptance crate's integration tests; 16 in `tokeira-engine` with the in-memory projection
-  store; 17 as a differential test in `tokeira-edge` replaying the recorded v1.31.0
+  (in-memory) and the DSQL integration suite (`dsql-integration`); 11, 14, 15 in the
+  acceptance crate's integration tests; 13 and 16 in `tokeira-engine` over comparison
+  helpers and the in-memory projection store, with real-start wiring examples; 17 as a
+  differential test in `tokeira-edge` replaying the recorded v1.31.0
   standalone-activity request set against the pre-change and post-change bridge.
 - **Unit tests (example-based):** exact error messages for the cap and the closed-activity
   attach (`activity.go:439-448 @ v1.32.0`), the `Internal` rejection text, the config

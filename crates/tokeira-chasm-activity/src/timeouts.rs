@@ -22,10 +22,58 @@
 //!   `STARTED`/`CANCEL_REQUESTED`; a heartbeat pushes the anchor out
 //!   (`activity_tasks.go` heartbeat `Validate`).
 
+use prost::Message as _;
+use tokeira_proto::failure::{Failure, TimeoutFailureInfo, failure::FailureInfo};
+
 use crate::{
+    retry::{RetryOutcome, retry_decision},
     state::{ActivityState, ActivityStatus},
-    statemachine::TimeoutType,
+    statemachine::{ActivityEvent, TimeoutType},
 };
+
+/// Construct the existing evaluator's timeout transition without performing I/O.
+/// Schedule-to-start/close are terminal; start-to-close/heartbeat first use the
+/// retry budget (`chasm/lib/activity/activity_tasks.go @ v1.31.0`). The evaluator
+/// and registered handlers share this decision so they persist identical bytes.
+pub fn timeout_event(state: &ActivityState, timeout_type: TimeoutType, now: i64) -> ActivityEvent {
+    let timed_out = || ActivityEvent::TimedOut {
+        stamp: state.stamp,
+        timeout_type,
+        failure_payload: build_timeout_failure(timeout_type),
+    };
+    match timeout_type {
+        TimeoutType::ScheduleToStart | TimeoutType::ScheduleToClose => timed_out(),
+        TimeoutType::StartToClose | TimeoutType::Heartbeat => match retry_decision(state, now, 0) {
+            RetryOutcome::Reschedule(interval) => ActivityEvent::Rescheduled {
+                failure: format!("activity {} timeout", timeout_type.as_str()),
+                identity: state.last_worker_identity.clone(),
+                last_heartbeat_details: Vec::new(),
+                interval_nanos: interval,
+            },
+            RetryOutcome::Terminal => timed_out(),
+        },
+    }
+}
+
+/// Encode the timeout failure exactly as the original evaluator did, keeping
+/// describe/poll failure payloads stable while moving event construction here.
+fn build_timeout_failure(timeout_type: TimeoutType) -> Vec<u8> {
+    let timeout_type_proto = match timeout_type {
+        TimeoutType::ScheduleToStart => tokeira_proto::enums::TimeoutType::ScheduleToStart,
+        TimeoutType::ScheduleToClose => tokeira_proto::enums::TimeoutType::ScheduleToClose,
+        TimeoutType::StartToClose => tokeira_proto::enums::TimeoutType::StartToClose,
+        TimeoutType::Heartbeat => tokeira_proto::enums::TimeoutType::Heartbeat,
+    };
+    Failure {
+        message: format!("activity {} timeout", timeout_type.as_str()),
+        failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
+            timeout_type: timeout_type_proto as i32,
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
 
 /// One candidate timeout: its kind and the Unix-nanosecond deadline it fires at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

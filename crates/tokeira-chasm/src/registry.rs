@@ -44,9 +44,11 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Context, EngineComponent, MutableContext, PureTaskHandler, RESERVED_SYSTEM_FIELDS,
-    RESERVED_TASK_ID_LIMIT, ScheduledTask, SideEffectTaskHandler, Task, TaskKind, TaskOutcome,
-    TaskValidity, component::Component, error::ChasmError, task_type_id_for_fqn,
+    Context, EngineComponent, LifecycleState, MutableContext, PureTaskHandler,
+    RESERVED_SYSTEM_FIELDS, RESERVED_TASK_ID_LIMIT, RootComponent, ScheduledTask,
+    SearchAttributeProvider, SearchAttributes, SideEffectTaskHandler, Task, TaskKind, TaskOutcome,
+    TaskValidity, VisibilityContributor, VisibilitySnapshot, component::Component,
+    error::ChasmError, task_type_id_for_fqn,
 };
 
 /// The archetype id reserved for the legacy Workflow engine. CHASM never assigns
@@ -83,7 +85,7 @@ pub fn archetype_id_for_fqn(fqn: &str) -> u32 {
 
 /// A registered component's index entry: its FQN, derived archetype id, Rust
 /// [`TypeId`], and the name of the [`Library`] that registered it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ComponentEntry {
     /// The component's fully-qualified name (its [`Component::FQN`]).
     pub fqn: &'static str,
@@ -93,6 +95,39 @@ pub struct ComponentEntry {
     pub type_id: TypeId,
     /// The name of the library that registered the component.
     pub library: &'static str,
+    root: Option<RootFunctions>,
+}
+
+// Equality remains registration identity, independent of monomorphized function
+// addresses (compiler merging/splitting makes address equality unreliable).
+impl PartialEq for ComponentEntry {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            self.fqn,
+            self.archetype_id,
+            self.type_id,
+            self.library,
+            self.root.is_some(),
+        ) == (
+            other.fqn,
+            other.archetype_id,
+            other.type_id,
+            other.library,
+            other.root.is_some(),
+        )
+    }
+}
+impl Eq for ComponentEntry {}
+
+type SnapshotFn = fn(&[u8]) -> Result<Option<VisibilitySnapshot>, ChasmError>;
+type SearchFn = fn(&[u8]) -> Result<SearchAttributes, ChasmError>;
+type LifecycleFn = fn(&[u8], &dyn Context) -> Result<LifecycleState, ChasmError>;
+
+#[derive(Debug, Clone, Copy)]
+struct RootFunctions {
+    visibility: SnapshotFn,
+    search: SearchFn,
+    lifecycle: LifecycleFn,
 }
 
 /// A typed handler's immutable dispatch entry. Identity is global across tasks;
@@ -477,6 +512,26 @@ impl RegistryBuilder {
         self.register_component(library, C::FQN, TypeId::of::<C>())
     }
 
+    /// Register a root and its byte-to-component visibility adapters. Generic
+    /// transitions and repair can then rebuild derived views without depending on
+    /// the library. Plain component registration remains available for children.
+    pub fn register_root<C>(&mut self, library: &'static str) -> Result<&mut Self, ChasmError>
+    where
+        C: EngineComponent + RootComponent + VisibilityContributor + SearchAttributeProvider,
+    {
+        self.register::<C>(library)?;
+        // Successful registration appended exactly this entry; adapters capture no
+        // runtime state and use the same prost bridge as task handlers.
+        if let Some(entry) = self.entries.last_mut() {
+            entry.root = Some(RootFunctions {
+                visibility: |bytes| Ok(decode_component::<C>(bytes)?.visibility_snapshot()),
+                search: |bytes| Ok(decode_component::<C>(bytes)?.search_attributes()),
+                lifecycle: |bytes, ctx| Ok(decode_component::<C>(bytes)?.lifecycle_state(ctx)),
+            });
+        }
+        Ok(self)
+    }
+
     fn register_component(
         &mut self,
         library: &'static str,
@@ -512,6 +567,7 @@ impl RegistryBuilder {
             archetype_id,
             type_id,
             library,
+            root: None,
         });
         Ok(self)
     }
@@ -644,6 +700,59 @@ impl Registry {
                 component_type_id,
                 task_type_id: task.task_type_id,
             }),
+        }
+    }
+
+    /// Read authoritative lifecycle from a registered root, independently of its
+    /// optional visibility contribution. Generic handler transitions must not
+    /// leave an invisible component running after it has closed.
+    pub fn lifecycle_state(
+        &self,
+        component_type_id: u32,
+        data: &[u8],
+        ctx: &dyn Context,
+    ) -> Result<LifecycleState, ChasmError> {
+        let root = self
+            .component_for_archetype(component_type_id)
+            .and_then(|entry| entry.root)
+            .ok_or_else(|| {
+                ChasmError::Validation(format!(
+                    "root adapters not registered for component {component_type_id}"
+                ))
+            })?;
+        (root.lifecycle)(data, ctx)
+    }
+
+    /// Rebuild a registered root's visibility from durable data. A component
+    /// registered without root adapters contributes no snapshot; malformed root
+    /// data is an error rather than silently disappearing from projection.
+    pub fn visibility_snapshot(
+        &self,
+        component_type_id: u32,
+        data: &[u8],
+    ) -> Result<Option<VisibilitySnapshot>, ChasmError> {
+        match self
+            .component_for_archetype(component_type_id)
+            .and_then(|entry| entry.root)
+        {
+            Some(root) => (root.visibility)(data),
+            None => Ok(None),
+        }
+    }
+
+    /// Rebuild a root's search attributes. Components without root adapters
+    /// contribute an empty set; decoding errors propagate to the transition.
+    pub fn search_attributes(
+        &self,
+        component_type_id: u32,
+        data: &[u8],
+    ) -> Result<SearchAttributes, ChasmError> {
+        match self
+            .component_for_archetype(component_type_id)
+            .and_then(|entry| entry.root)
+        {
+            Some(root) => (root.search)(data),
+            None => Ok(Vec::new()),
         }
     }
 

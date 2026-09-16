@@ -2769,6 +2769,9 @@ async fn build_in_memory_stack(
 /// projection lost by the best-effort post-commit write (Req 10.11).
 const VISIBILITY_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Recovery cadence for disposable CHASM timers and dispatch state.
+const CHASM_REBUILD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Authorization evidence is derived from task deadlines, so cleanup needs no
 /// operator TTL. One bounded batch per tick prevents expired rows from
 /// monopolizing the shared DSQL connection budget.
@@ -2819,23 +2822,28 @@ fn worker_task_provenance_cleanup_error_kind(
 /// Spawn the background visibility repair scanner: it reconstructs each committed
 /// execution's snapshot from authoritative node state and re-applies it iff-newer, so
 /// a committed transition can never permanently lack a projection (Req 10.11). The
-/// snapshot rebuild decodes the per-archetype node bytes (only the activity archetype
-/// today); other archetypes are skipped. Runs immediately, then on an interval, until
+/// snapshot rebuild uses the registered root adapters for every archetype. Runs immediately, then on an interval, until
 /// `cancel` fires.
 fn spawn_visibility_repair(
     tasks: &RuntimeShutdownHandle,
     nodes: Arc<dyn tokeira_storage::ChasmNodeRepository>,
     sink: Arc<dyn tokeira_projection::ProjectionSink>,
-    activity_archetype: Option<u32>,
+    registry: Arc<tokeira_chasm::Registry>,
     partition_count: u32,
     cancel: CancellationToken,
 ) {
     let rebuild: tokeira_runtime::chasm::SnapshotRebuilder =
         Arc::new(move |archetype_id, bytes| {
-            if Some(archetype_id) == activity_archetype {
-                tokeira_chasm_activity::rebuild_visibility_snapshot(bytes)
-            } else {
-                None
+            match registry.visibility_snapshot(archetype_id, bytes) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        archetype_id,
+                        "CHASM visibility rebuild decode failed"
+                    );
+                    None
+                }
             }
         });
     let scanner =
@@ -2849,6 +2857,36 @@ fn spawn_visibility_repair(
                 _ = interval.tick() => {
                     if let Err(error) = scanner.repair_once().await {
                         tracing::warn!(?error, "visibility repair pass failed");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Repeat the startup recovery pass so losing an in-memory delivery hint costs
+/// at most one scan interval. Shutdown cancels any in-flight derived scan.
+fn spawn_outbox_rebuild(
+    tasks: &RuntimeShutdownHandle,
+    scanner: tokeira_runtime::chasm::OutboxRebuildScanner,
+    cancel: CancellationToken,
+) {
+    let _rebuild = tasks.spawn(async move {
+        let mut interval = tokio::time::interval(CHASM_REBUILD_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Startup already ran the first pass before opening admission.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = scanner.rebuild_once() => {
+                            if let Err(error) = result {
+                                tracing::warn!(?error, "CHASM outbox rebuild pass failed");
+                            }
+                        }
                     }
                 }
             }
@@ -2873,9 +2911,11 @@ fn spawn_chasm_timer_sweeper(
     tasks: &RuntimeShutdownHandle,
     engine: Arc<tokeira_runtime::chasm::ChasmEngine>,
     evaluator: Arc<dyn tokeira_runtime::chasm::TimeoutEvaluator>,
+    archetype_id: u32,
     cancel: CancellationToken,
 ) {
-    let sweeper = tokeira_runtime::chasm::ChasmTimerSweeper::new(engine, evaluator);
+    let sweeper = tokeira_runtime::chasm::ChasmTimerSweeper::new(engine)
+        .with_evaluator(archetype_id, evaluator);
     let _sweeper = tasks.spawn(async move {
         let mut interval = tokio::time::interval(CHASM_TIMER_SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3428,8 +3468,8 @@ where
             .context("failed to register the activity CHASM library")?;
         let registry = Arc::new(registry_builder.build());
         // Capture what the visibility repair scanner needs before the engine consumes
-        // the node repo + registry: the activity archetype id (to dispatch the snapshot
-        // rebuild) and a clone of the authoritative node store (Req 10.11).
+        // the node repo + registry: the activity id selects the legacy evaluator;
+        // registered root adapters rebuild visibility for every archetype.
         let repair_archetype = registry.archetype_id(
             <tokeira_chasm_activity::ActivityExecution as tokeira_chasm::Component>::FQN,
         );
@@ -3454,11 +3494,21 @@ where
                 effective_config.infrastructure.placement.partition_count,
             ));
         let chasm_engine = Arc::new(tokeira_runtime::chasm::ChasmEngine::new(
-            chasm_node_repo,
-            registry,
+            chasm_node_repo.clone(),
+            registry.clone(),
             dispatch_queue.clone(),
             chasm_visibility_sink,
         ));
+        let rebuild = tokeira_runtime::chasm::OutboxRebuildScanner::new(
+            chasm_node_repo,
+            chasm_engine.clone(),
+            dispatch_queue.clone(),
+        );
+        rebuild
+            .rebuild_once()
+            .await
+            .context("failed to rebuild CHASM outboxes before serving")?;
+        spawn_outbox_rebuild(&engine_tasks, rebuild, background_cancel.clone());
         let activity_config = tokeira_chasm_activity::ActivityConfig {
             enable_standalone: effective_config
                 .policy
@@ -3486,7 +3536,7 @@ where
             &engine_tasks,
             repair_nodes,
             Arc::new(projection_sink()),
-            repair_archetype,
+            registry,
             effective_config.infrastructure.placement.partition_count,
             background_cancel.clone(),
         );
@@ -3502,6 +3552,7 @@ where
                 &engine_tasks,
                 sweeper_engine,
                 activity_bridge.clone(),
+                repair_archetype.context("activity CHASM archetype is not registered")?,
                 background_cancel.clone(),
             );
         }

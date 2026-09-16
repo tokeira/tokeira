@@ -202,6 +202,8 @@ pub struct SearchAttributeDef { pub name: &'static str, pub attr_type: SearchAtt
 
 impl RegistryBuilder {
     pub fn register<C: Component>(&mut self, library: &'static str) -> Result<&mut Self, ChasmError>; // exists
+    pub fn register_root<C>(&mut self, library: &'static str) -> Result<&mut Self, ChasmError>
+    where C: EngineComponent + RootComponent + VisibilityContributor + SearchAttributeProvider;
     pub fn register_pure_task<H: PureTaskHandler>(&mut self, library: &'static str, handler: H)
         -> Result<&mut Self, ChasmError>;
     pub fn register_side_effect_task<H: SideEffectTaskHandler>(&mut self, library: &'static str, handler: H)
@@ -219,6 +221,9 @@ impl RegistryBuilder {
 }
 
 impl Registry {
+    pub fn visibility_snapshot(&self, component_type_id: u32, data: &[u8]) -> Result<Option<VisibilitySnapshot>, ChasmError>;
+    pub fn search_attributes(&self, component_type_id: u32, data: &[u8]) -> Result<SearchAttributes, ChasmError>;
+    pub fn lifecycle_state(&self, component_type_id: u32, data: &[u8], ctx: &dyn Context) -> Result<LifecycleState, ChasmError>;
     pub fn task_for_id(&self, component_type_id: u32, task_type_id: u32) -> Option<&TaskEntry>;
     pub fn validate_task(&self, component_type_id: u32, data: &[u8], task: &ScheduledTask, ctx: &dyn Context)
         -> Result<TaskValidity, ChasmError>;
@@ -249,6 +254,12 @@ pub trait MutableContext: Context {
 }
 ```
 
+`NodeTree::resolve_task(encoded_path, id) -> Result<bool, ChasmError>` removes a
+persisted task, journals its before-image and dirties the node only when the id was
+held; a missing node is an internal error. `register_root` installs prost decoding
+adapters for visibility, search attributes and lifecycle. Lifecycle is authoritative
+and is computed independently of the optional visibility snapshot.
+
 `ChasmError` gains `UnknownTaskType { component_type_id, task_type_id }`,
 `ReservedLibraryName { name }`, `TaskTypeCollision { first, second, id }`,
 `ReservedSearchAttribute { name }`, and `UnregisteredArchetype { archetype_id, executions }`.
@@ -262,7 +273,7 @@ handlers for what it already stages.
 impl Library for ActivityLibrary {
     const NAME: &'static str = "activity";
     fn register(b: &mut RegistryBuilder) -> Result<(), ChasmError> {
-        b.register::<ActivityExecution>(Self::NAME)?
+        b.register_root::<ActivityExecution>(Self::NAME)?
          .register_reserved_side_effect_task(Self::NAME, DISPATCH_TASK_ID, DispatchHandler)?
          .register_reserved_pure_task(Self::NAME, SCHEDULE_TO_START_TASK_ID, ScheduleToStartHandler)?
          .register_reserved_pure_task(Self::NAME, SCHEDULE_TO_CLOSE_TASK_ID, ScheduleToCloseHandler)?
@@ -282,6 +293,13 @@ is the existing `apply(ActivityEvent::TimedOut/…)`. Requirement 2.8 keeps the 
 path serving these executions: the sweeper prefers the evaluator when one is installed
 for the archetype and falls back to handler execution otherwise, so registering the
 handlers changes no timing behaviour while making the outboxes bounded (Requirement 1.10).
+
+The shared pure `timeout_event(state, timeout_type, now) -> ActivityEvent` builds the
+same timeout/retry event for both timer handlers and the evaluator. Stage 5 also
+preserves start-to-close/heartbeat timers in `CancelRequested`, compares heartbeat
+deadlines against `max(last_heartbeat_time_nanos, started_time_nanos)`, and stages a
+replacement on each positive-timeout heartbeat (`activity_tasks.go:166-168,227-247`
+and `activity.go:576-585 @ v1.31.0`); close drops superseded deadlines.
 
 New events: `ActivityEvent::CallbacksAttached(Vec<ActivityCallback>)`,
 `ActivityEvent::CallbackAttempted { id, attempt_outcome }`, `ActivityEvent::CallbackRetryDue { id }`.
@@ -324,20 +342,26 @@ impl DispatchMultiplexer {
 #[async_trait]
 impl DispatchSink for DispatchMultiplexer {
     async fn dispatch(&self, key: &ExecutionKey, tasks: Vec<DispatchableTask>) -> anyhow::Result<()>;
-    // unknown task type → error (unreachable after close-time check; logged, task stays pending)
+    // Unknown task types and executor failures are logged; tasks remain pending.
 }
 ```
 
 `ChasmEngine::new` keeps its `Arc<dyn DispatchSink>` parameter; the engine bootstrap passes
-the multiplexer. Close-time validation (`engine.rs:655, 734`) passes
+the multiplexer in stage 9; stage 5 keeps `ActivityDispatchQueue` as its sink.
+Close-time validation (`engine.rs:655, 734`) passes
 `RegistryOutboxValidator { registry, component_type_id, data, ctx }` instead of
 `RetainAllValidator`, and returns `ChasmError::UnknownTaskType` before persisting when a
 staged task has no entry (Requirements 1.10–1.12, 3.2).
+
+`UpdateRequest` includes `resolved: Vec<TaskId>` drained from the typed transition
+context. Both typed and generic paths apply resolutions before validating close;
+root bytes passed to validators reflect every mutation in that transition.
 
 **Generic outcome application.**
 
 ```rust
 impl ChasmEngine {
+    pub async fn execute_due_pure_tasks(&self, key: &ExecutionKey, now: i64) -> Result<Option<i64>, ChasmError>;
     /// Apply an external outcome to the component that staged `task_id`. No-op (Ok(NotHeld))
     /// when the outbox no longer holds it. Reload-and-rerun on fenced conflict up to
     /// `max_commit_retries`. The drop of the task in the same transition is the
@@ -372,10 +396,10 @@ impl ChasmTimerSweeper {
 
 ```rust
 // rebuild.rs (new)
-pub struct OutboxRebuildScanner { nodes: Arc<dyn ChasmNodeRepository>, engine: Arc<ChasmEngine>, sink: Arc<DispatchMultiplexer> }
-pub struct RebuildStats { pub scanned: usize, pub timers_armed: usize, pub effects_executed: usize }
+pub struct OutboxRebuildScanner { nodes: Arc<dyn ChasmNodeRepository>, engine: Arc<ChasmEngine>, sink: Arc<dyn DispatchSink>, page: usize }
+pub struct RebuildStats { pub scanned: usize, pub timers_armed: usize, pub effects_dispatched: usize }
 impl OutboxRebuildScanner {
-    pub fn new(nodes: Arc<dyn ChasmNodeRepository>, engine: Arc<ChasmEngine>, sink: Arc<DispatchMultiplexer>) -> Self;
+    pub fn new(nodes: Arc<dyn ChasmNodeRepository>, engine: Arc<ChasmEngine>, sink: Arc<dyn DispatchSink>) -> Self;
     /// One pass: list running pointers (deterministic order), load each root node,
     /// set the armed timer to the outbox's earliest pure deadline, and hand every pending
     /// side-effect task whose validator holds and whose fire_at has elapsed to the sink.
@@ -516,7 +540,9 @@ archetype_id, business_id) DO UPDATE`, the existing shape re-keyed.
 
 **Dispatch queue.** `ActivityDispatchQueue` becomes the `ActivityDispatchExecutor`'s
 backing store; entries carry the target and a served-stamp set so a re-executed dispatch
-is a no-op.
+is a no-op. The `(ExecutionKey, stamp)` deduplication portion of task 9.1 lands in
+stage 5 for rebuild safety; terminal/deleted executions release their entries, and
+failed pickups remain retryable.
 
 ```rust
 struct DispatchEntry { key: ExecutionKey, stamp: i64, fire_at: Option<i64>, target: Option<DeploymentVersionTarget> }
@@ -635,7 +661,8 @@ dropping the engine and rebuilding over the same `Arc` repository.
 
 ### Registry entries (in memory, built once)
 
-`ComponentEntry` unchanged. `TaskEntry` as above; `task_type_id` is persisted inside
+`ComponentEntry` additionally holds optional root adapters for visibility, search
+attributes and authoritative lifecycle. `TaskEntry` as above; `task_type_id` is persisted inside
 `NodeMetadata.outbox` (`ScheduledTask.task_type_id`), which is why reserved ids are
 explicit and derived ids are a pure function of the FQN.
 

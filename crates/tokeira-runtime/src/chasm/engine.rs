@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use tokeira_chasm::{
     BusinessIdConflictPolicy, BusinessIdReusePolicy, ChasmError, Context, DispatchableTask,
     ExecutionInfo, ExecutionKey, LifecycleState, MutableContext, NodeTree, Registry,
-    RetainAllValidator, Staleness, TaskId, TransitionResult, VersionedTransition,
-    VisibilitySnapshot,
+    RegistryOutboxValidator, ScheduledTask, Staleness, TaskId, TaskOutcome, TaskValidity,
+    TransitionResult, VersionedTransition, VisibilitySnapshot,
 };
 use tokeira_storage::{
     ChasmNodeRepository, CurrentRun, ExpectedVersion, NodePersistOutcome, NodeWrite,
@@ -143,6 +143,17 @@ impl VisibilitySink for NoopVisibilitySink {
     }
 }
 
+/// Whether an external delivery committed its transition or was already obsolete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutcomeApplied {
+    /// The outcome and task removal committed under the same fence.
+    Applied(UpdateOutcome),
+    /// The exact side-effect task is no longer held; state was not changed.
+    NotHeld,
+    /// The execution has no root node.
+    ExecutionMissing,
+}
+
 /// Engine tuning, characterized by behaviour, not deployment (`AGENTS`
 /// Configuration). `long_poll_buffer` is subtracted from `long_poll_timeout` so a
 /// poll returns [`PollOutcome::Empty`] slightly before the client's deadline,
@@ -209,9 +220,7 @@ impl TransitionContext {
         std::mem::take(&mut self.staged_tasks)
     }
 
-    /// Consume task resolutions staged by handlers; stage 5 applies them to the
-    /// root outbox in the same fenced transition as the component mutation.
-    #[allow(dead_code)] // Stage 5 wires the consumer; this slice only adds the primitive.
+    /// Consume task resolutions for the same fenced transition as the mutation.
     pub(crate) fn take_resolved_tasks(&mut self) -> Vec<TaskId> {
         std::mem::take(&mut self.resolved)
     }
@@ -350,7 +359,8 @@ impl ChasmEngine {
     /// due executions; it is a point-in-time copy so the sweeper never holds the
     /// lock across an `await`. Engine-local, non-replicated state (Requirement 7.7).
     pub fn armed_timers_snapshot(&self) -> Vec<(ExecutionKey, i64)> {
-        self.timers
+        let mut snapshot: Vec<_> = self
+            .timers
             .lock()
             .map(|timers| {
                 timers
@@ -358,7 +368,15 @@ impl ChasmEngine {
                     .filter_map(|(key, deadline)| deadline.map(|d| (key.clone(), d)))
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        snapshot.sort_by(|(a, _), (b, _)| {
+            (&a.namespace_id, &a.business_id, &a.run_id).cmp(&(
+                &b.namespace_id,
+                &b.business_id,
+                &b.run_id,
+            ))
+        });
+        snapshot
     }
 
     /// Re-arm (or clear, with `None`) an execution's physical timer to `deadline`.
@@ -388,6 +406,217 @@ impl ChasmEngine {
             .current_run(namespace_id, archetype_id, business_id)
             .await
             .map_err(|e| ChasmError::Internal(format!("resolve current run: {e}")))
+    }
+
+    /// Apply an external outcome only while the exact side-effect task is held.
+    /// Component bytes and removal commit under one fence, so duplicates and late
+    /// deliveries are inert. Conflicts reload and rerun the pure handler up to the
+    /// configured bound; handler errors persist nothing.
+    pub async fn apply_side_effect_outcome(
+        &self,
+        target: &ExecutionKey,
+        task_type_id: u32,
+        task_id: TaskId,
+        outcome: TaskOutcome,
+    ) -> Result<OutcomeApplied, ChasmError> {
+        let attempts = self.config.max_commit_retries.max(1);
+        for _ in 0..attempts {
+            let (mut tree, baseline) = self.load_tree(target).await?;
+            let Some(root) = tree.node(ROOT_PATH) else {
+                return Ok(OutcomeApplied::ExecutionMissing);
+            };
+            let Some(task) = root
+                .metadata
+                .outbox
+                .side_effect_tasks
+                .iter()
+                .find(|task| task.id == task_id && task.task_type_id == task_type_id)
+                .cloned()
+            else {
+                return Ok(OutcomeApplied::NotHeld);
+            };
+            let archetype_id = root.metadata.component_type_id;
+            let initial_vt = root.metadata.initial_versioned_transition;
+            let data = root.data.as_deref().ok_or_else(|| {
+                ChasmError::Validation("CHASM root has no component data".to_owned())
+            })?;
+            let mut ctx = TransitionContext::new(target.clone(), tree.execution_vt(), self.now());
+            let data =
+                self.registry
+                    .apply_outcome(archetype_id, data, &task, &outcome, &mut ctx)?;
+            tree.set_data(ROOT_PATH, Some(data))?;
+            self.apply_context(&mut tree, &mut ctx)?;
+            // This engine-owned drop is the delivery fence even if a handler
+            // forgets to request resolution itself.
+            tree.resolve_task(ROOT_PATH, task_id)?;
+            let (lifecycle, visibility) = self.derive_root(&mut tree, &ctx)?;
+            let vt = next_vt(tree.execution_vt());
+            let result = self.close_root(&mut tree, vt, &ctx)?;
+            if matches!(
+                self.commit(target, &baseline, &result).await?,
+                NodePersistOutcome::Conflict { .. }
+            ) {
+                continue;
+            }
+            self.post_commit(target, result, archetype_id, vt, visibility)
+                .await?;
+            return Ok(OutcomeApplied::Applied(UpdateOutcome {
+                reference: self.root_ref(target, archetype_id, vt, initial_vt),
+                execution_vt: vt,
+                closed: lifecycle.is_closed(),
+            }));
+        }
+        Err(ChasmError::RetriesExhausted { attempts })
+    }
+
+    /// Execute the currently held due pure tasks in `(deadline, id)` order under
+    /// one fenced transition. Validation is repeated against each preceding
+    /// handler's result, and tasks resolved by an earlier handler are skipped.
+    /// Newly staged tasks wait for a later pass, bounding each transition's work.
+    pub async fn execute_due_pure_tasks(
+        &self,
+        key: &ExecutionKey,
+        now: i64,
+    ) -> Result<Option<i64>, ChasmError> {
+        let attempts = self.config.max_commit_retries.max(1);
+        for _ in 0..attempts {
+            let (mut tree, baseline) = self.load_tree(key).await?;
+            let Some(root) = tree.node(ROOT_PATH) else {
+                return Ok(None);
+            };
+            let archetype_id = root.metadata.component_type_id;
+            let mut due: Vec<ScheduledTask> = root
+                .metadata
+                .outbox
+                .pure_tasks
+                .iter()
+                .filter(|task| task.fire_at_unix_nanos.is_some_and(|at| at <= now))
+                .cloned()
+                .collect();
+            due.sort_by_key(|task| {
+                (
+                    task.fire_at_unix_nanos,
+                    task.id.versioned_transition.namespace_failover_version,
+                    task.id.versioned_transition.transition_count,
+                    task.id.offset,
+                )
+            });
+            if due.is_empty() {
+                return Ok(root.metadata.outbox.earliest_pure_deadline());
+            }
+            let mut ctx = TransitionContext::new(key.clone(), tree.execution_vt(), now);
+            for task in due {
+                let root = tree.node(ROOT_PATH).ok_or(ChasmError::ExecutionNotFound)?;
+                if !root
+                    .metadata
+                    .outbox
+                    .pure_tasks
+                    .iter()
+                    .any(|held| held.id == task.id)
+                {
+                    continue;
+                }
+                let data = root.data.as_deref().ok_or_else(|| {
+                    ChasmError::Validation("CHASM root has no component data".to_owned())
+                })?;
+                if self
+                    .registry
+                    .validate_task(archetype_id, data, &task, &ctx)?
+                    == TaskValidity::Valid
+                {
+                    let data = self
+                        .registry
+                        .execute_pure(archetype_id, data, &task, &mut ctx)?;
+                    tree.set_data(ROOT_PATH, Some(data))?;
+                    self.apply_context(&mut tree, &mut ctx)?;
+                }
+                tree.resolve_task(ROOT_PATH, task.id)?;
+            }
+            let (_, visibility) = self.derive_root(&mut tree, &ctx)?;
+            let vt = next_vt(tree.execution_vt());
+            let result = self.close_root(&mut tree, vt, &ctx)?;
+            let next = result.earliest_pure_deadline_unix_nanos;
+            if matches!(
+                self.commit(key, &baseline, &result).await?,
+                NodePersistOutcome::Conflict { .. }
+            ) {
+                continue;
+            }
+            self.post_commit(key, result, archetype_id, vt, visibility)
+                .await?;
+            return Ok(next);
+        }
+        Err(ChasmError::RetriesExhausted { attempts })
+    }
+
+    fn derive_root(
+        &self,
+        tree: &mut NodeTree,
+        ctx: &dyn Context,
+    ) -> Result<(LifecycleState, Option<VisibilitySnapshot>), ChasmError> {
+        let root = tree.node(ROOT_PATH).ok_or(ChasmError::ExecutionNotFound)?;
+        let id = root.metadata.component_type_id;
+        let data = root
+            .data
+            .as_deref()
+            .ok_or_else(|| ChasmError::Validation("CHASM root has no component data".to_owned()))?;
+        let lifecycle = self.registry.lifecycle_state(id, data, ctx)?;
+        let visibility = self.registry.visibility_snapshot(id, data)?;
+        tree.set_lifecycle(ROOT_PATH, lifecycle)?;
+        Ok((lifecycle, visibility))
+    }
+
+    /// Snapshot a root for archetype routing; callers must still fence any writes
+    /// because this read is only a derived scheduling hint.
+    pub(super) async fn root_node(
+        &self,
+        key: &ExecutionKey,
+    ) -> Result<Option<tokeira_chasm::ChasmNode>, ChasmError> {
+        let (tree, _) = self.load_tree(key).await?;
+        Ok(tree.node(ROOT_PATH).cloned())
+    }
+
+    fn close_root(
+        &self,
+        tree: &mut NodeTree,
+        vt: VersionedTransition,
+        ctx: &dyn Context,
+    ) -> Result<TransitionResult, ChasmError> {
+        let root = tree.node(ROOT_PATH).ok_or(ChasmError::ExecutionNotFound)?;
+        let component_type_id = root.metadata.component_type_id;
+        let data = root
+            .data
+            .clone()
+            .ok_or_else(|| ChasmError::Validation("CHASM root has no component data".to_owned()))?;
+        tree.close_transaction(
+            vt,
+            &RegistryOutboxValidator {
+                registry: &self.registry,
+                component_type_id,
+                data: &data,
+                ctx,
+            },
+        )
+    }
+
+    fn apply_context(
+        &self,
+        tree: &mut NodeTree,
+        ctx: &mut TransitionContext,
+    ) -> Result<(), ChasmError> {
+        for id in ctx.take_resolved_tasks() {
+            tree.resolve_task(ROOT_PATH, id)?;
+        }
+        for task in ctx.take_staged_tasks() {
+            tree.add_task(
+                ROOT_PATH,
+                task.kind,
+                task.task_type_id,
+                task.payload,
+                task.fire_at_unix_nanos,
+            )?;
+        }
+        Ok(())
     }
 
     async fn load_tree(
@@ -451,11 +680,16 @@ impl ChasmEngine {
         version: VersionedTransition,
         visibility: Option<VisibilitySnapshot>,
     ) -> Result<(), ChasmError> {
-        if !result.side_effect_tasks.is_empty() {
-            self.dispatch
-                .dispatch(key, result.side_effect_tasks)
-                .await
-                .map_err(|e| ChasmError::Internal(format!("dispatch side-effect tasks: {e}")))?;
+        if !result.side_effect_tasks.is_empty()
+            && let Err(error) = self.dispatch.dispatch(key, result.side_effect_tasks).await
+        {
+            // The commit stands. Returning an error could invite replay of an
+            // already-applied command; the rebuild scanner retries delivery.
+            tracing::warn!(
+                ?error,
+                ?key,
+                "CHASM dispatch failed; committed tasks remain pending"
+            );
         }
         self.arm_timer(key, result.earliest_pure_deadline_unix_nanos);
         if let Some(snapshot) = visibility {
@@ -670,7 +904,8 @@ impl Engine for ChasmEngine {
             Some(req.data),
         )?;
         let committed_vt = next_vt(tree.execution_vt());
-        let result = tree.close_transaction(committed_vt, &RetainAllValidator)?;
+        let ctx = TransitionContext::new(req.key.clone(), tree.execution_vt(), self.now());
+        let result = self.close_root(&mut tree, committed_vt, &ctx)?;
         let batch: Vec<NodeWrite> = result
             .dirty_nodes
             .iter()
@@ -748,8 +983,13 @@ impl Engine for ChasmEngine {
             )?;
         }
 
+        for id in req.resolved {
+            tree.resolve_task(ROOT_PATH, id)?;
+        }
+
         let committed_vt = next_vt(tree.execution_vt());
-        let result = tree.close_transaction(committed_vt, &RetainAllValidator)?;
+        let ctx = TransitionContext::new(req.key.clone(), tree.execution_vt(), self.now());
+        let result = self.close_root(&mut tree, committed_vt, &ctx)?;
         match self.commit(&req.key, &baseline, &result).await? {
             NodePersistOutcome::Applied => {}
             NodePersistOutcome::Conflict { .. } => return Ok(CommitOutcome::Conflict),
@@ -817,5 +1057,214 @@ impl Engine for ChasmEngine {
     ) -> Result<(), ChasmError> {
         self.wake_pollers(key);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chasm::{
+        TypedEngine,
+        test_support::{self as ts, ConflictingStore, Root, Work},
+    };
+    use proptest::prelude::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    };
+    use tokeira_chasm::{Task, task_type_id_for_fqn};
+
+    // Feature: chasm-extension-archetypes, Property 6: outcome application fence
+    // Only a held task can apply; conflicts, repeats and after-drop deliveries are inert.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn outcomes_apply_once_under_conflicts(count in 1usize..8, deliveries in prop::collection::vec((0u8..6, any::<u8>(), 0usize..20), 1..40)) {
+            ts::runtime().block_on(async {
+                let repo = Arc::new(ConflictingStore::default());
+                let engine = ts::engine(repo.clone(), Arc::new(AtomicI64::new(0)), ts::sink());
+                let key = ts::key(0);
+                let reference = ts::start(&engine, key.clone()).await;
+                let tasks: Vec<_> = (0..count).map(|i| Work::<true> { token: i as u32, ..Default::default() }).collect();
+                ts::stage(&engine, &reference, &tasks).await;
+                let root = engine.root_node(&key).await.unwrap().unwrap();
+                let ids: Vec<_> = root.metadata.outbox.side_effect_tasks.iter().map(|t| t.id).collect();
+                let mut held = vec![true; count];
+                let mut expected = Vec::new();
+                let task_type = task_type_id_for_fqn(Work::<true>::FQN);
+                for (action, index, conflicts) in deliveries {
+                    let index = usize::from(index) % count;
+                    if action == 3 {
+                        repo.conflicts.store(0, Ordering::SeqCst);
+                        TypedEngine::<Root>::new(engine.clone()).update(&reference, |_, ctx| { ctx.resolve_task(ids[index]); Ok(()) }).await.unwrap();
+                        held[index] = false;
+                        continue;
+                    }
+                    let before = repo.load_execution(&key).await.unwrap();
+                    repo.conflicts.store(conflicts, Ordering::SeqCst);
+                    let target = if action == 4 { ts::key(999) } else { key.clone() };
+                    let kind = if action == 5 { 999 } else { task_type };
+                    let result = engine.apply_side_effect_outcome(&target, kind, ids[index], TaskOutcome::Completed { payload: vec![1] }).await;
+                    let applied = action < 3 && held[index] && conflicts < 16;
+                    if applied {
+                        prop_assert!(matches!(result, Ok(OutcomeApplied::Applied(_))));
+                        held[index] = false;
+                        expected.push(index as u32);
+                    } else {
+                        if action == 4 { prop_assert_eq!(result.unwrap(), OutcomeApplied::ExecutionMissing); }
+                        else if action == 5 || !held[index] { prop_assert_eq!(result.unwrap(), OutcomeApplied::NotHeld); }
+                        else { prop_assert!(matches!(result, Err(ChasmError::RetriesExhausted { .. })), "retry bound"); }
+                        prop_assert_eq!(repo.load_execution(&key).await.unwrap(), before);
+                    }
+                    prop_assert_eq!(ts::data(&engine, &key).await.outcomes, expected.clone());
+                }
+                Ok(())
+            })?;
+        }
+    }
+
+    #[tokio::test]
+    async fn unregistered_task_aborts_root_change_and_resolution() {
+        let repo = Arc::new(ConflictingStore::default());
+        let engine = ts::engine(repo.clone(), Arc::new(AtomicI64::new(0)), ts::sink());
+        let key = ts::key(0);
+        let reference = ts::start(&engine, key.clone()).await;
+        ts::stage(&engine, &reference, &[Work::<true>::default()]).await;
+        let before = repo.load_execution(&key).await.unwrap();
+        let id = before[0].1.metadata.outbox.side_effect_tasks[0].id;
+        let result = TypedEngine::<Root>::new(engine.clone())
+            .update(&reference, |root, ctx| {
+                root.data.outcomes.push(100);
+                ctx.resolve_task(id);
+                ctx.add_task(tokeira_chasm::TaskKind::SideEffect, 999, vec![], None)
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ChasmError::UnknownTaskType {
+                task_type_id: 999,
+                ..
+            })
+        ));
+        assert_eq!(repo.load_execution(&key).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn generic_handlers_close_roots_without_visibility() {
+        for effect in [false, true] {
+            let repo = Arc::new(ConflictingStore::default());
+            let engine = ts::engine(repo.clone(), Arc::new(AtomicI64::new(0)), ts::sink());
+            let key = ts::key(0);
+            let reference = ts::start(&engine, key.clone()).await;
+            TypedEngine::<Root>::new(engine.clone())
+                .update(&reference, |root, _| {
+                    root.data.hidden = true;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            if effect {
+                ts::stage(
+                    &engine,
+                    &reference,
+                    &[Work::<true> {
+                        close: true,
+                        ..Default::default()
+                    }],
+                )
+                .await;
+                let task = engine
+                    .root_node(&key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .metadata
+                    .outbox
+                    .side_effect_tasks[0]
+                    .clone();
+                let result = engine
+                    .apply_side_effect_outcome(
+                        &key,
+                        task.task_type_id,
+                        task.id,
+                        TaskOutcome::Terminated,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    result,
+                    OutcomeApplied::Applied(UpdateOutcome { closed: true, .. })
+                ));
+            } else {
+                ts::stage(
+                    &engine,
+                    &reference,
+                    &[Work::<false> {
+                        deadline: 1,
+                        close: true,
+                        ..Default::default()
+                    }],
+                )
+                .await;
+                assert_eq!(engine.execute_due_pure_tasks(&key, 1).await.unwrap(), None);
+            }
+            let root = engine.root_node(&key).await.unwrap().unwrap();
+            assert_eq!(
+                root.metadata.lifecycle_state,
+                Some(LifecycleState::Completed)
+            );
+            assert!(root.metadata.outbox.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_errors_roll_back_the_whole_batch() {
+        let repo = Arc::new(ConflictingStore::default());
+        let engine = ts::engine(repo.clone(), Arc::new(AtomicI64::new(0)), ts::sink());
+        let key = ts::key(0);
+        let reference = ts::start(&engine, key.clone()).await;
+        ts::stage(
+            &engine,
+            &reference,
+            &[
+                Work::<false> {
+                    token: 1,
+                    deadline: 1,
+                    ..Default::default()
+                },
+                Work::<false> {
+                    token: 2,
+                    deadline: 2,
+                    fail: true,
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        ts::stage(
+            &engine,
+            &reference,
+            &[Work::<true> {
+                fail: true,
+                ..Default::default()
+            }],
+        )
+        .await;
+        let before = repo.load_execution(&key).await.unwrap();
+        assert!(engine.execute_due_pure_tasks(&key, 2).await.is_err());
+        assert_eq!(repo.load_execution(&key).await.unwrap(), before);
+        let task = &before[0].1.metadata.outbox.side_effect_tasks[0];
+        assert!(
+            engine
+                .apply_side_effect_outcome(
+                    &key,
+                    task.task_type_id,
+                    task.id,
+                    TaskOutcome::Terminated
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(repo.load_execution(&key).await.unwrap(), before);
     }
 }

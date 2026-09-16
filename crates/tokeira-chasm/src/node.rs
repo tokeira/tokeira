@@ -14,8 +14,9 @@
 //! unit for the runtime to persist and dispatch (Requirement 5.1, 5.2, 7.3–7.5).
 //! Computing the result is pure; the I/O of persisting it lives in the runtime.
 //!
-//! Implemented by tasks 5.1, 5.2 of the `chasm-foundation` spec; this is a
-//! skeleton.
+//! Validation is fallible. A per-transition before-image journal restores every
+//! changed node on failure, so neither data nor partial outbox filtering escapes
+//! an aborted close.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -218,6 +219,7 @@ pub struct NodeTree {
     created: BTreeSet<Vec<u8>>,
     pending_tasks: BTreeMap<Vec<u8>, Vec<PendingTask>>,
     execution_vt: VersionedTransition,
+    before: BTreeMap<Vec<u8>, Option<ChasmNode>>,
 }
 
 impl NodeTree {
@@ -292,6 +294,7 @@ impl NodeTree {
             metadata: NodeMetadata::new(component_type_id, lifecycle_state, self.execution_vt),
             data,
         };
+        self.before.entry(encoded_path.clone()).or_insert(None);
         self.nodes.insert(encoded_path.clone(), node);
         self.created.insert(encoded_path.clone());
         self.dirty.insert(encoded_path);
@@ -342,6 +345,7 @@ impl NodeTree {
                 "mark_dirty: no node at path {encoded_path:?}"
             )));
         }
+        self.record_before_change(encoded_path);
         self.dirty.insert(encoded_path.to_vec());
         Ok(())
     }
@@ -367,6 +371,7 @@ impl NodeTree {
                 "add_task: no node at path {encoded_path:?}"
             )));
         }
+        self.record_before_change(encoded_path);
         self.pending_tasks
             .entry(encoded_path.to_vec())
             .or_default()
@@ -414,8 +419,38 @@ impl NodeTree {
     /// # Errors
     ///
     /// [`ChasmError::Internal`] if `next_vt` does not strictly advance the
-    /// execution clock (a non-monotonic commit is a substrate/caller bug).
+    /// execution clock or a task offset is exhausted. Validator errors propagate,
+    /// including unknown task types and malformed payloads. On any error, all
+    /// nodes changed by this transition are restored and its dirty/pending sets
+    /// are empty; the execution clock is unchanged.
     pub fn close_transaction(
+        &mut self,
+        next_vt: VersionedTransition,
+        validator: &dyn OutboxValidator,
+    ) -> Result<TransitionResult, ChasmError> {
+        let result = self.try_close_transaction(next_vt, validator);
+        if result.is_err() {
+            // Restore the transition's before-images, including newly created
+            // nodes. Clearing only the dirty set would let a later transition
+            // accidentally commit data from this rejected transition.
+            for (path, prior) in std::mem::take(&mut self.before) {
+                match prior {
+                    Some(node) => {
+                        self.nodes.insert(path, node);
+                    }
+                    None => {
+                        self.nodes.remove(&path);
+                    }
+                }
+            }
+            self.dirty.clear();
+            self.created.clear();
+            self.pending_tasks.clear();
+        }
+        result
+    }
+
+    fn try_close_transaction(
         &mut self,
         next_vt: VersionedTransition,
         validator: &dyn OutboxValidator,
@@ -434,13 +469,16 @@ impl NodeTree {
         for (path, tasks) in pending {
             // The node is guaranteed present: add_task verified it and nothing
             // removes nodes mid-transition.
+            self.record_before_change(&path);
             let node = self
                 .nodes
                 .get_mut(&path)
                 .ok_or_else(|| ChasmError::Internal("close: pending task node vanished".into()))?;
             for pending_task in tasks {
                 let offset = node.metadata.next_task_offset;
-                node.metadata.next_task_offset += 1;
+                node.metadata.next_task_offset = offset
+                    .checked_add(1)
+                    .ok_or_else(|| ChasmError::Internal("task offset exhausted".into()))?;
                 let scheduled = ScheduledTask {
                     kind: pending_task.kind,
                     task_type_id: pending_task.task_type_id,
@@ -458,17 +496,18 @@ impl NodeTree {
         // Step 2 — re-validate every task tree-wide; drop the stale ones and mark
         // any node whose outbox shrank as dirty so the drop is persisted.
         let mut newly_dirtied: Vec<Vec<u8>> = Vec::new();
-        for (path, node) in self.nodes.iter_mut() {
-            let before = node.metadata.outbox.len();
-            node.metadata
-                .outbox
-                .pure_tasks
-                .retain(|t| validator.validate(path, t) == TaskValidity::Valid);
-            node.metadata
-                .outbox
-                .side_effect_tasks
-                .retain(|t| validator.validate(path, t) == TaskValidity::Valid);
-            if node.metadata.outbox.len() != before {
+        for (path, node) in &mut self.nodes {
+            let mut retained = TaskOutbox::new();
+            for task in node.metadata.outbox.iter() {
+                if validator.validate(path, task)? == TaskValidity::Valid {
+                    retained.push(task.clone());
+                }
+            }
+            if retained.len() != node.metadata.outbox.len() {
+                self.before
+                    .entry(path.clone())
+                    .or_insert_with(|| Some(node.clone()));
+                node.metadata.outbox = retained;
                 newly_dirtied.push(path.clone());
             }
         }
@@ -522,6 +561,7 @@ impl NodeTree {
         self.execution_vt = next_vt;
         self.dirty.clear();
         self.created.clear();
+        self.before.clear();
 
         Ok(TransitionResult {
             dirty_nodes,
@@ -530,8 +570,15 @@ impl NodeTree {
         })
     }
 
+    fn record_before_change(&mut self, path: &[u8]) {
+        self.before
+            .entry(path.to_vec())
+            .or_insert_with(|| self.nodes.get(path).cloned());
+    }
+
     /// Mutable access to a node, erroring if absent.
     fn node_mut(&mut self, encoded_path: &[u8]) -> Result<&mut ChasmNode, ChasmError> {
+        self.record_before_change(encoded_path);
         self.nodes
             .get_mut(encoded_path)
             .ok_or_else(|| ChasmError::Internal(format!("no node at path {encoded_path:?}")))
@@ -540,7 +587,15 @@ impl NodeTree {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        Component, Registry, RegistryOutboxValidator, Task, task_type_id_for_fqn,
+        test_support::{Data, Root, TestContext, Tick, TickHandler},
+    };
+    use proptest::prelude::*;
+    use prost::Message;
+
     use super::*;
+    use crate::task::RetainAllValidator;
 
     #[test]
     fn execution_key_round_trips() {
@@ -559,8 +614,6 @@ mod tests {
         info.close_time_unix_nanos = Some(1_700_000_000_000_000_000);
         assert!(info.is_closed());
     }
-
-    use crate::task::{RetainAllValidator, TaskKind, TaskValidity};
 
     fn vt(failover: i64, count: i64) -> VersionedTransition {
         VersionedTransition::new(failover, count)
@@ -776,5 +829,106 @@ mod tests {
                 b"$attempts#0002".to_vec()
             ]
         );
+    }
+
+    // Feature: chasm-extension-archetypes, Property 2: validate-then-drop at close
+    // Filtering preserves each surviving staging identity/order; errors restore all before-images.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn validate_then_drop_at_close(
+            old in prop::collection::vec((any::<bool>(), prop::option::of(any::<i64>())), 0..20),
+            pending in prop::collection::vec((any::<bool>(), prop::option::of(any::<i64>())), 0..20),
+            decisions in prop::collection::vec(any::<bool>(), 1..40),
+            unknown_position in 0_usize..20,
+            new_value in any::<i64>(),
+        ) {
+            let mut tree = NodeTree::new();
+            tree.create_node(Vec::new(), 7, Some(LifecycleState::Running), Some(vec![1])).unwrap();
+            for (index, (pure, deadline)) in old.iter().enumerate() {
+                tree.add_task(b"", if *pure { TaskKind::Pure } else { TaskKind::SideEffect }, index as u32, vec![index as u8], *deadline).unwrap();
+            }
+            tree.close_transaction(vt(1, 1), &RetainAllValidator).unwrap();
+            let old_tasks = tree.node(b"").unwrap().metadata.outbox.clone();
+            for (offset, (pure, deadline)) in pending.iter().enumerate() {
+                let index = old.len() + offset;
+                tree.add_task(b"", if *pure { TaskKind::Pure } else { TaskKind::SideEffect }, index as u32, vec![index as u8], *deadline).unwrap();
+            }
+            let decision = |_: &[u8], task: &ScheduledTask| if decisions[task.task_type_id as usize % decisions.len()] { TaskValidity::Valid } else { TaskValidity::Drop };
+            let result = tree.close_transaction(vt(1, 2), &decision).unwrap();
+            let actual = &tree.node(b"").unwrap().metadata.outbox;
+            let expected = old.iter().chain(&pending).enumerate()
+                .filter(|(index, _)| decisions[index % decisions.len()])
+                .map(|(index, (pure, deadline))| ScheduledTask {
+                    kind: if *pure { TaskKind::Pure } else { TaskKind::SideEffect }, task_type_id: index as u32,
+                    payload: vec![index as u8], fire_at_unix_nanos: *deadline,
+                    id: TaskId::new(if index < old.len() { vt(1, 1) } else { vt(1, 2) }, index as u32),
+                }).collect::<Vec<_>>();
+            prop_assert_eq!(&actual.pure_tasks, &expected.iter().filter(|task| task.is_pure()).cloned().collect::<Vec<_>>());
+            prop_assert_eq!(&actual.side_effect_tasks, &expected.iter().filter(|task| task.is_side_effect()).cloned().collect::<Vec<_>>());
+            prop_assert_eq!(result.earliest_pure_deadline_unix_nanos, expected.iter().filter(|task| task.is_pure()).filter_map(|task| task.fire_at_unix_nanos).min());
+            prop_assert_eq!(result.side_effect_tasks.iter().map(|dispatch| dispatch.task.clone()).collect::<Vec<_>>(), expected.iter().filter(|task| task.is_side_effect() && task.id.versioned_transition == vt(1, 2)).cloned().collect::<Vec<_>>());
+            for task in actual.iter().filter(|task| task.id.versioned_transition == vt(1, 1)) {
+                prop_assert!(old_tasks.iter().any(|old| old == task));
+            }
+
+            let mut builder = Registry::builder();
+            builder.register::<Root>("test").unwrap().register_pure_task("test", TickHandler).unwrap();
+            let registry = builder.build();
+            let component = registry.archetype_id(Root::<0>::FQN).unwrap();
+            let data = Data { value: 0 }.encode_to_vec();
+            let mut failing = NodeTree::new();
+            failing.create_node(Vec::new(), component, Some(LifecycleState::Running), Some(data.clone())).unwrap();
+            failing.close_transaction(vt(1, 1), &RetainAllValidator).unwrap();
+            let before = failing.node(b"").unwrap().clone();
+            failing.set_data(b"", Some(Data { value: new_value }.encode_to_vec())).unwrap();
+            failing.set_lifecycle(b"", LifecycleState::Completed).unwrap();
+            for index in 0..=unknown_position {
+                failing.add_task(b"", TaskKind::Pure,
+                    if index == unknown_position { 42 } else { task_type_id_for_fqn(Tick::FQN) },
+                    Task::encode(&Tick { delta: if index % 2 == 0 { 101 } else { 1 } }).unwrap(), Some(index as i64)).unwrap();
+            }
+            let ctx = TestContext::default();
+            let validator = RegistryOutboxValidator { registry: &registry, component_type_id: component, data: &data, ctx: &ctx };
+            let error = failing.close_transaction(vt(1, 2), &validator).unwrap_err();
+            prop_assert!(matches!(error, ChasmError::UnknownTaskType { task_type_id: 42, .. }), "expected unknown task type");
+            prop_assert!(failing.dirty.is_empty());
+            prop_assert!(failing.pending_tasks.is_empty());
+            prop_assert!(failing.created.is_empty());
+            prop_assert_eq!(failing.execution_vt(), vt(1, 1));
+            prop_assert_eq!(failing.node(b""), Some(&before));
+            prop_assert!(failing.close_transaction(vt(1, 2), &RetainAllValidator).unwrap().dirty_nodes.is_empty());
+        }
+    }
+
+    #[test]
+    fn validator_error_rolls_back_earlier_nodes_and_removes_new_nodes() {
+        struct FailLast;
+        impl OutboxValidator for FailLast {
+            fn validate(&self, _: &[u8], task: &ScheduledTask) -> Result<TaskValidity, ChasmError> {
+                if task.task_type_id == 99 {
+                    Err(ChasmError::Validation("late failure".into()))
+                } else {
+                    Ok(TaskValidity::Drop)
+                }
+            }
+        }
+        let mut tree = NodeTree::new();
+        tree.create_node(b"a".to_vec(), 1, None, Some(vec![1]))
+            .unwrap();
+        tree.add_task(b"a", TaskKind::Pure, 1, vec![], None)
+            .unwrap();
+        tree.close_transaction(vt(1, 1), &RetainAllValidator)
+            .unwrap();
+        let before = tree.node(b"a").unwrap().clone();
+        tree.create_node(b"z".to_vec(), 1, None, Some(vec![2]))
+            .unwrap();
+        tree.add_task(b"z", TaskKind::SideEffect, 99, vec![], None)
+            .unwrap();
+        assert!(tree.close_transaction(vt(1, 2), &FailLast).is_err());
+        assert_eq!(tree.node(b"a"), Some(&before));
+        assert!(tree.node(b"z").is_none());
+        assert!(tree.dirty.is_empty());
+        assert_eq!(tree.execution_vt(), vt(1, 1));
     }
 }

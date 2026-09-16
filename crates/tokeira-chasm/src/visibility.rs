@@ -14,6 +14,17 @@ use tokeira_types::{Memo, SearchAttributes as TypedSearchAttributes};
 
 use crate::component::LifecycleState;
 
+/// Engine-owned visibility fields. Component declarations and snapshot adapters
+/// share this list so extensions cannot spoof execution identity or lifecycle.
+pub const RESERVED_SYSTEM_FIELDS: &[&str] = &[
+    "archetype",
+    "status",
+    "lifecycle_state",
+    "namespace",
+    "run_id",
+    "business_id",
+];
+
 /// Component-contributed search attributes, as `(name, value)` string pairs.
 ///
 /// Kept as strings at the substrate boundary for the MVP; richer typed search

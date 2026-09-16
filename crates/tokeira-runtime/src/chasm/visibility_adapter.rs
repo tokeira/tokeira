@@ -30,14 +30,7 @@ use super::VisibilitySink;
 /// Reserved system fields a component must not spoof through a user search
 /// attribute (Requirement 10.10). The typed snapshot carries these as struct
 /// fields; a like-named entry in `search_attributes` is rejected.
-const RESERVED_FIELDS: &[&str] = &[
-    "archetype",
-    "status",
-    "lifecycle_state",
-    "namespace",
-    "run_id",
-    "business_id",
-];
+const RESERVED_FIELDS: &[&str] = tokeira_chasm::RESERVED_SYSTEM_FIELDS;
 
 /// Adapts CHASM engine transition-close events into writes on the shared visibility
 /// store, reusing the projection apply path (row + search-attribute index + rollup).

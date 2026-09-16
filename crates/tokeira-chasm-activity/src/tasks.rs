@@ -49,6 +49,15 @@ pub struct DispatchTask {
 
 impl Task for DispatchTask {
     const KIND: TaskKind = TaskKind::SideEffect;
+    const FQN: &'static str = "activity.dispatch";
+    fn encode(&self) -> Result<Vec<u8>, ChasmError> {
+        postcard::to_allocvec(self)
+            .map_err(|e| ChasmError::Internal(format!("encode {}: {e}", Self::FQN)))
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, ChasmError> {
+        postcard::from_bytes(bytes)
+            .map_err(|e| ChasmError::Validation(format!("decode {}: {e}", Self::FQN)))
+    }
     fn fire_at(&self) -> Option<i64> {
         None
     }
@@ -78,6 +87,15 @@ pub struct ScheduleToStartTimer {
 
 impl Task for ScheduleToStartTimer {
     const KIND: TaskKind = TaskKind::Pure;
+    const FQN: &'static str = "activity.schedule_to_start";
+    fn encode(&self) -> Result<Vec<u8>, ChasmError> {
+        postcard::to_allocvec(self)
+            .map_err(|e| ChasmError::Internal(format!("encode {}: {e}", Self::FQN)))
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, ChasmError> {
+        postcard::from_bytes(bytes)
+            .map_err(|e| ChasmError::Validation(format!("decode {}: {e}", Self::FQN)))
+    }
     fn fire_at(&self) -> Option<i64> {
         Some(self.fire_at_nanos)
     }
@@ -95,6 +113,15 @@ pub struct ScheduleToCloseTimer {
 
 impl Task for ScheduleToCloseTimer {
     const KIND: TaskKind = TaskKind::Pure;
+    const FQN: &'static str = "activity.schedule_to_close";
+    fn encode(&self) -> Result<Vec<u8>, ChasmError> {
+        postcard::to_allocvec(self)
+            .map_err(|e| ChasmError::Internal(format!("encode {}: {e}", Self::FQN)))
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, ChasmError> {
+        postcard::from_bytes(bytes)
+            .map_err(|e| ChasmError::Validation(format!("decode {}: {e}", Self::FQN)))
+    }
     fn fire_at(&self) -> Option<i64> {
         Some(self.fire_at_nanos)
     }
@@ -111,6 +138,15 @@ pub struct StartToCloseTimer {
 
 impl Task for StartToCloseTimer {
     const KIND: TaskKind = TaskKind::Pure;
+    const FQN: &'static str = "activity.start_to_close";
+    fn encode(&self) -> Result<Vec<u8>, ChasmError> {
+        postcard::to_allocvec(self)
+            .map_err(|e| ChasmError::Internal(format!("encode {}: {e}", Self::FQN)))
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, ChasmError> {
+        postcard::from_bytes(bytes)
+            .map_err(|e| ChasmError::Validation(format!("decode {}: {e}", Self::FQN)))
+    }
     fn fire_at(&self) -> Option<i64> {
         Some(self.fire_at_nanos)
     }
@@ -128,6 +164,15 @@ pub struct HeartbeatTimer {
 
 impl Task for HeartbeatTimer {
     const KIND: TaskKind = TaskKind::Pure;
+    const FQN: &'static str = "activity.heartbeat";
+    fn encode(&self) -> Result<Vec<u8>, ChasmError> {
+        postcard::to_allocvec(self)
+            .map_err(|e| ChasmError::Internal(format!("encode {}: {e}", Self::FQN)))
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, ChasmError> {
+        postcard::from_bytes(bytes)
+            .map_err(|e| ChasmError::Validation(format!("decode {}: {e}", Self::FQN)))
+    }
     fn fire_at(&self) -> Option<i64> {
         Some(self.fire_at_nanos)
     }
@@ -238,5 +283,67 @@ impl TaskValidator<ActivityExecution, HeartbeatTimer> for HeartbeatValidator {
         } else {
             TaskValidity::Drop
         }
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    fn preserved<T: Task + PartialEq + std::fmt::Debug>(task: T, fqn: &str) {
+        let legacy = postcard::to_allocvec(&task).unwrap();
+        assert_eq!(Task::encode(&task).unwrap(), legacy);
+        assert_eq!(T::decode(&legacy).unwrap(), task);
+        assert_eq!(T::FQN, fqn);
+        assert!(T::decode(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn task_identity_preserves_existing_activity_ids_and_postcard_bytes() {
+        assert_eq!(
+            [
+                DISPATCH_TASK_ID,
+                SCHEDULE_TO_START_TASK_ID,
+                SCHEDULE_TO_CLOSE_TASK_ID,
+                START_TO_CLOSE_TASK_ID,
+                HEARTBEAT_TASK_ID
+            ],
+            [1, 2, 3, 4, 5]
+        );
+        preserved(
+            DispatchTask {
+                stamp: 3,
+                task_queue: "queue".into(),
+            },
+            "activity.dispatch",
+        );
+        preserved(
+            ScheduleToStartTimer {
+                stamp: 3,
+                fire_at_nanos: 10,
+            },
+            "activity.schedule_to_start",
+        );
+        preserved(
+            ScheduleToCloseTimer {
+                stamp: 3,
+                fire_at_nanos: 20,
+            },
+            "activity.schedule_to_close",
+        );
+        preserved(
+            StartToCloseTimer {
+                stamp: 3,
+                fire_at_nanos: 30,
+            },
+            "activity.start_to_close",
+        );
+        preserved(
+            HeartbeatTimer {
+                stamp: 3,
+                fire_at_nanos: 40,
+            },
+            "activity.heartbeat",
+        );
     }
 }

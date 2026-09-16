@@ -128,6 +128,8 @@ pub trait Task: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// Stable name, `"<library>.<task>"`; the id is derived from it unless reserved.
     const FQN: &'static str;
     fn fire_at(&self) -> Option<i64>;
+    fn encode(&self) -> Result<Vec<u8>, ChasmError>;
+    fn decode(bytes: &[u8]) -> Result<Self, ChasmError>;
 }
 
 /// Ids below `RESERVED_TASK_ID_LIMIT` (1024) are explicit and reserved for built-in
@@ -173,7 +175,7 @@ pub trait SideEffectTaskHandler: Send + Sync + 'static {
 **Erased entries.** The registry stores monomorphized closures over encoded bytes, so the
 runtime dispatches by `(component_type_id, task_type_id)` with no `Any` and no reflection.
 Each closure decodes `C::Data`, builds `C` via `EngineComponent::from_data`, decodes the
-task with `postcard`, calls the typed handler, and re-encodes on the mutating paths.
+task with `Task::decode`, calls the typed handler, and re-encodes on the mutating paths.
 
 ```rust
 // registry.rs
@@ -232,8 +234,8 @@ impl Registry {
 `Library::register` is unchanged; a library that has tasks calls the new builder methods
 inside it. `RegistryBuilder::build` fails on: a non-built-in library using a built-in
 name; two task FQNs; two task ids; a derived id below the reserved limit; a reserved
-search-attribute name. `close_transaction` keeps its `&dyn OutboxValidator` parameter; the
-runtime passes a validator backed by `Registry::validate_task`.
+search-attribute name. `close_transaction` keeps its `&dyn OutboxValidator` parameter,
+whose `validate` is fallible; the runtime passes a validator backed by `Registry::validate_task`.
 
 `MutableContext` gains one method so a handler can drop the task it is completing:
 
@@ -501,7 +503,8 @@ pub struct CurrentExecution { pub key: ExecutionKey, pub archetype_id: u32, pub 
 ```
 
 `current_run` reads the new table first and falls back to the old one only while the
-backfill marker is unset; the backfill runs at engine start with the activity archetype id
+backfill marker is unset and only when the legacy run's root node carries the requested
+archetype id; the backfill runs at engine start with the activity archetype id
 until it copies zero rows, then writes a marker row (`tokeira_control_lease`-style, in the
 existing control table) so the fallback is skipped thereafter (Requirements 4.3, 4.4). The
 in-memory repository mirrors the behaviour without the marker.

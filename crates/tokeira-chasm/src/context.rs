@@ -23,7 +23,7 @@
 use crate::{
     error::ChasmError,
     node::{ExecutionInfo, ExecutionKey},
-    task::TaskKind,
+    task::{TaskId, TaskKind},
 };
 
 /// Read-only access available on every path (reads and transitions alike).
@@ -49,18 +49,21 @@ pub trait Context {
 
 /// Read-write access, available **only inside a transition**.
 ///
-/// Extends [`Context`] with the two mutating capabilities a transition needs:
-/// scheduling a task into the owning node's outbox, and marking the component's
-/// node dirty after mutating its in-memory state. Both are absent from [`Context`]
+/// Extends [`Context`] with scheduling and resolving outbox tasks, and marking
+/// the component's node dirty after mutating its in-memory state. These are absent from [`Context`]
 /// so a read path structurally cannot schedule work or mutate state
 /// (Requirement 6.3, 6.4).
 ///
 /// `add_task` takes the **pre-serialized** task fields rather than a generic
 /// `T: Task` so the trait stays object-safe (`&mut dyn MutableContext`). The
 /// engine's typed wrapper serializes a typed [`Task`](crate::task::Task) and calls
-/// this; the task receives its stable [`TaskId`](crate::task::TaskId) at transition
+/// this; the task receives its stable [`TaskId`] at transition
 /// close, so none is supplied here.
 pub trait MutableContext: Context {
+    /// Stage removal of a previously scheduled task by its stable id. Resolving
+    /// an absent task is a no-op; removal commits with the enclosing transition.
+    fn resolve_task(&mut self, id: TaskId);
+
     /// Schedule a task into the owning component node's outbox (Requirement 7.2).
     ///
     /// `kind` selects the pure/side-effect outbox; `task_type_id` names the

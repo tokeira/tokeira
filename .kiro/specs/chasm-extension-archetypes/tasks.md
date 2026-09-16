@@ -92,14 +92,20 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 
 ### Stage 3 — Substrate: task identity, typed handlers, registry (`tokeira-chasm`, `tokeira-chasm-derive`)
 
-- [ ] 3.1 Task identity: add `Task::FQN`, `RESERVED_TASK_ID_LIMIT = 1024`,
+- [x] 3.1 Task identity: add `Task::FQN`, `RESERVED_TASK_ID_LIMIT = 1024`,
   `task_type_id_for_fqn` (the archetype hash function), `TaskOutcome`, `StartActivityTask`
   and `DeploymentVersionTarget` in `task.rs`. Give the activity's five existing tasks FQNs
   (`activity.dispatch`, `activity.schedule_to_start`, …) without changing their ids.
   - _Requirements: 1.3_
-- [ ] 3.2 Handlers and registry: new `handler.rs` with `PureTaskHandler` and
+
+  **DONE (2026-09-16):** Task FQNs, the reserved range, task-owned codecs, outcome
+  values and prost start/version payloads are implemented and re-exported. Codec
+  regression tests preserve activity ids 1–5 and their existing postcard bytes; no
+  dependencies changed.
+
+- [x] 3.2 Handlers and registry: new `handler.rs` with `PureTaskHandler` and
   `SideEffectTaskHandler`; `TaskEntry` + `ErasedTaskHandler` (closures over encoded bytes,
-  decode with `EngineComponent::from_data` and `postcard`, re-encode on mutation);
+  decode with `EngineComponent::from_data` and `Task::decode`, re-encode on mutation);
   `RegistryBuilder::{register_pure_task, register_side_effect_task,
   register_reserved_pure_task, register_reserved_side_effect_task,
   register_search_attributes, seal_built_ins}`; `Registry::{task_for_id, validate_task,
@@ -109,28 +115,65 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   `ReservedLibraryName`, `TaskTypeCollision`, `ReservedSearchAttribute`,
   `UnregisteredArchetype`.
   - _Requirements: 1.1, 1.2, 1.4, 1.5, 1.6, 1.7_
-- [ ] 3.3 Add `MutableContext::resolve_task(TaskId)` and implement it on the runtime's
+
+  **DONE (2026-09-16):** Typed pure and side-effect handlers are registered through
+  monomorphized codec closures, with component/task lookup, identity checks, sealed
+  built-in names and search definitions. All five error variants and the shared reserved
+  system-field list are present. Typed dispatch and rejection tests pass.
+
+- [x] 3.3 Add `MutableContext::resolve_task(TaskId)` and implement it on the runtime's
   transition context (stage 5.2 wires it). Add `RegistryOutboxValidator` implementing
   `OutboxValidator` over `Registry::validate_task` for one component's encoded data.
   - _Requirements: 1.10_
-- [ ] 3.4 Derive and compile-time guards: a `trybuild` case in `tokeira-chasm-derive/tests/ui`
+
+  **DONE (2026-09-16):** Outbox validation is fallible and registry-backed for a single
+  root. A before-image journal restores changed nodes and clears dirty/pending state on
+  validation errors. The runtime stages task resolutions for stage 5; its two close
+  sites still use `RetainAllValidator`.
+
+- [x] 3.4 Derive and compile-time guards: a `trybuild` case in `tokeira-chasm-derive/tests/ui`
   rejecting a handler whose `Component` is not a `RootComponent`; module docs for
   `handler.rs` and the extended `registry.rs` per root `AGENTS.md §9`.
   - _Requirements: 1.1, 1.2_
-- [ ] 3.5 Property test: Property 1 — registry validity and id stability
+
+  **DONE (2026-09-16):** Both handler traits require `RootComponent`. The new trybuild
+  non-root rejection and its generated stderr pass alongside the 12 existing UI cases;
+  it compiles the actual trait source for portable diagnostic spans. Module/public-item
+  docs and substrate re-exports are updated.
+
+- [x] 3.5 Property test: Property 1 — registry validity and id stability
   - Generated library sets (names, component FQNs, task FQNs, reserved ids, search-attribute
     names); build succeeds iff the design's conditions hold; derived ids equal across builds.
   - Tag: `// Feature: chasm-extension-archetypes, Property 1: registry validity and id stability`
   - _Requirements: 1.3, 1.4, 1.5, 1.7_
-- [ ] 3.6 Property test: Property 2 — validate-then-drop at close
+
+  **DONE (2026-09-16):** Property 1 passes 128 generated registration traces against an
+  independent reference model, checking each rejection and its named item, searched
+  reserved-range hashes, component/task collisions, sealing and stable ids across two
+  builds.
+
+- [x] 3.6 Property test: Property 2 — validate-then-drop at close
   - Generated outboxes and validator decision functions; `close_transaction` retains exactly
     the `Valid` tasks in order; an unregistered task type fails the close with nothing dirty.
   - Tag: `// Feature: chasm-extension-archetypes, Property 2: validate-then-drop at close`
   - _Requirements: 1.10, 1.11, 1.12, 1.13, 3.2_
 
-- [ ] 4. Checkpoint: `cargo clippy -p tokeira-chasm -p tokeira-chasm-derive --all-targets`
+  **DONE (2026-09-16):** Property 2 passes 128 generated old/pending outboxes, retaining
+  exactly valid tasks with stable ids, per-kind staging order, timer minima and dispatch
+  sets. Unknown handlers roll back data, lifecycle and task counters with no dirty
+  nodes; a separate late-failure test restores earlier nodes and removes newly created
+  nodes.
+
+- [x] 4. Checkpoint: `cargo clippy -p tokeira-chasm -p tokeira-chasm-derive --all-targets`
   clean; `cargo nextest run -p tokeira-chasm -p tokeira-chasm-derive` green; `cargo test -p
   tokeira-chasm --doc` green.
+
+  **DONE (2026-09-16):** All six root finishing-bar commands pass with `--locked`
+  where applicable: nightly fmt, workspace lint/check, 3,368 nextest tests passed
+  (serial; two existing SDK integration tests skipped), workspace doctests and docs
+  with warnings denied. The focused substrate/derive/activity suite passes 114 tests;
+  all existing runtime CHASM tests pass. Live DSQL was not exercised (URL gate unset);
+  the two CHASM live cases and their feature/env gates are recorded in the live-suite guide.
 
 ### Stage 5 — Runtime: executors, outcome application, execution, rebuild (`tokeira-runtime`)
 

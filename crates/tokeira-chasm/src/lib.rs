@@ -42,7 +42,8 @@
 //! - [`path`] — the prefix-range-scannable node path encoder.
 //! - [`node`] — the persisted node, the `ExecutionKey`, and the node tree.
 //! - [`versioned_transition`] — the monotonic per-execution logical clock.
-//! - [`registry`] — the immutable component/library index.
+//! - [`registry`] — immutable components, task handlers and search declarations.
+//! - [`handler`] — typed pure execution and side-effect outcome transitions.
 //! - [`component_ref`] — the addressable, staleness-checked node return-address.
 //! - [`task`] — the pure/side-effect task model and validation contract.
 //!
@@ -53,6 +54,7 @@ pub mod component_ref;
 pub mod context;
 pub mod error;
 pub mod field;
+pub mod handler;
 pub mod node;
 pub mod path;
 pub mod policy;
@@ -60,6 +62,9 @@ pub mod registry;
 pub mod task;
 pub mod versioned_transition;
 pub mod visibility;
+
+#[cfg(test)]
+mod test_support;
 
 pub use component::{
     Component, ContextMetadata, EngineComponent, Lifecycle, LifecycleState, RootComponent,
@@ -69,6 +74,7 @@ pub use component_ref::ComponentRef;
 pub use context::{Context, MutableContext};
 pub use error::ChasmError;
 pub use field::{Field, FieldDescriptor, FieldKind, FieldRegistry, Map, NodeHandle, ParentPtr};
+pub use handler::{PureTaskHandler, SideEffectTaskHandler};
 pub use node::{
     ChasmNode, DispatchableTask, ExecutionInfo, ExecutionKey, NodeMetadata, NodeTree,
     TransitionResult,
@@ -77,13 +83,15 @@ pub use path::{PathEncoder, PathSegment, SegmentKind};
 pub use policy::{BusinessIdConflictPolicy, BusinessIdPolicy, BusinessIdReusePolicy};
 pub use registry::{
     ComponentEntry, LEGACY_WORKFLOW_ARCHETYPE_ID, Library, Registry, RegistryBuilder,
-    archetype_id_for_fqn,
+    SearchAttrKind, SearchAttributeDef, TaskEntry, archetype_id_for_fqn,
 };
 pub use task::{
-    OutboxValidator, RetainAllValidator, ScheduledTask, Task, TaskId, TaskKind, TaskOutbox,
-    TaskValidator, TaskValidity,
+    DeploymentVersionTarget, OutboxValidator, RESERVED_TASK_ID_LIMIT, RegistryOutboxValidator,
+    RetainAllValidator, ScheduledTask, StartActivityTask, Task, TaskId, TaskKind, TaskOutbox,
+    TaskOutcome, TaskValidator, TaskValidity, task_type_id_for_fqn,
 };
 pub use versioned_transition::{Staleness, VersionedTransition};
 pub use visibility::{
-    SearchAttributeProvider, SearchAttributes, VisibilityContributor, VisibilitySnapshot,
+    RESERVED_SYSTEM_FIELDS, SearchAttributeProvider, SearchAttributes, VisibilityContributor,
+    VisibilitySnapshot,
 };

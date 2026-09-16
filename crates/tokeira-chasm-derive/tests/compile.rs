@@ -2,6 +2,8 @@
 //! (Requirement 3.2-3.5) is pinned — message and span — so a macro change that
 //! weakens or reworded an enforcement is a visible diff, not a silent drift.
 //! The accept side lives in `tests/derive_behavior.rs`.
+//! The UI glob also pins the typed-handler root-component bound: a materializable
+//! child cannot be registered as an execution-root handler.
 
 #[test]
 fn shape_rules_are_enforced_at_compile_time() {

@@ -1,16 +1,19 @@
 # DSQL live suites
 
-These suites require an operator-selected Aurora DSQL database and run only with
-`dsql-integration`. They are outside the default test suite and CI. Run from the repository
+These suites require an operator-selected Aurora DSQL database and connect only when
+their environment gates are set. Most require `dsql-integration`; the CHASM unit tests
+listed below require `--features dsql` and also compile in the default suite. Live
+execution is outside the default validation and CI. Run from the repository
 root with `--locked`; keep endpoints, URLs, credentials, and resource identities in the
 operator environment rather than in committed files or shared output.
 
 ## URL-gated storage and projection
 
 Set `TOKEIRA_DSQL_TEST_DATABASE_URL` to a connection URL for a disposable test database.
-Each suite falls back to `DATABASE_URL` when that variable is unset and returns without
-connecting when neither is set. These suites connect through SQLx directly rather than
-the IAM connector. The database must permit schema setup and test-data writes; do not
+The three integration suites fall back to `DATABASE_URL` when that variable is unset
+and return without connecting when neither is set. The two CHASM tests use only
+`TOKEIRA_DSQL_TEST_DATABASE_URL` and return without connecting when it is unset.
+These suites connect through SQLx directly rather than the IAM connector. The database must permit schema setup and test-data writes; do not
 point them at a database holding application data.
 
 | Suite | Tests | Coverage |
@@ -18,6 +21,8 @@ point them at a database holding application data.
 | Storage `dsql_shard_leasing` | 4 | Lease ownership and fencing |
 | Storage `dsql_embedded_ownership` | 1 | Embedded ownership lifecycle |
 | Projection `dsql_projection_persistence` | 5 | Visibility persistence and queries |
+| Storage `dsql_archetype_scoped_business_ids` | 1 | CHASM Property 8: scoped pointers and backfill; `--features dsql`, URL gate only |
+| Storage `dsql_chasm_node_store_round_trips_and_fences` | 1 | CHASM nodes, atomic pointers and fencing; `--features dsql`, URL gate only |
 
 Run the suites and their test cases serially against the selected database. The shard
 fixtures reuse a deterministic shard ID across nextest's separate test processes:
@@ -26,6 +31,7 @@ fixtures reuse a deterministic shard ID across nextest's separate test processes
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_shard_leasing --test-threads 1
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_embedded_ownership --test-threads 1
 cargo nextest run -p tokeira-projection --features dsql-integration --locked --test dsql_projection_persistence --test-threads 1
+cargo nextest run -p tokeira-storage --features dsql --locked --test-threads 1 -E 'test(=dsql::chasm_node::tests::dsql_archetype_scoped_business_ids) | test(=dsql::chasm_node::tests::dsql_chasm_node_store_round_trips_and_fences)'
 ```
 
 A green result with the URL gates unset is not live evidence. Record the date, revision,

@@ -525,6 +525,7 @@ mod tests {
     }
 
     impl MutableContext for TestCtx {
+        fn resolve_task(&mut self, _id: tokeira_chasm::TaskId) {}
         fn add_task(
             &mut self,
             kind: TaskKind,

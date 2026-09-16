@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use tokeira_chasm::{
     BusinessIdConflictPolicy, BusinessIdReusePolicy, ChasmError, Context, DispatchableTask,
     ExecutionInfo, ExecutionKey, LifecycleState, MutableContext, NodeTree, Registry,
-    RetainAllValidator, Staleness, TransitionResult, VersionedTransition, VisibilitySnapshot,
+    RetainAllValidator, Staleness, TaskId, TransitionResult, VersionedTransition,
+    VisibilitySnapshot,
 };
 use tokeira_storage::{
     ChasmNodeRepository, CurrentRun, ExpectedVersion, NodePersistOutcome, NodeWrite,
@@ -181,6 +182,7 @@ pub(super) struct TransitionContext {
     info: ExecutionInfo,
     now: i64,
     staged_tasks: Vec<StagedTask>,
+    resolved: Vec<TaskId>,
     dirtied: bool,
 }
 
@@ -196,6 +198,7 @@ impl TransitionContext {
             },
             now,
             staged_tasks: Vec::new(),
+            resolved: Vec::new(),
             dirtied: false,
         }
     }
@@ -204,6 +207,13 @@ impl TransitionContext {
     /// [`UpdateRequest`].
     pub(crate) fn take_staged_tasks(&mut self) -> Vec<StagedTask> {
         std::mem::take(&mut self.staged_tasks)
+    }
+
+    /// Consume task resolutions staged by handlers; stage 5 applies them to the
+    /// root outbox in the same fenced transition as the component mutation.
+    #[allow(dead_code)] // Stage 5 wires the consumer; this slice only adds the primitive.
+    pub(crate) fn take_resolved_tasks(&mut self) -> Vec<TaskId> {
+        std::mem::take(&mut self.resolved)
     }
 }
 
@@ -222,6 +232,9 @@ impl Context for TransitionContext {
 }
 
 impl MutableContext for TransitionContext {
+    fn resolve_task(&mut self, id: TaskId) {
+        self.resolved.push(id);
+    }
     fn add_task(
         &mut self,
         kind: tokeira_chasm::TaskKind,

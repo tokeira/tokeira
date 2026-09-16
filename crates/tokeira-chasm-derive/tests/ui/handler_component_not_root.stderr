@@ -1,0 +1,16 @@
+error[E0277]: the trait bound `Child: RootComponent` is not satisfied
+  --> tests/ui/handler_component_not_root.rs:30:22
+   |
+30 |     type Component = Child;
+   |                      ^^^^^ unsatisfied trait bound
+   |
+help: the trait `RootComponent` is not implemented for `Child`
+  --> tests/ui/handler_component_not_root.rs:12:1
+   |
+12 | struct Child;
+   | ^^^^^^^^^^^^
+note: required by a bound in `handler::PureTaskHandler::Component`
+  --> tests/ui/../../../tokeira-chasm/src/handler.rs
+   |
+   |     type Component: EngineComponent + RootComponent;
+   |                                       ^^^^^^^^^^^^^ required by this bound in `PureTaskHandler::Component`

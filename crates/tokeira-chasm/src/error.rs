@@ -26,6 +26,47 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ChasmError {
+    /// No handler of the requested discipline owns this component/task pair.
+    /// Transition close must abort rather than silently retaining unknown work.
+    #[error("unknown task type {task_type_id} for component {component_type_id}")]
+    UnknownTaskType {
+        /// Archetype of the component that owns the outbox.
+        component_type_id: u32,
+        /// Persisted task type whose handler is missing.
+        task_type_id: u32,
+    },
+    /// A sealed built-in library name or the reserved registration phase was
+    /// used by an extension; registration leaves the builder unchanged.
+    #[error("reserved built-in library name or registration: `{name}`")]
+    ReservedLibraryName {
+        /// Library whose registration is forbidden.
+        name: String,
+    },
+    /// Duplicate task identity, or a derived id in the built-in reserved range.
+    #[error("task type id {id} collides between `{first}` and `{second}`")]
+    TaskTypeCollision {
+        /// Previously registered FQN, or the rejected FQN for a reserved hash.
+        first: String,
+        /// Conflicting FQN, or the reserved-range explanation.
+        second: String,
+        /// Conflicting persisted task id.
+        id: u32,
+    },
+    /// A component tried to declare an attribute supplied by the engine itself.
+    #[error("reserved system search attribute `{name}`")]
+    ReservedSearchAttribute {
+        /// Reserved field that must not be spoofed by a component.
+        name: String,
+    },
+    /// Startup found durable executions whose archetype is absent from the
+    /// registry; serving them without their library would strand their work.
+    #[error("unregistered archetype {archetype_id} owns {executions} executions")]
+    UnregisteredArchetype {
+        /// Persisted archetype id without a registered component.
+        archetype_id: u32,
+        /// Number of affected current execution pointers.
+        executions: u64,
+    },
     /// An activity/component event was applied from a state in which it is not
     /// legal. The transition is rejected and the component state is left
     /// unchanged (Requirement 11.5). This is a programming/protocol error, not a

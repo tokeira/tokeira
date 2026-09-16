@@ -33,6 +33,9 @@
 //!   deserializing a `ScheduledTask` back to its typed `Task` to run the typed
 //!   validator/executor.
 //!
+//! Task FQNs derive stable ids outside the reserved built-in range. Each task
+//! owns its wire codec: changing the registry must not change persisted bytes.
+//!
 //! Purity: these are plain value types and contracts. No I/O, no async, no storage
 //! (Requirement 1.1). The single armed physical timer and post-commit dispatch
 //! that consume a [transition result](crate::node::TransitionResult) live in the
@@ -40,7 +43,121 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{component::Component, context::Context, versioned_transition::VersionedTransition};
+use crate::{
+    ChasmError, Registry, component::Component, context::Context,
+    versioned_transition::VersionedTransition,
+};
+
+/// Persisted built-in task ids occupy `[0, 1024)`. Derived extension ids in this
+/// range are rejected, keeping existing activity outboxes (ids 1–5) readable.
+pub const RESERVED_TASK_ID_LIMIT: u32 = 1024;
+
+/// Derive a stable task id using exactly the component FQN hash. Registration
+/// rejects reserved-range hashes and collisions; this adds no remapping beyond
+/// the component hash's existing zero-id reservation.
+pub fn task_type_id_for_fqn(fqn: &str) -> u32 {
+    crate::registry::archetype_id_for_fqn(fqn)
+}
+
+/// Result of external work, applied by a pure outcome handler in a transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskOutcome {
+    /// Successful work with the executor's opaque result bytes.
+    Completed {
+        /// Result in the executor's wire format.
+        payload: Vec<u8>,
+    },
+    /// Failed work and the executor's retry classification.
+    Failed {
+        /// Encoded failure, interpreted by the component.
+        failure: Vec<u8>,
+        /// Whether retrying the external work may succeed.
+        retryable: bool,
+    },
+    /// Canceled work with optional executor-specific detail bytes.
+    Canceled {
+        /// Encoded cancellation details.
+        details: Vec<u8>,
+    },
+    /// Work exceeded the named Temporal timeout category.
+    TimedOut {
+        /// Numeric Temporal timeout enum, preserved without narrowing.
+        timeout_type: i32,
+    },
+    /// Work was terminated explicitly.
+    Terminated,
+}
+
+/// Exact worker deployment version for an internally staged standalone activity.
+/// This is Tokeira-owned routing metadata, not a public start-request extension.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, prost::Message)]
+pub struct DeploymentVersionTarget {
+    /// Deployment that owns the worker release.
+    #[prost(string, tag = "1")]
+    pub deployment_name: String,
+    /// Exact build within that deployment.
+    #[prost(string, tag = "2")]
+    pub build_id: String,
+}
+
+/// Library-neutral request for runtime work that starts a standalone activity.
+/// Payloads remain opaque encoded Temporal messages. This task owns a prost
+/// codec; libraries with existing codecs keep theirs, avoiding a substrate codec
+/// dependency or an implicit rewrite of durable outboxes.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, prost::Message)]
+pub struct StartActivityTask {
+    /// Business id of the requested activity execution.
+    #[prost(string, tag = "1")]
+    pub activity_id: String,
+    /// Worker activity type.
+    #[prost(string, tag = "2")]
+    pub activity_type: String,
+    /// Queue receiving the activity attempt.
+    #[prost(string, tag = "3")]
+    pub task_queue: String,
+    /// Encoded Temporal input payloads.
+    #[prost(bytes = "vec", tag = "4")]
+    pub input: Vec<u8>,
+    /// Encoded Temporal header.
+    #[prost(bytes = "vec", tag = "5")]
+    pub header: Vec<u8>,
+    /// Encoded Temporal retry policy.
+    #[prost(bytes = "vec", tag = "6")]
+    pub retry_policy: Vec<u8>,
+    /// Schedule-to-start timeout in nanoseconds.
+    #[prost(int64, tag = "7")]
+    pub schedule_to_start_nanos: i64,
+    /// Schedule-to-close timeout in nanoseconds.
+    #[prost(int64, tag = "8")]
+    pub schedule_to_close_nanos: i64,
+    /// Start-to-close timeout in nanoseconds.
+    #[prost(int64, tag = "9")]
+    pub start_to_close_nanos: i64,
+    /// Heartbeat timeout in nanoseconds.
+    #[prost(int64, tag = "10")]
+    pub heartbeat_nanos: i64,
+    /// Optional exact worker release; absent means unversioned dispatch.
+    #[prost(message, optional, tag = "11")]
+    pub version_target: Option<DeploymentVersionTarget>,
+}
+
+impl Task for StartActivityTask {
+    const KIND: TaskKind = TaskKind::SideEffect;
+    const FQN: &'static str = "chasm.start_activity";
+
+    fn fire_at(&self) -> Option<i64> {
+        None
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, ChasmError> {
+        Ok(prost::Message::encode_to_vec(self))
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, ChasmError> {
+        <Self as prost::Message>::decode(bytes)
+            .map_err(|e| ChasmError::Validation(format!("decode {}: {e}", Self::FQN)))
+    }
+}
 
 /// Which of the two task disciplines a task obeys (Requirement 7.1; foundation
 /// §1, §3). The discipline is a static property of the task *type*, so it is a
@@ -202,6 +319,17 @@ pub trait Task: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// The task's static discipline (pure vs side-effect).
     const KIND: TaskKind;
 
+    /// Stable name (`library.task`), hashed for extension ids. Renaming changes
+    /// durable identity, so a library must preserve it across releases.
+    const FQN: &'static str;
+
+    /// Encode with this task's durable wire codec. The substrate never chooses
+    /// a codec on the library's behalf.
+    fn encode(&self) -> Result<Vec<u8>, ChasmError>;
+
+    /// Decode the task's durable bytes; malformed payloads abort the transition.
+    fn decode(bytes: &[u8]) -> Result<Self, ChasmError>;
+
     /// For a pure task, the logical time (Unix nanoseconds) at which it becomes
     /// due. Drives the single tree-wide physical timer (Requirement 7.6). Returns
     /// `None` for side-effect tasks and for pure tasks with no deadline.
@@ -235,15 +363,25 @@ pub trait TaskValidator<C: Component, T: Task> {
 /// tests and simple callers can pass a closure.
 pub trait OutboxValidator {
     /// Decide whether the persisted `task` on the node at `encoded_path` survives.
-    fn validate(&self, encoded_path: &[u8], task: &ScheduledTask) -> TaskValidity;
+    /// Errors abort transition close; they must never be treated as a stale-task
+    /// drop, which would silently erase work whose handler cannot be resolved.
+    fn validate(
+        &self,
+        encoded_path: &[u8],
+        task: &ScheduledTask,
+    ) -> Result<TaskValidity, ChasmError>;
 }
 
 impl<F> OutboxValidator for F
 where
     F: Fn(&[u8], &ScheduledTask) -> TaskValidity,
 {
-    fn validate(&self, encoded_path: &[u8], task: &ScheduledTask) -> TaskValidity {
-        self(encoded_path, task)
+    fn validate(
+        &self,
+        encoded_path: &[u8],
+        task: &ScheduledTask,
+    ) -> Result<TaskValidity, ChasmError> {
+        Ok(self(encoded_path, task))
     }
 }
 
@@ -254,8 +392,45 @@ where
 pub struct RetainAllValidator;
 
 impl OutboxValidator for RetainAllValidator {
-    fn validate(&self, _encoded_path: &[u8], _task: &ScheduledTask) -> TaskValidity {
-        TaskValidity::Valid
+    fn validate(
+        &self,
+        _encoded_path: &[u8],
+        _task: &ScheduledTask,
+    ) -> Result<TaskValidity, ChasmError> {
+        Ok(TaskValidity::Valid)
+    }
+}
+
+/// Validates one root's outbox through its registered typed handlers. The encoded
+/// path is intentionally unused: materialization supports a single root proto
+/// (extension-archetypes decision D4), not arbitrary child components.
+pub struct RegistryOutboxValidator<'a> {
+    /// Frozen startup registry containing the root's handlers.
+    pub registry: &'a Registry,
+    /// Registered root archetype id.
+    pub component_type_id: u32,
+    /// Root data after the transition's component mutations.
+    pub data: &'a [u8],
+    /// Read-only transition context for deterministic validation.
+    pub ctx: &'a dyn Context,
+}
+
+impl std::fmt::Debug for RegistryOutboxValidator<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryOutboxValidator")
+            .field("component_type_id", &self.component_type_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OutboxValidator for RegistryOutboxValidator<'_> {
+    fn validate(
+        &self,
+        _encoded_path: &[u8],
+        task: &ScheduledTask,
+    ) -> Result<TaskValidity, ChasmError> {
+        self.registry
+            .validate_task(self.component_type_id, self.data, task, self.ctx)
     }
 }
 
@@ -311,11 +486,11 @@ mod tests {
         let t = task(TaskKind::Pure, 0, Some(1));
         let keep = |_path: &[u8], _t: &ScheduledTask| TaskValidity::Valid;
         assert_eq!(
-            OutboxValidator::validate(&keep, b"$state", &t),
+            OutboxValidator::validate(&keep, b"$state", &t).unwrap(),
             TaskValidity::Valid
         );
         assert_eq!(
-            RetainAllValidator.validate(b"$state", &t),
+            RetainAllValidator.validate(b"$state", &t).unwrap(),
             TaskValidity::Valid
         );
     }
@@ -331,8 +506,67 @@ mod tests {
             }
         };
         assert_eq!(
-            OutboxValidator::validate(&drop_pure, b"$state", &t),
+            OutboxValidator::validate(&drop_pure, b"$state", &t).unwrap(),
             TaskValidity::Drop
         );
+    }
+    #[test]
+    fn start_activity_task_preserves_all_fields_in_its_prost_codec() {
+        let task = StartActivityTask {
+            activity_id: "job".into(),
+            activity_type: "compile".into(),
+            task_queue: "queue".into(),
+            input: vec![0, 255],
+            header: vec![1, 2],
+            retry_policy: vec![3, 4],
+            schedule_to_start_nanos: 10,
+            schedule_to_close_nanos: 20,
+            start_to_close_nanos: 30,
+            heartbeat_nanos: 40,
+            version_target: Some(DeploymentVersionTarget {
+                deployment_name: "worker".into(),
+                build_id: "release".into(),
+            }),
+        };
+        let bytes = Task::encode(&task).unwrap();
+        assert_eq!(<StartActivityTask as Task>::decode(&bytes).unwrap(), task);
+        assert_eq!(
+            serde_json::from_str::<StartActivityTask>(&serde_json::to_string(&task).unwrap())
+                .unwrap(),
+            task
+        );
+        assert!(<StartActivityTask as Task>::decode(&[0xff]).is_err());
+        assert_eq!(task.fire_at(), None);
+        assert_eq!(
+            Task::encode(&StartActivityTask {
+                activity_id: "x".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+            vec![10, 1, b'x']
+        );
+        assert_eq!(
+            prost::Message::encode_to_vec(&DeploymentVersionTarget {
+                deployment_name: "a".into(),
+                build_id: "b".into()
+            }),
+            vec![10, 1, b'a', 18, 1, b'b']
+        );
+        for outcome in [
+            TaskOutcome::Completed { payload: vec![1] },
+            TaskOutcome::Failed {
+                failure: vec![2],
+                retryable: true,
+            },
+            TaskOutcome::Canceled { details: vec![3] },
+            TaskOutcome::TimedOut { timeout_type: 17 },
+            TaskOutcome::Terminated,
+        ] {
+            assert_eq!(
+                serde_json::from_str::<TaskOutcome>(&serde_json::to_string(&outcome).unwrap())
+                    .unwrap(),
+                outcome
+            );
+        }
     }
 }

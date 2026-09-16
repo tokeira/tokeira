@@ -266,7 +266,9 @@ fn user_metadata_to_edge(
     })
 }
 
-fn link_to_edge(link: &proto_common::Link) -> Result<EdgeLink, ProtoConversionError> {
+/// Preserve link identities and references for admission and callback delivery;
+/// a missing variant is invalid rather than silently discarded.
+pub(crate) fn link_to_edge(link: &proto_common::Link) -> Result<EdgeLink, ProtoConversionError> {
     use proto_common::link::{Variant, workflow_event::Reference};
 
     match link.variant.as_ref() {
@@ -347,14 +349,22 @@ fn validate_completion_callbacks(
     // this in the edge preserves that validation order without making callback
     // policy part of workflow semantics.
     let max_callbacks = max_callbacks_per_workflow();
-    let url_max_length = callback_url_max_length();
-    let header_max_size = callback_header_max_size();
-    let address_rules = callback_address_rules();
     if callbacks.len() > max_callbacks {
         return Err(ProtoConversionError::InvalidArgument(format!(
             "cannot attach more than {max_callbacks} callbacks to a workflow"
         )));
     }
+    validate_callback_specs(callbacks)?;
+    Ok(max_callbacks)
+}
+
+/// Shared callback address/header checks. Each component owns its attachment cap.
+pub(crate) fn validate_callback_specs(
+    callbacks: &[proto_common::Callback],
+) -> Result<(), ProtoConversionError> {
+    let url_max_length = callback_url_max_length();
+    let header_max_size = callback_header_max_size();
+    let address_rules = callback_address_rules();
     for callback in callbacks {
         if let Some(proto_common::callback::Variant::Nexus(nexus)) = callback.variant.as_ref() {
             validate_callback_url(&nexus.url, url_max_length, address_rules.as_deref())?;
@@ -370,7 +380,7 @@ fn validate_completion_callbacks(
             }
         }
     }
-    Ok(max_callbacks)
+    Ok(())
 }
 
 /// Builds the link set v1.31.0 validates on admission: the request's own links

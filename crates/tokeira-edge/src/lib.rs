@@ -136,6 +136,7 @@
 
 pub mod batch_engine;
 pub mod chasm_activity;
+pub mod chasm_executors;
 pub mod conformance;
 pub mod errors;
 pub mod grpc;

@@ -257,7 +257,8 @@ fn user_metadata_to_kernel(metadata: EdgeUserMetadata) -> tokeira_kernel::state:
     }
 }
 
-fn link_to_kernel(link: EdgeLink) -> tokeira_kernel::state::Link {
+/// Preserve every admitted link variant for history and the shared completion client.
+pub(crate) fn link_to_kernel(link: EdgeLink) -> tokeira_kernel::state::Link {
     match link {
         EdgeLink::WorkflowEvent {
             namespace,

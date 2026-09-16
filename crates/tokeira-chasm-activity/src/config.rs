@@ -43,6 +43,11 @@ pub struct ActivityConfig {
     /// `false`.
     #[serde(default)]
     pub enable_standalone: bool,
+    /// Expose standalone completion callbacks (`activity.enableCallbacks`,
+    /// `chasm/lib/activity/config.go:37–40 @ v1.32.0`). Default false preserves
+    /// the v1.31.0 wire surface independently of standalone activity admission.
+    #[serde(default)]
+    pub enable_callbacks: bool,
     /// How long a poll blocks before returning empty. Default 20s.
     #[serde(default = "default_long_poll_timeout")]
     pub long_poll_timeout: Duration,
@@ -56,6 +61,7 @@ impl Default for ActivityConfig {
         Self {
             max_callbacks_per_execution: default_max_callbacks_per_execution(),
             enable_standalone: false,
+            enable_callbacks: false,
             long_poll_timeout: DEFAULT_LONG_POLL_TIMEOUT,
             long_poll_buffer: DEFAULT_LONG_POLL_BUFFER,
         }
@@ -70,6 +76,7 @@ mod tests {
     fn defaults_match_v1_31_0() {
         let config = ActivityConfig::default();
         assert!(!config.enable_standalone);
+        assert!(!config.enable_callbacks);
         assert_eq!(config.max_callbacks_per_execution, 2000);
         assert_eq!(config.long_poll_timeout, Duration::from_secs(20));
         assert_eq!(config.long_poll_buffer, Duration::from_secs(1));
@@ -80,6 +87,7 @@ mod tests {
         let config = ActivityConfig {
             max_callbacks_per_execution: 17,
             enable_standalone: true,
+            enable_callbacks: true,
             long_poll_timeout: Duration::from_secs(30),
             long_poll_buffer: Duration::from_millis(500),
         };

@@ -67,12 +67,12 @@ pub struct NodeWrite {
     pub expected: ExpectedVersion,
 }
 
-/// The result of a [`persist_dirty`](ChasmNodeRepository::persist_dirty) batch.
+/// The result of a fenced node batch or new-execution transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodePersistOutcome {
-    /// Every node's fence held; the batch was applied as one atomic unit.
+    /// Every node and current-pointer fence held; the batch was applied atomically.
     Applied,
-    /// At least one node's fence failed; nothing was written. The runtime should
+    /// A node or current-pointer fence failed; nothing was written. The runtime should
     /// reload the execution and re-run the transition (Requirement 9.5).
     Conflict {
         /// Human-readable description of the first failing fence.
@@ -191,13 +191,17 @@ pub trait ChasmNodeRepository: Send + Sync {
     /// `current_executions` row inside the entity-create transaction — so a run's
     /// nodes and its current-run pointer never tear. Node fences behave exactly as in
     /// [`persist_dirty`](Self::persist_dirty); on a node conflict nothing is written
-    /// and the pointer is left unchanged.
+    /// and the pointer is left unchanged. `expected_current` is the pointer read
+    /// during policy evaluation (`None` means absent), including archetype-checked
+    /// legacy fallback. A mismatch rolls back the entire batch and returns
+    /// [`NodePersistOutcome::Conflict`] so the caller reloads and re-evaluates policy.
     async fn persist_new_execution(
         &self,
         key: &ExecutionKey,
         archetype_id: u32,
         batch: Vec<NodeWrite>,
         current: CurrentRun,
+        expected_current: Option<CurrentRun>,
     ) -> Result<NodePersistOutcome>;
 
     /// Resolve the current run for `(namespace_id, archetype_id, business_id)` — the run a bare-id
@@ -292,6 +296,45 @@ struct InMemoryPointers {
     markers: HashSet<String>,
 }
 
+impl InMemoryPointers {
+    fn resolve<'a>(
+        &'a self,
+        executions: &HashMap<ExecutionKey, BTreeMap<Vec<u8>, ChasmNode>>,
+        namespace_id: &str,
+        archetype_id: u32,
+        business_id: &str,
+    ) -> Option<&'a CurrentRun> {
+        let cursor = CurrentExecutionCursor {
+            namespace_id: namespace_id.to_owned(),
+            archetype_id,
+            business_id: business_id.to_owned(),
+        };
+        if let Some(current) = self.current.get(&cursor) {
+            return Some(current);
+        }
+        if self
+            .markers
+            .contains(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
+        {
+            return None;
+        }
+        // The legacy key has no archetype. The root supplies it so fallback never
+        // leaks another archetype's run, and a deleted legacy run stays absent.
+        self.legacy
+            .get(&(namespace_id.to_owned(), business_id.to_owned()))
+            .filter(|current| {
+                executions
+                    .get(&ExecutionKey::new(
+                        namespace_id,
+                        business_id,
+                        &current.run_id,
+                    ))
+                    .and_then(|tree| tree.get(b"".as_slice()))
+                    .is_some_and(|root| root.metadata.component_type_id == archetype_id)
+            })
+    }
+}
+
 impl InMemoryChasmNodeStore {
     /// Construct an empty store.
     pub fn new() -> Self {
@@ -364,6 +407,7 @@ impl ChasmNodeRepository for InMemoryChasmNodeStore {
         archetype_id: u32,
         batch: Vec<NodeWrite>,
         current: CurrentRun,
+        expected_current: Option<CurrentRun>,
     ) -> Result<NodePersistOutcome> {
         let mut executions = self
             .executions
@@ -373,6 +417,19 @@ impl ChasmNodeRepository for InMemoryChasmNodeStore {
             .pointers
             .lock()
             .map_err(|_| anyhow::anyhow!("chasm pointer store mutex poisoned"))?;
+        // The same locks cover lookup, node writes and pointer advance. Checking
+        // before creating the tree prevents a losing start from leaving any nodes.
+        if pointers.resolve(
+            &executions,
+            &key.namespace_id,
+            archetype_id,
+            &key.business_id,
+        ) != expected_current.as_ref()
+        {
+            return Ok(NodePersistOutcome::Conflict {
+                reason: "current-run pointer changed during start admission".into(),
+            });
+        }
         let tree = executions.entry(key.clone()).or_default();
         if let Some(reason) = check_and_apply_node_batch(tree, batch) {
             return Ok(NodePersistOutcome::Conflict { reason });
@@ -402,35 +459,8 @@ impl ChasmNodeRepository for InMemoryChasmNodeStore {
             .pointers
             .lock()
             .map_err(|_| anyhow::anyhow!("chasm pointer store mutex poisoned"))?;
-        let cursor = CurrentExecutionCursor {
-            namespace_id: namespace_id.to_owned(),
-            archetype_id,
-            business_id: business_id.to_owned(),
-        };
-        if let Some(current) = pointers.current.get(&cursor) {
-            return Ok(Some(current.clone()));
-        }
-        if pointers
-            .markers
-            .contains(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
-        {
-            return Ok(None);
-        }
-        // The legacy key has no archetype. The root supplies it so fallback never
-        // leaks another archetype's run, and a deleted legacy run stays absent.
         Ok(pointers
-            .legacy
-            .get(&(namespace_id.to_owned(), business_id.to_owned()))
-            .filter(|current| {
-                executions
-                    .get(&ExecutionKey::new(
-                        namespace_id,
-                        business_id,
-                        &current.run_id,
-                    ))
-                    .and_then(|tree| tree.get(b"".as_slice()))
-                    .is_some_and(|root| root.metadata.component_type_id == archetype_id)
-            })
+            .resolve(&executions, namespace_id, archetype_id, business_id)
             .cloned())
     }
 
@@ -934,10 +964,10 @@ pub(crate) mod pointer_tests {
         reuse: u8,
         conflict: u8,
     ) -> Result<Outcome> {
-        if let Some(pointer) = repo
+        let expected_current = repo
             .current_run(&key.namespace_id, archetype, &key.business_id)
-            .await?
-        {
+            .await?;
+        if let Some(pointer) = expected_current.as_ref() {
             let existing = ExecutionKey::new(&key.namespace_id, &key.business_id, &pointer.run_id);
             let nodes = repo.load_execution(&existing).await?;
             let node = &nodes
@@ -950,7 +980,7 @@ pub(crate) mod pointer_tests {
                 "cross-archetype root"
             );
             if !request.is_empty() && pointer.request_id == request {
-                return Ok(Outcome::Existing(pointer.run_id));
+                return Ok(Outcome::Existing(pointer.run_id.clone()));
             }
             let reuse = [
                 BusinessIdReusePolicy::AllowDuplicate,
@@ -964,8 +994,10 @@ pub(crate) mod pointer_tests {
             ][usize::from(conflict)];
             if node.metadata.lifecycle_state == Some(LifecycleState::Running) {
                 return Ok(match conflict {
-                    BusinessIdConflictPolicy::Fail => Outcome::Rejected(pointer.run_id),
-                    BusinessIdConflictPolicy::UseExisting => Outcome::Existing(pointer.run_id),
+                    BusinessIdConflictPolicy::Fail => Outcome::Rejected(pointer.run_id.clone()),
+                    BusinessIdConflictPolicy::UseExisting => {
+                        Outcome::Existing(pointer.run_id.clone())
+                    }
                     BusinessIdConflictPolicy::TerminateExisting => Outcome::Unsupported,
                 });
             }
@@ -973,7 +1005,7 @@ pub(crate) mod pointer_tests {
                 || (reuse == BusinessIdReusePolicy::AllowDuplicateFailedOnly
                     && node.metadata.lifecycle_state == Some(LifecycleState::Completed))
             {
-                return Ok(Outcome::Rejected(pointer.run_id));
+                return Ok(Outcome::Rejected(pointer.run_id.clone()));
             }
         }
         let pointer = current(key.run_id.clone(), request, LifecycleState::Running);
@@ -982,7 +1014,8 @@ pub(crate) mod pointer_tests {
                 key,
                 archetype,
                 vec![root(archetype, LifecycleState::Running, 1)],
-                pointer
+                pointer,
+                expected_current,
             )
             .await?
                 == NodePersistOutcome::Applied,
@@ -1176,6 +1209,153 @@ pub(crate) mod pointer_tests {
         }
     }
 
+    pub(crate) async fn exercise_pointer_fence(
+        repo: &dyn ChasmNodeRepository,
+        namespace: &str,
+    ) -> Result<()> {
+        let first = ExecutionKey::new(namespace, "racing-start", Uuid::new_v4().to_string());
+        let second = ExecutionKey::new(namespace, "racing-start", Uuid::new_v4().to_string());
+        let pointer =
+            |key: &ExecutionKey| current(key.run_id.clone(), "request", LifecycleState::Running);
+        let (first_result, second_result) = tokio::join!(
+            repo.persist_new_execution(
+                &first,
+                7,
+                vec![root(7, LifecycleState::Running, 1)],
+                pointer(&first),
+                None
+            ),
+            repo.persist_new_execution(
+                &second,
+                7,
+                vec![root(7, LifecycleState::Running, 1)],
+                pointer(&second),
+                None
+            ),
+        );
+        let (winner, loser) = match (first_result?, second_result?) {
+            (NodePersistOutcome::Applied, NodePersistOutcome::Conflict { .. }) => (&first, &second),
+            (NodePersistOutcome::Conflict { .. }, NodePersistOutcome::Applied) => (&second, &first),
+            results => anyhow::bail!("exactly one racing start must win: {results:?}"),
+        };
+        assert_eq!(
+            repo.current_run(namespace, 7, "racing-start").await?,
+            Some(pointer(winner))
+        );
+        assert_eq!(repo.load_execution(winner).await?.len(), 1);
+        assert!(repo.load_execution(loser).await?.is_empty());
+
+        let mut wrong_epoch = pointer(winner);
+        wrong_epoch.vt_epoch.transition_count += 1;
+        assert!(matches!(
+            repo.persist_new_execution(
+                loser,
+                7,
+                vec![root(7, LifecycleState::Running, 1)],
+                pointer(loser),
+                Some(wrong_epoch)
+            )
+            .await?,
+            NodePersistOutcome::Conflict { .. }
+        ));
+        assert!(repo.load_execution(loser).await?.is_empty());
+        let successor = ExecutionKey::new(namespace, "racing-start", Uuid::new_v4().to_string());
+        assert_eq!(
+            repo.persist_new_execution(
+                &successor,
+                7,
+                vec![root(7, LifecycleState::Running, 1)],
+                pointer(&successor),
+                Some(pointer(winner))
+            )
+            .await?,
+            NodePersistOutcome::Applied
+        );
+        assert!(matches!(
+            repo.persist_new_execution(
+                loser,
+                7,
+                vec![root(7, LifecycleState::Running, 1)],
+                pointer(loser),
+                Some(pointer(winner))
+            )
+            .await?,
+            NodePersistOutcome::Conflict { .. }
+        ));
+        assert!(repo.load_execution(loser).await?.is_empty());
+        assert_eq!(
+            repo.current_run(namespace, 7, "racing-start").await?,
+            Some(pointer(&successor))
+        );
+        for key in [first, second, successor] {
+            repo.delete_execution(&key).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_starts_fence_pointer_and_roll_back_losing_nodes() {
+        exercise_pointer_fence(&InMemoryChasmNodeStore::new(), "ns")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_fence_uses_archetype_checked_legacy_fallback() {
+        let store = InMemoryChasmNodeStore::new();
+        let old = ExecutionKey::new("ns", "business", "old");
+        let legacy = current("old".into(), "old-request", LifecycleState::Running);
+        seed(&store, &old, 7, legacy.clone()).await;
+        let new = ExecutionKey::new("ns", "business", "new");
+        let pointer = current("new".into(), "new-request", LifecycleState::Running);
+        assert!(matches!(
+            store
+                .persist_new_execution(
+                    &new,
+                    7,
+                    vec![root(7, LifecycleState::Running, 1)],
+                    pointer.clone(),
+                    None
+                )
+                .await
+                .unwrap(),
+            NodePersistOutcome::Conflict { .. }
+        ));
+        assert!(store.load_execution(&new).await.unwrap().is_empty());
+        let other = ExecutionKey::new("ns", "business", "other");
+        assert_eq!(
+            store
+                .persist_new_execution(
+                    &other,
+                    8,
+                    vec![root(8, LifecycleState::Running, 1)],
+                    current("other".into(), "request", LifecycleState::Running),
+                    None
+                )
+                .await
+                .unwrap(),
+            NodePersistOutcome::Applied
+        );
+        assert_eq!(
+            store
+                .persist_new_execution(
+                    &new,
+                    7,
+                    vec![root(7, LifecycleState::Running, 1)],
+                    pointer.clone(),
+                    Some(legacy)
+                )
+                .await
+                .unwrap(),
+            NodePersistOutcome::Applied
+        );
+        assert_eq!(
+            store.current_run("ns", 7, "business").await.unwrap(),
+            Some(pointer)
+        );
+        assert_eq!(store.pointers.lock().unwrap().legacy.len(), 1);
+    }
+
     #[tokio::test]
     async fn backfill_resumes_and_preserves_newer_pointers() {
         let store = InMemoryChasmNodeStore::new();
@@ -1204,6 +1384,7 @@ pub(crate) mod pointer_tests {
                 7,
                 vec![root(7, LifecycleState::Failed, 1)],
                 new.clone(),
+                store.current_run("ns", 7, "3").await.unwrap(),
             )
             .await
             .unwrap();
@@ -1276,7 +1457,11 @@ pub(crate) mod pointer_tests {
                         &key,
                         archetype,
                         vec![root(archetype, LifecycleState::Running, 1)],
-                        pointer
+                        pointer,
+                        store
+                            .current_run("ns", archetype, "business")
+                            .await
+                            .unwrap(),
                     )
                     .await
                     .unwrap(),
@@ -1290,7 +1475,8 @@ pub(crate) mod pointer_tests {
                     &old,
                     7,
                     vec![root(7, LifecycleState::Completed, 1)],
-                    invalid
+                    invalid,
+                    store.current_run("ns", 7, "business").await.unwrap(),
                 )
                 .await
                 .unwrap(),
@@ -1347,6 +1533,7 @@ pub(crate) mod pointer_tests {
                     archetype,
                     vec![root(archetype, status, 1)],
                     current(key.run_id.clone(), "request", status),
+                    None,
                 )
                 .await
                 .unwrap();

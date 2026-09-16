@@ -13,6 +13,7 @@ use tonic::{Request, Response, Status, codec::CompressionEncoding};
 use tracing::debug;
 
 use time::OffsetDateTime;
+use tokeira_chasm::DeploymentVersionTarget;
 use tokeira_projection::{STANDARD_SEARCH_ATTRIBUTES, SearchAttrType};
 use tokeira_proto::{
     enums::{IndexedValueType, TaskQueueType},
@@ -34,6 +35,7 @@ use tokeira_proto::public::temporal::api::{activity::v1 as activity_v1, worker::
 
 use crate::{
     Action,
+    chasm_activity::{defaulted_retry_policy, retry_policy_fields},
     grpc::{
         errors::{
             proto_conversion_status, worker_versioning_v1_disabled_status,
@@ -283,33 +285,6 @@ fn proto_duration_to_nanos(value: Option<&prost_types::Duration>) -> i64 {
             .saturating_add(i64::from(duration.nanos)),
         None => 0,
     }
-}
-
-/// Return the normalized standalone-activity retry policy that v1.31.0 persists and
-/// exposes through Describe. Tokeira uses the release defaults as constants rather
-/// than dynamic configuration (`chasm/lib/activity/frontend.go:362-419 @ v1.31.0`).
-fn defaulted_retry_policy(
-    policy: Option<&tokeira_proto::common::RetryPolicy>,
-) -> tokeira_proto::common::RetryPolicy {
-    // EnsureDefaults: InitialInterval 1s, BackoffCoefficient 2.0, MaximumInterval
-    // 100 × InitialInterval, MaximumAttempts 0 (unlimited).
-    let mut normalized = policy.cloned().unwrap_or_default();
-    if proto_duration_to_nanos(normalized.initial_interval.as_ref()) == 0 {
-        normalized.initial_interval = Some(prost_types::Duration {
-            seconds: 1,
-            nanos: 0,
-        });
-    }
-    if normalized.backoff_coefficient == 0.0 {
-        normalized.backoff_coefficient = 2.0;
-    }
-    if proto_duration_to_nanos(normalized.maximum_interval.as_ref()) == 0 {
-        // DefaultDefaultRetrySettings.MaximumIntervalCoefficient = 100.
-        let maximum =
-            proto_duration_to_nanos(normalized.initial_interval.as_ref()).saturating_mul(100);
-        normalized.maximum_interval = nanos_to_proto_duration(maximum);
-    }
-    normalized
 }
 
 /// Build a `PollActivityTaskQueueResponse` for a standalone-activity task served
@@ -756,6 +731,7 @@ fn chasm_describe_response(
     include_outcome: bool,
     description: crate::chasm_activity::ActivityDescription,
     long_poll_token: Vec<u8>,
+    callbacks_enabled: bool,
 ) -> workflowservice::DescribeActivityExecutionResponse {
     let input = include_input
         .then(|| tokeira_proto::common::Payloads::decode(description.input.as_slice()).ok())
@@ -772,8 +748,113 @@ fn chasm_describe_response(
         input,
         outcome,
         long_poll_token,
-        callbacks: Vec::new(),
+        callbacks: if callbacks_enabled {
+            activity_callback_infos(&description.callbacks)
+        } else {
+            Vec::new()
+        },
     }
+}
+
+fn activity_callback_infos(
+    callbacks: &[tokeira_chasm_activity::ActivityCallback],
+) -> Vec<activity_v1::CallbackInfo> {
+    // buildCallbackInfos (`chasm/lib/activity/activity.go:1929–1975 @ v1.32.0`).
+    // Internal return addresses are not a public callback variant (decision D2).
+    callbacks
+        .iter()
+        .filter_map(|callback| {
+            let Some(tokeira_chasm_activity::activity_callback::Target::Nexus(target)) =
+                &callback.target
+            else {
+                return None;
+            };
+            Some(activity_v1::CallbackInfo {
+                trigger: Some(activity_v1::callback_info::Trigger {
+                    variant: Some(
+                        activity_v1::callback_info::trigger::Variant::ActivityClosed(
+                            activity_v1::callback_info::ActivityClosed {},
+                        ),
+                    ),
+                }),
+                info: Some(
+                    tokeira_proto::public::temporal::api::callback::v1::CallbackInfo {
+                        callback: Some(tokeira_proto::common::Callback {
+                            variant: Some(tokeira_proto::common::callback::Variant::Nexus(
+                                tokeira_proto::common::callback::Nexus {
+                                    url: target.url.clone(),
+                                    header: target.header.clone().into_iter().collect(),
+                                },
+                            )),
+                            links: callback
+                                .links
+                                .iter()
+                                .filter_map(|bytes| {
+                                    tokeira_proto::common::Link::decode(bytes.as_slice()).ok()
+                                })
+                                .collect(),
+                        }),
+                        registration_time: nanos_to_proto_timestamp(
+                            callback.registration_time_nanos,
+                        ),
+                        state: callback.state,
+                        attempt: callback.attempt,
+                        last_attempt_complete_time: nanos_to_proto_timestamp(
+                            callback.last_attempt_complete_time_nanos,
+                        ),
+                        next_attempt_schedule_time: nanos_to_proto_timestamp(
+                            callback.next_attempt_time_nanos,
+                        ),
+                        last_attempt_failure: (!callback.last_attempt_failure.is_empty())
+                            .then(|| {
+                                tokeira_proto::failure::Failure::decode(
+                                    callback.last_attempt_failure.as_slice(),
+                                )
+                                .ok()
+                            })
+                            .flatten(),
+                        blocked_reason: String::new(),
+                    },
+                ),
+            })
+        })
+        .collect()
+}
+
+fn activity_callback_specs(
+    callbacks: &[tokeira_proto::common::Callback],
+) -> Result<Vec<tokeira_chasm_activity::CallbackSpec>, Status> {
+    translate::validate_callback_specs(callbacks).map_err(proto_conversion_status)?;
+    callbacks
+        .iter()
+        .map(|callback| {
+            match &callback.variant {
+                Some(tokeira_proto::common::callback::Variant::Nexus(nexus)) => {
+                    Ok(tokeira_chasm_activity::CallbackSpec {
+                        // The activity path copies headers verbatim, unlike workflow starts
+                        // (`chasm/lib/activity/activity.go:462–465 @ v1.32.0`).
+                        target: tokeira_chasm_activity::CallbackTarget::Nexus {
+                            url: nexus.url.clone(),
+                            header: nexus.header.clone().into_iter().collect(),
+                        },
+                        links: callback
+                            .links
+                            .iter()
+                            .map(prost::Message::encode_to_vec)
+                            .collect(),
+                    })
+                }
+                Some(tokeira_proto::common::callback::Variant::Internal(_)) => {
+                    Err(Status::invalid_argument(
+                        "unsupported callback variant: *common.Callback_Internal_",
+                    ))
+                }
+                None => Err(Status::invalid_argument(
+                    "unsupported callback variant: <nil>",
+                )),
+            }
+        })
+        .collect()
 }
 
 /// Build a `PollActivityExecutionResponse` from a (typically terminal) description.
@@ -973,18 +1054,20 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .inner
             .admit_activity_task_queue_poll(&headers, &edge_req)
             .await?;
-        let scoped_worker = context
+        let admitted = context
             .claims
             .as_ref()
-            .is_some_and(|claims| claims.worker_scope.is_some());
+            .and_then(|claims| claims.worker_scope.as_ref())
+            .map(|scope| DeploymentVersionTarget {
+                deployment_name: scope.deployment_name().to_owned(),
+                build_id: scope.build_id().to_owned(),
+            });
         // CHASM-first: serve a queued standalone-activity task if one is waiting on
         // this task queue, before falling through to the workflow-activity path
-        // (the two share this RPC). Scoped workers cannot enter this bridge:
-        // standalone tasks are unversioned and therefore fail the fixed exact
-        // Deployment-Version admission model.
+        // (the two share this RPC). Only authenticated scope supplies an admitted
+        // version; unscoped poll fields cannot claim internally targeted work.
         if let Some(bridge) = &self.chasm_activity
             && bridge.is_enabled()
-            && !scoped_worker
         {
             let task_queue = req
                 .task_queue
@@ -992,9 +1075,34 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 .map(|q| q.name.clone())
                 .unwrap_or_default();
             if let Some(task) = bridge
-                .poll_activity_task_waiting(&task_queue, &req.identity)
+                .poll_activity_task_waiting(&task_queue, &req.identity, admitted.as_ref())
                 .await?
             {
+                if let Some(target) = &task.version_target {
+                    let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+                    let expires_at = OffsetDateTime::from_unix_timestamp_nanos(
+                        i128::from(task.started_time_nanos) + i128::from(task.start_to_close_nanos),
+                    )
+                    .map_err(|_| {
+                        Status::internal("standalone activity deadline is out of range")
+                    })?;
+                    self.inner
+                        .register_standalone_task_provenance(
+                            &context,
+                            &task.task_token,
+                            &tokeira_types::WorkerTaskOrigin {
+                                namespace_id,
+                                normal_task_queue: TaskQueueName(task_queue.clone()),
+                                task_class: WorkerTaskClass::Activity,
+                                deployment: tokeira_types::DeploymentId(
+                                    target.deployment_name.clone(),
+                                ),
+                                build_id: tokeira_types::BuildId(target.build_id.clone()),
+                            },
+                            expires_at,
+                        )
+                        .await?;
+                }
                 debug!(%task_queue, "poll_activity_task_queue served standalone activity");
                 return Ok(Response::new(chasm_activity_poll_response(
                     &req.namespace,
@@ -1027,12 +1135,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && bridge.owns_task_token(&req.task_token)
         {
-            self.inner
-                .admit_request(
+            let context = self
+                .inner
+                .admit_worker_request(
                     &headers,
                     Some(&req.namespace),
                     Action::RespondActivityTaskCompleted,
                     false,
+                )
+                .await?;
+            let provenance = self
+                .inner
+                .authorize_standalone_task_token(
+                    &context,
+                    Action::RespondActivityTaskCompleted,
+                    &req.task_token,
                 )
                 .await?;
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
@@ -1046,6 +1163,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 )
                 .await?;
             debug!("respond_activity_task_completed (standalone) success");
+            self.inner
+                .delete_consumed_task_provenance(provenance, Action::RespondActivityTaskCompleted)
+                .await;
             return Ok(Response::new(
                 translate::respond_activity_completed_to_proto(),
             ));
@@ -1072,12 +1192,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && bridge.owns_task_token(&req.task_token)
         {
-            self.inner
-                .admit_request(
+            let context = self
+                .inner
+                .admit_worker_request(
                     &headers,
                     Some(&req.namespace),
                     Action::RespondActivityTaskFailed,
                     false,
+                )
+                .await?;
+            let provenance = self
+                .inner
+                .authorize_standalone_task_token(
+                    &context,
+                    Action::RespondActivityTaskFailed,
+                    &req.task_token,
                 )
                 .await?;
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
@@ -1107,6 +1236,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     req.identity,
                 )
                 .await?;
+            self.inner
+                .delete_consumed_task_provenance(provenance, Action::RespondActivityTaskFailed)
+                .await;
             return Ok(Response::new(translate::respond_activity_failed_to_proto()));
         }
         let edge_req =
@@ -1137,8 +1269,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             // Scoped Worker credentials never authorize standalone Activity
             // tokens. Authenticate and reject that identity before the CHASM
             // bridge validates or mutates any standalone execution.
-            self.inner
-                .admit_request(
+            let context = self
+                .inner
+                .admit_worker_request(
                     &headers,
                     Some(&req.namespace),
                     Action::RecordActivityTaskHeartbeat,
@@ -1149,6 +1282,13 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 return Err(Status::invalid_argument("Task token not set on request"));
             }
             if bridge.owns_task_token(&req.task_token) {
+                self.inner
+                    .authorize_standalone_task_token(
+                        &context,
+                        Action::RecordActivityTaskHeartbeat,
+                        &req.task_token,
+                    )
+                    .await?;
                 let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
                 let details = req.details.map(|p| p.encode_to_vec()).unwrap_or_default();
                 let cancel_requested = bridge
@@ -1596,12 +1736,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && bridge.owns_task_token(&req.task_token)
         {
-            self.inner
-                .admit_request(
+            let context = self
+                .inner
+                .admit_worker_request(
                     &headers,
                     Some(&req.namespace),
                     Action::RespondActivityTaskCanceled,
                     false,
+                )
+                .await?;
+            let provenance = self
+                .inner
+                .authorize_standalone_task_token(
+                    &context,
+                    Action::RespondActivityTaskCanceled,
+                    &req.task_token,
                 )
                 .await?;
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
@@ -1613,6 +1762,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     details,
                 )
                 .await?;
+            self.inner
+                .delete_consumed_task_provenance(provenance, Action::RespondActivityTaskCanceled)
+                .await;
             return Ok(Response::new(
                 translate::respond_activity_canceled_to_proto(),
             ));
@@ -3164,11 +3316,18 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         // proto-free). Computed before `req.retry_policy` is moved into the opaque
         // describe-echo bytes below.
         let retry_policy = defaulted_retry_policy(req.retry_policy.as_ref());
-        let retry_initial = proto_duration_to_nanos(retry_policy.initial_interval.as_ref());
-        let retry_coefficient = retry_policy.backoff_coefficient;
-        let retry_maximum = proto_duration_to_nanos(retry_policy.maximum_interval.as_ref());
-        let retry_max_attempts = retry_policy.maximum_attempts;
+        let (retry_initial, retry_coefficient, retry_maximum, retry_max_attempts) =
+            retry_policy_fields(&retry_policy);
+        // v1.31.0 ignores this field completely; only the explicit callback gate
+        // admits the v1.32.0 surface (`chasm/lib/activity/frontend.go @ v1.32.0`).
+        let callbacks = if bridge.callbacks_enabled() {
+            activity_callback_specs(&req.completion_callbacks)?
+        } else {
+            Vec::new()
+        };
         let start = crate::chasm_activity::StartActivity {
+            callbacks,
+            version_target: None,
             namespace_id: namespace_id.0.to_string(),
             activity_id: req.activity_id,
             run_id,
@@ -3271,6 +3430,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 req.include_outcome,
                 description,
                 token,
+                bridge.callbacks_enabled(),
             )));
         }
         // Decode + validate the caller's token against the requested execution before
@@ -3311,6 +3471,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     req.include_outcome,
                     description,
                     token,
+                    bridge.callbacks_enabled(),
                 )))
             }
             // Empty non-error response: an invitation to resubmit the long-poll.
@@ -3653,6 +3814,8 @@ mod tests {
     // RespondNexusTaskFailed error); exercising them is required for v1.31.0.
     #![allow(deprecated)]
 
+    mod standalone;
+
     use std::{
         collections::BTreeMap,
         sync::{Arc, Mutex},
@@ -3787,6 +3950,7 @@ mod tests {
             false,
             description,
             vec![7, 7, 7],
+            false,
         );
         assert_eq!(
             response.long_poll_token,
@@ -3820,6 +3984,7 @@ mod tests {
             false,
             description,
             vec![9],
+            false,
         );
         assert!(
             !response.long_poll_token.is_empty(),

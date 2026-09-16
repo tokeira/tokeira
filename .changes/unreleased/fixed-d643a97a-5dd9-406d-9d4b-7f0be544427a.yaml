@@ -1,0 +1,5 @@
+kind: fixed
+body: Standalone activity starts now commit atomically, preventing stranded runs and reporting state_transition_count as 1 immediately after start, matching Temporal v1.31.0.
+time: 2026-09-16T15:33:11.680255+01:00
+custom:
+    Slice: d643a97a-5dd9-406d-9d4b-7f0be544427a

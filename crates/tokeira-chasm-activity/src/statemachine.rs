@@ -27,7 +27,9 @@
 //! (Requirement 11.6) — because a retry has already moved the attempt on and the
 //! validate-then-drop gate would have reaped its timer.
 
-use tokeira_chasm::{ChasmError, MutableContext, Task, TaskKind};
+use prost::Message as _;
+use tokeira_chasm::{ChasmError, MutableContext, Task, TaskKind, TaskOutcome};
+use tokeira_proto::failure::{Failure, failure::FailureInfo};
 
 use crate::{
     callbacks::{self, CallbackAttemptOutcome, CallbackSpec},
@@ -38,6 +40,44 @@ use crate::{
         ScheduleToCloseTimer, ScheduleToStartTimer, StartToCloseTimer,
     },
 };
+
+/// Translate the durable activity outcome for an Internal callback. The result
+/// and failure remain opaque Temporal bytes; active states have no outcome.
+/// Missing or malformed timeout failure metadata yields the Unspecified type (0).
+pub fn terminal_outcome(state: &ActivityState) -> Option<TaskOutcome> {
+    match state.status() {
+        ActivityStatus::Completed => Some(TaskOutcome::Completed {
+            payload: state.result.clone(),
+        }),
+        ActivityStatus::Failed => Some(TaskOutcome::Failed {
+            failure: if state.failure_payload.is_empty() {
+                Failure {
+                    message: state.failure.clone(),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+            } else {
+                state.failure_payload.clone()
+            },
+            retryable: false,
+        }),
+        ActivityStatus::Canceled => Some(TaskOutcome::Canceled {
+            details: state.canceled_details.clone(),
+        }),
+        ActivityStatus::Terminated => Some(TaskOutcome::Terminated),
+        ActivityStatus::TimedOut => {
+            let timeout_type = Failure::decode(state.failure_payload.as_slice())
+                .ok()
+                .and_then(|failure| match failure.failure_info {
+                    Some(FailureInfo::TimeoutFailureInfo(info)) => Some(info.timeout_type),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Some(TaskOutcome::TimedOut { timeout_type })
+        }
+        _ => None,
+    }
+}
 
 /// The kind of timeout a [`ActivityEvent::TimedOut`] records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,6 +591,82 @@ fn encode_task<T: serde::Serialize>(task: &T) -> Result<Vec<u8>, ChasmError> {
 mod tests {
     use super::*;
     use tokeira_chasm::{Context, ExecutionInfo, ExecutionKey};
+
+    #[test]
+    fn terminal_outcomes_preserve_each_durable_result() {
+        let failure = Failure {
+            message: "failed".into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut state = ActivityState {
+            result: vec![1],
+            failure: "fallback".into(),
+            failure_payload: failure.clone(),
+            canceled_details: vec![2],
+            ..Default::default()
+        };
+        for (status, outcome) in [
+            (
+                ActivityStatus::Completed,
+                TaskOutcome::Completed { payload: vec![1] },
+            ),
+            (
+                ActivityStatus::Failed,
+                TaskOutcome::Failed {
+                    failure,
+                    retryable: false,
+                },
+            ),
+            (
+                ActivityStatus::Canceled,
+                TaskOutcome::Canceled { details: vec![2] },
+            ),
+            (ActivityStatus::Terminated, TaskOutcome::Terminated),
+        ] {
+            state.set_status(status);
+            assert_eq!(terminal_outcome(&state), Some(outcome));
+        }
+        state.set_status(ActivityStatus::TimedOut);
+        for timeout_type in 0..=4 {
+            state.failure_payload = Failure {
+                failure_info: Some(FailureInfo::TimeoutFailureInfo(
+                    tokeira_proto::failure::TimeoutFailureInfo {
+                        timeout_type,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            assert_eq!(
+                terminal_outcome(&state),
+                Some(TaskOutcome::TimedOut { timeout_type })
+            );
+        }
+        state.set_status(ActivityStatus::Failed);
+        state.failure_payload.clear();
+        assert_eq!(
+            terminal_outcome(&state),
+            Some(TaskOutcome::Failed {
+                failure: Failure {
+                    message: "fallback".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                retryable: false,
+            })
+        );
+        for status in [
+            ActivityStatus::Unspecified,
+            ActivityStatus::Scheduled,
+            ActivityStatus::Started,
+            ActivityStatus::CancelRequested,
+        ] {
+            state.set_status(status);
+            assert_eq!(terminal_outcome(&state), None);
+        }
+    }
 
     fn apply(
         state: &mut ActivityState,

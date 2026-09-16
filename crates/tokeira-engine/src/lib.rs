@@ -3080,6 +3080,9 @@ where
         scanner: CompletionCallbackScannerConfig::default(),
     };
 
+    let chasm_nexus_client = nexus_completion_deps.client.clone();
+    let chasm_nexus_config = nexus_completion_deps.config.clone();
+
     let worker_compute_deployment_repository = worker_deployment_repository.clone();
     let runtime = TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         repo.clone(),
@@ -3484,6 +3487,7 @@ where
         .context("failed to backfill CHASM current executions")?;
         let repair_nodes = chasm_node_repo.clone();
         let dispatch_queue = Arc::new(tokeira_edge::chasm_activity::ActivityDispatchQueue::new());
+        let multiplexer = Arc::new(tokeira_runtime::chasm::DispatchMultiplexer::default());
         // Standalone activities flow into the shared visibility index via the
         // engine→projection adapter, post-commit and off the correctness path
         // (spec task 24.2). It reuses the same projection apply path as the workflow
@@ -3496,19 +3500,9 @@ where
         let chasm_engine = Arc::new(tokeira_runtime::chasm::ChasmEngine::new(
             chasm_node_repo.clone(),
             registry.clone(),
-            dispatch_queue.clone(),
+            multiplexer.clone(),
             chasm_visibility_sink,
         ));
-        let rebuild = tokeira_runtime::chasm::OutboxRebuildScanner::new(
-            chasm_node_repo,
-            chasm_engine.clone(),
-            dispatch_queue.clone(),
-        );
-        rebuild
-            .rebuild_once()
-            .await
-            .context("failed to rebuild CHASM outboxes before serving")?;
-        spawn_outbox_rebuild(&engine_tasks, rebuild, background_cancel.clone());
         let activity_config = tokeira_chasm_activity::ActivityConfig {
             enable_standalone: effective_config
                 .policy
@@ -3519,14 +3513,48 @@ where
         let standalone_enabled = activity_config.enable_standalone;
         // Keep an engine handle for the timer sweeper before the bridge takes it.
         let sweeper_engine = chasm_engine.clone();
+        let dispatch_executor = Arc::new(
+            tokeira_edge::chasm_executors::ActivityDispatchExecutor::new(
+                Arc::downgrade(&chasm_engine),
+                dispatch_queue,
+            ),
+        );
         let activity_bridge = Arc::new(
             tokeira_edge::chasm_activity::ActivityBridge::new(
-                chasm_engine,
-                activity_config,
+                chasm_engine.clone(),
+                activity_config.clone(),
                 DEFAULT_MAX_ID_LENGTH,
             )
-            .with_dispatch_queue(dispatch_queue),
+            .with_dispatch_executor(dispatch_executor.clone()),
         );
+        // Weak engine handles break the ownership cycle. Register every role before
+        // rebuild/serve; stage 11's builder must preserve this bootstrap order.
+        multiplexer.register(dispatch_executor)?;
+        multiplexer.register(Arc::new(
+            tokeira_edge::chasm_executors::StartActivityExecutor::new(
+                Arc::downgrade(&chasm_engine),
+                activity_config,
+                DEFAULT_MAX_ID_LENGTH,
+            ),
+        ))?;
+        multiplexer.register(Arc::new(
+            tokeira_edge::chasm_executors::DeliverCallbackExecutor::new(
+                Arc::downgrade(&chasm_engine),
+                chasm_nexus_client,
+                chasm_nexus_config,
+                namespaces.clone(),
+            ),
+        ))?;
+        let rebuild = tokeira_runtime::chasm::OutboxRebuildScanner::new(
+            chasm_node_repo,
+            chasm_engine.clone(),
+            multiplexer.clone(),
+        );
+        rebuild
+            .rebuild_once()
+            .await
+            .context("failed to rebuild CHASM outboxes before serving")?;
+        spawn_outbox_rebuild(&engine_tasks, rebuild, background_cancel.clone());
         // Spawn the visibility repair scanner (Req 10.11): a committed transition can
         // never permanently lack a projection — the scanner rebuilds each execution's
         // snapshot from authoritative node state and re-applies it iff-newer. This is

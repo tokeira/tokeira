@@ -301,26 +301,86 @@ deadlines against `max(last_heartbeat_time_nanos, started_time_nanos)`, and stag
 replacement on each positive-timeout heartbeat (`activity_tasks.go:166-168,227-247`
 and `activity.go:576-585 @ v1.31.0`); close drops superseded deadlines.
 
-New events: `ActivityEvent::CallbacksAttached(Vec<ActivityCallback>)`,
-`ActivityEvent::CallbackAttempted { id, attempt_outcome }`, `ActivityEvent::CallbackRetryDue { id }`.
+New status-preserving events:
+
+```rust
+CallbacksAttached { request_id: String, callbacks: Vec<CallbackSpec>, max_callbacks: usize },
+CallbackAttempted { id: String, outcome: CallbackAttemptOutcome },
+CallbackRetryDue { id: String },
+
+pub struct CallbackSpec { pub target: CallbackTarget, pub links: Vec<Vec<u8>> }
+pub enum CallbackTarget {
+    Nexus { url: String, header: BTreeMap<String, String> },
+    Internal { component_ref: Vec<u8>, task_type_id: u32, task_id: Vec<u8> },
+}
+pub enum CallbackAttemptOutcome {
+    Succeeded,
+    RetryableFailure { failure: Vec<u8>, next_attempt_time_nanos: i64 },
+    NonRetryableFailure { failure: Vec<u8> },
+}
+```
+
+Attachment admits `Unspecified`, `Scheduled`, `Started` and `CancelRequested`. An empty
+batch is a no-op even after closure; otherwise a terminal activity status rejects it.
+The cap counts the existing and incoming lists before upsert. Each batch takes one clock
+reading, assigns `<request_id>-<index>` ids, and upserts `STANDBY`, attempt-zero callbacks
+without changing existing positions (`activity.go:429–475 @ v1.32.0`). The caller supplies
+`ActivityConfig::max_callbacks_per_execution`, default 2000 (`callback/config.go:17–21
+@ v1.32.0`). Internal targets are accepted by this pure layer; the edge enforces D2.
+
 The terminal transitions (`Completed`, `Failed`, `Canceled`, `Terminated`, `TimedOut`)
 additionally set every `STANDBY` callback to `SCHEDULED` and stage one `DeliverCallback`
 task each, mirroring `activity.go:421-426 @ v1.32.0`.
 
 ```rust
-pub struct DeliverCallback { pub callback_id: String, pub stamp: i64 }  // KIND = SideEffect
+pub struct DeliverCallback { pub callback_id: String, pub stamp: i32 }  // KIND = SideEffect
 pub struct CallbackRetryTimer { pub callback_id: String, pub attempt: i32, pub fire_at_nanos: i64 } // KIND = Pure
 ```
 
-`DeliverCallbackHandler::on_outcome` records the attempt: success → `SUCCEEDED`; retryable
-failure → `BACKING_OFF`, `next_attempt_time = now + backoff(attempt)` and a staged
-`CallbackRetryTimer`; non-retryable → `FAILED`. `CallbackRetryHandler::execute` sets
-`SCHEDULED` and stages a new `DeliverCallback`. Backoff is the workflow plane's
-`nexus_completion_backoff` over the same runtime config (Requirement 5.7).
+The postcard-coded tasks have FQNs `activity.deliver_callback` (side effect, no fire time)
+and `activity.callback_retry` (pure, supplied fire time). Delivery validates `SCHEDULED`
+and the matching attempt stamp; retry validates `BACKING_OFF` and the matching attempt
+(`callback/tasks.go:107–109,175–182 @ v1.32.0`).
 
-`validate_and_normalize` gains `callbacks: Vec<ActivityCallback>` and
+`DeliverCallbackHandler::on_outcome` applies `CallbackAttempted`, which requires
+`SCHEDULED`, increments attempt once and records the context time. Success → `SUCCEEDED`
+and clears failure; retryable failure → `BACKING_OFF`, records failure and the supplied
+next attempt time verbatim, and stages `CallbackRetryTimer`; non-retryable → `FAILED`
+and records failure. `CallbackRetryHandler::execute` requires `BACKING_OFF`, sets
+`SCHEDULED`, clears the next time and stages a new `DeliverCallback` stamped with the
+completed-attempt count (`callback/statemachine.go:36–124`, `component.go:72–75
+@ v1.32.0`). Both events preserve every activity status. Unknown ids are `Internal`;
+wrong callback states are `IllegalTransition` (the validators fence them in the engine).
+The engine resolves the held delivery task; its handler never resolves it itself.
+
+The exported outcome envelope uses empty `TaskOutcome::Completed` payloads for success,
+retryable `TaskOutcome::Failed` with postcard-encoded
+`RetryableDeliveryFailure { failure: Vec<u8>, next_attempt_time_nanos: i64 }`, and
+non-retryable `Failed` with raw encoded Temporal Failure bytes. Other outcomes are
+`Unsupported`. `callback_attempt_outcome`, `retryable_delivery_failure` and
+`non_retryable_delivery_failure` share this codec with the executor. Stage 9's executor
+supplies `now + nexus_completion_backoff(config, attempt, seed)` over the workflow
+plane's shared policy (Requirement 5.7); the pure library does no backoff calculation.
+
+`next_callback_retry_deadline` returns the minimum deadline among `BACKING_OFF` callbacks;
+`due_callback_retries(state, now)` returns their due ids in attach order, including zero
+deadlines. Existing activity timeout helpers stay unchanged. Stage 9 folds these helpers
+into the bridge evaluator and applies `CallbackRetryDue`; close drops the superseded timer.
+
+Tokeira's root `lifecycle_of(state)` remains `Running` while any callback is unsettled
+(only `SUCCEEDED` and `FAILED` settle), otherwise it returns the unchanged
+`lifecycle_for(status)`. This keeps terminal activities visible to the Running-execution
+rebuild scan until delivery finishes. Visibility uses the same lifecycle helper while
+preserving the terminal status keyword and original close time; attachment still checks
+activity status. An unreachable endpoint can retain `Running` indefinitely under the
+one-hour retry interval cap (`callback/config.go @ v1.32.0`).
+
+`validate_and_normalize` gains `callbacks: Vec<CallbackSpec>` and
 `version_target: Option<DeploymentVersionTarget>`; the public edge path always passes
 `None` for the target and passes callbacks only with the gate on (Requirements 5.1, 7.2).
+It checks nonempty target deployment/build names, Nexus URLs, and Internal component refs
+with nonzero task type ids. URL/header policy belongs to edge admission; attachment owns
+the cap and closed rule. Stage 7 leaves the edge request's callbacks empty.
 
 ### Runtime: `crates/tokeira-runtime/src/chasm`
 
@@ -670,11 +730,11 @@ explicit and derived ids are a pure function of the FQN.
 
 | Tag | Field | Source |
 |---|---|---|
-| 39 | `version_target: Option<DeploymentVersionTarget>` | D1; never set from the public start |
+| 39 | `version_target: Option<tokeira_chasm::DeploymentVersionTarget>` | Reuses the substrate message; D1, never set from the public start |
 | 40 | `callbacks: Vec<ActivityCallback>` | `activity.go:111-113 @ v1.32.0` (`Callbacks chasm.Map`) flattened per D4 |
 
 ```protobuf
-message DeploymentVersionTarget { string deployment_name = 1; string build_id = 2; }
+// DeploymentVersionTarget reuses the substrate's existing two-field message.
 message ActivityCallback {
   string id = 1;                       // "<request_id>-<idx>", activity.go:471
   int64 registration_time_nanos = 2;   // ctx.Now at attach, activity.go:455
@@ -683,7 +743,7 @@ message ActivityCallback {
   int64 last_attempt_complete_time_nanos = 5;
   bytes last_attempt_failure = 6;      // encoded Failure
   int64 next_attempt_time_nanos = 7;
-  bytes links = 8;                     // encoded repeated Link
+  repeated bytes links = 8;            // one encoded Link per element
   oneof target {
     NexusTarget nexus = 10;            // common.v1.Callback.Nexus
     InternalTarget internal = 11;      // D2; never on the wire
@@ -692,6 +752,10 @@ message ActivityCallback {
 message NexusTarget { string url = 1; map<string, string> header = 2; }
 message InternalTarget { bytes component_ref = 1; uint32 task_type_id = 2; bytes task_id = 3; }
 ```
+
+`NexusTarget.header` uses prost `btree_map` / Rust `BTreeMap` for deterministic root bytes.
+Internal targets store `ComponentRef::encode()` output and a postcard-encoded `TaskId`
+opaquely; the start and delivery executors own those codecs.
 
 ### Dispatch entry and token (edge, in memory / wire)
 
@@ -793,7 +857,9 @@ with INVALID_ARGUMENT — and describe lists exactly the Nexus callbacks.
 *For any* terminal transition and any sequence of delivery outcomes per callback, the
 callback state follows `STANDBY → SCHEDULED → (BACKING_OFF → SCHEDULED)* → SUCCEEDED |
 FAILED`, attempts are counted once per delivery, the next attempt time equals the workflow
-plane's backoff for that attempt, and a non-retryable failure is terminal.
+plane's backoff supplied by the executor for that attempt, and a non-retryable failure is
+terminal. The pure property checks the supplied deadline is recorded verbatim; executor
+coverage verifies its shared-policy calculation in stage 9.
 
 **Validates: Requirements 5.6, 5.7, 5.8**
 
@@ -871,8 +937,8 @@ before this design, including a start that carries `completion_callbacks`.
 | Callbacks gate on, standalone gate off | `ValidationError::Field { field: "policy.compatibility.enable_standalone_activity_callbacks", .. }` | Config load fails |
 | Gate on, invalid Nexus callback | existing edge validation error | INVALID_ARGUMENT |
 | Gate on, `Internal` variant on the wire | `EdgeError::InvalidArgument("unsupported callback variant")` | INVALID_ARGUMENT |
-| Gate on, over the callback cap | `ChasmError::Validation` from `attach_callbacks` | FAILED_PRECONDITION |
-| Gate on, attach to a closed activity | `ChasmError::Validation` | FAILED_PRECONDITION (`activity.go:439 @ v1.32.0`) |
+| Gate on, over the callback cap | `ChasmError::FailedPrecondition` from attachment | FAILED_PRECONDITION |
+| Gate on, attach to a closed activity | `ChasmError::FailedPrecondition` | FAILED_PRECONDITION (`activity.go:439 @ v1.32.0`) |
 | Targeted token completed by a wrong-version scoped worker | `scoped_worker_denied()` | PERMISSION_DENIED |
 | Fenced conflict on `on_outcome` after `max_commit_retries` | `ChasmError::RetriesExhausted` | Callback attempt recorded as retryable failure |
 
@@ -881,8 +947,9 @@ before this design, including a start that carries `completion_callbacks`.
 - **Property tests (required):** Properties 1–17, `proptest`, ≥100 cases each, tagged
   `// Feature: chasm-extension-archetypes, Property N: <name>`. Placement: 1, 2 in
   `tokeira-chasm` (`registry.rs`, `node.rs`); 3, 4, 5, 6 in `tokeira-runtime/src/chasm`
-  (`sweeper.rs`, `rebuild.rs`, `engine.rs`) over the in-memory repository; 7, 9, 10, 12 in
-  `tokeira-edge/src/chasm_activity.rs` over the bridge; 8 in `tokeira-storage/src/chasm.rs`
+  (`sweeper.rs`, `rebuild.rs`, `engine.rs`) over the in-memory repository; 7, 9, 12 in
+  `tokeira-edge/src/chasm_activity.rs` over the bridge; 10 in the activity crate's pure
+  callback state machine (128 cases); 8 in `tokeira-storage/src/chasm.rs`
   (in-memory) and the DSQL integration suite (`dsql-integration`); 11, 13, 14, 15 in the
   acceptance crate's integration tests; 16 in `tokeira-engine` with the in-memory projection
   store; 17 as a differential test in `tokeira-edge` replaying the recorded v1.31.0

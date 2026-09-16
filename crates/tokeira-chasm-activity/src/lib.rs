@@ -13,6 +13,8 @@
 //! config.go,library.go} @ v1.31.0`), per `AGENTS §8`. Where the design's sketch
 //! and the targeted release differ, the release wins and the deviation is noted at
 //! the call site.
+//! Callback attachment and delivery bookkeeping track `chasm/lib/callback` and
+//! `chasm/lib/activity/activity.go @ v1.32.0`, as extension behavior behind the gate.
 //!
 //! ## MVP materialization note
 //!
@@ -28,6 +30,7 @@
 //! - [`state`] — the [`ActivityState`] proto, the
 //!   [`ActivityStatus`] enum, and the lifecycle mapping.
 //! - [`statemachine`] — the legal transition table and stamp-fenced `apply`.
+//! - [`callbacks`] — v1.32.0 attachment and delivery bookkeeping; executors own I/O.
 //! - [`backoff`] — exponential retry-interval computation (pure, proto-free).
 //! - [`retry`] — the [`retry_decision`] (`shouldRetry` +
 //!   `hasEnoughTimeForRetry`).
@@ -40,6 +43,7 @@
 //!   component and the `activity` library registration.
 
 pub mod backoff;
+pub mod callbacks;
 pub mod component;
 pub mod config;
 pub mod retry;
@@ -50,15 +54,27 @@ pub mod timeouts;
 pub mod validator;
 
 pub use backoff::exponential_retry_interval;
+pub use callbacks::{
+    CallbackAttemptOutcome, CallbackSpec, CallbackTarget, RetryableDeliveryFailure,
+    callback_attempt_outcome, non_retryable_delivery_failure, retryable_delivery_failure,
+};
 pub use component::{ActivityExecution, ActivityLibrary, rebuild_visibility_snapshot};
 pub use config::ActivityConfig;
 pub use retry::{RetryOutcome, retry_decision};
-pub use state::{ActivityState, ActivityStatus, lifecycle_for};
+pub use state::{
+    ActivityCallback, ActivityState, ActivityStatus, InternalTarget, NexusTarget,
+    activity_callback, lifecycle_for, lifecycle_of,
+};
 pub use statemachine::{ActivityEvent, TimeoutType, legal_target};
 pub use tasks::{
-    DISPATCH_TASK_ID, DispatchTask, HEARTBEAT_TASK_ID, HeartbeatTimer, SCHEDULE_TO_CLOSE_TASK_ID,
-    SCHEDULE_TO_START_TASK_ID, START_TO_CLOSE_TASK_ID, ScheduleToCloseTimer, ScheduleToStartTimer,
-    StartToCloseTimer,
+    CALLBACK_RETRY_TASK_ID, CallbackRetryHandler, CallbackRetryTimer, CallbackRetryValidator,
+    DELIVER_CALLBACK_TASK_ID, DISPATCH_TASK_ID, DeliverCallback, DeliverCallbackHandler,
+    DeliverCallbackValidator, DispatchTask, HEARTBEAT_TASK_ID, HeartbeatTimer,
+    SCHEDULE_TO_CLOSE_TASK_ID, SCHEDULE_TO_START_TASK_ID, START_TO_CLOSE_TASK_ID,
+    ScheduleToCloseTimer, ScheduleToStartTimer, StartToCloseTimer,
 };
-pub use timeouts::{due_timeout, next_timeout_deadline, timeout_event};
+pub use timeouts::{
+    due_callback_retries, due_timeout, next_callback_retry_deadline, next_timeout_deadline,
+    timeout_event,
+};
 pub use validator::{ActivityRequest, NormalizedTimeouts, validate_and_normalize};

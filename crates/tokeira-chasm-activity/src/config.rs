@@ -22,6 +22,11 @@ fn default_long_poll_buffer() -> Duration {
     DEFAULT_LONG_POLL_BUFFER
 }
 
+fn default_max_callbacks_per_execution() -> usize {
+    // callback.maxPerExecution, chasm/lib/callback/config.go:17–21 @ v1.32.0.
+    2000
+}
+
 /// Standalone-activity configuration.
 ///
 /// `enable_standalone` defaults to `false` per namespace (the edge gate consults
@@ -30,6 +35,10 @@ fn default_long_poll_buffer() -> Duration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActivityConfig {
+    /// Attach-time bound on the callback collection in the root proto. Default 2000
+    /// (`chasm/lib/callback/config.go @ v1.32.0`); includes existing ids before upsert.
+    #[serde(default = "default_max_callbacks_per_execution")]
+    pub max_callbacks_per_execution: usize,
     /// Whether standalone activities are admitted for the namespace. Default
     /// `false`.
     #[serde(default)]
@@ -45,6 +54,7 @@ pub struct ActivityConfig {
 impl Default for ActivityConfig {
     fn default() -> Self {
         Self {
+            max_callbacks_per_execution: default_max_callbacks_per_execution(),
             enable_standalone: false,
             long_poll_timeout: DEFAULT_LONG_POLL_TIMEOUT,
             long_poll_buffer: DEFAULT_LONG_POLL_BUFFER,
@@ -60,6 +70,7 @@ mod tests {
     fn defaults_match_v1_31_0() {
         let config = ActivityConfig::default();
         assert!(!config.enable_standalone);
+        assert_eq!(config.max_callbacks_per_execution, 2000);
         assert_eq!(config.long_poll_timeout, Duration::from_secs(20));
         assert_eq!(config.long_poll_buffer, Duration::from_secs(1));
     }
@@ -67,6 +78,7 @@ mod tests {
     #[test]
     fn round_trips_without_loss() {
         let config = ActivityConfig {
+            max_callbacks_per_execution: 17,
             enable_standalone: true,
             long_poll_timeout: Duration::from_secs(30),
             long_poll_buffer: Duration::from_millis(500),

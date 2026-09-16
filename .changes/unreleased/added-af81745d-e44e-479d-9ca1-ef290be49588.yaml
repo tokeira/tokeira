@@ -1,0 +1,5 @@
+kind: added
+body: Standalone activities persist completion callbacks and a deployment-version target and drive callback delivery through registered tasks, gated off.
+time: 2026-09-16T13:56:23.280473+01:00
+custom:
+    Slice: af81745d-e44e-479d-9ca1-ef290be49588

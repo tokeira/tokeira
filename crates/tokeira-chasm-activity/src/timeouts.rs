@@ -23,13 +23,40 @@
 //!   (`activity_tasks.go` heartbeat `Validate`).
 
 use prost::Message as _;
-use tokeira_proto::failure::{Failure, TimeoutFailureInfo, failure::FailureInfo};
+use tokeira_proto::{
+    enums::CallbackState,
+    failure::{Failure, TimeoutFailureInfo, failure::FailureInfo},
+};
 
 use crate::{
     retry::{RetryOutcome, retry_decision},
     state::{ActivityState, ActivityStatus},
     statemachine::{ActivityEvent, TimeoutType},
 };
+
+/// Earliest callback backoff deadline. The activity evaluator combines this with
+/// its activity timeout hint; terminal activity status does not suppress delivery work.
+pub fn next_callback_retry_deadline(state: &ActivityState) -> Option<i64> {
+    state
+        .callbacks
+        .iter()
+        .filter(|callback| callback.state() == CallbackState::BackingOff)
+        .map(|callback| callback.next_attempt_time_nanos)
+        .min()
+}
+
+/// Due callback ids in persisted attach order. The evaluator applies retry events
+/// in this order and close validation drops the superseded timers.
+pub fn due_callback_retries(state: &ActivityState, now: i64) -> Vec<String> {
+    state
+        .callbacks
+        .iter()
+        .filter(|callback| {
+            callback.state() == CallbackState::BackingOff && callback.next_attempt_time_nanos <= now
+        })
+        .map(|callback| callback.id.clone())
+        .collect()
+}
 
 /// Construct the existing evaluator's timeout transition without performing I/O.
 /// Schedule-to-start/close are terminal; start-to-close/heartbeat first use the

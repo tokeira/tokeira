@@ -407,7 +407,7 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   late-bound multiplexer. `executor_dedupes_before_and_after_pickup` proves one delivery
   across replay.
 
-- [ ] 9.2 `StartActivityExecutor` (`chasm.start_activity`): map every `StartActivityTask`
+- [x] 9.2 `StartActivityExecutor` (`chasm.start_activity`): map every `StartActivityTask`
   field onto the bridge's start path with request id = the staging task id, attach the
   `InternalTarget { component_ref, task_type_id, task_id }`, carry `version_target`.
   `DeliverCallbackExecutor` (task type 6) branches on Nexus/Internal: the first calls
@@ -416,19 +416,25 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   held task; missing targets fail permanently, exhausted commit retries back off.
   - _Requirements: 3.12, 5.7, 5.8, 6.3, 6.4, 6.5, 6.8, 6.10_
 
-  **IN PROGRESS (stage 9):** All four roles execute through three weak-engine executors. Tests
+  **DONE (2026-09-16):** All four roles execute through three weak-engine executors. Tests
   cover idempotent staged starts and field mapping, permanent start rejection classes,
   Internal applied/already-applied/missing/rejected/conflict outcomes, Nexus first-payload
   success, shared backoff/limits and all three namespace-cache results. The executor shares
   the edge cache; absent/tombstoned namespaces omit only the back-link, cache errors retry.
   Accepted addenda: TaskId codecs live in activity callbacks (round-trip tested, no edge
   postcard dependency); every start uses atomic `TypedEngine::start_with`, so rejected
-  attachment persists nothing. Timer hints are armed before nested dispatch so a newer
-  callback retry survives; a dedicated regression covers that ordering.
+  attachment persists nothing. Concurrent same-request create conflicts return the winner;
+  timer hints are armed before nested dispatch so a newer callback retry survives. Dedicated
+  regression tests cover both hazards.
 
-  Concurrent-create verification exposed a missing current-pointer fence in both
-  repositories. The approved pointer-fence correction follows in its own commit, with
-  repository and engine race tests.
+  Accepted storage addendum (2026-09-16): the creating transaction carries the admission
+  expectation (absent or the superseded run/epoch), fences the archetype pointer and rolls
+  back nodes on a miss. The engine reloads the pointer/live root and re-evaluates policy up
+  to its retry bound, returning the same-request winner with `created: false`. In-memory
+  and env-gated live DSQL tests cover paired creates, stale superseding fences and rollback;
+  engine pairs cover idempotency, conflict/reuse verdicts and superseding starts. A bounded
+  retry test verifies pristine initializer input and one post-commit dispatch. This correction
+  lands in its own commit and has a third `fixed` fragment with a 139-character body.
 
 - [x] 9.3 Poll admission: `poll_activity_task_waiting(task_queue, identity, admitted:
   Option<&DeploymentVersionTarget>)` selects the first due entry whose target equals
@@ -519,16 +525,17 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   `gate_off_generated_starts_ignore_callbacks` adds 128 generated cases. The count
   correction has a separate fixed changie fragment alongside the slice's added entry.
 
-- [ ] 10. Checkpoint: `cargo clippy -p tokeira-edge --all-targets` clean; `cargo nextest run
+- [x] 10. Checkpoint: `cargo clippy -p tokeira-edge --all-targets` clean; `cargo nextest run
   -p tokeira-edge` green including every existing standalone-activity and scoped-worker test.
 
-  **IN PROGRESS (2026-09-16):** Formatting, workspace lint (zero warnings), workspace
-  check, doctests (1 passed, 20 ignored) and docs with warnings denied pass. Full workspace
-  nextest: 3420 passed, 1 failed, 2 skipped; the only failure is the new concurrent-start
-  regression exposing the missing repository pointer fence in 9.2. The earlier four-crate
-  run hit the known backlog property flake; its serial rerun and the full workspace rerun
-  pass that property. Golden, all edge tests and the nested callback timer regression pass.
-  No dependency changes; the approved pointer-fence correction and final bar follow.
+  **DONE (2026-09-16):** The full workspace bar passes: nightly formatting, lint with
+  zero warnings, workspace check, nextest (3428 passed, 2 skipped), doctests (1 passed,
+  20 ignored), and documentation with warnings denied. Golden and all existing standalone,
+  scoped-worker, callback, long-poll and runtime tests pass, including the storage/engine
+  race regressions and nested callback timer regression. The earlier known backlog property
+  flake passed both its serial rerun and the final full suite. The new live DSQL variant
+  compiles but skips its database work because `TOKEIRA_DSQL_TEST_DATABASE_URL` is absent.
+  Changelog dry-run and diff checks pass. No dependency, lockfile, schema or kernel changes.
 
 ### Stage 11 — Config and engine: gate, builder, handle, clock, seeding (`tokeira-config`, `tokeira-engine`)
 

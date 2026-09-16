@@ -294,6 +294,7 @@ impl SideEffectExecutor for IdempotentExecutor {
 pub(super) struct ConflictingStore {
     pub inner: InMemoryChasmNodeStore,
     pub conflicts: AtomicUsize,
+    pub create_conflicts: AtomicUsize,
 }
 #[async_trait]
 impl ChasmNodeRepository for ConflictingStore {
@@ -321,9 +322,21 @@ impl ChasmNodeRepository for ConflictingStore {
         archetype_id: u32,
         batch: Vec<NodeWrite>,
         current: CurrentRun,
+        expected_current: Option<CurrentRun>,
     ) -> anyhow::Result<NodePersistOutcome> {
+        if self
+            .create_conflicts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Ok(NodePersistOutcome::Conflict {
+                reason: "injected start contention".into(),
+            });
+        }
         self.inner
-            .persist_new_execution(key, archetype_id, batch, current)
+            .persist_new_execution(key, archetype_id, batch, current, expected_current)
             .await
     }
     async fn current_run(

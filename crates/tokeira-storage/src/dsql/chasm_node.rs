@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use sqlx::{Connection, Row};
+use sqlx::{Connection, PgConnection, Row};
 use tokeira_chasm::{ChasmNode, ExecutionKey, LifecycleState, VersionedTransition};
 use uuid::Uuid;
 
@@ -106,6 +106,40 @@ impl DsqlChasmNodeRepository {
                 row.try_get("transition_count")?,
             ),
         })
+    }
+
+    async fn read_current(
+        connection: &mut PgConnection,
+        namespace_id: Uuid,
+        archetype_id: u32,
+        business_id: &str,
+    ) -> Result<Option<CurrentRun>> {
+        // One statement gives the new pointer, marker and legacy fallback the same
+        // snapshot: a concurrent backfill cannot hide a row between those reads.
+        // The legacy key lacks an archetype; its root prevents cross-archetype
+        // aliasing and resurrection of deleted runs without writing the old table.
+        let row = sqlx::query(
+            "SELECT run_id, request_id, status, failover_version, transition_count
+             FROM chasm_current_execution
+             WHERE namespace_id = $1 AND archetype_id = $2 AND business_id = $3
+             UNION ALL
+             SELECT old.run_id, old.request_id, old.status, old.failover_version, old.transition_count
+             FROM chasm_current_run AS old
+             JOIN chasm_node AS root ON root.namespace_id = old.namespace_id
+               AND root.business_id = old.business_id AND root.run_id = old.run_id
+               AND root.encoded_path = '' AND root.archetype_id = $2
+             WHERE old.namespace_id = $1 AND old.business_id = $3
+               AND NOT EXISTS (SELECT 1 FROM chasm_backfill_marker WHERE marker_name = $4)
+               AND NOT EXISTS (SELECT 1 FROM chasm_current_execution
+                 WHERE namespace_id = $1 AND archetype_id = $2 AND business_id = $3)",
+        )
+        .bind(namespace_id)
+        .bind(i64::from(archetype_id))
+        .bind(business_id)
+        .bind(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
+        .fetch_optional(connection)
+        .await?;
+        row.as_ref().map(Self::current_from_row).transpose()
     }
 
     /// Encode a [`LifecycleState`] as the `CHASM pointer status` SMALLINT
@@ -253,10 +287,28 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         archetype_id: u32,
         batch: Vec<NodeWrite>,
         current: CurrentRun,
+        expected_current: Option<CurrentRun>,
     ) -> Result<NodePersistOutcome> {
         let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
+
+        // Admission may have observed a legacy pointer before backfill. Use the
+        // same effective lookup here; a new scoped pointer must not erase it just
+        // because the scoped table is still empty. The conditional write below
+        // also fences writers racing after this snapshot was read.
+        if Self::read_current(&mut tx, namespace_id, archetype_id, business_id).await?
+            != expected_current
+        {
+            tx.rollback().await?;
+            return Ok(NodePersistOutcome::Conflict {
+                reason: "current-run pointer changed during start admission".into(),
+            });
+        }
+        let expected_run_id = expected_current
+            .as_ref()
+            .map(|current| Self::parse_uuid("expected current run_id", &current.run_id))
+            .transpose()?;
 
         // Phase 1 — node fences (all-or-nothing), identical to `persist_dirty`.
         for write in &batch {
@@ -350,11 +402,14 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
             }
         }
 
-        // Phase 3 — advance the current-run pointer in the SAME transaction (the
+        // Phase 3 — conditionally advance the pointer in the SAME transaction (the
         // analog of v1.31.0's current_executions write inside the entity-create tx),
         // so the run's root node and its current-run pointer never tear. Archetype
         // is part of the key upstream too (schema/postgresql/v12/temporal/versioned/
-        // v1.19/current_chasm_executions.sql @ v1.31.0).
+        // v1.19/current_chasm_executions.sql @ v1.31.0). A NULL expected run permits
+        // insertion only; a superseding start must replace the exact observed run
+        // and epoch. A miss rolls back node writes, while DSQL OCC rejects a pair
+        // of concurrent writes even if both transactions saw the expected value.
         let current_run_id = Self::parse_uuid("current run_id", &current.run_id)?;
         let pointer = sqlx::query(
             "INSERT INTO chasm_current_execution
@@ -367,7 +422,10 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
                 status = EXCLUDED.status,
                 failover_version = EXCLUDED.failover_version,
                 transition_count = EXCLUDED.transition_count,
-                updated_at = EXCLUDED.updated_at",
+                updated_at = EXCLUDED.updated_at
+             WHERE chasm_current_execution.run_id = $9
+               AND chasm_current_execution.failover_version = $10
+               AND chasm_current_execution.transition_count = $11",
         )
         .bind(namespace_id)
         .bind(business_id)
@@ -377,16 +435,34 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         .bind(current.vt_epoch.namespace_failover_version)
         .bind(current.vt_epoch.transition_count)
         .bind(i64::from(archetype_id))
+        .bind(expected_run_id)
+        .bind(
+            expected_current
+                .as_ref()
+                .map(|current| current.vt_epoch.namespace_failover_version),
+        )
+        .bind(
+            expected_current
+                .as_ref()
+                .map(|current| current.vt_epoch.transition_count),
+        )
         .execute(&mut *tx)
         .await;
-        if let Err(err) = pointer {
-            if DsqlRunRepository::is_serialization_failure(&err) {
+        match pointer {
+            Ok(result) if result.rows_affected() == 0 => {
+                tx.rollback().await?;
+                return Ok(NodePersistOutcome::Conflict {
+                    reason: "current-run pointer changed during start admission".into(),
+                });
+            }
+            Ok(_) => {}
+            Err(err) if DsqlRunRepository::is_serialization_failure(&err) => {
                 tx.rollback().await?;
                 return Ok(NodePersistOutcome::Conflict {
                     reason: "dsql serialization failure during current-run write".to_owned(),
                 });
             }
-            return Err(err.into());
+            Err(err) => return Err(err.into()),
         }
 
         match tx.commit().await {
@@ -408,32 +484,13 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
     ) -> Result<Option<CurrentRun>> {
         let namespace_uuid = Self::parse_uuid("namespace_id", namespace_id)?;
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        // One statement gives the new pointer, marker and legacy fallback the same
-        // snapshot: a concurrent backfill cannot hide a row between those reads.
-        // The legacy key lacks an archetype; its root prevents cross-archetype
-        // aliasing and resurrection of deleted runs without writing the old table.
-        let row = sqlx::query(
-            "SELECT run_id, request_id, status, failover_version, transition_count
-             FROM chasm_current_execution
-             WHERE namespace_id = $1 AND archetype_id = $2 AND business_id = $3
-             UNION ALL
-             SELECT old.run_id, old.request_id, old.status, old.failover_version, old.transition_count
-             FROM chasm_current_run AS old
-             JOIN chasm_node AS root ON root.namespace_id = old.namespace_id
-               AND root.business_id = old.business_id AND root.run_id = old.run_id
-               AND root.encoded_path = '' AND root.archetype_id = $2
-             WHERE old.namespace_id = $1 AND old.business_id = $3
-               AND NOT EXISTS (SELECT 1 FROM chasm_backfill_marker WHERE marker_name = $4)
-               AND NOT EXISTS (SELECT 1 FROM chasm_current_execution
-                 WHERE namespace_id = $1 AND archetype_id = $2 AND business_id = $3)",
+        Self::read_current(
+            permit.connection()?,
+            namespace_uuid,
+            archetype_id,
+            business_id,
         )
-        .bind(namespace_uuid)
-        .bind(i64::from(archetype_id))
-        .bind(business_id)
-        .bind(CHASM_CURRENT_EXECUTION_BACKFILL_MARKER)
-        .fetch_optional(permit.connection()?)
-        .await?;
-        row.as_ref().map(Self::current_from_row).transpose()
+        .await
     }
 
     async fn scan_current_executions(
@@ -742,6 +799,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dsql_concurrent_starts_fence_pointer_and_roll_back_losing_nodes() -> anyhow::Result<()>
+    {
+        let Some(store) = dsql_store_from_env().await? else {
+            return Ok(());
+        };
+        pointer_tests::exercise_pointer_fence(
+            &store.chasm_node_repository(),
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn dsql_chasm_node_store_round_trips_and_fences() -> anyhow::Result<()> {
         let Some(store) = dsql_store_from_env().await? else {
             return Ok(());
@@ -775,7 +845,8 @@ mod tests {
                 &key,
                 7,
                 batch,
-                pointer_tests::current(key.run_id.clone(), "create", LifecycleState::Running)
+                pointer_tests::current(key.run_id.clone(), "create", LifecycleState::Running),
+                None,
             )
             .await?,
             NodePersistOutcome::Applied
@@ -817,7 +888,9 @@ mod tests {
                     uuid::Uuid::new_v4().to_string(),
                     "conflict",
                     LifecycleState::Completed
-                )
+                ),
+                repo.current_run(&key.namespace_id, 7, &key.business_id)
+                    .await?,
             )
             .await?,
             NodePersistOutcome::Conflict { .. }

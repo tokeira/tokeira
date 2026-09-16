@@ -1708,8 +1708,8 @@ pub(crate) async fn start_activity(
                 if !req.callbacks.is_empty() {
                     activity.apply(
                         ActivityEvent::CallbacksAttached {
-                            request_id,
-                            callbacks: req.callbacks,
+                            request_id: request_id.clone(),
+                            callbacks: req.callbacks.clone(),
                             max_callbacks: config.max_callbacks_per_execution,
                         },
                         ctx,

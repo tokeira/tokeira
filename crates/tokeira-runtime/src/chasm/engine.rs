@@ -779,160 +779,171 @@ impl ChasmEngine {
 impl ChasmEngine {
     pub(super) async fn start_with_initializer(
         &self,
-        mut req: StartRequest,
-        initialize: impl FnOnce(
+        req: StartRequest,
+        mut initialize: impl FnMut(
             &mut StartRequest,
             &mut TransitionContext,
         ) -> Result<LifecycleState, ChasmError>
         + Send,
     ) -> Result<StartOutcome, ChasmError> {
-        // Business-id reuse/conflict enforcement against the current run for this id
-        // (`service/history/chasm_engine.go:1014-1090 @ v1.31.0`). The current-run
-        // pointer is the authority; the run's *live* root lifecycle — not the
-        // advisory pointer status — decides live-vs-terminal, so a just-closed run is
-        // governed by the reuse policy rather than the conflict policy.
-        if let Some(current) = self
-            .current_run(
-                &req.key.namespace_id,
-                req.archetype_id,
-                &req.key.business_id,
-            )
-            .await?
-        {
-            let current_key = ExecutionKey::new(
-                req.key.namespace_id.clone(),
-                req.key.business_id.clone(),
-                current.run_id.clone(),
-            );
-            let current_root = self.read_root(&current_key).await?;
-            let current_lifecycle = current_root.as_ref().and_then(|r| r.lifecycle);
-            let current_vt = current_root
-                .as_ref()
-                .map(|r| r.execution_vt)
-                .unwrap_or_default();
-            let live = matches!(current_lifecycle, Some(LifecycleState::Running));
-            // Idempotent retry: a Start carrying the same request id as the run that
-            // created the current run returns that run unchanged, ahead of any policy
-            // branch (`Fail/SecondStartWithSameRequestIdReturnsExistingRun @ v1.31.0`).
-            let same_request_id = req
-                .request_id
-                .as_deref()
-                .is_some_and(|id| !id.is_empty() && id == current.request_id);
+        let attempts = self.config.max_commit_retries.max(1);
+        for _ in 0..attempts {
+            // A failed pointer fence invalidates policy admission as well as the
+            // create. Reload both the pointer and live root; the winner may have
+            // our request id, or require an entirely different policy verdict.
+            let mut req = req.clone();
+            // Business-id reuse/conflict enforcement against the current run for this id
+            // (`service/history/chasm_engine.go:1014-1090 @ v1.31.0`). The current-run
+            // pointer is the authority; the run's *live* root lifecycle — not the
+            // advisory pointer status — decides live-vs-terminal, so a just-closed run is
+            // governed by the reuse policy rather than the conflict policy.
+            let expected_current = self
+                .current_run(
+                    &req.key.namespace_id,
+                    req.archetype_id,
+                    &req.key.business_id,
+                )
+                .await?;
+            if let Some(current) = expected_current.as_ref() {
+                let current_key = ExecutionKey::new(
+                    req.key.namespace_id.clone(),
+                    req.key.business_id.clone(),
+                    current.run_id.clone(),
+                );
+                let current_root = self.read_root(&current_key).await?;
+                let current_lifecycle = current_root.as_ref().and_then(|r| r.lifecycle);
+                let current_vt = current_root
+                    .as_ref()
+                    .map(|r| r.execution_vt)
+                    .unwrap_or_default();
+                let live = matches!(current_lifecycle, Some(LifecycleState::Running));
+                // Idempotent retry: a Start carrying the same request id as the run that
+                // created the current run returns that run unchanged, ahead of any policy
+                // branch (`Fail/SecondStartWithSameRequestIdReturnsExistingRun @ v1.31.0`).
+                let same_request_id = req
+                    .request_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty() && id == current.request_id);
 
-            let mut return_existing = same_request_id;
-            if !same_request_id {
-                if live {
-                    match req.policy.conflict {
-                        BusinessIdConflictPolicy::Fail => {
-                            return Err(already_started(&current));
-                        }
-                        BusinessIdConflictPolicy::UseExisting => return_existing = true,
-                        BusinessIdConflictPolicy::TerminateExisting => {
-                            // The targeted release also answers Unimplemented here
-                            // (`chasm_engine.go:1041 @ v1.31.0`); the activity edge never
-                            // maps a request to this variant, so it is unreachable in
-                            // practice but kept faithful.
-                            return Err(ChasmError::Unsupported(
-                                "ID Conflict Policy Terminate Existing is not yet supported"
-                                    .to_owned(),
-                            ));
-                        }
-                    }
-                } else {
-                    match req.policy.reuse {
-                        // Terminal current run: a fresh run is admitted (fall through).
-                        BusinessIdReusePolicy::AllowDuplicate => {}
-                        BusinessIdReusePolicy::AllowDuplicateFailedOnly => {
-                            // Reject only if the terminal run completed *successfully*;
-                            // a failed/canceled/terminated/timed-out run (mapped to
-                            // `Failed`) may be retried (`chasm_engine.go:1070 @ v1.31.0`).
-                            if matches!(current_lifecycle, Some(LifecycleState::Completed)) {
-                                return Err(already_started(&current));
+                let mut return_existing = same_request_id;
+                if !same_request_id {
+                    if live {
+                        match req.policy.conflict {
+                            BusinessIdConflictPolicy::Fail => {
+                                return Err(already_started(current));
+                            }
+                            BusinessIdConflictPolicy::UseExisting => return_existing = true,
+                            BusinessIdConflictPolicy::TerminateExisting => {
+                                // The targeted release also answers Unimplemented here
+                                // (`chasm_engine.go:1041 @ v1.31.0`); the activity edge never
+                                // maps a request to this variant, so it is unreachable in
+                                // practice but kept faithful.
+                                return Err(ChasmError::Unsupported(
+                                    "ID Conflict Policy Terminate Existing is not yet supported"
+                                        .to_owned(),
+                                ));
                             }
                         }
-                        BusinessIdReusePolicy::RejectDuplicate => {
-                            return Err(already_started(&current));
+                    } else {
+                        match req.policy.reuse {
+                            // Terminal current run: a fresh run is admitted (fall through).
+                            BusinessIdReusePolicy::AllowDuplicate => {}
+                            BusinessIdReusePolicy::AllowDuplicateFailedOnly => {
+                                // Reject only if the terminal run completed *successfully*;
+                                // a failed/canceled/terminated/timed-out run (mapped to
+                                // `Failed`) may be retried (`chasm_engine.go:1070 @ v1.31.0`).
+                                if matches!(current_lifecycle, Some(LifecycleState::Completed)) {
+                                    return Err(already_started(current));
+                                }
+                            }
+                            BusinessIdReusePolicy::RejectDuplicate => {
+                                return Err(already_started(current));
+                            }
                         }
                     }
                 }
+
+                if return_existing {
+                    return Ok(StartOutcome {
+                        reference: self.root_ref(
+                            &current_key,
+                            req.archetype_id,
+                            current_vt,
+                            current_vt,
+                        ),
+                        created: false,
+                    });
+                }
             }
 
-            if return_existing {
-                return Ok(StartOutcome {
-                    reference: self.root_ref(
-                        &current_key,
-                        req.archetype_id,
-                        current_vt,
-                        current_vt,
-                    ),
-                    created: false,
-                });
+            let (mut tree, baseline) = self.load_tree(&req.key).await?;
+            if tree.node(ROOT_PATH).is_some() {
+                // A concurrent same-run create may commit after admission but before
+                // this read. Re-enter policy evaluation rather than initialize its root.
+                continue;
             }
+            // A fresh run_id means the node tree is empty, so the Absent node fences
+            // below also reject a same-(namespace, business, run) collision. The pointer
+            // advance is co-transactional with the root-node create
+            // (`activity-executions-first-class` Req 1, 2).
+            // The initializer runs only after policy/idempotency admission and before
+            // any write. Its state and tasks share the atomic root/pointer create, so
+            // rejection or failed persistence cannot leave a half-initialized run.
+            let mut ctx = TransitionContext::new(req.key.clone(), tree.execution_vt(), self.now());
+            let lifecycle = initialize(&mut req, &mut ctx)?;
+            tree.create_node(
+                ROOT_PATH.to_vec(),
+                req.archetype_id,
+                Some(lifecycle),
+                Some(req.data),
+            )?;
+            self.apply_context(&mut tree, &mut ctx)?;
+            let committed_vt = next_vt(tree.execution_vt());
+            let result = self.close_root(&mut tree, committed_vt, &ctx)?;
+            let batch: Vec<NodeWrite> = result
+                .dirty_nodes
+                .iter()
+                .map(|(path, node)| NodeWrite {
+                    encoded_path: path.clone(),
+                    node: node.clone(),
+                    expected: match baseline.get(path) {
+                        Some(vt) => ExpectedVersion::Vt(*vt),
+                        None => ExpectedVersion::Absent,
+                    },
+                })
+                .collect();
+            let current = CurrentRun {
+                run_id: req.key.run_id.clone(),
+                // The create request id pins id-reuse idempotency and the AlreadyStarted
+                // `StartRequestId`; an absent originating id records as empty (no idempotency key).
+                request_id: req.request_id.clone().unwrap_or_default(),
+                status: lifecycle,
+                vt_epoch: committed_vt,
+            };
+            match self
+                .repo
+                .persist_new_execution(&req.key, req.archetype_id, batch, current, expected_current)
+                .await
+                .map_err(|e| ChasmError::Internal(format!("persist new execution: {e}")))?
+            {
+                NodePersistOutcome::Applied => {}
+                NodePersistOutcome::Conflict { .. } => continue,
+            }
+
+            self.post_commit(
+                &req.key,
+                result,
+                req.archetype_id,
+                committed_vt,
+                req.visibility,
+            )
+            .await?;
+            return Ok(StartOutcome {
+                reference: self.root_ref(&req.key, req.archetype_id, committed_vt, committed_vt),
+                created: true,
+            });
         }
-
-        let (mut tree, baseline) = self.load_tree(&req.key).await?;
-        // A fresh run_id means the node tree is empty, so the Absent node fences
-        // below also reject a same-(namespace, business, run) collision. The pointer
-        // advance is co-transactional with the root-node create
-        // (`activity-executions-first-class` Req 1, 2).
-        // The initializer runs only after policy/idempotency admission and before
-        // any write. Its state and tasks share the atomic root/pointer create, so
-        // rejection or failed persistence cannot leave a half-initialized run.
-        let mut ctx = TransitionContext::new(req.key.clone(), tree.execution_vt(), self.now());
-        let lifecycle = initialize(&mut req, &mut ctx)?;
-        tree.create_node(
-            ROOT_PATH.to_vec(),
-            req.archetype_id,
-            Some(lifecycle),
-            Some(req.data),
-        )?;
-        self.apply_context(&mut tree, &mut ctx)?;
-        let committed_vt = next_vt(tree.execution_vt());
-        let result = self.close_root(&mut tree, committed_vt, &ctx)?;
-        let batch: Vec<NodeWrite> = result
-            .dirty_nodes
-            .iter()
-            .map(|(path, node)| NodeWrite {
-                encoded_path: path.clone(),
-                node: node.clone(),
-                expected: match baseline.get(path) {
-                    Some(vt) => ExpectedVersion::Vt(*vt),
-                    None => ExpectedVersion::Absent,
-                },
-            })
-            .collect();
-        let current = CurrentRun {
-            run_id: req.key.run_id.clone(),
-            // The create request id pins id-reuse idempotency and the AlreadyStarted
-            // `StartRequestId`; an absent originating id records as empty (no idempotency key).
-            request_id: req.request_id.clone().unwrap_or_default(),
-            status: lifecycle,
-            vt_epoch: committed_vt,
-        };
-        match self
-            .repo
-            .persist_new_execution(&req.key, req.archetype_id, batch, current)
-            .await
-            .map_err(|e| ChasmError::Internal(format!("persist new execution: {e}")))?
-        {
-            NodePersistOutcome::Applied => {}
-            NodePersistOutcome::Conflict { reason } => {
-                return Err(ChasmError::BusinessIdConflict(reason));
-            }
-        }
-
-        self.post_commit(
-            &req.key,
-            result,
-            req.archetype_id,
-            committed_vt,
-            req.visibility,
-        )
-        .await?;
-        Ok(StartOutcome {
-            reference: self.root_ref(&req.key, req.archetype_id, committed_vt, committed_vt),
-            created: true,
-        })
+        Err(ChasmError::RetriesExhausted { attempts })
     }
 }
 
@@ -1092,11 +1103,70 @@ mod tests {
         test_support::{self as ts, ConflictingStore, Root, Work},
     };
     use proptest::prelude::*;
+    use prost::Message;
     use std::sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
     };
-    use tokeira_chasm::{Task, task_type_id_for_fqn};
+    use tokeira_chasm::{BusinessIdPolicy, Task, TaskKind, task_type_id_for_fqn};
+
+    #[tokio::test]
+    async fn atomic_start_retries_pristine_input_and_stops_at_bound() {
+        for conflicts in [1, 3] {
+            let repo = Arc::new(ConflictingStore::default());
+            repo.create_conflicts.store(conflicts, Ordering::SeqCst);
+            let dispatch = Arc::new(CollectingDispatchSink::default());
+            let engine = Arc::new(
+                ChasmEngine::new(
+                    repo.clone(),
+                    ts::registry(),
+                    dispatch.clone(),
+                    Arc::new(NoopVisibilitySink),
+                )
+                .with_config(ChasmEngineConfig {
+                    max_commit_retries: 3,
+                    ..Default::default()
+                }),
+            );
+            let mut calls = 0;
+            let outcome = TypedEngine::<Root>::new(engine.clone())
+                .start_with(
+                    ts::key(0),
+                    ts::Data::default(),
+                    Some("request".into()),
+                    BusinessIdPolicy::default(),
+                    |component, ctx| {
+                        calls += 1;
+                        assert!(component.data.pure.is_empty());
+                        component.data.pure.push(7);
+                        ctx.add_task(
+                            TaskKind::SideEffect,
+                            task_type_id_for_fqn(Work::<true>::FQN),
+                            Work::<true> {
+                                token: 7,
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                            None,
+                        )
+                    },
+                )
+                .await;
+            if conflicts == 1 {
+                assert!(outcome.unwrap().created);
+                assert_eq!(calls, 2);
+                assert_eq!(dispatch.dispatched.lock().unwrap().len(), 1);
+            } else {
+                assert!(matches!(
+                    outcome,
+                    Err(ChasmError::RetriesExhausted { attempts: 3 })
+                ));
+                assert_eq!(calls, 3);
+                assert!(repo.load_execution(&ts::key(0)).await.unwrap().is_empty());
+                assert!(dispatch.dispatched.lock().unwrap().is_empty());
+            }
+        }
+    }
 
     // Feature: chasm-extension-archetypes, Property 6: outcome application fence
     // Only a held task can apply; conflicts, repeats and after-drop deliveries are inert.

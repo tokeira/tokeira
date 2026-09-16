@@ -80,14 +80,16 @@ where
     /// Create and initialize a root in one atomic start transaction. The initializer
     /// runs only when policy admits a new run; returning an existing request/run
     /// never repeats it. A rejected initializer persists neither root nor pointer.
-    /// Staged tasks are validated, persisted, dispatched and armed by normal close.
+    /// A fenced create can re-run the initializer on pristine input up to the
+    /// retry bound, so it must stage effects through the context rather than
+    /// perform external effects. Staged tasks dispatch only after a winning commit.
     pub async fn start_with(
         &self,
         key: ExecutionKey,
         data: C::Data,
         request_id: Option<String>,
         policy: BusinessIdPolicy,
-        initialize: impl FnOnce(&mut C, &mut dyn MutableContext) -> Result<(), ChasmError> + Send,
+        mut initialize: impl FnMut(&mut C, &mut dyn MutableContext) -> Result<(), ChasmError> + Send,
     ) -> Result<StartOutcome, ChasmError> {
         let archetype_id = self.engine.registry().archetype_id(C::FQN).ok_or_else(|| {
             ChasmError::Internal(format!("archetype `{}` is not registered", C::FQN))
@@ -235,7 +237,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     use tokeira_chasm::{
         BusinessIdPolicy, ChasmError, Component, Context, ContextMetadata, ExecutionKey,
@@ -510,6 +512,155 @@ mod tests {
             created.reference.execution_key
         );
         assert_eq!(fx.dispatch.dispatched.lock().unwrap().len(), 1);
+    }
+
+    async fn racing_starts(
+        same_request: bool,
+        conflict: tokeira_chasm::BusinessIdConflictPolicy,
+        superseding: bool,
+        close_on_start: bool,
+    ) {
+        let fx = fixture();
+        if superseding {
+            TypedEngine::<Counter>::new(fx.engine.clone())
+                .start_with(
+                    key(),
+                    CounterData::default(),
+                    Some("old-request".into()),
+                    BusinessIdPolicy::default(),
+                    |component, _| {
+                        component.data.done = true;
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let barrier = Arc::new(Barrier::new(2));
+        let mut starts = Vec::new();
+        for run in ["one", "two"] {
+            let engine = fx.engine.clone();
+            let barrier = barrier.clone();
+            starts.push(tokio::spawn(async move {
+                TypedEngine::<Counter>::new(engine)
+                    .start_with(
+                        ExecutionKey::new("ns", "counter-1", run),
+                        CounterData::default(),
+                        Some(if same_request { "same-request" } else { run }.into()),
+                        BusinessIdPolicy {
+                            conflict,
+                            reuse: if close_on_start {
+                                tokeira_chasm::BusinessIdReusePolicy::RejectDuplicate
+                            } else {
+                                tokeira_chasm::BusinessIdReusePolicy::AllowDuplicate
+                            },
+                        },
+                        move |component, ctx| {
+                            barrier.wait();
+                            component.data.counter = 42;
+                            component.data.done = close_on_start;
+                            ctx.add_task(TaskKind::SideEffect, 11, vec![], None)
+                        },
+                    )
+                    .await
+            }));
+        }
+        let first = starts.remove(0).await.unwrap();
+        let second = starts.remove(0).await.unwrap();
+        let (winner, loser) = if first.as_ref().is_ok_and(|outcome| outcome.created) {
+            (first.unwrap(), second)
+        } else {
+            (second.unwrap(), first)
+        };
+        assert!(winner.created);
+        if same_request
+            || (!close_on_start && conflict == tokeira_chasm::BusinessIdConflictPolicy::UseExisting)
+        {
+            let loser = loser.unwrap();
+            assert!(!loser.created);
+            assert_eq!(
+                winner.reference.execution_key,
+                loser.reference.execution_key
+            );
+        } else if conflict == tokeira_chasm::BusinessIdConflictPolicy::TerminateExisting
+            && !close_on_start
+        {
+            assert!(matches!(loser, Err(ChasmError::Unsupported(_))));
+        } else {
+            assert!(
+                matches!(loser, Err(ChasmError::BusinessIdAlreadyStarted { run_id, request_id, .. }) if run_id == winner.reference.execution_key.run_id && request_id == run_id)
+            );
+        }
+        assert_eq!(
+            winner
+                .reference
+                .execution_versioned_transition
+                .transition_count,
+            1
+        );
+        let loser_run = if winner.reference.execution_key.run_id == "one" {
+            "two"
+        } else {
+            "one"
+        };
+        assert!(matches!(
+            fx.engine
+                .read_component(&ExecutionKey::new("ns", "counter-1", loser_run))
+                .await,
+            Err(ChasmError::ExecutionNotFound)
+        ));
+        assert_eq!(
+            TypedEngine::<Counter>::new(fx.engine.clone())
+                .read(&winner.reference, |component, _| Ok(component.data.counter))
+                .await
+                .unwrap(),
+            42
+        );
+        assert_eq!(fx.dispatch.dispatched.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_atomic_starts_with_same_request_return_one_initialized_run() {
+        racing_starts(
+            true,
+            tokeira_chasm::BusinessIdConflictPolicy::Fail,
+            false,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_starts_re_evaluate_conflict_policy_for_winner() {
+        for policy in [
+            tokeira_chasm::BusinessIdConflictPolicy::Fail,
+            tokeira_chasm::BusinessIdConflictPolicy::UseExisting,
+            tokeira_chasm::BusinessIdConflictPolicy::TerminateExisting,
+        ] {
+            racing_starts(false, policy, false, false).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_starts_re_evaluate_reuse_policy_for_closed_winner() {
+        racing_starts(
+            false,
+            tokeira_chasm::BusinessIdConflictPolicy::UseExisting,
+            false,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_superseding_starts_fence_the_observed_run() {
+        racing_starts(
+            false,
+            tokeira_chasm::BusinessIdConflictPolicy::Fail,
+            true,
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]

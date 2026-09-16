@@ -507,7 +507,9 @@ and releasing the guard before awaiting it, including nested dispatch. Bootstrap
 the multiplexer, then the engine, then registers every executor before rebuilding or serving.
 An unknown type stays in the durable outbox for the next rebuild pass.
 Post-commit timer hints are published before invoking executors, so nested outcome commits
-retain their newer retry deadlines.
+retain their newer retry deadlines. Start conflicts reload the current pointer and live root,
+then re-evaluate request id and policy within the commit retry bound; a same-request loser
+returns the winner with `created: false`.
 
 Staged-start request ids explicitly render the TaskId's failover version, transition count
 and offset, prefixed `chasm.start_activity:`. Length-prefixed parent execution identity also
@@ -588,7 +590,7 @@ Columns and encodings match `V056` (`status`: 0 Running, 1 Completed, 2 Failed).
 #[async_trait]
 pub trait ChasmNodeRepository: Send + Sync {
     async fn persist_dirty(&self, key: &ExecutionKey, batch: Vec<NodeWrite>) -> Result<NodePersistOutcome>;
-    async fn persist_new_execution(&self, key: &ExecutionKey, archetype_id: u32, batch: Vec<NodeWrite>, current: CurrentRun)
+    async fn persist_new_execution(&self, key: &ExecutionKey, archetype_id: u32, batch: Vec<NodeWrite>, current: CurrentRun, expected_current: Option<CurrentRun>)
         -> Result<NodePersistOutcome>;                     // archetype_id added
     async fn current_run(&self, namespace_id: &str, archetype_id: u32, business_id: &str)
         -> Result<Option<CurrentRun>>;                     // archetype_id added; new table, fallback to old
@@ -611,12 +613,20 @@ pub struct CurrentExecution { pub key: ExecutionKey, pub archetype_id: u32, pub 
 `current_run` reads the new table first and falls back to the old one only while the
 backfill marker is unset and only when the legacy run's root node carries the requested
 archetype id; the backfill runs at engine start with the activity archetype id
-until it copies zero rows, then writes a marker row (`tokeira_control_lease`-style, in the
-existing control table) so the fallback is skipped thereafter (Requirements 4.3, 4.4). The
-in-memory repository mirrors the behaviour without the marker.
+until it copies zero rows, then writes a marker row in `chasm_backfill_marker` so the fallback
+is skipped thereafter (Requirements 4.3, 4.4). The in-memory repository mirrors the same
+pointer and marker checks.
 
-`persist_new_execution` writes the pointer to the new table with `ON CONFLICT (namespace_id,
-archetype_id, business_id) DO UPDATE`, the existing shape re-keyed.
+`persist_new_execution` receives the current pointer captured during start policy evaluation:
+absent or a specific superseded run and epoch. Its conditional pointer write shares the node
+transaction; any mismatch or DSQL optimistic-concurrency rejection rolls back all new nodes.
+The fence uses the same archetype-checked legacy fallback during backfill. DSQL inserts an
+absent pointer or updates only the expected run/epoch, and the in-memory store checks under
+the same locks as node writes. No schema changes are required. A conflict reloads both pointer
+and live root and re-evaluates the complete start policy within the engine's retry bound,
+returning the winner for the same request id and the policy's verdict for any other loser.
+This preserves the conflict/idempotency decision and previous-run fence in
+`service/history/chasm_engine.go:913-983,1101-1110 @ v1.31.0`.
 
 ### Edge: `crates/tokeira-edge`
 
@@ -673,7 +683,9 @@ triggers, links and attempt metadata; zero attempt timestamps and empty failures
 All public and executor starts use `TypedEngine::start_with(key, data, request_id, policy,
 initializer)`: only the creating transaction attaches callbacks and schedules the activity,
 then closes, commits, dispatches and arms tasks. Rejected attachment persists neither root
-nor current pointer; an idempotent repeat does not run the initializer. Both pinned handlers
+nor current pointer; an idempotent repeat does not run the initializer. A failed create fence
+may re-run the initializer on pristine input after policy admits a retry; it stages effects
+through the context, with dispatch only after a winning commit. Both pinned handlers
 schedule within `chasm.StartExecution` (`chasm/lib/activity/handler.go:66-90 @ v1.31.0`,
 `handler.go:65-100 @ v1.32.0`). This corrects the public
 `ActivityExecutionInfo.state_transition_count` after start from two to one; describes expose

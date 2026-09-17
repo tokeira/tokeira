@@ -1,5 +1,0 @@
-kind: changed
-body: CHASM current-run pointers are keyed by archetype in a new table; legacy activity pointers are backfilled at engine start and the old table stays read-only.
-time: 2026-09-16T12:02:21.89156+01:00
-custom:
-    Slice: 8b0c6320-8ef6-441f-a151-d48c1115799b

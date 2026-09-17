@@ -1,5 +1,0 @@
-kind: changed
-body: CHASM runs registered pure tasks, fences external outcomes, and rebuilds pending timers and effects from committed state on startup and periodic scans.
-time: 2026-09-16T12:39:33.878578+01:00
-custom:
-    Slice: 6930d6f7-45bd-4f39-baff-61524bd1ce9e

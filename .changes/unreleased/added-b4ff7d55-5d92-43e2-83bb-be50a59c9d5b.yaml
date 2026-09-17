@@ -1,5 +1,0 @@
-kind: added
-body: CHASM tasks carry stable names and task-owned codecs; libraries register typed pure and side-effect handlers and search-attribute definitions.
-time: 2026-09-16T12:02:21.905844+01:00
-custom:
-    Slice: b4ff7d55-5d92-43e2-83bb-be50a59c9d5b

@@ -1,5 +1,0 @@
-kind: fixed
-body: Advance the DSQL schema contract to V071 so default-gate embedded startup installs and accepts the CHASM pointer and backfill tables.
-time: 2026-09-17T16:11:05.057678+01:00
-custom:
-    Slice: b944c3fd-9765-44e7-8272-055e0501a380

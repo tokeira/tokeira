@@ -871,12 +871,29 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
 
 ### Stage 16 — Conformance rerun and finish
 
-- [ ] 16.1 Rerun the functional harness's standalone-activity tier at v1.31.0 with gates at
+- [x] 16.1 Rerun the functional harness's standalone-activity tier at v1.31.0 with gates at
   default (operator-invoked, per `docs/testing/functional-conformance-harness.md`); record the
   outcome in `docs/readiness/conformance.md`.
   - _Requirements: 10.1_
-- [ ] 16.2 Finish: the root `AGENTS.md §10.4` bar green on the workspace; rebase once onto
+  - DONE (2026-09-17): engine `28d0b3af` (merged native visibility), conformance fork
+    `423ae614` and Go 1.26.2. Two consecutive fresh-server runs with wire capture each
+    produced 174 pass / 0 fail / 0 native skips / 0 unfinished and the same 52 RPC/status
+    pairs. Two preceding runs without wire capture had the identical passing outcomes.
+    Three existing size-limit registry exclusions remain separately classified; no corpus
+    body or exclusion changed. Servers booted with default policy gates; the unmodified
+    upstream suite enabled standalone activities through its live override. Callbacks
+    stayed default-gated. `docs/readiness/conformance.md` records the pins, counting
+    convention, exclusions, binary hash, and evidence location. This is the in-memory
+    public-wire corpus, not a live-DSQL or embedded-snapshot-recovery claim.
+- [x] 16.2 Finish: the root `AGENTS.md §10.4` bar green on the workspace; rebase once onto
   `origin/main`; PR per `§10.6`.
+  - DONE (2026-09-17): nightly formatting, workspace lint/check, workspace nextest
+    (3,475 passed, 2 skipped), doctests (1 passed, 20 ignored), and warnings-as-errors
+    workspace rustdoc all passed. Offline links for the edited Markdown and
+    `git diff --check` passed. The evidence-only slice changes this task record, the
+    readiness ledger, and an internal changelog fragment; no production code, dependency,
+    lockfile, corpus, or skip-registry change. Task 15.3 remains open for its separately
+    owned compatibility-branch reference.
 
 ## Task Dependency Graph
 

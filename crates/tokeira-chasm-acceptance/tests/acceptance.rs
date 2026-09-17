@@ -259,6 +259,24 @@ async fn resource_reconciles_through_scoped_workers_and_the_public_builder() {
     assert_eq!(view.history.len(), 1);
     assert_eq!(view.history[0].outcome(), OperationOutcome::Completed);
     assert!(view.active_operation.is_none());
+    let visibility = engine
+        .chasm_visibility::<Resource>(namespace_id_for("default"))
+        .unwrap();
+    let query = "DesiredGeneration = 2 AND ObservedGeneration = 2";
+    assert_eq!(visibility.count(Some(query)).await.unwrap(), 1);
+    let page = visibility
+        .list(tokeira_engine::chasm::ComponentQuery {
+            query: Some(query.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.executions.len(), 1);
+    assert_eq!(page.executions[0].business_id, key.business_id);
+    assert_eq!(
+        page.executions[0].search_attributes.0["ObservedGeneration"],
+        tokeira_types::SearchAttrValue::Int(2)
+    );
     assert_eq!(
         commands::update(&handle, &reference, 2, "generation-three")
             .await
@@ -321,6 +339,48 @@ async fn resource_reconciles_through_scoped_workers_and_the_public_builder() {
     assert_eq!(view.history.len(), 2);
     assert_eq!(view.last_failure, failure.encode_to_vec());
     assert_eq!(view.status, "Failed");
+    assert_eq!(
+        engine
+            .chasm_visibility::<Resource>(namespace_id_for("another-namespace"))
+            .unwrap()
+            .count(None)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        engine
+            .chasm_visibility::<tokeira_chasm_activity::ActivityExecution>(namespace_id_for(
+                "default"
+            ))
+            .unwrap()
+            .count(None)
+            .await
+            .unwrap(),
+        2
+    );
+    let query = "DeploymentStatus = 'Failed' AND DesiredGeneration = 3 AND ObservedGeneration = 2";
+    assert_eq!(visibility.count(Some(query)).await.unwrap(), 1);
+    let page = visibility
+        .list(tokeira_engine::chasm::ComponentQuery {
+            query: Some(query.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.executions.len(), 1);
+    assert_eq!(
+        page.executions[0].lifecycle_state,
+        tokeira_engine::chasm::VisibilityLifecycleState::Open
+    );
+    assert_eq!(
+        page.executions[0].search_attributes.0["DesiredGeneration"],
+        tokeira_types::SearchAttrValue::Int(3)
+    );
+    assert_eq!(
+        page.executions[0].search_attributes.0["DeploymentStatus"],
+        tokeira_types::SearchAttrValue::Keyword("Failed".into())
+    );
     let response = engine
         .endpoint()
         .call(request(

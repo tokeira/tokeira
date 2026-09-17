@@ -7,4 +7,11 @@ pub use tokeira_chasm::{
     SearchAttributeDef, SideEffectTaskHandler, StartActivityTask, Task, TaskId, TaskKind,
     TaskOutcome, TaskValidity,
 };
+pub use tokeira_projection::{
+    ComponentPage, ComponentQuery, ComponentQueryError, ComponentSummary, ComponentVisibility,
+};
 pub use tokeira_runtime::chasm::{SideEffectExecutor, TypedEngine};
+pub use tokeira_types::{
+    ArchetypeId, Memo, NamespaceId, RunId, SearchAttrValue, SearchAttributes, TransitionSeq,
+    VisibilityLifecycleState,
+};

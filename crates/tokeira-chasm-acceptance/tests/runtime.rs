@@ -13,18 +13,18 @@ use std::sync::Arc;
 use fixture::{Clock, QUEUE, SECOND, Stack, key, reference, target};
 use proptest::prelude::*;
 use prost::Message;
-use tokeira_chasm::{Component, ExecutionKey, archetype_id_for_fqn};
-use tokeira_chasm_acceptance::{OperationOutcome, Resource};
+use tokeira_chasm::{Component, ExecutionKey, Registry, archetype_id_for_fqn};
+use tokeira_chasm_acceptance::{AcceptanceLibrary, OperationOutcome, Resource};
 use tokeira_chasm_activity::statemachine::terminal_outcome;
 use tokeira_projection::{
-    InMemoryVisibilityStore, PageBounds, SearchAttrType, SortOrder, VisibilitySink,
-    VisibilityStore, compile_filter,
+    ComponentVisibility, InMemoryVisibilityStore, PageBounds, SearchAttrType, SortOrder,
+    VisibilitySink, VisibilityStore, compile_filter,
 };
 use tokeira_proto::{
     enums::CallbackState,
     failure::{Failure, failure::FailureInfo},
 };
-use tokeira_runtime::chasm::{OutcomeApplied, ProjectionVisibilitySink};
+use tokeira_runtime::chasm::{OutcomeApplied, ProjectionVisibilitySink, VisibilityRepairScanner};
 use tokeira_storage::{ChasmNodeRepository, InMemoryChasmNodeStore};
 use tokeira_types::{ArchetypeId, NamespaceId, SearchAttrValue};
 use uuid::Uuid;
@@ -134,12 +134,8 @@ async fn typed_resource_attributes_are_queryable_through_the_real_projection_ada
         Arc::new(VisibilitySink::new(visibility.clone())),
         1,
     ));
-    let stack = Stack::with_visibility(
-        Arc::new(InMemoryChasmNodeStore::new()),
-        &Clock::new(100 * SECOND),
-        true,
-        adapter,
-    );
+    let nodes = Arc::new(InMemoryChasmNodeStore::new());
+    let stack = Stack::with_visibility(nodes.clone(), &Clock::new(100 * SECOND), true, adapter);
     create_and_update(&stack).await;
     stack.complete(&stack.poll().await.unwrap(), false).await;
     commands::update(&stack.handle(), &reference(key()), 2, "desired-three")
@@ -181,6 +177,38 @@ async fn typed_resource_attributes_are_queryable_through_the_real_projection_ada
         rows[0].search_attributes.0["DeploymentStatus"],
         SearchAttrValue::Keyword("Failed".into())
     );
+    // Feature: chasm-extension-visibility, Property 3: repair recreates the same queried image from committed roots.
+    let archetype = ArchetypeId(archetype_id_for_fqn(Resource::FQN));
+    let original = ComponentVisibility::new(Arc::new(visibility), namespace, archetype)
+        .list(Default::default())
+        .await
+        .unwrap();
+    let repaired = InMemoryVisibilityStore::default();
+    for (name, kind) in [
+        ("DeploymentStatus", SearchAttrType::Keyword),
+        ("DesiredGeneration", SearchAttrType::Int),
+        ("ObservedGeneration", SearchAttrType::Int),
+    ] {
+        repaired
+            .register_attr(namespace, name.into(), kind)
+            .await
+            .unwrap();
+    }
+    let query = ComponentVisibility::new(Arc::new(repaired.clone()), namespace, archetype);
+    assert_eq!(query.count(None).await.unwrap(), 0);
+    let mut registry = Registry::builder();
+    registry.register_library::<AcceptanceLibrary>().unwrap();
+    let registry = registry.build();
+    let repair = VisibilityRepairScanner::new(
+        nodes,
+        Arc::new(VisibilitySink::new(repaired)),
+        Arc::new(move |id, bytes| registry.visibility_snapshot(id, bytes).ok().flatten()),
+        1,
+    );
+    assert_eq!(repair.repair_once().await.unwrap().rebuilt, 1);
+    assert_eq!(query.list(Default::default()).await.unwrap(), original);
+    repair.repair_once().await.unwrap();
+    assert_eq!(query.list(Default::default()).await.unwrap(), original);
 }
 
 async fn delivery_case(failed: bool, crash: u8, deleted: bool, start_time: i64) {

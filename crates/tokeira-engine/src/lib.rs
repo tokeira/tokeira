@@ -445,6 +445,9 @@ pub struct BootstrapNexusEndpointConfig {
 /// perform asynchronous file I/O.
 #[derive(Debug)]
 pub struct Engine {
+    // Shared bootstrap state exists in every deployment; typed access is opt-in.
+    #[cfg_attr(not(feature = "chasm-extensions"), allow(dead_code))]
+    component_visibility_store: chasm_extensions::VisibilityQueryStore,
     // Owned in every deployment; typed access is an opt-in public surface.
     #[cfg_attr(not(feature = "chasm-extensions"), allow(dead_code))]
     chasm_engine: Arc<tokeira_runtime::chasm::ChasmEngine>,
@@ -838,6 +841,31 @@ pub struct TemporalEndpoint {
 }
 
 impl Engine {
+    /// Discover projected executions for a registered root in one namespace.
+    ///
+    /// The embedder must authorize namespace access before obtaining this handle;
+    /// it bypasses the Temporal transport and its interceptors. Results are
+    /// eventually consistent. Use [`Self::chasm`] for authoritative state/commands.
+    #[cfg(feature = "chasm-extensions")]
+    pub fn chasm_visibility<C>(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+    ) -> Result<tokeira_projection::ComponentVisibility, tokeira_chasm::ChasmError>
+    where
+        C: tokeira_chasm::EngineComponent
+            + tokeira_chasm::RootComponent
+            + tokeira_chasm::SearchAttributeProvider
+            + tokeira_chasm::VisibilityContributor,
+    {
+        let archetype_id = self.registry.archetype_id(C::FQN).ok_or_else(|| {
+            tokeira_chasm::ChasmError::Internal(format!("archetype `{}` is not registered", C::FQN))
+        })?;
+        Ok(tokeira_projection::ComponentVisibility::new(
+            self.component_visibility_store.0.clone(),
+            namespace_id,
+            tokeira_types::ArchetypeId(archetype_id),
+        ))
+    }
     /// Configure unstable CHASM libraries, executors and time before startup.
     #[cfg(feature = "chasm-extensions")]
     pub fn builder(config: EmbeddedEngineConfig) -> EngineBuilder {
@@ -910,6 +938,7 @@ impl Engine {
             ownership: None,
         };
         let engine = Self {
+            component_visibility_store: stack.component_visibility_store,
             chasm_engine: stack.chasm_engine,
             registry: stack.registry,
             endpoint: TemporalEndpoint {
@@ -1251,6 +1280,7 @@ async fn start_embedded_dsql(
         ownership: Some(ownership),
     };
     let engine = Engine {
+        component_visibility_store: stack.component_visibility_store,
         chasm_engine: stack.chasm_engine,
         registry: stack.registry,
         endpoint: TemporalEndpoint {
@@ -2661,6 +2691,7 @@ enum ConstructedStack {
 }
 
 struct EmbeddedStack {
+    component_visibility_store: chasm_extensions::VisibilityQueryStore,
     chasm_engine: Arc<tokeira_runtime::chasm::ChasmEngine>,
     registry: Arc<tokeira_chasm::Registry>,
     service: InProcessGrpcService,
@@ -3843,6 +3874,9 @@ where
         StackTransport::Embedded => {
             startup_guard.disarm();
             return Ok(ConstructedStack::Embedded(EmbeddedStack {
+                component_visibility_store: chasm_extensions::VisibilityQueryStore(Arc::new(
+                    visibility_query_store,
+                )),
                 chasm_engine,
                 registry,
                 service: InProcessGrpcService::new(workflow_grpc, operator_grpc, admin_grpc),

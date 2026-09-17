@@ -89,6 +89,22 @@ async fn builder_exposes_roots_seeds_attributes_and_uses_chasm_clock() {
     );
 
     let activity = engine.chasm::<ActivityExecution>().unwrap();
+    assert!(
+        engine
+            .chasm_visibility::<Root<3>>(namespace_id_for("default"))
+            .unwrap_err()
+            .to_string()
+            .contains("absent.root")
+    );
+    assert_eq!(
+        engine
+            .chasm_visibility::<Root<0>>(namespace_id_for("default"))
+            .unwrap()
+            .count(None)
+            .await
+            .unwrap(),
+        0
+    );
     let key = ExecutionKey::new(
         namespace_id_for("default").0.to_string(),
         "clock-activity",

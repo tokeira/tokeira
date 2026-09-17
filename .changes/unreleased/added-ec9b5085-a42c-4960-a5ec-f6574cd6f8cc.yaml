@@ -1,0 +1,5 @@
+kind: added
+body: Embedded CHASM applications can list and count their component executions with scoped pagination and typed visibility attributes.
+time: 2026-09-17T13:23:17.842183+01:00
+custom:
+    Slice: ec9b5085-a42c-4960-a5ec-f6574cd6f8cc

@@ -13,6 +13,21 @@ use tokeira_types::NamespaceId;
 use crate::{EmbeddedEngineConfig, Engine};
 use crate::{EmbeddedEngineStartError, EmbeddedStartupPhase};
 
+/// Keeps the query store shared without requiring provider implementations to
+/// expose storage internals through the engine's Debug output.
+pub(crate) struct VisibilityQueryStore(
+    // Bootstrap retains the same store in every build; only the accessor is opt-in.
+    #[cfg_attr(not(feature = "chasm-extensions"), allow(dead_code))]
+    pub(crate)  Arc<dyn tokeira_projection::VisibilityStore>,
+);
+
+impl std::fmt::Debug for VisibilityQueryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VisibilityQueryStore")
+            .finish_non_exhaustive()
+    }
+}
+
 type LibraryRegistration = fn(&mut RegistryBuilder) -> Result<(), ChasmError>;
 
 /// Inputs consumed once by the shared bootstrap before admission opens.

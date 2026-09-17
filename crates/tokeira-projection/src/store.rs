@@ -54,6 +54,18 @@ pub trait VisibilityStore: Send + Sync {
         sort: SortOrder,
         page: &PageBounds,
     ) -> Result<ListResult>;
+    /// Read generic component rows with their complete typed attribute images.
+    /// Implementations that store attributes separately must hydrate them in the
+    /// same transaction snapshot as the rows, so versions and values cannot tear.
+    async fn list_component_executions(
+        &self,
+        namespace_id: NamespaceId,
+        filter: &CompiledFilter,
+        sort: SortOrder,
+        page: &PageBounds,
+    ) -> Result<ListResult> {
+        self.list_executions(namespace_id, filter, sort, page).await
+    }
     async fn count_executions(
         &self,
         namespace_id: NamespaceId,

@@ -225,8 +225,16 @@ impl VisibilityStore for DsqlVisibilityStore {
     ) -> Result<()> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
         let connection = permit.connection()?;
-        upsert_search_attr_index_row(connection, run_key, namespace_id, attr_id, attr_type, value)
-            .await
+        upsert_search_attr_index_row(
+            connection,
+            run_key,
+            namespace_id,
+            attr_id,
+            attr_type,
+            value,
+            false,
+        )
+        .await
     }
 
     async fn remove_search_attr_index(
@@ -252,87 +260,33 @@ impl VisibilityStore for DsqlVisibilityStore {
         sort: SortOrder,
         page: &PageBounds,
     ) -> Result<ListResult> {
-        let (filter_sql, mut values, next_param) = compile_filter(filter, 2)?;
-        let (cursor_sql, cursor_values, next_param) =
-            cursor_predicate(sort, page.after.as_ref(), next_param)?;
-        values.extend(cursor_values);
-        let archetype_sql = archetype_clause(filter);
-        let limit = page.limit.min(crate::types::MAX_PAGE_SIZE);
-        let sql = format!(
-            r#"
-            SELECT
-                run_key,
-                namespace_id,
-                archetype_id,
-                business_id,
-                run_id,
-                authority_epoch,
-                source_transition_seq,
-                status_keyword,
-                lifecycle_state,
-                start_time,
-                update_time,
-                close_time,
-                execution_type,
-                task_queue,
-                transition_count,
-                memo_blob,
-                execution_time,
-                execution_duration,
-                history_length,
-                history_size_bytes,
-                parent_workflow_id,
-                parent_run_id,
-                root_workflow_id,
-                root_run_id
-            FROM execution_visibility_current
-            WHERE namespace_id = $1
-              AND lifecycle_state <> 2
-              {archetype_sql}
-              {filter_sql}
-              {cursor_sql}
-            ORDER BY {}
-            LIMIT ${}
-            "#,
-            sort_clause(sort),
-            next_param
-        );
-        // SQL safety: `sql` is the SQL compiler's output. Request values reach it
-        // only as `$n` placeholders (Property 2) and are bound below; interpolated
-        // identifiers come from the compiler's own tables.
-        let mut query = sqlx::query(AssertSqlSafe(sql)).bind(namespace_id.0);
-        query = bind_sql_values(query, &values);
-        query = query.bind(i64::try_from(limit + 1)?);
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let referenced_tables = referenced_search_attr_index_tables(filter, None)?;
-        let started = Instant::now();
-        let rows = query.fetch_all(permit.connection()?).await;
-        let duration = started.elapsed();
-        projection_metrics::record_visibility_query_duration("list", duration);
-        for table in referenced_tables {
-            projection_metrics::record_sa_index_scan_duration(table, duration);
-        }
-        let rows = rows?;
-        let mut executions = rows
-            .into_iter()
-            .map(row_to_execution)
-            .collect::<Result<Vec<_>>>()?;
-        let next_page_token = if executions.len() > limit {
-            let last = executions[limit - 1].clone();
-            executions.truncate(limit);
-            Some(PageToken {
-                close_time: last.close_time,
-                start_time: last.start_time,
-                run_key: last.run_key,
-                sort_order: sort,
-            })
-        } else {
-            None
-        };
-        Ok(ListResult {
-            rows: executions,
-            next_page_token,
-        })
+        list_rows(
+            permit.connection()?,
+            namespace_id,
+            filter,
+            sort,
+            page,
+            false,
+        )
+        .await
+    }
+
+    async fn list_component_executions(
+        &self,
+        namespace_id: NamespaceId,
+        filter: &CompiledFilter,
+        sort: SortOrder,
+        page: &PageBounds,
+    ) -> Result<ListResult> {
+        let mut permit = self.director.acquire(DbClass::Projection).await?;
+        // Both SELECTs must share DSQL's transaction snapshot: a projection apply
+        // atomically replaces the row and attributes, so separate reads could
+        // otherwise label new values with an older transition version.
+        let mut tx = permit.connection()?.begin().await?;
+        let result = list_rows(&mut tx, namespace_id, filter, sort, page, true).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     async fn count_executions(
@@ -642,6 +596,7 @@ impl ProjectionSink for DsqlVisibilityStore {
                             attr.attr_id,
                             attr.attr_type,
                             value,
+                            row.archetype_id != ArchetypeId::WORKFLOW,
                         )
                         .await?;
                         storage_metrics::record_dsql_statement_duration(
@@ -709,6 +664,136 @@ impl ProjectionSink for DsqlVisibilityStore {
         projection_metrics::record_sink_write_duration(partition_id, sink_started.elapsed());
         Ok(())
     }
+}
+
+async fn list_rows(
+    connection: &mut PgConnection,
+    namespace_id: NamespaceId,
+    filter: &CompiledFilter,
+    sort: SortOrder,
+    page: &PageBounds,
+    hydrate_attributes: bool,
+) -> Result<ListResult> {
+    let (filter_sql, mut values, next_param) = compile_filter(filter, 2)?;
+    let (cursor_sql, cursor_values, next_param) =
+        cursor_predicate(sort, page.after.as_ref(), next_param)?;
+    values.extend(cursor_values);
+    let archetype_sql = archetype_clause(filter);
+    let limit = page.limit.min(crate::types::MAX_PAGE_SIZE);
+    let sql = format!(
+        r#"
+            SELECT
+                run_key,
+                namespace_id,
+                archetype_id,
+                business_id,
+                run_id,
+                authority_epoch,
+                source_transition_seq,
+                status_keyword,
+                lifecycle_state,
+                start_time,
+                update_time,
+                close_time,
+                execution_type,
+                task_queue,
+                transition_count,
+                memo_blob,
+                execution_time,
+                execution_duration,
+                history_length,
+                history_size_bytes,
+                parent_workflow_id,
+                parent_run_id,
+                root_workflow_id,
+                root_run_id
+            FROM execution_visibility_current
+            WHERE namespace_id = $1
+              AND lifecycle_state <> 2
+              {archetype_sql}
+              {filter_sql}
+              {cursor_sql}
+            ORDER BY {}
+            LIMIT ${}
+            "#,
+        sort_clause(sort),
+        next_param
+    );
+    // SQL safety: `sql` is the SQL compiler's output. Request values reach it
+    // only as `$n` placeholders (Property 2) and are bound below; interpolated
+    // identifiers come from the compiler's own tables.
+    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(namespace_id.0);
+    query = bind_sql_values(query, &values);
+    query = query.bind(i64::try_from(limit + 1)?);
+    let referenced_tables = referenced_search_attr_index_tables(filter, None)?;
+    let started = Instant::now();
+    let rows = query.fetch_all(&mut *connection).await;
+    let duration = started.elapsed();
+    projection_metrics::record_visibility_query_duration("list", duration);
+    for table in referenced_tables {
+        projection_metrics::record_sa_index_scan_duration(table, duration);
+    }
+    let rows = rows?;
+    let mut executions = rows
+        .into_iter()
+        .map(row_to_execution)
+        .collect::<Result<Vec<_>>>()?;
+    let next_page_token = if executions.len() > limit {
+        let last = executions[limit - 1].clone();
+        executions.truncate(limit);
+        Some(PageToken {
+            close_time: last.close_time,
+            start_time: last.start_time,
+            run_key: last.run_key,
+            sort_order: sort,
+        })
+    } else {
+        None
+    };
+    if hydrate_attributes {
+        hydrate_component_attributes(connection, namespace_id, &mut executions).await?;
+    }
+    Ok(ListResult {
+        rows: executions,
+        next_page_token,
+    })
+}
+
+async fn hydrate_component_attributes(
+    connection: &mut PgConnection,
+    namespace_id: NamespaceId,
+    executions: &mut [ExecutionRow],
+) -> Result<()> {
+    if executions.is_empty() {
+        return Ok(());
+    }
+    let run_keys: Vec<Uuid> = executions.iter().map(|row| row.run_key.0).collect();
+    // Index cells repeat the full value for each element/token. DISTINCT returns
+    // one typed image per attribute without an N+1 query or cross-namespace join.
+    let values = sqlx::query(
+        "SELECT DISTINCT idx.run_key, registry.attr_name, idx.value_data
+         FROM execution_visibility_attr_index idx
+         JOIN sa_registry registry ON registry.namespace_id = idx.namespace_id
+             AND registry.attr_id = idx.attr_id
+         WHERE idx.namespace_id = $1 AND idx.run_key = ANY($2)",
+    )
+    .bind(namespace_id.0)
+    .bind(&run_keys)
+    .fetch_all(connection)
+    .await?;
+    for value in values {
+        let key: Uuid = value.try_get("run_key")?;
+        let name: String = value.try_get("attr_name")?;
+        let data: Vec<u8> = value.try_get("value_data")?;
+        let decoded: SearchAttrValue = codec::decode(&data)?;
+        if let Some(row) = executions.iter_mut().find(|row| row.run_key.0 == key) {
+            anyhow::ensure!(
+                row.search_attributes.0.insert(name, decoded).is_none(),
+                "conflicting component visibility attribute images for run {key}"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn upsert_execution_row(
@@ -901,10 +986,11 @@ async fn upsert_search_attr_index_row(
     attr_id: AttrId,
     attr_type: SearchAttrType,
     value: &SearchAttrValue,
+    preserve_empty: bool,
 ) -> Result<()> {
     let attr_id = i64_from_u64(attr_id.0, "search attribute id")?;
     let value_data = codec::encode(value)?;
-    for cell in attr_cells(attr_type, value)? {
+    for cell in stored_attr_cells(attr_type, value, preserve_empty)? {
         sqlx::query(
             r#"
             INSERT INTO execution_visibility_attr_index (
@@ -932,6 +1018,21 @@ async fn upsert_search_attr_index_row(
         .await?;
     }
     Ok(())
+}
+
+fn stored_attr_cells(
+    attr_type: SearchAttrType,
+    value: &SearchAttrValue,
+    preserve_empty: bool,
+) -> Result<Vec<AttrCell>> {
+    let mut cells = attr_cells(attr_type, value)?;
+    // Empty lists and tokenless text still contribute a component value. Retain
+    // its encoded image without inventing an element/token that could match a
+    // predicate. Workflow writes retain their existing empty-value semantics.
+    if preserve_empty && cells.is_empty() {
+        cells.push(AttrCell::default());
+    }
+    Ok(cells)
 }
 
 async fn remove_search_attr_index_row(
@@ -1975,6 +2076,29 @@ mod tests {
     use super::*;
     use crate::types::{workflow_lifecycle_state, workflow_status_keyword};
 
+    #[test]
+    fn empty_component_values_have_an_image_without_searchable_elements() {
+        for (kind, value) in [
+            (
+                SearchAttrType::KeywordList,
+                SearchAttrValue::KeywordList(vec![]),
+            ),
+            (SearchAttrType::Text, SearchAttrValue::Text("  !!! ".into())),
+        ] {
+            let cells = stored_attr_cells(kind, &value, true).unwrap();
+            assert_eq!(cells.len(), 1);
+            assert!(cells[0].keyword_value.is_none());
+            assert!(cells[0].text_token.is_none());
+            assert!(stored_attr_cells(kind, &value, false).unwrap().is_empty());
+        }
+        let actual_empty_keyword = stored_attr_cells(
+            SearchAttrType::KeywordList,
+            &SearchAttrValue::KeywordList(vec![String::new()]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(actual_empty_keyword[0].keyword_value.as_deref(), Some(""));
+    }
     #[test]
     fn memo_patch_extends_existing_memo() {
         let mut existing_entries = BTreeMap::new();

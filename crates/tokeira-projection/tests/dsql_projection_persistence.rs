@@ -2,13 +2,14 @@
 
 //! Live projection persistence checks using the storage crate's canonical migrations.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use time::OffsetDateTime;
 use tokeira_projection::{
-    DsqlVisibilityStore, ProjectionSink, VisibilityStore, workflow_status_keyword,
+    ComponentQuery, ComponentQueryError, ComponentVisibility, DsqlVisibilityStore, ProjectionSink,
+    VisibilityStore, workflow_status_keyword,
 };
 use tokeira_storage::{
     ProjectionContext, ProjectionLog, ProjectionRecord,
@@ -16,10 +17,138 @@ use tokeira_storage::{
 };
 use tokeira_types::{
     ArchetypeId, ExecutionStatus, Memo, NamespaceId, Payload, ProjectionCursor, RunId, RunKey,
-    SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkflowId,
-    WorkflowType,
+    SearchAttrValue, SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
+    WorkflowId, WorkflowType,
 };
 use uuid::Uuid;
+
+#[tokio::test]
+async fn component_visibility_hydrates_typed_images_and_scopes_pages() -> Result<()> {
+    let Some(context) = TestContext::connect().await? else {
+        return Ok(());
+    };
+    let store = Arc::new(context.visibility_store().await?);
+    let namespace = NamespaceId(Uuid::new_v4());
+    let archetype = ArchetypeId(9871);
+    let attributes = SearchAttributes(
+        [
+            ("Generation".into(), SearchAttrValue::Int(12)),
+            ("Status".into(), SearchAttrValue::Keyword("Degraded".into())),
+            (
+                "Tags".into(),
+                SearchAttrValue::KeywordList(vec!["b".into(), "a".into(), "b".into()]),
+            ),
+            ("EmptyList".into(), SearchAttrValue::KeywordList(vec![])),
+            (
+                "Description".into(),
+                SearchAttrValue::Text("hello world hello".into()),
+            ),
+            ("Tokenless".into(), SearchAttrValue::Text("  !!! ".into())),
+            ("Ready".into(), SearchAttrValue::Bool(false)),
+            ("Ratio".into(), SearchAttrValue::Double(1.25)),
+            (
+                "At".into(),
+                SearchAttrValue::Datetime(OffsetDateTime::UNIX_EPOCH),
+            ),
+        ]
+        .into(),
+    );
+    let mut records = Vec::new();
+    for index in 0..5 {
+        let run_key = RunKey(Uuid::new_v4());
+        let mut image = sample_context(run_key);
+        image.namespace_id = if index == 4 {
+            NamespaceId(Uuid::new_v4())
+        } else {
+            namespace
+        };
+        image.archetype_id = if index == 3 {
+            ArchetypeId(9872)
+        } else {
+            archetype
+        };
+        image.status_keyword = "Degraded".into();
+        image.search_attributes = attributes.clone();
+        for (name, value) in &attributes.0 {
+            store
+                .register_attr(
+                    image.namespace_id,
+                    name.clone(),
+                    tokeira_projection::search_attr_type_of(value),
+                )
+                .await?;
+        }
+        let record = ProjectionRecord {
+            partition_id: 0,
+            fanout: 1,
+            run_key,
+            transition_seq: TransitionSeq(1),
+            context: image,
+        };
+        store.apply(&record, 0).await?;
+        records.push(record);
+    }
+    let handle = ComponentVisibility::new(store.clone(), namespace, archetype);
+    let query = "Generation = 12 AND ExecutionStatus = 'Degraded'";
+    assert_eq!(handle.count(Some(query)).await?, 3);
+    let mut token = None;
+    let mut seen = std::collections::BTreeSet::new();
+    loop {
+        let page = handle
+            .list(ComponentQuery {
+                query: Some(query.into()),
+                page_size: 1,
+                next_page_token: token,
+            })
+            .await?;
+        for row in page.executions {
+            assert!(seen.insert(row.run_id.0));
+            assert_eq!(row.search_attributes, attributes);
+            assert_eq!(row.status_keyword, "Degraded");
+            assert_eq!(row.lifecycle_state, VisibilityLifecycleState::Open);
+            assert_eq!(row.namespace_id, namespace);
+            assert_eq!(row.archetype_id, archetype);
+            assert_eq!(row.source_transition_seq, TransitionSeq(1));
+        }
+        token = page.next_page_token;
+        if token.is_none() {
+            break;
+        }
+        let other = ComponentVisibility::new(store.clone(), namespace, ArchetypeId(9872));
+        assert!(matches!(
+            other
+                .list(ComponentQuery {
+                    query: Some(query.into()),
+                    next_page_token: token.clone(),
+                    ..Default::default()
+                })
+                .await,
+            Err(ComponentQueryError::InvalidPageToken(_))
+        ));
+    }
+    assert_eq!(seen.len(), 3);
+    let mut updated = records[0].clone();
+    updated.transition_seq = TransitionSeq(2);
+    updated.context.search_attributes = SearchAttributes::default();
+    store.apply(&updated, 0).await?;
+    store.apply(&records[0], 0).await?;
+    let page = handle.list(Default::default()).await?;
+    let row = page
+        .executions
+        .iter()
+        .find(|row| row.run_id == updated.context.run_id)
+        .unwrap();
+    assert_eq!(row.source_transition_seq, TransitionSeq(2));
+    assert!(row.search_attributes.0.is_empty());
+    assert_eq!(handle.count(Some(query)).await?, 2);
+    for record in &mut records {
+        record.transition_seq = TransitionSeq(3);
+        record.context.lifecycle_state = VisibilityLifecycleState::Deleted;
+        store.apply_deletion(record).await?;
+    }
+    assert_eq!(handle.count(None).await?, 0);
+    Ok(())
+}
 
 #[tokio::test]
 async fn read_from_paginates_projection_log_rows() -> Result<()> {

@@ -88,6 +88,17 @@ where
             .list_executions(namespace_id, filter, sort, page)
             .await
     }
+    async fn list_component_executions(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        filter: &CompiledFilter,
+        sort: SortOrder,
+        page: &PageBounds,
+    ) -> Result<ListResult> {
+        self.store
+            .list_component_executions(namespace_id, filter, sort, page)
+            .await
+    }
     async fn count_executions(
         &self,
         namespace_id: tokeira_types::NamespaceId,

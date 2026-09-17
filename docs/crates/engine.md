@@ -40,6 +40,7 @@ semantics.
 | `run_from_cli` | Production daemon bootstrap from the shared CLI/config contracts |
 | `Engine::builder` / `EngineBuilder` | CHASM extension registration: `library`, `side_effect_executor`, `clock`, `build` |
 | `Engine::chasm::<C>` | Typed handle on a registered root component |
+| `Engine::chasm_visibility::<C>` | Read-only projected list/count for a registered root and namespace |
 | `tokeira_engine::chasm` | Re-exports an extension library needs, so it takes no direct dependency on the internal crates |
 
 ## Registering a CHASM component
@@ -60,6 +61,29 @@ before persisted effects are rebuilt.
 `Engine::chasm::<C>()` then returns a typed handle on a registered root
 component, in the same process as the caller — no client, no workflow start, and
 no queue between the caller and the decision.
+
+`Engine::chasm_visibility::<C>(namespace_id)` returns a `ComponentVisibility`
+handle over the same projection store the running engine writes, in memory or
+DSQL. `list(ComponentQuery)` provides bounded keyset pagination and
+`count(Some(predicate))` counts matching executions. For example, an extension
+can filter `DesiredGeneration = 3 AND DeploymentStatus = 'Failed'` using its
+declared typed attributes. The shared grammar also supports `ExecutionStatus`
+as an archetype-defined keyword. Result summaries preserve that keyword and
+open/closed lifecycle separately; a failed operation can leave its resource open.
+
+The handle fixes namespace and archetype after query compilation. Continuations
+are bound to that scope and the trimmed predicate; page size defaults to 100
+and must be 1–1000. Invalid predicates, page sizes and continuations have named
+errors. Cursors are not credentials: the embedding application authorizes its
+namespace access before obtaining a handle. This in-process API does not run
+Temporal transport interceptors, and workflow/activity RPCs retain their own
+archetype isolation.
+
+Visibility is a repairable, eventually consistent read model. Separate pages
+and counts do not promise a frozen snapshot during concurrent changes. Use
+the typed component handle for authoritative details and commands; never use
+a projected row to admit a mutation. This surface adds no embedded in-memory
+snapshot restart support.
 
 `EngineBuilder::clock` sets the CHASM plane's nanosecond time source. It is the
 plane's definitive clock: transitions, pure deadlines, delayed dispatch, callback

@@ -18,6 +18,11 @@ use crate::{
     },
 };
 
+/// Preserves registry availability failures separately from invalid predicates.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct AttributeLookupError(#[from] pub(crate) anyhow::Error);
+
 /// Resolve a visibility predicate against registered fields and validate its literal types.
 /// An absent or blank predicate matches every execution within the caller's scope.
 pub async fn compile_filter<S: VisibilityStore + ?Sized>(
@@ -395,7 +400,11 @@ async fn resolve_field<S: VisibilityStore + ?Sized>(
     if let Some(system) = system {
         return Ok(FieldRef::System(system));
     }
-    if let Some(attr) = store.resolve_attr(namespace_id, trimmed).await? {
+    if let Some(attr) = store
+        .resolve_attr(namespace_id, trimmed)
+        .await
+        .map_err(AttributeLookupError)?
+    {
         return Ok(FieldRef::Custom {
             name: trimmed.to_string(),
             attr_id: attr.attr_id,
@@ -413,7 +422,8 @@ async fn resolve_field<S: VisibilityStore + ?Sized>(
         .unwrap_or_else(|| format!("Temporal{trimmed}"));
     if let Some(attr) = store
         .resolve_attr(namespace_id, &prefixed_or_stripped)
-        .await?
+        .await
+        .map_err(AttributeLookupError)?
     {
         return Ok(FieldRef::Custom {
             name: prefixed_or_stripped,

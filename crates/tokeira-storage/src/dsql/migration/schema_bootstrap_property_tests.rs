@@ -243,6 +243,53 @@ fn selected_metadata_version(current: u32, seed: u32) -> Option<u32> {
     }
 }
 
+#[test]
+fn chasm_startup_schema_contract_migrates_and_accepts_required_tables() {
+    let recognized = recognized_migrations();
+    let contract = MigrationRunner::compatibility_contract();
+    // Default-gate engine startup still reads the pointer and backfill marker.
+    // A self-consistent digest of an older prefix cannot make that schema usable.
+    for (version, name) in [
+        (69, "chasm_current_execution"),
+        (70, "idx_chasm_current_execution_status"),
+        (71, "chasm_backfill_marker"),
+    ] {
+        assert!(
+            recognized
+                .iter()
+                .any(|migration| { migration.version == version && migration.name == name })
+        );
+    }
+    for current in [0, 68, 69, 70, 71] {
+        let observed = observation(&recognized, current, (current > 0).then_some(current));
+        for policy in [
+            SchemaMigrationPolicy::Automatic,
+            SchemaMigrationPolicy::ValidateOnly,
+        ] {
+            let expected = match (current, policy) {
+                (71, _) => SchemaDecision::Compatible {
+                    current: 71,
+                    legacy_backfill: false,
+                },
+                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 71 },
+                (_, SchemaMigrationPolicy::Automatic) => SchemaDecision::Migrate {
+                    from: current,
+                    to: 71,
+                },
+                (_, SchemaMigrationPolicy::ValidateOnly) => SchemaDecision::MigrationRequired {
+                    current,
+                    target: 71,
+                },
+            };
+            assert_eq!(
+                assess_schema_compatibility(&contract, &recognized, &observed, policy),
+                expected,
+                "CHASM startup requires V071: current={current}, policy={policy:?}",
+            );
+        }
+    }
+}
+
 // Feature: managed-embedded-dsql-schema-bootstrap, Property 1: bug condition is eliminated
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
@@ -452,11 +499,12 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
     #[test]
-    fn property_bootstrap_sources_and_schema_contract_are_preserved(
+    fn property_bootstrap_sources_and_v68_prefix_are_preserved(
         pre_claim in any::<bool>(),
         statement_seed in any::<usize>(),
     ) {
-        let initialize = SchemaDecision::Initialize { target: 68 };
+        let contract = MigrationRunner::embedded_schema_contract();
+        let initialize = SchemaDecision::Initialize { target: contract.target_version };
         let statements = if pre_claim {
             bootstrap_statements_for_decision(&initialize)
                 .expect("initialize has a coordination bootstrap")
@@ -479,12 +527,11 @@ proptest! {
         prop_assert_eq!(statements[selected].matches(';').count(), 1);
         prop_assert!(DdlValidator::validate(statements[selected], "bootstrap").is_empty());
 
-        let contract = MigrationRunner::embedded_schema_contract();
-        prop_assert_eq!(contract.target_version, 68);
-        prop_assert_eq!(contract.maximum_readable_version, 68);
-        prop_assert_eq!(contract.immutable_through_version, 68);
+        // Extending the release target must preserve the already-published prefix
+        // and bootstrap SQL; pinning the target itself hid required CHASM migrations.
+        prop_assert!(contract.immutable_through_version >= 68);
         prop_assert_eq!(
-            contract.migration_set_digest.as_str(),
+            prefix_digest(68),
             "sha256:270ceac8abf12e8926d1039b9a8e71ae1ff8656f29873e2397f9a7a7513d8953"
         );
         prop_assert_eq!(

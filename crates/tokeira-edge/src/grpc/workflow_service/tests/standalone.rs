@@ -1064,7 +1064,6 @@ proptest! {
     fn scoped_wire_tokens_reject_other_releases(version in 0u8..4, action in 0u8..4) {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let h = Harness::new();
-            h.clock.store(OffsetDateTime::now_utc().unix_timestamp_nanos() as i64, Ordering::SeqCst);
             let target = DeploymentVersionTarget { deployment_name: format!("deployment-{}", version / 2), build_id: format!("build-{version}") };
             let wrong = DeploymentVersionTarget { build_id: format!("build-{}", (version + 1) % 4), ..target.clone() };
             let provenance = Arc::new(tokeira_storage::InMemoryStore::default());

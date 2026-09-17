@@ -385,12 +385,18 @@ flag's forward direction, not the shipped default)
 (`common/dynamicconfig/constants.go:2870-2874 @ v1.31.0`). The suite opts in with
 `EnableChasm` and `EnableCHASMCallbacks`. This is a callbacks-mode gate, and Tokeira's
 CHASM boundary is explicit: of the five CHASM components at v1.31.0 (`chasm/lib/
-{activity, callback, nexusoperation, scheduler, workflow}`), Tokeira supports
-**standalone activities only** — `chasm/lib/activity @ v1.31.0`, answered by Tokeira's
-own implementation, whose suite ran actively in this report. The other CHASM
-components are not supported; where the corpus exercises them it does so behind
-non-default flags (the scheduler and callback gates cited above), and the
-corresponding entrypoints are excluded by name. The HSM
+{activity, callback, nexusoperation, scheduler, workflow}`), Tokeira answers
+**standalone activities** — `chasm/lib/activity @ v1.31.0`, by Tokeira's own
+implementation, whose suite ran actively in this report. The other four are not
+supported; where the corpus exercises them it does so behind non-default flags (the
+scheduler and callback gates cited above), and the corresponding entrypoints are
+excluded by name.
+
+Tokeira's CHASM plane is not limited to that one component — an embedding host can
+register a component library of its own — but registered components are Tokeira-native
+surface with no upstream counterpart, so they are outside the v1.31.0 compatibility
+claim and change nothing this report measures. The corpus exercises the public
+Temporal contract, and a registered component adds no public RPC to it. The HSM
 sibling remains active and produced 14 pass outcomes. Invoking the CHASM name through
 the runner produced “no tests to run” and zero outcomes; it is not counted among the 64
 test-bearing entrypoints or the 106 exclusions beneath them.

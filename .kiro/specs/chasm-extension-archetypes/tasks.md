@@ -818,7 +818,7 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   fragment is 149 characters. No dependency or storage changes. Live DSQL, stage 15.1–15.3
   documentation/sibling amendments and the stage 16 corpus rerun remain outside this slice.
 
-- [ ] 15.1 Crate docs: `docs/crates/chasm.md` (handlers, ids, the sealed built-in rule),
+- [x] 15.1 Crate docs: `docs/crates/chasm.md` (handlers, ids, the sealed built-in rule),
   `docs/crates/chasm-activity.md` (callbacks, version target), `docs/crates/runtime.md`
   (executors, multiplexer, rebuild scan, outcome primitive), `docs/crates/storage.md` (the
   pointer table, backfill, retirement), `docs/crates/edge.md` (the four executors, versioned
@@ -828,14 +828,40 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   item docs per root `AGENTS.md §9` with the citations named in `requirements.md`;
   `RUSTDOCFLAGS="-D warnings" cargo doc` clean.
   - _Requirements: 10.5, 10.6, 10.7_
-- [ ] 15.2 Amend `.kiro/specs/scoped-worker-authorization/requirements.md`: add the sanctioned
+  - DONE: all six crate pages amended in place — `chasm.md` gains typed handlers, the
+    stable-id scheme and the sealing rule; `chasm-activity.md` gains completion callbacks
+    (including why a terminal activity stays Running until they settle) and the version
+    target; `runtime.md` gains the multiplexer, the outcome primitive and the rebuild scan;
+    `storage.md` gains the archetype-keyed pointer, the backfill and its marker, and why
+    `chasm_current_run` is left in place; `edge.md` gains the three executors and four roles,
+    the versioned poll and the provenance anchor; `engine.md` gains the builder, the typed
+    handle and the clock. `corpus-evidence.md` no longer says standalone activities are the
+    only component: upstream's four others remain unsupported, and registered components are
+    named as Tokeira-native surface outside the v1.31.0 claim. `chasm-plane.svg` refreshed in
+    house style — the boundary card becomes registration, the sweeper card gains the rebuild
+    scan, the engine card names the multiplexer, and the pointer table is renamed.
+    `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` is clean; the
+    module and public-item docs written in stages 1–13 already carried their §9 citations.
+    Also folded in the stage 14 review nit: the wall-clock pin in Property 12's harness is
+    gone, so its 128 cases run under the simulated clock.
+- [x] 15.2 Amend `.kiro/specs/scoped-worker-authorization/requirements.md`: add the sanctioned
   exception to Requirement 10.4 stating criteria 7.5–7.10 of this spec; leave criterion 10.4
   itself unchanged. (`AGENTS.md §6` snapshot before editing.)
   - _Requirements: 7.11, 10.3_
+  - DONE: criterion 10.4 is untouched. A "Sanctioned exception to criterion 10.4" subsection
+    follows Requirement 10's criteria, restating 7.4–7.10 and showing the exception is
+    narrow: exact-release routing is added, and nothing 10.4 refuses becomes servable — an
+    untargeted task is still withheld from a scoped worker (7.6).
 - [ ] 15.3 Amend `.kiro/specs/chasm-activity-timeouts-and-retry/tasks.md`: mark task 4.3 done by
   this spec with a DONE record; add to `.kiro/specs/v132-standalone-activities` a one-line
   reference that Requirement 5 of this spec implements standalone-activity callbacks, gated.
   - _Requirements: 10.2, 10.4_
+  - PARTIAL: `chasm-activity-timeouts-and-retry` task 4.3 is ticked with a DONE record naming
+    `OutboxRebuildScanner` as the recovery scan that satisfies its Requirement 9, generalized
+    to every registered archetype. The second half cannot be done: no
+    `.kiro/specs/v132-standalone-activities` exists in the repository, on `main` or on any
+    branch, so there is nothing to add the callback reference to. This task stays open until
+    that spec exists or the owner drops the reference.
 
 ### Stage 16 — Conformance rerun and finish
 

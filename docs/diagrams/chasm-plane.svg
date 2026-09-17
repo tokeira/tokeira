@@ -18,7 +18,7 @@
 
   <text x="60" y="48" font-family="'SF Mono',Menlo,monospace" font-size="13" letter-spacing="3" fill="#9A4A2C">TOKEIRA · ARCHITECTURE</text>
   <text x="60" y="88" class="title">The CHASM plane</text>
-  <text x="60" y="118" class="subtitle">Durable state-machine components beside the workflow runtime — today, standalone activities. Additive by construction: the same storage discipline, zero shared code paths.</text>
+  <text x="60" y="118" class="subtitle">Durable state-machine components beside the workflow runtime — those the engine ships, and those an embedding host registers. The same storage discipline, zero shared code paths.</text>
 
   <text x="60" y="168" class="section">THE FRAMEWORK</text>
   <text x="760" y="168" class="section">THE RUNTIME SUBSTRATE</text>
@@ -28,19 +28,19 @@
   <rect x="60" y="188" width="420" height="150" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
   <text x="84" y="220" class="boxtitle">tokeira-chasm</text>
   <text x="84" y="246" class="mono">+ tokeira-chasm-derive · tokeira-chasm-activity</text>
-  <text x="84" y="274" class="small">Typed durable components: state, commands, transitions,</text>
-  <text x="84" y="294" class="small">timers — authored as Rust types, wired by the derive</text>
-  <text x="84" y="314" class="small">macro. Standalone activities are the first component.</text>
+  <text x="84" y="274" class="small">Typed durable components: state, tasks, transitions, timers</text>
+  <text x="84" y="294" class="small">— authored as Rust types, wired by the derive macro. Task</text>
+  <text x="84" y="314" class="small">ids are stable; the built-in range is sealed to built-ins.</text>
 
   <!-- the boundary card -->
   <rect x="60" y="378" width="420" height="196" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".45" stroke-width="1.4"/>
-  <text x="84" y="410" class="boxtitle">The v0.1 boundary — stated plainly</text>
-  <text x="84" y="438" class="small">Temporal v1.31.0 ships five CHASM components: activity,</text>
-  <text x="84" y="458" class="small">callback, nexusoperation, scheduler, workflow. Tokeira</text>
-  <text x="84" y="478" class="small">supports standalone activities only. Upstream itself gates</text>
-  <text x="84" y="498" class="small">the scheduler behind an experiment flag and callbacks</text>
-  <text x="84" y="518" class="small">behind a mode — the boundary is honest on both sides.</text>
-  <text x="84" y="548" class="mono">claim source: docs/readiness/corpus-evidence.md</text>
+  <text x="84" y="410" class="boxtitle">Registering a component</text>
+  <text x="84" y="438" class="small">An embedding host adds its own component library at build</text>
+  <text x="84" y="458" class="small">time and reaches it by type, in its own process. Built-in</text>
+  <text x="84" y="478" class="small">registration seals first, so an extension cannot claim a</text>
+  <text x="84" y="498" class="small">built-in name or task id, and nothing is served until every</text>
+  <text x="84" y="518" class="small">library and executor has registered.</text>
+  <text x="84" y="548" class="mono">Engine::builder().library(..) · engine.chasm::&lt;C&gt;()</text>
 
   <!-- ghosted workflow runtime + boundary -->
   <rect x="60" y="626" width="420" height="104" rx="10" fill="#F6F3EE" stroke="#8A8378" stroke-opacity=".45" stroke-width="1.2" stroke-dasharray="4 5"/>
@@ -54,13 +54,14 @@
   <text x="604" y="248" class="small">Loads a component tree, applies a typed command,</text>
   <text x="604" y="268" class="small">commits the transition fenced — the same commit</text>
   <text x="604" y="288" class="small">posture as workflows, on separate machinery.</text>
-  <text x="604" y="316" class="mono">ChasmNodeRepository — CAS on the node tree</text>
+  <text x="604" y="316" class="mono">DispatchMultiplexer — one executor per task type</text>
 
-  <rect x="580" y="398" width="420" height="130" rx="10" fill="#F6F3EE" stroke="#8A8378" stroke-opacity=".55" stroke-width="1.3" stroke-dasharray="5 5"/>
-  <text x="604" y="430" class="boxtitle" fill="#4A443C">ChasmTimerSweeper</text>
-  <text x="604" y="458" class="small">Nothing else fires armed activity timeouts. Gated by</text>
-  <text x="604" y="478" class="small">activity.enableStandalone — production pays no idle</text>
-  <text x="604" y="498" class="small">sweep; the conformance harness keeps it armed.</text>
+  <rect x="580" y="398" width="420" height="150" rx="10" fill="#F6F3EE" stroke="#8A8378" stroke-opacity=".55" stroke-width="1.3" stroke-dasharray="5 5"/>
+  <text x="604" y="430" class="boxtitle" fill="#4A443C">Sweeper · rebuild scan</text>
+  <text x="604" y="458" class="small">Nothing else fires an armed timeout. Beside it, the outbox</text>
+  <text x="604" y="478" class="small">rebuild scan re-derives pending effects and deadlines from</text>
+  <text x="604" y="498" class="small">committed state, at start and on a sweep after — so an</text>
+  <text x="604" y="518" class="small">effect lost to a restart comes back on its own.</text>
 
   <rect x="580" y="568" width="420" height="150" rx="10" fill="#F6F3EE" stroke="#8A8378" stroke-opacity=".55" stroke-width="1.3" stroke-dasharray="5 5"/>
   <text x="604" y="600" class="boxtitle" fill="#4A443C">Visibility, archetype-neutral</text>
@@ -81,10 +82,10 @@
 
   <rect x="1500" y="438" width="440" height="168" rx="10" fill="#F6F3EE" stroke="#C88D6F" stroke-opacity=".6" stroke-width="1.5" stroke-dasharray="8 5"/>
   <text x="1524" y="470" class="boxtitle">Two tables, one index</text>
-  <text x="1524" y="498" class="mono">chasm_node · chasm_current_run</text>
-  <text x="1524" y="526" class="small">Component trees and current-run pointers, committed</text>
-  <text x="1524" y="546" class="small">fenced like everything else. Visibility rows land in the</text>
-  <text x="1524" y="566" class="small">shared execution_visibility_* index beside workflows.</text>
+  <text x="1524" y="498" class="mono">chasm_node · chasm_current_execution</text>
+  <text x="1524" y="526" class="small">Component trees, and one live execution per archetype</text>
+  <text x="1524" y="546" class="small">and business id, committed fenced like everything else.</text>
+  <text x="1524" y="566" class="small">Visibility rows land in the shared index beside workflows.</text>
 
   <!-- flows -->
   <g stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round">
@@ -110,14 +111,15 @@
     <circle cx="96" cy="904" r="13" fill="#B85C38"/><text x="96" y="909" text-anchor="middle" class="num">2</text>
     <text x="120" y="909">Every transition commits fenced into the component tree (CAS on chasm_node) — the CHASM plane inherits the engine's one non-negotiable habit.</text>
     <circle cx="96" cy="940" r="13" fill="#8A8378"/><text x="96" y="945" text-anchor="middle" class="num">3</text>
-    <text x="120" y="945">The sweeper is the only thing that fires armed activity timeouts; it submits typed commands back through the engine, never touching state directly.</text>
+    <text x="120" y="945">The sweeper is the only thing that fires an armed timeout; it submits typed commands back through the engine, never touching state directly.</text>
     <circle cx="96" cy="976" r="13" fill="#33586E"/><text x="96" y="981" text-anchor="middle" class="num">4</text>
-    <text x="120" y="981">Visibility snapshots land in the shared archetype-neutral index — one list surface serves workflows and standalone activities alike.</text>
+    <text x="120" y="981">Visibility snapshots land in the shared archetype-neutral index — one list surface serves workflows and every registered component alike.</text>
     <text x="120" y="1022" class="mono">Key: clay = the commit path · dashed grey = sweeper / gated machinery · dashed slate-blue = derived visibility</text>
     <text x="120" y="1062" class="body">Why this plane exists: components that need durability without workflow semantics — no event history replay, no task queues,</text>
     <text x="120" y="1086" class="body">no worker round-trips. A standalone activity is state + retry policy + heartbeats, committed fenced, visible beside everything else.</text>
-    <text x="120" y="1126" class="small">What arrives here next tracks upstream: as Temporal's CHASM components mature past their gates, this plane is where they land —</text>
-    <text x="120" y="1146" class="small">the substrate is archetype-neutral by construction, and the visibility contract already speaks for components that do not exist yet.</text>
+    <text x="120" y="1126" class="small">Where the compatibility claim sits: of the five CHASM components Temporal ships at v1.31.0 — activity, callback, nexusoperation, scheduler,</text>
+    <text x="120" y="1146" class="small">workflow — Tokeira answers standalone activities. A registered component is Tokeira-native surface with no upstream counterpart, so it adds</text>
+    <text x="120" y="1166" class="small">no public RPC and sits outside that claim. The substrate was archetype-neutral by construction; registration is what made it reachable.</text>
   </g>
 
   <g transform="translate(1908,1292)" stroke="#B85C38" stroke-width="2.2" stroke-linecap="round" opacity=".8">

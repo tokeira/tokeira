@@ -858,10 +858,16 @@ test with `proptest`, ≥100 cases, tagged `// Feature: chasm-extension-archetyp
   - _Requirements: 10.2, 10.4_
   - PARTIAL: `chasm-activity-timeouts-and-retry` task 4.3 is ticked with a DONE record naming
     `OutboxRebuildScanner` as the recovery scan that satisfies its Requirement 9, generalized
-    to every registered archetype. The second half cannot be done: no
-    `.kiro/specs/v132-standalone-activities` exists in the repository, on `main` or on any
-    branch, so there is nothing to add the callback reference to. This task stays open until
-    that spec exists or the owner drops the reference.
+    to every registered archetype. The second half is a **cross-branch amendment that is still
+    owed**: `.kiro/specs/v132-standalone-activities` is not on `main`, but it exists on the
+    compatibility branch as a placeholder whose full `requirements.md`, `design.md` and
+    `tasks.md` are not yet authored. Its scope is broader than callbacks — standalone
+    activities on by default, start delay, paused status, the operator RPCs, activity batch
+    operations — and it inherits the callback capability rather than needing to build it.
+    The line it should carry: standalone-activity completion callbacks are already
+    implemented behind a default-off gate by this spec's Requirement 5. The amendment belongs
+    on the branch that owns the placeholder, not duplicated onto `main`, and this task stays
+    open until it lands there.
 
 ### Stage 16 — Conformance rerun and finish
 

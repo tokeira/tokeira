@@ -24,12 +24,12 @@ use http::{HeaderMap, HeaderValue};
 use prost::Message as _;
 use temporalio_client::{Connection, ConnectionOptions};
 use tokeira_config::{
-    EmbeddedDsqlLimits, EmbeddedEngineConfig, EmbeddedStorageConfig, ManagedClusterIntent,
-    ManagedEmbeddedDsqlConfig,
+    DsqlMigrationPolicy, EmbeddedDsqlLimits, EmbeddedEngineConfig, EmbeddedStorageConfig,
+    ExistingEmbeddedDsqlConfig, ManagedClusterIntent, ManagedEmbeddedDsqlConfig,
 };
 use tokeira_engine::{
-    EmbeddedEngineStartError, EmbeddedStartupPhase, Engine, InProcessGrpcRequest, TemporalEndpoint,
-    TokeiraConfig,
+    EmbeddedEngineStartError, EmbeddedStartupPhase, Engine, InProcessGrpcRequest,
+    SchemaStartupOutcome, TemporalEndpoint, TokeiraConfig,
 };
 use tokeira_managed_dsql::{
     AdminDeadline, AwsDsqlControlPlane, ClusterDescriptorState, ClusterDescriptorStore,
@@ -195,10 +195,7 @@ async fn exercise_first_generation(
         .context("managed startup report must contain canonical cluster identity")?;
     ensure!(cluster.cluster_id == cluster_id);
     ensure!(cluster.cluster_arn == cluster_arn);
-    ensure!(
-        report.schema.is_some(),
-        "managed startup must apply the schema contract"
-    );
+    verify_chasm_schema_report(engine)?;
     ensure!(
         report.ownership.is_some(),
         "managed startup must acquire exclusive embedded ownership"
@@ -390,6 +387,7 @@ async fn exercise_restart_generation(
     first_fence: i64,
     network_workflow_id: &str,
 ) -> Result<()> {
+    verify_chasm_schema_report(engine)?;
     let restart_report = engine.startup_report();
     let restart_cluster = restart_report
         .cluster
@@ -446,12 +444,25 @@ async fn exercise_restart_generation(
     Ok(())
 }
 
+fn verify_chasm_schema_report(engine: &Engine) -> Result<()> {
+    let schema = engine
+        .startup_report()
+        .schema
+        .as_ref()
+        .context("DSQL startup must report its schema contract")?;
+    ensure!(schema.observed_version == 71);
+    ensure!(schema.target_version == 71);
+    ensure!(schema.maximum_readable_version == 71);
+    Ok(())
+}
+
 async fn exercise_ready_cluster(
     region: &str,
     descriptor_path: PathBuf,
     tags: BTreeMap<String, String>,
     cluster_id: &str,
     cluster_arn: &str,
+    endpoint: &str,
 ) -> Result<()> {
     // Occupied configured listeners prove embedded transport remains callback-only.
     let occupied_grpc = TcpListener::bind("127.0.0.1:0")?;
@@ -464,6 +475,20 @@ async fn exercise_ready_cluster(
         &occupied_grpc,
         &occupied_metrics,
         &occupied_nexus,
+    );
+    ensure!(
+        !config
+            .server
+            .policy
+            .compatibility
+            .enable_standalone_activities
+    );
+    ensure!(
+        !config
+            .server
+            .policy
+            .compatibility
+            .enable_standalone_activity_callbacks
     );
 
     let engine = Engine::start_with_embedded_config(config.clone()).await?;
@@ -484,7 +509,7 @@ async fn exercise_ready_cluster(
         .expect_err("the old embedded endpoint must remain closed after ownership release");
     ensure!(old_status.code() == tonic::Code::Unavailable);
 
-    let restarted = Engine::start_with_embedded_config(config).await?;
+    let restarted = Engine::start_with_embedded_config(config.clone()).await?;
     let restart_result = exercise_restart_generation(
         &restarted,
         cluster_id,
@@ -496,7 +521,43 @@ async fn exercise_ready_cluster(
     )
     .await;
     let restart_shutdown = restarted.shutdown().await;
-    combine_generation_result(restart_result, restart_shutdown, "restarted")
+    combine_generation_result(restart_result, restart_shutdown, "restarted")?;
+
+    // Existing-cluster validate-only admission must accept the same V071 schema
+    // that managed automatic startup installed, with both activity gates still off.
+    let existing_config = EmbeddedEngineConfig {
+        storage: EmbeddedStorageConfig::ExistingDsql(ExistingEmbeddedDsqlConfig {
+            region: region.to_owned(),
+            cluster_id: cluster_id.to_owned(),
+            cluster_arn: cluster_arn.to_owned(),
+            endpoint: endpoint.to_owned(),
+            migration_policy: DsqlMigrationPolicy::ValidateOnly,
+            limits: EmbeddedDsqlLimits::default(),
+        }),
+        ..config
+    };
+    let existing = Engine::start_with_embedded_config(existing_config).await?;
+    let existing_result = async {
+        verify_chasm_schema_report(&existing)?;
+        ensure!(
+            existing
+                .startup_report()
+                .schema
+                .as_ref()
+                .is_some_and(|schema| { schema.outcome == SchemaStartupOutcome::Compatible })
+        );
+        let _: tokeira_proto::workflowservice::GetSystemInfoResponse = call(
+            &existing.endpoint(),
+            "GetSystemInfo",
+            HeaderMap::new(),
+            GetSystemInfoRequest::default(),
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    let existing_shutdown = existing.shutdown().await;
+    combine_generation_result(existing_result, existing_shutdown, "existing validate-only")
 }
 
 async fn destroy_ready_cluster(
@@ -687,7 +748,15 @@ async fn managed_embedded_dsql_live_lifecycle() -> Result<()> {
     complete_ready_cluster(
         async {
             ready_validation?;
-            exercise_ready_cluster(&region, descriptor_path, tags, cluster_id, cluster_arn).await
+            exercise_ready_cluster(
+                &region,
+                descriptor_path,
+                tags,
+                cluster_id,
+                cluster_arn,
+                endpoint,
+            )
+            .await
         },
         move || destroy_ready_cluster(control, store, teardown_cluster_id, teardown_cluster_arn),
     )

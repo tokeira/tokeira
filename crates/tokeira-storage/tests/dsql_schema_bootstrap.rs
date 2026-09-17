@@ -1,11 +1,11 @@
 #![cfg(feature = "dsql-integration")]
 
-//! Opt-in real-DSQL recovery from the observed token-zero bootstrap state.
+//! Opt-in real-DSQL bootstrap recovery and the V068-to-V071 CHASM upgrade.
 //!
 //! The test never resets a database. It mutates only an explicitly acknowledged
-//! database whose current schema contains no relations, seeds the exact metadata left
-//! by the failed startup, and requires a new disposable database after an interrupted
-//! run rather than performing automated destructive cleanup.
+//! empty database or a disposable database at exactly V068. The bootstrap case seeds
+//! the exact metadata left by the failed startup. Neither case performs destructive
+//! cleanup or downgrades a database after an interrupted run.
 
 use std::time::{Duration as StdDuration, Instant};
 
@@ -108,6 +108,7 @@ async fn token_zero_empty_ledger_state_converges_through_the_embedded_target() -
     release?;
 
     verify_target_boundary(&mut connection, &migration_plan).await?;
+    verify_chasm_startup_tables(&mut connection).await?;
     assert_eq!(
         runner
             .assess_connection(
@@ -121,6 +122,100 @@ async fn token_zero_empty_ledger_state_converges_through_the_embedded_target() -
             legacy_backfill: false,
         }
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "migrates an explicitly acknowledged disposable V068 DSQL database; set TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_DATABASE_URL and TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_ACK"]
+async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
+    let database_url = std::env::var("TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_DATABASE_URL").context(
+        "TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_DATABASE_URL must name a disposable V068 database",
+    )?;
+    ensure!(
+        std::env::var("TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_ACK").as_deref()
+            == Ok("MIGRATE_DISPOSABLE_V068_DATABASE"),
+        "TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_ACK must equal MIGRATE_DISPOSABLE_V068_DATABASE"
+    );
+    let cluster = ControlLeaseClusterIdentity {
+        cluster_id: std::env::var("TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_CLUSTER_ID")
+            .context("TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_CLUSTER_ID must identify the fixture")?,
+        cluster_arn: std::env::var("TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_CLUSTER_ARN")
+            .context("TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_CLUSTER_ARN must identify the fixture")?,
+    };
+    let mut connection = PgConnection::connect(&database_url).await?;
+    let runner = MigrationRunner::embedded();
+    let contract = MigrationRunner::compatibility_contract();
+    assert_eq!(contract.target_version, 71);
+    // Inspect before any mutation: this fixture must exercise the released V068
+    // boundary, not silently pass against a database already upgraded to V071.
+    assert_eq!(
+        runner
+            .assess_connection(
+                &mut connection,
+                &contract,
+                SchemaMigrationPolicy::ValidateOnly
+            )
+            .await?,
+        SchemaDecision::MigrationRequired {
+            current: 68,
+            target: 71
+        },
+    );
+    let decision = runner
+        .assess_connection(&mut connection, &contract, SchemaMigrationPolicy::Automatic)
+        .await?;
+    assert_eq!(decision, SchemaDecision::Migrate { from: 68, to: 71 });
+    runner
+        .bootstrap_migration_coordination(&mut connection, &decision)
+        .await?;
+    let leases = ConnectionControlLeaseRepository::new();
+    let mut guard = leases
+        .acquire(
+            &mut connection,
+            &ControlLeaseAcquireRequest {
+                claim_name: "schema-migration".to_owned(),
+                cluster,
+                owner_id: format!("schema-upgrade-{}", uuid::Uuid::new_v4()),
+                lease_duration: Duration::minutes(5),
+                admission_margin: Duration::seconds(20),
+                acquire_deadline: Instant::now() + StdDuration::from_secs(30),
+            },
+        )
+        .await?;
+    let gate = OwnershipAdmissionGate::for_guard(&guard);
+    let application = runner
+        .apply_decision(&mut connection, &decision, &leases, &mut guard, &gate)
+        .await;
+    let release = leases.release(&mut connection, &guard, &gate).await;
+    assert_eq!(application?.applied, 3);
+    release?;
+    verify_target_boundary(&mut connection, &runner.dry_run()?).await?;
+    verify_chasm_startup_tables(&mut connection).await?;
+    assert_eq!(
+        runner
+            .assess_connection(
+                &mut connection,
+                &contract,
+                SchemaMigrationPolicy::ValidateOnly
+            )
+            .await?,
+        SchemaDecision::Compatible {
+            current: 71,
+            legacy_backfill: false
+        },
+    );
+    Ok(())
+}
+
+async fn verify_chasm_startup_tables(connection: &mut PgConnection) -> Result<()> {
+    // A valid ledger alone missed the defect: default-gate startup reads these
+    // relations before it can serve anything, even when no activities exist.
+    sqlx::query("SELECT archetype_id FROM chasm_current_execution LIMIT 1")
+        .fetch_optional(&mut *connection)
+        .await?;
+    sqlx::query("SELECT marker_name FROM chasm_backfill_marker LIMIT 1")
+        .fetch_optional(&mut *connection)
+        .await?;
     Ok(())
 }
 

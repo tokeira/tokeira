@@ -6,6 +6,22 @@ AWS accepts `CreateCluster`, recovers with the durable client token, starts the 
 embedded engine, serves an in-process Temporal request, shuts down cleanly, and then
 explicitly disables deletion protection and destroys the cluster.
 
+The CHASM schema-contract correction advances the release target, readable maximum,
+and immutable lock through V071. Migration SQL and the V001–V068 identities are
+unchanged. Default-gate startup still reads `chasm_backfill_marker` and
+`chasm_current_execution`, so the contract must include these tables even when
+standalone activities and callbacks are disabled. An older contract could validate its
+own V068 digest, initialize only through V068, then fail during CHASM construction;
+an already-migrated V071 database was rejected as a future schema.
+
+The default test suite now checks initialization, V068–V070 upgrade decisions,
+validate-only refusal below V071, and V071 admission. The live lifecycle test below
+asserts V071 after managed startup and restart, then starts the same cluster through
+`ExistingDsql` with `ValidateOnly`, with both activity gates off. The storage bootstrap
+regression also queries both CHASM tables after migration, rather than accepting the
+ledger alone as evidence. These live paths require a separate authorized execution;
+compile success does not establish live DSQL startup.
+
 Do not run it against an account or Region where creating and deleting a cluster is not
 authorized. Aurora DSQL meters compute, reads, writes, and storage; see AWS's current
 [billing description](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/billing-metering.html).
@@ -175,3 +191,32 @@ retain the descriptor as recovery evidence and use a new protected path for late
 The live test deliberately performs no `tkr` or `tkp` operation. Cluster lifecycle
 authority remains an explicit library-level test boundary, separate from the embedded
 engine's normal drop and shutdown paths.
+
+## V068 upgrade regression
+
+`v68_upgrade_installs_chasm_tables_and_accepts_v71` in
+`crates/tokeira-storage/tests/dsql_schema_bootstrap.rs` exercises the real fenced
+migration runner on a **separate disposable database already initialized through
+V068**. Prepare it with the preceding release; do not downgrade an existing V071
+database or use the preserved bootstrap fixture above. Stop other engines using the
+disposable database before the test. The test refuses any starting ledger other than
+V068 before mutation, applies exactly three migrations, checks both CHASM tables and
+the complete ledger/digest, and verifies validate-only admission at V071.
+
+Set `TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_DATABASE_URL` privately using fresh IAM
+authentication, and supply the fixture's canonical identity through
+`TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_CLUSTER_ID` and
+`TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_CLUSTER_ARN`. The identity must match any existing
+schema-migration claim; the test never substitutes a synthetic identity for a released
+claim. With explicit authorization to upgrade that disposable database, run:
+
+```bash
+TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_ACK=MIGRATE_DISPOSABLE_V068_DATABASE \
+cargo nextest run -p tokeira-storage --test dsql_schema_bootstrap --locked \
+  --features dsql-integration --run-ignored only \
+  -E 'test(=v68_upgrade_installs_chasm_tables_and_accepts_v71)'
+```
+
+This test leaves the database at V071 and performs no destructive cleanup. Use a new
+disposable V068 fixture for another run. Its evidence complements the full engine
+lifecycle test; it does not by itself exercise engine construction.

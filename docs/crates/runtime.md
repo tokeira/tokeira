@@ -15,7 +15,7 @@ result under a fence, and only then publishes derived effects.
 | Area | Representative contracts |
 |---|---|
 | Workflow lanes | `TokeiraRuntime`, lane executors, run actors, mailbox coalescing, bounded OCC retry |
-| CHASM | `ChasmEngine`, `TypedEngine`, timer sweeper, repair scanners, visibility adapter |
+| CHASM | `ChasmEngine`, `TypedEngine`, `DispatchMultiplexer`, `ChasmTimerSweeper`, `OutboxRebuildScanner`, repair scanners, visibility adapter |
 | Delivery | `InMemoryBroker`, `InMemoryActivityBroker`, durable backlog and drain paths, dispatch publisher |
 | Scheduling | Native schedule store and engine, overlap policies, backfill, cron and next-time evaluation |
 | Time | Workflow, workflow-task, activity, heartbeat, timer, Nexus, callback, and speculative-timer scanners |
@@ -33,6 +33,29 @@ the parallel `ChasmEngine` and `ChasmNodeRepository` CAS-fenced node batch.
 Only a successful commit can publish broker work, timers, visibility, or other
 side effects. Queues are disposable; the authoritative transition log and
 durable backlog provide recovery.
+
+## CHASM side effects
+
+A committed transition stages tasks in the node itself; dispatching them is a
+derived effect that runs afterwards, never as part of the decision.
+
+`DispatchMultiplexer` routes a staged side-effect task to the `SideEffectExecutor`
+registered for its task type. Registration is late-bound, so bootstrap can build
+the multiplexer, then the engine, then register every executor before anything is
+served. Executors hold a weak engine handle — a stopped engine is a logged no-op —
+and an unknown task type simply stays in the durable outbox for the next pass.
+
+`ChasmEngine::apply_side_effect_outcome` is the primitive an executor calls with a
+result. It applies the outcome only while the exact side-effect task is still
+held, and commits the component bytes and the task's removal under one fence, so a
+duplicate or late delivery is inert. It reports `Applied`, `NotHeld` when the task
+has already gone, or `ExecutionMissing`. A conflict reloads and reruns the pure
+handler within the configured bound; a handler error persists nothing.
+
+`OutboxRebuildScanner` re-derives pending effects from committed state — at start
+and on a sweep thereafter — so an effect lost to a restart comes back without
+operator action. `ChasmTimerSweeper` does the same for armed timers, evaluating
+due deadlines from durable state through the engine's configured clock.
 
 ## Delivery and schedules
 

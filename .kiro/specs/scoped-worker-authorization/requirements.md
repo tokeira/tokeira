@@ -542,6 +542,25 @@ gate, so that a fast path cannot bypass queue/version enforcement.
 8. THE scoped authorization decision SHALL be structurally shared across normal and fast paths
    rather than duplicated as best-effort handler checks.
 
+#### Sanctioned exception to criterion 10.4
+
+Criterion 10.4 stands unchanged: a scoped identity is never served an *unversioned*
+standalone activity. It is not a bar on serving a scoped worker at all. Criteria 7.5 to
+7.10 of [`chasm-extension-archetypes`](../chasm-extension-archetypes/requirements.md)
+define the versioned path that is now served, and they are the closure of this one:
+
+- A standalone task whose target equals the polling worker's version is served to it
+  (7.5), and scoped admission still completes before the bridge is consulted (7.4).
+- A task carrying no target is still withheld from a scoped worker (7.6), which is
+  criterion 10.4 restated at the bridge.
+- A task whose target differs from the worker's version is withheld (7.7), and a queue
+  holding only targeted tasks serves nothing to an unscoped worker (7.8).
+- The task token carries the target (7.9), so a completion, failure, cancellation or
+  heartbeat arriving from a different version is refused (7.10).
+
+The exception is therefore narrow: exact-release routing is added, and nothing that
+criterion 10.4 refuses becomes servable.
+
 ### Requirement 11: Compatibility, errors, observability, and documentation
 
 **User Story:** As an operator, I want this security extension to be explicit and diagnosable

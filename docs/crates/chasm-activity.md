@@ -20,8 +20,39 @@ edge translates Activity Execution RPCs through its activity bridge.
 | `validator` | `ActivityRequest`, timeout normalization and request validation |
 | `backoff` and `retry` | Exponential interval calculation and `RetryOutcome` |
 | `timeouts` | Due timeout and next deadline derived from durable state |
-| `tasks` | Dispatch side effect plus heartbeat, schedule-to-close, schedule-to-start, and start-to-close timers |
+| `tasks` | Dispatch side effect plus heartbeat, schedule-to-close, schedule-to-start, and start-to-close timers; the callback delivery task and its retry timer |
+| `callbacks` | `CallbackSpec`, `CallbackTarget`, `CallbackAttemptOutcome`, delivery-failure classification |
 | `config` | `ActivityConfig` constants used by the archetype |
+
+## Completion callbacks
+
+An activity may carry callbacks attached at start, delivered when it closes.
+State lives in the activity root itself rather than in a separate component
+(`ActivityCallback`, in attach order, state values 0–5 matching
+`chasm/lib/callback/proto/v1/message.proto @ v1.32.0`). A target is either
+`Internal` — another component in the same engine, applied in process — or
+`Nexus`, delivered over HTTP by an edge executor.
+
+Two rules are worth stating on their own.
+
+- **Delivery does not change the outcome.** Status and close time are the
+  activity's public result and are settled independently of whether a callback
+  has been delivered.
+- **A terminal activity stays Running until its callbacks settle.**
+  `lifecycle_of` reports `Running` while any callback is unsettled, so the
+  Running-execution rebuild scan keeps finding the activity and can re-deliver
+  after a restart. Without callbacks it is exactly `lifecycle_for`.
+
+Callbacks are gated: `ActivityConfig::enable_callbacks` is off by default,
+matching upstream's `activity.enableCallbacks` at `v1.32.0`. Attachment is
+bounded by `max_callbacks_per_execution`, default 2000.
+
+## Version target
+
+A request may name an exact worker release. The target rides the staged dispatch
+as `DeploymentVersionTarget` (deployment name and build id) and reaches the edge,
+where it becomes the routing key a poller must match. The library itself only
+carries and validates it; admission belongs to the edge.
 
 ## Contracts
 

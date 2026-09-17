@@ -44,7 +44,13 @@ via the operator-invoked live corpus (Stage 7).
   precedence; validate-then-drop. _Req 1, 2, 3_
 - [ ] 4.2 `ChasmTimerSweeper` (`tokeira-runtime`): interval tick (+ optional engine `Notify`), read
   armed due entries, call `evaluate_timeouts`, release due delayed dispatches; injectable clock. _Req 1_
-- [ ] 4.3 Recovery scan: re-derive armed deadlines from node state so a lost entry self-heals. _Req 9_
+- [x] 4.3 Recovery scan: re-derive armed deadlines from node state so a lost entry self-heals. _Req 9_
+  - DONE: delivered by `chasm-extension-archetypes`, which needed the same scan for every
+    registered archetype rather than for activities alone. `OutboxRebuildScanner`
+    (`tokeira-runtime`, `src/chasm/rebuild.rs`) pages the Running current-execution
+    pointers, loads each root node and re-derives both pending side effects and armed
+    deadlines from committed state, at start and on the sweep thereafter. A deadline lost
+    to a restart is re-armed without operator action, which is what Req 9 asked for.
 - [ ] 4.4 Unit-test each timeout type + precedence with an injected clock. _Req 2, 3_
 
 ### Stage 5 — Heartbeat timer reset (`tokeira-chasm-activity` + `tokeira-edge`)

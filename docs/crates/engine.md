@@ -38,6 +38,35 @@ semantics.
 | `EngineStartupReport` | Redacted storage, cluster, schema, and ownership admission evidence |
 | `TokeiradHandle` | Listener-backed in-memory server handle used by integration hosts |
 | `run_from_cli` | Production daemon bootstrap from the shared CLI/config contracts |
+| `Engine::builder` / `EngineBuilder` | CHASM extension registration: `library`, `side_effect_executor`, `clock`, `build` |
+| `Engine::chasm::<C>` | Typed handle on a registered root component |
+| `tokeira_engine::chasm` | Re-exports an extension library needs, so it takes no direct dependency on the internal crates |
+
+## Registering a CHASM component
+
+Behind the `chasm-extensions` feature, a host can register its own durable
+component rather than only using the ones the engine ships. The surface is
+deliberately small and explicitly unstable — it carries no semver promise.
+
+`Engine::builder(config)` takes libraries, side-effect executors and an optional
+clock, then `build()` starts the ordinary service stack. Everything is decided
+before admission opens: built-in registration is sealed first, so an extension
+cannot replace a built-in name or identity; a colliding component or task
+identity fails the build; a duplicate executor task type fails the build; and
+storage holding unknown archetypes, incompatible attribute declarations or
+unserviceable outboxes is refused rather than served. Executors all register
+before persisted effects are rebuilt.
+
+`Engine::chasm::<C>()` then returns a typed handle on a registered root
+component, in the same process as the caller — no client, no workflow start, and
+no queue between the caller and the decision.
+
+`EngineBuilder::clock` sets the CHASM plane's nanosecond time source. It is the
+plane's definitive clock: transitions, pure deadlines, delayed dispatch, callback
+registration and sweeper passes all read it, which is what makes a simulated
+clock usable in tests. Workflow time is unchanged, and two real-time uses are
+sanctioned and named in the spec — a component long poll's transport deadline,
+and the task-token provenance lifetime that storage enforces on real time.
 
 ## Contracts
 

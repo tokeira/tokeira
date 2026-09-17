@@ -1,5 +1,0 @@
-kind: added
-body: Standalone activities deliver completion callbacks over Nexus or into a staging component; versioned standalone tasks go only to scoped workers of the matching release.
-time: 2026-09-16T15:32:57.708408+01:00
-custom:
-    Slice: a81ec568-751c-479a-8041-6e08cda36f70

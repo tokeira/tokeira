@@ -1,5 +1,0 @@
-kind: added
-body: Embedders build the engine with extension CHASM libraries, executors and a clock behind the chasm-extensions feature; a config key gates standalone-activity callbacks.
-time: 2026-09-16T17:07:33.463495+01:00
-custom:
-    Slice: 69cc5c6e-7283-46b5-9392-e01d4e21800c

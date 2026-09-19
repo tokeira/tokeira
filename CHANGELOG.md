@@ -2,6 +2,12 @@
 
 All notable user-facing changes to this project are documented here.
 
+## 0.4.1 on 2026-09-19
+
+### Added
+
+* tokeira_engine::chasm now carries the Component derive, every contract a library names, namespace_id_for, and TypedEngine::reference to resolve a run by business id.
+
 ## 0.4.0 on 2026-09-17
 
 ### Added

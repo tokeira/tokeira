@@ -60,23 +60,29 @@ pub fn task_type_id_for_fqn(fqn: &str) -> u32 {
 }
 
 /// Result of external work, applied by a pure outcome handler in a transition.
+/// The byte fields are opaque to the substrate; for the built-in standalone
+/// activity they are the Temporal API messages named on each variant, encoded as
+/// protobuf, and a library's own executor chooses its own encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskOutcome {
     /// Successful work with the executor's opaque result bytes.
     Completed {
-        /// Result in the executor's wire format.
+        /// Result in the executor's wire format; an activity result is an encoded
+        /// `temporal.api.common.v1.Payloads`.
         payload: Vec<u8>,
     },
     /// Failed work and the executor's retry classification.
     Failed {
-        /// Encoded failure, interpreted by the component.
+        /// Encoded failure, interpreted by the component; an activity failure is
+        /// an encoded `temporal.api.failure.v1.Failure`.
         failure: Vec<u8>,
         /// Whether retrying the external work may succeed.
         retryable: bool,
     },
     /// Canceled work with optional executor-specific detail bytes.
     Canceled {
-        /// Encoded cancellation details.
+        /// Encoded cancellation details; an activity's are the worker's encoded
+        /// `temporal.api.common.v1.Payloads`.
         details: Vec<u8>,
     },
     /// Work exceeded the named Temporal timeout category.
@@ -115,13 +121,14 @@ pub struct StartActivityTask {
     /// Queue receiving the activity attempt.
     #[prost(string, tag = "3")]
     pub task_queue: String,
-    /// Encoded Temporal input payloads.
+    /// Encoded `temporal.api.common.v1.Payloads`: the worker's activity input.
     #[prost(bytes = "vec", tag = "4")]
     pub input: Vec<u8>,
-    /// Encoded Temporal header.
+    /// Encoded `temporal.api.common.v1.Header`, handed to the worker unchanged.
     #[prost(bytes = "vec", tag = "5")]
     pub header: Vec<u8>,
-    /// Encoded Temporal retry policy.
+    /// Encoded `temporal.api.common.v1.RetryPolicy`; empty selects the engine's
+    /// defaults.
     #[prost(bytes = "vec", tag = "6")]
     pub retry_policy: Vec<u8>,
     /// Schedule-to-start timeout in nanoseconds.

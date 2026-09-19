@@ -35,6 +35,10 @@ associated type, fully qualified name, and static `FieldRegistry`.
   never silently omitted from persistence.
 - `#[chasm(fqn = "...")]` supplies the component's stable fully qualified
   name.
+- `#[chasm(crate = "...")]` names the path the generated impl reaches the
+  substrate through; the default is `::tokeira_chasm`. A crate that depends on
+  `tokeira-engine` alone writes `crate = "::tokeira_engine::chasm"`, the
+  re-export module the engine publishes for extension libraries.
 - The macro does not generate lifecycle behaviour. The author implements
   `Lifecycle`, and the `Component: Lifecycle` bound makes omission a compile
   error.

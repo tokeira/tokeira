@@ -1,0 +1,5 @@
+error: #[chasm(crate = "...")] must name the path the substrate is reachable at, e.g. "::tokeira_engine::chasm": unexpected token
+  --> tests/ui/bad_crate_path.rs:11:41
+   |
+11 | #[chasm(fqn = "test.bad_crate", crate = "not a path")]
+   |                                         ^^^^^^^^^^^^

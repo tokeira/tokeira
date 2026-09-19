@@ -48,6 +48,33 @@ where
         }
     }
 
+    /// `C`'s archetype id, which registration fixed at engine build; an
+    /// unregistered `C` is a wiring defect, not a caller error.
+    fn archetype_id(&self) -> Result<u32, ChasmError> {
+        self.engine.registry().archetype_id(C::FQN).ok_or_else(|| {
+            ChasmError::Internal(format!("archetype `{}` is not registered", C::FQN))
+        })
+    }
+
+    /// Resolve the current run for a business id into a root reference, so a caller
+    /// that did not perform the start — or restarted since — can reach the
+    /// execution again. Reads the authoritative current-run pointer, never the
+    /// visibility projection. The current run may already be closed: the pointer
+    /// follows the latest run for the id whatever its lifecycle, so read the state
+    /// before assuming a live one. `None` when no run was ever started for the id
+    /// under `C`'s archetype, or the current run was deleted. `namespace_id` is the
+    /// string an [`ExecutionKey`] carries.
+    pub async fn reference(
+        &self,
+        namespace_id: &str,
+        business_id: &str,
+    ) -> Result<Option<ComponentRef>, ChasmError> {
+        let archetype_id = self.archetype_id()?;
+        self.engine
+            .current_reference(namespace_id, archetype_id, business_id)
+            .await
+    }
+
     /// Start a new execution rooted at a `C` carrying `data` (Requirement 6.1).
     pub async fn start(
         &self,
@@ -56,9 +83,7 @@ where
         request_id: Option<String>,
         policy: BusinessIdPolicy,
     ) -> Result<StartOutcome, ChasmError> {
-        let archetype_id = self.engine.registry().archetype_id(C::FQN).ok_or_else(|| {
-            ChasmError::Internal(format!("archetype `{}` is not registered", C::FQN))
-        })?;
+        let archetype_id = self.archetype_id()?;
         // Capture the creating transition's visibility snapshot from the initial
         // component before encoding, so a started-but-not-yet-updated execution is
         // still listable (Requirement 10.2).
@@ -91,9 +116,7 @@ where
         policy: BusinessIdPolicy,
         mut initialize: impl FnMut(&mut C, &mut dyn MutableContext) -> Result<(), ChasmError> + Send,
     ) -> Result<StartOutcome, ChasmError> {
-        let archetype_id = self.engine.registry().archetype_id(C::FQN).ok_or_else(|| {
-            ChasmError::Internal(format!("archetype `{}` is not registered", C::FQN))
-        })?;
+        let archetype_id = self.archetype_id()?;
         let request = StartRequest {
             key,
             archetype_id,
@@ -199,9 +222,7 @@ where
             Ok(_) | Err(ChasmError::BusinessIdConflict(_)) => {}
             Err(other) => return Err(other),
         }
-        let archetype_id = self.engine.registry().archetype_id(C::FQN).ok_or_else(|| {
-            ChasmError::Internal(format!("archetype `{}` is not registered", C::FQN))
-        })?;
+        let archetype_id = self.archetype_id()?;
         // `update` reads the live state by execution key; the VT fields of this
         // reference are placeholders it does not consult.
         let reference = ComponentRef::new(
@@ -872,6 +893,103 @@ mod tests {
         fx.engine.delete_execution(&key()).await.unwrap();
         let err = fx.engine.read_component(&key()).await.unwrap_err();
         assert!(matches!(err, ChasmError::ExecutionNotFound));
+    }
+
+    #[tokio::test]
+    async fn reference_resolves_the_current_run_from_the_pointer() {
+        let fx = fixture();
+        let typed = TypedEngine::<Counter>::new(fx.engine.clone());
+        assert_eq!(typed.reference("ns", "counter-1").await.unwrap(), None);
+
+        let started = typed
+            .start(
+                key(),
+                CounterData::default(),
+                Some("req-1".to_owned()),
+                BusinessIdPolicy::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            typed.reference("ns", "counter-1").await.unwrap(),
+            Some(started.reference.clone())
+        );
+
+        // A later commit moves the resolved reference with the execution clock, so
+        // the one minted at start reads as stale against it.
+        let (_, updated) = typed
+            .update(&started.reference, |c, _ctx| {
+                c.data.counter += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let resolved = typed
+            .reference("ns", "counter-1")
+            .await
+            .unwrap()
+            .expect("current run");
+        assert_eq!(resolved, updated.reference);
+        assert!(
+            started
+                .reference
+                .is_stale(&resolved.execution_versioned_transition)
+        );
+
+        // Another id, or the same id under another archetype, resolves nothing.
+        assert_eq!(typed.reference("ns", "counter-2").await.unwrap(), None);
+        assert_eq!(
+            fx.engine
+                .current_reference("ns", 999, "counter-1")
+                .await
+                .unwrap(),
+            None
+        );
+
+        fx.engine.delete_execution(&key()).await.unwrap();
+        assert_eq!(typed.reference("ns", "counter-1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn reference_follows_a_superseding_run() {
+        let fx = fixture();
+        let typed = TypedEngine::<Counter>::new(fx.engine.clone());
+        let first = typed
+            .start_with(
+                key(),
+                CounterData::default(),
+                None,
+                BusinessIdPolicy::default(),
+                |c, _ctx| {
+                    c.data.done = true;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            typed.reference("ns", "counter-1").await.unwrap(),
+            Some(first.reference)
+        );
+
+        // The closed run stays current until a new start supersedes it.
+        let second = typed
+            .start(
+                ExecutionKey::new("ns", "counter-1", "run-2"),
+                CounterData::default(),
+                None,
+                BusinessIdPolicy::default(),
+            )
+            .await
+            .unwrap();
+        assert!(second.created);
+        let resolved = typed
+            .reference("ns", "counter-1")
+            .await
+            .unwrap()
+            .expect("superseding run");
+        assert_eq!(resolved.execution_key.run_id, "run-2");
+        assert_eq!(resolved, second.reference);
     }
 
     #[tokio::test]

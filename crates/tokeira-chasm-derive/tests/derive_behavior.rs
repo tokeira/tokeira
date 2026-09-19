@@ -82,6 +82,31 @@ where
     }
 }
 
+/// The shape an embedder sees: the substrate reachable only through a re-export
+/// module, never as `::tokeira_chasm` itself. `#[chasm(crate = "...")]` roots every
+/// generated path there.
+mod reexport {
+    pub(crate) use tokeira_chasm::{Component, FieldDescriptor, FieldKind, FieldRegistry};
+}
+
+// Field values are never read here: the derive classifies fields by type at
+// expansion time, and these tests assert the generated registry metadata only.
+#[allow(dead_code)]
+#[derive(Component)]
+#[chasm(fqn = "test.rerooted", crate = "self::reexport")]
+struct Rerooted {
+    #[chasm(data)]
+    state: Field<Payload>,
+    #[chasm(transient)]
+    scratch: u32,
+}
+
+impl tokeira_chasm::Lifecycle for Rerooted {
+    fn lifecycle_state(&self, _ctx: &dyn Context) -> LifecycleState {
+        LifecycleState::Running
+    }
+}
+
 fn minimal() -> Minimal {
     Minimal {
         state: Field::with_value(Payload::default()),
@@ -143,6 +168,27 @@ fn registry_exposes_exactly_one_data_field() {
         .expect("derive guarantees a data field");
     assert_eq!(data.name, "state");
     assert_eq!(minimal().fields().len(), 1);
+}
+
+#[test]
+fn crate_attribute_reroots_the_generated_impl() {
+    assert_eq!(Rerooted::FQN, "test.rerooted");
+    let component = Rerooted {
+        state: Field::with_value(Payload::default()),
+        scratch: 0,
+    };
+    let named: Vec<(&str, FieldKind)> = component
+        .fields()
+        .iter()
+        .map(|descriptor| (descriptor.name, descriptor.kind))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("state", FieldKind::Data),
+            ("scratch", FieldKind::Transient)
+        ]
+    );
 }
 
 #[test]

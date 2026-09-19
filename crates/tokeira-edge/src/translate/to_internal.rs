@@ -33,6 +33,11 @@ pub struct PollInternalRequest {
     pub timeout: std::time::Duration,
 }
 
+/// The namespace id every namespace-scoped durable row and key is written under for
+/// a namespace name: a deterministic function of the name, assigned at registration
+/// and re-derived on every request, so the same name always addresses the same
+/// rows. It is the id an embedder needs to build an `ExecutionKey` or a visibility
+/// handle for a namespace it reaches by name.
 pub fn namespace_id_for(name: &str) -> NamespaceId {
     let mut bytes = *b"tokeira-edge-ns!";
     for (idx, byte) in name.as_bytes().iter().enumerate() {

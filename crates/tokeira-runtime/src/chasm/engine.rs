@@ -18,9 +18,9 @@ use std::{
 
 use async_trait::async_trait;
 use tokeira_chasm::{
-    BusinessIdConflictPolicy, BusinessIdReusePolicy, ChasmError, Context, DispatchableTask,
-    ExecutionInfo, ExecutionKey, LifecycleState, MutableContext, NodeTree, Registry,
-    RegistryOutboxValidator, ScheduledTask, Staleness, TaskId, TaskOutcome, TaskValidity,
+    BusinessIdConflictPolicy, BusinessIdReusePolicy, ChasmError, ComponentRef, Context,
+    DispatchableTask, ExecutionInfo, ExecutionKey, LifecycleState, MutableContext, NodeTree,
+    Registry, RegistryOutboxValidator, ScheduledTask, Staleness, TaskId, TaskOutcome, TaskValidity,
     TransitionResult, VersionedTransition, VisibilitySnapshot,
 };
 use tokeira_storage::{
@@ -408,6 +408,38 @@ impl ChasmEngine {
             .map_err(|e| ChasmError::Internal(format!("resolve current run: {e}")))
     }
 
+    /// Resolve the current run for `(namespace_id, archetype_id, business_id)` into
+    /// a root [`ComponentRef`]. The pointer names the run; the run's root supplies
+    /// the execution clock and its creation stamp, so the reference equals the one
+    /// the latest commit minted rather than carrying placeholder stamps. The current
+    /// run may already be closed — the pointer follows the latest run whatever its
+    /// lifecycle. `None` when no run is current for the id, or when the current
+    /// run's nodes are gone (a delete that landed after the pointer read; the store
+    /// removes both together). Authoritative: the node store, never the projection.
+    pub async fn current_reference(
+        &self,
+        namespace_id: &str,
+        archetype_id: u32,
+        business_id: &str,
+    ) -> Result<Option<ComponentRef>, ChasmError> {
+        let Some(current) = self
+            .current_run(namespace_id, archetype_id, business_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let key = ExecutionKey::new(namespace_id, business_id, current.run_id);
+        let (tree, _) = self.load_tree(&key).await?;
+        Ok(tree.node(ROOT_PATH).map(|root| {
+            self.root_ref(
+                &key,
+                root.metadata.component_type_id,
+                tree.execution_vt(),
+                root.metadata.initial_versioned_transition,
+            )
+        }))
+    }
+
     /// Apply an external outcome only while the exact side-effect task is held.
     /// Component bytes and removal commit under one fence, so duplicates and late
     /// deliveries are inert. Conflicts reload and rerun the pure handler up to the
@@ -769,14 +801,8 @@ impl ChasmEngine {
         archetype_id: u32,
         execution_vt: VersionedTransition,
         initial_vt: VersionedTransition,
-    ) -> tokeira_chasm::ComponentRef {
-        tokeira_chasm::ComponentRef::new(
-            key.clone(),
-            archetype_id,
-            execution_vt,
-            vec![],
-            initial_vt,
-        )
+    ) -> ComponentRef {
+        ComponentRef::new(key.clone(), archetype_id, execution_vt, vec![], initial_vt)
     }
 
     /// Read the root component's snapshot, or `None` if the execution does not

@@ -1,0 +1,5 @@
+kind: added
+body: tokeira_engine::chasm now carries the Component derive, every contract a library names, namespace_id_for, and TypedEngine::reference to resolve a run by business id.
+time: 2026-09-19T16:08:07.852665+01:00
+custom:
+    Slice: b945a374-4a2f-4785-bc89-f2fd85a596cc

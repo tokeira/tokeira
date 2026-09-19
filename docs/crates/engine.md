@@ -39,9 +39,9 @@ semantics.
 | `TokeiradHandle` | Listener-backed in-memory server handle used by integration hosts |
 | `run_from_cli` | Production daemon bootstrap from the shared CLI/config contracts |
 | `Engine::builder` / `EngineBuilder` | CHASM extension registration: `library`, `side_effect_executor`, `clock`, `build` |
-| `Engine::chasm::<C>` | Typed handle on a registered root component |
+| `Engine::chasm::<C>` | Typed handle on a registered root component: start, update, read, and `reference` by business id |
 | `Engine::chasm_visibility::<C>` | Read-only projected list/count for a registered root and namespace |
-| `tokeira_engine::chasm` | Re-exports an extension library needs, so it takes no direct dependency on the internal crates |
+| `tokeira_engine::chasm` | Everything an extension library names — the component and task contracts, the `Component` derive, `namespace_id_for` — so it depends on `tokeira-engine` alone |
 
 ## Registering a CHASM component
 
@@ -60,7 +60,30 @@ before persisted effects are rebuilt.
 
 `Engine::chasm::<C>()` then returns a typed handle on a registered root
 component, in the same process as the caller — no client, no workflow start, and
-no queue between the caller and the decision.
+no queue between the caller and the decision. `reference(namespace_id,
+business_id)` on that handle resolves the current run for a business id from the
+authoritative current-run pointer, so a caller that did not perform the start, or
+restarted since, reaches the execution again; the reference it returns is the one
+the latest commit minted. The current run may already be closed, and `None`
+means no run was started under that archetype or the current one was deleted.
+
+An extension library is written against `tokeira_engine::chasm` alone. The
+module re-exports the component contract and the bounds `Engine::chasm`
+requires, the field and metadata types, task authoring and the executor
+contract, the typed handle with its outcomes, the visibility query types, and
+`namespace_id_for`, which derives the `NamespaceId` every execution key and
+visibility handle for a namespace name carries. The `Component` derive is
+re-exported too; because its generated code names the substrate by absolute
+path, a library reaching it through the engine declares
+`#[chasm(fqn = "...", crate = "::tokeira_engine::chasm")]`. The module's
+rustdoc states the wire encodings on the activity boundary: a staged
+`StartActivityTask` carries protobuf-encoded `temporal.api.common.v1`
+`Payloads`, `Header` and `RetryPolicy`, and a `TaskOutcome` delivered for an
+activity carries `Payloads` or a `temporal.api.failure.v1.Failure`. The engine's
+own compile check (`tests/chasm_embedder.rs`) is the model: a root component
+derived through the re-export, its library, one pure task, one side-effect task
+with its executor, and the control-plane calls, with every internal crate
+shadowed so a direct import cannot slip in.
 
 `Engine::chasm_visibility::<C>(namespace_id)` returns a `ComponentVisibility`
 handle over the same projection store the running engine writes, in memory or

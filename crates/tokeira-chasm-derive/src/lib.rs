@@ -35,11 +35,16 @@
 //! author writes, by implementing the `Lifecycle` trait. Because `Component: Lifecycle`, a component
 //! that derives `Component` but forgets `Lifecycle` fails to compile — the requirement is a real
 //! bound, not a naming convention (see `tokeira_chasm::component` for the rationale).
+//!
+//! The generated impl names the substrate by absolute path, `::tokeira_chasm` by default. A crate
+//! that reaches the substrate only through a re-export — an embedder depending on `tokeira-engine`
+//! alone — names that root with `#[chasm(crate = "...")]`, the same escape hatch serde offers as
+//! `#[serde(crate = "...")]`; every generated path is then rooted there instead.
 
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    Data, DeriveInput, Field, Fields, GenericArgument, PathArguments, Type, parse_macro_input,
+    Data, DeriveInput, Field, Fields, GenericArgument, Path, PathArguments, Type, parse_macro_input,
 };
 
 /// Derives `tokeira_chasm::Component` for a named-field struct, generating its static field registry
@@ -47,7 +52,15 @@ use syn::{
 /// compile time (design HP1, Requirement 3).
 ///
 /// The `#[chasm(...)]` helper attribute carries the component's fully-qualified name
-/// (`#[chasm(fqn = "...")]`) and per-field markers (`#[chasm(data)]`, `#[chasm(transient)]`).
+/// (`#[chasm(fqn = "...")]`), optionally the path the generated impl reaches the substrate
+/// through (`#[chasm(crate = "...")]`, default `::tokeira_chasm`), and per-field markers
+/// (`#[chasm(data)]`, `#[chasm(transient)]`).
+///
+/// `crate` exists for a component written against a re-export of the substrate: the generated
+/// code names `Component`, `FieldRegistry`, `FieldDescriptor` and `FieldKind` under that path, so
+/// `#[chasm(crate = "::tokeira_engine::chasm")]` compiles in a crate whose only engine dependency
+/// is `tokeira-engine`. The path must resolve at the derive site; a leading `::` pins it to a
+/// crate root rather than a local module.
 ///
 /// A component that derives `Component` but never implements `Lifecycle` does not compile —
 /// the requirement is a real supertrait bound, not a naming convention. (Proven here as a
@@ -107,7 +120,7 @@ impl Kind {
 fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let ident = &input.ident;
 
-    let fqn = parse_container_fqn(input)?;
+    let ContainerAttrs { fqn, krate } = parse_container_attrs(input)?;
 
     let fields = named_fields(input)?;
 
@@ -203,30 +216,41 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let descriptor_tokens = descriptors.iter().map(|(name, kind)| {
         let variant = kind.variant();
         quote! {
-            ::tokeira_chasm::FieldDescriptor::new(
+            #krate::FieldDescriptor::new(
                 #name,
-                ::tokeira_chasm::FieldKind::#variant,
+                #krate::FieldKind::#variant,
             )
         }
     });
 
     Ok(quote! {
-        impl #impl_generics ::tokeira_chasm::Component for #ident #ty_generics #where_clause {
+        impl #impl_generics #krate::Component for #ident #ty_generics #where_clause {
             type Data = #data_ty;
             const FQN: &'static str = #fqn;
-            fn fields(&self) -> ::tokeira_chasm::FieldRegistry<'_> {
-                const FIELDS: &[::tokeira_chasm::FieldDescriptor] = &[
+            fn fields(&self) -> #krate::FieldRegistry<'_> {
+                const FIELDS: &[#krate::FieldDescriptor] = &[
                     #(#descriptor_tokens),*
                 ];
-                ::tokeira_chasm::FieldRegistry::new(FIELDS)
+                #krate::FieldRegistry::new(FIELDS)
             }
         }
     })
 }
 
-/// Read the required `#[chasm(fqn = "...")]` container attribute.
-fn parse_container_fqn(input: &DeriveInput) -> syn::Result<String> {
+/// The container-level `#[chasm(...)]` settings.
+struct ContainerAttrs {
+    /// The component's stable fully-qualified name.
+    fqn: String,
+    /// The path every generated substrate reference is rooted at.
+    krate: Path,
+}
+
+/// Read the container attributes: the required `#[chasm(fqn = "...")]` and the optional
+/// `#[chasm(crate = "...")]`, which defaults to the absolute `::tokeira_chasm` so a crate that
+/// depends on the substrate directly needs no attribute at all.
+fn parse_container_attrs(input: &DeriveInput) -> syn::Result<ContainerAttrs> {
     let mut fqn: Option<String> = None;
+    let mut krate: Option<Path> = None;
     for attr in &input.attrs {
         if !attr.path().is_ident("chasm") {
             continue;
@@ -237,17 +261,37 @@ fn parse_container_fqn(input: &DeriveInput) -> syn::Result<String> {
                 let lit: syn::LitStr = value.parse()?;
                 fqn = Some(lit.value());
                 Ok(())
+            } else if meta.path.is_ident("crate") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                // Re-parse the literal's contents as a path so a typo surfaces at the
+                // attribute, not as unresolved names inside the generated impl.
+                let path = lit.parse::<Path>().map_err(|error| {
+                    syn::Error::new(
+                        lit.span(),
+                        format!(
+                            "#[chasm(crate = \"...\")] must name the path the substrate is reachable at, e.g. \"::tokeira_engine::chasm\": {error}"
+                        ),
+                    )
+                })?;
+                krate = Some(path);
+                Ok(())
             } else {
-                Err(meta
-                    .error("unknown #[chasm(...)] container attribute; expected `fqn = \"...\"`"))
+                Err(meta.error(
+                    "unknown #[chasm(...)] container attribute; expected `fqn = \"...\"` or `crate = \"...\"`",
+                ))
             }
         })?;
     }
-    fqn.ok_or_else(|| {
+    let fqn = fqn.ok_or_else(|| {
         syn::Error::new_spanned(
             input,
             "#[derive(Component)] requires #[chasm(fqn = \"...\")] (the component's fully-qualified name)",
         )
+    })?;
+    Ok(ContainerAttrs {
+        fqn,
+        krate: krate.unwrap_or_else(|| syn::parse_quote!(::tokeira_chasm)),
     })
 }
 

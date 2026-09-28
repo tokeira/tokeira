@@ -13,7 +13,7 @@ anyhow = "1"
 # produced with; bumping any of these changes generated output and requires a
 # regen. `protox` compiles the vendored protos in pure Rust, so no `protoc` is
 # needed on the machine that regenerates.
-connectrpc-build = "0.6"
+connectrpc-build = "0.9"
 prost = "0.14"
 prost-types = "0.14"
 protox = "0.9"

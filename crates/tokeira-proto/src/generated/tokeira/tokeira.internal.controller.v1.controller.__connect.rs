@@ -61,7 +61,21 @@ for ::buffa::view::OwnedView<__buffa::view::ControllerDirectiveView<'static>> {
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
     }
 }
 impl ::connectrpc::Encodable<RoutingUpdate> for __buffa::view::RoutingUpdateView<'_> {
@@ -78,7 +92,21 @@ for ::buffa::view::OwnedView<__buffa::view::RoutingUpdateView<'static>> {
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
     }
 }
 impl ::connectrpc::Encodable<RefreshBundleResponse>
@@ -96,7 +124,21 @@ for ::buffa::view::OwnedView<__buffa::view::RefreshBundleResponseView<'static>> 
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
     }
 }
 impl ::connectrpc::Encodable<NominateResponse>
@@ -114,7 +156,21 @@ for ::buffa::view::OwnedView<__buffa::view::NominateResponseView<'static>> {
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
     }
 }
 impl ::connectrpc::Encodable<MarkDrainingResponse>
@@ -132,7 +188,21 @@ for ::buffa::view::OwnedView<__buffa::view::MarkDrainingResponseView<'static>> {
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
     }
 }
 impl ::connectrpc::Encodable<DescribeNodeDrainResponse>
@@ -150,60 +220,56 @@ for ::buffa::view::OwnedView<__buffa::view::DescribeNodeDrainResponseView<'stati
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
     }
 }
 /// Full service name for this service.
 pub const PLACEMENT_CONTROLLER_SERVICE_NAME: &str = "tokeira.internal.controller.v1.PlacementController";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `RuntimeMembership` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `RuntimeMembership` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const PLACEMENT_CONTROLLER_RUNTIME_MEMBERSHIP_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/tokeira.internal.controller.v1.PlacementController/RuntimeMembership",
         ::connectrpc::StreamType::BidiStream,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `SubscribeRouting` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `SubscribeRouting` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const PLACEMENT_CONTROLLER_SUBSCRIBE_ROUTING_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/tokeira.internal.controller.v1.PlacementController/SubscribeRouting",
         ::connectrpc::StreamType::ServerStream,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `RefreshBundle` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `RefreshBundle` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const PLACEMENT_CONTROLLER_REFRESH_BUNDLE_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/tokeira.internal.controller.v1.PlacementController/RefreshBundle",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `NominateScaleInCandidates` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `NominateScaleInCandidates` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const PLACEMENT_CONTROLLER_NOMINATE_SCALE_IN_CANDIDATES_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/tokeira.internal.controller.v1.PlacementController/NominateScaleInCandidates",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `MarkNodeDraining` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `MarkNodeDraining` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const PLACEMENT_CONTROLLER_MARK_NODE_DRAINING_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/tokeira.internal.controller.v1.PlacementController/MarkNodeDraining",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `DescribeNodeDrain` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `DescribeNodeDrain` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const PLACEMENT_CONTROLLER_DESCRIBE_NODE_DRAIN_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/tokeira.internal.controller.v1.PlacementController/DescribeNodeDrain",
         ::connectrpc::StreamType::Unary,
@@ -213,19 +279,32 @@ pub const PLACEMENT_CONTROLLER_DESCRIBE_NODE_DRAIN_SPEC: ::connectrpc::Spec = ::
 ///
 /// # Implementing handlers
 ///
-/// Handlers receive requests as `OwnedFooView` (an alias for
-/// `OwnedView<FooView<'static>>`), which gives zero-copy borrowed access
-/// to fields (e.g. `request.name` is a `&str` into the decoded buffer).
-/// The view can be held across `.await` points. When two RPC types in
-/// the same package would alias to the same `Owned<…>View` name (e.g.
-/// a local message plus an imported one with the same short name), the
-/// alias is suppressed for both and the request type is spelled as
-/// `OwnedView<…View<'static>>` directly in the trait signature.
-///
 /// Implement methods with plain `async fn`; the returned future satisfies
-/// the `Send` bound automatically. See the
-/// [buffa user guide](https://github.com/anthropics/buffa/blob/main/docs/guide.md#ownedview-in-async-trait-implementations)
-/// for zero-copy access patterns and when `to_owned_message()` is needed.
+/// the `Send` bound automatically.
+///
+/// **Unary and server-streaming requests** arrive as
+/// [`ServiceRequest<'_, Req>`](::connectrpc::ServiceRequest): a zero-copy
+/// view of the request plus its body, valid for the duration of the call.
+/// Fields are read directly (`request.name` is a `&str` into the decoded
+/// buffer) and the borrow may be held across `.await` points. Anything
+/// that must outlive the call — `tokio::spawn`, channels, server state,
+/// or data captured by a returned response stream — takes owned data:
+/// call `request.to_owned_message()` (or copy the specific fields)
+/// first.
+///
+/// **Client-streaming and bidi requests** arrive as
+/// [`InboundStream<Req>`](::connectrpc::InboundStream) — a
+/// `ServiceStream` of [`StreamMessage`](::connectrpc::StreamMessage)s.
+/// Each item owns its decoded buffer and is `Send + 'static`, so items
+/// can be buffered or moved into spawned tasks; read fields zero-copy
+/// through the generated accessor methods (`item.name()`) or `.view()`,
+/// convert with `.to_owned_message()`, or yield an item back unchanged —
+/// `StreamMessage<M>` implements `Encodable<M>`.
+///
+/// Request types resolved through `extern_path` (e.g. well-known types
+/// from another crate) use the same wrappers; the crate that owns the
+/// type must be generated with buffa ≥ 0.9.0 and views enabled so the
+/// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
 /// generated `OutView<'_>` / `OwnedOutView`,
@@ -238,19 +317,25 @@ pub const PLACEMENT_CONTROLLER_DESCRIBE_NODE_DRAIN_SPEC: ::connectrpc::Spec = ::
 ///
 /// Server-streaming and bidi-streaming methods return
 /// `ServiceStream<impl Encodable<Out> + Send + use<Self>>`. The
-/// `use<Self>` precise-capturing clause excludes `&self`'s lifetime
-/// (unary methods use `use<'a, Self>` and may borrow), so stream items
-/// must be `'static`. To stream view-encoded data, encode each item
-/// inside the stream body and yield
+/// `use<Self>` precise-capturing clause excludes `&self`'s lifetime and
+/// the request's lifetime (unary methods use `use<'a, Self>` and may
+/// borrow from `&self`), so stream items must be `'static` and cannot
+/// borrow from the request. To stream view-encoded data, encode each
+/// item inside the stream body and yield
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
 pub trait PlacementController: Send + Sync + 'static {
     /// Handle the RuntimeMembership RPC.
+    ///
+    /// Each `requests` item is a [`StreamMessage`](::connectrpc::StreamMessage):
+    /// it owns its buffer, is `Send + 'static`, and exposes zero-copy
+    /// accessor methods (`item.name()`), `.view()`, and
+    /// `.to_owned_message()`.
     fn runtime_membership(
         &self,
         ctx: ::connectrpc::RequestContext,
-        requests: ::connectrpc::ServiceStream<OwnedRuntimeMembershipRequestView>,
+        requests: ::connectrpc::InboundStream<RuntimeMembershipRequest>,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             ::connectrpc::ServiceStream<
@@ -259,10 +344,16 @@ pub trait PlacementController: Send + Sync + 'static {
         >,
     > + Send;
     /// Handle the SubscribeRouting RPC.
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call (until the response stream is returned);
+    /// message fields are read directly on it (zero-copy). Data the
+    /// returned stream needs must be copied out or converted via
+    /// `.to_owned_message()`.
     fn subscribe_routing(
         &self,
         ctx: ::connectrpc::RequestContext,
-        request: OwnedSubscribeRoutingRequestView,
+        request: ::connectrpc::ServiceRequest<'_, SubscribeRoutingRequest>,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             ::connectrpc::ServiceStream<
@@ -273,10 +364,16 @@ pub trait PlacementController: Send + Sync + 'static {
     /// Handle the RefreshBundle RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
     fn refresh_bundle<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
-        request: OwnedRefreshBundleRequestView,
+        request: ::connectrpc::ServiceRequest<'_, RefreshBundleRequest>,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<RefreshBundleResponse> + Send + use<'a, Self>,
@@ -285,10 +382,16 @@ pub trait PlacementController: Send + Sync + 'static {
     /// Handle the NominateScaleInCandidates RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
     fn nominate_scale_in_candidates<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
-        request: OwnedNominateRequestView,
+        request: ::connectrpc::ServiceRequest<'_, NominateRequest>,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<NominateResponse> + Send + use<'a, Self>,
@@ -297,22 +400,36 @@ pub trait PlacementController: Send + Sync + 'static {
     /// Handle the MarkNodeDraining RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
     fn mark_node_draining<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
-        request: OwnedMarkDrainingRequestView,
+        request: ::connectrpc::ServiceRequest<'_, MarkDrainingRequest>,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<MarkDrainingResponse> + Send + use<'a, Self>,
         >,
     > + Send;
-    /// Handle the DescribeNodeDrain RPC.
+    /// Read-only drain progress for one node, as last reported by its heartbeat.
+    /// Separate from MarkNodeDraining so a poll loop never re-marks a node and
+    /// overwrites a SAFE_TO_TERMINATE verdict with DRAINING.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
     fn describe_node_drain<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
-        request: OwnedDescribeNodeDrainRequestView,
+        request: ::connectrpc::ServiceRequest<'_, DescribeNodeDrainRequest>,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
@@ -324,6 +441,9 @@ pub trait PlacementController: Send + Sync + 'static {
 /// Extension trait for registering a service implementation with a Router.
 ///
 /// This trait is automatically implemented for all types that implement the service trait.
+/// Prefer [`Router::add_service`](::connectrpc::Router::add_service) for
+/// top-down registration; `register` remains available for compatibility
+/// and cases where the service-first call shape is more convenient.
 ///
 /// # Example
 ///
@@ -360,7 +480,12 @@ impl<S: PlacementController> PlacementControllerExt for S {
                     let svc = ::std::sync::Arc::clone(&self);
                     move |ctx, req| {
                         let svc = ::std::sync::Arc::clone(&svc);
-                        async move { svc.runtime_membership(ctx, req).await }
+                        async move {
+                            let req = ::connectrpc::dispatcher::codegen::into_stream_messages::<
+                                RuntimeMembershipRequest,
+                            >(req);
+                            svc.runtime_membership(ctx, req).await
+                        }
                     }
                 }),
             )
@@ -374,9 +499,19 @@ impl<S: PlacementController> PlacementControllerExt for S {
                 "SubscribeRouting",
                 ::connectrpc::view_streaming_handler_fn({
                     let svc = ::std::sync::Arc::clone(&self);
-                    move |ctx, req| {
+                    move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            __buffa::view::SubscribeRoutingRequestView<'static>,
+                        >|
+                    {
                         let svc = ::std::sync::Arc::clone(&svc);
-                        async move { svc.subscribe_routing(ctx, req).await }
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                SubscribeRoutingRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.subscribe_routing(ctx, sreq).await
+                        }
                     }
                 }),
             )
@@ -386,10 +521,19 @@ impl<S: PlacementController> PlacementControllerExt for S {
                 "RefreshBundle",
                 {
                     let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |ctx, req, format| {
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            __buffa::view::RefreshBundleRequestView<'static>,
+                        >,
+                        format|
+                    {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
-                            svc.refresh_bundle(ctx, req)
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                RefreshBundleRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.refresh_bundle(ctx, sreq)
                                 .await?
                                 .encode::<RefreshBundleResponse>(format)
                         }
@@ -402,10 +546,19 @@ impl<S: PlacementController> PlacementControllerExt for S {
                 "NominateScaleInCandidates",
                 {
                     let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |ctx, req, format| {
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            __buffa::view::NominateRequestView<'static>,
+                        >,
+                        format|
+                    {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
-                            svc.nominate_scale_in_candidates(ctx, req)
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                NominateRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.nominate_scale_in_candidates(ctx, sreq)
                                 .await?
                                 .encode::<NominateResponse>(format)
                         }
@@ -418,10 +571,19 @@ impl<S: PlacementController> PlacementControllerExt for S {
                 "MarkNodeDraining",
                 {
                     let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |ctx, req, format| {
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            __buffa::view::MarkDrainingRequestView<'static>,
+                        >,
+                        format|
+                    {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
-                            svc.mark_node_draining(ctx, req)
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                MarkDrainingRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.mark_node_draining(ctx, sreq)
                                 .await?
                                 .encode::<MarkDrainingResponse>(format)
                         }
@@ -434,10 +596,19 @@ impl<S: PlacementController> PlacementControllerExt for S {
                 "DescribeNodeDrain",
                 {
                     let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |ctx, req, format| {
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            __buffa::view::DescribeNodeDrainRequestView<'static>,
+                        >,
+                        format|
+                    {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
-                            svc.describe_node_drain(ctx, req)
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                DescribeNodeDrainRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.describe_node_drain(ctx, sreq)
                                 .await?
                                 .encode::<DescribeNodeDrainResponse>(format)
                         }
@@ -445,6 +616,17 @@ impl<S: PlacementController> PlacementControllerExt for S {
                 },
             )
             .with_spec(PLACEMENT_CONTROLLER_DESCRIBE_NODE_DRAIN_SPEC)
+    }
+}
+/// Type-inference marker used by [`Router::add_service`](::connectrpc::Router::add_service).
+#[doc(hidden)]
+pub struct PlacementControllerRegisterMarker;
+impl<
+    S: PlacementController,
+> ::connectrpc::ServiceRegister<PlacementControllerRegisterMarker>
+for ::std::sync::Arc<S> {
+    fn register_service(self, router: ::connectrpc::Router) -> ::connectrpc::Router {
+        <S as PlacementControllerExt>::register(self, router)
     }
 }
 /// Monomorphic dispatcher for `PlacementController`.
@@ -548,9 +730,16 @@ impl<T: PlacementController> ::connectrpc::Dispatcher for PlacementControllerSer
             "RefreshBundle" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
-                        __buffa::view::RefreshBundleRequestView,
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        RefreshBundleRequest,
                     >(request.encoded()?, format)?;
+                    let req: __buffa::view::RefreshBundleRequestView<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        RefreshBundleRequest,
+                    >::from_parts(&req, &body);
                     svc.refresh_bundle(ctx, req)
                         .await?
                         .encode::<RefreshBundleResponse>(format)
@@ -559,9 +748,16 @@ impl<T: PlacementController> ::connectrpc::Dispatcher for PlacementControllerSer
             "NominateScaleInCandidates" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
-                        __buffa::view::NominateRequestView,
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        NominateRequest,
                     >(request.encoded()?, format)?;
+                    let req: __buffa::view::NominateRequestView<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        NominateRequest,
+                    >::from_parts(&req, &body);
                     svc.nominate_scale_in_candidates(ctx, req)
                         .await?
                         .encode::<NominateResponse>(format)
@@ -570,9 +766,16 @@ impl<T: PlacementController> ::connectrpc::Dispatcher for PlacementControllerSer
             "MarkNodeDraining" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
-                        __buffa::view::MarkDrainingRequestView,
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        MarkDrainingRequest,
                     >(request.encoded()?, format)?;
+                    let req: __buffa::view::MarkDrainingRequestView<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        MarkDrainingRequest,
+                    >::from_parts(&req, &body);
                     svc.mark_node_draining(ctx, req)
                         .await?
                         .encode::<MarkDrainingResponse>(format)
@@ -581,9 +784,16 @@ impl<T: PlacementController> ::connectrpc::Dispatcher for PlacementControllerSer
             "DescribeNodeDrain" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
-                        __buffa::view::DescribeNodeDrainRequestView,
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        DescribeNodeDrainRequest,
                     >(request.encoded()?, format)?;
+                    let req: __buffa::view::DescribeNodeDrainRequestView<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        DescribeNodeDrainRequest,
+                    >::from_parts(&req, &body);
                     svc.describe_node_drain(ctx, req)
                         .await?
                         .encode::<DescribeNodeDrainResponse>(format)
@@ -608,9 +818,16 @@ impl<T: PlacementController> ::connectrpc::Dispatcher for PlacementControllerSer
             "SubscribeRouting" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
-                        __buffa::view::SubscribeRoutingRequestView,
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        SubscribeRoutingRequest,
                     >(request, format)?;
+                    let req: __buffa::view::SubscribeRoutingRequestView<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        SubscribeRoutingRequest,
+                    >::from_parts(&req, &body);
                     let resp = svc.subscribe_routing(ctx, req).await?;
                     Ok(
                         resp
@@ -657,9 +874,9 @@ impl<T: PlacementController> ::connectrpc::Dispatcher for PlacementControllerSer
             "RuntimeMembership" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req_stream = ::connectrpc::dispatcher::codegen::decode_view_request_stream::<
-                        __buffa::view::RuntimeMembershipRequestView,
-                    >(requests, format);
+                    let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
+                        RuntimeMembershipRequest,
+                    >(requests, format, ctx.decode_options().clone());
                     let resp = svc.runtime_membership(ctx, req_stream).await?;
                     Ok(
                         resp
@@ -711,11 +928,12 @@ impl<T: PlacementController> ::connectrpc::Dispatcher for PlacementControllerSer
 /// # Working with the response
 ///
 /// Unary calls return [`UnaryResponse<OwnedView<FooView>>`](::connectrpc::client::UnaryResponse).
-/// The `OwnedView` derefs to the view, so field access is zero-copy:
+/// [`view()`](::connectrpc::client::UnaryResponse::view) borrows the response
+/// message, so field access is zero-copy:
 ///
 /// ```rust,ignore
-/// let resp = client.runtime_membership(request).await?.into_view();
-/// let name: &str = resp.name;  // borrow into the response buffer
+/// let resp = client.runtime_membership(request).await?;
+/// let name: &str = resp.view().name;  // borrow into the response buffer
 /// ```
 ///
 /// If you need the owned struct (e.g. to store or pass by value), use
@@ -724,6 +942,13 @@ impl<T: PlacementController> ::connectrpc::Dispatcher for PlacementControllerSer
 /// ```rust,ignore
 /// let owned = client.runtime_membership(request).await?.into_owned();
 /// ```
+///
+/// [`into_view()`](::connectrpc::client::UnaryResponse::into_view) keeps the
+/// zero-copy decoded body (an `OwnedView`) without copying; field access on it
+/// goes through `.reborrow()`. Streaming responses yield one
+/// [`StreamMessage`](::connectrpc::StreamMessage) per received message from
+/// `.message().await` — read fields zero-copy through the generated accessor
+/// methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`.
 #[derive(Clone)]
 pub struct PlacementControllerClient<T> {
     transport: T,
@@ -732,7 +957,7 @@ pub struct PlacementControllerClient<T> {
 impl<T> PlacementControllerClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::http_body::Body>::Error: ::std::fmt::Display,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::fmt::Display,
 {
     /// Create a new client with the given transport and configuration.
     pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {
@@ -777,8 +1002,8 @@ where
         ::connectrpc::client::call_bidi_stream(
                 &self.transport,
                 &self.config,
-                PLACEMENT_CONTROLLER_SERVICE_NAME,
-                "RuntimeMembership",
+                PLACEMENT_CONTROLLER_RUNTIME_MEMBERSHIP_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 options,
             )
             .await
@@ -815,8 +1040,8 @@ where
         ::connectrpc::client::call_server_stream(
                 &self.transport,
                 &self.config,
-                PLACEMENT_CONTROLLER_SERVICE_NAME,
-                "SubscribeRouting",
+                PLACEMENT_CONTROLLER_SUBSCRIBE_ROUTING_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -852,8 +1077,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                PLACEMENT_CONTROLLER_SERVICE_NAME,
-                "RefreshBundle",
+                PLACEMENT_CONTROLLER_REFRESH_BUNDLE_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -889,8 +1114,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                PLACEMENT_CONTROLLER_SERVICE_NAME,
-                "NominateScaleInCandidates",
+                PLACEMENT_CONTROLLER_NOMINATE_SCALE_IN_CANDIDATES_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -926,8 +1151,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                PLACEMENT_CONTROLLER_SERVICE_NAME,
-                "MarkNodeDraining",
+                PLACEMENT_CONTROLLER_MARK_NODE_DRAINING_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -967,8 +1192,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                PLACEMENT_CONTROLLER_SERVICE_NAME,
-                "DescribeNodeDrain",
+                PLACEMENT_CONTROLLER_DESCRIBE_NODE_DRAIN_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

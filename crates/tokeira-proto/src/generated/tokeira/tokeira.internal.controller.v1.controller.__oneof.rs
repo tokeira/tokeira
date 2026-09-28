@@ -34,19 +34,19 @@ pub mod runtime_membership_request {
             Self::Some(Request::from(v))
         }
     }
-    impl serde::Serialize for Request {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for Request {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::Registration(v) => {
-                    map.serialize_entry("registration", v)?;
+                    map.serialize_entry("registration", &**v)?;
                 }
                 Self::Heartbeat(v) => {
-                    map.serialize_entry("heartbeat", v)?;
+                    map.serialize_entry("heartbeat", &**v)?;
                 }
             }
             map.end()
@@ -111,25 +111,25 @@ pub mod controller_directive {
             Self::Some(Directive::from(v))
         }
     }
-    impl serde::Serialize for Directive {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for Directive {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::Drain(v) => {
-                    map.serialize_entry("drain", v)?;
+                    map.serialize_entry("drain", &**v)?;
                 }
                 Self::RoutingUpdate(v) => {
-                    map.serialize_entry("routingUpdate", v)?;
+                    map.serialize_entry("routingUpdate", &**v)?;
                 }
                 Self::ConnectionBudget(v) => {
-                    map.serialize_entry("connectionBudget", v)?;
+                    map.serialize_entry("connectionBudget", &**v)?;
                 }
                 Self::DesiredPlacement(v) => {
-                    map.serialize_entry("desiredPlacement", v)?;
+                    map.serialize_entry("desiredPlacement", &**v)?;
                 }
             }
             map.end()
@@ -167,19 +167,19 @@ pub mod routing_update {
             Self::Some(Update::from(v))
         }
     }
-    impl serde::Serialize for Update {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for Update {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::Full(v) => {
-                    map.serialize_entry("full", v)?;
+                    map.serialize_entry("full", &**v)?;
                 }
                 Self::Delta(v) => {
-                    map.serialize_entry("delta", v)?;
+                    map.serialize_entry("delta", &**v)?;
                 }
             }
             map.end()
@@ -206,16 +206,16 @@ pub mod bundle_ownership_entry {
             Self::Some(State::from(v))
         }
     }
-    impl serde::Serialize for State {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for State {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::Owner(v) => {
-                    map.serialize_entry("owner", v)?;
+                    map.serialize_entry("owner", &**v)?;
                 }
                 Self::Unowned(v) => {
                     map.serialize_entry("unowned", v)?;
@@ -245,16 +245,16 @@ pub mod node_endpoint_entry {
             Self::Some(State::from(v))
         }
     }
-    impl serde::Serialize for State {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for State {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::Endpoint(v) => {
-                    map.serialize_entry("endpoint", v)?;
+                    map.serialize_entry("endpoint", &**v)?;
                 }
                 Self::Removed(v) => {
                     map.serialize_entry("removed", v)?;

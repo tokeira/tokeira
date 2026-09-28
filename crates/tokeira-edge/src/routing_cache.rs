@@ -179,7 +179,7 @@ pub async fn subscribe_routing_once(
         .map_err(|e| anyhow!("subscribe_routing failed: {e}"))?;
     if let Some(update) = stream.message().await.map_err(|e| anyhow!("{e}"))? {
         // Work directly with the zero-copy view — no .to_owned_message().
-        apply_routing_update_view(&cache, &update)?;
+        apply_routing_update_view(&cache, update.view())?;
     }
     Ok(())
 }
@@ -233,7 +233,7 @@ async fn subscribe_until_disconnect(
                     return Err(anyhow!("routing subscription ended"));
                 };
                 // Zero-copy: read fields directly from the view without allocating.
-                apply_routing_update_view(&cache, &update)?;
+                apply_routing_update_view(&cache, update.view())?;
             }
         }
     }

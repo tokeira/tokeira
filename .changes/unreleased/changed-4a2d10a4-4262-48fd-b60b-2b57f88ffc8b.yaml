@@ -1,5 +1,0 @@
-kind: changed
-body: tokeira-proto's connect bindings regenerate on buffa 0.9; handlers take ServiceRequest or InboundStream, and stream items expose their zero-copy view through view().
-time: 2026-09-28T01:48:17.000000+01:00
-custom:
-    Slice: 4a2d10a4-4262-48fd-b60b-2b57f88ffc8b

@@ -1,5 +1,0 @@
-kind: security
-body: connectrpc 0.8.2 closes RUSTSEC-2026-0304 for the conformance control listener; ringbuf 0.5.2 closes RUSTSEC-2026-0293; chacha20 moves off the yanked 0.10.0 to 0.10.2.
-time: 2026-09-28T01:48:15.918120+01:00
-custom:
-    Slice: 6fade3b5-45e2-490e-b85f-a856441e58ff

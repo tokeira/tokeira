@@ -4,17 +4,16 @@
 //! `PlacementController` trait. Provides zero-copy request views and
 //! serves Connect, gRPC, and gRPC-Web on the same handlers.
 
-use connectrpc::{RequestContext, Response, ServiceResult, ServiceStream};
+use connectrpc::{
+    InboundStream, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
+};
 use futures::StreamExt;
 use tokeira_proto::connect::tokeira::internal::controller::v1::{
     self as pb, BundleOwnerMessage, BundleOwnershipEntry,
     ControllerDirective as WireControllerDirective, DescribeNodeDrainResponse, FullRoutingSnapshot,
     MarkDrainingResponse, NodeEndpointEntry, NodeEndpointMessage, NominateResponse,
-    OwnedDescribeNodeDrainRequestView, OwnedMarkDrainingRequestView, OwnedNominateRequestView,
-    OwnedRefreshBundleRequestView, OwnedRuntimeMembershipRequestView,
-    OwnedSubscribeRoutingRequestView, PlacementConfigMessage, PlacementController,
-    RefreshBundleResponse, RoutingUpdate, ScaleInCandidate, bundle_ownership_entry,
-    node_endpoint_entry, routing_update,
+    PlacementConfigMessage, PlacementController, RefreshBundleResponse, RoutingUpdate,
+    ScaleInCandidate, bundle_ownership_entry, node_endpoint_entry, routing_update,
 };
 use tokeira_types::{IncarnationId, PlacementConfig, ShardId};
 
@@ -40,7 +39,7 @@ impl PlacementController for ConnectPlacementController {
     async fn runtime_membership(
         &self,
         _ctx: RequestContext,
-        requests: ServiceStream<OwnedRuntimeMembershipRequestView>,
+        requests: InboundStream<pb::RuntimeMembershipRequest>,
     ) -> ServiceResult<ServiceStream<WireControllerDirective>> {
         use pb::runtime_membership_request::Request;
 
@@ -115,7 +114,7 @@ impl PlacementController for ConnectPlacementController {
     async fn subscribe_routing(
         &self,
         _ctx: RequestContext,
-        _req: OwnedSubscribeRoutingRequestView,
+        _req: ServiceRequest<'_, pb::SubscribeRoutingRequest>,
     ) -> ServiceResult<ServiceStream<RoutingUpdate>> {
         let snapshot = self
             .state
@@ -131,7 +130,7 @@ impl PlacementController for ConnectPlacementController {
     async fn refresh_bundle(
         &self,
         _ctx: RequestContext,
-        req: OwnedRefreshBundleRequestView,
+        req: ServiceRequest<'_, pb::RefreshBundleRequest>,
     ) -> ServiceResult<RefreshBundleResponse> {
         let bundle_id = ShardId(req.bundle_id);
         let leases = self
@@ -164,7 +163,7 @@ impl PlacementController for ConnectPlacementController {
     async fn nominate_scale_in_candidates(
         &self,
         _ctx: RequestContext,
-        req: OwnedNominateRequestView,
+        req: ServiceRequest<'_, pb::NominateRequest>,
     ) -> ServiceResult<NominateResponse> {
         let membership = self.state.membership.read().await;
         let candidates = membership.nominate_scale_in(req.limit);
@@ -191,7 +190,7 @@ impl PlacementController for ConnectPlacementController {
     async fn mark_node_draining(
         &self,
         _ctx: RequestContext,
-        req: OwnedMarkDrainingRequestView,
+        req: ServiceRequest<'_, pb::MarkDrainingRequest>,
     ) -> ServiceResult<MarkDrainingResponse> {
         let node_id = parse_node_id(req.node_id)?;
         let accepted = self.state.mark_node_draining(node_id).await;
@@ -204,7 +203,7 @@ impl PlacementController for ConnectPlacementController {
     async fn describe_node_drain(
         &self,
         _ctx: RequestContext,
-        req: OwnedDescribeNodeDrainRequestView,
+        req: ServiceRequest<'_, pb::DescribeNodeDrainRequest>,
     ) -> ServiceResult<DescribeNodeDrainResponse> {
         let node_id = parse_node_id(req.node_id)?;
         let state = self.state.describe_node_drain(node_id).await;
@@ -451,8 +450,12 @@ fn encode_lease_entry(
 mod tests {
     use std::sync::Arc;
 
+    use connectrpc::StreamMessage;
     use futures::{StreamExt, stream};
-    use pb::{controller_directive, runtime_membership_request};
+    use pb::{
+        OwnedDescribeNodeDrainRequestView, OwnedMarkDrainingRequestView, controller_directive,
+        runtime_membership_request,
+    };
     use tokeira_storage::{ControlRepository, InMemoryStore, LeaseOutcome, LeaseRepository};
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
@@ -478,7 +481,7 @@ mod tests {
         ))
     }
 
-    fn registration_request(node_id: IncarnationId) -> OwnedRuntimeMembershipRequestView {
+    fn registration_request(node_id: IncarnationId) -> StreamMessage<pb::RuntimeMembershipRequest> {
         let request = pb::RuntimeMembershipRequest {
             request: Some(runtime_membership_request::Request::Registration(
                 pb::RuntimeRegistration {
@@ -493,10 +496,12 @@ mod tests {
             )),
             ..Default::default()
         };
-        OwnedRuntimeMembershipRequestView::from_owned(&request).unwrap()
+        StreamMessage::from_message(&request)
     }
 
-    fn heartbeat_request(drain_state: pb::NodeDrainState) -> OwnedRuntimeMembershipRequestView {
+    fn heartbeat_request(
+        drain_state: pb::NodeDrainState,
+    ) -> StreamMessage<pb::RuntimeMembershipRequest> {
         let request = pb::RuntimeMembershipRequest {
             request: Some(runtime_membership_request::Request::Heartbeat(
                 pb::RuntimeHeartbeat {
@@ -507,7 +512,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        OwnedRuntimeMembershipRequestView::from_owned(&request).unwrap()
+        StreamMessage::from_message(&request)
     }
 
     /// A request stream that stays open and can be fed heartbeats after the
@@ -515,8 +520,8 @@ mod tests {
     fn open_requests(
         node_id: IncarnationId,
     ) -> (
-        mpsc::Sender<Result<OwnedRuntimeMembershipRequestView, connectrpc::ConnectError>>,
-        ServiceStream<OwnedRuntimeMembershipRequestView>,
+        mpsc::Sender<Result<StreamMessage<pb::RuntimeMembershipRequest>, connectrpc::ConnectError>>,
+        InboundStream<pb::RuntimeMembershipRequest>,
     ) {
         let (tx, rx) = mpsc::channel(8);
         tx.try_send(Ok(registration_request(node_id)))
@@ -524,12 +529,23 @@ mod tests {
         (tx, Box::pin(ReceiverStream::new(rx)))
     }
 
-    fn mark_request(node_id: IncarnationId) -> OwnedMarkDrainingRequestView {
-        OwnedMarkDrainingRequestView::from_owned(&pb::MarkDrainingRequest {
+    /// Mark `node_id` draining through the served handler; `true` when the
+    /// controller accepted the mark.
+    async fn mark(service: &ConnectPlacementController, node_id: IncarnationId) -> bool {
+        let request = OwnedMarkDrainingRequestView::from_owned(&pb::MarkDrainingRequest {
             node_id: node_id.to_string(),
             ..Default::default()
         })
-        .unwrap()
+        .unwrap();
+        service
+            .mark_node_draining(
+                RequestContext::default(),
+                ServiceRequest::from_parts(request.reborrow(), request.bytes()),
+            )
+            .await
+            .unwrap()
+            .body
+            .accepted
     }
 
     async fn describe(
@@ -543,7 +559,10 @@ mod tests {
             })
             .unwrap();
         let response = service
-            .describe_node_drain(RequestContext::default(), request)
+            .describe_node_drain(
+                RequestContext::default(),
+                ServiceRequest::from_parts(request.reborrow(), request.bytes()),
+            )
             .await
             .unwrap()
             .body;
@@ -571,7 +590,7 @@ mod tests {
         let request = registration_request(node_id);
         // Keep the request side open: closing it represents a disconnected
         // runtime and correctly moves the node out of active placement.
-        let requests: ServiceStream<OwnedRuntimeMembershipRequestView> =
+        let requests: InboundStream<pb::RuntimeMembershipRequest> =
             Box::pin(stream::once(async move { Ok(request) }).chain(stream::pending()));
 
         let mut directives = service
@@ -643,13 +662,7 @@ mod tests {
             other => panic!("unexpected lease outcome: {other:?}"),
         };
 
-        let accepted = service
-            .mark_node_draining(RequestContext::default(), mark_request(draining))
-            .await
-            .unwrap()
-            .body
-            .accepted;
-        assert!(accepted);
+        assert!(mark(&service, draining).await);
         assert!(matches!(
             directives.next().await.unwrap().unwrap().directive,
             Some(controller_directive::Directive::Drain(_))
@@ -673,14 +686,7 @@ mod tests {
         .await;
 
         // A repeated mark is accepted and never demotes the verdict.
-        assert!(
-            service
-                .mark_node_draining(RequestContext::default(), mark_request(draining))
-                .await
-                .unwrap()
-                .body
-                .accepted
-        );
+        assert!(mark(&service, draining).await);
         assert_eq!(
             describe(&service, draining).await,
             (true, pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE)
@@ -774,14 +780,7 @@ mod tests {
             describe(&service, never_seen).await,
             (false, pb::NodeDrainState::NODE_DRAIN_STATE_UNSPECIFIED)
         );
-        assert!(
-            !service
-                .mark_node_draining(RequestContext::default(), mark_request(never_seen))
-                .await
-                .unwrap()
-                .body
-                .accepted
-        );
+        assert!(!mark(&service, never_seen).await);
 
         let active = IncarnationId::new();
         let (_tx, requests) = open_requests(active);

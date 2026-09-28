@@ -9,16 +9,15 @@ authors.workspace = true
 description = "Buffa/connect-rust bindings for Tokeira compatibility metadata"
 
 [dependencies]
-buffa = { version = "0.6", features = ["json"] }
-buffa-types = { version = "0.6", features = ["json"] }
-connectrpc = { version = "0.6", features = ["client"] }
-http-body = "1"
+buffa = { version = "0.9", features = ["json"] }
+buffa-types = { version = "0.9", features = ["json"] }
+connectrpc = { version = "0.9.1", features = ["client"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [build-dependencies]
-connectrpc-build = "0.6"
+connectrpc-build = "0.9"
 walkdir = "2"
 
 [lints]

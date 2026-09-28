@@ -21,8 +21,8 @@ arc-swap = "1"
 async-trait = "0.1"
 base64.workspace = true
 bytes = "1"
-buffa = { version = "0.6", features = ["json"] }
-connectrpc = { version = "0.6", features = ["client"] }
+buffa = { version = "0.9", features = ["json"] }
+connectrpc = { version = "0.9.1", features = ["client"] }
 http = "1"
 http-body-util.workspace = true
 metrics.workspace = true

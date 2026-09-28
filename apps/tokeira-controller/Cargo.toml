@@ -18,7 +18,7 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 axum = "0.8"
 clap.workspace = true
-connectrpc = { version = "0.6", features = ["axum"] }
+connectrpc = { version = "0.9.1", features = ["axum"] }
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 serde.workspace = true

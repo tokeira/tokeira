@@ -7,8 +7,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-buffa = { version = "0.6", features = ["json"] }
-connectrpc = { version = "0.6", features = ["server"] }
+buffa = { version = "0.9", features = ["json"] }
+connectrpc = { version = "0.9.1", features = ["server"] }
 tokeira-build-info.workspace = true
 tokeira-compatibility.workspace = true
 tokeira-compatibility-proto.workspace = true

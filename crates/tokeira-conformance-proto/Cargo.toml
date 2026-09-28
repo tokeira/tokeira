@@ -9,18 +9,17 @@ authors.workspace = true
 description = "Buffa/connect-rust bindings for the Tokeira conformance control API (conformance-only)"
 
 [dependencies]
-buffa = { version = "0.8.1", features = ["json"] }
-buffa-types = { version = "0.8.1", features = ["json"] }
-connectrpc = { version = "0.8.1", features = ["client"] }
-http-body = "1"
+buffa = { version = "0.9", features = ["json"] }
+buffa-types = { version = "0.9", features = ["json"] }
+connectrpc = { version = "0.9.1", features = ["client"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [build-dependencies]
-# connectrpc-build tops out at 0.8.0 on crates.io; additive-patch semver keeps it
-# compatible with the connectrpc 0.8.1 runtime crate (same 0.8 minor line).
-connectrpc-build = "0.8"
+# Same 0.9 minor line as the connectrpc runtime crate above: the codegen and the
+# runtime version in lockstep, and buffa 0.9 output only compiles against a 0.9 runtime.
+connectrpc-build = "0.9"
 walkdir = "2"
 
 [lints]

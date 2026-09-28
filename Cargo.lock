@@ -155,18 +155,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-compression"
-version = "0.4.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
-dependencies = [
- "compression-codecs",
- "compression-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "async-recursion"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1456,24 +1444,9 @@ dependencies = [
 
 [[package]]
 name = "buffa"
-version = "0.6.0"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "941c714734a660caa93a210c531dec553cc0ef417890409914d24032c94ab840"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "hashbrown 0.15.5",
- "once_cell",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "buffa"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33f29a40702df4b86ccd84211bfde8cee0bce6d0811450ade4a86a7d0958a23a"
+checksum = "a92f2f5df67a9d5ccfc65237bfc954c56328aee40a04a9b92381ecba370be246"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1489,27 +1462,12 @@ dependencies = [
 
 [[package]]
 name = "buffa-codegen"
-version = "0.6.0"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "693ea91be01336fb0084b2e7bb071be7393224c72f737c846471e4013e58c327"
+checksum = "bb4bea10ef85ea3d06a20412c67cb612527feb25f33367eab850139441fb5dd9"
 dependencies = [
- "buffa 0.6.0",
- "buffa-descriptor 0.6.0",
- "prettyplease",
- "proc-macro2",
- "quote",
- "syn",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "buffa-codegen"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6681b562b18ea719622d0d12684e88ecbdca600d517557dc7bcef7704631e28"
-dependencies = [
- "buffa 0.8.1",
- "buffa-descriptor 0.8.1",
+ "buffa",
+ "buffa-descriptor",
  "prettyplease",
  "proc-macro2",
  "quote",
@@ -1519,22 +1477,11 @@ dependencies = [
 
 [[package]]
 name = "buffa-descriptor"
-version = "0.6.0"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad8df83adfcb525621f5a96c88e610f90aff1112ec57522d9b48a943df327394"
+checksum = "2b7dd79a6898e70dac8adae959c8ad2cae51ed96397935c91c996280cedcb55e"
 dependencies = [
- "buffa 0.6.0",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "buffa-descriptor"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57ed423c4ecec86d1500879ce42e7e5f6def01bc632985ac756c1fd723fa21fc"
-dependencies = [
- "buffa 0.8.1",
+ "buffa",
  "rustversion",
  "serde",
  "serde_json",
@@ -1542,25 +1489,13 @@ dependencies = [
 
 [[package]]
 name = "buffa-types"
-version = "0.6.0"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc84fac1e7efc335e74934a4ebe0534a30411ec2ea6a5a17ed294201c6b3b23c"
+checksum = "b15b05c8418f1e200e406e5b19df97400dffa833e2450e4392c506896cbc97ac"
 dependencies = [
- "buffa 0.6.0",
+ "buffa",
  "bytes",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "buffa-types"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cb54bcbf6946c58e550eeaf6209047146363dbc7cbdc87e49e67089ed2ff5f"
-dependencies = [
- "buffa 0.8.1",
- "bytes",
+ "jiff",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1871,25 +1806,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "compression-codecs"
-version = "0.4.38"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
-dependencies = [
- "compression-core",
- "flate2",
- "memchr",
- "zstd",
- "zstd-safe",
-]
-
-[[package]]
-name = "compression-core"
-version = "0.4.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
-
-[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1900,15 +1816,14 @@ dependencies = [
 
 [[package]]
 name = "connectrpc"
-version = "0.6.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3382e121377f6c160bbbe56f5809637ccbabff7edbf56bb8e96cc64e65998045"
+checksum = "457cfa540c62e1b0b05db676cc9a9129162ad94d3a3eec6f2d19706c53acae7d"
 dependencies = [
- "async-compression",
  "async-trait",
  "axum",
  "base64 0.22.1",
- "buffa 0.6.0",
+ "buffa",
  "bytes",
  "flate2",
  "futures",
@@ -1922,39 +1837,7 @@ dependencies = [
  "pin-project",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "wasm-bindgen-futures",
- "zstd",
-]
-
-[[package]]
-name = "connectrpc"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9427cfdfde21ced38118af1fa5fa4256327b8f4fa45119b97f9a79a80c7d7c6f"
-dependencies = [
- "async-compression",
- "async-trait",
- "base64 0.22.1",
- "buffa 0.8.1",
- "bytes",
- "flate2",
- "futures",
- "http 1.4.0",
- "http-body 1.0.1",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "percent-encoding",
- "pin-project",
- "serde",
- "serde_json",
+ "sync_wrapper",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -1967,55 +1850,26 @@ dependencies = [
 
 [[package]]
 name = "connectrpc-build"
-version = "0.6.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e83c1366d73975a36aa5788beaef5e39747841d07ce9aa69237047aaf76c4fea"
+checksum = "603619f92fc55725d971ed9292855cd75f7a2c52ed66c181e0ec531dd7f8dd9b"
 dependencies = [
  "anyhow",
- "buffa 0.6.0",
- "buffa-codegen 0.6.0",
- "connectrpc-codegen 0.6.0",
- "tempfile",
-]
-
-[[package]]
-name = "connectrpc-build"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8cdec2dacacd00437898dad38f98105c82d51086a78baa62cee6dc66c031070"
-dependencies = [
- "anyhow",
- "buffa 0.8.1",
- "buffa-codegen 0.8.1",
- "connectrpc-codegen 0.8.0",
+ "buffa",
+ "buffa-codegen",
+ "connectrpc-codegen",
  "tempfile",
 ]
 
 [[package]]
 name = "connectrpc-codegen"
-version = "0.6.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4185bd4287223a2f5a2aef54c4d668e8e148cdd244ebf73db62a4e61e6c2f350"
+checksum = "514a7a6fbe705d532ddf490c221db7bd52c5b94fd691cb257a7c18e5646355bb"
 dependencies = [
  "anyhow",
- "buffa 0.6.0",
- "buffa-codegen 0.6.0",
- "heck",
- "prettyplease",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "connectrpc-codegen"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36c6e3bb62a4a77f41d5cd3d290a488bf529dc7e26b444cda67a3e5544c97542"
-dependencies = [
- "anyhow",
- "buffa 0.8.1",
- "buffa-codegen 0.8.1",
+ "buffa",
+ "buffa-codegen",
  "heck",
  "prettyplease",
  "proc-macro2",
@@ -2613,7 +2467,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2798,7 +2652,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3592,7 +3446,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b305d85504de270ad3525d726a6b69cc59ee7b2269b014387651107ab9f0755b"
 dependencies = [
  "bstr",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -5588,7 +5442,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6426,7 +6280,7 @@ name = "proto-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "connectrpc-build 0.6.0",
+ "connectrpc-build",
  "prost",
  "prost-types",
  "protox",
@@ -7155,7 +7009,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7214,7 +7068,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7726,9 +7580,9 @@ dependencies = [
 
 [[package]]
 name = "smoothutf8"
-version = "0.1.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36358427d32ecdb1624616deed99eccfef0a167fe5bf40ddb51efe6980bc1ec8"
+checksum = "6b4ec95892483d6d94284caccfddb9b77111a4dcac33ed25d624248def0fa5f1"
 dependencies = [
  "simdutf8",
 ]
@@ -8151,7 +8005,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8619,8 +8473,8 @@ version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "buffa 0.6.0",
- "connectrpc 0.6.0",
+ "buffa",
+ "connectrpc",
  "metrics",
  "metrics-util",
  "proptest",
@@ -8842,11 +8696,10 @@ dependencies = [
 name = "tokeira-compatibility-proto"
 version = "0.4.1"
 dependencies = [
- "buffa 0.6.0",
- "buffa-types 0.6.0",
- "connectrpc 0.6.0",
- "connectrpc-build 0.6.0",
- "http-body 1.0.1",
+ "buffa",
+ "buffa-types",
+ "connectrpc",
+ "connectrpc-build",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -8857,8 +8710,8 @@ dependencies = [
 name = "tokeira-compatibility-service"
 version = "0.4.1"
 dependencies = [
- "buffa 0.6.0",
- "connectrpc 0.6.0",
+ "buffa",
+ "connectrpc",
  "tokeira-build-info",
  "tokeira-compatibility",
  "tokeira-compatibility-proto",
@@ -8938,7 +8791,7 @@ dependencies = [
 name = "tokeira-conformance-control"
 version = "0.4.1"
 dependencies = [
- "connectrpc 0.8.2",
+ "connectrpc",
  "tokeira-conformance",
  "tokeira-conformance-proto",
 ]
@@ -8947,11 +8800,10 @@ dependencies = [
 name = "tokeira-conformance-proto"
 version = "0.4.1"
 dependencies = [
- "buffa 0.8.1",
- "buffa-types 0.8.1",
- "connectrpc 0.8.2",
- "connectrpc-build 0.8.0",
- "http-body 1.0.1",
+ "buffa",
+ "buffa-types",
+ "connectrpc",
+ "connectrpc-build",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -8964,8 +8816,8 @@ version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "buffa 0.6.0",
- "connectrpc 0.6.0",
+ "buffa",
+ "connectrpc",
  "futures",
  "metrics",
  "metrics-util",
@@ -8994,7 +8846,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "axum",
  "clap",
- "connectrpc 0.6.0",
+ "connectrpc",
  "metrics",
  "metrics-exporter-prometheus",
  "serde",
@@ -9128,9 +8980,9 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64 0.22.1",
- "buffa 0.6.0",
+ "buffa",
  "bytes",
- "connectrpc 0.6.0",
+ "connectrpc",
  "http 1.4.0",
  "http-body-util",
  "metrics",
@@ -9472,10 +9324,9 @@ dependencies = [
 name = "tokeira-proto"
 version = "0.4.1"
 dependencies = [
- "buffa 0.6.0",
- "buffa-types 0.6.0",
- "connectrpc 0.6.0",
- "http-body 1.0.1",
+ "buffa",
+ "buffa-types",
+ "connectrpc",
  "prost",
  "prost-types",
  "serde",
@@ -9505,11 +9356,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "buffa 0.6.0",
- "buffa-types 0.6.0",
+ "buffa",
+ "buffa-types",
  "chrono",
  "chrono-tz",
- "connectrpc 0.6.0",
+ "connectrpc",
  "dashmap",
  "metrics",
  "metrics-util",
@@ -9660,7 +9511,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
- "connectrpc 0.8.2",
+ "connectrpc",
  "http 1.4.0",
  "http-body-util",
  "hyper",
@@ -10764,7 +10615,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

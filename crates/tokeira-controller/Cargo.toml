@@ -9,8 +9,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-buffa = { version = "0.6", features = ["json"] }
-connectrpc = { version = "0.6", features = ["client"] }
+buffa = { version = "0.9", features = ["json"] }
+connectrpc = { version = "0.9.1", features = ["client"] }
 futures = "0.3"
 metrics.workspace = true
 prost-types = "0.14"

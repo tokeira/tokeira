@@ -2432,7 +2432,7 @@
       "new_entrypoint_name": false,
       "owner": "v132-lifecycle-fidelity",
       "out_of_surface_reason": null,
-      "scope_allocation_note": null,
+      "scope_allocation_note": "TestUpdateWorkflowSdkSuite/TestUpdateSameRequestIDDeduplicatesCallbacks is owned by v132-nexus (D5: update completion-callback registration and deduplication). The remaining suite leaves stay with v132-lifecycle-fidelity. Captured baseline counts are unchanged.",
       "counts": {
         "pass": 5,
         "fail": 2,

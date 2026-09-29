@@ -2557,6 +2557,18 @@ pub fn respond_completed_request_to_edge(
     // namespace inherit it (workflow_task_completed_handler.go @ v1.31.0).
     let request_namespace = req.namespace.clone();
 
+    // The eager compatibility guard is edge-owned; the wire flag need not add
+    // a second field to the durable kernel command (service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:528-549 @ v1.32.0).
+    let eager_use_workflow_build_id = req
+        .commands
+        .iter()
+        .filter_map(|command| match command.attributes.as_ref() {
+            Some(command::command::Attributes::ScheduleActivityTaskCommandAttributes(
+                attributes,
+            )) if attributes.use_workflow_build_id => Some(attributes.activity_id.clone()),
+            _ => None,
+        })
+        .collect();
     let mut commands = Vec::new();
     for cmd in req.commands {
         match proto_command_to_workflow_command(cmd, &request_namespace) {
@@ -2677,6 +2689,7 @@ pub fn respond_completed_request_to_edge(
             .capabilities
             .is_some_and(|capabilities| capabilities.discard_speculative_workflow_task_with_events),
         commands,
+        eager_use_workflow_build_id,
         force_create_new_workflow_task: req.force_create_new_workflow_task,
         return_new_workflow_task: req.return_new_workflow_task,
         query_results: req
@@ -3220,54 +3233,100 @@ pub fn update_namespace_response_to_proto(
     }
 }
 
+/// Link to event 1, which is never buffered
+/// (`service/history/api/link_util.go:9-28 @ v1.32.0`).
+pub fn started_event_ref_link(
+    namespace: &str,
+    workflow_id: &str,
+    run_id: &str,
+) -> proto_common::Link {
+    proto_common::Link {
+        variant: Some(proto_common::link::Variant::WorkflowEvent(
+            proto_common::link::WorkflowEvent {
+                namespace: namespace.to_owned(),
+                workflow_id: workflow_id.to_owned(),
+                run_id: run_id.to_owned(),
+                reference: Some(proto_common::link::workflow_event::Reference::EventRef(
+                    proto_common::link::workflow_event::EventReference {
+                        event_id: 1,
+                        event_type: enums::EventType::WorkflowExecutionStarted as i32,
+                    },
+                )),
+            },
+        )),
+    }
+}
+
+/// Link by request identity so buffered events need not invent an event id
+/// (`service/history/api/link_util.go:30-52 @ v1.32.0`).
+pub fn request_id_ref_link(
+    namespace: &str,
+    workflow_id: &str,
+    run_id: &str,
+    request_id: &str,
+    event_type: i32,
+) -> proto_common::Link {
+    proto_common::Link {
+        variant: Some(proto_common::link::Variant::WorkflowEvent(
+            proto_common::link::WorkflowEvent {
+                namespace: namespace.to_owned(),
+                workflow_id: workflow_id.to_owned(),
+                run_id: run_id.to_owned(),
+                reference: Some(proto_common::link::workflow_event::Reference::RequestIdRef(
+                    proto_common::link::workflow_event::RequestIdReference {
+                        request_id: request_id.to_owned(),
+                        event_type,
+                    },
+                )),
+            },
+        )),
+    }
+}
+
 pub fn start_response_to_proto(
     resp: StartWorkflowExecutionResponse,
     namespace: String,
     workflow_id: String,
 ) -> workflowservice::StartWorkflowExecutionResponse {
-    use proto_common::link::{
-        Variant, WorkflowEvent,
-        workflow_event::{EventReference, Reference, RequestIdReference},
-    };
     let run_id = resp.run_id.0.to_string();
-    // v1.31.0 returns a self-referential response link. For an OnConflictOptions attach that
-    // recorded a WorkflowExecutionOptionsUpdated event, it is a RequestIdRef to that event keyed
-    // by the attaching request id (generateRequestIdRefLink, startworkflow/api.go:833). Otherwise
-    // — a fresh start, a dedup that maps to the original start request, or a plain UseExisting
-    // attach — it is an EventRef to event 1 / WORKFLOW_EXECUTION_STARTED
-    // (generateStartedEventRefLink, startworkflow/api.go:811).
-    let reference = match resp.attached_request_id {
-        Some(request_id) => Reference::RequestIdRef(RequestIdReference {
-            request_id,
-            event_type: tokeira_proto::enums::EventType::WorkflowExecutionOptionsUpdated as i32,
-        }),
-        None => Reference::EventRef(EventReference {
-            event_id: 1,
-            event_type: tokeira_proto::enums::EventType::WorkflowExecutionStarted as i32,
-        }),
-    };
-    let link = proto_common::Link {
-        variant: Some(Variant::WorkflowEvent(WorkflowEvent {
-            namespace,
-            workflow_id,
-            run_id: run_id.clone(),
-            reference: Some(reference),
-        })),
+    let link = match resp.attached_request_id {
+        Some(request_id) => request_id_ref_link(
+            &namespace,
+            &workflow_id,
+            &run_id,
+            &request_id,
+            enums::EventType::WorkflowExecutionOptionsUpdated as i32,
+        ),
+        None => started_event_ref_link(&namespace, &workflow_id, &run_id),
     };
     workflowservice::StartWorkflowExecutionResponse {
         run_id,
+        first_execution_run_id: resp.first_execution_run_id.0.to_string(),
         started: resp.started,
         status: execution_status_to_proto(resp.status),
         link: Some(link),
         eager_workflow_task: resp.eager_workflow_task.map(poll_response_to_proto),
-        ..Default::default()
     }
 }
 
 pub fn signal_response_to_proto(
-    _resp: SignalWorkflowExecutionResponse,
+    resp: SignalWorkflowExecutionResponse,
+    namespace: String,
+    workflow_id: String,
 ) -> workflowservice::SignalWorkflowExecutionResponse {
-    workflowservice::SignalWorkflowExecutionResponse { link: None }
+    // Signal response links are independent of the CHASM backlink recording gate
+    // (service/history/api/signalworkflow/api.go:115-122 @ v1.32.0).
+    workflowservice::SignalWorkflowExecutionResponse {
+        link: resp.run_id.map(|run_id| {
+            request_id_ref_link(
+                &namespace,
+                &workflow_id,
+                &run_id.0.to_string(),
+                &resp.request_id,
+                enums::EventType::WorkflowExecutionSignaled as i32,
+            )
+        }),
+    }
 }
 
 /// Build the proto poll response from the edge DTO.
@@ -4759,12 +4818,21 @@ pub fn signal_with_start_request_to_edge(
 
 pub fn signal_with_start_response_to_proto(
     resp: EdgeSignalWithStartWorkflowExecutionResponse,
+    namespace: String,
+    workflow_id: String,
 ) -> workflowservice::SignalWithStartWorkflowExecutionResponse {
+    let run_id = resp.run_id.0.to_string();
     workflowservice::SignalWithStartWorkflowExecutionResponse {
-        first_execution_run_id: String::new(),
-        run_id: resp.run_id.0.to_string(),
+        first_execution_run_id: resp.first_execution_run_id.0.to_string(),
+        signal_link: Some(request_id_ref_link(
+            &namespace,
+            &workflow_id,
+            &run_id,
+            &resp.request_id,
+            enums::EventType::WorkflowExecutionSignaled as i32,
+        )),
+        run_id,
         started: resp.started,
-        signal_link: None,
     }
 }
 
@@ -4979,6 +5047,9 @@ pub fn proto_command_to_workflow_command(
                 .map(task_queue_to_domain)
                 .unwrap_or_default();
             Ok(WorkflowCommand::ContinueAsNew {
+                backoff_start_interval: proto_duration_to_time(
+                    attrs.backoff_start_interval.as_ref(),
+                ),
                 new_run_id: RunId::new(),
                 workflow_type: WorkflowType(
                     attrs
@@ -5341,6 +5412,7 @@ pub fn workflow_command_to_proto(
             workflow_task_timeout,
             retry_policy,
             initial_versioning_behavior,
+            backoff_start_interval,
             ..
         } => Some(Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(
             command::ContinueAsNewWorkflowExecutionCommandAttributes {
@@ -5351,6 +5423,7 @@ pub fn workflow_command_to_proto(
                     task_queue,
                 )),
                 input: Some(payloads_from_domain(input)),
+                backoff_start_interval: backoff_start_interval.map(to_proto_duration),
                 workflow_run_timeout: workflow_run_timeout.map(to_proto_duration),
                 workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
                 retry_policy: retry_policy.as_ref().map(retry_policy_from_domain),
@@ -5548,8 +5621,11 @@ fn workflow_execution_info_from_description(
             .first_run_id
             .map(|run_id| run_id.0.to_string())
             .unwrap_or_default(),
-        memo: Some(memo_from_domain(&value.memo)),
-        search_attributes: Some(search_attributes_from_domain(&value.search_attributes)),
+        memo: tokeira_proto::conversions::common::filtered_memo_from_domain(&value.memo),
+        search_attributes:
+            tokeira_proto::conversions::common::filtered_search_attributes_from_domain(
+                &value.search_attributes,
+            ),
         auto_reset_points: reset_points_to_proto(&value.auto_reset_points),
         most_recent_worker_version_stamp: value.most_recent_worker_version_stamp.as_ref().map(
             |stamp| proto_common::WorkerVersionStamp {
@@ -6456,6 +6532,14 @@ pub fn update_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "UpdateWorkflowExecutionRequest.request",
         ))?;
+    // Callback validation applies even while registration is disabled
+    // (service/history/workflow/update/update.go:390-395 @ v1.32.0).
+    if !request.completion_callbacks.is_empty() && request.request_id.is_empty() {
+        return Err(ProtoConversionError::InvalidArgument(
+            "invalid *update.Request: request_id is required when completion_callbacks are set"
+                .to_owned(),
+        ));
+    }
     let meta = request.meta.as_ref();
     let input_msg = request.input.as_ref();
 
@@ -6476,6 +6560,7 @@ pub fn update_request_to_edge(
 
     Ok(crate::translate::UpdateWorkflowExecutionRequest {
         namespace: req.namespace,
+        request_id: request.request_id.clone(),
         workflow_id: execution.workflow_id.clone(),
         run_id: non_empty(execution.run_id.clone()),
         first_execution_run_id: non_empty(req.first_execution_run_id),
@@ -6537,6 +6622,8 @@ pub(crate) fn unprocessed_update_failure() -> failure_proto::Failure {
 
 pub fn update_response_to_proto(
     resp: crate::translate::UpdateWorkflowExecutionResponse,
+    namespace: &str,
+    request_id: &str,
 ) -> workflowservice::UpdateWorkflowExecutionResponse {
     use tokeira_proto::public::temporal::api::update::v1 as update;
 
@@ -6566,8 +6653,43 @@ pub fn update_response_to_proto(
         None => None,
     };
 
+    // v1.32.0 selects the workflow link for a completed failure outcome, even
+    // when acceptance preceded the failure; stage and outcome are the public
+    // discriminants (service/history/api/updateworkflow/api.go:278-312 @ v1.32.0).
+    let link = if matches!(
+        resp.stage,
+        crate::translate::UpdateLifecycleStageDto::Completed
+    ) && outcome
+        .as_ref()
+        .is_some_and(|outcome| matches!(&outcome.value, Some(update::outcome::Value::Failure(_))))
+    {
+        Some(proto_common::Link {
+            variant: Some(proto_common::link::Variant::Workflow(
+                proto_common::link::Workflow {
+                    namespace: namespace.to_owned(),
+                    workflow_id: resp.update_ref.workflow_id.clone(),
+                    run_id: resp.update_ref.run_id.clone(),
+                    reason: "Update rejected".to_owned(),
+                },
+            )),
+        })
+    } else if matches!(
+        resp.stage,
+        crate::translate::UpdateLifecycleStageDto::Accepted
+            | crate::translate::UpdateLifecycleStageDto::Completed
+    ) {
+        Some(request_id_ref_link(
+            namespace,
+            &resp.update_ref.workflow_id,
+            &resp.update_ref.run_id,
+            request_id,
+            enums::EventType::WorkflowExecutionUpdateAccepted as i32,
+        ))
+    } else {
+        None
+    };
     workflowservice::UpdateWorkflowExecutionResponse {
-        link: None,
+        link,
         update_ref: Some(update::UpdateRef {
             workflow_execution: Some(proto_common::WorkflowExecution {
                 workflow_id: resp.update_ref.workflow_id,
@@ -6792,6 +6914,8 @@ pub fn multi_operation_request_to_edge(
 /// workflow_handler.go:863-895 @ v1.31.0).
 pub fn multi_operation_response_to_proto(
     resp: EdgeExecuteMultiOperationResponse,
+    namespace: &str,
+    update_request_id: &str,
 ) -> workflowservice::ExecuteMultiOperationResponse {
     use workflowservice::execute_multi_operation_response::{
         Response, response::Response as ResponseVariant,
@@ -6803,13 +6927,15 @@ pub fn multi_operation_response_to_proto(
                 response: Some(ResponseVariant::StartWorkflow(
                     workflowservice::StartWorkflowExecutionResponse {
                         run_id: resp.run_id.0.to_string(),
+                        first_execution_run_id: resp.first_execution_run_id.0.to_string(),
+                        link: Some(started_event_ref_link(
+                            namespace,
+                            &resp.update.update_ref.workflow_id,
+                            &resp.run_id.0.to_string(),
+                        )),
                         started: resp.started,
-                        // `status` reflects the target run's current state —
-                        // load-bearing on the dedup/attach/already-completed
-                        // paths (proto StartWorkflowExecutionResponse.status
-                        // doc; multioperation/api.go @ v1.31.0). No response
-                        // link: the multi-op start response carries only
-                        // RunId/Started/Status.
+                        // Running-workflow links reference the resolved run's start
+                        // (service/history/api/multioperation/api.go:334-339 @ v1.32.0).
                         status: execution_status_to_proto(resp.status),
                         ..Default::default()
                     },
@@ -6821,6 +6947,8 @@ pub fn multi_operation_response_to_proto(
                 // AcceptedRunClosed server-authored failure).
                 response: Some(ResponseVariant::UpdateWorkflow(update_response_to_proto(
                     resp.update,
+                    namespace,
+                    update_request_id,
                 ))),
             },
         ],
@@ -8996,6 +9124,34 @@ mod tests {
         ]
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        // Feature: v132-lifecycle-fidelity, Property 10: nil-map omission
+        // Describe applies the same snapshot omission as start/continue/child
+        // history (common/payload/payload.go:84-126 @ v1.32.0).
+        #[test]
+        fn describe_omits_all_nil_maps(values in prop::collection::vec(any::<bool>(), 0..20)) {
+            let mut description = description_with_versioning(&VersioningProjectionCase { versioning_info: None, worker_deployment_name: None });
+            let mut expected = Vec::new();
+            for (index, live) in values.into_iter().enumerate() {
+                let key = format!("key-{index}");
+                description.memo.0.insert(key.clone(), tokeira_types::Payload::new(if live { b"value".to_vec() } else { b"null".to_vec() }));
+                description.search_attributes.0.insert(key.clone(), tokeira_types::SearchAttrValue::KeywordList(if live { vec!["value".into()] } else { Vec::new() }));
+                if live { expected.push(key); }
+            }
+            expected.sort();
+            let info = describe_response_to_proto(description).workflow_execution_info.unwrap();
+            prop_assert_eq!(info.memo.is_none(), expected.is_empty());
+            prop_assert_eq!(info.search_attributes.is_none(), expected.is_empty());
+            if let (Some(memo), Some(search)) = (info.memo, info.search_attributes) {
+                let mut memo_keys = memo.fields.keys().cloned().collect::<Vec<_>>(); memo_keys.sort();
+                let mut search_keys = search.indexed_fields.keys().cloned().collect::<Vec<_>>(); search_keys.sort();
+                prop_assert_eq!(&memo_keys, &expected);
+                prop_assert_eq!(&search_keys, &expected);
+            }
+        }
+    }
+
     fn description_with_versioning(
         case: &VersioningProjectionCase,
     ) -> WorkflowExecutionDescription {
@@ -10157,6 +10313,8 @@ mod tests {
                 message: "Workflow execution is already running. WorkflowId: wf, RunId: r."
                     .to_string(),
                 run_id: "run-123".to_string(),
+                first_execution_run_id: "chain-123".to_string(),
+                start_request_id: "start-123".to_string(),
             },
         ));
         assert_eq!(status.code(), Code::AlreadyExists);
@@ -10235,9 +10393,10 @@ mod tests {
         use workflowservice::execute_multi_operation_response::response::Response as ResponseVariant;
 
         let run_id = tokeira_types::RunId::new();
-        let resp =
-            multi_operation_response_to_proto(crate::translate::ExecuteMultiOperationResponse {
+        let resp = multi_operation_response_to_proto(
+            crate::translate::ExecuteMultiOperationResponse {
                 run_id,
+                first_execution_run_id: run_id,
                 started: false,
                 status: ExecutionStatus::Completed,
                 update: crate::translate::UpdateWorkflowExecutionResponse {
@@ -10252,7 +10411,10 @@ mod tests {
                         result: Payloads::default(),
                     }),
                 },
-            });
+            },
+            "default",
+            "update-request",
+        );
 
         assert_eq!(resp.responses.len(), 2);
         match resp.responses[0].response.as_ref().expect("start response") {
@@ -10382,3 +10544,7 @@ mod tests {
         overrides.clear(FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY);
     }
 }
+
+#[cfg(test)]
+#[path = "fidelity_properties.rs"]
+mod fidelity_tests;

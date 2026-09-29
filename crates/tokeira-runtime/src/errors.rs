@@ -181,6 +181,13 @@ pub struct ConsistentQueryBufferExceeded;
 #[error("workflow update was aborted by closing workflow")]
 pub struct UpdateAbortedByClosingWorkflow;
 
+/// A second closing abort exhausted the one server-side update-with-start retry.
+/// The wire code is ABORTED with the original closing-abort message
+/// (`service/history/api/multioperation/api.go:154-158 @ v1.32.0`).
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("workflow update was aborted by closing workflow")]
+pub struct UpdateWithStartRetryExhausted;
+
 /// A worker completion referenced an update the server does not know and the
 /// message carried no resurrect payload. The workflow task was already failed
 /// with cause `BadUpdateWorkflowExecutionMessage`; the completion call

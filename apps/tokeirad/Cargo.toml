@@ -65,7 +65,7 @@ tokeira-storage = { path = "../../crates/tokeira-storage", features = ["dsql"] }
 tokeira-types = { path = "../../crates/tokeira-types" }
 tokeira-conformance-control = { workspace = true, optional = true }
 tokeira-conformance = { workspace = true, optional = true }
-connectrpc = { version = "0.8.1", features = ["server"], optional = true }
+connectrpc = { version = "0.9.1", features = ["server"], optional = true }
 http = "1"
 
 [features]

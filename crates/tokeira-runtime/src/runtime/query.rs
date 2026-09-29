@@ -409,7 +409,17 @@ where
                     .await;
             }
             Err(error) => {
-                self.update_registry.remove(run_key, &update_id);
+                if let Some(exceeded) = error.downcast_ref::<crate::UpdateLimitExceeded>() {
+                    self.update_registry.notify(
+                        run_key,
+                        &update_id,
+                        UpdateResolution::AdmissionLimitExceeded {
+                            limit: exceeded.limit,
+                        },
+                    );
+                } else {
+                    self.update_registry.remove(run_key, &update_id);
+                }
                 return Err(error);
             }
         };
@@ -592,6 +602,9 @@ where
             // server-authored completed-before failure.
             Ok(Ok(UpdateResolution::AbortedByClosingWorkflow)) => {
                 Err(crate::errors::UpdateAbortedByClosingWorkflow.into())
+            }
+            Ok(Ok(UpdateResolution::AdmissionLimitExceeded { limit })) => {
+                Err(crate::UpdateLimitExceeded { limit }.into())
             }
             Ok(Ok(UpdateResolution::WorkflowContinuing)) => {
                 Err(crate::errors::WorkflowClosing.into())

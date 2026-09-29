@@ -32,10 +32,12 @@ impl AdminServiceGrpc {
         Self { inner }
     }
 
-    pub fn into_service(self) -> AdminServiceServer<Self> {
-        AdminServiceServer::new(self)
-            .accept_compressed(CompressionEncoding::Gzip)
-            .send_compressed(CompressionEncoding::Gzip)
+    pub fn into_service(self) -> super::status_limit::StatusMessageLimit<AdminServiceServer<Self>> {
+        super::status_limit::StatusMessageLimit::new(
+            AdminServiceServer::new(self)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Gzip),
+        )
     }
 }
 

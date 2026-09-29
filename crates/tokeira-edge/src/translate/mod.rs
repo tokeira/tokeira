@@ -11,7 +11,7 @@
 //! - [`history_serializer`] — kernel `HistoryEvent` → proto history event
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     time::Duration,
 };
 
@@ -224,6 +224,8 @@ pub struct StartWorkflowExecutionRequest {
 pub struct StartWorkflowExecutionResponse {
     pub run_key: RunKey,
     pub run_id: RunId,
+    /// Chain head of the resolved execution.
+    pub first_execution_run_id: RunId,
     pub transition_seq: u64,
     pub last_event_id: i64,
     pub started: bool,
@@ -258,6 +260,10 @@ pub struct SignalWorkflowExecutionResponse {
     pub accepted: bool,
     pub transition_seq: u64,
     pub last_event_id: i64,
+    /// Resolved workflow run; absent for deployment-registry entity signals.
+    pub run_id: Option<RunId>,
+    /// Effective id used for signal deduplication and the response backlink.
+    pub request_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -343,6 +349,9 @@ pub struct RespondWorkflowTaskCompletedRequest {
     pub worker_instance_key: String,
     pub worker_control_task_queue: String,
     pub commands: Vec<WorkflowCommand>,
+    /// Activity commands opting into the completing workflow's compatible build.
+    /// This controls inline delivery only and does not enter kernel history.
+    pub eager_use_workflow_build_id: HashSet<String>,
     pub return_new_workflow_task: bool,
     pub force_create_new_workflow_task: bool,
     pub query_results: HashMap<String, QueryResultDto>,
@@ -460,7 +469,8 @@ pub struct WorkflowExecutionDescription {
     /// Most recent structured worker-version stamp from a completed WFT.
     pub most_recent_worker_version_stamp: Option<tokeira_kernel::WorkerVersionStamp>,
     /// Per-request → authoring-event map for `WorkflowExtendedInfo.request_id_infos`
-    /// (the start request → STARTED, each UseExisting attach → OPTIONS_UPDATED).
+    /// (starts → STARTED, UseExisting attaches → OPTIONS_UPDATED, and enabled
+    /// signal backlinks → SIGNALED, possibly buffered).
     pub request_id_infos: std::collections::BTreeMap<String, tokeira_kernel::RequestIdInfo>,
     /// Count of external-payload references across the run's history
     /// (`executionStats.ExternalPayloadCount` surfaced by Describe,
@@ -979,6 +989,8 @@ pub struct UpdateWorkflowExecutionRequest {
     pub input: Payloads,
     pub wait_policy: UpdateWaitPolicyDto,
     pub timeout: Duration,
+    /// Caller-supplied update request identity for response links.
+    pub request_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1128,7 +1140,11 @@ pub struct SignalWithStartWorkflowExecutionRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SignalWithStartWorkflowExecutionResponse {
     pub run_id: RunId,
+    /// Chain head of the resolved execution.
+    pub first_execution_run_id: RunId,
     pub started: bool,
+    /// Effective signal request id, including a server-generated id when omitted.
+    pub request_id: String,
 }
 
 /// Edge request for `ExecuteMultiOperation` — exactly the Update-with-Start
@@ -1161,6 +1177,8 @@ pub struct ExecuteMultiOperationRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecuteMultiOperationResponse {
     pub run_id: RunId,
+    /// Chain head of the resolved execution.
+    pub first_execution_run_id: RunId,
     /// Whether the start leg created a new run (false on attach/dedup/replay
     /// paths — `multioperation/api.go @ v1.31.0`).
     pub started: bool,

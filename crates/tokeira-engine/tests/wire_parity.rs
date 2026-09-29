@@ -448,6 +448,8 @@ fn decision(entry: &Value) -> Value {
 }
 
 // Feature: tonic-0-14-grpc-stack, Property 2: status parity across transports
+// Already-started details include the original start request and chain head
+// (service/history/api/workflow_id_dedup.go:238-256 @ v1.32.0).
 #[tokio::test]
 async fn status_catalogue_matches_the_golden_on_every_surface() -> Result<()> {
     let surfaces = Surfaces::start().await?;

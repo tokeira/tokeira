@@ -241,7 +241,7 @@ impl MembershipClient {
                     };
                     // Work directly with the zero-copy view — only allocate
                     // when storing data (lease operations need owned strings).
-                    self.handle_directive_view(&directive).await?;
+                    self.handle_directive_view(directive.view()).await?;
                 }
             }
         }

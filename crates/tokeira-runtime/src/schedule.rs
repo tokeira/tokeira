@@ -1419,7 +1419,9 @@ where
             }),
             start_workflow_status: WorkflowExecutionStatus::Running,
         },
-        Ok(StartWorkflowResult::UsedExisting { run_key, run_id })
+        Ok(StartWorkflowResult::UsedExisting {
+            run_key, run_id, ..
+        })
         | Ok(StartWorkflowResult::Rejected {
             run_key, run_id, ..
         }) => ScheduleActionResult {

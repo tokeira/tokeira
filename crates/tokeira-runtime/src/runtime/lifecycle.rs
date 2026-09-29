@@ -46,6 +46,34 @@ struct StartCommitOutcome {
     eager_workflow_task: Option<StartedWorkflowTask>,
 }
 
+fn update_only_closing_abort(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<MultiOperationError>(),
+        Some(MultiOperationError::UpdateFailed { started: false, source })
+        if source.is::<crate::UpdateAbortedByClosingWorkflow>())
+}
+
+async fn retry_closing_update<T, F, Fut>(mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    // Re-execute the complete operation only when it did not create a run;
+    // recreating an already-started run would duplicate the caller's mutation
+    // (service/history/api/multioperation/api.go:126-180 @ v1.32.0).
+    match operation().await {
+        Err(error) if update_only_closing_abort(&error) => {}
+        result => return result,
+    }
+    match operation().await {
+        Err(error) if update_only_closing_abort(&error) => Err(MultiOperationError::UpdateFailed {
+            started: false,
+            source: crate::UpdateWithStartRetryExhausted.into(),
+        }
+        .into()),
+        result => result,
+    }
+}
+
 impl<R> TokeiraRuntime<R>
 where
     R: RunRepository + 'static,
@@ -252,6 +280,9 @@ where
                             return Ok(StartWorkflowResult::Started {
                                 run_key: request.run_key,
                                 run_id: request.run_id,
+                                first_execution_run_id: new_state
+                                    .first_execution_run_id
+                                    .unwrap_or(new_state.run_id),
                                 mutation_metadata: mutation_metadata(&new_state),
                                 eager_workflow_task,
                             });
@@ -270,14 +301,22 @@ where
                         CommitResult::CurrentExecutionConflict { .. } => continue,
                     }
                 }
-                ConflictResolution::UseExisting { run_key, run_id } => {
+                ConflictResolution::UseExisting {
+                    run_key,
+                    run_id,
+                    first_execution_run_id,
+                } => {
                     self.apply_start_on_conflict_options(
                         run_key,
                         &request,
                         completion_callback_limit,
                     )
                     .await?;
-                    return Ok(StartWorkflowResult::UsedExisting { run_key, run_id });
+                    return Ok(StartWorkflowResult::UsedExisting {
+                        run_key,
+                        run_id,
+                        first_execution_run_id,
+                    });
                 }
                 ConflictResolution::TerminateAndStart { run_key } => {
                     self.terminate_existing_for_conflict(
@@ -296,6 +335,9 @@ where
                             return Ok(StartWorkflowResult::Started {
                                 run_key: request.run_key,
                                 run_id: request.run_id,
+                                first_execution_run_id: new_state
+                                    .first_execution_run_id
+                                    .unwrap_or(new_state.run_id),
                                 mutation_metadata: mutation_metadata(&new_state),
                                 eager_workflow_task,
                             });
@@ -316,17 +358,22 @@ where
                 ConflictResolution::Rejected {
                     run_key,
                     run_id,
+                    first_execution_run_id,
+                    start_request_id,
                     reason,
                 } => {
                     return Ok(StartWorkflowResult::Rejected {
                         run_key,
                         run_id,
+                        first_execution_run_id,
+                        start_request_id,
                         reason,
                     });
                 }
                 ConflictResolution::DedupRetried {
                     run_key,
                     run_id,
+                    first_execution_run_id,
                     execution_status,
                 } => {
                     let eager_workflow_task = self
@@ -335,6 +382,7 @@ where
                     return Ok(StartWorkflowResult::Deduped {
                         run_key,
                         run_id,
+                        first_execution_run_id,
                         execution_status,
                         eager_workflow_task,
                     });
@@ -485,6 +533,33 @@ where
         update_timeout: Duration,
         wait_policy: UpdateWaitPolicy,
     ) -> Result<MultiOperationResult> {
+        retry_closing_update(|| {
+            self.execute_multi_operation_once(
+                request.clone(),
+                update_id.clone(),
+                update_name.clone(),
+                update_input.clone(),
+                update_request.clone(),
+                update_timeout,
+                wait_policy.clone(),
+            )
+        })
+        .await
+    }
+
+    // Keep one attempt's inputs identical to the public operation so its bounded
+    // retry repeats both legs with the same idempotency identifiers.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_multi_operation_once(
+        &self,
+        request: StartRequest,
+        update_id: String,
+        update_name: String,
+        update_input: Payloads,
+        update_request: RequestContext,
+        update_timeout: Duration,
+        wait_policy: UpdateWaitPolicy,
+    ) -> Result<MultiOperationResult> {
         let current = ExecutionRef {
             namespace_id: request.namespace_id,
             workflow_id: request.workflow_id.clone(),
@@ -525,6 +600,7 @@ where
             return Ok(MultiOperationResult {
                 run_key,
                 run_id,
+                first_execution_run_id: state.first_execution_run_id.unwrap_or(run_id),
                 started: false,
                 execution_status,
                 update,
@@ -586,9 +662,16 @@ where
                         None => continue,
                     }
                 }
-                ConflictResolution::UseExisting { run_key, run_id }
+                ConflictResolution::UseExisting {
+                    run_key,
+                    run_id,
+                    first_execution_run_id,
+                }
                 | ConflictResolution::DedupRetried {
-                    run_key, run_id, ..
+                    run_key,
+                    run_id,
+                    first_execution_run_id,
+                    ..
                 } => {
                     let execution = ExecutionRef {
                         namespace_id: request.namespace_id,
@@ -613,6 +696,7 @@ where
                     return Ok(MultiOperationResult {
                         run_key,
                         run_id,
+                        first_execution_run_id,
                         started: false,
                         execution_status: ExecutionStatus::Running,
                         update,
@@ -621,11 +705,15 @@ where
                 ConflictResolution::Rejected {
                     run_key,
                     run_id,
+                    first_execution_run_id,
+                    start_request_id,
                     reason,
                 } => {
                     return Err(MultiOperationError::StartRejected {
                         run_key,
                         run_id,
+                        first_execution_run_id,
+                        start_request_id,
                         reason,
                     }
                     .into());
@@ -687,6 +775,13 @@ where
             }
             Err(error) => {
                 self.update_registry.remove(request.run_key, update_id);
+                if error.is::<crate::UpdateLimitExceeded>() {
+                    return Err(MultiOperationError::UpdateFailed {
+                        started: false,
+                        source: error,
+                    }
+                    .into());
+                }
                 return Err(error);
             }
         }
@@ -712,6 +807,7 @@ where
         Ok(Some(MultiOperationResult {
             run_key: request.run_key,
             run_id: request.run_id,
+            first_execution_run_id: request.first_execution_run_id.unwrap_or(request.run_id),
             started: true,
             execution_status: ExecutionStatus::Running,
             update,
@@ -741,6 +837,9 @@ where
                     CommitResult::Applied { .. } => Ok(SignalWithStartResult::Started {
                         run_key: request.run_key,
                         run_id: request.run_id,
+                        first_execution_run_id: request
+                            .first_execution_run_id
+                            .unwrap_or(request.run_id),
                     }),
                     // A duplicate here means THIS run already accepted this
                     // request id (the dedupe table is run-scoped) — a redriven
@@ -750,6 +849,9 @@ where
                     CommitResult::Duplicate => Ok(SignalWithStartResult::Started {
                         run_key: request.run_key,
                         run_id: request.run_id,
+                        first_execution_run_id: request
+                            .first_execution_run_id
+                            .unwrap_or(request.run_id),
                     }),
                     CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
                     CommitResult::CurrentExecutionConflict {
@@ -759,7 +861,11 @@ where
                     )),
                 }
             }
-            ConflictResolution::UseExisting { run_key, run_id } => {
+            ConflictResolution::UseExisting {
+                run_key,
+                run_id,
+                first_execution_run_id,
+            } => {
                 let execution = ExecutionRef {
                     namespace_id: request.namespace_id,
                     workflow_id: request.workflow_id.clone(),
@@ -780,7 +886,11 @@ where
                     .await?
                 {
                     CommitResult::Applied { .. } | CommitResult::Duplicate => {
-                        Ok(SignalWithStartResult::Signaled { run_key, run_id })
+                        Ok(SignalWithStartResult::Signaled {
+                            run_key,
+                            run_id,
+                            first_execution_run_id,
+                        })
                     }
                     CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
                     CommitResult::CurrentExecutionConflict {
@@ -805,6 +915,9 @@ where
                     CommitResult::Applied { .. } => Ok(SignalWithStartResult::Started {
                         run_key: request.run_key,
                         run_id: request.run_id,
+                        first_execution_run_id: request
+                            .first_execution_run_id
+                            .unwrap_or(request.run_id),
                     }),
                     // A duplicate here means THIS run already accepted this
                     // request id (the dedupe table is run-scoped) — a redriven
@@ -814,6 +927,9 @@ where
                     CommitResult::Duplicate => Ok(SignalWithStartResult::Started {
                         run_key: request.run_key,
                         run_id: request.run_id,
+                        first_execution_run_id: request
+                            .first_execution_run_id
+                            .unwrap_or(request.run_id),
                     }),
                     CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
                     CommitResult::CurrentExecutionConflict {
@@ -826,17 +942,28 @@ where
             ConflictResolution::Rejected {
                 run_key,
                 run_id,
+                first_execution_run_id,
+                start_request_id,
                 reason,
             } => Ok(SignalWithStartResult::Rejected {
                 run_key,
                 run_id,
+                first_execution_run_id,
+                start_request_id,
                 reason,
             }),
             // A retried signal-with-start whose RequestId authored the incumbent's start is
             // idempotent: return the existing run (mirrors the start dedup path, api.go:332).
             ConflictResolution::DedupRetried {
-                run_key, run_id, ..
-            } => Ok(SignalWithStartResult::Started { run_key, run_id }),
+                run_key,
+                run_id,
+                first_execution_run_id,
+                ..
+            } => Ok(SignalWithStartResult::Started {
+                run_key,
+                run_id,
+                first_execution_run_id,
+            }),
         }
     }
 
@@ -1536,6 +1663,34 @@ where
     /// check uses `find_latest_run`; both reload the run because the pointer can
     /// race a just-closed run, and the status read must come from authoritative
     /// state, not the index.
+    async fn start_request_id_for_run(
+        &self,
+        state: &tokeira_kernel::WorkflowState,
+    ) -> Result<String> {
+        if let Some((id, _)) = state.request_id_infos.iter().find(|(_, info)| {
+            info.event_type == tokeira_kernel::EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
+        }) {
+            return Ok(id.clone());
+        }
+        // Signal-with-start uses one request id for two events. Describe's
+        // signal projection can replace that map entry, so event 1 remains the
+        // authority for start deduplication and already-started details
+        // (service/history/api/workflow_id_dedup.go:238-256; service/history/api/describeworkflow/api.go:295-306 @ v1.32.0).
+        Ok(self
+            .repo
+            .read_history(state.run_key, 0, 1)
+            .await?
+            .first()
+            .and_then(|event| match &event.kind {
+                HistoryEventKind::WorkflowExecutionStarted { request_id, .. }
+                | HistoryEventKind::WorkflowExecutionStartedV2 { request_id, .. } => {
+                    Some(request_id.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default())
+    }
+
     async fn resolve_conflict(
         &self,
         namespace_id: NamespaceId,
@@ -1553,16 +1708,18 @@ where
             let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
                 return Ok(ConflictResolution::Absent);
             };
+            let start_request_id = self.start_request_id_for_run(&state).await?;
             if state.status.is_open() {
                 // v1.31.0 handleConflict (startworkflow/api.go:328-336): a retried start whose
                 // RequestId already authored this run's WorkflowExecutionStarted is deduped to the
                 // incumbent BEFORE any conflict policy applies.
-                if let Some(info) = state.request_id_infos.get(request_id)
-                    && info.event_type == tokeira_kernel::EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
-                {
+                if !request_id.is_empty() && start_request_id == request_id {
                     return Ok(ConflictResolution::DedupRetried {
                         run_key,
                         run_id: state.run_id,
+                        first_execution_run_id: state
+                            .first_execution_run_id
+                            .unwrap_or(state.run_id),
                         execution_status: state.status,
                     });
                 }
@@ -1570,11 +1727,18 @@ where
                     WorkflowIdConflictPolicy::Fail => ConflictResolution::Rejected {
                         run_key,
                         run_id: state.run_id,
+                        first_execution_run_id: state
+                            .first_execution_run_id
+                            .unwrap_or(state.run_id),
+                        start_request_id: start_request_id.clone(),
                         reason: StartRejectReason::ConflictPolicyFail,
                     },
                     WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting {
                         run_key,
                         run_id: state.run_id,
+                        first_execution_run_id: state
+                            .first_execution_run_id
+                            .unwrap_or(state.run_id),
                     },
                     WorkflowIdConflictPolicy::TerminateExisting => {
                         ConflictResolution::TerminateAndStart { run_key }
@@ -1589,13 +1753,13 @@ where
         let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
             return Ok(ConflictResolution::Absent);
         };
+        let start_request_id = self.start_request_id_for_run(&state).await?;
         if state.status.is_open() {
-            if let Some(info) = state.request_id_infos.get(request_id)
-                && info.event_type == tokeira_kernel::EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
-            {
+            if !request_id.is_empty() && start_request_id == request_id {
                 return Ok(ConflictResolution::DedupRetried {
                     run_key,
                     run_id: state.run_id,
+                    first_execution_run_id: state.first_execution_run_id.unwrap_or(state.run_id),
                     execution_status: state.status,
                 });
             }
@@ -1603,11 +1767,14 @@ where
                 WorkflowIdConflictPolicy::Fail => ConflictResolution::Rejected {
                     run_key,
                     run_id: state.run_id,
+                    first_execution_run_id: state.first_execution_run_id.unwrap_or(state.run_id),
+                    start_request_id: start_request_id.clone(),
                     reason: StartRejectReason::ConflictPolicyFail,
                 },
                 WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting {
                     run_key,
                     run_id: state.run_id,
+                    first_execution_run_id: state.first_execution_run_id.unwrap_or(state.run_id),
                 },
                 WorkflowIdConflictPolicy::TerminateExisting => {
                     ConflictResolution::TerminateAndStart { run_key }
@@ -1623,12 +1790,11 @@ where
         // signal_with_start_workflow.go:264-266 @ v1.31.0). Without this, a
         // network-retried start after a fast-closing first run would silently
         // create a second run.
-        if let Some(info) = state.request_id_infos.get(request_id)
-            && info.event_type == tokeira_kernel::EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
-        {
+        if !request_id.is_empty() && start_request_id == request_id {
             return Ok(ConflictResolution::DedupRetried {
                 run_key,
                 run_id: state.run_id,
+                first_execution_run_id: state.first_execution_run_id.unwrap_or(state.run_id),
                 execution_status: state.status,
             });
         }
@@ -1653,6 +1819,10 @@ where
                     ConflictResolution::Rejected {
                         run_key,
                         run_id: state.run_id,
+                        first_execution_run_id: state
+                            .first_execution_run_id
+                            .unwrap_or(state.run_id),
+                        start_request_id: start_request_id.clone(),
                         reason: StartRejectReason::ReuseAllowFailedOnly,
                     }
                 }
@@ -1660,6 +1830,8 @@ where
             WorkflowIdReusePolicy::RejectDuplicate => ConflictResolution::Rejected {
                 run_key,
                 run_id: state.run_id,
+                first_execution_run_id: state.first_execution_run_id.unwrap_or(state.run_id),
+                start_request_id: start_request_id.clone(),
                 reason: StartRejectReason::ReuseRejectDuplicate,
             },
         })
@@ -1821,7 +1993,7 @@ mod tests {
         SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
     };
 
-    fn deletion_start_request() -> StartRequest {
+    pub(super) fn deletion_start_request() -> StartRequest {
         let now = OffsetDateTime::UNIX_EPOCH;
         let run_id = RunId::new();
         StartRequest {
@@ -1882,7 +2054,7 @@ mod tests {
         }
     }
 
-    fn deletion_runtime(repo: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
+    pub(super) fn deletion_runtime(repo: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         TokeiraRuntime::new(
             repo,
             1,
@@ -2038,3 +2210,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle_properties.rs"]
+mod fidelity_tests;

@@ -1942,6 +1942,11 @@ pub enum WorkflowCommand {
         /// The kernel commits it with the predecessor close event.
         #[serde(default)]
         successor_versioning_info: Option<WorkflowVersioningInfo>,
+        /// Requested delay, preserved on the close event; successor dispatch
+        /// separately enforces the minimum interval between runs
+        /// (`historybuilder/event_factory.go:491 @ v1.32.0`). Appended for postcard.
+        #[serde(default)]
+        backoff_start_interval: Option<Duration>,
     },
     /// Cancel the workflow (cooperative cancellation
     /// completed). Closes the run.

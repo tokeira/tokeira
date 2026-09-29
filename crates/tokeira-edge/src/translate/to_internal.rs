@@ -984,6 +984,7 @@ mod tests {
             worker_instance_key: String::new(),
             worker_control_task_queue: String::new(),
             client_discards_speculative_with_events: false,
+            eager_use_workflow_build_id: Default::default(),
             commands: Vec::new(),
             return_new_workflow_task: false,
             force_create_new_workflow_task: false,

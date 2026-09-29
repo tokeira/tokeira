@@ -1177,7 +1177,23 @@ where
                                         // successor queue and committed it in
                                         // `successor_versioning_info`.
                                         versioning_override: None,
-                                        workflow_start_delay: backoff_start_interval,
+                                        // Requested CAN backoff remains unchanged in the close
+                                        // event; only successor dispatch is raised to the minimum
+                                        // interval (service/history/workflow/mutable_state_impl.go:2786,2868-2894 @ v1.32.0).
+                                        workflow_start_delay: if initiator
+                                            == tokeira_kernel::ContinueAsNewInitiator::Workflow
+                                        {
+                                            tokeira_kernel::continue_as_new_min_backoff(
+                                                backoff_start_interval,
+                                                new_state.closed_at.unwrap_or(new_state.started_at)
+                                                    - (new_state.started_at
+                                                        + new_state
+                                                            .workflow_start_delay
+                                                            .unwrap_or(time::Duration::ZERO)),
+                                            )
+                                        } else {
+                                            backoff_start_interval
+                                        },
                                         // Temporal carries completion callbacks
                                         // and priority into continue-as-new start
                                         // requests so run-chain completion and
@@ -1506,11 +1522,22 @@ where
                 loaded
             }
         };
-        let transition = transition_span.in_scope(|| {
+        if crate::update_admission::check_admission(
+            repo,
+            &loaded,
+            &command,
+            crate::update_admission::total_updates_limit(),
+        )
+        .await?
+        {
+            return Ok((CommitResult::Duplicate, SmallVec::new(), SmallVec::new()));
+        }
+        let mut transition = transition_span.in_scope(|| {
             kernel
-                .apply(loaded, command.clone())
+                .apply(loaded.clone(), command.clone())
                 .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))
         })?;
+        crate::signal_backlinks::record(repo, &loaded, &command, &mut transition).await?;
         transition_span.record("tokeira.run_id", transition.next_state.run_id.0.to_string());
         transition_span.record(
             "tokeira.workflow_type",

@@ -161,19 +161,37 @@ pub fn search_attributes_to_domain(
     ))
 }
 
-/// Return whether a payload carries Temporal's memo/search-attribute deletion
-/// sentinel (`json/plain` null or empty-list).
+/// Return whether payload data is a Temporal nil sentinel, irrespective of encoding.
 ///
 /// Starts filter these values; workflow-task upserts retain the distinction as
 /// a per-key clear operation (`common/payload/payload.go @ v1.31.0`).
 pub fn is_temporal_nil_payload(value: &common::Payload) -> bool {
-    let encoding = value.metadata.get("encoding").map(Vec::as_slice);
-    // Temporal filters JSON null and empty-list payloads from memo/search
-    // attributes before writing start history, so client-side nil values do not
-    // become validation errors (`common/payload/payload.go:94 @ v1.31.0`).
-    matches!(encoding, Some(b"binary/null"))
-        || (matches!(encoding, Some(b"json/plain"))
-            && matches!(value.data.as_slice(), b"null" | b"[]"))
+    // Metadata does not participate in this predicate: even opaque payloads
+    // with nil sentinel bytes are removed (common/payload/payload.go:84-94 @ v1.32.0).
+    matches!(value.data.as_slice(), b"" | b"null" | b"[]")
+}
+
+/// Serialize a memo snapshot, omitting the message when all fields are nil.
+/// Patch serialization must retain nil values because they express deletion.
+pub fn filtered_memo_from_domain(value: &Memo) -> Option<common::Memo> {
+    let mut memo = memo_from_domain(value);
+    memo.fields
+        .retain(|_, payload| !is_temporal_nil_payload(payload));
+    // Empty and all-nil maps both become absent (common/payload/payload.go:117-126 @ v1.32.0).
+    (!memo.fields.is_empty()).then_some(memo)
+}
+
+/// Serialize search-attribute snapshots with nil entries and empty maps omitted.
+pub fn filtered_search_attributes_from_domain(
+    value: &DomainSearchAttributes,
+) -> Option<common::SearchAttributes> {
+    let mut attributes = search_attributes_from_domain(value);
+    attributes
+        .indexed_fields
+        .retain(|_, payload| !is_temporal_nil_payload(payload));
+    // This also handles nil values reconstructed from stored state, outside
+    // frontend admission (common/payload/payload.go:101-110 @ v1.32.0).
+    (!attributes.indexed_fields.is_empty()).then_some(attributes)
 }
 
 /// Encode a search-attribute value in the standard Temporal wire format: the

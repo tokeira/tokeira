@@ -292,10 +292,13 @@ link, so that the multi-operation contract matches `1.32.0`.
 
 #### Acceptance Criteria
 
-1. WHEN an update with a new update id is admitted and the count of admitted plus
-   completed updates for the run is at least the Total_Updates_Limit, THE admission
-   SHALL fail `FAILED_PRECONDITION` with the message of `registry.go:445-450 @ v1.32.0`
-   (contains `"limit on the total number of distinct updates in this workflow has been reached"`).
+1. WHEN an update with a new update id is admitted, THE admission SHALL fail
+   `FAILED_PRECONDITION` exactly when the Total_Updates_Limit is non-zero and the
+   count of distinct admitted-plus-completed update ids for the run is at least
+   that limit; zero disables the limit (`service/history/workflow/update/registry.go:438-444
+   @ v1.32.0`). The error message SHALL equal the full formatted string from
+   `registry.go:446-449`, with the limit interpolated; tests SHALL compare the whole
+   text rather than a substring.
 2. WHEN that failure occurs inside `ExecuteMultiOperation`, THE response SHALL be the
    multi-operation error whose first entry is `"Operation was aborted."` and whose
    second entry carries the limit message (`tests/update_workflow_test.go:5809-5812`).
@@ -425,7 +428,9 @@ behaviour, which is now enabled, including its guards.
 
 1. WHEN a gRPC status message exceeds 4000 bytes, THE edge SHALL return
    `TruncateUTF8(message, 4000 − len(suffix)) + "... <truncated>"`
-   (`common/rpc/interceptor/service_error_interceptor.go:17, 54-60 @ v1.32.0`).
+   with at most 4000 bytes, never splitting a code point
+   (`common/util/strings.go:9-20`;
+   `common/rpc/interceptor/service_error_interceptor.go:17, 54-60 @ v1.32.0`).
 2. THE truncation SHALL preserve the status code and error details.
 
 ### Requirement 10: Workflow pause gate and validation

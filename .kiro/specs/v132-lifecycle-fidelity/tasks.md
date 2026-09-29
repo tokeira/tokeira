@@ -6,80 +6,81 @@ property has a required property-based test task. Corpus checkpoints run the nam
 suites on `tokeira/conformance-v1.32.0` three times against `tokeirad` built with
 `--features conformance`.
 
-- [ ] 1. Phase A — execution lineage and response fidelity
-  - [ ] 1.1 Runtime start results carry the chain head
+- [x] 1. Phase A — execution lineage and response fidelity
+  - [x] 1.1 Runtime start results carry the chain head
     - `StartWorkflowResult` and `SignalWithStartResult` gain `first_execution_run_id`
       (and `start_request_id` on the rejected variant), read from the resolved run's
       state; edge DTOs and `EdgeError::WorkflowStartRejected` carry them.
     - _Requirements: 1.1, 1.2, 1.3, 1.6, 1.7_
-  - [ ] 1.2 Emit the chain head on the three proto paths
+  - [x] 1.2 Emit the chain head on the three proto paths
     - Start response, signal-with-start response, and `workflow_already_started_status`
       (also `start_request_id`); multi-operation start leg reuses the DTO.
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6_
-  - [ ] 1.3 Property test: Property 1 — chain head propagates to every start-path outcome
+  - [x] 1.3 Property test: Property 1 — chain head propagates to every start-path outcome
     - Generated lineages (retry, cron, continue-as-new, reset) and start requests;
       reference model = event 1 of the resolved run.
     - Tag: `// Feature: v132-lifecycle-fidelity, Property 1: chain head propagates to every start-path outcome`
     - _Requirements: 1.1–1.6_
-  - [ ] 1.4 Continue-as-new backoff field
+  - [x] 1.4 Continue-as-new backoff field
     - `WorkflowCommand::ContinueAsNew.backoff_start_interval` (serde default, last);
-      edge fills it; kernel passes it to `continue_as_new_min_backoff`.
+      edge fills it; kernel preserves it in the close event; runtime calls the pure
+      `continue_as_new_min_backoff` helper when constructing the successor delay.
     - _Requirements: 2.1, 2.2, 2.3, 2.4_
-  - [ ] 1.5 Property test: Property 2 — continue-as-new backoff arithmetic
+  - [x] 1.5 Property test: Property 2 — continue-as-new backoff arithmetic
     - Tag: `// Feature: v132-lifecycle-fidelity, Property 2: continue-as-new backoff arithmetic`
     - _Requirements: 2.1, 2.2, 2.3_
-  - [ ] 1.6 Total-updates limit at admission
+  - [x] 1.6 Total-updates limit at admission
     - Distinct-update counter per run against the `history.maxTotalUpdates` consult
       site; exact message; retried requests do not count; multi-operation error shape.
     - _Requirements: 3.1, 3.2, 3.6_
-  - [ ] 1.7 Update-with-start retry-once and running-workflow leg
+  - [x] 1.7 Update-with-start retry-once and running-workflow leg
     - Re-execute once on a closing abort with no started run; `ABORTED` on the second;
       running leg `started = false`, `status = RUNNING`, Started_Event_Ref_Link.
     - _Requirements: 3.3, 3.4, 3.5_
-  - [ ] 1.8 Property tests: Property 3, Property 4, Property 5
+  - [x] 1.8 Property tests: Property 3, Property 4, Property 5
     - Tags: `// Feature: v132-lifecycle-fidelity, Property 3: total-updates limit at admission`,
       `… Property 4: update-with-start re-executes once on a closing abort`,
       `… Property 5: running-workflow start leg`
     - _Requirements: 3.1–3.6_
-  - [ ] 1.9 Link constructors and response links
+  - [x] 1.9 Link constructors and response links
     - `started_event_ref_link`, `request_id_ref_link`; update response link by
       outcome; signal and signal-with-start links; query link stays unset.
     - _Requirements: 4.1, 4.2, 4.3, 5.1, 5.2, 5.3_
-  - [ ] 1.10 Request links onto produced events
+  - [x] 1.10 Request links onto produced events
     - Start, signal, cancel-requested, terminated events carry the request's `links`.
     - _Requirements: 5.4_
-  - [ ] 1.11 Signal request-id infos behind the backlinks override
+  - [x] 1.11 Signal request-id infos behind the backlinks override
     - Runtime records signal request ids (buffered → event id) when
       `history.enableCHASMSignalBacklinks` is on; reset rebuilds them; the bridge
       wires the key; ledger amended (task 5.2).
     - _Requirements: 5.5, 5.6, 5.7_
-  - [ ] 1.12 Property tests: Property 6, Property 7, Property 8, Property 9
+  - [x] 1.12 Property tests: Property 6, Property 7, Property 8, Property 9
     - Tags: `… Property 6: update response link by outcome`, `… Property 7: signal links are unconditional and idempotent`,
       `… Property 8: request links land on the produced event`, `… Property 9: signal request-id infos follow the override`
     - _Requirements: 4.1, 4.2, 5.1–5.7_
-  - [ ] 1.13 Nil-map omission and predicate alignment
+  - [x] 1.13 Nil-map omission and predicate alignment
     - `is_temporal_nil_payload` per `isNilPayload`; `None` for empty filtered maps on
       start, continue-as-new, child-start events and describe.
     - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5_
-  - [ ] 1.14 Property test: Property 10 — nil-map omission
+  - [x] 1.14 Property test: Property 10 — nil-map omission
     - Tag: `… Property 10: nil-map omission`
     - _Requirements: 6.1–6.5_
-  - [ ] 1.15 Update callbacks precondition
+  - [x] 1.15 Update callbacks precondition
     - Exact `INVALID_ARGUMENT` message; callbacks otherwise ignored; reassign the SDK
       dedup leaf to D5 in the findings owner table.
     - _Requirements: 7.1, 7.2, 7.3_
-  - [ ] 1.16 Eager dispatch guards
+  - [x] 1.16 Eager dispatch guards
     - Remove the per-response cap; paused-workflow and versioned-routing guards;
       retry policy on the inline task.
     - _Requirements: 8.1, 8.2, 8.3_
-  - [ ] 1.17 Status truncation
+  - [x] 1.17 Status truncation
     - UTF-8-safe truncation at 4000 bytes with the `"... <truncated>"` suffix.
     - _Requirements: 9.1, 9.2_
-  - [ ] 1.18 Property tests: Property 11, Property 12, Property 20
+  - [x] 1.18 Property tests: Property 11, Property 12, Property 20
     - Tags: `… Property 11: callback precondition`, `… Property 12: status message truncation`,
       `… Property 20: eager dispatch guards`
     - _Requirements: 7.1, 7.2, 9.1, 9.2, 8.1–8.3_
-  - [ ] 1.19 Checkpoint: bar green; corpus `TestWorkflowTestSuite`,
+  - [x] 1.19 Checkpoint: bar green; corpus `TestWorkflowTestSuite`,
     `TestContinueAsNewTestSuite`, `TestUpdateWithStartSuite`,
     `TestUpdateWorkflowSdkSuite` (minus the D5 leaf), `TestNilSearchAttributeSuite`,
     and the D6 leaves of `TestLinksTestSuite` clean three times; Ledger rows updated.
@@ -205,3 +206,49 @@ suites on `tokeira/conformance-v1.32.0` three times against `tokeirad` built wit
   flip by the umbrella spec.
 - Diagnoses recorded during task 2.5 belong here, each with a `path:line @ v1.32.0`
   citation, before the corresponding fix lands.
+
+### Phase A validation and review checkpoint — 2026-09-15
+
+- Requirements 1–9 are implemented, with Properties 1–12 and 20 exercised at
+  100 or more cases per property. The approved amendments preserve zero as an
+  unlimited update budget, require the complete interpolated limit message, and
+  bound truncated status text to at most 4000 bytes without splitting a code point.
+- Task 1.4 is complete. The wording correction was approved on 2026-09-29 and
+  applied to A2 and the task description: Requirement 2.1 and
+  `service/history/historybuilder/event_factory.go:476-499 @ v1.32.0` preserve
+  the requested backoff in the close event; the successor's minimum delay belongs
+  at runtime construction (`service/history/workflow/mutable_state_impl.go:2778-2794,
+  2868-2894 @ v1.32.0`). This aligns the design with the existing implementation.
+- Task 1.19 completed on 2026-09-29. The target suites' measured outcomes and build
+  validation
+  are recorded in the [readiness ledger](../../../docs/readiness/conformance.md#temporal-v1320-successor-verification).
+  Update-with-start had deadlocked in the fork's metrics capture shim after
+  the correct total-update-limit rejection: the corpus opens a second capture
+  while retaining the failed request's first capture until cleanup
+  (`tests/update_workflow_test.go:4982, 5805-5807 @ v1.32.0`). The separately approved
+  shim correction retains isolation between clusters while supporting overlapping
+  windows within one cluster, with once-only freezing and lock release. Four
+  regression tests each passed 75 times under the race detector at 1, 4, and 8
+  logical CPUs; full shim race tests, focused Go vet, and the fork's
+  `make lint-code` also passed. The shim change is fork commit
+  `5d6ceeed1e560a4e2c6f39a7d0377ea3a95fcc58`. Three fresh
+  update-with-start runs each produced 26 pass / 0 fail / 1 existing skip, with
+  identical leaf outcomes. No corpus body or skip registry was changed.
+- Devbox validation is green: nightly formatting verification, `cargo lint --locked`,
+  `cargo check --workspace --locked`, `cargo nextest run --workspace --locked --no-fail-fast`
+  (3,392 passed, 2 skipped), `cargo test --workspace --doc --locked`, and
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`.
+  The full gRPC property module additionally passes 35 properties with
+  `PROPTEST_CASES=1024`; focused conformance-feature properties also pass.
+- `cargo run -p compatibility-docs --locked -- check-temporal` confirms the
+  configuration ledger and generated documentation agree. The offline link check
+  passes for tracked Markdown. The broad local glob also scans ignored build and
+  old evidence files and reports three pre-existing missing local links there.
+- Regression fixtures now reflect nil-map omission, nil memo upserts as deletion,
+  and the already-started failure's start request id and chain head. The wire
+  golden changes only those two fields on its three transport surfaces; status
+  codes, text, and other metadata are unchanged.
+- Admission counts distinct completed ids from durable history under the loaded
+  snapshot boundary, alongside admitted/pending ids. This preserves correctness
+  after legacy completions and cold replay without a second kernel state change;
+  the tradeoff is a history scan for each new update id.

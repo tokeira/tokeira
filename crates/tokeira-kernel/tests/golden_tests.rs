@@ -928,6 +928,7 @@ fn make_timeout_request() -> WorkflowExecutionTimedOutRequest {
 
 fn make_continue_as_new_command() -> WorkflowCommand {
     WorkflowCommand::ContinueAsNew {
+        backoff_start_interval: None,
         header: None,
         new_run_id: RunId::new(),
         workflow_type: WorkflowType("wf-next".into()),

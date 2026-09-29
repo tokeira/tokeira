@@ -2997,10 +2997,10 @@
     },
     {
       "temporal_key": "history.enableCHASMSignalBacklinks",
-      "classification": "pinned-behavioral-constant",
-      "tokeira_treatment": "Target default false keeps CHASM signal backlinks gated. The lifecycle delta owns DescribeWorkflow response fidelity.",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "Stock default false; conformance builds record signal request-id backlinks in the same fenced transition and rebuild them on reset.",
       "owner": ".kiro/specs/v132-lifecycle-fidelity",
-      "conformance_override": "none",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:3224 @ v1.32.0",
         ".kiro/specs/v132-lifecycle-fidelity"

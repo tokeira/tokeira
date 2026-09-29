@@ -63,55 +63,107 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::RuntimeMembershipRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::RuntimeMembershipRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::RuntimeRegistrationView;
+#[doc(inline)]
+pub use self::__buffa::view::RuntimeRegistrationOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::RuntimeHeartbeatView;
 #[doc(inline)]
+pub use self::__buffa::view::RuntimeHeartbeatOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::LanePressureView;
+#[doc(inline)]
+pub use self::__buffa::view::LanePressureOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ControllerDirectiveView;
 #[doc(inline)]
+pub use self::__buffa::view::ControllerDirectiveOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::DrainDirectiveView;
+#[doc(inline)]
+pub use self::__buffa::view::DrainDirectiveOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ConnectionBudgetDirectiveView;
 #[doc(inline)]
+pub use self::__buffa::view::ConnectionBudgetDirectiveOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::DesiredPlacementDirectiveView;
+#[doc(inline)]
+pub use self::__buffa::view::DesiredPlacementDirectiveOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::SubscribeRoutingRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::SubscribeRoutingRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::RoutingUpdateView;
+#[doc(inline)]
+pub use self::__buffa::view::RoutingUpdateOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::FullRoutingSnapshotView;
 #[doc(inline)]
+pub use self::__buffa::view::FullRoutingSnapshotOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::RoutingDeltaMessageView;
+#[doc(inline)]
+pub use self::__buffa::view::RoutingDeltaMessageOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::BundleOwnershipEntryView;
 #[doc(inline)]
+pub use self::__buffa::view::BundleOwnershipEntryOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::BundleOwnerMessageView;
+#[doc(inline)]
+pub use self::__buffa::view::BundleOwnerMessageOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::NodeEndpointEntryView;
 #[doc(inline)]
+pub use self::__buffa::view::NodeEndpointEntryOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::NodeEndpointMessageView;
+#[doc(inline)]
+pub use self::__buffa::view::NodeEndpointMessageOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::PlacementConfigMessageView;
 #[doc(inline)]
+pub use self::__buffa::view::PlacementConfigMessageOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::RefreshBundleRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::RefreshBundleRequestOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::RefreshBundleResponseView;
 #[doc(inline)]
+pub use self::__buffa::view::RefreshBundleResponseOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::NominateRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::NominateRequestOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::NominateResponseView;
 #[doc(inline)]
+pub use self::__buffa::view::NominateResponseOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ScaleInCandidateView;
+#[doc(inline)]
+pub use self::__buffa::view::ScaleInCandidateOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::MarkDrainingRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::MarkDrainingRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::MarkDrainingResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::MarkDrainingResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::DescribeNodeDrainRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::DescribeNodeDrainRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::DescribeNodeDrainResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::DescribeNodeDrainResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;
 include!("tokeira.internal.controller.v1.controller.__connect.rs");

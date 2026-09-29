@@ -306,13 +306,12 @@ pub const EVENT_TYPE_WORKFLOW_EXECUTION_STARTED: i32 = 1;
 /// is the event an attaching `UseExisting` request authors.
 pub const EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED: i32 = 55;
 
-/// Per-run record of which event a request id authored (mirrors
-/// `persistencespb.RequestIDInfo`). Tokeira adopted the buffered-event model
-/// (spec: `kernel-event-buffering`, superseding the earlier no-buffering
-/// deviation), but request-id infos are only authored for start / options-
-/// updated events — kinds the `bufferEvent` predicate never buffers
-/// (`event_store.go:263 @ v1.31.0`) — so `buffered` remains `false` here; it
-/// is retained for wire parity with the `DescribeWorkflowExecution` surface.
+/// Per-run record of the event a request id authored.
+///
+/// The kernel records starts and options updates. The runtime additionally
+/// records signal backlinks in the fenced transition when its conformance
+/// override is enabled; buffered signals receive their real id at flush
+/// (`service/history/workflow/mutable_state_impl.go:6174-6186 @ v1.32.0`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestIdInfo {
     /// History event id that this request id authored.
@@ -321,8 +320,7 @@ pub struct RequestIdInfo {
     /// e.g. `WorkflowExecutionStarted` for the starting request or
     /// `WorkflowExecutionOptionsUpdated` for an attached request.
     pub event_type: i32,
-    /// Whether the authoring event is still buffered. Always `false` here
-    /// (see the struct-level note).
+    /// Whether the authoring signal is still buffered without a history event id.
     pub buffered: bool,
 }
 

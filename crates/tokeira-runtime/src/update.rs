@@ -157,6 +157,10 @@ pub(crate) enum UpdateResolution {
     /// and errors_failures.go:14 @ v1.31.0). Surfaces as a FAILED_PRECONDITION
     /// RPC error, with `response` nil.
     AbortedByWftFailure,
+    /// Every waiter for the same new id observes the same admission failure.
+    AdmissionLimitExceeded {
+        limit: i64,
+    },
     /// The update was delivered but the completing worker ignored it — the
     /// server auto-rejects it with the `unprocessedUpdateFailure` server
     /// outcome (RejectUnprocessed, Req 9). The caller receives a COMPLETED

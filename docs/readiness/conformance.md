@@ -34,6 +34,82 @@ Implementer Mandate in FINDINGS — "a wrong guess behind a green check bakes in
 | Tier-1 in-process oracle | Responses + history match v1.31.0, RPC coverage gate | `conformance-harness` (`tokeira-conformance` crate) | ⬜ not built |
 | Tier-2 functional corpus | Temporal's own Go suites pass over gRPC | `temporal-functional-conformance` | 🟡 partial |
 
+## Temporal v1.32.0 successor verification
+
+The `v132-lifecycle-fidelity` execution-lineage and response-fidelity slice was
+verified separately from the release evidence below; the advertised claim remains
+`1.31.0`. The five initially completed suites were measured on 2026-09-15 from the
+working tree based on engine
+`2b9c47efb6ab7c811deff02c352a6a30f9b9b22a`, against conformance fork
+`182b30086c399c1803ee3524810cca472864147e`. The server is built with
+`cargo build -p tokeirad --features conformance --locked`, then preserved separately
+from Cargo's output before repeat runs. Its SHA-256 is
+`b77441a6244cf70e7812c7363183432f446628a676ff25563ee1d10c55845586`.
+
+Each invocation uses `GOTOOLCHAIN=go1.26.8` and the suite runner:
+
+```sh
+TOKEIRA_BIN="<preserved-conformance-binary>" GOTOOLCHAIN=go1.26.8 \
+  go run -tags test_dep ./tests/tokeira_conformance_runsuite/ -timeout 6m '^<Suite>$'
+```
+
+Counts are terminal Go leaf outcomes (pass / fail / skip), excluding parent nodes.
+Existing registry exclusions remain in force. The original v1.32 baseline manifest
+is preserved; the numbers here are an addendum.
+
+Three consecutive fresh-process invocations of each completed suite produced
+identical per-leaf outcomes with the preserved conformance binary. The SDK and
+link suites retain seven executed D5 failures; all D6 leaves in these five suites
+are clean. Update-with-start completed separately on 2026-09-29 with the fork's
+metrics-capture correction, committed as
+`5d6ceeed1e560a4e2c6f39a7d0377ea3a95fcc58`, with identical leaf outcomes across its
+three runs.
+The engine source is unchanged from the earlier verification; its rebuilt macOS
+conformance binary has SHA-256
+`5a8eb327c415640d12cadf11e44c304c22a90b4d0f38fcaa245b2947674360fb`,
+verified unchanged after all three invocations.
+
+| Suite | Before (P / F / S) | Each of final runs 1–3 (P / F / S) | Checkpoint status |
+|---|---:|---:|---|
+| `TestWorkflowTestSuite` | 29 / 9 / 0 | 38 / 0 / 0 | Clean |
+| `TestContinueAsNewTestSuite` | 8 / 4 / 0 | 12 / 0 / 0 | Clean |
+| `TestUpdateWithStartSuite` | 22 / 4 / 1 | 26 / 0 / 1 | Clean; existing exclusions retained |
+| `TestUpdateWorkflowSdkSuite` | 5 / 1 / 0 | 5 / 1 / 0 | 5 D6 leaves clean; 1 D5 failure |
+| `TestNilSearchAttributeSuite` | 4 / 2 / 0 | 6 / 0 / 0 | Clean |
+| `TestLinksTestSuite` | 2 / 10 / 0 | 6 / 6 / 0 | 6 D6 leaves clean; 6 D5 failures |
+
+The approved metrics-capture correction removes the update-with-start harness
+deadlock: the correct total-update-limit rejection leaves one capture open until
+cleanup, while the corpus immediately opens another in the same cluster
+(`tests/update_workflow_test.go:4982, 5805-5807 @ v1.32.0`). The bridge now shares
+the global isolation lock among that cluster's active windows, freezes each window
+once, and releases the lock only after the final window freezes. Each window keeps
+its own baseline and final scrape; other clusters' capture windows remain excluded.
+No corpus body or skip registry changed. The four regression tests cover overlap,
+concurrent starts and closes, concurrent snapshot/stop calls, and cross-cluster
+exclusion; each passed 75 times under the race detector with shuffled ordering and
+1, 4, and 8 logical CPUs. The full shim suites also passed under the race detector,
+and `go vet -tags test_dep` passed for the shim and capture packages. The fork's
+`make lint-code` also passed with automatic fixes disabled and the pre-change HEAD
+as its lint baseline.
+
+The captured skip remains `TestUpdateWithStartSuite/TestReturnUpdateInFlightLimitError`
+(unwired `history.maxInFlightUpdates`). The existing
+`TestUpdateWithStartSuite/TestUpdateIsAbortedByClosingWorkflow/return_retryable_error_after_retry`
+exclusion requires an in-process retry hook and is filtered by the runner before a
+terminal Go leaf outcome is emitted. Neither exclusion was added by this correction.
+
+The SDK callback leaf is exactly
+`TestUpdateWorkflowSdkSuite/TestUpdateSameRequestIDDeduplicatesCallbacks`.
+The six D5 link leaves are the `SignalExistingWorkflow` and
+`SignalStartsNewWorkflow` children of `TestSignalWithStartWorkflowExecution_LinksAttachedToEvent`,
+`TestSignalWithStartWorkflowExecution_BufferedDuringWorkflowTask`, and
+`TestSignalWithStartWorkflowExecution_BacklinkSurvivesReset` in `TestLinksTestSuite`. These remain
+executed failures in the table, rather than new exclusions.
+
+Build and property validation, plus the continue-as-new design wording correction
+approved on 2026-09-29, are recorded in the [implementation task notes](../../.kiro/specs/v132-lifecycle-fidelity/tasks.md#phase-a-validation-and-review-checkpoint--2026-09-15).
+
 ## Tier-2 functional corpus — cluster status
 
 From the canonical run (corpus @ v1.31.0; 100 entrypoints; 1501 per-test outcomes: 1194 fail / 267

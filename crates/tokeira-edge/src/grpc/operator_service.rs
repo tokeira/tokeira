@@ -27,11 +27,15 @@ impl OperatorServiceGrpc {
         Self { inner }
     }
 
-    pub fn into_service(self) -> OperatorServiceServer<Self> {
+    pub fn into_service(
+        self,
+    ) -> super::status_limit::StatusMessageLimit<OperatorServiceServer<Self>> {
         // Negotiate gzip for parity with the SDKs (see WorkflowServiceGrpc).
-        OperatorServiceServer::new(self)
-            .accept_compressed(CompressionEncoding::Gzip)
-            .send_compressed(CompressionEncoding::Gzip)
+        super::status_limit::StatusMessageLimit::new(
+            OperatorServiceServer::new(self)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Gzip),
+        )
     }
 }
 

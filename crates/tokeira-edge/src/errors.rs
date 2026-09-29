@@ -32,6 +32,10 @@ pub enum EdgeError {
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
 
+    /// A retryable operation abort with its public message preserved.
+    #[error("aborted: {0}")]
+    Aborted(String),
+
     /// v1.31.0's `consts.ErrWorkflowClosing`: a signal (or update) arrived
     /// while the workflow has a close attempt bouncing off buffered events
     /// with a started WFT retrying it. RESOURCE_EXHAUSTED with cause
@@ -136,7 +140,14 @@ pub enum EdgeError {
     /// `WorkflowExecutionAlreadyStarted` serviceerror like
     /// [`EdgeError::WorkflowAlreadyStarted`].
     #[error("{message}")]
-    WorkflowStartRejected { message: String, run_id: String },
+    WorkflowStartRejected {
+        message: String,
+        run_id: String,
+        /// Chain head of the incumbent run.
+        first_execution_run_id: String,
+        /// Request that authored the incumbent start.
+        start_request_id: String,
+    },
 
     /// A standalone-activity Start was rejected by the id reuse/conflict policy
     /// against an existing run. Carries the current run's id and create request id
@@ -200,6 +211,7 @@ impl EdgeError {
             EdgeError::Unimplemented(_) => StatusCode::NOT_IMPLEMENTED,
             EdgeError::NotFound(_) => StatusCode::NOT_FOUND,
             EdgeError::AlreadyExists(_) => StatusCode::CONFLICT,
+            EdgeError::Aborted(_) => StatusCode::CONFLICT,
             EdgeError::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::WorkflowClosing => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::ConsistentQueryBufferExceeded => StatusCode::TOO_MANY_REQUESTS,
@@ -236,6 +248,7 @@ impl EdgeError {
             EdgeError::Unimplemented(_) => "unimplemented",
             EdgeError::NotFound(_) => "not_found",
             EdgeError::AlreadyExists(_) => "already_exists",
+            EdgeError::Aborted(_) => "aborted",
             EdgeError::ResourceExhausted(_) => "resource_exhausted",
             EdgeError::WorkflowClosing => "workflow_closing",
             EdgeError::ConsistentQueryBufferExceeded => "consistent_query_buffer_exceeded",
@@ -271,6 +284,14 @@ impl EdgeError {
 
 impl From<anyhow::Error> for EdgeError {
     fn from(value: anyhow::Error) -> Self {
+        if let Some(exceeded) = value.downcast_ref::<tokeira_runtime::UpdateLimitExceeded>() {
+            return Self::FailedPrecondition(exceeded.to_string());
+        }
+        if let Some(exhausted) =
+            value.downcast_ref::<tokeira_runtime::UpdateWithStartRetryExhausted>()
+        {
+            return Self::Aborted(exhausted.to_string());
+        }
         // A failed activity-token revalidation surfaces as v1.31.0's
         // `ErrActivityTaskNotFound`: code NotFound with this exact message,
         // asserted verbatim by clients (`service/history/consts/const.go:44-45

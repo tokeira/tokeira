@@ -468,7 +468,7 @@ build and operator-artifact directories excluded.
 | `TestTimeSkippingTestSuite` | new entrypoint/mode | 1 / 14 / 0 / 0 | `new-suite` | `v132-gated-surfaces` |
 | `TestTransientTaskSuite` | clean (1.6) | 4 / 0 / 0 / 0 | `unchanged-clean` | `v132-lifecycle-fidelity` |
 | `TestUpdateWithStartSuite` | clean (2.12) | 32 / 8 / 2 / 0 | `regression` | `v132-lifecycle-fidelity` |
-| `TestUpdateWorkflowSdkSuite` | clean (2.12) | 5 / 2 / 0 / 0 | `regression` | `v132-lifecycle-fidelity` |
+| `TestUpdateWorkflowSdkSuite` | clean (2.12) | 5 / 2 / 0 / 0 | `regression` | `v132-lifecycle-fidelity`; exact leaf `TestUpdateSameRequestIDDeduplicatesCallbacks` → `v132-nexus` |
 | `TestUserMetadataSuite` | clean (4.27) | 5 / 0 / 0 / 0 | `unchanged-clean` | `v132-lifecycle-fidelity` |
 | `TestUserTimersTestSuite` | clean (1.5) | 2 / 0 / 0 / 0 | `unchanged-clean` | `v132-lifecycle-fidelity` |
 | `TestVersioning3FunctionalSuite` | clean (8.41) | 13 / 2 / 33 / 0 | `regression` | `v132-worker-deployments` |
@@ -626,3 +626,13 @@ passed, and the source-tree offline link check reported zero errors. All capture
 counts, classifications, provenance and raw outcomes were compared with the base;
 only the five approved manifest allocation notes differ. No engine source,
 dependency file or delta placeholder changed.
+
+## Update callback ownership addendum (2026-09-15)
+
+`TestUpdateWorkflowSdkSuite/TestUpdateSameRequestIDDeduplicatesCallbacks` belongs to
+`v132-nexus` (D5): it asserts completion-callback registration and request-id
+deduplication. Lifecycle fidelity implements only the missing-request-id precondition
+and leaves callback registration disabled (`service/history/workflow/update/update.go:390–395
+@ v1.32.0`; lifecycle Requirement 7). The other suite leaves remain with
+`v132-lifecycle-fidelity`. The captured counts above and in the manifest are unchanged;
+the manifest records this exact ownership exception in `scope_allocation_note`.

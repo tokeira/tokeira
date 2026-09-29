@@ -361,6 +361,8 @@ pub enum StartWorkflowResult {
     Started {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the resolved run, retained across every successor.
+        first_execution_run_id: RunId,
         mutation_metadata: MutationMetadata,
         /// First WFT committed as started for inline eager delivery.
         eager_workflow_task: Option<StartedWorkflowTask>,
@@ -368,6 +370,8 @@ pub enum StartWorkflowResult {
     UsedExisting {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the resolved run, retained across every successor.
+        first_execution_run_id: RunId,
     },
     /// A retried start whose RequestId already authored the open incumbent's
     /// `WorkflowExecutionStarted` is deduped to that run. v1.31.0 returns this as
@@ -376,6 +380,8 @@ pub enum StartWorkflowResult {
     Deduped {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the resolved run, retained across every successor.
+        first_execution_run_id: RunId,
         execution_status: ExecutionStatus,
         /// Still-live first WFT reconstructed for an eager request-id retry.
         eager_workflow_task: Option<StartedWorkflowTask>,
@@ -383,6 +389,10 @@ pub enum StartWorkflowResult {
     Rejected {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the resolved run, retained across every successor.
+        first_execution_run_id: RunId,
+        /// Request that authored the resolved run's start event.
+        start_request_id: String,
         reason: StartRejectReason,
     },
 }
@@ -409,6 +419,8 @@ pub enum StartRejectReason {
 pub struct MultiOperationResult {
     pub run_key: RunKey,
     pub run_id: RunId,
+    /// Chain head of the run resolved by the start leg.
+    pub first_execution_run_id: RunId,
     /// Whether the start leg created a new run (false on attach/dedup/replay).
     pub started: bool,
     /// Execution status reported on the start response.
@@ -431,6 +443,10 @@ pub enum MultiOperationError {
     StartRejected {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the rejected incumbent.
+        first_execution_run_id: RunId,
+        /// Request that originally started the rejected incumbent.
+        start_request_id: String,
         reason: StartRejectReason,
     },
     /// The UPDATE leg failed. `started` records whether the start leg
@@ -448,14 +464,22 @@ pub enum SignalWithStartResult {
     Started {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the resolved run, retained across every successor.
+        first_execution_run_id: RunId,
     },
     Signaled {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the resolved run, retained across every successor.
+        first_execution_run_id: RunId,
     },
     Rejected {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the resolved run, retained across every successor.
+        first_execution_run_id: RunId,
+        /// Request that authored the resolved run's start event.
+        start_request_id: String,
         reason: StartRejectReason,
     },
 }
@@ -496,6 +520,8 @@ enum ConflictResolution {
     UseExisting {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the resolved run, retained across every successor.
+        first_execution_run_id: RunId,
     },
     TerminateAndStart {
         run_key: RunKey,
@@ -504,6 +530,10 @@ enum ConflictResolution {
     Rejected {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the resolved run, retained across every successor.
+        first_execution_run_id: RunId,
+        /// Request that authored the resolved run's start event.
+        start_request_id: String,
         reason: StartRejectReason,
     },
     /// The incoming RequestId already authored the open incumbent's
@@ -513,6 +543,8 @@ enum ConflictResolution {
     DedupRetried {
         run_key: RunKey,
         run_id: RunId,
+        /// Chain head of the resolved run, retained across every successor.
+        first_execution_run_id: RunId,
         execution_status: ExecutionStatus,
     },
 }
@@ -2204,7 +2236,8 @@ mod tests {
             reused,
             StartWorkflowResult::UsedExisting {
                 run_key: first.run_key,
-                run_id: first.run_id
+                run_id: first.run_id,
+                first_execution_run_id: first.first_execution_run_id.unwrap_or(first.run_id),
             }
         );
 
@@ -2364,6 +2397,8 @@ mod tests {
             StartWorkflowResult::Rejected {
                 run_key: first.run_key,
                 run_id: first.run_id,
+                first_execution_run_id: first.first_execution_run_id.unwrap_or(first.run_id),
+                start_request_id: first.request.request_id.0.clone(),
                 reason: StartRejectReason::ConflictPolicyFail,
             }
         );

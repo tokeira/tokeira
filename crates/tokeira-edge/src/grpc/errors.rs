@@ -18,6 +18,7 @@ impl From<EdgeError> for Status {
             EdgeError::NotFound(message) => Status::not_found(message),
             EdgeError::AlreadyExists(message) => Status::already_exists(message),
             EdgeError::ResourceExhausted(message) => Status::resource_exhausted(message),
+            EdgeError::Aborted(message) => Status::aborted(message),
             EdgeError::WorkflowClosing => workflow_closing_status(),
             EdgeError::ConsistentQueryBufferExceeded => busy_workflow_resource_exhausted_status(
                 "consistent query buffer is full, this may be caused by too many queries and \
@@ -74,10 +75,20 @@ impl From<EdgeError> for Status {
             } => workflow_already_started_status(
                 format!("{namespace}/{workflow_id} already started as {run_id}"),
                 run_id,
+                String::new(),
+                String::new(),
             ),
-            EdgeError::WorkflowStartRejected { message, run_id } => {
-                workflow_already_started_status(message, run_id)
-            }
+            EdgeError::WorkflowStartRejected {
+                message,
+                run_id,
+                first_execution_run_id,
+                start_request_id,
+            } => workflow_already_started_status(
+                message,
+                run_id,
+                first_execution_run_id,
+                start_request_id,
+            ),
             EdgeError::BatchOperationAlreadyExists { namespace, job_id } => {
                 Status::already_exists(format!("{namespace}/{job_id}"))
             }
@@ -279,13 +290,18 @@ fn busy_workflow_resource_exhausted_status(message: String) -> Status {
     )
 }
 
-pub(crate) fn workflow_already_started_status(message: String, run_id: String) -> Status {
+pub(crate) fn workflow_already_started_status(
+    message: String,
+    run_id: String,
+    first_execution_run_id: String,
+    start_request_id: String,
+) -> Status {
     use prost::Message as _;
     use tokeira_proto::public::temporal::api::errordetails::v1::WorkflowExecutionAlreadyStartedFailure;
 
     let failure = WorkflowExecutionAlreadyStartedFailure {
-        first_execution_run_id: String::new(),
-        start_request_id: String::new(),
+        first_execution_run_id,
+        start_request_id,
         run_id,
     };
     let detail = ProtoAny {

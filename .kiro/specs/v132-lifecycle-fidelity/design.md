@@ -102,16 +102,20 @@ pub enum StartWorkflowResult {
 `WorkflowCommand::ContinueAsNew` gains `backoff_start_interval: Option<Duration>`
 (serde default, appended last). The edge fills it from
 `ContinueAsNewWorkflowExecutionCommandAttributes.backoff_start_interval`
-(`grpc/translate.rs` command translation). `kernel.rs` passes it as `command_backoff`
-into the existing `continue_as_new_min_backoff` (`kernel.rs:150-161`), which already
-encodes `mutable_state_impl.go:2868-2894`. The lane maps the event's
-`backoff_start_interval` to the successor's `workflow_start_delay` as today
-(`lane.rs:1180`).
+(`grpc/translate.rs` command translation). The kernel records the requested value
+unchanged in the continued-as-new event
+(`service/history/historybuilder/event_factory.go:476-499 @ v1.32.0`). When creating
+that event's successor, the runtime lane calls the existing pure
+`continue_as_new_min_backoff` helper with the requested value and the predecessor's
+execution lifetime. Its result becomes the successor's `workflow_start_delay`
+(`service/history/workflow/mutable_state_impl.go:2778-2794, 2868-2894 @ v1.32.0`).
 
 **A3. Update-with-start (Req 3).** Runtime update admission (`crates/tokeira-runtime`
 update registry) gains a per-run counter `admitted + completed` distinct update ids
-and rejects a new id at or above the `history.maxTotalUpdates` consult site (already
-`Wired`) with `FAILED_PRECONDITION` and the `registry.go:445-450` message; a retried
+and rejects a new id at or above a non-zero `history.maxTotalUpdates` consult value
+(already `Wired`); zero disables the limit (`registry.go:438-444 @ v1.32.0`). The
+`FAILED_PRECONDITION` message equals the full formatted string from
+`registry.go:446-449`, with the limit interpolated; a retried
 `(request_id, update_id)` does not count. The edge's `execute_multi_operation`
 re-executes the whole operation once when the update leg reports a closing abort and
 the start leg did not start a run; a second abort maps to `ABORTED`
@@ -146,6 +150,9 @@ skips eager dispatch for a paused workflow and for versioned routing without
 **A8. Truncation (Req 9).** A tonic interceptor (or the existing status mapping in
 `grpc/errors.rs`) applies `truncate_utf8(msg, 4000 − suffix.len()) + "... <truncated>"`
 to every outgoing `Status` message longer than 4000 bytes, preserving code and details.
+The result has at most 4000 bytes and never splits a code point
+(`common/util/strings.go:9-20`,
+`common/rpc/interceptor/service_error_interceptor.go:57-60 @ v1.32.0`).
 
 ### Phase B — workflow pause
 
@@ -262,8 +269,11 @@ continued-as-new event carries `b`, and the successor's first-task backoff equal
 ### Property 3: Total-updates limit at admission
 
 *For any* sequence of update requests on one run with limit `M`, a request with a
-new update id is rejected `FAILED_PRECONDITION` exactly when the count of distinct
-update ids already admitted or completed is at least `M`; retried requests with a
+new update id is rejected `FAILED_PRECONDITION` exactly when `M` is non-zero and the
+count of distinct update ids already admitted or completed is at least `M`; zero
+disables the limit (`service/history/workflow/update/registry.go:438-444 @ v1.32.0`).
+The rejection message equals the full formatted string from `registry.go:446-449`,
+with `M` interpolated, and the test compares the whole text. Retried requests with a
 seen `(request_id, update_id)` never change the count.
 
 **Validates: Requirements 3.1, 3.2, 3.6**
@@ -334,8 +344,10 @@ off.
 ### Property 12: Status message truncation
 
 *For any* outgoing status, the message is unchanged when at most 4000 bytes and equals
-the UTF-8-safe prefix plus `"... <truncated>"` with total length 4000 otherwise; code
-and details are unchanged.
+the UTF-8-safe prefix plus `"... <truncated>"` with at most 4000 bytes otherwise,
+and never splits a code point; code and details are unchanged
+(`common/util/strings.go:9-20`,
+`common/rpc/interceptor/service_error_interceptor.go:57-60 @ v1.32.0`).
 
 **Validates: Requirements 9.1, 9.2**
 

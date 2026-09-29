@@ -147,7 +147,7 @@ const CONTINUE_AS_NEW_MIN_INTERVAL: time::Duration = time::Duration::seconds(1);
 /// WFT is pending on the delay timer, not yet scheduled
 /// (`TestChildWorkflowWithContinueAsNewParentTerminate`,
 /// `TestContinueAsNewRunExecutionTimeout`).
-fn continue_as_new_min_backoff(
+pub fn continue_as_new_min_backoff(
     command_backoff: Option<time::Duration>,
     lifetime: time::Duration,
 ) -> Option<time::Duration> {
@@ -5347,6 +5347,7 @@ fn apply_workflow_command(
             header,
             initial_versioning_behavior,
             successor_versioning_info,
+            backoff_start_interval,
         } => {
             // A close command with buffered events is an UnhandledCommand:
             // the workflow must observe the buffered events before closing
@@ -5394,20 +5395,10 @@ fn apply_workflow_command(
                     )),
                 });
             }
-            // Throttle rapid CaN so each generation lives at least the minimal
-            // interval — the successor's first WFT is delayed accordingly.
-            // Lifetime is measured from the run's EXECUTION time (start + its
-            // own first-WFT backoff), not its start, so a generation whose WFT
-            // only became available after its own delay still yields a fresh
-            // backoff for the next generation (v1.31.0 uses ExecutionTime,
-            // mutable_state_impl.go:2678-2679).
-            let execution_time = builder.state.started_at
-                + builder
-                    .state
-                    .workflow_start_delay
-                    .unwrap_or(time::Duration::ZERO);
-            let backoff_start_interval =
-                continue_as_new_min_backoff(None, builder.now - execution_time);
+            // The close event records the requested delay verbatim. The runtime
+            // applies continue_as_new_min_backoff when it constructs the successor,
+            // keeping public history distinct from throttled task dispatch
+            // (service/history/historybuilder/event_factory.go:491 and service/history/workflow/mutable_state_impl.go:2786 @ v1.32.0).
             builder.emit(HistoryEventKind::WorkflowExecutionContinuedAsNew {
                 workflow_task_completed_event_id,
                 new_run_id,

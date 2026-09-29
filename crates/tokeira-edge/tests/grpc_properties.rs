@@ -56,12 +56,15 @@ use uuid::Uuid;
 
 proptest! {
     #[test]
-    fn property_start_request_roundtrip_except_derived_callback_limit(
+    fn property_start_request_roundtrip_except_admission_normalization(
         mut edge in arb_start_request()
     ) {
         let proto = start_request_to_proto(&edge);
         let roundtrip = start_request_to_edge(proto).unwrap();
         edge.completion_callback_limit = roundtrip.completion_callback_limit;
+        // Start admission drops nil memo payloads regardless of encoding
+        // (common/payload/payload.go:84-126 @ v1.32.0).
+        edge.memo.0.retain(|_, payload| !matches!(payload.data.as_slice(), b"" | b"null" | b"[]"));
         prop_assert_eq!(roundtrip, edge);
     }
 
@@ -192,14 +195,15 @@ proptest! {
         prop_assert_eq!(info.history_length, edge.history_length);
         prop_assert_eq!(info.history_size_bytes, edge.history_size_bytes);
         prop_assert_eq!(info.state_transition_count, edge.state_transition_count);
-        prop_assert_eq!(
-            info.memo.expect("memo").fields.len(),
-            edge.memo.0.len()
-        );
-        prop_assert_eq!(
-            info.search_attributes.expect("search attributes").indexed_fields.len(),
-            edge.search_attributes.0.len()
-        );
+        // Describe omits nil entries and absent maps (common/payload/payload.go:84-126 @ v1.32.0).
+        let memo_count = edge.memo.0.values()
+            .filter(|payload| !matches!(payload.data.as_slice(), b"" | b"null" | b"[]"))
+            .count();
+        prop_assert_eq!(info.memo.is_some(), memo_count > 0);
+        prop_assert_eq!(info.memo.map_or(0, |memo| memo.fields.len()), memo_count);
+        // This generator emits non-nil search values, including non-empty lists.
+        prop_assert_eq!(info.search_attributes.is_some(), !edge.search_attributes.0.is_empty());
+        prop_assert_eq!(info.search_attributes.map_or(0, |attributes| attributes.indexed_fields.len()), edge.search_attributes.0.len());
     }
 
     #[test]
@@ -303,7 +307,16 @@ proptest! {
                 let expected = WorkflowCommand::UpsertMemoPatch(MemoPatch(
                     memo.0
                         .iter()
-                        .map(|(key, value)| (key.clone(), FieldChange::Set(value.clone())))
+                        .map(|(key, value)| {
+                            // Nil payloads represent deletion in a patch, not an
+                            // omitted key (common/payload/payload.go:84-94 @ v1.32.0).
+                            let change = if matches!(value.data.as_slice(), b"" | b"null" | b"[]") {
+                                FieldChange::Clear
+                            } else {
+                                FieldChange::Set(value.clone())
+                            };
+                            (key.clone(), change)
+                        })
                         .collect(),
                 ));
                 prop_assert_eq!(roundtrip, expected);
@@ -589,6 +602,7 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::NotShardOwner { .. } => Code::Aborted,
         EdgeError::FailedPrecondition(_) => Code::FailedPrecondition,
         EdgeError::Internal(_) => Code::Internal,
+        EdgeError::Aborted(_) => Code::Aborted,
     }
 }
 
@@ -857,6 +871,7 @@ fn arb_start_response() -> impl Strategy<Value = StartWorkflowExecutionResponse>
                 StartWorkflowExecutionResponse {
                     run_key: RunKey(Uuid::from_u128(run_key)),
                     run_id: RunId(Uuid::from_u128(run_id)),
+                    first_execution_run_id: RunId(Uuid::from_u128(run_id)),
                     transition_seq,
                     last_event_id,
                     started,
@@ -1252,6 +1267,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
             .prop_map(
                 |(workflow_type, task_queue, input, memo, search_attributes)| {
                     WorkflowCommand::ContinueAsNew {
+                        backoff_start_interval: None,
                         new_run_id: tokeira_types::RunId::new(),
                         workflow_type: tokeira_types::WorkflowType(workflow_type),
                         task_queue: tokeira_types::TaskQueueName(task_queue),
@@ -1743,6 +1759,7 @@ proptest! {
             run_id: None,
             first_execution_run_id: None,
             update_id: update_id.clone(),
+            request_id: String::new(),
             update_name: update_name.clone(),
             input: input.clone(),
             wait_policy,
@@ -1812,7 +1829,7 @@ proptest! {
             stage: UpdateLifecycleStageDto::Completed,
             outcome: Some(outcome),
         };
-        let _proto = update_response_to_proto(edge);
+        let _proto = update_response_to_proto(edge, "default", "request-id");
         // The upstream response type has different fields (update_ref, outcome, stage)
         // so we just verify the conversion doesn't panic.
     }

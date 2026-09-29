@@ -143,16 +143,20 @@ impl WorkflowServiceGrpc {
         self
     }
 
-    pub fn into_service(self) -> WorkflowServiceServer<Self> {
+    pub fn into_service(
+        self,
+    ) -> super::status_limit::StatusMessageLimit<WorkflowServiceServer<Self>> {
         // Accept (and send) gzip: the Temporal SDKs compress requests by default —
         // the Python SDK defaults to GrpcCompression.GZIP — so a server that does not
         // negotiate gzip rejects unmodified SDK traffic with "Content is compressed
         // with 'gzip' which isn't supported". `send_compressed` only compresses a
         // response when the caller advertises `grpc-accept-encoding`, matching
         // Temporal's behaviour. Identity (uncompressed) callers are unaffected.
-        WorkflowServiceServer::new(self)
-            .accept_compressed(CompressionEncoding::Gzip)
-            .send_compressed(CompressionEncoding::Gzip)
+        super::status_limit::StatusMessageLimit::new(
+            WorkflowServiceServer::new(self)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Gzip),
+        )
     }
 
     /// Whether standalone activities are available on this server (the
@@ -851,12 +855,16 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::signal_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
+        let namespace = edge_req.namespace.clone();
+        let workflow_id = edge_req.workflow_id.clone();
         let edge_resp = self
             .inner
             .signal_workflow_execution(&headers, edge_req)
             .await?;
         Ok(Response::new(translate::signal_response_to_proto(
             edge_resp,
+            namespace,
+            workflow_id,
         )))
     }
 
@@ -1235,6 +1243,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             update_name = %edge_req.update_name,
             "update_workflow_execution"
         );
+        let namespace = edge_req.namespace.clone();
+        let request_id = edge_req.request_id.clone();
         let edge_resp = self
             .inner
             .update_workflow_execution(&headers, edge_req)
@@ -1246,6 +1256,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         );
         Ok(Response::new(translate::update_response_to_proto(
             edge_resp,
+            &namespace,
+            &request_id,
         )))
     }
 
@@ -1371,6 +1383,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             update_name = %edge_req.update.update_name,
             "execute_multi_operation"
         );
+        let namespace = edge_req.namespace.clone();
+        let request_id = edge_req.update.request_id.clone();
         match self
             .inner
             .execute_multi_operation(&headers, edge_req)
@@ -1384,6 +1398,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 );
                 Ok(Response::new(translate::multi_operation_response_to_proto(
                     edge_resp,
+                    &namespace,
+                    &request_id,
                 )))
             }
             // A post-validation leg failure: top-level code = the failing
@@ -1678,12 +1694,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::signal_with_start_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
+        let namespace = edge_req.namespace.clone();
+        let workflow_id = edge_req.workflow_id.clone();
         let edge_resp = self
             .inner
             .signal_with_start_workflow_execution(&headers, edge_req)
             .await?;
         Ok(Response::new(
-            translate::signal_with_start_response_to_proto(edge_resp),
+            translate::signal_with_start_response_to_proto(edge_resp, namespace, workflow_id),
         ))
     }
     async fn reset_workflow_execution(
@@ -2063,6 +2081,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 // v1.31.0`).
                 return Err(workflow_already_started_status(
                     format!("schedule {:?} is already registered", schedule_id.0),
+                    String::new(),
+                    String::new(),
                     String::new(),
                 ));
             }

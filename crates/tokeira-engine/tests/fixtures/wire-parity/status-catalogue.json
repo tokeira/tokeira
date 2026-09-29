@@ -219,19 +219,19 @@
     "start_duplicate_rejected": {
       "host-listener": {
         "code": 6,
-        "details_base64": "CAYSdldvcmtmbG93IGV4ZWN1dGlvbiBpcyBhbHJlYWR5IHJ1bm5pbmcuIFdvcmtmbG93SWQ6IHdpcmUtcGFyaXR5LWR1cGxpY2F0ZSwgUnVuSWQ6IDAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMC4agQEKV3R5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5Xb3JrZmxvd0V4ZWN1dGlvbkFscmVhZHlTdGFydGVkRmFpbHVyZRImEiQwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDA=",
+        "details_base64": "CAYSdldvcmtmbG93IGV4ZWN1dGlvbiBpcyBhbHJlYWR5IHJ1bm5pbmcuIFdvcmtmbG93SWQ6IHdpcmUtcGFyaXR5LWR1cGxpY2F0ZSwgUnVuSWQ6IDAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMC4awAEKV3R5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5Xb3JrZmxvd0V4ZWN1dGlvbkFscmVhZHlTdGFydGVkRmFpbHVyZRJlChd3aXJlLXBhcml0eS1kdXBsaWNhdGUtMRIkMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwGiQwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDA=",
         "message": "Workflow execution is already running. WorkflowId: wire-parity-duplicate, RunId: 00000000-0000-0000-0000-000000000000.",
         "metadata": {}
       },
       "in-process": {
         "code": 6,
-        "details_base64": "CAYSdldvcmtmbG93IGV4ZWN1dGlvbiBpcyBhbHJlYWR5IHJ1bm5pbmcuIFdvcmtmbG93SWQ6IHdpcmUtcGFyaXR5LWR1cGxpY2F0ZSwgUnVuSWQ6IDAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMC4agQEKV3R5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5Xb3JrZmxvd0V4ZWN1dGlvbkFscmVhZHlTdGFydGVkRmFpbHVyZRImEiQwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDA=",
+        "details_base64": "CAYSdldvcmtmbG93IGV4ZWN1dGlvbiBpcyBhbHJlYWR5IHJ1bm5pbmcuIFdvcmtmbG93SWQ6IHdpcmUtcGFyaXR5LWR1cGxpY2F0ZSwgUnVuSWQ6IDAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMC4awAEKV3R5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5Xb3JrZmxvd0V4ZWN1dGlvbkFscmVhZHlTdGFydGVkRmFpbHVyZRJlChd3aXJlLXBhcml0eS1kdXBsaWNhdGUtMRIkMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwGiQwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDA=",
         "message": "Workflow execution is already running. WorkflowId: wire-parity-duplicate, RunId: 00000000-0000-0000-0000-000000000000.",
         "metadata": {}
       },
       "public-listener": {
         "code": 6,
-        "details_base64": "CAYSdldvcmtmbG93IGV4ZWN1dGlvbiBpcyBhbHJlYWR5IHJ1bm5pbmcuIFdvcmtmbG93SWQ6IHdpcmUtcGFyaXR5LWR1cGxpY2F0ZSwgUnVuSWQ6IDAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMC4agQEKV3R5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5Xb3JrZmxvd0V4ZWN1dGlvbkFscmVhZHlTdGFydGVkRmFpbHVyZRImEiQwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDA=",
+        "details_base64": "CAYSdldvcmtmbG93IGV4ZWN1dGlvbiBpcyBhbHJlYWR5IHJ1bm5pbmcuIFdvcmtmbG93SWQ6IHdpcmUtcGFyaXR5LWR1cGxpY2F0ZSwgUnVuSWQ6IDAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMC4awAEKV3R5cGUuZ29vZ2xlYXBpcy5jb20vdGVtcG9yYWwuYXBpLmVycm9yZGV0YWlscy52MS5Xb3JrZmxvd0V4ZWN1dGlvbkFscmVhZHlTdGFydGVkRmFpbHVyZRJlChd3aXJlLXBhcml0eS1kdXBsaWNhdGUtMRIkMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwGiQwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDA=",
         "message": "Workflow execution is already running. WorkflowId: wire-parity-duplicate, RunId: 00000000-0000-0000-0000-000000000000.",
         "metadata": {
           "access-control-allow-origin": "*",

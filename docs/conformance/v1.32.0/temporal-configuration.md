@@ -18,9 +18,9 @@ Counts below include dynamic settings and the separately audited static groups.
 | Tokeira treatment | Count |
 |---|---:|
 | deployment policy | 10 |
-| pinned behavioral constant | 246 |
+| pinned behavioral constant | 245 |
 | auto-tuned mechanical setting | 383 |
-| conformance-only override | 30 |
+| conformance-only override | 31 |
 | architecturally irrelevant or excluded | 26 |
 
 ## Changes from v1.31.0
@@ -62,7 +62,7 @@ Added keys include renames and consolidations. Defaults are source expressions; 
 | `history.enableCHASMSchedulerMigrationWithRunningWorkflows` | v1.32.0 |  | — | `false` | `.kiro/specs/v132-lifecycle-fidelity` | Target default false prevents migration of schedules with running workflows; Tokeira has no Temporal implementation-migration control. |
 | `history.enableCHASMSchedulerRouting` | — |  | `false` | `true` | `.kiro/specs/v132-lifecycle-fidelity` | Target false -> true routes non-create schedule RPCs through CHASM first with legacy fallback. Creation and migration gates remain false and rollout percentages remain zero. The lifecycle delta owns scheduler response fidelity. |
 | `history.enableCHASMSchedulerSentinels` | — |  | `false` | `true` | `.kiro/specs/v132-lifecycle-fidelity` | Target false -> true reserves the scheduler ID space before CHASM creation is enabled. The lifecycle delta owns any observable collision behavior; creation remains gated off. |
-| `history.enableCHASMSignalBacklinks` | v1.32.0 |  | — | `false` | `.kiro/specs/v132-lifecycle-fidelity` | Target default false keeps CHASM signal backlinks gated. The lifecycle delta owns DescribeWorkflow response fidelity. |
+| `history.enableCHASMSignalBacklinks` | v1.32.0 |  | — | `false` | `.kiro/specs/v132-lifecycle-fidelity` | Stock default false; conformance builds record signal request-id backlinks in the same fenced transition and rebuild them on reset. |
 | `history.enableCHASMSkipPersistence` | v1.32.0 |  | — | `false` | `crates/tokeira-storage` | Target false disables Temporal's unchanged-node persistence optimization. Tokeira fenced transitions and immutable snapshots own persistence correctness. |
 | `history.enableCloseInboundReplicationStreamOnShutdown` | v1.32.0 |  | — | `true` | `docs/architecture/000-overview.md` | Temporal cross-cluster replication stream shutdown has no Tokeira service equivalent. |
 | `history.enablePaginationTokenBranchValidation` | v1.32.0 |  | — | `true` | `.kiro/specs/v132-lifecycle-fidelity` | Target default true checks history page-token branch identity against the execution. The lifecycle delta owns history pagination error fidelity. |
@@ -393,7 +393,7 @@ These historical records are excluded from target counts. A wired override here 
 | `history.enableCHASMSchedulerMigrationWithRunningWorkflows` | namespace / `Bool` | `false` | pinned behavioral constant — Target default false prevents migration of schedules with running workflows; Tokeira has no Temporal implementation-migration control. | none | `.kiro/specs/v132-lifecycle-fidelity` | `common/dynamicconfig/constants.go:3197` |
 | `history.enableCHASMSchedulerRouting` | namespace / `Bool` | `true` | pinned behavioral constant — Target false -> true routes non-create schedule RPCs through CHASM first with legacy fallback. Creation and migration gates remain false and rollout percentages remain zero. The lifecycle delta owns scheduler response fidelity. No production raw-key control is added. | none | `.kiro/specs/v132-lifecycle-fidelity` | `common/dynamicconfig/constants.go:3174` |
 | `history.enableCHASMSchedulerSentinels` | namespace / `Bool` | `true` | pinned behavioral constant — Target false -> true reserves the scheduler ID space before CHASM creation is enabled. The lifecycle delta owns any observable collision behavior; creation remains gated off. No production raw-key control is added. | none | `.kiro/specs/v132-lifecycle-fidelity` | `common/dynamicconfig/constants.go:3205` |
-| `history.enableCHASMSignalBacklinks` | namespace / `Bool` | `false` | pinned behavioral constant — Target default false keeps CHASM signal backlinks gated. The lifecycle delta owns DescribeWorkflow response fidelity. | none | `.kiro/specs/v132-lifecycle-fidelity` | `common/dynamicconfig/constants.go:3224` |
+| `history.enableCHASMSignalBacklinks` | namespace / `Bool` | `false` | conformance-only override — Stock default false; conformance builds record signal request-id backlinks in the same fenced transition and rebuild them on reset. | wired | `.kiro/specs/v132-lifecycle-fidelity` | `common/dynamicconfig/constants.go:3224` |
 | `history.enableCHASMSkipPersistence` | namespace / `Bool` | `false` | auto-tuned mechanical setting — Target false disables Temporal's unchanged-node persistence optimization. Tokeira fenced transitions and immutable snapshots own persistence correctness. | none | `crates/tokeira-storage` | `common/dynamicconfig/constants.go:3145` |
 | `history.enableChasm` | namespace / `Bool` | `true` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `.kiro/specs/configuration-policy` | `common/dynamicconfig/constants.go:3140` |
 | `history.enableCloseInboundReplicationStreamOnShutdown` | global / `Bool` | `true` | architecturally irrelevant or excluded — Temporal cross-cluster replication stream shutdown has no Tokeira service equivalent. | none | `docs/architecture/000-overview.md` | `common/dynamicconfig/constants.go:1741` |

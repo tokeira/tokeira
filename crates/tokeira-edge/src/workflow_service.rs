@@ -1306,7 +1306,6 @@ pub struct WorkflowService {
     worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore>,
     batch_store: Arc<BatchOperationStore>,
     workflow_rules: WorkflowRuleStore,
-    eager_dispatch_config: EagerDispatchConfig,
     task_queue_rate_limiter: TaskQueueRateLimiter,
 }
 
@@ -1413,19 +1412,6 @@ fn validate_nexus_completed_response_failure_details(
 impl std::fmt::Debug for WorkflowService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkflowService").finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EagerDispatchConfig {
-    pub max_eager_activity_tasks_per_response: usize,
-}
-
-impl Default for EagerDispatchConfig {
-    fn default() -> Self {
-        Self {
-            max_eager_activity_tasks_per_response: 3,
-        }
     }
 }
 
@@ -1849,17 +1835,8 @@ impl WorkflowService {
             worker_task_provenance: Arc::new(tokeira_storage::InMemoryStore::default()),
             batch_store,
             workflow_rules,
-            eager_dispatch_config: EagerDispatchConfig::default(),
             task_queue_rate_limiter: TaskQueueRateLimiter::default(),
         }
-    }
-
-    pub fn with_eager_dispatch_config(
-        mut self,
-        eager_dispatch_config: EagerDispatchConfig,
-    ) -> Self {
-        self.eager_dispatch_config = eager_dispatch_config;
-        self
     }
 
     /// Attach the edge-owned waiters used by caller-facing Nexus HTTP dispatch.
@@ -4070,7 +4047,9 @@ impl WorkflowService {
                 }),
                 start_workflow_status: WorkflowExecutionStatus::Running,
             },
-            StartWorkflowResult::UsedExisting { run_key, run_id }
+            StartWorkflowResult::UsedExisting {
+                run_key, run_id, ..
+            }
             | StartWorkflowResult::Rejected {
                 run_key, run_id, ..
             } => ScheduleActionResult {
@@ -4410,6 +4389,7 @@ impl WorkflowService {
                 }
                 match outcome {
                     StartWorkflowResult::Started {
+                        first_execution_run_id,
                         mutation_metadata,
                         eager_workflow_task,
                         ..
@@ -4429,6 +4409,7 @@ impl WorkflowService {
                                 new_run_id: None,
                             },
                         );
+                        response.first_execution_run_id = first_execution_run_id;
                         response.eager_workflow_task = match eager_workflow_task {
                             Some(started) => Some(
                                 from_internal::poll_response(
@@ -4443,7 +4424,11 @@ impl WorkflowService {
                         };
                         Ok(response)
                     }
-                    StartWorkflowResult::UsedExisting { run_key, run_id } => {
+                    StartWorkflowResult::UsedExisting {
+                        run_key,
+                        run_id,
+                        first_execution_run_id,
+                    } => {
                         // UseExisting attached to a running incumbent rather than
                         // creating a new run. v1.31.0 returns success here — RunId =
                         // the existing run, Started = false, Status = RUNNING — not an
@@ -4457,6 +4442,7 @@ impl WorkflowService {
                         Ok(StartWorkflowExecutionResponse {
                             run_key,
                             run_id,
+                            first_execution_run_id,
                             transition_seq: 0,
                             last_event_id: 0,
                             started: false,
@@ -4478,6 +4464,7 @@ impl WorkflowService {
                     StartWorkflowResult::Deduped {
                         run_key,
                         run_id,
+                        first_execution_run_id,
                         execution_status,
                         eager_workflow_task,
                     } => {
@@ -4501,6 +4488,7 @@ impl WorkflowService {
                         Ok(StartWorkflowExecutionResponse {
                             run_key,
                             run_id,
+                            first_execution_run_id,
                             transition_seq: 0,
                             last_event_id: 0,
                             started: true,
@@ -4509,12 +4497,18 @@ impl WorkflowService {
                             eager_workflow_task,
                         })
                     }
-                    StartWorkflowResult::Rejected { run_id, reason, .. } => {
-                        Err(EdgeError::WorkflowStartRejected {
-                            message: start_reject_message(reason, &workflow_id, run_id),
-                            run_id: run_id.0.to_string(),
-                        })
-                    }
+                    StartWorkflowResult::Rejected {
+                        run_id,
+                        first_execution_run_id,
+                        start_request_id,
+                        reason,
+                        ..
+                    } => Err(EdgeError::WorkflowStartRejected {
+                        message: start_reject_message(reason, &workflow_id, run_id),
+                        run_id: run_id.0.to_string(),
+                        first_execution_run_id: first_execution_run_id.0.to_string(),
+                        start_request_id,
+                    }),
                 }
             },
         )
@@ -4573,6 +4567,8 @@ impl WorkflowService {
                             .await?;
                     }
                     return Ok(SignalWorkflowExecutionResponse {
+                        run_id: None,
+                        request_id: req.request_id.clone().unwrap_or_default(),
                         accepted: true,
                         transition_seq: 0,
                         last_event_id: 0,
@@ -4584,6 +4580,8 @@ impl WorkflowService {
                     )
                 {
                     return Ok(SignalWorkflowExecutionResponse {
+                        run_id: None,
+                        request_id: req.request_id.clone().unwrap_or_default(),
                         accepted: true,
                         transition_seq: 0,
                         last_event_id: 0,
@@ -4609,7 +4607,16 @@ impl WorkflowService {
                     )
                     .await?;
 
+                let LoadedRun::Existing(state) =
+                    self.repo.load_run(run_key).await.map_err(EdgeError::from)?
+                else {
+                    return Err(EdgeError::WorkflowNotFound {
+                        namespace: req.namespace,
+                        workflow_id: req.workflow_id,
+                    });
+                };
                 let internal = to_internal::signal_request(req, &ctx);
+                let request_id = internal.request.request_id.0.clone();
                 let outcome = self
                     .runtime
                     .signal_workflow(run_key, internal)
@@ -4618,7 +4625,10 @@ impl WorkflowService {
                 self.notify_history_run_key(run_key, outcome.last_event_id)
                     .await;
 
-                Ok(from_internal::signal_response(outcome))
+                let mut response = from_internal::signal_response(outcome);
+                response.run_id = Some(state.run_id);
+                response.request_id = request_id;
+                Ok(response)
             },
         )
         .await
@@ -5099,11 +5109,8 @@ impl WorkflowService {
                     });
                 }
 
-                let eager_activity_specs = collect_eager_activity_specs(
-                    &req.commands,
-                    self.eager_dispatch_config
-                        .max_eager_activity_tasks_per_response,
-                );
+                let eager_activity_specs = collect_eager_activity_specs(&req.commands);
+                let eager_use_workflow_build_id = req.eager_use_workflow_build_id.clone();
                 let eager_activity_namespace = if eager_activity_specs.is_empty() {
                     None
                 } else if let Some(namespace) = context.namespace.as_ref() {
@@ -5162,7 +5169,15 @@ impl WorkflowService {
                 }
 
                 if let Some(workflow_namespace) = eager_activity_namespace.as_deref() {
+                    let loaded = self.repo.load_run(run_key).await.map_err(EdgeError::from)?;
                     for (activity_id, task_queue, deployment, build_id) in eager_activity_specs {
+                        // Use committed versioning information, including the just-completed
+                        // worker stamp. The runtime's fenced activity start also rejects pause
+                        // races after this read (service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:528-549 @ v1.32.0).
+                        let LoadedRun::Existing(state) = &loaded else { continue };
+                        if !eager_activity_allowed(state, eager_use_workflow_build_id.contains(&activity_id)) {
+                            continue;
+                        }
                         let queue = tokeira_types::QueueKey {
                             namespace_id,
                             task_queue,
@@ -6499,6 +6514,7 @@ impl WorkflowService {
                         internal.versioning_override.as_ref(),
                     )
                     .await?;
+                let signal_request_id = internal.request.request_id.0.clone();
                 let outcome = self
                     .runtime
                     .signal_with_start_workflow(internal)
@@ -6512,28 +6528,46 @@ impl WorkflowService {
                     .await;
                 }
                 match outcome {
-                    SignalWithStartResult::Started { run_key, run_id } => {
+                    SignalWithStartResult::Started {
+                        run_key,
+                        run_id,
+                        first_execution_run_id,
+                    } => {
                         let last_event_id = read_last_event_id(self.repo.as_ref(), run_key).await?;
                         self.notify_history_run_key(run_key, last_event_id).await;
                         Ok(SignalWithStartWorkflowExecutionResponse {
                             run_id,
+                            first_execution_run_id,
+                            request_id: signal_request_id,
                             started: true,
                         })
                     }
-                    SignalWithStartResult::Signaled { run_key, run_id } => {
+                    SignalWithStartResult::Signaled {
+                        run_key,
+                        run_id,
+                        first_execution_run_id,
+                    } => {
                         let last_event_id = read_last_event_id(self.repo.as_ref(), run_key).await?;
                         self.notify_history_run_key(run_key, last_event_id).await;
                         Ok(SignalWithStartWorkflowExecutionResponse {
                             run_id,
+                            first_execution_run_id,
+                            request_id: signal_request_id,
                             started: false,
                         })
                     }
-                    SignalWithStartResult::Rejected { run_id, reason, .. } => {
-                        Err(EdgeError::WorkflowStartRejected {
-                            message: start_reject_message(reason, &req.workflow_id, run_id),
-                            run_id: run_id.0.to_string(),
-                        })
-                    }
+                    SignalWithStartResult::Rejected {
+                        run_id,
+                        first_execution_run_id,
+                        start_request_id,
+                        reason,
+                        ..
+                    } => Err(EdgeError::WorkflowStartRejected {
+                        message: start_reject_message(reason, &req.workflow_id, run_id),
+                        run_id: run_id.0.to_string(),
+                        first_execution_run_id: first_execution_run_id.0.to_string(),
+                        start_request_id,
+                    }),
                 }
             },
         )
@@ -6635,6 +6669,7 @@ impl WorkflowService {
                         Ok(ExecuteMultiOperationOutcome::Completed(
                             ExecuteMultiOperationResponse {
                                 run_id: result.run_id,
+                                first_execution_run_id: result.first_execution_run_id,
                                 started: result.started,
                                 status: result.execution_status,
                                 update: from_internal::update_response(result.update),
@@ -6646,14 +6681,20 @@ impl WorkflowService {
                         // carries the SAME `WorkflowExecutionAlreadyStarted`
                         // error standalone start produces for that reason
                         // (Req 4.2); op1 aborts as the sibling.
-                        Ok(MultiOperationError::StartRejected { run_id, reason, .. }) => {
-                            Ok(ExecuteMultiOperationOutcome::Failed(
-                                MultiOperationFailure::Start(EdgeError::WorkflowStartRejected {
-                                    message: start_reject_message(reason, &workflow_id, run_id),
-                                    run_id: run_id.0.to_string(),
-                                }),
-                            ))
-                        }
+                        Ok(MultiOperationError::StartRejected {
+                            run_id,
+                            first_execution_run_id,
+                            start_request_id,
+                            reason,
+                            ..
+                        }) => Ok(ExecuteMultiOperationOutcome::Failed(
+                            MultiOperationFailure::Start(EdgeError::WorkflowStartRejected {
+                                message: start_reject_message(reason, &workflow_id, run_id),
+                                run_id: run_id.0.to_string(),
+                                first_execution_run_id: first_execution_run_id.0.to_string(),
+                                start_request_id,
+                            }),
+                        )),
                         // Update leg failed: run its source through the same
                         // anyhow→EdgeError pipeline standalone update uses so
                         // typed aborts (NotFound closing-abort,
@@ -8953,6 +8994,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::Unimplemented(_) => "unimplemented",
         EdgeError::NotFound(_) => "not_found",
         EdgeError::AlreadyExists(_) => "already_exists",
+        EdgeError::Aborted(_) => "aborted",
         EdgeError::ResourceExhausted(_) => "resource_exhausted",
         EdgeError::WorkflowClosing => "resource_exhausted",
         EdgeError::ConsistentQueryBufferExceeded => "resource_exhausted",
@@ -9502,7 +9544,6 @@ fn is_internal_nexus_task_queue(task_queue: &str) -> bool {
 
 fn collect_eager_activity_specs(
     commands: &[tokeira_kernel::WorkflowCommand],
-    limit: usize,
 ) -> Vec<(
     String,
     TaskQueueName,
@@ -9527,8 +9568,29 @@ fn collect_eager_activity_specs(
             )),
             _ => None,
         })
-        .take(limit)
         .collect()
+}
+
+fn eager_activity_allowed(
+    state: &tokeira_kernel::WorkflowState,
+    use_workflow_build_id: bool,
+) -> bool {
+    // Legacy build routing needs explicit compatibility; deployment versioning
+    // (V3) permits eager activity delivery without this flag. No response cap
+    // exists in service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:528-549, 663-672 @ v1.32.0.
+    let legacy_stamp = state
+        .versioning_info
+        .as_ref()
+        .and_then(|info| info.most_recent_worker_version_stamp.as_ref())
+        .is_some_and(|stamp| stamp.use_versioning)
+        && state.effective_behavior() == tokeira_kernel::state::VersioningBehavior::Unspecified;
+    // The domain build_id is also populated for deployment versions; those
+    // are not Temporal's legacy AssignedBuildId routing mode.
+    let assigned_build = state.effective_behavior()
+        == tokeira_kernel::state::VersioningBehavior::Unspecified
+        && state.build_id.as_ref().is_some_and(|id| !id.0.is_empty());
+    state.status == ExecutionStatus::Running
+        && (!(legacy_stamp || assigned_build) || use_workflow_build_id)
 }
 
 fn cross_namespace_authorization_targets(
@@ -9720,10 +9782,11 @@ mod tests {
         EmptyVisibilityApi, ExecutionResolver, WorkflowService,
         activity_offer_requires_rule_evaluation, apply_matrix_capability_field,
         build_update_activity_options_command, collect_eager_activity_specs,
-        cross_namespace_authorization_targets, resolve_build_id_reset_point,
-        scoped_worker_allows_completion_targets, scoped_worker_allows_task_origin,
-        system_capabilities_with_matrix_overlay, worker_identity_from_request,
-        worker_rate_limit_when_api_unset, workflow_rule_crud_admitted,
+        cross_namespace_authorization_targets, eager_activity_allowed,
+        resolve_build_id_reset_point, scoped_worker_allows_completion_targets,
+        scoped_worker_allows_task_origin, system_capabilities_with_matrix_overlay,
+        worker_identity_from_request, worker_rate_limit_when_api_unset,
+        workflow_rule_crud_admitted,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -10512,6 +10575,7 @@ mod tests {
             worker_instance_key: "worker-instance-a".to_owned(),
             worker_control_task_queue: "worker-control-a".to_owned(),
             commands,
+            eager_use_workflow_build_id: Default::default(),
             return_new_workflow_task: false,
             force_create_new_workflow_task: false,
             query_results: std::collections::HashMap::new(),
@@ -10915,6 +10979,7 @@ mod tests {
             run_id: run_id.map(|id| id.0.to_string()),
             first_execution_run_id: None,
             update_id: update_id.to_string(),
+            request_id: String::new(),
             update_name: "update-handler".to_string(),
             input: Payloads(vec![Payload {
                 metadata: Default::default(),
@@ -11375,9 +11440,11 @@ mod tests {
         }
 
         #[test]
-        fn property_collect_eager_activity_specs_respects_limit(
+        // Feature: v132-lifecycle-fidelity, Property 20: eager dispatch guards
+        // Every requested activity is considered; there is no numeric cap
+        // (service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:542-549, 663-672 @ v1.32.0).
+        fn property_collect_eager_activity_specs_has_no_response_cap(
             commands in prop::collection::vec(arb_workflow_command(), 0..20),
-            limit in 0usize..8usize,
         ) {
             let eager_commands: Vec<_> = commands
                 .iter()
@@ -11399,12 +11466,30 @@ mod tests {
                 })
                 .collect();
 
-            let specs = collect_eager_activity_specs(&commands, limit);
-            prop_assert!(specs.len() <= limit);
+            let specs = collect_eager_activity_specs(&commands);
             prop_assert_eq!(
                 specs,
-                eager_commands.into_iter().take(limit).collect::<Vec<_>>()
+                eager_commands
             );
+        }
+
+        // Feature: v132-lifecycle-fidelity, Property 20: eager dispatch guards
+        // Pause and legacy compatibility guards use committed routing state;
+        // V3 deployment routing permits eager delivery (service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:528-549 @ v1.32.0).
+        #[test]
+        fn eager_guards_follow_pause_and_routing(paused in any::<bool>(), legacy_stamp in any::<bool>(), assigned_build in any::<bool>(), deployment_mode in any::<bool>(), use_workflow_build_id in any::<bool>()) {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let (service, runtime, namespace_id, workflow_id, run_id) = update_test_service().await.unwrap();
+                let run_key = runtime.repo().resolve_execution(&tokeira_types::ExecutionRef { namespace_id, workflow_id, run_id: Some(run_id) }).await.unwrap().unwrap();
+                let tokeira_kernel::LoadedRun::Existing(mut state) = service.repo.load_run(run_key).await.unwrap() else { panic!("started run") };
+                state.status = if paused { tokeira_types::ExecutionStatus::Paused } else { tokeira_types::ExecutionStatus::Running };
+                state.build_id = assigned_build.then(|| tokeira_types::BuildId("build".into()));
+                let info = state.versioning_info.get_or_insert_with(Default::default);
+                info.behavior = if deployment_mode { tokeira_kernel::VersioningBehavior::Pinned } else { tokeira_kernel::VersioningBehavior::Unspecified };
+                info.most_recent_worker_version_stamp = Some(tokeira_kernel::WorkerVersionStamp { build_id: "build".into(), use_versioning: legacy_stamp });
+                let expected = !paused && (deployment_mode || !(legacy_stamp || assigned_build) || use_workflow_build_id);
+                assert_eq!(eager_activity_allowed(&state, use_workflow_build_id), expected);
+            });
         }
 
         #[test]

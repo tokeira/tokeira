@@ -413,6 +413,13 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::Wired,
     },
+    // Recording is part of the signal's fenced runtime transition. The stock
+    // default remains false (common/dynamicconfig/constants.go:3224-3231 @ v1.32.0).
+    KeySpec {
+        key: "history.enableCHASMSignalBacklinks",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
     KeySpec {
         key: "history.maxTotalUpdates.suggestContinueAsNewThreshold",
         value_type: ValueType::Double,

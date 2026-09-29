@@ -28,9 +28,9 @@ use tokeira_kernel::{
 };
 use tokeira_proto::{
     conversions::common::{
-        headers_from_domain, memo_from_domain, payload_from_domain, payload_to_failure,
-        payloads_from_domain, search_attr_value_to_payload, search_attributes_from_domain,
-        task_queue_from_domain, to_opt_proto_duration, to_proto_duration, to_proto_timestamp,
+        headers_from_domain, payload_from_domain, payload_to_failure, payloads_from_domain,
+        search_attr_value_to_payload, task_queue_from_domain, to_opt_proto_duration,
+        to_proto_duration, to_proto_timestamp,
     },
     enums, history,
     public::temporal::api::{
@@ -611,8 +611,8 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 parent_initiated_event_id: *parent_initiated_event_id,
                 task_queue: Some(task_queue_from_domain(task_queue)),
                 input: Some(payloads_from_domain(input)),
-                memo: Some(memo_from_domain(memo)),
-                search_attributes: Some(search_attributes_from_domain(search_attributes)),
+                memo: tokeira_proto::conversions::common::filtered_memo_from_domain(memo),
+                search_attributes: tokeira_proto::conversions::common::filtered_search_attributes_from_domain(search_attributes),
                 continued_execution_run_id: opt_run_id(continued_execution_run_id),
                 continued_failure: continued_failure.as_ref().map(payload_to_failure),
                 last_completion_result: last_completion_result.as_ref().map(payloads_from_domain),
@@ -773,8 +773,8 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 }),
                 task_queue: Some(task_queue_from_domain(task_queue)),
                 input: Some(payloads_from_domain(input)),
-                memo: Some(memo_from_domain(memo)),
-                search_attributes: Some(search_attributes_from_domain(search_attributes)),
+                memo: tokeira_proto::conversions::common::filtered_memo_from_domain(memo),
+                search_attributes: tokeira_proto::conversions::common::filtered_search_attributes_from_domain(search_attributes),
                 workflow_run_timeout: to_opt_proto_duration(*workflow_run_timeout),
                 workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
                 initiator: continue_as_new_initiator_i32(initiator),
@@ -1185,8 +1185,8 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 input: Some(payloads_from_domain(input)),
                 namespace_id: namespace_id.0.to_string(),
                 header: header.as_ref().map(headers_from_domain),
-                memo: Some(memo_from_domain(memo)),
-                search_attributes: Some(search_attributes_from_domain(search_attributes)),
+                memo: tokeira_proto::conversions::common::filtered_memo_from_domain(memo),
+                search_attributes: tokeira_proto::conversions::common::filtered_search_attributes_from_domain(search_attributes),
                 workflow_execution_timeout: to_opt_proto_duration(*workflow_execution_timeout),
                 workflow_run_timeout: to_opt_proto_duration(*workflow_run_timeout),
                 workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
@@ -4390,3 +4390,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "nil_map_properties.rs"]
+mod nil_map_properties;

@@ -1276,6 +1276,7 @@ fn arb_continue_as_new_command() -> impl Strategy<Value = WorkflowCommand> {
                 workflow_run_timeout,
                 workflow_task_timeout,
             )| WorkflowCommand::ContinueAsNew {
+                backoff_start_interval: None,
                 header: None,
                 new_run_id: RunId::new(),
                 workflow_type: WorkflowType(workflow_type),
@@ -1905,6 +1906,67 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
 
 fn kernel() -> BasicKernel {
     BasicKernel
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    // Feature: v132-lifecycle-fidelity, Property 2: continue-as-new backoff arithmetic
+    // Preserve command backoff in history, independently applying the minimum to
+    // successor dispatch (service/history/historybuilder/event_factory.go:476-499;
+    // service/history/workflow/mutable_state_impl.go:2868-2894 @ v1.32.0).
+    #[test]
+    fn continue_as_new_backoff_preserves_event_and_minimum(
+        mut command in arb_continue_as_new_command(), requested_ms in prop::option::of(0i64..3000), lifetime_ms in 0i64..3000,
+    ) {
+        let requested = requested_ms.map(Duration::milliseconds);
+        let WorkflowCommand::ContinueAsNew { backoff_start_interval, .. } = &mut command else { unreachable!() };
+        *backoff_start_interval = requested;
+        let now = fixed_now();
+        let mut state = with_pending_wft(make_open_state(now), 95, Some(13), 1);
+        state.started_at = now - Duration::milliseconds(lifetime_ms);
+        let request = completion_request(&state, vec![command.clone()], Default::default(), None, None, false, now);
+        let result = kernel().apply(LoadedRun::Existing(state), Command::WorkflowTaskCompleted(request)).unwrap();
+        let event_backoff = result.history_events.iter().find_map(|event| match event.kind {
+            HistoryEventKind::WorkflowExecutionContinuedAsNew { backoff_start_interval, .. } => Some(backoff_start_interval),
+            _ => None,
+        }).unwrap();
+        prop_assert_eq!(event_backoff, requested);
+        let effective = tokeira_kernel::continue_as_new_min_backoff(event_backoff, Duration::milliseconds(lifetime_ms));
+        let expected_ms = requested_ms.unwrap_or(0).max(1000 - lifetime_ms).max(0);
+        prop_assert_eq!(effective.unwrap_or(Duration::ZERO), Duration::milliseconds(expected_ms));
+        let encoded = postcard::to_allocvec(&command).unwrap();
+        prop_assert_eq!(postcard::from_bytes::<WorkflowCommand>(&encoded).unwrap(), command);
+    }
+
+    // Feature: v132-lifecycle-fidelity, Property 8: request links land on the produced event
+    // Links remain opaque and ordered through the authoritative transition
+    // (service/history/historybuilder/event_factory.go @ v1.32.0).
+    #[test]
+    fn request_links_reach_start_signal_cancel_and_terminate(mut start in arb_start_request(), links in arb_links()) {
+        start.links = links.clone();
+        let started = kernel().apply(LoadedRun::Absent, Command::Start(start.clone())).unwrap();
+        let HistoryEventKind::WorkflowExecutionStartedV2 { links: actual, .. } = &started.history_events[0].kind else { panic!("start event") };
+        prop_assert_eq!(actual, &links);
+        let now = fixed_now();
+        let mut signal = signal_request("linked-signal", now);
+        signal.links = links.clone();
+        let commands = [
+            Command::Signal(signal),
+            Command::Cancel(CancelRequest { reason: "cancel".into(), external_initiator: None, external_initiated_event_id: 0, links: links.clone(), request: request_context("linked-cancel", now), now }),
+            Command::Terminate(TerminateRequest { reason: "terminate".into(), details: None, identity: "client".into(), links: links.clone(), request: request_context("linked-terminate", now), now }),
+        ];
+        for command in commands {
+            let transition = kernel().apply(LoadedRun::Existing(make_open_state(now)), command).unwrap();
+            let actual = transition.history_events.iter().find_map(|event| match &event.kind {
+                HistoryEventKind::WorkflowExecutionSignaled { links, .. }
+                | HistoryEventKind::WorkflowExecutionCancelRequested { links, .. }
+                | HistoryEventKind::WorkflowExecutionTerminated { links, .. } => Some(links),
+                _ => None,
+            }).unwrap();
+            prop_assert_eq!(actual, &links);
+        }
+    }
 }
 
 proptest! {
@@ -3695,6 +3757,7 @@ proptest! {
                     ..
                 },
                 WorkflowCommand::ContinueAsNew {
+                backoff_start_interval: None,
                     header: None,
                     new_run_id: expected_new_run_id,
                     workflow_type: expected_workflow_type,
@@ -5308,6 +5371,7 @@ fn property_42_parent_close_policy_all_paths() {
             }),
             wf_close(WorkflowCommand::CancelWorkflow { details: None }),
             wf_close(WorkflowCommand::ContinueAsNew {
+                backoff_start_interval: None,
                 header: None,
                 new_run_id: RunId::new(),
                 workflow_type: WorkflowType("next".into()),
@@ -5671,6 +5735,7 @@ fn property_57_close_clears_pending_updates() {
         }),
         wf_close(WorkflowCommand::CancelWorkflow { details: None }),
         wf_close(WorkflowCommand::ContinueAsNew {
+            backoff_start_interval: None,
             header: None,
             new_run_id: RunId::new(),
             workflow_type: WorkflowType("next".into()),
@@ -6140,6 +6205,7 @@ fn property_63_close_preserves_execution_options() {
         ),
         (
             wf_close(WorkflowCommand::ContinueAsNew {
+                backoff_start_interval: None,
                 header: None,
                 new_run_id: RunId::new(),
                 workflow_type: WorkflowType("next".into()),
@@ -6376,6 +6442,7 @@ proptest! {
                     worker_deployment_name: None,
                     sticky: None,
                     commands: vec![WorkflowCommand::ContinueAsNew {
+                backoff_start_interval: None,
                         header: None,
                         new_run_id: RunId::new(),
                         workflow_type: WorkflowType("wf".into()),
@@ -6984,6 +7051,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
         }),
         wf_close(WorkflowCommand::CancelWorkflow { details: None }),
         wf_close(WorkflowCommand::ContinueAsNew {
+            backoff_start_interval: None,
             header: None,
             new_run_id: RunId::new(),
             workflow_type: WorkflowType("next".into()),

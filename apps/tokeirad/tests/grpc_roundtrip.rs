@@ -105,8 +105,9 @@ async fn grpc_roundtrip_start_describe_and_reflection() -> Result<()> {
     assert!(info.history_length > 0);
     assert!(info.history_size_bytes > 0);
     assert!(info.state_transition_count > 0);
-    assert!(info.memo.is_some());
-    assert!(info.search_attributes.is_some());
+    // Empty snapshots are omitted (common/payload/payload.go:84-126 @ v1.32.0).
+    assert!(info.memo.is_none());
+    assert!(info.search_attributes.is_none());
 
     let list = loop {
         let response = workflow

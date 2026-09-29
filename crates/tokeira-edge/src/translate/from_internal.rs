@@ -20,6 +20,7 @@ pub fn start_response(
     StartWorkflowExecutionResponse {
         run_key: req.run_key,
         run_id: req.run_id,
+        first_execution_run_id: req.first_execution_run_id.unwrap_or(req.run_id),
         transition_seq: outcome.transition_seq,
         last_event_id: outcome.last_event_id,
         started: true,
@@ -31,6 +32,8 @@ pub fn start_response(
 
 pub fn signal_response(outcome: WorkflowMutationOutcome) -> SignalWorkflowExecutionResponse {
     SignalWorkflowExecutionResponse {
+        run_id: None,
+        request_id: String::new(),
         accepted: !outcome.was_duplicate,
         transition_seq: outcome.transition_seq,
         last_event_id: outcome.last_event_id,
@@ -371,6 +374,27 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: v132-lifecycle-fidelity, Property 20: eager dispatch guards
+        // Inline eager delivery retains the activity's retry policy through the
+        // same serializer as polling (service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:663-672 @ v1.32.0).
+        #[test]
+        fn eager_activity_retry_policy_survives_both_translations(initial in 1i64..1000, maximum in 1i64..1000, attempts in 0u32..20, coefficient in 1u32..8) {
+            let mut started = started_activity_task();
+            let policy = tokeira_types::RetryPolicy {
+                initial_interval: time::Duration::seconds(initial), maximum_interval: Some(time::Duration::seconds(maximum)),
+                maximum_attempts: attempts, backoff_coefficient: f64::from(coefficient), non_retryable_error_types: vec!["fatal".into()],
+            };
+            started.retry_policy = Some(policy.clone());
+            let response = poll_activity_response(started, NamespaceId::new(), "default").unwrap();
+            prop_assert_eq!(response.retry_policy.as_ref(), Some(&policy));
+            let wire = crate::grpc::translate::poll_activity_response_to_proto(response).retry_policy.unwrap();
+            prop_assert_eq!(wire.initial_interval.unwrap().seconds, initial);
+            prop_assert_eq!(wire.maximum_interval.unwrap().seconds, maximum);
+            prop_assert_eq!(wire.maximum_attempts, attempts as i32);
+            prop_assert_eq!(wire.backoff_coefficient, f64::from(coefficient));
+            prop_assert_eq!(wire.non_retryable_error_types, vec!["fatal".to_string()]);
+        }
 
         #[test]
         fn partial_history_offset_requires_sticky_match(previous_started_event_id in -10i64..10_000, is_sticky_match in any::<bool>()) {

@@ -14,10 +14,9 @@ categories = ["api-bindings", "encoding"]
 publish = true
 
 [dependencies]
-buffa = { version = "0.6", features = ["json"] }
-buffa-types = { version = "0.6", features = ["json"] }
-connectrpc = { version = "0.6", features = ["client"] }
-http-body = "1"
+buffa = { version = "0.9", features = ["json"] }
+buffa-types = { version = "0.9", features = ["json"] }
+connectrpc = { version = "0.9.1", features = ["client"] }
 prost = "0.14"
 prost-types = "0.14"
 serde = { version = "1", features = ["derive"] }

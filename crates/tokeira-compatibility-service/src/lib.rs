@@ -4,8 +4,14 @@
 //! deliberately only an adapter from that in-process model to the Buffa DTOs
 //! exposed by `tokeira-compatibility-proto`.
 
+// The generated service trait returns `impl Encodable<Resp>`; the handlers
+// below name the concrete response type, which the lint reports as a
+// refinement of the trait's return type. Naming it is deliberate: it keeps the
+// response free of the request borrow without a precise-capture clause.
+#![allow(refining_impl_trait_internal, refining_impl_trait_reachable)]
+
 use buffa::{EnumValue, MessageField};
-use connectrpc::{ConnectError, RequestContext, Response, ServiceResult};
+use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
 use tokeira_build_info::BuildInfo;
 use tokeira_compatibility::{
     CompatibilityEvidenceKind, CompatibilitySurfaceKind, FEATURE_MATRIX, FeatureEntry,
@@ -82,29 +88,31 @@ impl CompatibilityServiceHandler {
     }
 }
 
+// The request is a zero-copy view borrowed from the dispatcher-owned body for
+// the duration of the call; every response below is built from process state,
+// so nothing borrowed from the request escapes into it.
 impl proto::CompatibilityService for CompatibilityServiceHandler {
     async fn get_compatibility(
         &self,
         _ctx: RequestContext,
-        _request: proto::OwnedGetCompatibilityRequestView,
-    ) -> ServiceResult<impl connectrpc::Encodable<proto::GetCompatibilityResponse> + Send> {
+        _request: ServiceRequest<'_, proto::GetCompatibilityRequest>,
+    ) -> ServiceResult<proto::GetCompatibilityResponse> {
         Ok(Response::new(self.compatibility_response()))
     }
 
     async fn list_compatibility_surfaces(
         &self,
         _ctx: RequestContext,
-        _request: proto::OwnedListCompatibilitySurfacesRequestView,
-    ) -> ServiceResult<impl connectrpc::Encodable<proto::ListCompatibilitySurfacesResponse> + Send>
-    {
+        _request: ServiceRequest<'_, proto::ListCompatibilitySurfacesRequest>,
+    ) -> ServiceResult<proto::ListCompatibilitySurfacesResponse> {
         Ok(Response::new(self.surfaces_response()))
     }
 
     async fn get_feature(
         &self,
         _ctx: RequestContext,
-        request: proto::OwnedGetFeatureRequestView,
-    ) -> ServiceResult<impl connectrpc::Encodable<proto::GetFeatureResponse> + Send> {
+        request: ServiceRequest<'_, proto::GetFeatureRequest>,
+    ) -> ServiceResult<proto::GetFeatureResponse> {
         let Some(response) = self.feature_response(request.feature_id) else {
             return Err(ConnectError::not_found(format!(
                 "compatibility feature `{}` not found",
@@ -117,8 +125,8 @@ impl proto::CompatibilityService for CompatibilityServiceHandler {
     async fn get_sdk_compatibility(
         &self,
         _ctx: RequestContext,
-        request: proto::OwnedGetSdkCompatibilityRequestView,
-    ) -> ServiceResult<impl connectrpc::Encodable<proto::GetSdkCompatibilityResponse> + Send> {
+        request: ServiceRequest<'_, proto::GetSdkCompatibilityRequest>,
+    ) -> ServiceResult<proto::GetSdkCompatibilityResponse> {
         Ok(Response::new(self.sdk_response(request.language)))
     }
 }

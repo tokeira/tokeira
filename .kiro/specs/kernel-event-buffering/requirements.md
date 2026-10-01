@@ -72,6 +72,12 @@ is accepted.
   its view of history is frozen at `started_event_id`.
 - **Buffered event**: A history event whose authoring command was admitted while a WFT was started, held
   in durable state without a history event id and flushed into history when the WFT next closes.
+- **Externally-originated event**: An event that records something that happened outside the workflow
+  task: a signal, a cancel request, a timer firing, an activity or child workflow starting or finishing,
+  the result of a signal or cancel sent to another workflow, a Nexus operation starting or finishing, a
+  pause or unpause, an options update. Requirement 2.3 lists every kind. All other events are written by
+  the transition that produces them: the workflow task's own events, the events written from the
+  worker's commands and update messages, and the events that start or close the run.
 - **WFT close**: Any transition that ends the *started* state of the current WFT — completion
   (`WorkflowTaskCompleted`), failure (`WorkflowTaskFailed`), timeout (`WorkflowTaskTimedOut`), or the
   force-close that terminate performs on a started WFT.
@@ -175,10 +181,8 @@ buffered while a WFT is in flight.
 5. WHEN an event that the predicate classifies as non-bufferable (a workflow state-change event, a
    workflow-task event, or an event generated directly from a worker command/message) is produced while
    a WFT is started, THE Kernel SHALL emit it into history immediately (never buffered).
-6. THE set of externally-originated events that SHALL buffer while a WFT is started SHALL, at minimum
-   for Phase 1, include `WorkflowExecutionSignaled` and `WorkflowExecutionCancelRequested`; Phase 2
-   extends buffering to activity resolutions, child-workflow resolutions, external signal/cancel
-   results, and Nexus completions per the full `bufferEvent` predicate (Requirement 7).
+6. WHILE a WFT is started, THE Kernel SHALL buffer every externally-originated event. Requirement 2.3
+   classifies every event kind.
 
 ### Requirement 2.2: Buffering Does Not Create a Second WFT
 
@@ -191,6 +195,50 @@ that a signal flood during a started WFT does not amplify wakeups.
    WFT will re-deliver the buffered events after it closes; the existing
    `pre_completion` follow-up-WFT logic covers this on completion).
 2. FOR ALL transitions that buffer an event, `dispatch_ops` SHALL contain no `EnqueueWorkflowTask`.
+
+### Requirement 2.3: Every Event Kind Is Classified
+
+**User Story:** As a Tokeira developer, I want every history event kind classified in one place, so that
+whether an event buffers is decided once rather than by each handler.
+
+The classification follows `bufferEvent` (`service/history/historybuilder/event_store.go:263-318 @
+v1.31.0`), which buffers every event kind except the four classes it names.
+
+| Class | Event kinds | While a WFT is started |
+|---|---|---|
+| Run start and close | `WorkflowExecutionStarted`, `WorkflowExecutionStartedV2`, `WorkflowExecutionCompleted`, `WorkflowExecutionFailed`, `WorkflowExecutionTimedOut`, `WorkflowExecutionTerminated`, `WorkflowExecutionContinuedAsNew`, `WorkflowExecutionCanceled` | Never buffered |
+| Workflow task | `WorkflowTaskScheduled`, `WorkflowTaskStarted`, `WorkflowTaskCompleted`, `WorkflowTaskFailed`, `WorkflowTaskTimedOut` | Never buffered |
+| Written from a worker command | `ActivityTaskScheduled`, `ActivityTaskCancelRequested`, `TimerStarted`, `TimerCanceled`, `MarkerRecorded`, `StartChildWorkflowExecutionInitiated`, `SignalExternalWorkflowExecutionInitiated`, `RequestCancelExternalWorkflowExecutionInitiated`, `UpsertWorkflowSearchAttributes`, `WorkflowPropertiesModified`, `NexusOperationScheduled`, `NexusOperationCancelRequested` | Never buffered |
+| Written from an update message | `WorkflowExecutionUpdateAccepted`, `WorkflowExecutionUpdateCompleted`, `WorkflowExecutionUpdateCompletedV2` | Never buffered |
+| Externally-originated | `WorkflowExecutionSignaled`, `WorkflowExecutionCancelRequested`, `TimerFired`, `ActivityTaskStarted`, `ActivityTaskCompleted`, `ActivityTaskFailed`, `ActivityTaskTimedOut`, `ActivityTaskCanceled`, `ChildWorkflowExecutionStarted`, `StartChildWorkflowExecutionFailed`, `ChildWorkflowExecutionCompleted`, `ChildWorkflowExecutionFailed`, `ChildWorkflowExecutionCanceled`, `ChildWorkflowExecutionTerminated`, `ChildWorkflowExecutionTimedOut`, `ExternalWorkflowExecutionSignaled`, `SignalExternalWorkflowExecutionFailed`, `ExternalWorkflowExecutionCancelRequested`, `RequestCancelExternalWorkflowExecutionFailed`, `NexusOperationStarted`, `NexusOperationCompleted`, `NexusOperationFailed`, `NexusOperationCanceled`, `NexusOperationTimedOut`, `NexusOperationCancelRequestCompleted`, `NexusOperationCancelRequestFailed`, `WorkflowExecutionPaused`, `WorkflowExecutionUnpaused`, `WorkflowExecutionOptionsUpdated`, `WorkflowExecutionUpdateAdmitted` | Buffered |
+| Never written | `WorkflowExecutionUpdateRejected` (decode-only) | Not applicable |
+
+`WorkflowExecutionPaused` and `WorkflowExecutionUnpaused` buffer so that a workflow task in flight when
+the workflow is paused can still complete; v1.31.0 names this case explicitly in `bufferEvent`.
+`WorkflowExecutionUpdateAdmitted` is written only when a reset reapplies an update onto the new run,
+where no workflow task is started; it is listed for completeness.
+
+#### Acceptance Criteria
+
+1. THE Kernel SHALL classify each `HistoryEventKind` exactly as the table above.
+2. THE classification SHALL be exhaustive: adding a `HistoryEventKind` without classifying it SHALL fail
+   to compile, so a new kind cannot append during a started WFT by omission.
+
+### Requirement 2.4: Buffering Covers Every Task Mode and Every Source
+
+**User Story:** As an SDK worker holding a started workflow task, I want buffering to protect my task
+whatever kind of task it is and wherever the event comes from, so that no path changes history under me.
+
+#### Acceptance Criteria
+
+1. THE buffering rule of Requirement 2.1 SHALL apply to a started WFT of every mode: normal, retry
+   (attempt > 1) and speculative.
+2. THE buffering rule SHALL apply wherever an externally-originated event is recorded, including the
+   activity start recorded when a worker polls an activity task and the activity start recorded when a
+   not-yet-started activity is completed by id.
+3. WHEN an externally-originated event is recorded while no WFT is started and a speculative WFT is
+   scheduled, THE Kernel SHALL convert the speculative WFT to normal before appending the event
+   (`speculative-wft` Requirement 4.1).
 
 ---
 
@@ -218,18 +266,44 @@ the workflow-task-close event, so that the run's history matches v1.31.0 and the
    the buffered events are delivered to a worker. This subsumes the current
    `pre_completion_last_event_id > started_event_id` check.
 
-### Requirement 3.2: Buffer Reorder Rule (Phase 2)
+### Requirement 3.2: Buffer Reorder Rule
 
 **User Story:** As a Tokeira developer, I want flushed buffered events reordered per v1.31.0, so that
 asynchronous completion events land after other buffered events.
 
 #### Acceptance Criteria
 
-1. WHEN flushing buffered events that include activity/child/Nexus completion-class events, THE Kernel
-   SHALL place those completion-class events **after** the non-completion buffered events, matching
-   `reorderBuffer` (`event_store.go:411 @ v1.31.0`).
-2. Requirement 3.2 is Phase 2; Phase 1 (signals/cancel-requested only) has no completion-class buffered
-   events and therefore preserves plain admission order.
+1. WHEN flushing buffered events, THE Kernel SHALL place the completion-class events after every other
+   buffered event, keeping admission order within each group (`reorderBuffer`,
+   `event_store.go:413-443 @ v1.31.0`). The completion class is: `ActivityTaskCompleted`,
+   `ActivityTaskFailed`, `ActivityTaskTimedOut`, `ActivityTaskCanceled`,
+   `ChildWorkflowExecutionCompleted`, `ChildWorkflowExecutionFailed`, `ChildWorkflowExecutionCanceled`,
+   `ChildWorkflowExecutionTerminated`, `ChildWorkflowExecutionTimedOut`, `NexusOperationCompleted`,
+   `NexusOperationFailed`, `NexusOperationCanceled`, `NexusOperationTimedOut`.
+2. WHEN no completion-class event is buffered, THE flush SHALL keep plain admission order.
+
+### Requirement 3.3: Started Ids Are Wired on Flush
+
+**User Story:** As an SDK worker, I want a completion event to name the real id of the started event it
+belongs to, even when both were buffered, so that the history links up.
+
+v1.31.0 assigns ids to a flushed batch and then patches each completion's started id from the started
+event flushed with it, keyed by the activity's scheduled id or the child's initiated id (`wireEventIDs`,
+`event_store.go:339-406`); the pending activity or child then records the real id
+(`updatePendingEventIDs`, `mutable_state_impl.go:7957-7981 @ v1.31.0`).
+
+#### Acceptance Criteria
+
+1. WHILE a `ChildWorkflowExecutionStarted` event is buffered, THE Kernel SHALL record the child's started
+   event id as the buffered sentinel (`BUFFERED_EVENT_ID`, v1.31.0's `common.BufferedEventID`), and any
+   child completion event authored in that window SHALL carry the sentinel as its started event id.
+2. WHEN a buffered `ChildWorkflowExecutionStarted` is flushed, THE Kernel SHALL write its real event id
+   into every child completion event for the same child (matched by initiated event id) flushed in the
+   same batch.
+3. WHEN a buffered `ChildWorkflowExecutionStarted` is flushed and the child is still pending, THE Kernel
+   SHALL record the real event id as the child's started event id, so a completion arriving after the
+   flush names the real id.
+4. THE same wiring SHALL continue to hold for activities, keyed by scheduled event id.
 
 ---
 
@@ -345,6 +419,23 @@ flushing, and force-close.
 
 1. FOR ALL transitions that close a run, `next_state.buffered_events` SHALL be empty.
 
+### Requirement 6.4: A Started Task's History Is Frozen
+
+**User Story:** As an SDK worker holding a started workflow task, I want history to stay exactly as it was
+when I received the task until my task closes, so that the ids and order I hold stay valid.
+
+This is the outcome buffering exists to guarantee, stated as a rule the kernel can check: in v1.31.0 the
+buffer is flushed into history only when no workflow task is started
+(`hBuilder.Finish(!ms.HasStartedWorkflowTask())`, `mutable_state_impl.go:7800 @ v1.31.0`).
+
+#### Acceptance Criteria
+
+1. WHILE the same WFT is started both before and after a transition, THE transition SHALL append no
+   history events.
+2. THE Kernel SHALL check criterion 1 on every transition it computes; IF a transition breaks it, THEN
+   THE Kernel SHALL reject the transition and nothing SHALL be committed (`speculative-wft`
+   Requirement I.4 defines the check and the rejection).
+
 ---
 
 ## Property Tests
@@ -383,6 +474,32 @@ flushing, and force-close.
 1. FOR ALL transitions that close a run, `next_state.buffered_events` SHALL be empty.
    `// Feature: kernel-event-buffering, Property 5`
 
+### Requirement P6: Every Externally-Originated Event Buffers During a Started WFT
+
+1. FOR ALL open WorkflowState with a started WFT of any mode (normal, retry, speculative) and FOR ALL
+   commands that record an externally-originated event (Requirement 2.3), THE transition SHALL append
+   no history event, SHALL add the event to `buffered_events`, and SHALL leave `last_event_id` unchanged.
+   `// Feature: kernel-event-buffering, Property 6`
+
+### Requirement P7: Flush Puts Completion-Class Events Last
+
+1. FOR ALL buffered batches, THE flush SHALL emit the non-completion events in admission order followed
+   by the completion-class events in admission order, with contiguous ids.
+   `// Feature: kernel-event-buffering, Property 7`
+
+### Requirement P8: Flushed Completions Name Their Real Started Event
+
+1. FOR ALL buffered batches holding a started event and a completion for the same activity or child,
+   THE flushed completion's started event id SHALL equal the flushed started event's id, and no flushed
+   event SHALL carry the buffered sentinel.
+   `// Feature: kernel-event-buffering, Property 8`
+
+### Requirement P9: Started-Task History Is Frozen
+
+1. FOR ALL command sequences applied to an open run, WHEN the same WFT is started before and after a
+   transition, THE transition SHALL append no history events.
+   `// Feature: kernel-event-buffering, Property 9`
+
 ---
 
 ## Golden Transition Test
@@ -395,6 +512,20 @@ flushing, and force-close.
    `WorkflowExecutionStarted, WorkflowTaskScheduled, WorkflowTaskStarted, WorkflowTaskFailed,
    WorkflowExecutionSignaled, WorkflowExecutionTerminated` (`tests/workflow_test.go:993 @ v1.31.0`).
 
+### Requirement G2: Child Completion During a Started WFT
+
+1. WHEN a child workflow completes while the parent's WFT is started, and that WFT then completes with
+   no commands, THE completion transition SHALL emit, in order and with contiguous ids,
+   `WorkflowTaskCompleted`, `ChildWorkflowExecutionCompleted`, `WorkflowTaskScheduled`.
+
+### Requirement G3: Child Start and Completion Buffered Together
+
+1. WHEN a child workflow both starts and completes while the parent's WFT is started, and a signal
+   arrives after the child completes, THE completion transition SHALL flush
+   `ChildWorkflowExecutionStarted`, `WorkflowExecutionSignaled`, `ChildWorkflowExecutionCompleted` in
+   that order (the completion moves after the signal), and the flushed `ChildWorkflowExecutionCompleted`
+   SHALL name the flushed `ChildWorkflowExecutionStarted` as its started event.
+
 ---
 
 ## Out of Scope / Dependencies
@@ -404,9 +535,6 @@ flushing, and force-close.
   the existing Feature 2 `WorkflowTaskFailed` retry command. This is edge/runtime work tracked under
   `edge-unimplemented.md` / the owning `api-conformance-wft-completion` spec, and depends on this kernel
   feature landing.
-- **Full buffering fidelity (Phase 2).** Buffering and reordering of activity/child/Nexus completion
-  events (Requirements 2.1.6, 3.2) is deferred to Phase 2. Phase 1 delivers signals/cancel-requested
-  buffering, flush-on-close, and terminate force-close — the minimum for the raised conformance leaves.
 - **`TestWorkflowRetry` / `TestWorkflowRetryFailures`** are **confirmed out of scope for this spec**:
   both assert plain 5-event per-attempt histories (`tests/workflow_test.go:1440-1520 @ v1.31.0`) with no
   buffered event; the 6-vs-4 delta is the retry-chain / `RespondWorkflowTaskFailed` edge-and-runtime

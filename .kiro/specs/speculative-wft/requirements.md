@@ -101,8 +101,18 @@ their blast radius, so kernel changes are deliberate accepted decisions, not sil
   path reused at attempt 1.
 - **Rollback / drop:** a rejection-only completion erases the task: zero history events, waiters
   still resolved with the rejection outcomes, SDK rewound via `ResetHistoryEventId`.
-- **Convert-to-normal:** a speculative task becomes a normal persisted task when other events
-  intrude (signal, heartbeat, timeout) — its events are written at conversion time.
+- **Convert-to-normal:** a speculative task becomes a normal persisted task when anything else is
+  written to history (any externally-originated event), on heartbeat, or on timeout — its events are
+  written at conversion time (Req 4).
+- **Reserved event ids:** the two ids a task is given without being written to history —
+  `last_event_id + 1` for its `WorkflowTaskScheduled` and `+ 2` for its `WorkflowTaskStarted`. A
+  speculative WFT holds them from the moment it is scheduled; a retry WFT (attempt > 1) holds them once
+  it is started, because from then on a worker has seen them. The update request delivered with the
+  task points at the reserved Scheduled id (Req 2.2).
+- **Externally-originated event:** as defined in `kernel-event-buffering` (Requirement 2.3 lists every
+  kind): a signal, a cancel request, a timer firing, an activity or child workflow starting or
+  finishing, a signal or cancel result from another workflow, a Nexus operation event, a pause or
+  unpause, an options update.
 - **K4 seam:** the existing invalid-command reject path (`Reject::InvalidCommandAttributes` →
   persisted `WorkflowTaskFailed` + `INVALID_ARGUMENT`, drop-without-persist on transient attempts;
   `crates/tokeira-runtime/src/runtime/workflow_task.rs:444-510`).
@@ -153,6 +163,16 @@ and correctly anchored messages, so replay and update delivery line up.
    **persisted** WFT-started id (a dropped speculative WFT never advances it).
 4. GetHistory SHALL stay clean: speculative events appear only in the polled task's history, never
    in `GetWorkflowExecutionHistory`, until commit/conversion (synthesis is read-only).
+5. THE poll response SHALL contain the history as it stood when the task started: persisted events up
+   to the event before the task's reserved Scheduled id (for a task with reserved ids) or up to its
+   persisted `WorkflowTaskStarted` (for a normal task). An event committed after the start SHALL NOT
+   appear in it. (v1.31.0 reads `[firstEventID, nextEventID)` with `nextEventID` fixed when the task
+   starts, `recordworkflowtaskstarted/api.go:272-276, 419 @ v1.31.0`.)
+6. THE synthesized `WorkflowTaskScheduled` and `WorkflowTaskStarted` SHALL be appended only when they
+   continue exactly from the last event read; WHEN they would not, THE edge SHALL NOT append them, SHALL
+   NOT fail the poll, and SHALL log the inconsistency. (`GetRawHistory` / `GetHistory` skip the suffix
+   when `ValidateTransientWorkflowTaskEvents` fails — "Don't append events, but don't fail request" —
+   `get_history_util.go:118-128, 234-246, 438-457 @ v1.31.0`.)
 
 ### Requirement 3: Completion — Commit vs Rollback
 
@@ -187,20 +207,36 @@ vanish, and any substantive completion to persist it, matching v1.31.0 exactly.
 
 ### Requirement 4: Convert-to-Normal Triggers
 
+**User Story:** As an SDK worker, I want a speculative workflow task to become a normal one as soon as
+anything else is written to history, so that the task's events land at the ids I was given and no other
+event takes them.
+
 #### Acceptance Criteria
 
-1. WHEN a signal arrives while the speculative WFT is SCHEDULED, THE Kernel SHALL convert it in
-   place: history shows `WorkflowTaskScheduled`, `WorkflowExecutionSignaled`, `WorkflowTaskStarted`
-   (signal between scheduled and started).
-   (`convertSpeculativeWorkflowTaskToNormal`, `workflow_task_state_machine.go:1466-1530 @ v1.31.0`.)
-2. WHEN a signal buffers while the speculative WFT is STARTED, THE task SHALL persist and convert
-   (history: Scheduled, Started, Completed, then the flushed Signaled).
+1. WHEN an externally-originated event is recorded while the speculative WFT is SCHEDULED, THE Kernel
+   SHALL first write the task's `WorkflowTaskScheduled` at its reserved id, with the original schedule
+   time and attempt, convert the task to normal, and only then append the event. For a signal, history
+   shows `WorkflowTaskScheduled`, `WorkflowExecutionSignaled`, `WorkflowTaskStarted`; a child workflow
+   completing, an activity starting or a timer firing gives the same shape with its own event in the
+   middle. (`convertSpeculativeWorkflowTaskToNormal`, `workflow_task_state_machine.go:1466-1537`, run
+   at every transaction close by `closeTransactionHandleSpeculativeWorkflowTask`,
+   `mutable_state_impl.go:7238-7251 @ v1.31.0`.)
+2. WHEN an externally-originated event is recorded while the speculative WFT is STARTED, THE event
+   SHALL buffer (`kernel-event-buffering` Requirement 2.4) and the task SHALL persist when it closes:
+   `WorkflowTaskScheduled` and `WorkflowTaskStarted` at the reserved ids, the close event, then the
+   flushed events. A completion SHALL NOT drop the task while events are buffered.
 3. WHEN the worker heartbeats a speculative WFT (`ForceCreateNewWorkflowTask`, no
    commands/messages), THE task SHALL convert (commit, reason `force_create_task`); the successor
    WFT SHALL be **normal**, and the update message SHALL NOT be redelivered on it (heartbeat sends
    only newly-admitted updates, `includeAlreadySent = !heartbeat`), while remaining rejectable by
    referencing the earlier request message.
    (`workflow_task_state_machine.go:690-698`; `update/registry.go:327-358 @ v1.31.0`.)
+4. WHEN the buffered-event limit force-fails a started speculative WFT, THE Kernel SHALL write the
+   task's `WorkflowTaskScheduled` and `WorkflowTaskStarted` at the reserved ids before the
+   `WorkflowTaskFailed`, as every other path that closes a started speculative WFT does.
+   (`closeTransactionHandleBufferedEventsLimit`, `mutable_state_impl.go:8202-8231`, fails the task
+   through `failWorkflowTask`, `workflow/util.go:26-48`, whose `AddWorkflowTaskFailedEvent` writes both
+   events first for a speculative task, `workflow_task_state_machine.go:865-891 @ v1.31.0`.)
 
 ### Requirement 5: Timeouts
 
@@ -313,6 +349,52 @@ vanish, and any substantive completion to persist it, matching v1.31.0 exactly.
 1. FOR ALL transitions, `next_state` holds at most one `PendingWorkflowTask`; a task is exactly one
    of normal, transient (`attempt > 1`), or speculative (flag, attempt 1). A speculative task never
    survives a conversion or completion still flagged speculative.
+
+### Requirement I.3: Reserved Ids Are Never Shared
+
+**User Story:** As an SDK worker, I want the ids a workflow task reserved to belong to that task alone,
+so that the history I hold never has two events with one id and the update I was sent stays anchored to
+the task's own Scheduled event.
+
+A task with reserved ids is a speculative WFT, scheduled or started, or a started retry WFT
+(attempt > 1). A scheduled retry WFT does not hold its reserved id: no worker has seen it yet.
+
+#### Acceptance Criteria
+
+1. WHILE a WFT with reserved ids stays pending, THE Kernel SHALL NOT give either reserved id to any
+   event other than that task's own `WorkflowTaskScheduled` and `WorkflowTaskStarted`.
+2. WHILE a speculative WFT stays speculative across a transition, THE transition SHALL append no
+   history events; the first event recorded converts it (Requirement 4.1).
+3. WHEN a transition converts a task with reserved ids to normal, or writes its
+   `WorkflowTaskCompleted`, `WorkflowTaskFailed` or `WorkflowTaskTimedOut`, THE same transition SHALL
+   first write the task's `WorkflowTaskScheduled` (and its `WorkflowTaskStarted`, if the task started)
+   at exactly the reserved ids. (v1.31.0 returns an internal error when the Scheduled id it writes
+   differs from the reserved one, `workflow_task_state_machine.go:1501-1503 @ v1.31.0`.)
+4. WHEN a transition ends a task with reserved ids without writing any of its events — a dropped
+   speculative WFT, a failed or timed-out retry WFT, a run that closes — THE reserved ids SHALL be
+   released and the next events MAY take them. (v1.31.0 writes nothing for a failed retry task,
+   `workflow_task_state_machine.go:892-895`, and does not convert a speculative task when the run is
+   closing, `mutable_state_impl.go:7241-7244 @ v1.31.0`.)
+5. WHEN an event is recorded while a retry WFT is scheduled but not started, THE event MAY take the
+   task's reserved id, and THE task SHALL get new ids as a normal attempt-1 task when it starts
+   (unchanged; `AddWorkflowTaskStartedEvent`, `workflow_task_state_machine.go:559-576 @ v1.31.0`).
+
+### Requirement I.4: Every Transition Is Checked
+
+**User Story:** As the Tokeira owner, I want the kernel to refuse a transition that breaks these rules
+rather than commit it, so that an event source that misses them fails loudly instead of corrupting a
+run's history.
+
+#### Acceptance Criteria
+
+1. THE Kernel SHALL check every transition it computes for: event ids that continue contiguously from
+   the run's `last_event_id`; `kernel-event-buffering` Requirement 6.4 (a started task's history is
+   frozen); and Requirement I.3.
+2. IF a transition fails the check, THEN THE Kernel SHALL reject it with a rejection that names the
+   broken rule, nothing SHALL be committed, and the command SHALL fail with an internal error — the
+   outcome v1.31.0 gives when a speculative task's Scheduled id does not match its reserved id.
+3. THE check SHALL also apply to the activity-start transitions the runtime commits itself, which a
+   kernel function computes (`kernel-event-buffering` Requirement 2.4).
 
 ## Out of Scope
 

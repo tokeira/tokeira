@@ -85,10 +85,15 @@ waiter aborts, RejectUnprocessed, and metrics.
   no upstream/proto type may cross into the kernel. The kernel classifies "rejection-only" from
   this owned model alone; the edge owns the decode. Purity-by-construction: the kernel stays a
   deterministic `state + command → Transition` machine with no proto dependency.**
-- **K4 — Convert-to-normal transitions.** Signal while SCHEDULED: materialize Scheduled before
-  appending the signal (Scheduled, Signaled, Started ordering at start). Signal buffered while
-  STARTED: convert at completion (persist; flush after Completed). Timeouts and heartbeat: Req 5 /
-  Req 4.3 shapes. These generalize the transient conversion rules (B.4) to the speculative flag.
+- **K4 — Convert-to-normal transitions.** Any externally-originated event recorded while the task is
+  SCHEDULED: write Scheduled at the reserved id first, then the event — the signal shape (Scheduled,
+  Signaled, Started) for every such event, through the transition builder's single append rule
+  (`kernel-event-buffering` design, "One append rule"). Any externally-originated event recorded while
+  the task is STARTED: the event buffers and the task is written when it closes (completion, explicit
+  failure, start-to-close timeout, force-close, buffered-event limit), each path writing Scheduled and
+  Started at the reserved ids first; flushed events follow the close event. Timeouts and heartbeat:
+  Req 5 / Req 4.3 shapes. These generalize the transient conversion rules (B.4) to the speculative flag.
+  "Reserved ids" below explains how this keeps v1.31.0's guarantee inside Tokeira's architecture.
 - **K5 — `WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage`.** Appended LAST after
   `BadRequestCancelExternalWorkflowExecutionAttributes` — postcard encodes variants positionally
   (discipline comment, `command.rs:225-228`); `as_str()` renders
@@ -135,14 +140,87 @@ flowchart TD
     Mat --> RU["RejectUnprocessed: Sent-state updates auto-rejected (Req 9)"]
 ```
 
+## Reserved ids
+
+A speculative task's `WorkflowTaskScheduled` and `WorkflowTaskStarted` are not written when the task is
+scheduled or started. The task holds the next two ids instead (`last_event_id + 1` and `+ 2`), and the
+worker receives them in the poll response, with an update request that points at the Scheduled id. A
+retry task (attempt > 1) holds its ids the same way once it starts. The ids are only right if nothing
+else is written first (Requirement I.3).
+
+### How v1.31.0 keeps them
+
+Each request in v1.31.0 is a transaction on mutable state. External events go into a buffer during the
+request, without ids. When the transaction closes, a pending speculative task is converted first — its
+Scheduled event (and Started, if it started) is written and takes the reserved ids — and the buffer is
+flushed into history only if no task is started (`closeTransaction`, `mutable_state_impl.go:7086-7100`;
+`convertSpeculativeWorkflowTaskToNormal`, `workflow_task_state_machine.go:1466-1537`;
+`Finish(!ms.HasStartedWorkflowTask())`, `mutable_state_impl.go:7800 @ v1.31.0`). No event can be numbered
+before the conversion.
+
+### How Tokeira keeps them
+
+Tokeira computes a transition with one pure call and numbers each event as it is appended, so there is no
+close step to attach the conversion to. The same guarantee comes from three places:
+
+- **At append time, for a scheduled task.** The builder's append rule converts a scheduled speculative
+  task before appending anything — the path a signal already takes (`materialize_scheduled_speculative`),
+  now taken by every externally-originated event. The converted task is a normal scheduled task that
+  still carries the speculative 5s schedule-to-start deadline, a case the runtime already handles for
+  signals.
+- **At close time, for a started task.** The event buffers, and the task stays speculative until it
+  closes, where v1.31.0 would convert it at the buffering transaction's close and write Scheduled and
+  Started early. Tokeira waits because the runtime decides how to time out a started task when it starts
+  it: a speculative task gets a precise in-memory start-to-close timer, a normal task the durable sweep
+  (`start_polled_workflow_task_inner` in `runtime/workflow_task.rs`; the post-commit timer hook in
+  `lane.rs`). Converting a started task mid-flight would leave a started normal task that nothing times
+  out. Waiting leaves the runtime as it is and produces the same final history: Scheduled and Started at
+  the reserved ids, the close event, then the flushed events. The cost is that every path that closes a
+  started speculative task must write Scheduled and Started first. Completion, explicit failure, the
+  start-to-close timeout and force-close do; the buffered-event limit's force-fail does not, and is fixed
+  here (Requirement 4.4).
+- **In the poll response.** v1.31.0 reads a polled task's history inside the start transaction, bounded
+  by the next event id fixed at start, and appends the generated Scheduled and Started only if they
+  continue from that bound. In Tokeira the runtime commits the start and the edge reads storage
+  afterwards, so an event committed in between can reach the response. That is how the reported failure
+  arose: the edge read `ChildWorkflowExecutionCompleted(42)`, then appended the generated
+  `WorkflowTaskScheduled(42)`. The edge bounds its read by the started task's own ids and appends the
+  generated events only when they continue exactly (Requirement 2.5, 2.6). Once the kernel keeps reserved
+  ids, this is defence in depth.
+
+### Transition check
+
+One pure function in `tokeira-kernel` checks each transition against the state it was computed from,
+before the transition leaves the kernel. "The same task" means the same `logical_seq`; the redispatches
+that issue a new `logical_seq` only apply to a task that is neither started nor speculative, which holds
+no reserved ids.
+
+- event ids run contiguously from `last_event_id + 1`, and `next_state.last_event_id` is the last of them;
+- if the same task is started before and after, the transition appends nothing (`kernel-event-buffering`
+  Requirement 6.4);
+- if the same task is speculative before and after, the transition appends nothing (Requirement I.3.2);
+- if the task held reserved ids, no other event takes them while it stays pending, and a transition that
+  writes the task's events writes its Scheduled (and Started, if it started) at the reserved ids before
+  anything that refers to them (Requirement I.3.1, I.3.3).
+
+`Kernel::apply` runs the check on every transition, and so does the kernel function that computes the
+runtime's activity-start transitions. A failure returns a new `Reject` variant naming the broken rule; the
+runtime commits nothing, and the edge's existing fallback for kernel rejections surfaces it as an internal
+error (`From<anyhow::Error> for EdgeError`, `crates/tokeira-edge/src/errors.rs`). The check runs in release
+builds: it is one pass over the transition's events, and refusing a corrupt history is its purpose.
+`Reject` is a public enum without `#[non_exhaustive]`, so the new variant breaks exhaustive matches in
+embedding crates; the engine release that carries it is a minor version bump.
+
 ## Components and Interfaces
 
 ### Kernel (`crates/tokeira-kernel`)
 
 - `state.rs` — `PendingWorkflowTask.task_type` (K1, `serde(default)`).
 - `kernel.rs` — `apply_update` speculative arm (K2); `apply_workflow_task_completed`
-  drop/materialize + follow-up (K3, K7); conversion hooks on signal/buffer/timeout paths (K4);
-  `ProtocolMessage` arms take the worker sequencing id and emit the new completed variant (K6).
+  drop/materialize + follow-up (K3, K7); conversion through the builder's append rule and on the
+  timeout and force-close paths, including the buffered-event limit (K4); `ProtocolMessage` arms take
+  the worker sequencing id and emit the new completed variant (K6); the transition check run at the end
+  of `Kernel::apply` ("Reserved ids").
 - `command.rs` — `BadUpdateWorkflowExecutionMessage` appended (K5);
   `UpdateProtocolBody::{Accepted, Completed}` field additions (wire-message model, K6).
 - `event.rs` — appended failure-capable completed variant (K6).
@@ -180,7 +258,11 @@ flowchart TD
 
 - **Poll synthesis:** widen the transient predicate (`from_internal.rs:47-76`,
   `append_transient_suffix` in `workflow_service.rs:5414`) to speculative; anchor `Messages[]`
-  sequencing ids at the virtual scheduled id (Req 2).
+  sequencing ids at the virtual scheduled id (Req 2). `poll_response` reads history only up to the
+  started task's boundary — `started_event_id - 2` for a task with reserved ids, `started_event_id`
+  for a normal task — and appends the generated pair only when the last event read is exactly the one
+  before the reserved Scheduled id; otherwise it logs and returns the history without the pair
+  (Req 2.5, 2.6).
 - **Completion wire:** thread unreferenced messages through
   `to_internal::workflow_task_completed_request` (Req 6.5); decode `Response`-with-Failure as
   Completed-with-failure (fix `grpc/translate.rs:2342-2367`); surface `ResetHistoryEventId` on the
@@ -216,6 +298,8 @@ flowchart TD
 | Explicit RespondWorkflowTaskFailed | update stays admitted; redelivered on the retry WFT |
 | Late completion of timed-out started speculative | NotFound "Workflow task not found." |
 | Update delivered but unprocessed | server rejection with `unprocessedUpdateFailure` (exact string, Req 9) |
+| A computed transition breaks the reserved-id or frozen-history rules | nothing committed; the command fails with Internal, naming the broken rule (Req I.4) |
+| Poll-response suffix would not continue from the history read | suffix not appended, poll not failed, inconsistency logged (Req 2.6) |
 
 Existing WFT fencing rejects are untouched; speculative tokens fence on the virtual started id the
 same way transient tokens already do.
@@ -239,14 +323,46 @@ same way transient tokens already do.
   note) — empty-speculative accept+complete history: WFTScheduled(5) WFTStarted(6)
   WFTCompleted(7) UpdateAccepted(8, sequencing 5) UpdateCompleted(9, accepted 8).
 - **Golden G2** — reject leaves history ending at the prior WFTCompleted (no trace).
+- **P7 — Reserved ids are never shared.** Over interleaved sequences of update admission, WFT start,
+  completion (accept, reject with and without the discard capability), failure, both timeouts,
+  heartbeat, and every externally-originated command: event ids stay unique and contiguous across the
+  whole history; no event other than a task's own Scheduled/Started takes a reserved id of a pending
+  speculative or started retry task; and a written task's Scheduled/Started sit at its reserved ids.
+  (Req 4, I.3)
+- **P8 — Conversion comes first.** For every externally-originated kind recorded while a speculative task
+  is scheduled, the transition's first event is the task's Scheduled at the reserved id with the original
+  time and attempt, then the recorded event; the task is normal afterwards. (Req 4.1)
+- **P9 — Nothing is stranded.** Over the same sequences, whenever a WFT closes after events were recorded
+  beyond the worker's view, a follow-up WFT is scheduled or the run has closed, so every recorded event
+  reaches a worker. (Req 4.2; `kernel-event-buffering` Req 3.1.6)
+- **P10 — The check accepts exactly the valid transitions.** For generated (state, transition) pairs the
+  check accepts if and only if the rules of Requirement I.4 hold; every transition the kernel computes in
+  P7's sequences passes it. (Req I.4)
+- **P11 — Preservation.** Behaviour outside the bug condition is unchanged: goldens (a)-(e), the buffered
+  signal, both timeout shapes, heartbeat, and explicit fail keep their histories, and a scheduled retry
+  task whose reserved id an event took gets new ids at start. (Req 3, 4.1, 4.3, 5, I.3.5)
+- **Golden G3** — child completes while the task is scheduled: Scheduled(5) with the original schedule
+  time, ChildWorkflowExecutionCompleted(6); the start writes Started(7). (Req 4.1)
+- **Golden G4** — child completes while the task is started: nothing appended, the child event buffered;
+  a rejection-only completion with the discard capability does not drop, and writes Scheduled(5),
+  Started(6), Completed(7), ChildWorkflowExecutionCompleted(8), Scheduled(9). (Req 4.2)
+- **Golden G5** — the buffered-event limit force-fails a started speculative task: Scheduled(5),
+  Started(6), WorkflowTaskFailed(7, ForceCloseCommand, naming 5 and 6), then the flushed events.
+  (Req 4.4)
 
-**Validates: Requirements 1-10, I.1, I.2.**
+**Validates: Requirements 1-10, I.1-I.4.**
 
 ## Testing Strategy
 
-- **Kernel property/golden tests** (`property_tests.rs` / `golden_tests.rs`): P1-P6, G1, G2,
+- **Kernel property/golden tests** (`property_tests.rs` / `golden_tests.rs`): P1-P11, G1-G5,
   tagged `// Feature: speculative-wft, Property N`; generators drive idle-run update → speculative
-  schedule → {reject | accept+complete | signal | heartbeat | timeout} at attempt 1.
+  schedule → {reject | accept+complete | signal | heartbeat | timeout} at attempt 1, and P7/P9 add
+  every externally-originated command at every point in the task's life.
+- **Exploration tests first** (bug condition): before the fix, tests that assert the reserved-id rules
+  for a child completion while the task is scheduled and while it is started, the stranded child result
+  on both completion outcomes, a child completion during a started retry task, the buffered-event limit
+  on a started speculative task, and a child completion during a started normal task all FAIL on the
+  unfixed kernel. Their failure confirms the bug; they then become the regression goldens.
 - **Runtime/edge tests:** direct-dispatch (no backlog row), sticky fallback, rollback bookkeeping
   (timers disarmed, broker cleared, re-dispatch works), poll suffix + message anchoring, drop
   response carries `ResetHistoryEventId`, RejectUnprocessed resolution, validation-taxonomy wire

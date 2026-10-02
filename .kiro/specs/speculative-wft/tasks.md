@@ -203,9 +203,11 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
   **(DONE — P7, P8, P9 and P11 in `property_tests.rs`; P10 as unit tests in `integrity.rs`, where the
   crate-private check is reachable. With the old append behaviour injected and the check disabled,
   P7 and P9 fail on their own assertions — P9 on the reported drop.)**
-- [ ] V.7 Checkpoint: the full bar; conformance rerun of `TestWorkflowUpdateSuite`,
+- [x] V.7 Checkpoint: the full bar; conformance rerun of `TestWorkflowUpdateSuite`,
   `TestUpdateWorkflowSdkSuite` and `TestUpdateWithStartSuite` alongside the `kernel-event-buffering`
-  2.9 suites.
+  2.9 suites. **(DONE — no failures in `TestWorkflowUpdateSuite` (31 tests), `TestUpdateWorkflowSdkSuite`
+  (5) and `TestUpdateWithStartSuite` (4), nor in the activity (9), activity-client (5) and workflow (16)
+  suites run with them; the 2.9 suites are recorded there.)**
 
 ## Phase D — Docs
 

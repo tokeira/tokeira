@@ -135,9 +135,18 @@ warnings`, `cargo +nightly fmt`, and `cargo test -p tokeira-kernel`.
   sequences from idle runs and runs with a pending task of each mode; with
   the old append behaviour injected it fails both through the transition
   check and on its own assertion.)**
-- [ ] 2.9 Checkpoint: the full bar; conformance rerun of the child-workflow,
+- [x] 2.9 Checkpoint: the full bar; conformance rerun of the child-workflow,
   Nexus, external signal/cancel, pause and buffered-events suites — shifted
-  histories must match v1.31.0. (Req 0.2)
+  histories must match v1.31.0. (Req 0.2) **(DONE — bar green; the v1.31.0
+  corpus against a conformance build of `1ea4ec48` has no failures in the
+  child-workflow (7 tests), reset-with-child (3, plus 6 registry skips),
+  Nexus (11), signal (11), cancel (5), buffered-events (3) and
+  max-buffered-events (1) suites. The pause suite is outside the v1.31.0
+  conformance surface and fails all 7 tests before any step after the pause:
+  `DescribeWorkflowExecution` omits the `TemporalPauseInfo` search attribute,
+  and identity length is not validated. Neither is touched by this change;
+  the rest of its paused-state check passes, including no workflow task
+  scheduled after the pause event.)**
 - [x] 2.10 Update `020-kernel.md` (the predicate paragraph: full
   classification, the append rule, child started-id wiring) and the
   `should_buffer` / `is_buffered_resolution_class` comments. (Req 0.3)

@@ -203,22 +203,24 @@ pub(crate) fn check_transition(prior: &PriorRun, transition: &Transition) -> Res
                 wrote_started = true;
                 continue;
             }
+            // The close event names the task's Scheduled and Started ids,
+            // which exist only if this transition wrote them first. A close
+            // event whose ids were written falls through to the reserved-id
+            // check below like any other event.
             HistoryEventKind::WorkflowTaskCompleted { logical_seq, .. }
             | HistoryEventKind::WorkflowTaskFailed { logical_seq, .. }
             | HistoryEventKind::WorkflowTaskTimedOut { logical_seq, .. }
-                if *logical_seq == task.logical_seq =>
+                if *logical_seq == task.logical_seq
+                    && (!wrote_scheduled
+                        || (task.started_event_id.is_some() && !wrote_started)) =>
             {
-                // The close event names the task's Scheduled and Started ids,
-                // which exist only if this transition wrote them first.
-                if !wrote_scheduled || (task.started_event_id.is_some() && !wrote_started) {
-                    return Err(reserved_violation(
-                        task,
-                        format!(
-                            "event {} closes it before its reserved events were written",
-                            event.event_id
-                        ),
-                    ));
-                }
+                return Err(reserved_violation(
+                    task,
+                    format!(
+                        "event {} closes it before its reserved events were written",
+                        event.event_id
+                    ),
+                ));
             }
             _ => {}
         }

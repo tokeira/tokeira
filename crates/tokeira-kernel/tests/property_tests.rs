@@ -8559,9 +8559,11 @@ fn arb_initial_run() -> impl Strategy<Value = WorkflowState> {
     ]
 }
 
-/// What a step hands the kernel.
+/// What a step hands the kernel. `Command` is boxed: it is an order of
+/// magnitude larger than an activity-start request, and a step is built and
+/// consumed once, so the indirection costs nothing the test can observe.
 enum StepInput {
-    Command(Command),
+    Command(Box<Command>),
     ActivityStart(tokeira_kernel::ActivityStartRequest),
 }
 
@@ -8778,7 +8780,7 @@ fn step_input(
             })
         }
     };
-    Some(StepInput::Command(command))
+    Some(StepInput::Command(Box::new(command)))
 }
 
 /// One applied step: the state it was applied to and what it produced.
@@ -8821,7 +8823,7 @@ fn drive(
         }
         let result = match input {
             StepInput::Command(command) => {
-                BasicKernel.apply(LoadedRun::Existing(state.clone()), command)
+                BasicKernel.apply(LoadedRun::Existing(state.clone()), *command)
             }
             StepInput::ActivityStart(request) => {
                 BasicKernel.apply_activity_started(LoadedRun::Existing(state.clone()), request)

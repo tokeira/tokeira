@@ -163,11 +163,45 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
   (S.1 + pre-existing) stay skipped; TestSpeculativeWorkflowTask_QueryFailureClearsWFContext is
   tracked under the Tier 2.10 query-buffer work, not gated here.
 
+## Phase V — Reserved-id integrity
+
+> Trigger: GitHub issue #235. A child workflow's result, recorded while an update's speculative task
+> was started, took the task's reserved Scheduled id; the edge then read it and appended the generated
+> `WorkflowTaskScheduled` with the same id, and the Rust SDK reported "HistoryUpdate isn't contiguous".
+> The same gap leaves the child's result undelivered when the task completes, and reaches started
+> retry tasks and the buffered-event limit. Lands in one change with `kernel-event-buffering` Phase 2's
+> second slice (tasks 2.4–2.10). Bugfix order: the exploration tests come first and must fail.
+
+- [ ] V.1 Exploration tests, expected to FAIL on the unfixed kernel (failure confirms the bug; record
+  each observed failure): a child completion while the speculative task is scheduled (the Scheduled
+  event is not written first) and while it is started (the child event takes reserved id 5); the
+  started case followed by a rejection-only completion with the discard capability (dropped, child
+  result stranded) and by a written completion (Scheduled/Started land at 6/7, no follow-up task); a
+  child completion during a started retry task (reserved id 10 taken); the buffered-event limit on a
+  started speculative task (`WorkflowTaskFailed` at 5 naming unwritten ids); a child completion during a
+  started normal task (appended rather than buffered). They then become regression goldens asserting
+  the v1.31.0 shapes. (Req 4.1, 4.2, 4.4, I.3; `kernel-event-buffering` Req 2.4, 6.4)
+- [ ] V.2 Conversion before append for every externally-originated event, through the append rule of
+  `kernel-event-buffering` task 2.5; goldens G3, G4. (Req 4.1, 4.2)
+- [ ] V.3 Buffered-event limit: write Scheduled and Started at the reserved ids before the force-close
+  `WorkflowTaskFailed` (cite `AddWorkflowTaskFailedEvent`, `workflow_task_state_machine.go:865-891 @
+  v1.31.0`); golden G5. (Req 4.4)
+- [ ] V.4 Transition check and its `Reject` variant: run at the end of `Kernel::apply` and in the kernel
+  function behind the runtime's activity-start transitions; surfaces as Internal. (Req I.3, I.4)
+- [ ] V.5 Edge: bound the poll-response history read by the started task's ids; append the generated
+  Scheduled/Started only when they continue exactly from the last event read; otherwise log and return
+  the history without them. (Req 2.5, 2.6)
+- [ ] V.6 Properties P7–P11 (`// Feature: speculative-wft, Property N`). (Req 4, I.3, I.4)
+- [ ] V.7 Checkpoint: the full bar; conformance rerun of `TestWorkflowUpdateSuite`,
+  `TestUpdateWorkflowSdkSuite` and `TestUpdateWithStartSuite` alongside the `kernel-event-buffering`
+  2.9 suites.
+
 ## Phase D — Docs
 
 - [ ] D.1 Amend `docs/architecture/020-kernel.md` (three WFT modes, drop/materialize, conversion
-  table) and `docs/readiness/command-surface.md` (appended cause + event variant, wire-message
-  model). (AGENTS §9)
+  table, and the reserved-id rule with how Tokeira keeps it) and `docs/readiness/command-surface.md`
+  (appended cause + event variant, wire-message model, the transition check's `Reject` variant).
+  (AGENTS §9)
 
 ## Task Dependency Graph
 
@@ -182,7 +216,11 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
     { "id": 5, "tasks": ["E.1", "E.2", "E.3"] },
     { "id": 6, "tasks": ["M.1", "M.2", "T.1", "T.2"] },
     { "id": 7, "tasks": ["C.1"] },
-    { "id": 8, "tasks": ["D.1"] }
+    { "id": 8, "tasks": ["V.1"] },
+    { "id": 9, "tasks": ["V.2", "V.3", "V.4", "V.5"] },
+    { "id": 10, "tasks": ["V.6"] },
+    { "id": 11, "tasks": ["V.7"] },
+    { "id": 12, "tasks": ["D.1"] }
   ]
 }
 ```
@@ -190,5 +228,7 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
 > Wave ordering: 0.1 gates everything kernel-ward; S.1 is independent but wave-0 so the first full
 > suite run cannot be masked by harness panics. K.1 (the existence bit) precedes every other kernel
 > arm; K.3/K.4/K.7 build on K.2's scheduling arm. Runtime dispatch/timers (wave 4) need the kernel
-> shapes; edge wire (wave 5) needs both. C.1 is operator-invoked and flips the gated leaves; D.1
-> records the landed model.
+> shapes; edge wire (wave 5) needs both. C.1 is operator-invoked and flips the gated leaves. Phase V
+> starts with the exploration tests (V.1); V.2 shares the append rule with `kernel-event-buffering`
+> task 2.5, and V.7 reruns the suites only once both specs' tasks have landed. D.1 records the landed
+> model.

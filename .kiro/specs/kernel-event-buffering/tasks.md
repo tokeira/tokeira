@@ -13,7 +13,7 @@ warnings`, `cargo +nightly fmt`, and `cargo test -p tokeira-kernel`.
 
 - [x] 0.1 Record acceptance of Requirement 0 (buffered-event model supersedes the no-buffering
   deviation). **Accepted for Phase 1 (2026-07-01, owner).** Phase 2 deferred until a completion-during-
-  started-WFT leaf demands it (see requirements Out of Scope).
+  started-WFT case demanded it (see Phase 2 below).
 
 ## Phase 1 — Minimum conformant buffering + terminate force-close
 
@@ -62,9 +62,8 @@ warnings`, `cargo +nightly fmt`, and `cargo test -p tokeira-kernel`.
 > Trigger met 2026-07-07 by Tier 2.13 (`TestWorkflowBufferedEventsTestSuite` +
 > `TestMaxBufferedEventSuite`). Landed as the **activity slice** — the first
 > completion-during-started-WFT leaves demand activity buffering + reorder +
-> the count limit. Child-workflow / Nexus / external resolutions extend the
-> whitelist when THEIR tiers land; the flush machinery (reorder + wire) is
-> already general.
+> the count limit. Child-workflow, external-workflow, Nexus and pause events
+> are the second slice (tasks 2.4–2.10).
 
 - [x] 2.1 Extend `should_buffer` + activity resolution handlers to buffer
   completion-class events during a started WFT **(DONE — activity started +
@@ -86,9 +85,44 @@ warnings`, `cargo +nightly fmt`, and `cargo test -p tokeira-kernel`.
   activity-reorder spine + a broadened property remain a follow-up nicety.)**
   Broaden property coverage to completion-class buffering + reordering.
 
-> Deferred within Phase 2 (not corpus-demanded here): child-workflow / Nexus /
-> external resolution buffering (their tiers); a mutable-state SIZE-limit
-> terminate — `TestBufferedEventsMutableStateSizeLimit` needs
+> Not implemented: a mutable-state SIZE-limit terminate —
+> `TestBufferedEventsMutableStateSizeLimit` needs
 > `OverrideDynamicConfig(MutableStateSizeLimitError=410KB)`, undeliverable
-> out-of-process, so it is a registered OverrideDynamicConfig-class skip and
-> the size-limit terminate is not implemented.
+> out-of-process, so it is a registered OverrideDynamicConfig-class skip.
+
+### Phase 2, second slice — the remaining externally-originated events
+
+> Trigger: GitHub issue #235. A child workflow's result, recorded while an
+> update's speculative workflow task was started, took the task's reserved
+> event id: the worker could receive two events numbered 42, or never be given
+> the child's result. While a task holds reserved ids, an event that is not
+> buffered corrupts the worker's history rather than only reordering it. This
+> slice lands in one change with `speculative-wft` Phase V, whose exploration
+> tests (V.1) come first and fail until both land.
+
+- [ ] 2.4 Classify every `HistoryEventKind` in `should_buffer` per Requirement
+  2.3, as an exhaustive match with no wildcard arm; cite `bufferEvent`
+  (`event_store.go:263-318 @ v1.31.0`). (Req 2.1.6, 2.3)
+- [ ] 2.5 Replace `emit_or_buffer` with `TransitionBuilder::append_external`
+  (buffer while a WFT is started; otherwise convert a scheduled speculative
+  WFT, then append) and route every externally-originated kernel site through
+  it: child started and resolved, external signal and cancel results, Nexus
+  started, resolved and cancel-request results, pause, unpause. Move the
+  signal, cancel, timer, activity and options sites onto the same rule.
+  (Req 2.1, 2.4)
+- [ ] 2.6 Child started-id wiring: the sentinel while
+  `ChildWorkflowExecutionStarted` is buffered; the flush back-fills the pending
+  child's started id and patches flushed child completions (keyed by initiated
+  id); child and Nexus completions join the completion class. (Req 3.2, 3.3)
+- [ ] 2.7 Runtime activity starts: compute the poll-path start and the by-id
+  completion's start with a kernel function built on the append rule (covering
+  the retry-policy transient start and the stamp and identity updates the
+  runtime does by hand today); keep the runtime's commit path. (Req 2.4)
+- [ ] 2.8 Properties P6–P9 (`// Feature: kernel-event-buffering, Property N`)
+  and goldens G2, G3. (Req P6–P9, G2, G3)
+- [ ] 2.9 Checkpoint: the full bar; conformance rerun of the child-workflow,
+  Nexus, external signal/cancel, pause and buffered-events suites — shifted
+  histories must match v1.31.0. (Req 0.2)
+- [ ] 2.10 Update `020-kernel.md` (the predicate paragraph: full
+  classification, the append rule, child started-id wiring) and the
+  `should_buffer` / `is_buffered_resolution_class` comments. (Req 0.3)

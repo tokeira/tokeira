@@ -1399,7 +1399,7 @@ pub enum LoadedRun {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use serde::Serialize;
@@ -1419,7 +1419,7 @@ mod tests {
         }
     }
 
-    fn open_state() -> WorkflowState {
+    pub(crate) fn open_state() -> WorkflowState {
         WorkflowState {
             completed_update_count: 0,
             run_key: RunKey::new(),

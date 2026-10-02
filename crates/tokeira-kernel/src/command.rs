@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    BuildId, DeploymentId, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
-    RequestContext, RetryPolicy, RunId, RunKey, SearchAttrValue, SearchAttributes, TaskQueueName,
-    WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
+    BuildId, DeploymentId, EventPrincipal, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload,
+    Payloads, RequestContext, RetryPolicy, RunId, RunKey, SearchAttrValue, SearchAttributes,
+    TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
 };
 
 use crate::{
@@ -1508,6 +1508,38 @@ pub struct WorkflowExecutionTimedOutRequest {
     #[serde(default)]
     pub new_execution_run_id: Option<RunId>,
     /// Wall-clock time the command was accepted.
+    pub now: OffsetDateTime,
+}
+
+/// Which path recorded an activity start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityStartMode {
+    /// A worker polled the activity task. Under a retry policy the start is
+    /// transient: recorded on the activity, with no history event until the
+    /// activity resolves (`AddActivityTaskStartedEvent`,
+    /// mutable_state_impl.go:4082-4152 @ v1.31.0).
+    Poll,
+    /// A by-id completion of an activity no worker started: the start is
+    /// written as an event carrying the completing caller's identity, whatever
+    /// the retry policy (respondactivitytaskcompleted/api.go:89-105 @
+    /// v1.31.0).
+    CompletedById,
+}
+
+/// Request from the runtime recording that an activity started, for the
+/// activity-start transitions it commits itself
+/// (`BasicKernel::apply_activity_started`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActivityStartRequest {
+    /// Activity that started.
+    pub activity_id: String,
+    /// Identity of the polling worker, or of the by-id caller.
+    pub identity: WorkerIdentity,
+    /// Authenticated caller an appended event is attributed to.
+    pub principal: Option<EventPrincipal>,
+    /// Which path recorded the start.
+    pub mode: ActivityStartMode,
+    /// Wall-clock time the start was recorded.
     pub now: OffsetDateTime,
 }
 

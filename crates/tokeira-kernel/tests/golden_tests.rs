@@ -9740,3 +9740,379 @@ fn pending_limit_causes_append_without_changing_old_postcard_discriminants() {
         vec![20]
     );
 }
+
+// ─── Reserved event ids and full buffering — goldens ───
+//
+// A speculative task (from scheduling) and a started retry task hold the ids
+// of Scheduled/Started events they have not written. Every event recorded from
+// outside the task either buffers (a task is started) or lands after the
+// speculative task converts (it is only scheduled), so nothing takes those ids
+// and every recorded event reaches a worker.
+
+/// `(event_id, variant name)` for readable shape assertions.
+fn event_names(events: &[HistoryEvent]) -> Vec<(i64, String)> {
+    events
+        .iter()
+        .map(|event| {
+            let kind = format!("{:?}", event.kind);
+            let name = kind
+                .split([' ', '{', '('])
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            (event.event_id, name)
+        })
+        .collect()
+}
+
+fn names(expected: &[(i64, &str)]) -> Vec<(i64, String)> {
+    expected
+        .iter()
+        .map(|(id, name)| (*id, (*name).to_owned()))
+        .collect()
+}
+
+fn resolve_child(state: WorkflowState) -> Transition {
+    kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::ChildResolved(ChildResolvedRequest {
+                resolved_run_id: None,
+                child_workflow_id: WorkflowId("child-1".into()),
+                resolution: ChildResolution::Completed {
+                    result: payloads("done"),
+                },
+                now: now() + Duration::seconds(1),
+            }),
+        )
+        .unwrap()
+}
+
+fn reject_update(update_id: &str) -> Vec<WorkflowCommand> {
+    vec![WorkflowCommand::ProtocolMessage {
+        message_id: "msg-reject".into(),
+        body: UpdateProtocolBody::Rejected {
+            update_id: update_id.into(),
+            failure: payload("rejected"),
+        },
+    }]
+}
+
+/// An update's speculative task, started (reserved ids 5/6), on a run with a
+/// started child.
+fn started_speculative_with_child() -> WorkflowState {
+    let state = with_child(
+        make_quiescent_state_after_first_wft(),
+        "child-1",
+        10,
+        ParentClosePolicy::Terminate,
+        true,
+    );
+    start_pending_task(admit_update(state, "update-1")).next_state
+}
+
+#[test]
+fn child_completion_while_speculative_scheduled_converts_the_task_first() {
+    let state = with_child(
+        make_quiescent_state_after_first_wft(),
+        "child-1",
+        10,
+        ParentClosePolicy::Terminate,
+        true,
+    );
+    let state = admit_update(state, "update-1");
+    let scheduled_at = state.pending_workflow_task.as_ref().unwrap().scheduled_at;
+
+    let resolved = resolve_child(state);
+    assert_eq!(
+        event_names(&resolved.history_events),
+        names(&[
+            (5, "WorkflowTaskScheduled"),
+            (6, "ChildWorkflowExecutionCompleted")
+        ])
+    );
+    // The Scheduled event keeps the task's own schedule time.
+    assert_eq!(resolved.history_events[0].happened_at, scheduled_at);
+    let pending = resolved.next_state.pending_workflow_task.clone().unwrap();
+    assert_eq!(pending.task_type, tokeira_kernel::WorkflowTaskType::Normal);
+    assert_eq!(pending.scheduled_event_id, 5);
+
+    let started = start_pending_task(resolved.next_state);
+    assert_eq!(
+        event_names(&started.history_events),
+        names(&[(7, "WorkflowTaskStarted")])
+    );
+}
+
+#[test]
+fn child_completion_while_speculative_started_buffers_and_blocks_the_drop() {
+    let resolved = resolve_child(started_speculative_with_child());
+    // The worker holds Scheduled 5 / Started 6: nothing may take them.
+    assert!(resolved.history_events.is_empty());
+    assert_eq!(resolved.next_state.last_event_id, 4);
+    assert_eq!(resolved.next_state.buffered_events.len(), 1);
+
+    // A rejection-only completion from a worker that discards speculative
+    // tasks with events would drop the task; the buffered child result keeps
+    // it, and the result is delivered on a follow-up task.
+    let mut request =
+        speculative_completion_request(&resolved.next_state, reject_update("update-1"));
+    request.client_discards_speculative_with_events = true;
+    let completed = kernel()
+        .apply(
+            LoadedRun::Existing(resolved.next_state),
+            Command::WorkflowTaskCompleted(request),
+        )
+        .unwrap();
+    assert_eq!(
+        event_names(&completed.history_events),
+        names(&[
+            (5, "WorkflowTaskScheduled"),
+            (6, "WorkflowTaskStarted"),
+            (7, "WorkflowTaskCompleted"),
+            (8, "ChildWorkflowExecutionCompleted"),
+            (9, "WorkflowTaskScheduled"),
+        ])
+    );
+    let follow_up = completed.next_state.pending_workflow_task.unwrap();
+    assert_eq!(
+        follow_up.task_type,
+        tokeira_kernel::WorkflowTaskType::Normal
+    );
+    assert_eq!(follow_up.scheduled_event_id, 9);
+}
+
+#[test]
+fn child_completion_while_speculative_started_then_accepted_keeps_the_update_anchor() {
+    let resolved = resolve_child(started_speculative_with_child());
+    let completed = kernel()
+        .apply(
+            LoadedRun::Existing(resolved.next_state.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &resolved.next_state,
+                vec![
+                    WorkflowCommand::ProtocolMessage {
+                        message_id: "msg-accept".into(),
+                        body: accepted_body("update-1", 5),
+                    },
+                    WorkflowCommand::ProtocolMessage {
+                        message_id: "msg-complete".into(),
+                        body: UpdateProtocolBody::Completed {
+                            update_id: "update-1".into(),
+                            result: payloads("done"),
+                            failure: None,
+                        },
+                    },
+                ],
+            )),
+        )
+        .unwrap();
+    // The update was anchored at 5, which is the task's own Scheduled event;
+    // the child result flushes after the task's commands and gets a follow-up.
+    assert_eq!(
+        event_names(&completed.history_events),
+        names(&[
+            (5, "WorkflowTaskScheduled"),
+            (6, "WorkflowTaskStarted"),
+            (7, "WorkflowTaskCompleted"),
+            (8, "WorkflowExecutionUpdateAccepted"),
+            (9, "WorkflowExecutionUpdateCompletedV2"),
+            (10, "ChildWorkflowExecutionCompleted"),
+            (11, "WorkflowTaskScheduled"),
+        ])
+    );
+    assert!(completed.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn child_completion_while_retry_started_buffers() {
+    let mut state = with_child(
+        make_open_state(),
+        "child-1",
+        5,
+        ParentClosePolicy::Terminate,
+        true,
+    );
+    assert_eq!(state.last_event_id, 9);
+    state.workflow_task_attempt = 2;
+    state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
+        task_type: tokeira_kernel::WorkflowTaskType::Normal,
+        schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
+        logical_seq: LogicalTaskSeq(3),
+        scheduled_event_id: 10,
+        scheduled_at: now(),
+        started_event_id: Some(11),
+        started_at: Some(now()),
+        attempt: 2,
+    });
+    let resolved = resolve_child(state);
+    // The worker holds the retry's Scheduled 10 / Started 11.
+    assert!(resolved.history_events.is_empty());
+    assert_eq!(resolved.next_state.last_event_id, 9);
+    assert_eq!(resolved.next_state.buffered_events.len(), 1);
+}
+
+#[test]
+fn child_completion_during_a_started_task_flushes_after_completed() {
+    let state = with_child(
+        make_open_state_with_started_wft(),
+        "child-1",
+        5,
+        ParentClosePolicy::Terminate,
+        true,
+    );
+    let resolved = resolve_child(state);
+    assert!(resolved.history_events.is_empty());
+    assert_eq!(resolved.next_state.buffered_events.len(), 1);
+
+    let completed = kernel()
+        .apply(
+            LoadedRun::Existing(resolved.next_state.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &resolved.next_state,
+                Vec::new(),
+            )),
+        )
+        .unwrap();
+    assert_eq!(
+        event_names(&completed.history_events),
+        names(&[
+            (10, "WorkflowTaskCompleted"),
+            (11, "ChildWorkflowExecutionCompleted"),
+            (12, "WorkflowTaskScheduled"),
+        ])
+    );
+}
+
+#[test]
+fn child_start_and_completion_buffered_together_flush_wired() {
+    let state = with_child(
+        make_open_state_with_started_wft(),
+        "child-1",
+        5,
+        ParentClosePolicy::Terminate,
+        false,
+    );
+    let started = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::ChildStartConfirmed(ChildStartConfirmedRequest {
+                child_workflow_id: WorkflowId("child-1".into()),
+                initiated_event_id: 5,
+                result: ChildStartResult::Started {
+                    child_run_id: RunId::new(),
+                    workflow_type: WorkflowType("child-workflow".into()),
+                },
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(started.history_events.is_empty());
+    let child = &started.next_state.children[&WorkflowId("child-1".into())];
+    assert_eq!(
+        child.started_event_id,
+        Some(tokeira_kernel::BUFFERED_EVENT_ID)
+    );
+
+    let resolved = resolve_child(started.next_state);
+    let signaled = kernel()
+        .apply(
+            LoadedRun::Existing(resolved.next_state),
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: payloads("signal"),
+                header: None,
+                links: Vec::new(),
+                request: request_context("signal-after-child"),
+                now: now() + Duration::seconds(2),
+            }),
+        )
+        .unwrap();
+    assert_eq!(signaled.next_state.buffered_events.len(), 3);
+
+    let completed = kernel()
+        .apply(
+            LoadedRun::Existing(signaled.next_state.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &signaled.next_state,
+                Vec::new(),
+            )),
+        )
+        .unwrap();
+    // The completion moves after the signal; it names the flushed start.
+    assert_eq!(
+        event_names(&completed.history_events),
+        names(&[
+            (10, "WorkflowTaskCompleted"),
+            (11, "ChildWorkflowExecutionStarted"),
+            (12, "WorkflowExecutionSignaled"),
+            (13, "ChildWorkflowExecutionCompleted"),
+            (14, "WorkflowTaskScheduled"),
+        ])
+    );
+    match &completed.history_events[3].kind {
+        HistoryEventKind::ChildWorkflowExecutionCompleted {
+            started_event_id, ..
+        } => assert_eq!(*started_event_id, 11),
+        other => panic!("expected ChildWorkflowExecutionCompleted, got {other:?}"),
+    }
+}
+
+#[test]
+fn buffer_limit_writes_a_started_speculative_task_before_failing_it() {
+    let mut state = start_pending_task(admit_update(
+        make_quiescent_state_after_first_wft(),
+        "update-1",
+    ))
+    .next_state;
+    let scheduled_at = state.pending_workflow_task.as_ref().unwrap().scheduled_at;
+    let mut last = None;
+    for index in 0..101 {
+        let transition = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::Signal(SignalRequest {
+                    signal_name: "sig".into(),
+                    input: payloads("signal"),
+                    header: None,
+                    links: Vec::new(),
+                    request: request_context(&format!("signal-{index}")),
+                    now: now() + Duration::seconds(1),
+                }),
+            )
+            .unwrap();
+        state = transition.next_state.clone();
+        last = Some(transition);
+    }
+    let forced = last.unwrap();
+    let shape = event_names(&forced.history_events);
+    assert_eq!(
+        shape[..4],
+        names(&[
+            (5, "WorkflowTaskScheduled"),
+            (6, "WorkflowTaskStarted"),
+            (7, "WorkflowTaskFailed"),
+            (8, "WorkflowExecutionSignaled"),
+        ])[..]
+    );
+    assert_eq!(forced.history_events[0].happened_at, scheduled_at);
+    assert!(matches!(
+        forced.history_events[2].kind,
+        HistoryEventKind::WorkflowTaskFailed {
+            scheduled_event_id: 5,
+            started_event_id: 6,
+            failure_cause: WorkflowTaskFailedCause::ForceCloseCommand,
+            ..
+        }
+    ));
+    // All 101 signals flush, then a fresh task redelivers them.
+    assert_eq!(shape.len(), 3 + 101 + 1);
+    assert_eq!(
+        shape.last().unwrap(),
+        &(109, "WorkflowTaskScheduled".to_owned())
+    );
+}

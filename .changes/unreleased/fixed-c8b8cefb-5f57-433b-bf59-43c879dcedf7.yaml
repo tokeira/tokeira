@@ -1,0 +1,5 @@
+kind: fixed
+body: An event recorded while an update's speculative workflow task is in flight no longer reuses the task's event ids; child, Nexus, external-workflow and pause events now buffer.
+time: 2026-10-02T13:24:21.000000+01:00
+custom:
+    Slice: c8b8cefb-5f57-433b-bf59-43c879dcedf7

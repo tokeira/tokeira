@@ -8414,3 +8414,812 @@ proptest! {
         prop_assert_eq!(pending_advice(&replayed), recorded);
     }
 }
+
+// ─── Reserved event ids and full buffering — properties ───
+//
+// Generated runs interleave updates, workflow-task starts, completions,
+// failures and timeouts with every kind of event recorded from outside the
+// task. The kernel's transition check refuses a transition that breaks the
+// history rules, so the driver below fails a case on any such refusal; each
+// property then restates its rule from what a worker sees.
+
+/// Something that happens to a run, in a generated sequence.
+#[derive(Clone, Copy, Debug)]
+enum RunStep {
+    AdmitUpdate,
+    StartTask,
+    Complete { reject_update: bool, discards: bool },
+    FailTask,
+    TimeOutStartToClose,
+    TimeOutScheduleToStart,
+    Signal,
+    ChildStarted,
+    ChildCompleted,
+    ActivityStarted,
+    ActivityCompleted,
+    TimerFired,
+    ExternalSignalResolved,
+    NexusStarted,
+    NexusCompleted,
+    Pause,
+    Unpause,
+}
+
+/// The steps that record an event from outside the workflow task.
+fn arb_external_step() -> impl Strategy<Value = RunStep> {
+    prop_oneof![
+        Just(RunStep::Signal),
+        Just(RunStep::ChildStarted),
+        Just(RunStep::ChildCompleted),
+        Just(RunStep::ActivityStarted),
+        Just(RunStep::ActivityCompleted),
+        Just(RunStep::TimerFired),
+        Just(RunStep::ExternalSignalResolved),
+        Just(RunStep::NexusStarted),
+        Just(RunStep::NexusCompleted),
+        Just(RunStep::Pause),
+        Just(RunStep::Unpause),
+    ]
+}
+
+fn arb_run_step() -> impl Strategy<Value = RunStep> {
+    prop_oneof![
+        3 => Just(RunStep::AdmitUpdate),
+        3 => Just(RunStep::StartTask),
+        3 => (any::<bool>(), any::<bool>()).prop_map(|(reject_update, discards)| {
+            RunStep::Complete { reject_update, discards }
+        }),
+        1 => Just(RunStep::FailTask),
+        1 => Just(RunStep::TimeOutStartToClose),
+        1 => Just(RunStep::TimeOutScheduleToStart),
+        8 => arb_external_step(),
+    ]
+}
+
+/// A run whose last workflow task completed at 14 (started 13), with one of
+/// each externally-resolved resource pending: a child and an activity not yet
+/// started, a started child and activity, a timer, an external signal and a
+/// Nexus operation.
+fn run_for_steps(now: OffsetDateTime) -> WorkflowState {
+    let mut state = make_open_state(now);
+    state.previous_started_event_id = 13;
+    let state = with_child(state, "child-1", 10, ParentClosePolicy::Abandon, false);
+    let state = with_child(state, "child-2", 8, ParentClosePolicy::Abandon, true);
+    let state = with_activity(state, "activity-1");
+    let mut state = with_activity(state, "activity-2");
+    if let Some(activity) = state.activities.get_mut("activity-2") {
+        activity.schedule_event_id = 6;
+        activity.started_event_id = Some(7);
+        activity.started_at = Some(now);
+    }
+    let state = with_timer(state, "timer-1", now);
+    let state = with_pending_external_signal(state, 11);
+    with_pending_nexus_operation(state, "op-1")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TaskMode {
+    Normal,
+    Retry,
+    Speculative,
+}
+
+fn arb_task_mode() -> impl Strategy<Value = TaskMode> {
+    prop_oneof![
+        Just(TaskMode::Normal),
+        Just(TaskMode::Retry),
+        Just(TaskMode::Speculative),
+    ]
+}
+
+/// `run_for_steps` with a pending workflow task of `mode`, started or not.
+/// Normal tasks have written their events (15, 16); retry and speculative
+/// tasks hold them as reserved ids.
+fn run_with_task(mode: TaskMode, started: bool, now: OffsetDateTime) -> WorkflowState {
+    let mut state = run_for_steps(now);
+    let (task_type, attempt) = match mode {
+        TaskMode::Normal => (tokeira_kernel::WorkflowTaskType::Normal, 1),
+        TaskMode::Retry => (tokeira_kernel::WorkflowTaskType::Normal, 2),
+        TaskMode::Speculative => (tokeira_kernel::WorkflowTaskType::Speculative, 1),
+    };
+    if matches!(mode, TaskMode::Normal) {
+        state.last_event_id = if started { 16 } else { 15 };
+    }
+    if matches!(mode, TaskMode::Speculative) {
+        state.admitted_updates.insert("update-0".into());
+    }
+    state.workflow_task_attempt = attempt;
+    state.pending_workflow_task = Some(PendingWorkflowTask {
+        advice: Default::default(),
+        task_type,
+        schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
+        logical_seq: LogicalTaskSeq(4),
+        scheduled_event_id: 15,
+        scheduled_at: now - Duration::seconds(30),
+        started_event_id: started.then_some(16),
+        started_at: started.then_some(now - Duration::seconds(20)),
+        attempt,
+    });
+    state.next_workflow_task_seq = LogicalTaskSeq(5);
+    state
+}
+
+/// A starting run: idle, or with a pending task of any mode, started or not.
+fn arb_initial_run() -> impl Strategy<Value = WorkflowState> {
+    prop_oneof![
+        Just(()).prop_map(|()| run_for_steps(fixed_now())),
+        (arb_task_mode(), any::<bool>()).prop_map(|(mode, started)| run_with_task(
+            mode,
+            started,
+            fixed_now()
+        )),
+    ]
+}
+
+/// What a step hands the kernel.
+enum StepInput {
+    Command(Command),
+    ActivityStart(tokeira_kernel::ActivityStartRequest),
+}
+
+/// The kernel input `step` stands for in `state`, or `None` when it does not
+/// apply (no task to start, the child already resolved, ...).
+fn step_input(
+    state: &WorkflowState,
+    step: RunStep,
+    index: usize,
+    at: OffsetDateTime,
+    delivered: &[String],
+) -> Option<StepInput> {
+    let pending = state.pending_workflow_task.as_ref();
+    let started = pending.and_then(|task| task.started_event_id);
+    let request = request_context(&format!("step-{index}"), at);
+    let child = |want_started: bool| {
+        state
+            .children
+            .values()
+            .find(|child| child.started_event_id.is_some() == want_started)
+            .cloned()
+    };
+    let activity = |want_started: bool| {
+        state
+            .activities
+            .values()
+            .find(|activity| activity.started_event_id.is_some() == want_started)
+            .cloned()
+    };
+    let command = match step {
+        RunStep::AdmitUpdate => Command::Update(UpdateRequest {
+            update_id: format!("update-{index}"),
+            update_name: "handler".into(),
+            input: payloads("input"),
+            request,
+            now: at,
+        }),
+        RunStep::StartTask => {
+            let task = pending.filter(|task| task.started_event_id.is_none())?;
+            Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+                logical_seq: task.logical_seq,
+                worker_identity: WorkerIdentity("worker".into()),
+                request_id: format!("start-{index}"),
+                history_size_bytes: 0,
+                deployment_transition: None,
+                deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
+                polled_task_queue: TaskQueueName("queue".into()),
+                now: at,
+            })
+        }
+        RunStep::Complete {
+            reject_update,
+            discards,
+        } => {
+            started?;
+            let rejected = state.admitted_updates.iter().min().cloned();
+            let commands = match (reject_update, rejected) {
+                (true, Some(update_id)) => vec![WorkflowCommand::ProtocolMessage {
+                    message_id: format!("reject-{index}"),
+                    body: UpdateProtocolBody::Rejected {
+                        update_id,
+                        failure: payload("rejected"),
+                    },
+                }],
+                _ => Vec::new(),
+            };
+            let mut request =
+                completion_request(state, commands, Default::default(), None, None, false, at);
+            request.client_discards_speculative_with_events = discards;
+            // The updates the worker was sent with this task: unprocessed ones
+            // are rejected by the server once it completes, as the runtime
+            // does when it stamps them.
+            request.delivered_update_ids = delivered.to_vec();
+            Command::WorkflowTaskCompleted(request)
+        }
+        RunStep::FailTask => Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+            history_size_bytes: 0,
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+            logical_seq: pending?.logical_seq,
+            started_event_id: started?,
+            failure_cause: WorkflowTaskFailedCause::NonDeterminismError,
+            failure_details: None,
+            worker_identity: WorkerIdentity("worker".into()),
+            request,
+            now: at,
+            reset_reapply: Vec::new(),
+        }),
+        RunStep::TimeOutStartToClose => {
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: pending?.logical_seq,
+                started_event_id: started?,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: at,
+            })
+        }
+        RunStep::TimeOutScheduleToStart => {
+            let task = pending.filter(|task| task.started_event_id.is_none())?;
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: task.logical_seq,
+                started_event_id: 0,
+                timeout_type: WorkflowTaskTimeoutType::ScheduleToStart,
+                now: at,
+            })
+        }
+        RunStep::Signal => Command::Signal(SignalRequest {
+            signal_name: "sig".into(),
+            input: payloads("signal"),
+            header: None,
+            links: Vec::new(),
+            request,
+            now: at,
+        }),
+        RunStep::ChildStarted => {
+            let child = child(false)?;
+            Command::ChildStartConfirmed(ChildStartConfirmedRequest {
+                child_workflow_id: child.child_workflow_id,
+                initiated_event_id: child.initiated_event_id,
+                result: ChildStartResult::Started {
+                    child_run_id: RunId::new(),
+                    workflow_type: child.workflow_type,
+                },
+                now: at,
+            })
+        }
+        RunStep::ChildCompleted => Command::ChildResolved(ChildResolvedRequest {
+            resolved_run_id: None,
+            child_workflow_id: child(true)?.child_workflow_id,
+            resolution: ChildResolution::Completed {
+                result: payloads("child-result"),
+            },
+            now: at,
+        }),
+        RunStep::ActivityStarted => {
+            return Some(StepInput::ActivityStart(
+                tokeira_kernel::ActivityStartRequest {
+                    activity_id: activity(false)?.activity_id,
+                    identity: WorkerIdentity("activity-worker".into()),
+                    principal: None,
+                    mode: tokeira_kernel::ActivityStartMode::Poll,
+                    now: at,
+                },
+            ));
+        }
+        RunStep::ActivityCompleted => Command::ActivityResolved(ActivityResolvedRequest {
+            activity_id: activity(true)?.activity_id,
+            resolution: ActivityResolution::Completed {
+                result: payloads("activity-result"),
+            },
+            worker_identity: None,
+            request,
+            now: at,
+        }),
+        RunStep::TimerFired => Command::TimerDue(TimerDueRequest {
+            timer_id: state.timers.keys().next()?.clone(),
+            fired_at: at,
+        }),
+        RunStep::ExternalSignalResolved => {
+            Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                initiated_event_id: *state.pending_external_signals.keys().next()?,
+                result: ExternalSignalResult::Signaled,
+                now: at,
+            })
+        }
+        RunStep::NexusStarted => {
+            let operation = state
+                .pending_nexus_operations
+                .values()
+                .find(|operation| !operation.started)?;
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: operation.operation_id.clone(),
+                scheduled_event_id: operation.scheduled_event_id,
+                resolution: NexusResolution::Started {
+                    operation_token: "token".into(),
+                    links: Vec::new(),
+                },
+                now: at,
+            })
+        }
+        RunStep::NexusCompleted => {
+            let operation = state.pending_nexus_operations.values().next()?;
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: operation.operation_id.clone(),
+                scheduled_event_id: operation.scheduled_event_id,
+                resolution: NexusResolution::Completed {
+                    result: payloads("nexus-result"),
+                    links: Vec::new(),
+                },
+                now: at,
+            })
+        }
+        RunStep::Pause => {
+            if state.status == ExecutionStatus::Paused {
+                return None;
+            }
+            Command::PauseWorkflow(PauseWorkflowRequest {
+                identity: "operator".into(),
+                reason: "pause".into(),
+                request,
+                now: at,
+            })
+        }
+        RunStep::Unpause => {
+            if state.status != ExecutionStatus::Paused {
+                return None;
+            }
+            Command::UnpauseWorkflow(UnpauseWorkflowRequest {
+                identity: "operator".into(),
+                reason: "resume".into(),
+                request,
+                now: at,
+            })
+        }
+    };
+    Some(StepInput::Command(command))
+}
+
+/// One applied step: the state it was applied to and what it produced.
+struct AppliedStep {
+    step: RunStep,
+    prior: WorkflowState,
+    transition: Transition,
+}
+
+/// Apply `steps` in order from `initial`, skipping a step whose precondition
+/// does not hold. Any history-integrity refusal fails the case.
+fn drive(
+    initial: WorkflowState,
+    steps: &[RunStep],
+) -> Result<Vec<AppliedStep>, proptest::test_runner::TestCaseError> {
+    let start = fixed_now();
+    let mut state = initial;
+    let mut applied = Vec::new();
+    // The updates admitted when the current task started — what its worker
+    // was sent.
+    let mut delivered: Vec<String> = if state
+        .pending_workflow_task
+        .as_ref()
+        .is_some_and(|task| task.started_event_id.is_some())
+    {
+        state.admitted_updates.iter().cloned().collect()
+    } else {
+        Vec::new()
+    };
+    delivered.sort();
+    for (index, step) in steps.iter().enumerate() {
+        let at = start + Duration::seconds(index as i64 + 1);
+        let Some(input) = step_input(&state, *step, index, at, &delivered) else {
+            continue;
+        };
+        if matches!(step, RunStep::StartTask) {
+            let mut admitted: Vec<String> = state.admitted_updates.iter().cloned().collect();
+            admitted.sort();
+            delivered = admitted;
+        }
+        let result = match input {
+            StepInput::Command(command) => {
+                BasicKernel.apply(LoadedRun::Existing(state.clone()), command)
+            }
+            StepInput::ActivityStart(request) => {
+                BasicKernel.apply_activity_started(LoadedRun::Existing(state.clone()), request)
+            }
+        };
+        match result {
+            Ok(transition) => {
+                let next = transition.next_state.clone();
+                applied.push(AppliedStep {
+                    step: *step,
+                    prior: state,
+                    transition,
+                });
+                state = next;
+            }
+            Err(Reject::HistoryIntegrity(message)) => {
+                return Err(proptest::test_runner::TestCaseError::fail(format!(
+                    "step {index} ({step:?}) was refused: {message}"
+                )));
+            }
+            // The step's precondition did not hold in this state.
+            Err(_) => {}
+        }
+    }
+    Ok(applied)
+}
+
+fn same_task(prior: Option<&PendingWorkflowTask>, next: Option<&PendingWorkflowTask>) -> bool {
+    matches!((prior, next), (Some(prior), Some(next)) if prior.logical_seq == next.logical_seq)
+}
+
+/// Whether `kind` records something that schedules a workflow task when none
+/// is pending. An activity starting, a pause and an options update do not.
+fn wakes_the_workflow(kind: &HistoryEventKind) -> bool {
+    matches!(
+        kind,
+        HistoryEventKind::WorkflowExecutionSignaled { .. }
+            | HistoryEventKind::WorkflowExecutionCancelRequested { .. }
+            | HistoryEventKind::WorkflowExecutionUnpaused { .. }
+            | HistoryEventKind::TimerFired { .. }
+            | HistoryEventKind::ActivityTaskCompleted { .. }
+            | HistoryEventKind::ActivityTaskFailed { .. }
+            | HistoryEventKind::ActivityTaskTimedOut { .. }
+            | HistoryEventKind::ActivityTaskCanceled { .. }
+            | HistoryEventKind::ChildWorkflowExecutionStarted { .. }
+            | HistoryEventKind::StartChildWorkflowExecutionFailed { .. }
+            | HistoryEventKind::ChildWorkflowExecutionCompleted { .. }
+            | HistoryEventKind::ChildWorkflowExecutionFailed { .. }
+            | HistoryEventKind::ChildWorkflowExecutionCanceled { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+            | HistoryEventKind::ExternalWorkflowExecutionSignaled { .. }
+            | HistoryEventKind::SignalExternalWorkflowExecutionFailed { .. }
+            | HistoryEventKind::ExternalWorkflowExecutionCancelRequested { .. }
+            | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed { .. }
+            | HistoryEventKind::NexusOperationStarted { .. }
+            | HistoryEventKind::NexusOperationCompleted { .. }
+            | HistoryEventKind::NexusOperationFailed { .. }
+            | HistoryEventKind::NexusOperationCanceled { .. }
+            | HistoryEventKind::NexusOperationTimedOut { .. }
+            | HistoryEventKind::NexusOperationCancelRequestCompleted { .. }
+            | HistoryEventKind::NexusOperationCancelRequestFailed { .. }
+    )
+}
+
+fn is_completion(kind: &HistoryEventKind) -> bool {
+    matches!(
+        kind,
+        HistoryEventKind::ActivityTaskCompleted { .. }
+            | HistoryEventKind::ActivityTaskFailed { .. }
+            | HistoryEventKind::ActivityTaskTimedOut { .. }
+            | HistoryEventKind::ActivityTaskCanceled { .. }
+            | HistoryEventKind::ChildWorkflowExecutionCompleted { .. }
+            | HistoryEventKind::ChildWorkflowExecutionFailed { .. }
+            | HistoryEventKind::ChildWorkflowExecutionCanceled { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+            | HistoryEventKind::NexusOperationCompleted { .. }
+            | HistoryEventKind::NexusOperationFailed { .. }
+            | HistoryEventKind::NexusOperationCanceled { .. }
+            | HistoryEventKind::NexusOperationTimedOut { .. }
+    )
+}
+
+fn variant_name(kind: &HistoryEventKind) -> String {
+    format!("{kind:?}")
+        .split([' ', '{', '('])
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    // Feature: kernel-event-buffering, Property 6 — an externally-originated
+    // event recorded while a task of any mode is started buffers.
+    #[test]
+    fn external_events_buffer_during_a_started_task(
+        mode in arb_task_mode(),
+        step in arb_external_step(),
+    ) {
+        let mut state = run_with_task(mode, true, fixed_now());
+        if matches!(step, RunStep::Unpause) {
+            state.status = ExecutionStatus::Paused;
+        }
+        let applied = drive(state, &[step])?;
+        prop_assume!(!applied.is_empty());
+        let applied = &applied[0];
+        prop_assert!(
+            applied.transition.history_events.is_empty(),
+            "{step:?} appended {:?}",
+            applied.transition.history_events
+        );
+        prop_assert_eq!(
+            applied.transition.next_state.last_event_id,
+            applied.prior.last_event_id
+        );
+        prop_assert!(
+            applied.transition.next_state.buffered_events.len()
+                > applied.prior.buffered_events.len()
+        );
+    }
+
+    // Feature: kernel-event-buffering, Property 7 — a flush emits the
+    // non-completion events in admission order, then the completions in
+    // admission order, with contiguous ids.
+    #[test]
+    fn flush_puts_completions_last(
+        steps in prop::collection::vec(arb_external_step(), 1..12),
+    ) {
+        let initial = run_with_task(TaskMode::Normal, true, fixed_now());
+        let applied = drive(initial.clone(), &steps)?;
+        let state = applied
+            .last()
+            .map(|step| step.transition.next_state.clone())
+            .unwrap_or(initial);
+        prop_assume!(!state.buffered_events.is_empty());
+        let buffered: Vec<String> = state
+            .buffered_events
+            .iter()
+            .filter(|event| !is_completion(&event.kind))
+            .chain(state.buffered_events.iter().filter(|event| is_completion(&event.kind)))
+            .map(|event| variant_name(&event.kind))
+            .collect();
+        let completed = BasicKernel
+            .apply(
+                LoadedRun::Existing(state.clone()),
+                Command::WorkflowTaskCompleted(completion_request(
+                    &state,
+                    Vec::new(),
+                    Default::default(),
+                    None,
+                    None,
+                    false,
+                    fixed_now() + Duration::minutes(1),
+                )),
+            )
+            .unwrap();
+        // WorkflowTaskCompleted, the flushed batch, then a follow-up task
+        // (unless the run is paused).
+        let flushed: Vec<String> = completed.history_events[1..=buffered.len()]
+            .iter()
+            .map(|event| variant_name(&event.kind))
+            .collect();
+        prop_assert_eq!(flushed, buffered);
+        for (offset, event) in completed.history_events.iter().enumerate() {
+            prop_assert_eq!(event.event_id, state.last_event_id + 1 + offset as i64);
+        }
+    }
+
+    // Feature: kernel-event-buffering, Property 8 — a flushed completion names
+    // the real id of the started event flushed with it, and no flushed event
+    // carries the buffered sentinel.
+    #[test]
+    fn flushed_completions_name_their_started_event(
+        steps in prop::collection::vec(arb_external_step(), 1..12),
+    ) {
+        let initial = run_with_task(TaskMode::Normal, true, fixed_now());
+        let applied = drive(initial.clone(), &steps)?;
+        let state = applied
+            .last()
+            .map(|step| step.transition.next_state.clone())
+            .unwrap_or(initial);
+        prop_assume!(!state.buffered_events.is_empty());
+        let completed = BasicKernel
+            .apply(
+                LoadedRun::Existing(state.clone()),
+                Command::WorkflowTaskCompleted(completion_request(
+                    &state,
+                    Vec::new(),
+                    Default::default(),
+                    None,
+                    None,
+                    false,
+                    fixed_now() + Duration::minutes(1),
+                )),
+            )
+            .unwrap();
+        let mut started_by_origin = std::collections::HashMap::new();
+        for event in &completed.history_events {
+            match &event.kind {
+                HistoryEventKind::ActivityTaskStarted { scheduled_event_id, .. } => {
+                    started_by_origin.insert(*scheduled_event_id, event.event_id);
+                }
+                HistoryEventKind::ChildWorkflowExecutionStarted { initiated_event_id, .. } => {
+                    started_by_origin.insert(*initiated_event_id, event.event_id);
+                }
+                HistoryEventKind::ActivityTaskCompleted {
+                    scheduled_event_id: origin,
+                    started_event_id,
+                    ..
+                }
+                | HistoryEventKind::ChildWorkflowExecutionCompleted {
+                    initiated_event_id: origin,
+                    started_event_id,
+                    ..
+                } => {
+                    prop_assert_ne!(*started_event_id, tokeira_kernel::BUFFERED_EVENT_ID);
+                    if let Some(real) = started_by_origin.get(origin) {
+                        prop_assert_eq!(started_event_id, real);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A child still pending after the flush holds its real started id.
+        for child in completed.next_state.children.values() {
+            prop_assert_ne!(child.started_event_id, Some(tokeira_kernel::BUFFERED_EVENT_ID));
+        }
+    }
+
+    // Feature: kernel-event-buffering, Property 9 — while the same task stays
+    // started across a transition, the transition appends nothing.
+    #[test]
+    fn started_task_history_is_frozen(
+        initial in arb_initial_run(),
+        steps in prop::collection::vec(arb_run_step(), 1..48),
+    ) {
+        for applied in drive(initial, &steps)? {
+            let prior = applied.prior.pending_workflow_task.as_ref();
+            let next = applied.transition.next_state.pending_workflow_task.as_ref();
+            let stays_started = same_task(prior, next)
+                && prior.is_some_and(|task| task.started_event_id.is_some())
+                && next.is_some_and(|task| task.started_event_id.is_some());
+            if stays_started {
+                prop_assert!(
+                    applied.transition.history_events.is_empty(),
+                    "{:?} appended under a started task: {:?}",
+                    applied.step,
+                    applied.transition.history_events
+                );
+            }
+        }
+    }
+
+    // Feature: speculative-wft, Property 7 — event ids stay unique and
+    // contiguous, no other event takes the ids a speculative or started retry
+    // task reserved, and a written task lands on exactly those ids.
+    #[test]
+    fn reserved_ids_are_never_shared(
+        initial in arb_initial_run(),
+        steps in prop::collection::vec(arb_run_step(), 1..48),
+    ) {
+        let mut next_id = initial.last_event_id + 1;
+        for applied in drive(initial, &steps)? {
+            for event in &applied.transition.history_events {
+                prop_assert_eq!(event.event_id, next_id);
+                next_id += 1;
+            }
+            let Some(task) = applied.prior.pending_workflow_task.as_ref() else {
+                continue;
+            };
+            let reserves = task.task_type == tokeira_kernel::WorkflowTaskType::Speculative
+                || (task.attempt > 1 && task.started_event_id.is_some());
+            if !reserves {
+                continue;
+            }
+            let next = applied.transition.next_state.pending_workflow_task.as_ref();
+            let still_claims = same_task(Some(task), next)
+                && next.is_some_and(|next| {
+                    next.scheduled_event_id == task.scheduled_event_id
+                        && next.started_event_id == task.started_event_id
+                });
+            for event in &applied.transition.history_events {
+                let own_scheduled = matches!(
+                    &event.kind,
+                    HistoryEventKind::WorkflowTaskScheduled { logical_seq, .. }
+                        if *logical_seq == task.logical_seq
+                );
+                let own_started = matches!(
+                    &event.kind,
+                    HistoryEventKind::WorkflowTaskStarted { logical_seq, .. }
+                        if *logical_seq == task.logical_seq
+                );
+                if own_scheduled {
+                    prop_assert_eq!(event.event_id, task.scheduled_event_id);
+                } else if own_started {
+                    prop_assert_eq!(Some(event.event_id), task.started_event_id);
+                } else if still_claims {
+                    prop_assert!(
+                        event.event_id != task.scheduled_event_id
+                            && Some(event.event_id) != task.started_event_id,
+                        "{:?} took a reserved id: {:?}",
+                        applied.step,
+                        event
+                    );
+                }
+            }
+        }
+    }
+
+    // Feature: speculative-wft, Property 8 — an externally-originated event
+    // recorded while a speculative task is scheduled converts the task first:
+    // its Scheduled event takes the reserved id, with the task's own time and
+    // attempt.
+    #[test]
+    fn scheduled_speculative_task_converts_before_any_external_event(
+        step in arb_external_step(),
+    ) {
+        let mut state = run_with_task(TaskMode::Speculative, false, fixed_now());
+        if matches!(step, RunStep::Unpause) {
+            state.status = ExecutionStatus::Paused;
+        }
+        let task = state.pending_workflow_task.clone().unwrap();
+        let applied = drive(state, &[step])?;
+        prop_assume!(!applied.is_empty());
+        let events = &applied[0].transition.history_events;
+        prop_assert!(events.len() >= 2, "{step:?} produced {events:?}");
+        prop_assert_eq!(events[0].event_id, task.scheduled_event_id);
+        prop_assert_eq!(events[0].happened_at, task.scheduled_at);
+        let is_own_scheduled = matches!(
+            &events[0].kind,
+            HistoryEventKind::WorkflowTaskScheduled { logical_seq, attempt: 1, .. }
+                if *logical_seq == task.logical_seq
+        );
+        prop_assert!(is_own_scheduled, "{step:?} did not convert first: {events:?}");
+        let converted = applied[0].transition.next_state.pending_workflow_task.clone().unwrap();
+        prop_assert_eq!(converted.task_type, tokeira_kernel::WorkflowTaskType::Normal);
+        prop_assert_eq!(converted.scheduled_event_id, task.scheduled_event_id);
+    }
+
+    // Feature: speculative-wft, Property 9 — whenever no task is pending on a
+    // running, unpaused run, every event that wakes the workflow was delivered
+    // to a worker that completed a task after it.
+    #[test]
+    fn nothing_recorded_is_stranded(
+        initial in arb_initial_run(),
+        steps in prop::collection::vec(arb_run_step(), 1..48),
+    ) {
+        let mut history: Vec<HistoryEvent> = Vec::new();
+        for applied in drive(initial, &steps)? {
+            history.extend(applied.transition.history_events.iter().cloned());
+            let next = &applied.transition.next_state;
+            if next.is_open()
+                && next.status != ExecutionStatus::Paused
+                && next.pending_workflow_task.is_none()
+            {
+                for event in history.iter().filter(|event| wakes_the_workflow(&event.kind)) {
+                    prop_assert!(
+                        event.event_id <= next.previous_started_event_id,
+                        "after {:?}, event {} {} is past the last completed task ({}) and no task is pending",
+                        applied.step,
+                        event.event_id,
+                        variant_name(&event.kind),
+                        next.previous_started_event_id
+                    );
+                }
+            }
+        }
+    }
+
+    // Feature: speculative-wft, Property 11 — preservation: an event may take
+    // a scheduled retry task's reserved id, and the task gets new ids as a
+    // normal attempt-1 task when it starts.
+    #[test]
+    fn scheduled_retry_task_is_renumbered_at_start(
+        attempt in 2u32..6,
+        signals in 1usize..4,
+    ) {
+        let mut state = run_with_task(TaskMode::Retry, false, fixed_now());
+        state.workflow_task_attempt = attempt;
+        if let Some(task) = state.pending_workflow_task.as_mut() {
+            task.attempt = attempt;
+        }
+        let mut steps = vec![RunStep::Signal; signals];
+        steps.push(RunStep::StartTask);
+        let applied = drive(state.clone(), &steps)?;
+        prop_assert_eq!(applied.len(), signals + 1);
+        let start = &applied[signals].transition;
+        let first_new = state.last_event_id + 1 + signals as i64;
+        prop_assert_eq!(
+            start.history_events.iter().map(|event| event.event_id).collect::<Vec<_>>(),
+            vec![first_new, first_new + 1]
+        );
+        let renumbered = start.next_state.pending_workflow_task.clone().unwrap();
+        prop_assert_eq!(renumbered.attempt, 1);
+        prop_assert_eq!(renumbered.scheduled_event_id, first_new);
+        prop_assert_eq!(renumbered.started_event_id, Some(first_new + 1));
+    }
+}

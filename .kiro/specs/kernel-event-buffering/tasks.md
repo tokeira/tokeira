@@ -100,29 +100,46 @@ warnings`, `cargo +nightly fmt`, and `cargo test -p tokeira-kernel`.
 > slice lands in one change with `speculative-wft` Phase V, whose exploration
 > tests (V.1) come first and fail until both land.
 
-- [ ] 2.4 Classify every `HistoryEventKind` in `should_buffer` per Requirement
+- [x] 2.4 Classify every `HistoryEventKind` in `should_buffer` per Requirement
   2.3, as an exhaustive match with no wildcard arm; cite `bufferEvent`
-  (`event_store.go:263-318 @ v1.31.0`). (Req 2.1.6, 2.3)
-- [ ] 2.5 Replace `emit_or_buffer` with `TransitionBuilder::append_external`
+  (`event_store.go:263-318 @ v1.31.0`). (Req 2.1.6, 2.3) **(DONE —
+  `is_externally_originated`, exhaustive over all 59 kinds;
+  `should_buffer` = started task ∧ externally originated.)**
+- [x] 2.5 Replace `emit_or_buffer` with `TransitionBuilder::append_external`
   (buffer while a WFT is started; otherwise convert a scheduled speculative
   WFT, then append) and route every externally-originated kernel site through
   it: child started and resolved, external signal and cancel results, Nexus
   started, resolved and cancel-request results, pause, unpause. Move the
   signal, cancel, timer, activity and options sites onto the same rule.
-  (Req 2.1, 2.4)
-- [ ] 2.6 Child started-id wiring: the sentinel while
+  (Req 2.1, 2.4) **(DONE — 23 child, external, Nexus and pause sites plus
+  the existing signal, cancel, timer, activity and options sites; the
+  per-site `materialize_scheduled_speculative()` calls folded into the rule.
+  The buffered-event limit is still checked when a signal buffers, as before:
+  other kinds count toward it but do not trigger it themselves.)**
+- [x] 2.6 Child started-id wiring: the sentinel while
   `ChildWorkflowExecutionStarted` is buffered; the flush back-fills the pending
   child's started id and patches flushed child completions (keyed by initiated
   id); child and Nexus completions join the completion class. (Req 3.2, 3.3)
-- [ ] 2.7 Runtime activity starts: compute the poll-path start and the by-id
+  **(DONE — one origin-id map serves activities and children in
+  `flush_buffered`.)**
+- [x] 2.7 Runtime activity starts: compute the poll-path start and the by-id
   completion's start with a kernel function built on the append rule (covering
   the retry-policy transient start and the stamp and identity updates the
   runtime does by hand today); keep the runtime's commit path. (Req 2.4)
-- [ ] 2.8 Properties P6–P9 (`// Feature: kernel-event-buffering, Property N`)
-  and goldens G2, G3. (Req P6–P9, G2, G3)
+  **(DONE — `BasicKernel::apply_activity_started(ActivityStartRequest)` with
+  `ActivityStartMode::{Poll, CompletedById}`, running the transition check;
+  both runtime paths in `runtime/activity.rs` call it and keep their OCC +
+  shard-epoch commit.)**
+- [x] 2.8 Properties P6–P9 (`// Feature: kernel-event-buffering, Property N`)
+  and goldens G2, G3. (Req P6–P9, G2, G3) **(DONE — P9 drives generated
+  sequences from idle runs and runs with a pending task of each mode; with
+  the old append behaviour injected it fails both through the transition
+  check and on its own assertion.)**
 - [ ] 2.9 Checkpoint: the full bar; conformance rerun of the child-workflow,
   Nexus, external signal/cancel, pause and buffered-events suites — shifted
   histories must match v1.31.0. (Req 0.2)
-- [ ] 2.10 Update `020-kernel.md` (the predicate paragraph: full
+- [x] 2.10 Update `020-kernel.md` (the predicate paragraph: full
   classification, the append rule, child started-id wiring) and the
   `should_buffer` / `is_buffered_resolution_class` comments. (Req 0.3)
+  **(DONE — also the event-id section (transition check) and the affected
+  command entries.)**

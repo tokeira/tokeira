@@ -1,0 +1,5 @@
+kind: changed
+body: tokeira-kernel adds Reject::HistoryIntegrity and apply_activity_started takes an ActivityStartRequest; StartedWorkflowTask gains last_event_id_at_start.
+time: 2026-10-02T13:24:21.000000+01:00
+custom:
+    Slice: 178762bf-d672-4bf7-8dd8-38976901418a

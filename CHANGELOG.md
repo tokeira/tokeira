@@ -2,6 +2,16 @@
 
 All notable user-facing changes to this project are documented here.
 
+## 0.5.1 on 2026-10-02
+
+### Fixed
+
+* An event recorded while an update's speculative workflow task is in flight no longer reuses the task's event ids; child, Nexus, external-workflow and pause events now buffer.
+
+
+
+
+
 ## 0.5.0 on 2026-09-28
 
 ### Changed

@@ -17,8 +17,8 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityControlTarget, ActivityOp, ActivityResolution, ActivityResolvedRequest,
     ActivityRetryPolicyPatch, BasicKernel, Command, CronContinuation, DispatchOp, FieldChange,
-    HistoryEvent, HistoryEventKind, LoadedRun, PauseActivityRequest, PauseWorkflowRequest,
-    RetryState, SignalRequest, SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest,
+    HistoryEventKind, LoadedRun, PauseActivityRequest, PauseWorkflowRequest, RetryState,
+    SignalRequest, SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest,
     TerminateRequest, Transition, UnpauseWorkflowRequest, UpdateExecutionOptionsRequest,
     UpdateRequest, VersioningOverrideChange, WorkflowCommand, WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest, merge_priority,
@@ -1577,6 +1577,12 @@ pub struct StartedWorkflowTask {
     /// started_event_id of the most recently completed
     /// workflow task.
     pub previous_started_event_id: i64,
+    /// The run's last persisted event id when this task started. The poll
+    /// response reads history only up to here, so an event committed after the
+    /// start cannot reach it; v1.31.0 reads `[firstEventID, nextEventID)` with
+    /// `nextEventID` fixed when the task starts
+    /// (recordworkflowtaskstarted/api.go:272-276, 419 @ v1.31.0).
+    pub last_event_id_at_start: i64,
     /// Whether this task was delivered to the worker that owns sticky cache.
     pub is_sticky_match: bool,
     /// Timestamp of the scheduling event for this task.

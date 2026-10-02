@@ -20,25 +20,27 @@ use tokeira_types::{
 
 use crate::{
     command::{
-        ActivityControlTarget, ActivityResolvedRequest, CallbackAttemptOutcome, CancelRequest,
-        ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult,
-        Command, CompletionCallbackAttemptedRequest, ContinueAsNewInitiator, CronContinuation,
-        ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-        ExternalSignalResult, FieldChange, MemoPatch, NexusCancellationAttemptOutcome,
-        NexusCancellationAttemptedRequest, NexusCancellationRetryRequest, NexusCompletionOutcome,
-        NexusOperationResolvedRequest, NexusOperationRetryRequest, NexusResolution,
-        PauseActivityRequest, PauseWorkflowRequest, ResetActivityRequest, ResetRequest,
-        ResetStickyRequest, RetryContinuation, RetryState, ScheduleQueryTaskRequest,
-        SearchAttributesPatch, SignalRequest, SignalWithStartRequest, StartAndUpdateRequest,
-        StartRequest, StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest,
-        TerminateRequest, TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
-        UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
-        UpdateRequest, VersioningOverrideChange, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-        WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest,
-        WorkflowTaskCompletionLimits, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-        WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTaskWorkerVersion,
+        ActivityControlTarget, ActivityResolvedRequest, ActivityStartMode, ActivityStartRequest,
+        CallbackAttemptOutcome, CancelRequest, ChildResolution, ChildResolvedRequest,
+        ChildStartConfirmedRequest, ChildStartResult, Command, CompletionCallbackAttemptedRequest,
+        ContinueAsNewInitiator, CronContinuation, ExternalCancelResolvedRequest,
+        ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult, FieldChange,
+        MemoPatch, NexusCancellationAttemptOutcome, NexusCancellationAttemptedRequest,
+        NexusCancellationRetryRequest, NexusCompletionOutcome, NexusOperationResolvedRequest,
+        NexusOperationRetryRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
+        ResetActivityRequest, ResetRequest, ResetStickyRequest, RetryContinuation, RetryState,
+        ScheduleQueryTaskRequest, SearchAttributesPatch, SignalRequest, SignalWithStartRequest,
+        StartAndUpdateRequest, StartRequest, StartWorkflowTaskRequest,
+        TerminateOnWorkflowTaskFailedRequest, TerminateRequest, TimerDueRequest,
+        UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+        UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningOverrideChange,
+        WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest,
+        WorkflowTaskCompletedRequest, WorkflowTaskCompletionLimits, WorkflowTaskFailedCause,
+        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+        WorkflowTaskWorkerVersion,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind, UpdateEventOutcome},
+    integrity::{PriorRun, check_transition},
     state::{
         ActivityPauseInfo, ActivityState, AutoResetPoint, ChildWorkflowState,
         DEFAULT_HISTORY_MAX_AUTO_RESET_POINTS, EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
@@ -203,6 +205,20 @@ pub struct ReplayContext {
 
 impl Kernel for BasicKernel {
     fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
+        // Captured before the state moves into the handler: the transition
+        // check compares the result against what it was computed from.
+        let prior = match &loaded {
+            LoadedRun::Existing(state) => PriorRun::of(state),
+            LoadedRun::Absent => PriorRun::ABSENT,
+        };
+        let transition = self.dispatch(loaded, command)?;
+        check_transition(&prior, &transition)?;
+        Ok(transition)
+    }
+}
+
+impl BasicKernel {
+    fn dispatch(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
         match command {
             Command::Start(req) => self.apply_start(loaded, req),
             Command::SignalWithStart(req) => self.apply_signal_with_start(loaded, req),
@@ -831,26 +847,18 @@ impl BasicKernel {
             request_id: req.request.request_id.0,
             identity: req.request.caller_identity,
         };
-        if should_buffer(&builder.state, &kind) {
-            // A worker holds the started WFT and its view of history is frozen
-            // at started_event_id; the signal is held on state and flushed when
-            // the WFT closes (`bufferEvent`, event_store.go:263 @ v1.31.0). No
-            // new WFT is scheduled — a started WFT is by definition pending,
-            // and the flush-on-close path schedules the follow-up delivery
-            // (Req 2.2).
-            builder.buffer(kind);
+        // While a worker holds a started WFT the signal is held on state and
+        // flushed when the WFT closes; no new WFT is scheduled — a started WFT
+        // is by definition pending, and the flush-on-close path schedules the
+        // follow-up delivery. Otherwise a scheduled speculative task converts
+        // first: Scheduled(5), Signaled(6), Started(7) in the corpus.
+        if builder.append_external(kind) == BUFFERED_EVENT_ID {
             // A signal flood that pushes the buffer over the count limit
             // force-closes the started WFT (v1.31.0
             // closeTransactionHandleBufferedEventsLimit).
             builder.enforce_buffered_event_limit();
             return Ok(builder.finish());
         }
-        // A scheduled-not-started SPECULATIVE task converts to normal before
-        // the signal appends: Scheduled(real), then Signaled — spec
-        // speculative-wft K4/Req 4.1 (corpus: Scheduled(5), Signaled(6),
-        // Started(7)).
-        builder.materialize_scheduled_speculative();
-        builder.emit(kind);
 
         // Insight: Tokeira keeps the "at most one outstanding workflow task"
         // invariant because it dramatically reduces wakeup amplification during
@@ -958,15 +966,9 @@ impl BasicKernel {
         // in the buffer (`ReplicateWorkflowExecutionCancelRequestedEvent`,
         // mutable_state_impl.go @ v1.31.0).
         builder.state.cancel_requested = true;
-        if should_buffer(&builder.state, &kind) {
-            builder.buffer(kind);
-            return Ok(builder.finish());
-        }
-        // Cancel-requested is an event-appending admission like a signal: a
-        // scheduled speculative task converts first so its Scheduled event
-        // precedes the appended event (spec speculative-wft K4).
-        builder.materialize_scheduled_speculative();
-        builder.emit(kind);
+        // Buffered while a WFT is started; otherwise appended after a
+        // scheduled speculative task converts, like a signal.
+        builder.append_external(kind);
 
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
@@ -1062,7 +1064,7 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        builder.emit(HistoryEventKind::WorkflowExecutionPaused {
+        builder.append_external(HistoryEventKind::WorkflowExecutionPaused {
             identity: req.identity.clone(),
             reason: req.reason.clone(),
             request_id: req.request.request_id.0.clone(),
@@ -1105,7 +1107,7 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        builder.emit(HistoryEventKind::WorkflowExecutionUnpaused {
+        builder.append_external(HistoryEventKind::WorkflowExecutionUnpaused {
             identity: req.identity,
             reason: req.reason,
             request_id: req.request.request_id.0,
@@ -1578,7 +1580,7 @@ impl BasicKernel {
         // real id and clears the flag (Describe assertion in TestBufferedEvents:
         // {Buffered:true, EventId:0} → {Buffered:false, EventId:14}).
         let options_event_id =
-            builder.emit_or_buffer(HistoryEventKind::WorkflowExecutionOptionsUpdated {
+            builder.append_external(HistoryEventKind::WorkflowExecutionOptionsUpdated {
                 identity: req.request.caller_identity.clone().unwrap_or_default(),
                 versioning_override: versioning_override.clone(),
                 completion_callbacks: completion_callbacks.clone(),
@@ -2233,48 +2235,74 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
-    /// Record that a worker picked up an activity task.
+    /// Record that an activity started — the transition the runtime commits
+    /// itself, on the activity poll path and for a by-id completion of an
+    /// activity no worker started.
     ///
-    /// Emits `ActivityTaskStarted` and records the started
-    /// event ID back into `ActivityState` so that subsequent
-    /// resolution events can reference it.
+    /// The runtime keeps its own commit for these (optimistic concurrency plus
+    /// the shard epoch, outside the run's lane), but the kernel computes the
+    /// transition: the started event goes through the append rule — buffered
+    /// while a workflow task is started, appended after a scheduled speculative
+    /// task converts — and the transition check covers it as it covers every
+    /// command. The caller has already checked the offer is current and the
+    /// activity not yet started.
     pub fn apply_activity_started(
         &self,
         loaded: LoadedRun,
-        activity_id: &str,
-        identity: WorkerIdentity,
-        now: OffsetDateTime,
+        req: ActivityStartRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
+        let prior = PriorRun::of(&state);
         let activity = state
             .activities
-            .get(activity_id)
+            .get(&req.activity_id)
             .cloned()
-            .ok_or_else(|| Reject::UnknownActivity(activity_id.to_string()))?;
+            .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
 
-        let mut builder = TransitionBuilder::new(state, now, None);
-        // Buffers to `BUFFERED_EVENT_ID` when a WFT is started (the worker's
-        // history view is frozen); the resolution event stores that sentinel as
-        // its `started_event_id` and the flush wires the real id once this
-        // ActivityTaskStarted is emitted (TestBufferedEventsOutOfOrder).
-        let started_event_id = builder.emit_or_buffer(HistoryEventKind::ActivityTaskStarted {
-            activity_id: activity_id.to_string(),
-            scheduled_event_id: activity.schedule_event_id,
-            attempt: activity.attempt,
-            identity: identity.clone(),
-            request_id: format!("activity-start-{}-{}", activity_id, activity.attempt),
-            last_failure: activity.last_failure.clone(),
-        });
+        let mut builder = TransitionBuilder::new(state, req.now, req.principal);
+        let started_event_id =
+            if req.mode == ActivityStartMode::Poll && activity.retry_policy.is_some() {
+                // A retry-policy start is transient: the start is recorded on
+                // the activity but consumes no history event until the
+                // activity resolves (`AddActivityTaskStartedEvent`,
+                // mutable_state_impl.go:4082-4152 @ v1.31.0), so a retryable
+                // failure leaves neither Started nor Failed for that attempt.
+                TRANSIENT_ACTIVITY_STARTED_EVENT_ID
+            } else {
+                // Buffers to `BUFFERED_EVENT_ID` while a WFT is started; the
+                // resolution then carries that sentinel as its
+                // `started_event_id` and the flush wires the real id in
+                // (TestBufferedEventsOutOfOrder).
+                builder.append_external(HistoryEventKind::ActivityTaskStarted {
+                    activity_id: req.activity_id.clone(),
+                    scheduled_event_id: activity.schedule_event_id,
+                    attempt: activity.attempt,
+                    identity: req.identity.clone(),
+                    request_id: format!("activity-start-{}-{}", req.activity_id, activity.attempt),
+                    last_failure: activity.last_failure.clone(),
+                })
+            };
 
-        if let Some(act) = builder.state.activities.get_mut(activity_id) {
-            act.started_event_id = Some(started_event_id);
-            act.started_at = Some(now);
-            // `ai.StartedIdentity` (kernel raise K3) — Describe's primary
-            // `LastWorkerIdentity` source (workflow/activity.go:159 @ v1.31.0).
-            act.started_identity = Some(identity);
-        }
+        let started = builder
+            .state
+            .activities
+            .get_mut(&req.activity_id)
+            .expect("activity was read from this state above");
+        // The stamp bump fences any other outstanding offer for this attempt
+        // (`ObsoleteMatchingTask`, recordactivitytaskstarted/api.go @ v1.31.0).
+        started.stamp += 1;
+        started.started_event_id = Some(started_event_id);
+        started.started_at = Some(req.now);
+        // `ai.StartedIdentity` — Describe's primary `LastWorkerIdentity`
+        // source (workflow/activity.go:159 @ v1.31.0). Stored verbatim, even
+        // when empty.
+        started.started_identity = Some(req.identity);
+        let snapshot = started.clone();
+        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
 
-        Ok(builder.finish())
+        let transition = builder.finish();
+        check_transition(&prior, &transition)?;
+        Ok(transition)
     }
 
     /// Remove a resolved activity from the pending set and wake the
@@ -2302,7 +2330,7 @@ impl BasicKernel {
         // still applies and `flush_buffered` wires the eventual real event ID.
         let started_event_id =
             if activity.started_event_id == Some(TRANSIENT_ACTIVITY_STARTED_EVENT_ID) {
-                builder.emit_or_buffer(HistoryEventKind::ActivityTaskStarted {
+                builder.append_external(HistoryEventKind::ActivityTaskStarted {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     attempt: activity.attempt,
@@ -2321,7 +2349,7 @@ impl BasicKernel {
             };
         match req.resolution {
             ActivityResolution::Completed { result } => {
-                builder.emit_or_buffer(HistoryEventKind::ActivityTaskCompleted {
+                builder.append_external(HistoryEventKind::ActivityTaskCompleted {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id,
@@ -2333,7 +2361,7 @@ impl BasicKernel {
                 failure,
                 retry_state,
             } => {
-                builder.emit_or_buffer(HistoryEventKind::ActivityTaskFailed {
+                builder.append_external(HistoryEventKind::ActivityTaskFailed {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id,
@@ -2350,7 +2378,7 @@ impl BasicKernel {
                 retry_state,
                 failure,
             } => {
-                builder.emit_or_buffer(HistoryEventKind::ActivityTaskTimedOut {
+                builder.append_external(HistoryEventKind::ActivityTaskTimedOut {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id,
@@ -2360,7 +2388,7 @@ impl BasicKernel {
                 });
             }
             ActivityResolution::Canceled { details } => {
-                builder.emit_or_buffer(HistoryEventKind::ActivityTaskCanceled {
+                builder.append_external(HistoryEventKind::ActivityTaskCanceled {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id,
@@ -2413,7 +2441,7 @@ impl BasicKernel {
             } => {
                 let child_run_id_for_state = child_run_id;
                 let started_event_id =
-                    builder.emit(HistoryEventKind::ChildWorkflowExecutionStarted {
+                    builder.append_external(HistoryEventKind::ChildWorkflowExecutionStarted {
                         child_workflow_id: child.child_workflow_id.clone(),
                         child_run_id,
                         workflow_type: child.workflow_type.clone(),
@@ -2428,7 +2456,7 @@ impl BasicKernel {
                 }
             }
             ChildStartResult::Failed { cause } => {
-                builder.emit(HistoryEventKind::StartChildWorkflowExecutionFailed {
+                builder.append_external(HistoryEventKind::StartChildWorkflowExecutionFailed {
                     child_workflow_id: child.child_workflow_id.clone(),
                     initiated_event_id: child.initiated_event_id,
                     namespace_id: child.namespace_id,
@@ -2469,7 +2497,7 @@ impl BasicKernel {
 
         match req.resolution {
             ChildResolution::Completed { result } => {
-                builder.emit(HistoryEventKind::ChildWorkflowExecutionCompleted {
+                builder.append_external(HistoryEventKind::ChildWorkflowExecutionCompleted {
                     child_workflow_id: child.child_workflow_id.clone(),
                     namespace_id: child.namespace_id,
                     namespace: child.namespace.clone(),
@@ -2481,7 +2509,7 @@ impl BasicKernel {
                 });
             }
             ChildResolution::Failed { failure } => {
-                builder.emit(HistoryEventKind::ChildWorkflowExecutionFailed {
+                builder.append_external(HistoryEventKind::ChildWorkflowExecutionFailed {
                     child_workflow_id: child.child_workflow_id.clone(),
                     namespace_id: child.namespace_id,
                     namespace: child.namespace.clone(),
@@ -2494,7 +2522,7 @@ impl BasicKernel {
                 });
             }
             ChildResolution::Canceled => {
-                builder.emit(HistoryEventKind::ChildWorkflowExecutionCanceled {
+                builder.append_external(HistoryEventKind::ChildWorkflowExecutionCanceled {
                     child_workflow_id: child.child_workflow_id.clone(),
                     namespace_id: child.namespace_id,
                     namespace: child.namespace.clone(),
@@ -2506,7 +2534,7 @@ impl BasicKernel {
                 });
             }
             ChildResolution::Terminated => {
-                builder.emit(HistoryEventKind::ChildWorkflowExecutionTerminated {
+                builder.append_external(HistoryEventKind::ChildWorkflowExecutionTerminated {
                     child_workflow_id: child.child_workflow_id.clone(),
                     namespace_id: child.namespace_id,
                     namespace: child.namespace.clone(),
@@ -2516,7 +2544,7 @@ impl BasicKernel {
                 });
             }
             ChildResolution::TimedOut => {
-                builder.emit(HistoryEventKind::ChildWorkflowExecutionTimedOut {
+                builder.append_external(HistoryEventKind::ChildWorkflowExecutionTimedOut {
                     child_workflow_id: child.child_workflow_id.clone(),
                     namespace_id: child.namespace_id,
                     namespace: child.namespace.clone(),
@@ -2554,7 +2582,7 @@ impl BasicKernel {
 
         match req.result {
             ExternalSignalResult::Signaled => {
-                builder.emit(HistoryEventKind::ExternalWorkflowExecutionSignaled {
+                builder.append_external(HistoryEventKind::ExternalWorkflowExecutionSignaled {
                     initiated_event_id: pending.initiated_event_id,
                     namespace_id: pending.target_namespace_id,
                     namespace: pending.target_namespace.clone(),
@@ -2563,7 +2591,7 @@ impl BasicKernel {
                 });
             }
             ExternalSignalResult::Failed { cause } => {
-                builder.emit(HistoryEventKind::SignalExternalWorkflowExecutionFailed {
+                builder.append_external(HistoryEventKind::SignalExternalWorkflowExecutionFailed {
                     initiated_event_id: pending.initiated_event_id,
                     namespace_id: pending.target_namespace_id,
                     namespace: pending.target_namespace.clone(),
@@ -2603,16 +2631,18 @@ impl BasicKernel {
 
         match req.result {
             ExternalCancelResult::CancelRequested => {
-                builder.emit(HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
-                    initiated_event_id: pending.initiated_event_id,
-                    namespace_id: pending.target_namespace_id,
-                    namespace: pending.target_namespace.clone(),
-                    target_workflow_id: pending.target_workflow_id,
-                    target_run_id: pending.target_run_id,
-                });
+                builder.append_external(
+                    HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
+                        initiated_event_id: pending.initiated_event_id,
+                        namespace_id: pending.target_namespace_id,
+                        namespace: pending.target_namespace.clone(),
+                        target_workflow_id: pending.target_workflow_id,
+                        target_run_id: pending.target_run_id,
+                    },
+                );
             }
             ExternalCancelResult::Failed { cause } => {
-                builder.emit(
+                builder.append_external(
                     HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed {
                         initiated_event_id: pending.initiated_event_id,
                         namespace_id: pending.target_namespace_id,
@@ -2670,7 +2700,7 @@ impl BasicKernel {
                         pending.operation_id.clone(),
                     ));
                 }
-                builder.emit(HistoryEventKind::NexusOperationStarted {
+                builder.append_external(HistoryEventKind::NexusOperationStarted {
                     operation_id: pending.operation_id.clone(),
                     scheduled_event_id: pending.scheduled_event_id,
                     operation_token: operation_token.clone(),
@@ -2730,7 +2760,7 @@ impl BasicKernel {
                 }
             }
             NexusResolution::Completed { result, links } => {
-                builder.emit(HistoryEventKind::NexusOperationCompleted {
+                builder.append_external(HistoryEventKind::NexusOperationCompleted {
                     operation_id: pending.operation_id.clone(),
                     scheduled_event_id: pending.scheduled_event_id,
                     result,
@@ -2745,7 +2775,7 @@ impl BasicKernel {
                 }
             }
             NexusResolution::Failed { failure } => {
-                builder.emit(HistoryEventKind::NexusOperationFailed {
+                builder.append_external(HistoryEventKind::NexusOperationFailed {
                     operation_id: pending.operation_id.clone(),
                     scheduled_event_id: pending.scheduled_event_id,
                     failure,
@@ -2780,7 +2810,7 @@ impl BasicKernel {
                 }
             }
             NexusResolution::Canceled => {
-                builder.emit(HistoryEventKind::NexusOperationCanceled {
+                builder.append_external(HistoryEventKind::NexusOperationCanceled {
                     operation_id: pending.operation_id.clone(),
                     scheduled_event_id: pending.scheduled_event_id,
                     // Carry the operation identity so the edge wraps the canceled event in a
@@ -2811,7 +2841,7 @@ impl BasicKernel {
                 // (`fabricateStartedEventIfMissing` + `CompletionHandler`,
                 // components/nexusoperations/completion.go @ v1.31.0).
                 if !pending.started {
-                    builder.emit(HistoryEventKind::NexusOperationStarted {
+                    builder.append_external(HistoryEventKind::NexusOperationStarted {
                         operation_id: pending.operation_id.clone(),
                         scheduled_event_id: pending.scheduled_event_id,
                         operation_token: operation_token.clone(),
@@ -2821,7 +2851,7 @@ impl BasicKernel {
 
                 match outcome {
                     NexusCompletionOutcome::Succeeded { result, links } => {
-                        builder.emit(HistoryEventKind::NexusOperationCompleted {
+                        builder.append_external(HistoryEventKind::NexusOperationCompleted {
                             operation_id: pending.operation_id.clone(),
                             scheduled_event_id: pending.scheduled_event_id,
                             result,
@@ -2829,14 +2859,14 @@ impl BasicKernel {
                         });
                     }
                     NexusCompletionOutcome::Failed { failure } => {
-                        builder.emit(HistoryEventKind::NexusOperationFailed {
+                        builder.append_external(HistoryEventKind::NexusOperationFailed {
                             operation_id: pending.operation_id.clone(),
                             scheduled_event_id: pending.scheduled_event_id,
                             failure,
                         });
                     }
                     NexusCompletionOutcome::Canceled => {
-                        builder.emit(HistoryEventKind::NexusOperationCanceled {
+                        builder.append_external(HistoryEventKind::NexusOperationCanceled {
                             operation_id: pending.operation_id.clone(),
                             scheduled_event_id: pending.scheduled_event_id,
                             endpoint: pending.endpoint.clone(),
@@ -2860,7 +2890,7 @@ impl BasicKernel {
                 }
             }
             NexusResolution::TimedOut { timeout_type } => {
-                builder.emit(HistoryEventKind::NexusOperationTimedOut {
+                builder.append_external(HistoryEventKind::NexusOperationTimedOut {
                     operation_id: pending.operation_id.clone(),
                     scheduled_event_id: pending.scheduled_event_id,
                     endpoint: pending.endpoint.clone(),
@@ -3026,7 +3056,7 @@ impl BasicKernel {
         }
 
         if let Some(kind) = history_kind {
-            builder.emit(kind);
+            builder.append_external(kind);
             if builder.state.pending_workflow_task.is_none() {
                 builder.schedule_workflow_task();
             }
@@ -3853,18 +3883,11 @@ impl BasicKernel {
             timer_id: timer.timer_id.clone(),
             started_event_id: timer.started_event_id,
         };
-        // A fire during a started WFT buffers (Phase 2 timer slice); the
-        // WFT-close flush delivers it and schedules the follow-up task.
-        if should_buffer(&builder.state, &fired) {
-            builder.buffer(fired);
-        } else {
-            // A fire while a speculative task is merely SCHEDULED converts it
-            // first — Scheduled(real) precedes TimerFired (spec
-            // speculative-wft K4; a K7 follow-up speculative task can coexist
-            // with running timers).
-            builder.materialize_scheduled_speculative();
-            builder.emit(fired);
-        }
+        // A fire during a started WFT buffers and the WFT-close flush delivers
+        // it; a fire while a speculative task is merely scheduled converts the
+        // task first (a follow-up speculative task can coexist with running
+        // timers).
+        builder.append_external(fired);
         builder.state.timers.remove(&timer.timer_id);
         builder.timer_ops.push(TimerOp::Delete {
             timer_id: timer.timer_id,
@@ -6328,50 +6351,112 @@ const PER_NS_WORKER_TASK_QUEUE: &str = "temporal-sys-per-ns-tq";
 /// leaf relies on this default, not an override (`TestMaxBufferedEventsLimit`).
 const MAX_BUFFERED_EVENTS: usize = 100;
 
+/// Whether an event kind records something that happened outside the workflow
+/// task — and so buffers while a task is started — following v1.31.0's
+/// `bufferEvent` (event_store.go:263-318 @ v1.31.0): every kind buffers except
+/// run start and close events, workflow-task events, events written from a
+/// worker command, and events written from an update message.
+///
+/// The match is exhaustive with no wildcard arm, so a new event kind does not
+/// compile until it is classified here — a kind left out of an opt-in list
+/// would otherwise be appended over a started task's history by omission.
+fn is_externally_originated(kind: &HistoryEventKind) -> bool {
+    match kind {
+        // Run start and close.
+        HistoryEventKind::WorkflowExecutionStarted { .. }
+        | HistoryEventKind::WorkflowExecutionStartedV2 { .. }
+        | HistoryEventKind::WorkflowExecutionCompleted { .. }
+        | HistoryEventKind::WorkflowExecutionFailed { .. }
+        | HistoryEventKind::WorkflowExecutionTimedOut { .. }
+        | HistoryEventKind::WorkflowExecutionTerminated { .. }
+        | HistoryEventKind::WorkflowExecutionContinuedAsNew { .. }
+        | HistoryEventKind::WorkflowExecutionCanceled { .. }
+        // The workflow task's own events.
+        | HistoryEventKind::WorkflowTaskScheduled { .. }
+        | HistoryEventKind::WorkflowTaskStarted { .. }
+        | HistoryEventKind::WorkflowTaskCompleted { .. }
+        | HistoryEventKind::WorkflowTaskFailed { .. }
+        | HistoryEventKind::WorkflowTaskTimedOut { .. }
+        // Written from a worker command.
+        | HistoryEventKind::ActivityTaskScheduled { .. }
+        | HistoryEventKind::ActivityTaskCancelRequested { .. }
+        | HistoryEventKind::TimerStarted { .. }
+        | HistoryEventKind::TimerCanceled { .. }
+        | HistoryEventKind::MarkerRecorded { .. }
+        | HistoryEventKind::StartChildWorkflowExecutionInitiated { .. }
+        | HistoryEventKind::SignalExternalWorkflowExecutionInitiated { .. }
+        | HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated { .. }
+        | HistoryEventKind::UpsertWorkflowSearchAttributes { .. }
+        | HistoryEventKind::WorkflowPropertiesModified { .. }
+        | HistoryEventKind::NexusOperationScheduled { .. }
+        | HistoryEventKind::NexusOperationCancelRequested { .. }
+        // Written from an update message.
+        | HistoryEventKind::WorkflowExecutionUpdateAccepted { .. }
+        | HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
+        | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { .. } => false,
+
+        // A timer firing buffers, so a CancelTimer in the started task's
+        // completion can still win by deleting the buffered fired event
+        // (`GetAndRemoveTimerFireEvent` @ v1.31.0;
+        // TestCancelTimer_CancelFiredAndBuffered).
+        HistoryEventKind::TimerFired { .. }
+        | HistoryEventKind::WorkflowExecutionSignaled { .. }
+        | HistoryEventKind::WorkflowExecutionCancelRequested { .. }
+        | HistoryEventKind::ActivityTaskStarted { .. }
+        | HistoryEventKind::ActivityTaskCompleted { .. }
+        | HistoryEventKind::ActivityTaskFailed { .. }
+        | HistoryEventKind::ActivityTaskTimedOut { .. }
+        | HistoryEventKind::ActivityTaskCanceled { .. }
+        | HistoryEventKind::ChildWorkflowExecutionStarted { .. }
+        | HistoryEventKind::StartChildWorkflowExecutionFailed { .. }
+        | HistoryEventKind::ChildWorkflowExecutionCompleted { .. }
+        | HistoryEventKind::ChildWorkflowExecutionFailed { .. }
+        | HistoryEventKind::ChildWorkflowExecutionCanceled { .. }
+        | HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
+        | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+        | HistoryEventKind::ExternalWorkflowExecutionSignaled { .. }
+        | HistoryEventKind::SignalExternalWorkflowExecutionFailed { .. }
+        | HistoryEventKind::ExternalWorkflowExecutionCancelRequested { .. }
+        | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed { .. }
+        | HistoryEventKind::NexusOperationStarted { .. }
+        | HistoryEventKind::NexusOperationCompleted { .. }
+        | HistoryEventKind::NexusOperationFailed { .. }
+        | HistoryEventKind::NexusOperationCanceled { .. }
+        | HistoryEventKind::NexusOperationTimedOut { .. }
+        | HistoryEventKind::NexusOperationCancelRequestCompleted { .. }
+        | HistoryEventKind::NexusOperationCancelRequestFailed { .. }
+        // A pause buffers so a task in flight when the workflow is paused can
+        // still complete; the unpause buffers with it to keep their order
+        // (named explicitly in `bufferEvent` @ v1.31.0).
+        | HistoryEventKind::WorkflowExecutionPaused { .. }
+        | HistoryEventKind::WorkflowExecutionUnpaused { .. }
+        // Drives the TestBufferedEvents RequestIdInfo {Buffered:true} →
+        // {Buffered:false, EventId:14} flip on flush.
+        | HistoryEventKind::WorkflowExecutionOptionsUpdated { .. }
+        // Written only when a reset reapplies an update onto the new run, where
+        // no task is started; v1.31.0's default branch buffers it.
+        | HistoryEventKind::WorkflowExecutionUpdateAdmitted { .. }
+        // Decode-only — never written. Classified by v1.31.0's default branch.
+        | HistoryEventKind::WorkflowExecutionUpdateRejected { .. } => true,
+    }
+}
+
+/// Whether `kind` must be held in the buffer rather than appended: a worker
+/// holding a started task has a history view frozen at its Started event, and
+/// an externally-originated event appended now would land inside that window
+/// (or on the ids a speculative or retry task reserved for its own events).
 fn should_buffer(state: &WorkflowState, kind: &HistoryEventKind) -> bool {
     let workflow_task_started = state
         .pending_workflow_task
         .as_ref()
         .is_some_and(|pending| pending.started_event_id.is_some());
-    if !workflow_task_started {
-        return false;
-    }
-    matches!(
-        kind,
-        HistoryEventKind::WorkflowExecutionSignaled { .. }
-            | HistoryEventKind::WorkflowExecutionCancelRequested { .. }
-            // Phase 2 timer slice (spec kernel-event-buffering; trigger met by
-            // TestCancelTimer_CancelFiredAndBuffered): a timer firing during a
-            // started WFT buffers, so a CancelTimer in that WFT's completion
-            // can still win by deleting the buffered fired event
-            // (`GetAndRemoveTimerFireEvent` @ v1.31.0).
-            | HistoryEventKind::TimerFired { .. }
-            // Phase 2 activity slice (spec kernel-event-buffering Req 2.1;
-            // trigger met by TestBufferedEvents / TestBufferedEventsOutOfOrder /
-            // TestMaxBufferedEventsLimit): activity start + resolution events
-            // buffer during a started WFT and flush after it, with the
-            // resolution events reordered to the end (`bufferEvent` default
-            // branch, event_store.go:263-318 @ v1.31.0). Child-workflow / Nexus
-            // / external resolutions extend this whitelist when their tiers
-            // demand it — the flush machinery already handles the general case.
-            | HistoryEventKind::ActivityTaskStarted { .. }
-            | HistoryEventKind::ActivityTaskCompleted { .. }
-            | HistoryEventKind::ActivityTaskFailed { .. }
-            | HistoryEventKind::ActivityTaskTimedOut { .. }
-            | HistoryEventKind::ActivityTaskCanceled { .. }
-            // WorkflowExecutionOptionsUpdated buffers too (drives the
-            // TestBufferedEvents RequestIdInfo{Buffered:true} → {Buffered:false,
-            // EventId:14} flip on flush).
-            | HistoryEventKind::WorkflowExecutionOptionsUpdated { .. }
-    )
+    workflow_task_started && is_externally_originated(kind)
 }
 
-/// A buffered event of the completion/resolution class — v1.31.0's
-/// `reorderBuffer` bucket that sorts AFTER all other buffered events on flush
-/// (event_store.go:413-443 @ v1.31.0), so a resolution always lands after its
-/// matching `*Started`. Currently the activity resolution events (Phase 2
-/// activity slice); child-workflow / Nexus terminal events join here when their
-/// tiers land.
+/// A buffered event of the completion class — v1.31.0's `reorderBuffer`
+/// bucket that sorts after all other buffered events on flush
+/// (event_store.go:413-443 @ v1.31.0), so a completion always lands after its
+/// matching `*Started`.
 fn is_buffered_resolution_class(kind: &HistoryEventKind) -> bool {
     matches!(
         kind,
@@ -6379,6 +6464,15 @@ fn is_buffered_resolution_class(kind: &HistoryEventKind) -> bool {
             | HistoryEventKind::ActivityTaskFailed { .. }
             | HistoryEventKind::ActivityTaskTimedOut { .. }
             | HistoryEventKind::ActivityTaskCanceled { .. }
+            | HistoryEventKind::ChildWorkflowExecutionCompleted { .. }
+            | HistoryEventKind::ChildWorkflowExecutionFailed { .. }
+            | HistoryEventKind::ChildWorkflowExecutionCanceled { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+            | HistoryEventKind::NexusOperationCompleted { .. }
+            | HistoryEventKind::NexusOperationFailed { .. }
+            | HistoryEventKind::NexusOperationCanceled { .. }
+            | HistoryEventKind::NexusOperationTimedOut { .. }
     )
 }
 
@@ -6467,20 +6561,31 @@ impl TransitionBuilder {
             });
     }
 
-    /// Emit an event immediately, OR buffer it when a workflow task is started
-    /// and the event is bufferable ([`should_buffer`]). Returns the assigned
-    /// real event id, or [`BUFFERED_EVENT_ID`] when buffered — so a caller that
-    /// records a started-event id (e.g. `ActivityTaskStarted`) stores the
-    /// sentinel and the flush wires the real id into the matching resolution
-    /// event. Mirrors v1.31.0's `EventStore::add` split (real id + latest batch
-    /// vs `BufferedEventID` + buffer batch, event_store.go:74-93 @ v1.31.0).
-    fn emit_or_buffer(&mut self, kind: HistoryEventKind) -> i64 {
+    /// The one way an externally-originated event enters a transition.
+    ///
+    /// While a workflow task is started the event is buffered and the
+    /// [`BUFFERED_EVENT_ID`] sentinel is returned, so a caller that records a
+    /// started-event id (`ActivityTaskStarted`, `ChildWorkflowExecutionStarted`)
+    /// stores the sentinel and the flush wires the real id in later — v1.31.0's
+    /// `EventStore::add` split (event_store.go:74-93 @ v1.31.0). Otherwise a
+    /// scheduled speculative task is converted first, so its Scheduled event
+    /// takes the id the task reserved and the event follows it; v1.31.0 gets
+    /// the same order by converting at transaction close before flushing its
+    /// buffer (`closeTransactionHandleSpeculativeWorkflowTask`,
+    /// mutable_state_impl.go:7238-7251 @ v1.31.0), while this builder numbers
+    /// each event as it is appended, so the conversion has to come first here.
+    /// Returns the event's real id when it is appended.
+    fn append_external(&mut self, kind: HistoryEventKind) -> i64 {
+        debug_assert!(
+            is_externally_originated(&kind),
+            "append_external is for externally-originated events: {kind:?}"
+        );
         if should_buffer(&self.state, &kind) {
             self.buffer(kind);
-            BUFFERED_EVENT_ID
-        } else {
-            self.emit(kind)
+            return BUFFERED_EVENT_ID;
         }
+        self.materialize_scheduled_speculative();
+        self.emit(kind)
     }
 
     /// Drain `buffered_events` into history in admission order, assigning
@@ -6496,7 +6601,8 @@ impl TransitionBuilder {
     /// that order (`FlushBufferToCurrentBatch` allocates AFTER reordering,
     /// event_store.go:131-168), then `wireEventIDs` (event_store.go:339-406)
     /// back-patches each resolution's `started_event_id` from the real id its
-    /// buffered `*Started` just received (keyed by the shared scheduled id).
+    /// buffered `*Started` just received (keyed by the activity's scheduled id
+    /// or the child's initiated id).
     /// A buffered `WorkflowExecutionOptionsUpdated` flips its `RequestIdInfo`
     /// from `buffered:true, event_id:0` to the real id here (`TestBufferedEvents`).
     fn flush_buffered(&mut self) -> usize {
@@ -6515,9 +6621,11 @@ impl TransitionBuilder {
             .partition(|event| !is_buffered_resolution_class(&event.kind));
         ordered.extend(resolutions);
 
-        // scheduled_event_id -> real started event id, for events whose
-        // `*Started` also buffered in this batch (they precede resolutions).
-        let mut started_by_scheduled: std::collections::HashMap<i64, i64> =
+        // Origin event id (an activity's scheduled id, a child's initiated id)
+        // -> real started event id, for completions whose `*Started` also
+        // buffered in this batch (the reorder above puts them after it). One
+        // map serves both: origin ids are distinct events of the same run.
+        let mut started_by_origin: std::collections::HashMap<i64, i64> =
             std::collections::HashMap::new();
         for event in ordered {
             let event_id = self.state.last_event_id + 1;
@@ -6529,7 +6637,7 @@ impl TransitionBuilder {
                     scheduled_event_id,
                     ..
                 } => {
-                    started_by_scheduled.insert(*scheduled_event_id, event_id);
+                    started_by_origin.insert(*scheduled_event_id, event_id);
                     // Back-fill the durable activity's started id so a resolution
                     // arriving AFTER this flush (activity still running when the
                     // WFT closed) references the real id, not the sentinel.
@@ -6537,6 +6645,51 @@ impl TransitionBuilder {
                         && activity.started_event_id == Some(BUFFERED_EVENT_ID)
                     {
                         activity.started_event_id = Some(event_id);
+                    }
+                }
+                // The same wiring for a child, keyed by its initiated id, and
+                // the pending child's started id updated the way
+                // `updatePendingEventIDs` does (mutable_state_impl.go:7957-7981
+                // @ v1.31.0) so a completion after this flush names the real id.
+                HistoryEventKind::ChildWorkflowExecutionStarted {
+                    child_workflow_id,
+                    initiated_event_id,
+                    ..
+                } => {
+                    started_by_origin.insert(*initiated_event_id, event_id);
+                    if let Some(child) = self.state.children.get_mut(&*child_workflow_id)
+                        && child.started_event_id == Some(BUFFERED_EVENT_ID)
+                    {
+                        child.started_event_id = Some(event_id);
+                    }
+                }
+                HistoryEventKind::ChildWorkflowExecutionCompleted {
+                    initiated_event_id,
+                    started_event_id,
+                    ..
+                }
+                | HistoryEventKind::ChildWorkflowExecutionFailed {
+                    initiated_event_id,
+                    started_event_id,
+                    ..
+                }
+                | HistoryEventKind::ChildWorkflowExecutionCanceled {
+                    initiated_event_id,
+                    started_event_id,
+                    ..
+                }
+                | HistoryEventKind::ChildWorkflowExecutionTerminated {
+                    initiated_event_id,
+                    started_event_id,
+                    ..
+                }
+                | HistoryEventKind::ChildWorkflowExecutionTimedOut {
+                    initiated_event_id,
+                    started_event_id,
+                    ..
+                } => {
+                    if let Some(real_started) = started_by_origin.get(initiated_event_id) {
+                        *started_event_id = *real_started;
                     }
                 }
                 HistoryEventKind::ActivityTaskCompleted {
@@ -6559,7 +6712,7 @@ impl TransitionBuilder {
                     started_event_id,
                     ..
                 } => {
-                    if let Some(real_started) = started_by_scheduled.get(scheduled_event_id) {
+                    if let Some(real_started) = started_by_origin.get(scheduled_event_id) {
                         *started_event_id = *real_started;
                     }
                 }
@@ -6609,9 +6762,21 @@ impl TransitionBuilder {
         // Only an attempt-1 task persists a WorkflowTaskFailed event (transient
         // retries write none — workflow_task_state_machine.go:892-895 @ v1.31.0).
         if pending.attempt == 1 {
+            // A started SPECULATIVE task has written neither its Scheduled nor
+            // its Started event: write them at the reserved ids first, so the
+            // Failed event names events that exist. v1.31.0 fails the task
+            // through `failWorkflowTask` (workflow/util.go:26-48), whose
+            // `AddWorkflowTaskFailedEvent` does the same for a speculative task
+            // (workflow_task_state_machine.go:865-891 @ v1.31.0).
+            let (scheduled_event_id, started_event_id) =
+                if pending.task_type == WorkflowTaskType::Speculative {
+                    self.write_started_speculative(&pending)
+                } else {
+                    (pending.scheduled_event_id, started_event_id)
+                };
             self.emit(HistoryEventKind::WorkflowTaskFailed {
                 logical_seq: pending.logical_seq,
-                scheduled_event_id: pending.scheduled_event_id,
+                scheduled_event_id,
                 started_event_id,
                 failure_cause: WorkflowTaskFailedCause::ForceCloseCommand,
                 failure_details: None,
@@ -6654,14 +6819,16 @@ impl TransitionBuilder {
     }
 
     /// Convert a SCHEDULED (not yet started) SPECULATIVE workflow task to
-    /// NORMAL because non-update history is about to append (spec
-    /// speculative-wft K4, Req 4.1): materialize its `WorkflowTaskScheduled`
-    /// event NOW — real id, original scheduled time and attempt — flip the
-    /// task mode, and rewire `scheduled_event_id` to the real id. Callers
-    /// invoke this BEFORE emitting their own event so the Scheduled event
-    /// precedes it, pinning the corpus ordering Scheduled(5), Signaled(6),
+    /// NORMAL because non-update history is about to append: materialize its
+    /// `WorkflowTaskScheduled` event NOW — at the id the task reserved, with
+    /// the original scheduled time and attempt — flip the task mode, and
+    /// rewire `scheduled_event_id` to the real id. [`Self::append_external`]
+    /// calls this before appending any externally-originated event, and the
+    /// schedule-to-start timeout before its timed-out event, so the Scheduled
+    /// event comes first: the corpus ordering Scheduled(5), Signaled(6),
     /// Started(7) (`TestScheduledSpeculativeWorkflowTask_ConvertToNormal`
-    /// `BecauseOfSignal`).
+    /// `BecauseOfSignal`), and the same for a child, activity, Nexus or timer
+    /// event.
     ///
     /// v1.31.0 equivalent: any transaction close with a pending speculative
     /// WFT converts it, and the conversion's WT events are deliberately
@@ -6702,6 +6869,49 @@ impl TransitionBuilder {
             .expect("pending workflow task was just observed");
         current.task_type = WorkflowTaskType::Normal;
         current.scheduled_event_id = scheduled;
+    }
+
+    /// Write a started SPECULATIVE task's `WorkflowTaskScheduled` and
+    /// `WorkflowTaskStarted` at its reserved ids, ahead of an event that
+    /// closes it here — the materialization v1.31.0's
+    /// `AddWorkflowTaskFailedEvent` performs for a speculative task
+    /// (workflow_task_state_machine.go:865-891 @ v1.31.0). Both carry the
+    /// task's own schedule and start times. Returns the two ids.
+    fn write_started_speculative(&mut self, pending: &PendingWorkflowTask) -> (i64, i64) {
+        let scheduled = self.emit_at(
+            pending.scheduled_at,
+            HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: pending.logical_seq,
+                task_queue: self.state.task_queue.clone(),
+                workflow_task_timeout: self.state.workflow_task_timeout,
+                attempt: pending.attempt,
+            },
+        );
+        let started = self.emit_at(
+            pending.started_at.unwrap_or(self.now),
+            HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: scheduled,
+                attempt: pending.attempt,
+                identity: WorkerIdentity(String::new()),
+                request_id: format!("transient-materialize-{}", pending.logical_seq.0),
+                // Materialization copies the Advice decided at the attempt's
+                // start; it never recomputes it against the thresholds in force
+                // now (stored task info, workflow_task_state_machine.go:790-794,
+                // 881-885, 954-958 @ v1.31.0).
+                history_size_bytes: pending.advice.history_size_bytes,
+                suggest_continue_as_new: pending.advice.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: pending
+                    .advice
+                    .suggest_continue_as_new_reasons
+                    .clone(),
+                target_worker_deployment_version_changed: pending
+                    .target_worker_deployment_version_changed,
+                target_version_changed_enabled: pending.target_version_changed_enabled,
+                target_deployment_version: pending.target_deployment_version.clone(),
+            },
+        );
+        (scheduled, started)
     }
 
     /// Fail a started WFT with cause `ForceCloseCommand` as the first step of
@@ -6747,49 +6957,11 @@ impl TransitionBuilder {
         }
         // A started SPECULATIVE task converts before it is force-failed:
         // Scheduled + Started persist late so the Failed event references
-        // real ids — the same materialization v1.31.0's
-        // `AddWorkflowTaskFailedEvent` performs for speculative tasks
-        // (workflow_task_state_machine.go:865-891 @ v1.31.0; spec
-        // speculative-wft: started → convert then fail). A merely SCHEDULED
-        // speculative task never reaches here (no started id) and leaves no
-        // trace.
+        // real ids. A merely SCHEDULED speculative task never reaches here (no
+        // started id) and leaves no trace.
         let (scheduled_event_id, started_event_id) =
             if pending.task_type == WorkflowTaskType::Speculative {
-                let scheduled = self.emit_at(
-                    pending.scheduled_at,
-                    HistoryEventKind::WorkflowTaskScheduled {
-                        logical_seq: pending.logical_seq,
-                        task_queue: self.state.task_queue.clone(),
-                        workflow_task_timeout: self.state.workflow_task_timeout,
-                        attempt: pending.attempt,
-                    },
-                );
-                let started = self.emit_at(
-                    pending.started_at.unwrap_or(self.now),
-                    HistoryEventKind::WorkflowTaskStarted {
-                        logical_seq: pending.logical_seq,
-                        scheduled_event_id: scheduled,
-                        attempt: pending.attempt,
-                        identity: WorkerIdentity(String::new()),
-                        request_id: format!("transient-materialize-{}", pending.logical_seq.0),
-                        // Materialization copies the Advice decided at the
-                        // attempt's start; it never recomputes it against the
-                        // thresholds in force now (stored task info,
-                        // workflow_task_state_machine.go:790-794, 881-885, 954-958
-                        // @ v1.31.0).
-                        history_size_bytes: pending.advice.history_size_bytes,
-                        suggest_continue_as_new: pending.advice.suggest_continue_as_new,
-                        suggest_continue_as_new_reasons: pending
-                            .advice
-                            .suggest_continue_as_new_reasons
-                            .clone(),
-                        target_worker_deployment_version_changed: pending
-                            .target_worker_deployment_version_changed,
-                        target_version_changed_enabled: pending.target_version_changed_enabled,
-                        target_deployment_version: pending.target_deployment_version.clone(),
-                    },
-                );
-                (scheduled, started)
+                self.write_started_speculative(&pending)
             } else {
                 (pending.scheduled_event_id, started_event_id)
             };
@@ -7571,4 +7743,14 @@ pub enum Reject {
     /// and bad-sequencing cases surface as InvalidArgument.
     #[error("bad update workflow execution message: {message}")]
     BadUpdateMessage { message: String, not_found: bool },
+    /// A computed transition broke a history-integrity rule: event ids
+    /// continue contiguously, a started workflow task's history stays frozen
+    /// until it closes, and no other event takes a workflow task's reserved
+    /// ids (the transition check, `integrity.rs`). Nothing is committed. No
+    /// correct path reaches it — it marks a kernel defect, and it surfaces as
+    /// INTERNAL, as v1.31.0's error for a speculative task whose Scheduled id
+    /// disagrees with its reserved one does
+    /// (workflow_task_state_machine.go:1501-1503 @ v1.31.0).
+    #[error("transition breaks history integrity: {0}")]
+    HistoryIntegrity(String),
 }

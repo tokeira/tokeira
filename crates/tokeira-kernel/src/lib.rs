@@ -20,6 +20,7 @@
 pub mod advice;
 pub mod command;
 pub mod event;
+mod integrity;
 pub mod kernel;
 pub mod state;
 pub mod transition;

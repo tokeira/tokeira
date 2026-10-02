@@ -172,7 +172,7 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
 > retry tasks and the buffered-event limit. Lands in one change with `kernel-event-buffering` Phase 2's
 > second slice (tasks 2.4–2.10). Bugfix order: the exploration tests come first and must fail.
 
-- [ ] V.1 Exploration tests, expected to FAIL on the unfixed kernel (failure confirms the bug; record
+- [x] V.1 Exploration tests, expected to FAIL on the unfixed kernel (failure confirms the bug; record
   each observed failure): a child completion while the speculative task is scheduled (the Scheduled
   event is not written first) and while it is started (the child event takes reserved id 5); the
   started case followed by a rejection-only completion with the discard capability (dropped, child
@@ -181,27 +181,42 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
   started speculative task (`WorkflowTaskFailed` at 5 naming unwritten ids); a child completion during a
   started normal task (appended rather than buffered). They then become regression goldens asserting
   the v1.31.0 shapes. (Req 4.1, 4.2, 4.4, I.3; `kernel-event-buffering` Req 2.4, 6.4)
-- [ ] V.2 Conversion before append for every externally-originated event, through the append rule of
-  `kernel-event-buffering` task 2.5; goldens G3, G4. (Req 4.1, 4.2)
-- [ ] V.3 Buffered-event limit: write Scheduled and Started at the reserved ids before the force-close
+  **(DONE — all eight failed on main `9aea4188` as described; they now live in `golden_tests.rs` as
+  goldens asserting the v1.31.0 shapes.)**
+- [x] V.2 Conversion before append for every externally-originated event, through the append rule of
+  `kernel-event-buffering` task 2.5; goldens G3, G4. (Req 4.1, 4.2) **(DONE)**
+- [x] V.3 Buffered-event limit: write Scheduled and Started at the reserved ids before the force-close
   `WorkflowTaskFailed` (cite `AddWorkflowTaskFailedEvent`, `workflow_task_state_machine.go:865-891 @
-  v1.31.0`); golden G5. (Req 4.4)
-- [ ] V.4 Transition check and its `Reject` variant: run at the end of `Kernel::apply` and in the kernel
+  v1.31.0`); golden G5. (Req 4.4) **(DONE — `write_started_speculative`, shared with force-close.)**
+- [x] V.4 Transition check and its `Reject` variant: run at the end of `Kernel::apply` and in the kernel
   function behind the runtime's activity-start transitions; surfaces as Internal. (Req I.3, I.4)
-- [ ] V.5 Edge: bound the poll-response history read by the started task's ids; append the generated
+  **(DONE — `integrity.rs`; `Reject::HistoryIntegrity(String)`. The check protects a task's reserved
+  ids only while its reserved Scheduled id is still the run's next id, so a run persisted by an
+  earlier engine version with an already-taken id heals through the existing renumbering instead of
+  having every transition refused. The new public `Reject` variant makes the next engine release a
+  minor version bump.)**
+- [x] V.5 Edge: bound the poll-response history read by the started task's ids; append the generated
   Scheduled/Started only when they continue exactly from the last event read; otherwise log and return
-  the history without them. (Req 2.5, 2.6)
-- [ ] V.6 Properties P7–P11 (`// Feature: speculative-wft, Property N`). (Req 4, I.3, I.4)
-- [ ] V.7 Checkpoint: the full bar; conformance rerun of `TestWorkflowUpdateSuite`,
+  the history without them. (Req 2.5, 2.6) **(DONE — `StartedWorkflowTask::last_event_id_at_start`
+  bounds the read; `poll_history` in `translate/from_internal.rs` assembles and validates.)**
+- [x] V.6 Properties P7–P11 (`// Feature: speculative-wft, Property N`). (Req 4, I.3, I.4)
+  **(DONE — P7, P8, P9 and P11 in `property_tests.rs`; P10 as unit tests in `integrity.rs`, where the
+  crate-private check is reachable. With the old append behaviour injected and the check disabled,
+  P7 and P9 fail on their own assertions — P9 on the reported drop.)**
+- [x] V.7 Checkpoint: the full bar; conformance rerun of `TestWorkflowUpdateSuite`,
   `TestUpdateWorkflowSdkSuite` and `TestUpdateWithStartSuite` alongside the `kernel-event-buffering`
-  2.9 suites.
+  2.9 suites. **(DONE — no failures in `TestWorkflowUpdateSuite` (31 tests), `TestUpdateWorkflowSdkSuite`
+  (5) and `TestUpdateWithStartSuite` (4), nor in the activity (9), activity-client (5) and workflow (16)
+  suites run with them; the 2.9 suites are recorded there.)**
 
 ## Phase D — Docs
 
 - [ ] D.1 Amend `docs/architecture/020-kernel.md` (three WFT modes, drop/materialize, conversion
   table, and the reserved-id rule with how Tokeira keeps it) and `docs/readiness/command-surface.md`
   (appended cause + event variant, wire-message model, the transition check's `Reject` variant).
-  (AGENTS §9)
+  (AGENTS §9) *(Progress: `020-kernel.md` now carries the speculative section — three modes,
+  drop/materialize, conversion, reserved ids — and the transition check; `command-surface.md` is
+  still to do.)*
 
 ## Task Dependency Graph
 

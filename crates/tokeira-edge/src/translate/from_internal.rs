@@ -43,11 +43,59 @@ pub async fn poll_response(
     namespace_id: NamespaceId,
 ) -> Result<PollWorkflowTaskQueueResponse> {
     let after_event_id = workflow_task_history_after_event_id(&started);
+    // The history as it stood when the task started. The runtime commits the
+    // start before this read, so without the bound an event committed in
+    // between would reach the worker ahead of the synthesized pair below;
+    // v1.31.0 reads `[firstEventID, nextEventID)` with `nextEventID` fixed when
+    // the task starts (recordworkflowtaskstarted/api.go:272-276, 419 @ v1.31.0).
+    let limit = usize::try_from(
+        started
+            .last_event_id_at_start
+            .saturating_sub(after_event_id),
+    )
+    .unwrap_or(0);
     let attributed_history = repo
-        .read_attributed_history(started.run_key, after_event_id, usize::MAX)
+        .read_attributed_history(started.run_key, after_event_id, limit)
         .await?;
-    let (mut history, mut history_principals): (Vec<_>, Vec<_>) = attributed_history
+    let (history, history_principals) = poll_history(&started, after_event_id, attributed_history);
+    Ok(PollWorkflowTaskQueueResponse {
+        task_token: crate::task_token::encode(started.token.clone(), namespace_id)?,
+        started_event_id: started.token.started_event_id,
+        previous_started_event_id: started.previous_started_event_id,
+        attempt: started.token.attempt,
+        scheduled_time: Some(started.scheduled_time),
+        started_time: Some(started.started_time),
+        payload: WorkflowTaskPayloadDto {
+            run_id: started.run_id,
+            workflow_id: started.workflow_id.0,
+            run_key: started.run_key,
+            task_queue: started.task_queue.0,
+            history,
+            history_principals,
+        },
+        query: None,
+        queries: HashMap::new(),
+        messages: Vec::new(),
+        poller_scaling_decision: None,
+    })
+}
+
+/// Assemble a polled task's history from the events read after
+/// `after_event_id`: only those up to the run's last event at start, then —
+/// for a task whose Scheduled/Started were never persisted — the synthesized
+/// pair, when it continues exactly from them.
+fn poll_history(
+    started: &StartedWorkflowTask,
+    after_event_id: i64,
+    read: Vec<tokeira_storage::AttributedHistoryEvent>,
+) -> (
+    Vec<tokeira_kernel::HistoryEvent>,
+    Vec<Option<tokeira_types::EventPrincipal>>,
+) {
+    let history_end = started.last_event_id_at_start;
+    let (mut history, mut history_principals): (Vec<_>, Vec<_>) = read
         .into_iter()
+        .filter(|attributed| attributed.event.event_id <= history_end)
         .map(|attributed| (attributed.event, attributed.principal))
         .unzip();
     // Transient-suffix synthesis (spec transient-wft Req B.7): a transient
@@ -57,13 +105,32 @@ pub async fn poll_response(
     // (`GetTransientWorkflowTaskInfo`, mutable_state_impl.go:1189-1250;
     // `response.TransientWorkflowTask`, recordworkflowtaskstarted/api.go:430
     // @ v1.31.0). Nothing is persisted; ids continue past the last real event.
-    let last_persisted = history.last().map(|event| event.event_id).unwrap_or(0);
-    // A started id beyond persisted history means the task is virtual —
-    // transient (attempt>1) OR speculative (attempt-1, spec speculative-wft
-    // E1): both synthesize the suffix; a normal attempt-1 task's started
+    // A started id beyond the history at start marks the task virtual —
+    // transient (attempt>1) or speculative; a normal attempt-1 task's started
     // event is persisted and never trips this.
-    if started.token.started_event_id > last_persisted {
-        let scheduled_event_id = started.token.started_event_id - 1;
+    let scheduled_event_id = started.token.started_event_id - 1;
+    let last_read = history
+        .last()
+        .map(|event| event.event_id)
+        .unwrap_or(after_event_id);
+    let synthesize = started.token.started_event_id > history_end;
+    // The pair goes on only when it continues exactly from the history read;
+    // otherwise the worker would get two events with one id or a gap. v1.31.0
+    // likewise skips a suffix that fails `ValidateTransientWorkflowTaskEvents`
+    // without failing the request (get_history_util.go:118-128, 234-246,
+    // 438-457 @ v1.31.0). The kernel's transition check keeps the reserved ids
+    // free, so this firing means stored history and run state disagree.
+    let continues = scheduled_event_id == history_end + 1 && last_read == history_end;
+    if synthesize && !continues {
+        tracing::error!(
+            run_key = %started.run_key.0,
+            scheduled_event_id,
+            history_end,
+            last_read,
+            "synthesized workflow task events do not continue from the stored history; omitted"
+        );
+    }
+    if synthesize && continues {
         history.push(tokeira_kernel::HistoryEvent {
             event_id: scheduled_event_id,
             happened_at: started.scheduled_time,
@@ -105,26 +172,7 @@ pub async fn poll_response(
         });
         history_principals.push(None);
     }
-    Ok(PollWorkflowTaskQueueResponse {
-        task_token: crate::task_token::encode(started.token.clone(), namespace_id)?,
-        started_event_id: started.token.started_event_id,
-        previous_started_event_id: started.previous_started_event_id,
-        attempt: started.token.attempt,
-        scheduled_time: Some(started.scheduled_time),
-        started_time: Some(started.started_time),
-        payload: WorkflowTaskPayloadDto {
-            run_id: started.run_id,
-            workflow_id: started.workflow_id.0,
-            run_key: started.run_key,
-            task_queue: started.task_queue.0,
-            history,
-            history_principals,
-        },
-        query: None,
-        queries: HashMap::new(),
-        messages: Vec::new(),
-        poller_scaling_decision: None,
-    })
+    (history, history_principals)
 }
 
 fn workflow_task_history_after_event_id(started: &StartedWorkflowTask) -> i64 {
@@ -299,7 +347,7 @@ mod tests {
         WorkflowTaskToken,
     };
 
-    use super::{poll_activity_response, workflow_task_history_after_event_id};
+    use super::{poll_activity_response, poll_history, workflow_task_history_after_event_id};
 
     fn task_origin(task_class: WorkerTaskClass) -> WorkerTaskOrigin {
         WorkerTaskOrigin {
@@ -329,6 +377,7 @@ mod tests {
             workflow_id: WorkflowId("workflow".to_string()),
             task_queue: TaskQueueName("queue".to_string()),
             previous_started_event_id,
+            last_event_id_at_start: 2,
             is_sticky_match,
             scheduled_time: OffsetDateTime::UNIX_EPOCH,
             started_time: OffsetDateTime::UNIX_EPOCH,
@@ -404,5 +453,72 @@ mod tests {
             .expect("activity token decodes");
             prop_assert_eq!(token_namespace_id, Some(namespace_id));
         }
+
+        // Feature: speculative-wft, Property 7 (poll side): the history a
+        // polled task carries is the history as it stood at start, and its
+        // synthesized pair continues it without a gap or a repeated id.
+        #[test]
+        fn poll_history_is_the_history_at_start(
+            history_end in 2i64..40,
+            committed_after in 0i64..4,
+            missing in 0i64..2,
+        ) {
+            let mut started = started_task(0, false);
+            started.last_event_id_at_start = history_end;
+            started.token.started_event_id = history_end + 2;
+            // Stored history: everything up to the start, minus `missing`
+            // trailing events, plus events committed after the start.
+            let stored_last = history_end - missing + committed_after;
+            let read = (1..=stored_last)
+                .filter(|id| *id <= history_end - missing || *id > history_end)
+                .map(signaled)
+                .collect();
+
+            let (history, principals) = poll_history(&started, 0, read);
+
+            prop_assert_eq!(history.len(), principals.len());
+            let ids: Vec<i64> = history.iter().map(|event| event.event_id).collect();
+            if missing == 0 {
+                let expected: Vec<i64> = (1..=history_end + 2).collect();
+                prop_assert_eq!(ids, expected);
+                let pair_starts_with_scheduled = matches!(
+                    history[history.len() - 2].kind,
+                    tokeira_kernel::HistoryEventKind::WorkflowTaskScheduled { .. }
+                );
+                prop_assert!(pair_starts_with_scheduled);
+            } else {
+                // Short of the start-time history: the pair would leave a
+                // gap, so it is left off.
+                let expected: Vec<i64> = (1..=history_end - missing).collect();
+                prop_assert_eq!(ids, expected);
+            }
+        }
+    }
+
+    fn signaled(event_id: i64) -> tokeira_storage::AttributedHistoryEvent {
+        tokeira_storage::AttributedHistoryEvent {
+            event: tokeira_kernel::HistoryEvent {
+                event_id,
+                happened_at: OffsetDateTime::UNIX_EPOCH,
+                kind: tokeira_kernel::HistoryEventKind::WorkflowExecutionSignaled {
+                    signal_name: "sig".to_string(),
+                    input: Payloads::default(),
+                    header: None,
+                    links: Vec::new(),
+                    request_id: format!("signal-{event_id}"),
+                    identity: None,
+                },
+            },
+            principal: None,
+        }
+    }
+
+    #[test]
+    fn poll_history_leaves_a_normal_task_unchanged() {
+        let started = started_task(0, false);
+        let read = (1..=2).map(signaled).collect();
+        let (history, _) = poll_history(&started, 0, read);
+        let ids: Vec<i64> = history.iter().map(|event| event.event_id).collect();
+        assert_eq!(ids, vec![1, 2]);
     }
 }

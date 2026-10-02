@@ -17,10 +17,14 @@
 //!   failure re-enqueues the next attempt, and an OCC conflict at start
 //!   republishes the offer instead of making the worker wait on a lock.
 use super::*;
-use crate::runtime::workflow_task::{
-    ResolvedWorkflowTaskTarget, poller_deployment_version, resolve_workflow_task_target_version,
-    route_activity_task_queue,
+use crate::{
+    lane::KernelRejected,
+    runtime::workflow_task::{
+        ResolvedWorkflowTaskTarget, poller_deployment_version,
+        resolve_workflow_task_target_version, route_activity_task_queue,
+    },
 };
+use tokeira_kernel::{ActivityStartMode, ActivityStartRequest};
 use tokeira_observability::OutcomeLabel;
 use tokeira_types::{TaskKind, WorkerTaskClass, WorkerTaskOrigin};
 use tracing::Instrument as _;
@@ -745,45 +749,24 @@ where
                 return Ok(token);
             }
 
-            let mut next_state = state.clone();
-            next_state.transition_seq = state.transition_seq.next();
-            let mut next_activity = current.clone();
-            next_activity.stamp += 1;
-            let now = OffsetDateTime::now_utc();
-            next_activity.started_at = Some(now);
-            // The fabricated start carries the completing caller's identity
-            // (respondactivitytaskcompleted/api.go:96 @ v1.31.0; K3 makes it
-            // durable as `started_identity`).
-            next_activity.started_identity = Some(identity.clone());
-            let started_event_id = next_state.last_event_id + 1;
-            next_state.last_event_id = started_event_id;
-            next_activity.started_event_id = Some(started_event_id);
-            next_state
-                .activities
-                .insert(activity_id.to_string(), next_activity.clone());
-
-            let started_event = HistoryEvent {
-                event_id: started_event_id,
-                happened_at: now,
-                kind: HistoryEventKind::ActivityTaskStarted {
-                    activity_id: activity_id.to_string(),
-                    scheduled_event_id: current.schedule_event_id,
-                    attempt: current.attempt,
-                    identity: identity.clone(),
-                    request_id: format!("activity-start-{}-{}", activity_id, current.attempt),
-                    last_failure: current.last_failure.clone(),
-                },
-            };
-            let transition = Transition {
-                expected_seq: state.transition_seq,
-                next_state,
-                history_events: smallvec![started_event],
-                event_principals: smallvec![request.principal.clone()],
-                request_dedupe_ops: SmallVec::new(),
-                activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
-                timer_ops: SmallVec::new(),
-                dispatch_ops: SmallVec::new(),
-            };
+            // The kernel computes the start, so its event follows the same
+            // append rule as every other — buffered while a workflow task is
+            // started, appended after a scheduled speculative task converts —
+            // and passes the transition check. The fabricated start carries the
+            // completing caller's identity (respondactivitytaskcompleted/api.go:96
+            // @ v1.31.0).
+            let transition = BasicKernel
+                .apply_activity_started(
+                    LoadedRun::Existing(state.clone()),
+                    ActivityStartRequest {
+                        activity_id: activity_id.to_string(),
+                        identity: identity.clone(),
+                        principal: request.principal.clone(),
+                        mode: ActivityStartMode::CompletedById,
+                        now: OffsetDateTime::now_utc(),
+                    },
+                )
+                .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
 
             // Same commit-epoch rule as start_activity_task: ZERO without a
             // placement controller (no lease to fence), real local epoch under
@@ -1071,85 +1054,32 @@ where
                 return Ok(None);
             }
 
-            let mut next_state = state.clone();
-            next_state.transition_seq = state.transition_seq.next();
-            let mut next_activity = current.clone();
-            next_activity.stamp += 1;
+            // The kernel computes the start, so its event follows the same
+            // append rule as every other — buffered while a workflow task is
+            // started, appended after a scheduled speculative task converts —
+            // and passes the transition check. A retry-policy start stays
+            // transient, with no event until the activity resolves. The polling
+            // worker's identity becomes `started_identity`, Describe's primary
+            // `LastWorkerIdentity` source (workflow/activity.go:159 @ v1.31.0).
             let now = OffsetDateTime::now_utc();
-            next_activity.started_at = Some(now);
-            // `ai.StartedIdentity` (kernel raise K3): the polling worker's
-            // identity, Describe's primary `LastWorkerIdentity` source
-            // (workflow/activity.go:159 @ v1.31.0). May be empty — v1.31.0
-            // stores it verbatim and Describe falls back on empty.
-            next_activity.started_identity = Some(worker_identity.clone());
-
-            // A retry-policy activity start is transient: v1.31.0 persists
-            // mutable start metadata but does not consume a history event until
-            // terminal resolution (`AddActivityTaskStartedEvent`,
-            // mutable_state_impl.go:4082-4152 @ v1.31.0). A retryable failure
-            // clears this marker when advancing the attempt, so neither Started
-            // nor Failed appears for an intermediate attempt.
-            //
-            // A non-retry start remains immediate unless a WFT is running. In
-            // that case the worker's history view is frozen, so Started buffers
-            // and is flushed before its matching resolution (`bufferEvent`,
-            // event_store.go:263 @ v1.31.0; TestBufferedEventsOutOfOrder).
-            let started_activity_kind = HistoryEventKind::ActivityTaskStarted {
-                activity_id: task.activity_id.clone(),
-                scheduled_event_id: current.schedule_event_id,
-                attempt: current.attempt,
-                identity: worker_identity.clone(),
-                request_id: format!("activity-start-{}-{}", task.activity_id, current.attempt),
-                last_failure: current.last_failure.clone(),
-            };
-            let workflow_task_started = state
-                .pending_workflow_task
-                .as_ref()
-                .is_some_and(|pending| pending.started_event_id.is_some());
-            let started_history_events = if current.retry_policy.is_some() {
-                next_activity.started_event_id =
-                    Some(tokeira_kernel::TRANSIENT_ACTIVITY_STARTED_EVENT_ID);
-                SmallVec::new()
-            } else if workflow_task_started {
-                next_activity.started_event_id = Some(tokeira_kernel::BUFFERED_EVENT_ID);
-                next_state
-                    .buffered_events
-                    .push(tokeira_kernel::BufferedEvent {
-                        admitted_at: now,
-                        kind: started_activity_kind,
+            let transition = BasicKernel
+                .apply_activity_started(
+                    LoadedRun::Existing(state.clone()),
+                    ActivityStartRequest {
+                        activity_id: task.activity_id.clone(),
+                        identity: worker_identity.clone(),
                         principal: None,
-                    });
-                SmallVec::new()
-            } else {
-                let started_event_id = next_state.last_event_id + 1;
-                next_state.last_event_id = started_event_id;
-                next_activity.started_event_id = Some(started_event_id);
-                smallvec![HistoryEvent {
-                    event_id: started_event_id,
-                    happened_at: now,
-                    kind: started_activity_kind,
-                }]
-            };
-
-            next_state
+                        mode: ActivityStartMode::Poll,
+                        now,
+                    },
+                )
+                .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
+            let next_activity = transition
+                .next_state
                 .activities
-                .insert(task.activity_id.clone(), next_activity.clone());
-
-            let event_principals = if started_history_events.is_empty() {
-                SmallVec::new()
-            } else {
-                smallvec![None]
-            };
-            let transition = Transition {
-                expected_seq: state.transition_seq,
-                next_state,
-                history_events: started_history_events,
-                event_principals,
-                request_dedupe_ops: SmallVec::new(),
-                activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
-                timer_ops: SmallVec::new(),
-                dispatch_ops: SmallVec::new(),
-            };
+                .get(&task.activity_id)
+                .cloned()
+                .expect("the kernel keeps the activity it just started");
 
             // Mirror the lane's commit-epoch rule (see lane.rs): with no
             // placement controller there is no durable lease to fence against,

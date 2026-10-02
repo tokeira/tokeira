@@ -144,6 +144,8 @@ Tokeira should maintain **two** monotonic counters per run:
 
 This is the user-visible position in workflow history. Event IDs are assigned by the kernel at `emit` time, starting from `last_event_id + 1` and incrementing for each event within a transition. They are contiguous within a run and never reused.
 
+A workflow task can hold ids it has not written yet — a speculative task, and a retry task once started (see [Speculative workflow tasks](#speculative-workflow-tasks)) — and a worker holding a started task reads history only up to its Started event. Every transition therefore passes a **transition check** before it leaves the kernel (`integrity.rs`): ids continue contiguously from `last_event_id`, a task that stays started sees no new history, and no other event takes a task's reserved ids. A transition that breaks a rule is rejected (`Reject::HistoryIntegrity`) and nothing commits — no correct path reaches it, so it surfaces as an internal error.
+
 ### Transition sequence
 
 This is the internal fence/checkpoint number for committed state transitions. It increments exactly once per `apply` call, regardless of how many history events are appended.
@@ -391,8 +393,11 @@ The following sections describe the exact behavior for each command.
 
 The kernel adopts Temporal's **buffered-event model** (spec: `kernel-event-buffering`, superseding the earlier deliberate no-buffering deviation). A worker holding a started WFT has a history view frozen at `started_event_id`; externally-originated events admitted in that window are held durably on `WorkflowState.buffered_events` — without event ids — and flushed into history when the WFT closes.
 
-- **Predicate** (`should_buffer`, mirroring `bufferEvent`, `historybuilder/event_store.go:263 @ v1.31.0`): workflow state-change events, workflow-task events, and events generated directly from a worker command or protocol message never buffer. Externally-originated events buffer while a WFT is *started*. Phase 1 scopes the bufferable set to `WorkflowExecutionSignaled` and `WorkflowExecutionCancelRequested`; Phase 2 extends to activity/child/Nexus completion-class events with the `reorderBuffer` rule (`event_store.go:411`).
-- **Flush** happens at every WFT close — `WorkflowTaskCompleted`, `WorkflowTaskFailed`, `WorkflowTaskTimedOut`, and the force-close below — emitting buffered events in admission order with contiguous ids immediately after the close event (`failWorkflowTask`, `workflow/util.go:26 @ v1.31.0`). On completion, flushed events land after the completion's command events and before any follow-up `WorkflowTaskScheduled`, and their presence triggers that follow-up WFT.
+- **Predicate** (`should_buffer`, mirroring `bufferEvent`, `historybuilder/event_store.go:263-318 @ v1.31.0`): run start and close events, workflow-task events, and events written from a worker command or update message never buffer. Every other kind is externally originated — a signal, a cancel request, a timer firing, an activity or child workflow starting or finishing, a signal or cancel result from another workflow, a Nexus operation event, a pause or unpause, an options update — and buffers while a WFT is *started*, whatever the task's mode (normal, retry, speculative). The classification is an exhaustive `match` with no wildcard arm, so a new event kind does not compile until it is classified.
+- **Append rule** (`TransitionBuilder::append_external`): every externally-originated event enters a transition through one builder method — buffered while a WFT is started, otherwise appended after a scheduled speculative task converts (see [Speculative workflow tasks](#speculative-workflow-tasks)). Paths that write the workflow task's own events, command events, update events or run-closing events emit directly. The runtime's two activity-start transitions (the activity poll path and a by-id completion of an activity no worker started) are computed by `BasicKernel::apply_activity_started`, which uses the same rule; the runtime keeps its own commit.
+- **Flush** happens at every WFT close — `WorkflowTaskCompleted`, `WorkflowTaskFailed`, `WorkflowTaskTimedOut`, and the force-close below — emitting buffered events with contiguous ids immediately after the close event (`failWorkflowTask`, `workflow/util.go:26 @ v1.31.0`). On completion, flushed events land after the completion's command events and before any follow-up `WorkflowTaskScheduled`, and their presence triggers that follow-up WFT.
+- **Reorder and wiring:** the flush places completion-class events — activity, child-workflow and Nexus completions — after every other buffered event, keeping admission order within each group (`reorderBuffer`, `event_store.go:413-443 @ v1.31.0`), so a completion lands after its matching `*Started`. A started event that buffered gets its real id at the flush; completions flushed with it, keyed by the activity's scheduled id or the child's initiated id, take that id as their started event id, and a still-pending activity or child records it (`wireEventIDs`, `event_store.go:339-406`; `updatePendingEventIDs`, `mutable_state_impl.go:7957-7981 @ v1.31.0`). Until then the activity's or child's started id holds `BUFFERED_EVENT_ID`.
+- **Buffered-event limit:** a signal that pushes the buffer past 100 events force-fails the started task (`ForceCloseCommand`), flushes, and schedules a fresh task (`closeTransactionHandleBufferedEventsLimit`, `mutable_state_impl.go:8202-8231 @ v1.31.0`). A started speculative task has its Scheduled and Started written at its reserved ids first. Other kinds count toward the limit but only a buffering signal checks it.
 - **Forced closes** (`Terminate`, workflow timeout, and the `RespondWorkflowTaskFailed(GRPC_MESSAGE_TOO_LARGE)` route): a started WFT is failed first with cause `ForceCloseCommand`, buffered events flush, and only then is the terminal event appended (`TerminateWorkflow`/`TimeoutWorkflow`, `workflow/util.go:71,115 @ v1.31.0`).
 - **Close discards**: buffered events surviving to a worker-commanded close are dropped, matching v1.31.0 (`FlushBufferToCurrentBatch` workflowFinished branch, `event_store.go:139`). Closed runs always carry an empty buffer.
 
@@ -404,7 +409,17 @@ A continuously-failing WFT (attempt > 1) is **transient** (spec `transient-wft`,
 - **Suppressed events:** only the attempt-1 failure/timeout persists `WorkflowTaskFailed`/`TimedOut` (`:892-895, :965-967`); a transient fail/timeout writes nothing. The terminate/timeout force-close of a transient task also writes nothing (`workflow/util.go:118-120`) — the close batch begins at the terminal event.
 - **Conversion to normal:** (i) a non-empty buffered flush at the failed/timed-out close resets attempt to 1 and persists a real fresh `WorkflowTaskScheduled` (`:329-338`); (ii) new events by start time (the virtual scheduled id no longer equals `last_event_id + 1`) reset attempt to 1 and persist real Scheduled + Started (`:559-576`).
 - **Late materialization:** a transient task that completes successfully materializes its real `WorkflowTaskScheduled` + `WorkflowTaskStarted` immediately before `WorkflowTaskCompleted`, contiguous (`:750-800`).
-- **Synthesis (runtime/edge, nothing persisted):** the poll response and final-page `GetWorkflowExecutionHistory` reads append the unpersisted virtual Scheduled(+Started) suffix so workers and readers see the task Temporal would show (`GetTransientWorkflowTaskInfo`, `mutable_state_impl.go:1189-1250`; `appendTransientTasks`, `getworkflowexecutionhistory/api.go:32-116`); CLI/UI clients are excluded (`ClientSupportsTranOrSpecEvents`, `get_history_util.go:427`).
+- **Synthesis (runtime/edge, nothing persisted):** the poll response and final-page `GetWorkflowExecutionHistory` reads append the unpersisted virtual Scheduled(+Started) suffix so workers and readers see the task Temporal would show (`GetTransientWorkflowTaskInfo`, `mutable_state_impl.go:1189-1250`; `appendTransientTasks`, `getworkflowexecutionhistory/api.go:32-116`); CLI/UI clients are excluded (`ClientSupportsTranOrSpecEvents`, `get_history_util.go:427`). The poll response reads stored history only up to the run's last event when the task started (`StartedWorkflowTask::last_event_id_at_start`; v1.31.0 reads `[firstEventID, nextEventID)` with `nextEventID` fixed at start, `recordworkflowtaskstarted/api.go:272-276, 419`), and appends the suffix only when it continues exactly from that history — otherwise it logs and leaves it off, as v1.31.0 does when `ValidateTransientWorkflowTaskEvents` fails (`get_history_util.go:118-128, 234-246`).
+
+### Speculative workflow tasks
+
+An update admitted with no pending WFT gets a **speculative** task (spec `speculative-wft`; `updateworkflow/api.go:171-186 @ v1.31.0`): an attempt-1 task flagged `WorkflowTaskType::Speculative`, which writes nothing when it is scheduled or started. A task is exactly one of normal, transient (attempt > 1) or speculative.
+
+- **Reserved ids:** a speculative task holds the next two ids — `last_event_id + 1` for its `WorkflowTaskScheduled` and `+ 2` for its `WorkflowTaskStarted` — from the moment it is scheduled; a transient task holds its ids once started. The worker receives them in the poll response, and the update request it carries points at the reserved Scheduled id. No other event may take them while the task claims them; the transition check refuses a transition that would.
+- **Drop or materialize:** a completion carrying only update rejections drops the task — no events, `ResetHistoryEventId` rewinds the SDK (`skipWorkflowTaskCompletedEvent`, `workflow_task_state_machine.go:676-748`) — unless events are buffered or events landed since the last completed task beyond the client's discard window. Any other completion writes Scheduled and Started at the reserved ids, then `WorkflowTaskCompleted` (`:750-819`). Failure, both timeouts, force-close and the buffered-event limit write them first too.
+- **Conversion:** an externally-originated event recorded while the task is *scheduled* converts it first — its Scheduled event takes the reserved id, with the task's own schedule time, then the event follows (`convertSpeculativeWorkflowTaskToNormal`, `workflow_task_state_machine.go:1466-1537 @ v1.31.0`). One recorded while the task is *started* buffers, and the task is written when it closes.
+
+Tokeira keeps v1.31.0's history here, not its mechanism. v1.31.0 converts a speculative task at every transaction close, before the request's buffered events are flushed (`closeTransactionHandleSpeculativeWorkflowTask`, `mutable_state_impl.go:7238-7251`). Tokeira numbers events as they are appended, so a scheduled task converts at append time instead. A started task stays speculative until it closes, because the runtime picks a task's timeout tracking when it starts it — a precise in-memory timer for a speculative task, the durable sweep for a normal one — and converting mid-flight would leave a started task nothing times out. The final history is the same.
 
 ### `Update`
 
@@ -578,7 +593,7 @@ This command is issued by the runtime when a started workflow task exceeds its s
 
 **Behavior:**
 
-1. Match on the resolution type: emit `ActivityTaskCompleted`, `ActivityTaskFailed`, `ActivityTaskTimedOut`, or `ActivityTaskCanceled`.
+1. Match on the resolution type: record `ActivityTaskCompleted`, `ActivityTaskFailed`, `ActivityTaskTimedOut`, or `ActivityTaskCanceled` through the append rule (buffered while a WFT is started).
 2. Remove the activity from the state's activities map.
 3. Push `ActivityOp::Delete` for the resolved activity.
 4. If no WFT is currently pending, schedule one.
@@ -591,7 +606,7 @@ This command is issued by the runtime when a started workflow task exceeds its s
 
 **Behavior:**
 
-1. Emit `TimerFired` event.
+1. Record `TimerFired` through the append rule (buffered while a WFT is started).
 2. Remove the timer from the state's timers map.
 3. Push `TimerOp::Delete` for the fired timer.
 4. If no WFT is currently pending, schedule one.
@@ -650,7 +665,7 @@ This command allows updating workflow execution options on a running workflow, s
 1. If the run is already paused with the same request ID, treat the command as an idempotent no-op.
 2. If the run is already paused with a different request ID, reject with `AlreadyPaused`.
 3. Emit `RequestDedupeOp` for the request ID.
-4. Emit `WorkflowExecutionPaused` carrying identity, reason, and request ID.
+4. Record `WorkflowExecutionPaused` carrying identity, reason, and request ID through the append rule — buffered while a WFT is started, so a task in flight when the workflow is paused can still complete.
 5. Set `status = Paused`, populate `pause_info`, and increment `wft_stamp`.
 6. Increment every open activity's `stamp` and emit `ActivityOp::Upsert` for each so stale deliveries can be invalidated.
 7. Do not schedule or redispatch a workflow task.
@@ -663,7 +678,7 @@ This command allows updating workflow execution options on a running workflow, s
 
 1. Reject with `NotPaused` if the run is not paused.
 2. Emit `RequestDedupeOp` for the request ID.
-3. Emit `WorkflowExecutionUnpaused` carrying identity, reason, and request ID.
+3. Record `WorkflowExecutionUnpaused` carrying identity, reason, and request ID through the append rule.
 4. Set `status = Running`, clear `pause_info`, and increment `wft_stamp`.
 5. Increment every open activity's `stamp`, emit `ActivityOp::Upsert`, and emit `DispatchOp::EnqueueActivityTask` for each activity.
 6. Schedule a new WFT only if no WFT is already pending.
@@ -726,8 +741,8 @@ This command is issued by the runtime when it has successfully created the child
 
 **Behavior:**
 
-1. Emit `ChildWorkflowExecutionStarted` event carrying the child workflow ID, run ID, and workflow type.
-2. Update the child entry in the open children map to record the started event ID.
+1. Record `ChildWorkflowExecutionStarted` carrying the child workflow ID, run ID, and workflow type through the append rule.
+2. Update the child entry in the open children map to record the started event ID — `BUFFERED_EVENT_ID` while the event is buffered, replaced by the real id at the flush.
 3. If no WFT is currently pending, schedule one.
 
 **Rejection:** If the child could not be started (e.g., workflow ID conflict), the runtime issues this command with a failure variant, and the kernel emits `StartChildWorkflowExecutionFailed`, removes the child from the open set, and schedules a WFT.
@@ -760,7 +775,7 @@ The runtime then issues `ChildStartConfirmed` (see above) to record the start or
 
 When the child run reaches a terminal state, the runtime issues `ChildResolved`.
 
-1. Match on the child's terminal status: emit `ChildWorkflowExecutionCompleted`, `Failed`, `Canceled`, `Terminated`, or `TimedOut`.
+1. Match on the child's terminal status: record `ChildWorkflowExecutionCompleted`, `Failed`, `Canceled`, `Terminated`, or `TimedOut` through the append rule (buffered while a WFT is started; after a scheduled speculative task converts).
 2. Remove the child from the open children map.
 3. If no WFT is currently pending, schedule one.
 
@@ -975,6 +990,7 @@ The kernel's `Reject` error type is a precise, enumerated set of rejection reaso
 - `AlreadyPaused`: duplicate pause request with a different request ID. (Feature 11)
 - `NotPaused`: unpause request against a non-paused workflow. (Feature 11)
 - `ActivityNotPaused(String)`: unpause request against an activity that is not paused. (Feature 11)
+- `HistoryIntegrity(String)`: a computed transition broke a history-integrity rule (contiguous ids, a started task's frozen history, a task's reserved ids); nothing commits and the caller receives an internal error. See [Event ID](#event-id).
 
 ### Future additions
 

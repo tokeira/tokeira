@@ -194,7 +194,7 @@ if pending_workflow_task is started:
                               cause: ForceCloseCommand }   // batch-first event
 flush_buffered()
 emit WorkflowExecutionTerminated { reason, details, identity }
-close(Terminated) + existing cleanup (activities/timers/pending-external, sticky, projection)
+close(Terminated) + existing cleanup (timers/pending-external, sticky, projection; activities stay)
 ```
 
 ### Message-too-large command (design decision)

@@ -35,7 +35,7 @@ flowchart TD
     end
 
     subgraph "Kernel Timeout Handling"
-        KERNEL -->|WorkflowExecutionTimedOut event<br/>+ close run + delete activities/timers| COMMIT[Fenced Commit]
+        KERNEL -->|WorkflowExecutionTimedOut event<br/>+ close run + delete timers| COMMIT[Fenced Commit]
         KERNEL -->|Reject::RunClosed / MissingRun| HARMLESS[Harmless no-op]
     end
 

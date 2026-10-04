@@ -139,11 +139,13 @@ Tests should extend existing `property_tests.rs` and `golden_tests.rs`. All test
 
 ### Requirement 2.3: Reset Entity Cleanup
 
-**User Story:** As a Tokeira developer, I want Reset to clean up all open entities, so that no orphaned activities, timers, children, or pending operations remain after a reset.
+**User Story:** As a Tokeira developer, I want Reset to clean up the open timers, children, and pending operations of the run it terminates and keep its pending activities, so that no orphaned timers or operations remain and DescribeWorkflowExecution lists the activities that were pending, as v1.31.0 does.
+
+**Ground truth:** v1.31.0 terminates a running current run during reset through `TerminateWorkflow` (`terminateWorkflow`, `service/history/ndc/workflow_resetter.go:139-145,629-642 @ v1.31.0`), which keeps the run's activity infos: neither it nor `ApplyWorkflowExecutionTerminatedEvent` touches them (`service/history/workflow/util.go:105-147`, `service/history/workflow/mutable_state_impl.go:5599-5616`), and `DeleteActivity` (`mutable_state_impl.go:2066`) is called only when an activity's completed, failed, timed-out or canceled event is applied (`:4249`, `:4299`, `:4351`, `:4484`) and for replication tombstones (`:8890`). `DescribeWorkflowExecution` lists `GetPendingActivityInfos()` without checking that the run is open (`service/history/api/describeworkflow/api.go:202-209 @ v1.31.0`).
 
 #### Acceptance Criteria
 
-1. WHEN a Reset command is received and open activities exist, THE Kernel SHALL emit an ActivityOp::Delete for each open activity and clear the activities map in next_state.
+1. WHEN a Reset command is received and open activities exist, THE Kernel SHALL keep each open activity in next_state.activities and SHALL NOT emit an ActivityOp::Delete for it.
 2. WHEN a Reset command is received and open timers exist, THE Kernel SHALL emit a TimerOp::Delete for each open timer and clear the timers map in next_state.
 3. WHEN a Reset command is received and open child workflows exist, THE Kernel SHALL apply Parent Close Policy for each open child (same as Terminate).
 4. WHEN a Reset command is received, THE TransitionBuilder's `close` method SHALL clear pending_external_signals, pending_external_cancels, pending_updates, and pending_nexus_operations maps.
@@ -232,7 +234,7 @@ Tests should extend existing `property_tests.rs` and `golden_tests.rs`. All test
 2. FOR ALL Reset transitions, next_state.pending_workflow_task SHALL be None.
 3. FOR ALL Reset transitions, next_state.sticky SHALL be None.
 4. FOR ALL Reset transitions, next_state.closed_at SHALL be Some.
-5. FOR ALL Reset transitions, next_state.activities SHALL be empty.
+5. FOR ALL Reset transitions, next_state.activities SHALL hold exactly the activity IDs of the input state's activities map (Requirement 2.3).
 6. FOR ALL Reset transitions, next_state.timers SHALL be empty.
 7. FOR ALL Reset transitions, next_state.pending_external_signals SHALL be empty.
 8. FOR ALL Reset transitions, next_state.pending_external_cancels SHALL be empty.
@@ -242,13 +244,13 @@ Tests should extend existing `property_tests.rs` and `golden_tests.rs`. All test
 
 ### Requirement 6.4: Reset Entity Cleanup Consistency
 
-**User Story:** As a Tokeira developer, I want the number of cleanup ops emitted by Reset to match the number of open entities, so that cleanup is complete and not over-counted.
+**User Story:** As a Tokeira developer, I want the number of timer cleanup ops emitted by Reset to match the number of open timers, and no activity to be deleted, so that timer cleanup is complete and not over-counted and pending activities survive the close.
 
 #### Acceptance Criteria
 
-1. FOR ALL Reset transitions, THE number of ActivityOp::Delete ops SHALL equal the number of entries in the input state's activities map.
+1. FOR ALL Reset transitions, THE activity_ops SHALL contain no ActivityOp::Delete.
 2. FOR ALL Reset transitions, THE number of TimerOp::Delete ops SHALL equal the number of entries in the input state's timers map.
-3. FOR ALL Reset transitions, every ActivityOp::Delete SHALL reference an activity_id that existed in the input state's activities map.
+3. FOR ALL Reset transitions, every activity_id in the input state's activities map SHALL be present in next_state.activities.
 4. FOR ALL Reset transitions, every TimerOp::Delete SHALL reference a timer_id that existed in the input state's timers map.
 
 ### Requirement 6.5: Reset Request Dedup
@@ -297,13 +299,13 @@ Tests should extend existing `property_tests.rs` and `golden_tests.rs`. All test
 
 1. FOR ALL valid open WorkflowState with last_event_id >= 1 and FOR ALL valid ResetRequest values with fork_event_id in [1, last_event_id], WHEN Reset is applied, THE next_state.status SHALL be ExecutionStatus::Terminated and next_state.closed_at SHALL be Some.
 
-### Requirement 7.2: Reset Cleans Up All Open Entities Property
+### Requirement 7.2: Reset Deletes Timers and Keeps Activities Property
 
-**User Story:** As a Tokeira developer, I want a property test verifying that Reset cleans up all open activities and timers, so that no orphaned entities remain.
+**User Story:** As a Tokeira developer, I want a property test verifying that Reset deletes all open timers and keeps all pending activities, so that no timer outlives the run and Describe still lists its activities.
 
 #### Acceptance Criteria
 
-1. FOR ALL valid open WorkflowState with N open activities and M open timers, WHEN Reset is applied with a valid fork_event_id, THE activity_ops SHALL contain exactly N ActivityOp::Delete ops and THE timer_ops SHALL contain exactly M TimerOp::Delete ops, and next_state.activities and next_state.timers SHALL both be empty.
+1. FOR ALL valid open WorkflowState with N open activities and M open timers, WHEN Reset is applied with a valid fork_event_id, THE activity_ops SHALL contain no ActivityOp::Delete, THE timer_ops SHALL contain exactly M TimerOp::Delete ops, next_state.activities SHALL hold the same N activity IDs, and next_state.timers SHALL be empty.
 
 ### Requirement 7.3: Reset Emits Exactly One Request Dedupe Op Property
 

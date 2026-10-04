@@ -61,7 +61,7 @@ graph TD
 
 The `close()` method on `TransitionBuilder` is extended to clear `pending_external_signals` and `pending_external_cancels` maps. No dispatch ops are emitted for cleared entries (unlike children, there is no parent close policy). This means ALL close paths automatically clear these maps:
 
-- **Terminate**: emit event → `close(Terminated)` → take activities/timers → `apply_parent_close_policy()` → `finish()`
+- **Terminate**: emit event → `close(Terminated)` (takes the timers; activities stay) → `apply_parent_close_policy()` → `finish()`
 - **WorkflowExecutionTimedOut**: same pattern
 - **CompleteWorkflow / FailWorkflow / CancelWorkflow / ContinueAsNew**: emit event → `close(status)` → `apply_parent_close_policy()` → return true
 

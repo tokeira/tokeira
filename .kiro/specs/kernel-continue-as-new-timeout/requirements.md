@@ -175,15 +175,17 @@ Downstream breakage: `WorkflowCommand` gains a `ContinueAsNew` variant (breaks e
 4. WHEN a WorkflowExecutionTimedOut command is received, THE Kernel SHALL NOT schedule a workflow task; the worker is not consulted.
 5. WHEN a WorkflowExecutionTimedOut command is received, THE Kernel SHALL NOT emit any RequestDedupeOp (this is internal runtime machinery).
 
-### Requirement 3.2: WorkflowExecutionTimedOut Entity Cleanup
+### Requirement 3.2: WorkflowExecutionTimedOut Timer Cleanup and Activity Retention
 
-**User Story:** As a Tokeira developer, I want WorkflowExecutionTimedOut to clean up all open entities, so that no orphaned activities or timers remain after a timeout.
+**User Story:** As a Tokeira developer, I want WorkflowExecutionTimedOut to delete the run's open timers and keep its pending activities, so that no timer comes due for a closed run and DescribeWorkflowExecution lists the activities that were pending when the run timed out, as v1.31.0 does.
+
+**Ground truth:** v1.31.0 keeps a timed-out run's activity infos. Both workflow timeout executors close the run through `TimeoutWorkflow` (`service/history/timer_queue_active_task_executor.go:703,826 @ v1.31.0`), which fails a started workflow task and appends `WorkflowExecutionTimedOut`; neither it nor `ApplyWorkflowExecutionTimedoutEvent` touches the run's activities (`service/history/workflow/util.go:71-99`, `service/history/workflow/mutable_state_impl.go:4604-4625 @ v1.31.0`). `DeleteActivity` (`mutable_state_impl.go:2066`) is called only when an activity's completed, failed, timed-out or canceled event is applied (`:4249`, `:4299`, `:4351`, `:4484`) and for replication tombstones (`:8890`). `DescribeWorkflowExecution` lists `GetPendingActivityInfos()` without checking that the run is open (`service/history/api/describeworkflow/api.go:202-209 @ v1.31.0`).
 
 #### Acceptance Criteria
 
-1. WHEN a WorkflowExecutionTimedOut command is received and open activities exist, THE Kernel SHALL emit an ActivityOp::Delete for each open activity.
+1. WHEN a WorkflowExecutionTimedOut command is received and open activities exist, THE Kernel SHALL keep each open activity in next_state.activities and SHALL NOT emit an ActivityOp::Delete for it.
 2. WHEN a WorkflowExecutionTimedOut command is received and open timers exist, THE Kernel SHALL emit a TimerOp::Delete for each open timer.
-3. WHEN a WorkflowExecutionTimedOut command is received, THE Kernel SHALL clear the activities map in next_state (next_state.activities SHALL be empty).
+3. WHEN a WorkflowExecutionTimedOut command is received, THE Kernel SHALL keep every entry of the activities map in next_state (next_state.activities SHALL hold exactly the activity IDs of the input state's activities map).
 4. WHEN a WorkflowExecutionTimedOut command is received, THE Kernel SHALL clear the timers map in next_state (next_state.timers SHALL be empty).
 5. WHEN a WorkflowExecutionTimedOut command is received with no open activities or timers, THE Kernel SHALL emit no ActivityOp or TimerOp.
 
@@ -304,19 +306,19 @@ Downstream breakage: `WorkflowCommand` gains a `ContinueAsNew` variant (breaks e
 2. FOR ALL WorkflowExecutionTimedOut transitions, next_state.pending_workflow_task SHALL be None.
 3. FOR ALL WorkflowExecutionTimedOut transitions, next_state.sticky SHALL be None.
 4. FOR ALL WorkflowExecutionTimedOut transitions, next_state.closed_at SHALL be Some.
-5. FOR ALL WorkflowExecutionTimedOut transitions, next_state.activities SHALL be empty.
+5. FOR ALL WorkflowExecutionTimedOut transitions, next_state.activities SHALL hold exactly the activity IDs of the input state's activities map (Requirement 3.2).
 6. FOR ALL WorkflowExecutionTimedOut transitions, next_state.timers SHALL be empty.
 7. FOR ALL WorkflowExecutionTimedOut transitions, dispatch_ops SHALL be empty (no WFT is scheduled).
 
 ### Requirement 7.5: Entity Cleanup Consistency for WorkflowExecutionTimedOut
 
-**User Story:** As a Tokeira developer, I want the number of cleanup ops emitted by WorkflowExecutionTimedOut to match the number of open entities, so that cleanup is complete and not over-counted.
+**User Story:** As a Tokeira developer, I want the number of timer cleanup ops emitted by WorkflowExecutionTimedOut to match the number of open timers, and no activity to be deleted, so that timer cleanup is complete and not over-counted and pending activities survive the close.
 
 #### Acceptance Criteria
 
-1. FOR ALL WorkflowExecutionTimedOut transitions, THE number of ActivityOp::Delete ops SHALL equal the number of entries in the input state's activities map.
+1. FOR ALL WorkflowExecutionTimedOut transitions, THE activity_ops SHALL contain no ActivityOp::Delete.
 2. FOR ALL WorkflowExecutionTimedOut transitions, THE number of TimerOp::Delete ops SHALL equal the number of entries in the input state's timers map.
-3. FOR ALL WorkflowExecutionTimedOut transitions, every ActivityOp::Delete SHALL reference an activity_id that existed in the input state's activities map.
+3. FOR ALL WorkflowExecutionTimedOut transitions, every activity_id in the input state's activities map SHALL be present in next_state.activities.
 4. FOR ALL WorkflowExecutionTimedOut transitions, every TimerOp::Delete SHALL reference a timer_id that existed in the input state's timers map.
 
 ### Requirement 7.6: WorkflowExecutionTimedOut Emits No Request Dedupe
@@ -389,13 +391,13 @@ Downstream breakage: `WorkflowCommand` gains a `ContinueAsNew` variant (breaks e
 
 1. FOR ALL valid open WorkflowState and FOR ALL valid WorkflowExecutionTimedOutRequest values, WHEN WorkflowExecutionTimedOut is applied, THE next_state.status SHALL be ExecutionStatus::TimedOut and next_state.closed_at SHALL be Some.
 
-### Requirement 8.5: WorkflowExecutionTimedOut Cleans Up All Open Entities Property
+### Requirement 8.5: WorkflowExecutionTimedOut Deletes Timers and Keeps Activities Property
 
-**User Story:** As a Tokeira developer, I want a property test verifying that WorkflowExecutionTimedOut cleans up all open activities and timers, so that no orphaned entities remain.
+**User Story:** As a Tokeira developer, I want a property test verifying that WorkflowExecutionTimedOut deletes all open timers and keeps all pending activities, so that no timer outlives the run and Describe still lists its activities.
 
 #### Acceptance Criteria
 
-1. FOR ALL valid open WorkflowState with N open activities and M open timers, WHEN WorkflowExecutionTimedOut is applied, THE activity_ops SHALL contain exactly N ActivityOp::Delete ops and THE timer_ops SHALL contain exactly M TimerOp::Delete ops, and next_state.activities and next_state.timers SHALL both be empty.
+1. FOR ALL valid open WorkflowState with N open activities and M open timers, WHEN WorkflowExecutionTimedOut is applied, THE activity_ops SHALL contain no ActivityOp::Delete, THE timer_ops SHALL contain exactly M TimerOp::Delete ops, next_state.activities SHALL hold the same N activity IDs, and next_state.timers SHALL be empty.
 
 ### Requirement 8.6: WorkflowExecutionTimedOut Emits No Dispatch Ops Property
 

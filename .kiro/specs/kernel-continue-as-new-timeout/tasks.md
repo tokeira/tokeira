@@ -49,7 +49,7 @@ All changes are additive to the existing kernel and types crates. Types first (t
 
   - [x] 3.3 Add apply_workflow_execution_timed_out method and Command match arm in kernel.rs
     - Add `WorkflowExecutionTimedOut(req) => self.apply_workflow_execution_timed_out(loaded, req)` match arm in `BasicKernel::apply`
-    - Implement `apply_workflow_execution_timed_out`: `expect_open` → `TransitionBuilder` → emit `WorkflowExecutionTimedOut` event (timeout_type, retry_state from request) → `close(ExecutionStatus::TimedOut)` → `std::mem::take` activities → `ActivityOp::Delete` each → `std::mem::take` timers → `TimerOp::Delete` each → `finish()`
+    - Implement `apply_workflow_execution_timed_out`: `expect_open` → `TransitionBuilder` → emit `WorkflowExecutionTimedOut` event (timeout_type, retry_state from request) → `close(ExecutionStatus::TimedOut)` (which takes the timers → `TimerOp::Delete` each) → `finish()`. Pending activities stay in state with no `ActivityOp` (Requirement 3.2)
     - No `RequestDedupeOp`, no `DispatchOp`
     - _Requirements: 3.1, 3.2, 3.3, 5.1, 7.4, 7.5, 7.6_
 
@@ -109,13 +109,13 @@ All changes are additive to the existing kernel and types crates. Types first (t
     - _Requirements: 2.1.3, 8.9_
 
   - [x] 6.6 Write property_28_timeout_closes_with_terminal_invariants
-    - `proptest! { }` block: for any valid open state and WorkflowExecutionTimedOutRequest, status is TimedOut, closed_at is Some, pending_workflow_task is None, sticky is None, activities empty, timers empty, dispatch_ops empty
+    - `proptest! { }` block: for any valid open state and WorkflowExecutionTimedOutRequest, status is TimedOut, closed_at is Some, pending_workflow_task is None, sticky is None, activities keep the input state's IDs, timers empty, dispatch_ops empty
     - Tag: `// Feature: kernel-continue-as-new-timeout, Property 4: WorkflowExecutionTimedOut closes with full terminal state invariants`
     - **Design Property 4**
     - _Requirements: 3.1.2, 3.1.3, 3.1.4, 7.4, 8.4_
 
   - [x] 6.7 Write property_29_timeout_entity_cleanup
-    - `proptest! { }` block: activity_ops count equals input activities count, timer_ops count equals input timers count, all delete ops reference IDs from input state, next_state maps empty
+    - `proptest! { }` block: activity_ops holds no `ActivityOp::Delete`, next_state.activities keeps the input state's activity IDs, timer_ops count equals input timers count, all timer delete ops reference IDs from input state, next_state.timers empty
     - Tag: `// Feature: kernel-continue-as-new-timeout, Property 5: WorkflowExecutionTimedOut entity cleanup count and consistency`
     - **Design Property 5**
     - _Requirements: 3.2, 7.5, 8.5_
@@ -146,7 +146,7 @@ All changes are additive to the existing kernel and types crates. Types first (t
 
   - [x] 7.2 Write WorkflowExecutionTimedOut happy path golden tests in golden_tests.rs
     - `workflow_execution_timed_out_no_entities` — Timeout on open run, no activities/timers
-    - `workflow_execution_timed_out_with_entities` — Timeout with 2 activities + 1 timer, verify cleanup ops
+    - `workflow_execution_timed_out_with_entities` — Timeout with 2 activities + 1 timer, verify the timer delete op and that both activities are kept with no activity op
     - `workflow_execution_timed_out_with_pending_wft` — Timeout clears pending WFT and sticky
     - _Requirements: 3.1, 3.2, 7.4, 7.5_
 

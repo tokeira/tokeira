@@ -328,7 +328,7 @@ resulting `WorkflowTaskFailed`, then appends `WorkflowExecutionTerminated`.
    (Requirement 3.1) before emitting `WorkflowExecutionTerminated`.
 3. AFTER flushing, THE Kernel SHALL emit `WorkflowExecutionTerminated` and close the run with
    `ExecutionStatus::Terminated`, performing the existing terminate cleanup (clear pending WFT, clear
-   sticky, clear activities/timers/pending-external maps, emit `ProjectionOp::CloseExecution`).
+   sticky, clear timers/pending-external maps, keep pending activities, emit `ProjectionOp::CloseExecution`).
 4. WHEN a `Terminate` command is received for an open run whose pending WFT is **scheduled-but-not-
    started**, THE Kernel SHALL NOT emit a `WorkflowTaskFailed` (there is no started attempt to fail);
    any buffered events (none expected in this state) SHALL still be flushed before termination.

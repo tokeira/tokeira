@@ -38,7 +38,7 @@ All changes are additive to the existing kernel crate. New types, enum variants,
     - _Requirements: 2.1, 2.2, 8.1.1, 8.1.3_
 
   - [x] 2.2 Add apply_terminate method to BasicKernel in kernel.rs
-    - `expect_open` → `TransitionBuilder` → push `RequestDedupeOp` → emit `WorkflowExecutionTerminated` → `close(ExecutionStatus::Terminated)` → for each activity push `ActivityOp::Delete` then `state.activities.clear()` → for each timer push `TimerOp::Delete` then `state.timers.clear()` → `finish()`
+    - `expect_open` → `TransitionBuilder` → push `RequestDedupeOp` → emit `WorkflowExecutionTerminated` → `close(ExecutionStatus::Terminated)` (which pushes `TimerOp::Delete` for each timer and clears `state.timers`) → `finish()`. Pending activities stay in `state.activities` with no `ActivityOp` (Requirement 3.2)
     - Import `TerminateRequest` in the use block
     - _Requirements: 3.1, 3.2, 3.3, 8.1.2, 8.1.4_
 
@@ -104,13 +104,13 @@ All changes are additive to the existing kernel crate. New types, enum variants,
     - _Requirements: 3.1.2_
 
   - [x] 4.7 Write property_21_terminate_closes_with_terminal_invariants
-    - `proptest! { }` block: status is Terminated, closed_at is Some, pending_workflow_task is None, sticky is None, activities empty, timers empty, dispatch_ops empty
+    - `proptest! { }` block: status is Terminated, closed_at is Some, pending_workflow_task is None, sticky is None, activities keep the input state's IDs, timers empty, dispatch_ops empty
     - Tag: `// Feature: kernel-cancel-terminate, Property 5: Terminate closes with full terminal state invariants`
     - **Design Property 5**
     - _Requirements: 3.1.3, 3.1.4, 3.1.5, 9.4.1–9.4.7, 10.4.1, 10.6.1_
 
   - [x] 4.8 Write property_22_terminate_entity_cleanup
-    - `proptest! { }` block: activity_ops count equals input activities count, timer_ops count equals input timers count, all delete ops reference IDs from input state
+    - `proptest! { }` block: activity_ops holds no `ActivityOp::Delete`, next_state.activities keeps the input state's activity IDs, timer_ops count equals input timers count, all timer delete ops reference IDs from input state
     - Tag: `// Feature: kernel-cancel-terminate, Property 6: Terminate entity cleanup count and consistency`
     - **Design Property 6**
     - _Requirements: 3.2.1–3.2.4, 9.5.1–9.5.4, 10.5.1_
@@ -142,7 +142,7 @@ All changes are additive to the existing kernel crate. New types, enum variants,
 
   - [x] 5.3 Write terminate happy path golden tests in golden_tests.rs
     - `terminate_no_open_entities` — Terminate on open run, no entities, assert exact transition
-    - `terminate_with_activities_and_timers` — Terminate with 2 activities + 1 timer, assert cleanup ops
+    - `terminate_with_activities_and_timers` — Terminate with 2 activities + 1 timer, assert the timer delete op and that both activities are kept with no activity op
     - `terminate_with_pending_wft` — Terminate clears pending WFT, assert no dispatch
     - Import new type: `TerminateRequest`
     - _Requirements: 11.5, 11.6, 11.7_

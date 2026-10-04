@@ -1,0 +1,5 @@
+kind: fixed
+body: A run closed by its worker now deletes its pending timers, whose rows were rejected on every timer scan and could stop a shard's timers from firing.
+time: 2026-10-04T18:23:13.000000+01:00
+custom:
+    Slice: 93d6a1a1-3b00-4c28-85e9-ab8bfc584858

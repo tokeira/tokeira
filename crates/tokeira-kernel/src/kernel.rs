@@ -1513,11 +1513,6 @@ impl BasicKernel {
                     .activity_ops
                     .push(ActivityOp::Delete { activity_id });
             }
-
-            let timers = std::mem::take(&mut builder.state.timers);
-            for (timer_id, _) in timers {
-                builder.timer_ops.push(TimerOp::Delete { timer_id });
-            }
         }
 
         Ok(builder.finish())
@@ -1666,11 +1661,6 @@ impl BasicKernel {
             builder
                 .activity_ops
                 .push(ActivityOp::Delete { activity_id });
-        }
-
-        let timers = std::mem::take(&mut builder.state.timers);
-        for (timer_id, _) in timers {
-            builder.timer_ops.push(TimerOp::Delete { timer_id });
         }
 
         builder.apply_parent_close_policy();
@@ -7011,11 +7001,6 @@ impl TransitionBuilder {
             self.activity_ops.push(ActivityOp::Delete { activity_id });
         }
 
-        let timers = std::mem::take(&mut self.state.timers);
-        for (timer_id, _) in timers {
-            self.timer_ops.push(TimerOp::Delete { timer_id });
-        }
-
         self.apply_parent_close_policy();
     }
 
@@ -7277,9 +7262,15 @@ impl TransitionBuilder {
     ///
     /// Beyond setting the status, this clears all pending subsystem
     /// state (WFT, sticky, pause, external signals/cancels, updates,
-    /// nexus ops) because none of those can ever resolve once the run
-    /// is closed. Cleaning them here keeps the persisted state minimal
+    /// nexus ops, timers) because none of those can ever resolve once the
+    /// run is closed. Cleaning them here keeps the persisted state minimal
     /// and prevents stale callbacks from matching.
+    ///
+    /// Pending activities stay: v1.31.0 keeps a closed run's activity infos
+    /// in mutable state and Describe still lists them
+    /// (describeworkflow/api.go:202 @ v1.31.0), and the kernel's activity
+    /// ops mirror state, so their rows stay too: refusing to act on a closed
+    /// run's activities is the runtime's job.
     fn close(&mut self, status: ExecutionStatus) {
         self.state.status = status;
         self.state.closed_at = Some(self.now);
@@ -7300,6 +7291,32 @@ impl TransitionBuilder {
         // event, so this only drops events overtaken by a worker close
         // command. Keeps closed runs buffer-free (Req 6.3).
         self.state.buffered_events.clear();
+        self.release_timers();
+    }
+
+    /// Delete every pending timer of a closing run.
+    ///
+    /// A closed run's timer can never fire, but its row would still come due:
+    /// the scanner would submit it on every pass, the kernel would reject it,
+    /// and a shard whose oldest due rows are all stale fires no timer again.
+    /// v1.31.0 discards such a task when it runs (the timer executor returns
+    /// `ErrWorkflowCompleted`, timer_queue_active_task_executor.go:178-181, and
+    /// the queue completes a task that fails NotFound, queues/executable.go:401
+    /// @ v1.31.0). Deleting the rows in the closing commit means none come due.
+    fn release_timers(&mut self) {
+        let timers = std::mem::take(&mut self.state.timers);
+        // A timer started earlier in this same transition has only a queued
+        // Upsert and no row yet; drop the Upsert rather than write a row that
+        // the Delete below removes again.
+        self.timer_ops.retain(|op| match op {
+            TimerOp::Upsert(timer) => !timers.contains_key(&timer.timer_id),
+            TimerOp::Delete { .. } => true,
+        });
+        self.timer_ops.extend(
+            timers
+                .into_keys()
+                .map(|timer_id| TimerOp::Delete { timer_id }),
+        );
     }
 
     fn schedule_completion_callbacks(&mut self) {

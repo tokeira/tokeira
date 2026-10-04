@@ -1394,6 +1394,39 @@ fn arb_nexus_resolution() -> impl Strategy<Value = NexusResolution> {
     ]
 }
 
+fn arb_worker_close_with_timers() -> impl Strategy<Value = (LoadedRun, Command)> {
+    let now = fixed_now();
+    (
+        0usize..4,
+        0usize..3,
+        prop_oneof![
+            arb_payloads().prop_map(|result| WorkflowCommand::CompleteWorkflow { result }),
+            arb_failure_payload().prop_map(|failure| WorkflowCommand::FailWorkflow { failure }),
+            Just(WorkflowCommand::CancelWorkflow { details: None }),
+            arb_continue_as_new_command(),
+        ],
+    )
+        .prop_map(move |(pending, started, close)| {
+            let mut state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+            for index in 0..pending {
+                state = with_timer(state, &format!("pending-{index}"), now);
+            }
+            let mut commands: Vec<_> = (0..started)
+                .map(|index| WorkflowCommand::StartTimer {
+                    timer_id: format!("started-{index}"),
+                    fire_at: now + time::Duration::minutes(5),
+                })
+                .collect();
+            commands.push(close);
+            let req =
+                completion_request(&state, commands, Default::default(), None, None, false, now);
+            (
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskCompleted(req),
+            )
+        })
+}
+
 fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
     let now = fixed_now();
     prop_oneof![
@@ -2969,6 +3002,23 @@ proptest! {
                 TimerOp::Upsert(timer) => prop_assert_eq!(transition.next_state.timers.get(&timer.timer_id), Some(timer)),
                 TimerOp::Delete { timer_id } => prop_assert!(!transition.next_state.timers.contains_key(timer_id)),
             }
+        }
+    }
+
+    /// A transition that closes an open run leaves no pending timer and writes no timer row.
+    #[test]
+    fn property_closing_releases_every_timer(
+        (loaded, command) in prop_oneof![arb_valid_pair(), arb_worker_close_with_timers()]
+    ) {
+        let was_open = matches!(&loaded, LoadedRun::Existing(state) if state.status.is_open());
+        let transition = kernel().apply(loaded, command).unwrap();
+        if was_open && !transition.next_state.status.is_open() {
+            let only_deletes = transition
+                .timer_ops
+                .iter()
+                .all(|op| matches!(op, TimerOp::Delete { .. }));
+            prop_assert!(transition.next_state.timers.is_empty());
+            prop_assert!(only_deletes);
         }
     }
 

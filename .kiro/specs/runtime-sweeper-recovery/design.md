@@ -202,7 +202,7 @@ pub struct ActivityState {
 
 Ownership: `scheduled_at` is set by the kernel when processing `ScheduleActivity`. `started_at` is set by the runtime in `start_activity_task` (the activity-start OCC upsert that bumps `stamp`). This matches the existing codebase where activity starts are runtime-side operations, not kernel history events.
 
-On sweep recovery, `last_heartbeat_at` defaults to `None` (falls back to `started_at` for heartbeat timeout evaluation — may produce false-positive heartbeat timeouts if the activity had been heartbeating regularly before failover but the elapsed time since `started_at` exceeds the heartbeat timeout; this is an accepted trade-off since suppressing heartbeat evaluation entirely would leave genuinely unresponsive activities undetected) and `cancel_requested` defaults to `false` (re-established on next worker heartbeat).
+On sweep recovery, `last_heartbeat_at` is the activity's persisted last heartbeat time ([activity-heartbeat-time](../activity-heartbeat-time/design.md)), and heartbeat timeout evaluation runs from the later of `started_at` and that time. `cancel_requested` defaults to `false`; the heartbeat response reads the durable `ActivityState.cancel_requested`, so nothing is lost.
 
 ### Durable PendingNexusOperation Extension
 

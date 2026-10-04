@@ -71,7 +71,11 @@ Explicitly out of scope:
   daemon.
 - **Format stability.** The snapshot format is NOT a compatibility surface. It is the
   dev/embedded tier; the version stamp exists to *refuse* old snapshots, not to
-  migrate them. No cross-version decode is ever attempted.
+  migrate them. No cross-version decode is ever attempted. Data carried in a
+  Snapshot_Extension after the payload
+  ([activity-heartbeat-time](../activity-heartbeat-time/requirements.md) Requirement 7)
+  leaves the document and its version unchanged; releases without it refuse such a
+  snapshot as trailing bytes.
 - **Hot restore.** No `&self` method ever replaces a live store's state — a live swap
   would violate the lease/fencing assumptions of every runtime component holding the
   store.
@@ -178,8 +182,10 @@ corrupting state.
    current version, THEN THE store SHALL return a version-mismatch error naming both
    the found and supported versions, and SHALL NOT construct a store.
 3. IF `from_snapshot` is given bytes that fail to decode (truncated, corrupt, or
-   trailing garbage after the payload), THEN THE store SHALL return a decode error and
-   SHALL NOT construct a store or panic.
+   bytes after the payload that are not a well-formed Snapshot_Extension,
+   [activity-heartbeat-time](../activity-heartbeat-time/requirements.md) Requirement
+   7.6), THEN THE store SHALL return a decode error and SHALL NOT construct a store or
+   panic.
 4. THE crate documentation for the snapshot API SHALL state that the format is
    unstable across Tokeira versions and exists for the dev/embedded tier only.
 

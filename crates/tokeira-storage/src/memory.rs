@@ -1748,6 +1748,7 @@ impl RunRepository for InMemoryStore {
                 due.push(DueTimer {
                     run_key: *run_key,
                     timer_id: timer.timer_id.clone(),
+                    fire_at: timer.fire_at,
                 });
                 if due.len() >= limit {
                     return Ok(due);
@@ -1841,6 +1842,7 @@ impl RunRepository for InMemoryStore {
                 due.push(DueTimer {
                     run_key: *run_key,
                     timer_id: timer.timer_id.clone(),
+                    fire_at: timer.fire_at,
                 });
                 if due.len() >= limit {
                     break;
@@ -1848,6 +1850,19 @@ impl RunRepository for InMemoryStore {
             }
         }
         Ok(due)
+    }
+
+    async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
+        let mut store = self.inner.lock().await;
+        let key = (timer.run_key, timer.timer_id.clone());
+        let matches = store
+            .timer_bucket
+            .get(&key)
+            .is_some_and(|row| row.fire_at == timer.fire_at);
+        if matches {
+            store.timer_bucket.remove(&key);
+        }
+        Ok(matches)
     }
 
     async fn list_runs_with_workflow_timeouts_for_shard(
@@ -4601,6 +4616,50 @@ mod tests {
         let due = store.list_due_timers(fixed_now(), 10).await.unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].timer_id, "timer-1");
+    }
+
+    #[tokio::test]
+    async fn delete_due_timer_if_matches_spares_a_replacement_row() {
+        let store = InMemoryStore::default();
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        transition
+            .timer_ops
+            .push(TimerOp::Upsert(timer_state("timer-1", fixed_now())));
+        let _ = store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+        let read = store
+            .list_due_timers(fixed_now(), 10)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(read.fire_at, fixed_now());
+
+        let replacement = DueTimer {
+            fire_at: fixed_now() + Duration::seconds(5),
+            ..read.clone()
+        };
+        store.inner.lock().await.timer_bucket.insert(
+            (run_key, "timer-1".into()),
+            timer_state("timer-1", replacement.fire_at),
+        );
+
+        assert!(!store.delete_due_timer_if_matches(&read).await.unwrap());
+        assert!(
+            store
+                .delete_due_timer_if_matches(&replacement)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_due_timers(fixed_now() + Duration::minutes(1), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

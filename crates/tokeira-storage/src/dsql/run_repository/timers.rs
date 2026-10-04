@@ -44,8 +44,8 @@ impl DsqlRunRepository {
             }
 
             let mut permit = self.director.acquire(DbClass::Read).await?;
-            let rows = sqlx::query_as::<_, (Uuid, String)>(
-                "SELECT run_key, timer_id
+            let rows = sqlx::query_as::<_, (Uuid, String, OffsetDateTime)>(
+                "SELECT run_key, timer_id, fire_at
              FROM timer_bucket
              WHERE shard_id = $1 AND fire_at <= $2
              ORDER BY fire_at ASC
@@ -60,11 +60,32 @@ impl DsqlRunRepository {
 
             Ok(rows
                 .into_iter()
-                .map(|(run_key, timer_id)| DueTimer {
+                .map(|(run_key, timer_id, fire_at)| DueTimer {
                     run_key: RunKey(run_key),
                     timer_id,
+                    fire_at,
                 })
                 .collect())
+        })
+    }
+
+    #[instrument(name = "dsql.delete_due_timer_if_matches", skip(self, timer), fields(run_key = %timer.run_key.0, timer_id = %timer.timer_id))]
+    pub(super) async fn do_delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
+        record_dsql_operation!(self, "delete_due_timer_if_matches", None, {
+            let mut permit = self.director.acquire(DbClass::Commit).await?;
+            // `fire_at` is part of the row's primary key, so matching it
+            // deletes exactly the row the scan read: a later timer that
+            // reuses the id has a different fire time and survives.
+            let result = sqlx::query(
+                "DELETE FROM timer_bucket
+             WHERE run_key = $1 AND timer_id = $2 AND fire_at = $3",
+            )
+            .bind(timer.run_key.0)
+            .bind(&timer.timer_id)
+            .bind(timer.fire_at)
+            .execute(permit.connection()?)
+            .await?;
+            Ok(result.rows_affected() > 0)
         })
     }
 }

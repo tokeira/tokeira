@@ -3257,6 +3257,7 @@ mod tests {
                     .map(|(run, timer_id)| DueTimer {
                         run_key: RunKey(Uuid::from_u128(run)),
                         timer_id,
+                        fire_at: OffsetDateTime::UNIX_EPOCH,
                     })
                     .collect();
                 let repo = MockTimerRepo::from_responses(vec![TimerListResponse::Ok(due_timers.clone())]);
@@ -3327,6 +3328,7 @@ mod tests {
                     .map(|(index, run)| DueTimer {
                         run_key: RunKey(Uuid::from_u128(run)),
                         timer_id: format!("timer-{index}"),
+                        fire_at: OffsetDateTime::UNIX_EPOCH,
                     })
                     .collect();
                 let repo = MockTimerRepo::from_responses(vec![TimerListResponse::Ok(due_timers)]);
@@ -3363,6 +3365,7 @@ mod tests {
                     .map(|(index, run)| DueTimer {
                         run_key: RunKey(Uuid::from_u128(run)),
                         timer_id: format!("timer-{index}"),
+                        fire_at: OffsetDateTime::UNIX_EPOCH,
                     })
                     .collect();
                 let repo = MockTimerRepo::from_responses(vec![TimerListResponse::Ok(due_timers.clone())]);
@@ -3413,6 +3416,7 @@ mod tests {
                     .map(|(index, run)| DueTimer {
                         run_key: RunKey(Uuid::from_u128(run)),
                         timer_id: format!("timer-{index}"),
+                        fire_at: OffsetDateTime::UNIX_EPOCH,
                     })
                     .collect();
                 let repo = MockTimerRepo::from_responses(vec![
@@ -3436,6 +3440,45 @@ mod tests {
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
+    }
+
+    #[tokio::test]
+    async fn timer_scan_deletes_rows_whose_run_is_gone() {
+        let due = |timer_id: &str| DueTimer {
+            run_key: RunKey::new(),
+            timer_id: timer_id.to_string(),
+            fire_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let (closed, missing, paused, unavailable) = (
+            due("closed"),
+            due("missing"),
+            due("paused"),
+            due("unavailable"),
+        );
+        let repo = MockTimerRepo::from_responses(vec![TimerListResponse::Ok(vec![
+            closed.clone(),
+            missing.clone(),
+            paused,
+            unavailable,
+        ])]);
+
+        crate::scanner::scan_due_timers_once_for_shard(
+            &repo,
+            tokeira_types::ShardId(0),
+            &TimerScannerConfig::default(),
+            |due, _fired_at| async move {
+                let reject = match due.timer_id.as_str() {
+                    "closed" => tokeira_kernel::Reject::RunClosed(ExecutionStatus::Completed),
+                    "missing" => tokeira_kernel::Reject::MissingRun,
+                    "paused" => tokeira_kernel::Reject::WorkflowPaused,
+                    _ => return Err(anyhow!("lane unavailable")),
+                };
+                Err(crate::lane::KernelRejected(reject).into())
+            },
+        )
+        .await;
+
+        assert_eq!(repo.recorded_deletes(), vec![closed, missing]);
     }
 
     #[tokio::test]
@@ -3769,6 +3812,7 @@ mod tests {
     struct MockTimerRepo {
         responses: Mutex<VecDeque<TimerListResponse>>,
         limits: Mutex<Vec<usize>>,
+        deletes: Mutex<Vec<DueTimer>>,
     }
 
     impl MockTimerRepo {
@@ -3776,11 +3820,16 @@ mod tests {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
                 limits: Mutex::new(Vec::new()),
+                deletes: Mutex::new(Vec::new()),
             }
         }
 
         fn recorded_limits(&self) -> Vec<usize> {
             self.limits.lock().expect("limits lock poisoned").clone()
+        }
+
+        fn recorded_deletes(&self) -> Vec<DueTimer> {
+            self.deletes.lock().expect("deletes lock poisoned").clone()
         }
     }
 
@@ -3967,6 +4016,14 @@ mod tests {
             limit: usize,
         ) -> Result<Vec<DueTimer>> {
             self.list_due_timers(_now, limit).await
+        }
+
+        async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
+            self.deletes
+                .lock()
+                .expect("deletes lock poisoned")
+                .push(timer.clone());
+            Ok(true)
         }
 
         async fn list_runs_with_workflow_timeouts_for_shard(

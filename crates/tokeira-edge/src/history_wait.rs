@@ -355,6 +355,10 @@ where
             .await
     }
 
+    async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
+        self.inner.delete_due_timer_if_matches(timer).await
+    }
+
     async fn list_runs_with_workflow_timeouts_for_shard(
         &self,
         shard_id: ShardId,

@@ -1,0 +1,5 @@
+kind: fixed
+body: The timer scanner deletes a due timer whose run has closed or no longer exists, so rows left by earlier releases stop blocking a shard's timers.
+time: 2026-10-04T20:11:56.000000+01:00
+custom:
+    Slice: 1ee8720e-115b-4f29-bd99-adf69ec88cd5

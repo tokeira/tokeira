@@ -120,9 +120,12 @@ Depends on: Feature 1 (Lane OCC Retry and Mailbox Coalescing), Feature 2 (Activi
 #### Acceptance Criteria
 
 1. WHEN a runtime node acquires a shard, THE Sweeper SHALL scan `timer_bucket` for due timers belonging to runs in that shard.
-2. WHEN a due timer is discovered, THE Sweeper SHALL inject a `Command::TimerDue` into the appropriate run actor's lane mailbox.
+2. WHEN a due timer is discovered, THE Sweeper SHALL inject into the appropriate run actor's lane mailbox the command the Timer_Scanner submits for it: `Command::WorkflowStartDelayElapsed` for the workflow start-delay timer, and `Command::TimerDue` for any other timer.
 3. WHEN a `TimerDue` command is delivered for a timer that has already been canceled or fired, THE Kernel SHALL reject it as a harmless no-op.
 4. THE Sweeper SHALL use a `DbClass::Maintenance` permit for storage queries during the sweep.
+5. IF the Kernel rejects a due timer's command, THEN THE Sweeper SHALL continue with the remaining due timers; WHEN the rejection is because the run has closed or no longer exists, THE Sweeper SHALL delete that timer row if it still has the fire time that was read.
+
+**Ground truth (criteria 2 and 5):** v1.31.0 fires the workflow start delay as a workflow backoff timer that schedules the first workflow task (`executeWorkflowBackoffTimerTask`), not as a user timer (`executeUserTimerTimeoutTask`) (`service/history/timer_queue_active_task_executor.go:137, 462 @ v1.31.0`). A `TimerDue` for the start delay would record a `TimerFired` for a timer the workflow never started. A timer task whose workflow has closed or is missing answers NotFound (`timer_queue_active_task_executor.go:154-157, 178-181`), and the queue completes such a task instead of retrying it, without holding up other tasks (`service/history/queues/executable.go:401 @ v1.31.0`).
 
 ---
 

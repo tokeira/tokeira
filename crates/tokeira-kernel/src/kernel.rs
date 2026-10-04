@@ -1503,16 +1503,11 @@ impl BasicKernel {
         // a base that is already closed keeps its terminal status — only the
         // `ResetRunId` link (set above) is recorded. Child parent-close-policy is
         // NOT applied on reset: v1.31.0 reconnects the base's children onto the new
-        // run rather than terminating them.
+        // run rather than terminating them. The terminated base keeps its pending
+        // activities, as on any terminate: v1.31.0 closes it through
+        // `TerminateWorkflow` (workflow_resetter.go:629-642 @ v1.31.0).
         if was_open {
             builder.close(ExecutionStatus::Terminated);
-
-            let activities = std::mem::take(&mut builder.state.activities);
-            for (activity_id, _) in activities {
-                builder
-                    .activity_ops
-                    .push(ActivityOp::Delete { activity_id });
-            }
         }
 
         Ok(builder.finish())
@@ -1655,14 +1650,6 @@ impl BasicKernel {
             new_execution_run_id: req.new_execution_run_id,
         });
         builder.close(ExecutionStatus::TimedOut);
-
-        let activities = std::mem::take(&mut builder.state.activities);
-        for (activity_id, _) in activities {
-            builder
-                .activity_ops
-                .push(ActivityOp::Delete { activity_id });
-        }
-
         builder.apply_parent_close_policy();
 
         Ok(builder.finish())
@@ -4680,7 +4667,9 @@ fn close_replayed_run(
     state.pending_workflow_task = None;
     state.sticky = None;
     state.pause_info = None;
-    state.activities.clear();
+    // Pending activities stay, as in a live close (`TransitionBuilder::close`):
+    // v1.31.0's rebuilder applies a close event (mutable_state_rebuilder.go:538,
+    // 570, 602 @ v1.31.0) without deleting the run's activity infos.
     state.timers.clear();
     state.children.clear();
     state.pending_external_signals.clear();
@@ -6975,10 +6964,11 @@ impl TransitionBuilder {
     }
 
     /// Shared terminate tail: force-close a started WFT, flush buffered
-    /// events, emit `WorkflowExecutionTerminated`, close as `Terminated`, and
-    /// clean up activities/timers/children. Ordering per `TerminateWorkflow`
-    /// (util.go:115 @ v1.31.0): WorkflowTaskFailed(ForceCloseCommand) →
-    /// flushed buffered events → WorkflowExecutionTerminated.
+    /// events, emit `WorkflowExecutionTerminated`, close as `Terminated`
+    /// (deleting the timers and keeping the activities), and apply the parent
+    /// close policy. Ordering per `TerminateWorkflow` (util.go:115 @ v1.31.0):
+    /// WorkflowTaskFailed(ForceCloseCommand) → flushed buffered events →
+    /// WorkflowExecutionTerminated.
     fn terminate_run(
         &mut self,
         reason: String,
@@ -6995,12 +6985,6 @@ impl TransitionBuilder {
             links,
         });
         self.close(ExecutionStatus::Terminated);
-
-        let activities = std::mem::take(&mut self.state.activities);
-        for (activity_id, _) in activities {
-            self.activity_ops.push(ActivityOp::Delete { activity_id });
-        }
-
         self.apply_parent_close_policy();
     }
 
@@ -7266,11 +7250,13 @@ impl TransitionBuilder {
     /// run is closed. Cleaning them here keeps the persisted state minimal
     /// and prevents stale callbacks from matching.
     ///
-    /// Pending activities stay: v1.31.0 keeps a closed run's activity infos
-    /// in mutable state and Describe still lists them
-    /// (describeworkflow/api.go:202 @ v1.31.0), and the kernel's activity
-    /// ops mirror state, so their rows stay too: refusing to act on a closed
-    /// run's activities is the runtime's job.
+    /// Pending activities stay, on every close including the forced ones
+    /// (terminate, workflow timeout, reset): v1.31.0 keeps a closed run's
+    /// activity infos in mutable state (`DeleteActivity` runs only when an
+    /// activity's resolution event is applied, mutable_state_impl.go:2066 @
+    /// v1.31.0) and Describe still lists them (describeworkflow/api.go:202 @
+    /// v1.31.0). The kernel's activity ops mirror state, so their rows stay
+    /// too: refusing to act on a closed run's activities is the runtime's job.
     fn close(&mut self, status: ExecutionStatus) {
         self.state.status = status;
         self.state.closed_at = Some(self.now);

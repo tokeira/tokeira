@@ -1,0 +1,5 @@
+kind: fixed
+body: DescribeWorkflowExecution now lists the pending activities of a terminated, timed-out or reset run, as Temporal does, instead of dropping them at the close.
+time: 2026-10-04T21:18:14.000000+01:00
+custom:
+    Slice: d607ba16-598a-4554-93e5-3e0d359df6a2

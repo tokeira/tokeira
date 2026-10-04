@@ -5,7 +5,9 @@
 //! `TimerDue` command to the owning lane. The scanner holds no authoritative
 //! state of its own — storage is the source of truth for which timers are due —
 //! so a missed or duplicated tick is recovered on the next scan and is safe after
-//! crash or failover. Second, the deterministic run-to-lane routing
+//! crash or failover. A due row whose run has closed or no longer exists can
+//! never fire, so the scanner deletes it rather than resubmit it on every pass
+//! at the front of the shard's oldest-first batch. Second, the deterministic run-to-lane routing
 //! (`lane_index_for_run_key`, `pick_lane_for_run_key`) used by every command
 //! submission path in the runtime, not just timers.
 //!
@@ -20,13 +22,18 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    Command, TimerDueRequest, WORKFLOW_START_DELAY_TIMER_ID, WorkflowStartDelayElapsedRequest,
+    Command, Reject, TimerDueRequest, WORKFLOW_START_DELAY_TIMER_ID,
+    WorkflowStartDelayElapsedRequest,
 };
 use tokeira_storage::{DueTimer, RunRepository};
 use tokeira_types::{RunKey, ShardId, dsql_spread_uuid};
 use tokio_util::sync::CancellationToken;
 
-use crate::{lane::LaneHandle, metrics as runtime_metrics, shard::ShardOwner};
+use crate::{
+    lane::{KernelRejected, LaneHandle},
+    metrics as runtime_metrics,
+    shard::ShardOwner,
+};
 
 /// Configuration knobs for the background timer scanner.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +89,41 @@ fn command_for_due_timer(due: DueTimer, fired_at: OffsetDateTime) -> Command {
     }
 }
 
+/// Whether `error` is the kernel rejecting a due timer because its run has
+/// closed or no longer exists.
+///
+/// Such a timer can never fire. v1.31.0 discards the task when it runs: the
+/// timer executor answers `ErrWorkflowExecutionNotFound` or
+/// `ErrWorkflowCompleted`, both NotFound
+/// (timer_queue_active_task_executor.go:154-157, 178-181 @ v1.31.0), and the
+/// queue completes a NotFound task instead of retrying it
+/// (queues/executable.go:401 @ v1.31.0).
+fn rejected_because_run_is_gone(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<KernelRejected>()
+        .is_some_and(|rejected| matches!(rejected.0, Reject::RunClosed(_) | Reject::MissingRun))
+}
+
+/// Delete the row of a due timer whose run is gone, if it is still the row
+/// the scan read. Returns whether a row was deleted.
+async fn delete_stale_due_timer<R>(repo: &R, due: &DueTimer) -> bool
+where
+    R: RunRepository + ?Sized,
+{
+    match repo.delete_due_timer_if_matches(due).await {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                run_key = ?due.run_key,
+                timer_id = due.timer_id,
+                "timer scanner failed to delete a due timer of a closed run"
+            );
+            false
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) async fn scan_due_timers_once<R, F, Fut>(
     repo: &R,
@@ -106,6 +148,10 @@ pub(crate) async fn scan_due_timers_once<R, F, Fut>(
 
     for due in due_timers {
         if let Err(error) = submit_due_timer(due.clone(), fired_at).await {
+            if rejected_because_run_is_gone(&error) {
+                delete_stale_due_timer(repo, &due).await;
+                continue;
+            }
             let message = error.to_string();
             if message.contains("kernel rejected") {
                 tracing::debug!(
@@ -152,8 +198,13 @@ pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
         }
     };
 
+    let mut deleted = 0usize;
     for due in due_timers {
         if let Err(error) = submit_due_timer(due.clone(), fired_at).await {
+            if rejected_because_run_is_gone(&error) {
+                deleted += usize::from(delete_stale_due_timer(repo, &due).await);
+                continue;
+            }
             let message = error.to_string();
             if message.contains("kernel rejected") {
                 tracing::debug!(
@@ -173,6 +224,9 @@ pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
                 );
             }
         }
+    }
+    if deleted > 0 {
+        runtime_metrics::record_scanner_stale_deleted("timer", shard_id.0, deleted);
     }
 }
 
@@ -278,10 +332,12 @@ mod tests {
         let delayed = DueTimer {
             run_key,
             timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
+            fire_at: fired_at,
         };
         let user_timer = DueTimer {
             run_key,
             timer_id: "timer-1".to_string(),
+            fire_at: fired_at,
         };
 
         assert!(matches!(

@@ -1,0 +1,5 @@
+kind: added
+body: tokeira_runtime_scanner_stale_deleted_total counts the due timer rows the scanner deleted because their run was gone.
+time: 2026-10-04T20:11:56.000000+01:00
+custom:
+    Slice: 12f45f34-b58b-496d-b97b-a58af69ba461

@@ -1125,6 +1125,16 @@ pub trait RunRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<DueTimer>>;
 
+    /// Delete one due timer row, but only if the durable row is still the one
+    /// `timer` was read as: the same run, timer id and fire time.
+    ///
+    /// This is the timer scanner's cleanup for a row the kernel rejected
+    /// because its run has closed or no longer exists, so it can never fire.
+    /// Matching the fire time makes the delete a no-op when the row has been
+    /// replaced by a later timer that reuses the id. Returns whether a row was
+    /// removed.
+    async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool>;
+
     /// List open runs with workflow timeout configuration
     /// for a shard (for sweep reconstruction).
     async fn list_runs_with_workflow_timeouts_for_shard(
@@ -1493,6 +1503,9 @@ pub struct DueTimer {
     pub run_key: RunKey,
     /// Application-level timer identifier.
     pub timer_id: String,
+    /// The fire time the row was read with; with the run and timer id it
+    /// names the exact row, so a conditional delete spares a replacement.
+    pub fire_at: OffsetDateTime,
 }
 
 /// Sweep entry for reconstructing workflow timeout tracking
@@ -2519,6 +2532,10 @@ where
         (**self)
             .list_due_timers_for_shard(shard_id, now, limit)
             .await
+    }
+
+    async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
+        (**self).delete_due_timer_if_matches(timer).await
     }
 
     async fn list_runs_with_workflow_timeouts_for_shard(

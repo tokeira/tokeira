@@ -70,6 +70,10 @@ pub const ACTIVITY_TASK_RETRY_TOTAL: &str = "tokeira_runtime_activity_task_retry
 pub const ACTIVITY_TASK_TIMED_OUT_TOTAL: &str = "tokeira_runtime_activity_task_timed_out_total";
 pub const SCANNER_TICK_TOTAL: &str = "tokeira_runtime_scanner_tick_total";
 pub const SCANNER_DISPATCHED_TOTAL: &str = "tokeira_runtime_scanner_dispatched_total";
+/// Due rows a scanner deleted because their run had closed or no longer
+/// existed, by shard. Rows left by an earlier release drain this way; a
+/// steady rate means something still leaves rows behind.
+pub const SCANNER_STALE_DELETED_TOTAL: &str = "tokeira_runtime_scanner_stale_deleted_total";
 pub const OCC_RETRY_TOTAL: &str = "tokeira_runtime_occ_retry_total";
 pub const KERNEL_TRANSITION_COMMITTED_TOTAL: &str = "tokeira_kernel_transition_committed_total";
 pub const KERNEL_EVENTS_EMITTED_TOTAL: &str = "tokeira_kernel_events_emitted_total";
@@ -148,6 +152,7 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (ACTIVITY_TASK_TIMED_OUT_TOTAL, MetricType::Counter),
     (SCANNER_TICK_TOTAL, MetricType::Counter),
     (SCANNER_DISPATCHED_TOTAL, MetricType::Counter),
+    (SCANNER_STALE_DELETED_TOTAL, MetricType::Counter),
     (OCC_RETRY_TOTAL, MetricType::Counter),
     (KERNEL_TRANSITION_COMMITTED_TOTAL, MetricType::Counter),
     (KERNEL_EVENTS_EMITTED_TOTAL, MetricType::Counter),
@@ -549,6 +554,16 @@ pub fn record_scanner_dispatched(scanner_type: &'static str, shard_id: u32) {
     .increment(1);
 }
 
+/// Record due rows a scanner deleted because their run was gone.
+pub fn record_scanner_stale_deleted(scanner_type: &'static str, shard_id: u32, deleted: usize) {
+    counter!(
+        SCANNER_STALE_DELETED_TOTAL,
+        "scanner_type" => scanner_type,
+        "shard_id" => shard_id.to_string(),
+    )
+    .increment(deleted as u64);
+}
+
 /// Record an OCC retry outcome.
 pub fn record_occ_retry(outcome: RetryOutcomeLabel) {
     counter!(OCC_RETRY_TOTAL, "outcome" => outcome.as_str()).increment(1);
@@ -770,6 +785,7 @@ mod tests {
             record_activity_task_timed_out(OutcomeLabel::Failure);
             record_scanner_tick("timer", 4);
             record_scanner_dispatched("timer", 4);
+            record_scanner_stale_deleted("timer", 4, 2);
             record_occ_retry(RetryOutcomeLabel::Retry);
             record_transition_committed("default", "Start");
             record_events_emitted("WorkflowExecutionStarted", 2);
@@ -900,6 +916,11 @@ mod tests {
         assert_eq!(labels.get("scanner_type"), Some(&"timer".to_string()));
         assert_eq!(labels.get("shard_id"), Some(&"4".to_string()));
         assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(SCANNER_STALE_DELETED_TOTAL).unwrap();
+        assert_eq!(labels.get("scanner_type"), Some(&"timer".to_string()));
+        assert_eq!(labels.get("shard_id"), Some(&"4".to_string()));
+        assert_eq!(value, &DebugValue::Counter(2));
 
         let (labels, value) = snapshot.get(OCC_RETRY_TOTAL).unwrap();
         assert_eq!(labels.get("outcome"), Some(&"retry".to_string()));

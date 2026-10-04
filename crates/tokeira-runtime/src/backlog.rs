@@ -546,6 +546,9 @@ mod tests {
         ) -> Result<Vec<DueTimer>> {
             Ok(Vec::new())
         }
+        async fn delete_due_timer_if_matches(&self, _timer: &DueTimer) -> Result<bool> {
+            Ok(false)
+        }
         async fn list_runs_with_workflow_timeouts_for_shard(
             &self,
             _shard_id: ShardId,

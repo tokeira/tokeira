@@ -1,0 +1,5 @@
+kind: changed
+body: tokeira-storage's RunRepository gains delete_due_timer_if_matches, and DueTimer carries the fire time it was read with.
+time: 2026-10-04T20:11:56.000000+01:00
+custom:
+    Slice: a2f1f301-37b6-4c80-952e-3ceb79bb4fa1

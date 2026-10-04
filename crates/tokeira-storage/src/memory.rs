@@ -23,8 +23,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ActivityOp, BasicKernel, CallbackState, DispatchOp, LoadedRun, ReplayContext, TimerOp,
-    Transition, WorkflowState, merge_priority,
+    ActivityOp, BasicKernel, DispatchOp, LoadedRun, ReplayContext, TimerOp, Transition,
+    WorkflowState, merge_priority,
 };
 use tokeira_types::{
     ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor, QueueKey,
@@ -37,24 +37,24 @@ use tokio::sync::Mutex;
 use crate::DeliveryOrder;
 use crate::{
     api::{
-        ActivityDispatchIdentity, ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry,
-        BudgetAllocationResult, BundleLease, CommitResult, CompletionCallbackSweepEntry,
-        ConflictToken, ConnectionDirector, ControlRepository, CurrentExecutionConflictPolicy,
-        DbClass, DbPermit, DeleteRunRequest, DeleteRunResult, DeploymentCasResult, DeploymentKey,
-        DeploymentName, DispatchableActivityTask, DispatchableWorkflowTask, DueActivityDispatch,
-        DueTimer, GenerationAdvanceResult, LeaseOutcome, LeaseRepository, NexusSweepEntry,
-        ProjectionBatch, ProjectionLog, ProjectionRecord, ProvenancePut,
-        ReconstructibleNexusDelivery, RequestRecord, RunHistoryStats, RunRepository,
-        StoredTaskQueueConfig, StoredTaskQueueConfigKey, StoredWorkerDeployment,
-        TaskQueueConfigCasResult, TaskQueueConfigRepository, TransitionAuditRecord,
-        WftTimeoutSweepEntry, WorkerDeploymentRepository, WorkerDeploymentVersionKey,
-        WorkerTaskProvenance, WorkerTaskProvenanceError, WorkerTaskProvenanceStore,
-        WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
+        ActivityDispatchIdentity, AttributedHistoryEvent, BacklogEntry, BudgetAllocationResult,
+        BundleLease, CommitResult, ConflictToken, ConnectionDirector, ControlRepository,
+        CurrentExecutionConflictPolicy, DbClass, DbPermit, DeleteRunRequest, DeleteRunResult,
+        DeploymentCasResult, DeploymentKey, DeploymentName, DispatchableActivityTask,
+        DispatchableWorkflowTask, DueActivityDispatch, DueTimer, GenerationAdvanceResult,
+        LeaseOutcome, LeaseRepository, ProjectionBatch, ProjectionLog, ProjectionRecord,
+        ProvenancePut, RequestRecord, RunHistoryStats, RunRepository, StoredTaskQueueConfig,
+        StoredTaskQueueConfigKey, StoredWorkerDeployment, TaskQueueConfigCasResult,
+        TaskQueueConfigRepository, TransitionAuditRecord, WorkerDeploymentRepository,
+        WorkerDeploymentVersionKey, WorkerTaskProvenance, WorkerTaskProvenanceError,
+        WorkerTaskProvenanceStore, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
         deleted_workflow_projection_context, dispatchable_workflow_task,
-        reconstructible_nexus_deliveries, workflow_is_open_and_pinned_to_version,
-        workflow_projection_context_with_previous,
+        workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
     },
     metrics as storage_metrics,
+    recovery_index::{
+        RecoveryCursor, RecoveryPage, RecoveryPhase, read_candidate_page, recovery_needed,
+    },
 };
 
 /// In-memory store intended for local development and semantic tests.
@@ -1758,36 +1758,40 @@ impl RunRepository for InMemoryStore {
         Ok(due)
     }
 
-    async fn list_dispatchable_workflow_tasks_for_shard(
+    async fn list_recovery_candidates_for_shard(
         &self,
         shard_id: ShardId,
+        cursor: Option<&RecoveryCursor>,
         limit: usize,
-    ) -> Result<Vec<DispatchableWorkflowTask>> {
+    ) -> Result<RecoveryPage> {
         let store = self.inner.lock().await;
-
-        // Collect matching run keys first so we can do the
-        // mutable sticky cleanup without cloning the shard map.
-        let candidates: Vec<RunKey> = store
-            .runs
-            .keys()
-            .filter(|rk| store.run_shard_map.get(rk) == Some(&shard_id))
-            .copied()
-            .collect();
-
-        let mut out = Vec::new();
-        for run_key in candidates {
-            let Some(state) = store.runs.get(&run_key) else {
-                continue;
+        // Every state here is written with the current predicate, so there
+        // are no legacy rows: the legacy phase is always empty and candidates
+        // are the shard's runs whose state holds recovery work (recovery-index
+        // Requirement 6), read through the same two-phase cursor as DSQL.
+        let (rows, next) = read_candidate_page(cursor, limit, |phase, after, limit| {
+            let mut rows: Vec<(RunKey, WorkflowState)> = match phase {
+                RecoveryPhase::Legacy => Vec::new(),
+                RecoveryPhase::Flagged => store
+                    .runs
+                    .values()
+                    .filter(|state| {
+                        store.run_shard_map.get(&state.run_key) == Some(&shard_id)
+                            && recovery_needed(state)
+                            && after.is_none_or(|after| state.run_key > after)
+                    })
+                    .map(|state| (state.run_key, state.clone()))
+                    .collect(),
             };
-            let Some(task) = dispatchable_workflow_task(state) else {
-                continue;
-            };
-            out.push(task);
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
+            rows.sort_by_key(|(run_key, _)| *run_key);
+            rows.truncate(limit);
+            std::future::ready(Ok(rows))
+        })
+        .await?;
+        Ok(RecoveryPage {
+            states: rows.into_iter().map(|(_, state)| state).collect(),
+            next,
+        })
     }
 
     async fn list_due_dispatchable_activity_tasks_for_shard(
@@ -1878,199 +1882,6 @@ impl RunRepository for InMemoryStore {
             store.timer_bucket.remove(&key);
         }
         Ok(matches)
-    }
-
-    async fn list_runs_with_workflow_timeouts_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
-        let store = self.inner.lock().await;
-        let mut out = Vec::new();
-        for state in store.runs.values() {
-            if store.run_shard_map.get(&state.run_key) != Some(&shard_id) {
-                continue;
-            }
-            if !state.is_open() {
-                continue;
-            }
-            if state.workflow_execution_timeout.is_none() && state.workflow_run_timeout.is_none() {
-                continue;
-            }
-            out.push(WorkflowTimeoutSweepEntry {
-                run_key: state.run_key,
-                workflow_execution_timeout: state.workflow_execution_timeout,
-                workflow_run_timeout: state.workflow_run_timeout,
-                started_at: state.started_at,
-                workflow_start_delay: state.workflow_start_delay,
-                first_run_started_at: state.first_run_started_at,
-                has_retry_policy: state.retry_policy.is_some(),
-            });
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
-    async fn list_started_workflow_tasks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WftTimeoutSweepEntry>> {
-        let store = self.inner.lock().await;
-        let mut out = Vec::new();
-        for state in store.runs.values() {
-            if store.run_shard_map.get(&state.run_key) != Some(&shard_id) {
-                continue;
-            }
-            let Some(pending) = state.pending_workflow_task.as_ref() else {
-                continue;
-            };
-            let (Some(started_event_id), Some(started_at)) =
-                (pending.started_event_id, pending.started_at)
-            else {
-                continue;
-            };
-            out.push(WftTimeoutSweepEntry {
-                run_key: state.run_key,
-                logical_seq: pending.logical_seq,
-                started_event_id,
-                started_at,
-                workflow_task_timeout: state.workflow_task_timeout,
-            });
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
-    async fn list_open_activities_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<ActivitySweepEntry>> {
-        let store = self.inner.lock().await;
-        let mut out = Vec::new();
-        for ((run_key, _), activity) in &store.activity_state_table {
-            if store.run_shard_map.get(run_key) != Some(&shard_id) {
-                continue;
-            }
-            out.push(ActivitySweepEntry {
-                run_key: *run_key,
-                activity_id: activity.activity_id.clone(),
-                schedule_event_id: activity.schedule_event_id,
-                attempt: activity.attempt,
-                original_scheduled_at: activity.scheduled_at,
-                current_attempt_scheduled_at: activity.current_attempt_scheduled_at,
-                started_at: activity.started_at,
-                schedule_to_close_timeout: activity.schedule_to_close_timeout,
-                schedule_to_start_timeout: activity.schedule_to_start_timeout,
-                start_to_close_timeout: activity.start_to_close_timeout,
-                heartbeat_timeout: activity.heartbeat_timeout,
-            });
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
-    async fn list_pending_nexus_operations_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<NexusSweepEntry>> {
-        let store = self.inner.lock().await;
-        let mut out = Vec::new();
-        for state in store.runs.values() {
-            if store.run_shard_map.get(&state.run_key) != Some(&shard_id) {
-                continue;
-            }
-            if !state.is_open() {
-                continue;
-            }
-            for op in state.pending_nexus_operations.values() {
-                // Only include operations with at least one timeout configured —
-                // operations without any timeout don't need tracking reconstruction.
-                if op.schedule_to_close_timeout.is_none()
-                    && op.schedule_to_start_timeout.is_none()
-                    && op.start_to_close_timeout.is_none()
-                {
-                    continue;
-                }
-                out.push(NexusSweepEntry {
-                    run_key: state.run_key,
-                    operation_id: op.operation_id.clone(),
-                    scheduled_event_id: op.scheduled_event_id,
-                    scheduled_at: op.scheduled_at,
-                });
-                if out.len() >= limit {
-                    return Ok(out);
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    async fn list_reconstructible_nexus_deliveries_for_shard(
-        &self,
-        shard_id: ShardId,
-        now: OffsetDateTime,
-        limit: usize,
-    ) -> Result<Vec<ReconstructibleNexusDelivery>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let store = self.inner.lock().await;
-        let mut out = Vec::new();
-        for state in store.runs.values() {
-            if store.run_shard_map.get(&state.run_key) != Some(&shard_id) {
-                continue;
-            }
-            for delivery in reconstructible_nexus_deliveries(state, now) {
-                out.push(delivery);
-                if out.len() == limit {
-                    return Ok(out);
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    async fn list_runs_with_pending_completion_callbacks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<CompletionCallbackSweepEntry>> {
-        let store = self.inner.lock().await;
-        let mut out = Vec::new();
-        for state in store.runs.values() {
-            if store.run_shard_map.get(&state.run_key) != Some(&shard_id) {
-                continue;
-            }
-            // A callback is pending delivery once the run closes: `Scheduled` (fired,
-            // not yet attempted) or `BackingOff` (attempt failed, awaiting retry). Both
-            // must be re-watched so a `Scheduled` callback whose first attempt was lost
-            // to a crash is re-driven; terminal/Standby callbacks are not the scanner's.
-            for (callback_index, callback) in state.completion_callbacks.iter().enumerate() {
-                if !matches!(
-                    callback.state,
-                    CallbackState::Scheduled | CallbackState::BackingOff
-                ) {
-                    continue;
-                }
-                out.push(CompletionCallbackSweepEntry {
-                    run_key: state.run_key,
-                    callback_index,
-                });
-                if out.len() >= limit {
-                    return Ok(out);
-                }
-            }
-        }
-        Ok(out)
     }
 }
 
@@ -3352,13 +3163,20 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = store
-            .list_runs_with_pending_completion_callbacks_for_shard(ShardId(0), usize::MAX)
+        // The closed run is still a recovery candidate because it has callbacks
+        // awaiting delivery, and its entries name exactly those callbacks.
+        let page = store
+            .list_recovery_candidates_for_shard(ShardId(0), None, 100)
             .await
             .unwrap();
-        let indices: BTreeSet<usize> = entries
+        let state = page
+            .states
             .iter()
-            .filter(|entry| entry.run_key == run_key)
+            .find(|state| state.run_key == run_key)
+            .expect("a closed run with pending callbacks is a candidate");
+        let indices: BTreeSet<usize> = crate::recovery_entries(state)
+            .completion_callbacks
+            .iter()
             .map(|entry| entry.callback_index)
             .collect();
         assert_eq!(
@@ -3366,6 +3184,94 @@ mod tests {
             BTreeSet::from([0, 1]),
             "Scheduled + BackingOff are pending; Succeeded is terminal"
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        // Feature: recovery-index, Property 2: Paging returns every Candidate exactly once, in order
+        #[test]
+        fn property_candidate_paging_returns_every_candidate_once_in_order(
+            runs in proptest::collection::vec(any::<bool>(), 0..16),
+            limit in 1usize..6,
+        ) {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let shard_count = 2;
+                let store = InMemoryStore::with_shard_count(shard_count);
+                let mut expected = Vec::new();
+                for (index, needs_work) in runs.into_iter().enumerate() {
+                    let run_key = RunKey::new();
+                    let mut transition = start_transition(run_key);
+                    transition.next_state.workflow_id = WorkflowId(format!("wf-{index}"));
+                    if !needs_work {
+                        transition.next_state.pending_workflow_task = None;
+                    }
+                    store
+                        .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                        .await
+                        .unwrap();
+                    if needs_work && shard_for_run_key(run_key, shard_count) == ShardId(0) {
+                        expected.push(run_key);
+                    }
+                }
+                expected.sort();
+
+                let mut listed = Vec::new();
+                let mut cursor = None;
+                loop {
+                    let page = store
+                        .list_recovery_candidates_for_shard(ShardId(0), cursor.as_ref(), limit)
+                        .await
+                        .unwrap();
+                    prop_assert!(page.states.len() <= limit);
+                    listed.extend(page.states.iter().map(|state| state.run_key));
+                    match page.next {
+                        Some(next) => cursor = Some(next),
+                        None => break,
+                    }
+                }
+                prop_assert_eq!(listed, expected);
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+
+        // Feature: recovery-index, Property 4: The stored flag matches the committed state
+        #[test]
+        fn property_a_run_is_listed_exactly_when_its_committed_state_needs_recovery(
+            flags in proptest::collection::vec(any::<bool>(), 1..6),
+        ) {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let store = InMemoryStore::with_shard_count(1);
+                let run_key = RunKey::new();
+                let base = sample_state(run_key);
+                for (index, needs_work) in flags.into_iter().enumerate() {
+                    let mut state = base.clone();
+                    state.transition_seq = TransitionSeq(index as u64 + 1);
+                    if !needs_work {
+                        state.pending_workflow_task = None;
+                    }
+                    let mut transition = start_transition(run_key);
+                    transition.expected_seq = TransitionSeq(index as u64);
+                    transition.next_state = state.clone();
+                    let result = store
+                        .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                        .await
+                        .unwrap();
+                    let applied = matches!(result, CommitResult::Applied { .. });
+                    prop_assert!(applied);
+
+                    let page = store
+                        .list_recovery_candidates_for_shard(ShardId(0), None, 10)
+                        .await
+                        .unwrap();
+                    let listed = page.states.iter().any(|listed| listed.run_key == run_key);
+                    prop_assert_eq!(listed, recovery_needed(&state));
+                }
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
     }
 
     fn activity_state(activity_id: &str) -> tokeira_kernel::ActivityState {
@@ -5695,13 +5601,26 @@ mod tests {
                             .map(|(rk, _)| *rk)
                             .collect();
 
-                    let wf_tasks = store
-                        .list_dispatchable_workflow_tasks_for_shard(
+                    let candidates = store
+                        .list_recovery_candidates_for_shard(
                             sid,
+                            None,
                             usize::MAX,
                         )
                         .await
                         .unwrap();
+                    assert!(candidates.next.is_none());
+                    let entries: Vec<_> = candidates
+                        .states
+                        .iter()
+                        .map(crate::recovery_entries)
+                        .collect();
+                    let wf_tasks: Vec<_> = entries
+                        .iter()
+                        .filter_map(|entries| {
+                            entries.dispatchable_workflow_task.as_ref()
+                        })
+                        .collect();
                     assert_eq!(
                         wf_tasks.len(),
                         expected_runs.len(),
@@ -5753,13 +5672,10 @@ mod tests {
                         );
                     }
 
-                    let wf_timeouts = store
-                        .list_runs_with_workflow_timeouts_for_shard(
-                            sid,
-                            usize::MAX,
-                        )
-                        .await
-                        .unwrap();
+                    let wf_timeouts: Vec<_> = entries
+                        .iter()
+                        .filter_map(|entries| entries.workflow_timeout.as_ref())
+                        .collect();
                     assert_eq!(
                         wf_timeouts.len(),
                         expected_runs.len(),
@@ -5771,13 +5687,10 @@ mod tests {
                         );
                     }
 
-                    let activities = store
-                        .list_open_activities_for_shard(
-                            sid,
-                            usize::MAX,
-                        )
-                        .await
-                        .unwrap();
+                    let activities: Vec<_> = entries
+                        .iter()
+                        .flat_map(|entries| entries.activities.iter())
+                        .collect();
                     assert_eq!(
                         activities.len(),
                         expected_runs.len(),

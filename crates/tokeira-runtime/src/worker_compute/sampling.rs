@@ -12,7 +12,10 @@ use std::{
 
 use anyhow::Result;
 use time::OffsetDateTime;
-use tokeira_storage::{RunRepository, WorkerComputeQueueSample, WorkerComputeRepository};
+use tokeira_storage::{
+    RecoveryCursor, RunRepository, WorkerComputeQueueSample, WorkerComputeRepository,
+    reconstructible_nexus_deliveries,
+};
 use tokeira_types::{
     ControllerInstanceKey, IncarnationId, QueueKey, ShardId, TaskKind, WorkerComputeQueueKey,
     WorkerComputeTaskType,
@@ -23,6 +26,9 @@ use crate::{
 };
 
 use super::{MetricsSnapshot, QUEUE_SAMPLE_TTL, TaskTypeMetrics};
+
+/// Recovery candidates the sampler decodes per page.
+const SAMPLE_PAGE: usize = 100;
 
 /// Monotonic process-local totals for one exact-version queue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -184,33 +190,50 @@ where
 
         let mut nexus_live = self.nexus_broker.versioned_backlog_counts().await;
         let mut nexus_reconstructed = BTreeMap::<WorkerComputeQueueKey, u64>::new();
+        // Only recovery candidates can hold reconstructible deliveries (open
+        // runs with pending Nexus operations), so each tick reads those runs,
+        // a page at a time, rather than every run of every active shard
+        // (recovery-index Requirement 5).
         for shard_id in active_shards {
-            for delivery in self
-                .run_repository
-                .list_reconstructible_nexus_deliveries_for_shard(*shard_id, now, usize::MAX)
-                .await?
-            {
-                let Some(endpoint) = self.nexus_registry.resolve(&delivery.endpoint) else {
-                    continue;
-                };
-                let EndpointTarget::Worker {
-                    namespace_id,
-                    task_queue,
-                } = endpoint.target
-                else {
-                    continue;
-                };
-                let key = WorkerComputeQueueKey {
-                    namespace_id,
-                    deployment_name: tokeira_types::DeploymentId(delivery.version.deployment_name),
-                    build_id: tokeira_types::BuildId(delivery.version.build_id),
-                    task_type: WorkerComputeTaskType::Nexus,
-                    task_queue,
-                };
-                nexus_reconstructed
-                    .entry(key)
-                    .and_modify(|count| *count = count.saturating_add(1))
-                    .or_insert(1);
+            let mut cursor: Option<RecoveryCursor> = None;
+            loop {
+                let page = self
+                    .run_repository
+                    .list_recovery_candidates_for_shard(*shard_id, cursor.as_ref(), SAMPLE_PAGE)
+                    .await?;
+                for delivery in page
+                    .states
+                    .iter()
+                    .flat_map(|state| reconstructible_nexus_deliveries(state, now))
+                {
+                    let Some(endpoint) = self.nexus_registry.resolve(&delivery.endpoint) else {
+                        continue;
+                    };
+                    let EndpointTarget::Worker {
+                        namespace_id,
+                        task_queue,
+                    } = endpoint.target
+                    else {
+                        continue;
+                    };
+                    let key = WorkerComputeQueueKey {
+                        namespace_id,
+                        deployment_name: tokeira_types::DeploymentId(
+                            delivery.version.deployment_name,
+                        ),
+                        build_id: tokeira_types::BuildId(delivery.version.build_id),
+                        task_type: WorkerComputeTaskType::Nexus,
+                        task_queue,
+                    };
+                    nexus_reconstructed
+                        .entry(key)
+                        .and_modify(|count| *count = count.saturating_add(1))
+                        .or_insert(1);
+                }
+                match page.next {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
         }
         for (key, reconstructed) in nexus_reconstructed {

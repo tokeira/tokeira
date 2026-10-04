@@ -1,7 +1,7 @@
 format_version = 1
 tokeira_release = "0.5.1"
 minimum_supported_version = 1
-target_version = 71
-maximum_readable_version = 71
-migration_set_digest = "sha256:75a97da74128ed14cc6d9a7e37edfb24687bbd554010aeabc593c35e0ad4685a"
-immutable_through_version = 71
+target_version = 73
+maximum_readable_version = 73
+migration_set_digest = "sha256:c1923f69387afdced72f6ee2d5dd819d182aa31bfbabb0d056efdf254bd11b6b"
+immutable_through_version = 73

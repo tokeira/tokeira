@@ -469,6 +469,22 @@ async fn write_transition(
     Ok(())
 }
 
+/// The one statement that writes `workflow_hot`. It also stores whether the
+/// state holds work the recovery sweep rebuilds (`$8`), so the sweep can find
+/// those runs through `idx_workflow_hot_recovery` without adding a statement
+/// to the commit (recovery-index Requirement 1).
+pub(super) const WORKFLOW_HOT_UPSERT_SQL: &str = "INSERT INTO workflow_hot
+         (run_key, namespace_id, workflow_id, shard_id, transition_seq, state_data, \
+          history_size_bytes, recovery_needed, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+         ON CONFLICT (run_key) DO UPDATE SET
+             transition_seq = EXCLUDED.transition_seq,
+             state_data = EXCLUDED.state_data,
+             history_size_bytes = EXCLUDED.history_size_bytes,
+             recovery_needed = EXCLUDED.recovery_needed,
+             shard_id = EXCLUDED.shard_id,
+             updated_at = EXCLUDED.updated_at";
+
 pub(super) async fn insert_workflow_hot(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
@@ -479,30 +495,20 @@ pub(super) async fn insert_workflow_hot(
     // `workflow_hot` is a materialized snapshot for recovery and read paths.
     // It is not the audit trail; history_batch carries the append-only events.
     let started = Instant::now();
-    sqlx::query(
-        "INSERT INTO workflow_hot
-         (run_key, namespace_id, workflow_id, shard_id, transition_seq, state_data, \
-          history_size_bytes, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-         ON CONFLICT (run_key) DO UPDATE SET
-             transition_seq = EXCLUDED.transition_seq,
-             state_data = EXCLUDED.state_data,
-             history_size_bytes = EXCLUDED.history_size_bytes,
-             shard_id = EXCLUDED.shard_id,
-             updated_at = EXCLUDED.updated_at",
-    )
-    .bind(run_key.0)
-    .bind(state.namespace_id.0)
-    .bind(&state.workflow_id.0)
-    .bind(DsqlRunRepository::shard_id_to_uuid(shard_id))
-    .bind(convert::i64_from_u64(
-        state.transition_seq.0,
-        "transition_seq",
-    )?)
-    .bind(codec::encode_workflow_state(state)?)
-    .bind(history_size_bytes)
-    .execute(&mut **tx)
-    .await?;
+    sqlx::query(WORKFLOW_HOT_UPSERT_SQL)
+        .bind(run_key.0)
+        .bind(state.namespace_id.0)
+        .bind(&state.workflow_id.0)
+        .bind(DsqlRunRepository::shard_id_to_uuid(shard_id))
+        .bind(convert::i64_from_u64(
+            state.transition_seq.0,
+            "transition_seq",
+        )?)
+        .bind(codec::encode_workflow_state(state)?)
+        .bind(history_size_bytes)
+        .bind(recovery_needed(state))
+        .execute(&mut **tx)
+        .await?;
     metrics::record_dsql_statement_duration(
         "commit_transition",
         "update_execution",

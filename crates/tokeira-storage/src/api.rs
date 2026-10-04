@@ -34,6 +34,8 @@ use tokeira_types::{
 };
 use uuid::Uuid;
 
+use crate::recovery_index::{RecoveryCursor, RecoveryPage};
+
 const WORKER_TASK_PROVENANCE_DIGEST_DOMAIN: &[u8] = b"tokeira-worker-task-provenance-v1\0";
 
 /// Compute the durable provenance key for exact public task-token bytes.
@@ -1079,13 +1081,21 @@ pub trait RunRepository: Send + Sync {
 
     // ── Shard-filtered sweep queries ────────────────────
 
-    /// List dispatchable workflow tasks for a specific
-    /// shard.
-    async fn list_dispatchable_workflow_tasks_for_shard(
+    /// List a page of `shard_id`'s recovery candidates: runs whose stored state
+    /// holds work the recovery sweep rebuilds
+    /// ([`recovery_needed`](crate::recovery_needed)), with their
+    /// decoded states, in run-key order within each phase of the listing.
+    ///
+    /// `cursor`, from a previous page, resumes strictly after that page; the
+    /// page's `next` is `None` once the listing is complete. A DSQL store also
+    /// returns rows written before the flag existed, first, so recovery stays
+    /// complete without a backfill (recovery-index Requirements 2 and 3).
+    async fn list_recovery_candidates_for_shard(
         &self,
         shard_id: ShardId,
+        cursor: Option<&RecoveryCursor>,
         limit: usize,
-    ) -> Result<Vec<DispatchableWorkflowTask>>;
+    ) -> Result<RecoveryPage>;
 
     /// List activity dispatch rows due at `now` for a specific shard, ordered
     /// by `dispatch_at` and then by a stable per-row key, carrying each row's
@@ -1145,65 +1155,6 @@ pub trait RunRepository: Send + Sync {
     /// replaced by a later timer that reuses the id. Returns whether a row was
     /// removed.
     async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool>;
-
-    /// List open runs with workflow timeout configuration
-    /// for a shard (for sweep reconstruction).
-    async fn list_runs_with_workflow_timeouts_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WorkflowTimeoutSweepEntry>>;
-
-    /// List started workflow tasks for a shard (for WFT timeout
-    /// tracking reconstruction).
-    async fn list_started_workflow_tasks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WftTimeoutSweepEntry>>;
-
-    /// List open activities for a shard (for timeout
-    /// tracking reconstruction).
-    async fn list_open_activities_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<ActivitySweepEntry>>;
-
-    /// List pending Nexus operations with timeouts for a
-    /// shard (for timeout tracking reconstruction).
-    async fn list_pending_nexus_operations_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<NexusSweepEntry>>;
-
-    /// List currently eligible exact-version Nexus deliveries for advisory backlog
-    /// reconstruction after broker-memory loss.
-    ///
-    /// Endpoint targets remain unresolved here; runtime owns that registry and
-    /// filters Worker targets without moving routing policy into storage.
-    async fn list_reconstructible_nexus_deliveries_for_shard(
-        &self,
-        _shard_id: ShardId,
-        _now: OffsetDateTime,
-        _limit: usize,
-    ) -> Result<Vec<ReconstructibleNexusDelivery>> {
-        Ok(Vec::new())
-    }
-
-    /// List the *pending* (`Scheduled` or `BackingOff`) completion callbacks of runs homed
-    /// on `shard_id`, so the completion-callback retry scanner can rebuild its volatile
-    /// index after a shard takeover (mirrors `list_pending_nexus_operations_for_shard`).
-    /// Both non-terminal states are included so a `Scheduled` callback whose first delivery
-    /// was lost to a crash is re-driven (see [`CompletionCallbackSweepEntry`]). Completion
-    /// callbacks live in the run blob, so backends enumerate the shard's runs and filter;
-    /// losing the index only delays a retry until the rebuild, never changes the outcome.
-    async fn list_runs_with_pending_completion_callbacks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<CompletionCallbackSweepEntry>>;
 
     // TODO(storage): add sweep methods for activity tasks, archival eligibility,
     // namespace-scoped pagination, and explicit current-execution conflict
@@ -1674,7 +1625,7 @@ pub fn reconstructible_nexus_deliveries(
 
 /// A *pending* (`Scheduled` or `BackingOff`) completion callback that the
 /// completion-callback retry scanner must re-watch after a shard takeover. Produced by
-/// [`RunRepository::list_runs_with_pending_completion_callbacks_for_shard`]. Like
+/// [`recovery_entries`](crate::recovery_entries). Like
 /// [`NexusSweepEntry`] this is only an index seed: the durable `CompletionCallback`
 /// remains the authority for the callback's current state and `next_attempt_at`, re-read
 /// at scan time. Both non-terminal states are included so a callback whose first attempt
@@ -2513,13 +2464,14 @@ where
         (**self).list_due_timers(now, limit).await
     }
 
-    async fn list_dispatchable_workflow_tasks_for_shard(
+    async fn list_recovery_candidates_for_shard(
         &self,
         shard_id: ShardId,
+        cursor: Option<&RecoveryCursor>,
         limit: usize,
-    ) -> Result<Vec<DispatchableWorkflowTask>> {
+    ) -> Result<RecoveryPage> {
         (**self)
-            .list_dispatchable_workflow_tasks_for_shard(shard_id, limit)
+            .list_recovery_candidates_for_shard(shard_id, cursor, limit)
             .await
     }
 
@@ -2549,67 +2501,6 @@ where
 
     async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
         (**self).delete_due_timer_if_matches(timer).await
-    }
-
-    async fn list_runs_with_workflow_timeouts_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
-        (**self)
-            .list_runs_with_workflow_timeouts_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_started_workflow_tasks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WftTimeoutSweepEntry>> {
-        (**self)
-            .list_started_workflow_tasks_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_open_activities_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<ActivitySweepEntry>> {
-        (**self)
-            .list_open_activities_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_pending_nexus_operations_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<NexusSweepEntry>> {
-        (**self)
-            .list_pending_nexus_operations_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_reconstructible_nexus_deliveries_for_shard(
-        &self,
-        shard_id: ShardId,
-        now: OffsetDateTime,
-        limit: usize,
-    ) -> Result<Vec<ReconstructibleNexusDelivery>> {
-        (**self)
-            .list_reconstructible_nexus_deliveries_for_shard(shard_id, now, limit)
-            .await
-    }
-
-    async fn list_runs_with_pending_completion_callbacks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<CompletionCallbackSweepEntry>> {
-        (**self)
-            .list_runs_with_pending_completion_callbacks_for_shard(shard_id, limit)
-            .await
     }
 }
 

@@ -145,9 +145,9 @@ async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
     let mut connection = PgConnection::connect(&database_url).await?;
     let runner = MigrationRunner::embedded();
     let contract = MigrationRunner::compatibility_contract();
-    assert_eq!(contract.target_version, 71);
+    assert_eq!(contract.target_version, 73);
     // Inspect before any mutation: this fixture must exercise the released V068
-    // boundary, not silently pass against a database already upgraded to V071.
+    // boundary, not silently pass against a database already upgraded to V073.
     assert_eq!(
         runner
             .assess_connection(
@@ -158,13 +158,13 @@ async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
             .await?,
         SchemaDecision::MigrationRequired {
             current: 68,
-            target: 71
+            target: 73
         },
     );
     let decision = runner
         .assess_connection(&mut connection, &contract, SchemaMigrationPolicy::Automatic)
         .await?;
-    assert_eq!(decision, SchemaDecision::Migrate { from: 68, to: 71 });
+    assert_eq!(decision, SchemaDecision::Migrate { from: 68, to: 73 });
     runner
         .bootstrap_migration_coordination(&mut connection, &decision)
         .await?;
@@ -187,7 +187,7 @@ async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
         .apply_decision(&mut connection, &decision, &leases, &mut guard, &gate)
         .await;
     let release = leases.release(&mut connection, &guard, &gate).await;
-    assert_eq!(application?.applied, 3);
+    assert_eq!(application?.applied, 5);
     release?;
     verify_target_boundary(&mut connection, &runner.dry_run()?).await?;
     verify_chasm_startup_tables(&mut connection).await?;
@@ -200,7 +200,7 @@ async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
             )
             .await?,
         SchemaDecision::Compatible {
-            current: 71,
+            current: 73,
             legacy_backfill: false
         },
     );

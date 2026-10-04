@@ -29,334 +29,93 @@ impl DsqlRunRepository {
         })
     }
 
-    #[instrument(name = "dsql.list_runs_with_workflow_timeouts_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
-    pub(super) async fn do_list_runs_with_workflow_timeouts_for_shard(
+    #[instrument(name = "dsql.list_recovery_candidates_for_shard", skip(self, cursor), fields(shard_id = shard_id.0, limit))]
+    pub(super) async fn do_list_recovery_candidates_for_shard(
         &self,
         shard_id: ShardId,
+        cursor: Option<&RecoveryCursor>,
         limit: usize,
-    ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
+    ) -> Result<RecoveryPage> {
         record_dsql_operation!(
             self,
-            "list_runs_with_workflow_timeouts_for_shard",
+            "list_recovery_candidates_for_shard",
             Some(shard_id),
             {
-                if limit == 0 {
-                    metrics::record_dsql_rows_read("list_runs_with_workflow_timeouts_for_shard", 0);
-                    return Ok(Vec::new());
-                }
-
-                let mut permit = self.director.acquire(DbClass::Read).await?;
-                let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                    "SELECT run_key, state_data
-             FROM workflow_hot
-             WHERE shard_id = $1",
-                )
-                .bind(Self::shard_id_to_uuid(shard_id))
-                .fetch_all(permit.connection()?)
-                .await?;
-                metrics::record_dsql_rows_read(
-                    "list_runs_with_workflow_timeouts_for_shard",
-                    rows.len(),
-                );
-
-                collect_workflow_timeout_entries(rows, limit)
+                let shard = Self::shard_id_to_uuid(shard_id);
+                let (rows, next) =
+                    read_candidate_page(cursor, limit, |phase, after, limit| async move {
+                        let mut permit = self.director.acquire(DbClass::Read).await?;
+                        let limit = i64::try_from(limit)?;
+                        // Each phase is an ordered range of
+                        // `idx_workflow_hot_recovery (shard_id, recovery_needed, run_key)`.
+                        let rows = match (phase, after) {
+                            (RecoveryPhase::Legacy, None) => {
+                                sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+                                    "SELECT run_key, state_data FROM workflow_hot
+                                 WHERE shard_id = $1 AND recovery_needed IS NULL
+                                 ORDER BY run_key ASC LIMIT $2",
+                                )
+                                .bind(shard)
+                                .bind(limit)
+                                .fetch_all(permit.connection()?)
+                                .await?
+                            }
+                            (RecoveryPhase::Legacy, Some(after)) => {
+                                sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+                                    "SELECT run_key, state_data FROM workflow_hot
+                                     WHERE shard_id = $1 AND recovery_needed IS NULL
+                                       AND run_key > $2
+                                     ORDER BY run_key ASC LIMIT $3",
+                                )
+                                .bind(shard)
+                                .bind(after.0)
+                                .bind(limit)
+                                .fetch_all(permit.connection()?)
+                                .await?
+                            }
+                            (RecoveryPhase::Flagged, None) => {
+                                sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+                                    "SELECT run_key, state_data FROM workflow_hot
+                                 WHERE shard_id = $1 AND recovery_needed = true
+                                 ORDER BY run_key ASC LIMIT $2",
+                                )
+                                .bind(shard)
+                                .bind(limit)
+                                .fetch_all(permit.connection()?)
+                                .await?
+                            }
+                            (RecoveryPhase::Flagged, Some(after)) => {
+                                sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+                                    "SELECT run_key, state_data FROM workflow_hot
+                                     WHERE shard_id = $1 AND recovery_needed = true
+                                       AND run_key > $2
+                                     ORDER BY run_key ASC LIMIT $3",
+                                )
+                                .bind(shard)
+                                .bind(after.0)
+                                .bind(limit)
+                                .fetch_all(permit.connection()?)
+                                .await?
+                            }
+                        };
+                        metrics::record_dsql_rows_read(
+                            "list_recovery_candidates_for_shard",
+                            rows.len(),
+                        );
+                        rows.into_iter()
+                            .map(|(run_key, state_data)| {
+                                let run_key = RunKey(run_key);
+                                codec::decode_workflow_state(run_key, &state_data)
+                                    .map(|state| (run_key, state))
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .await?;
+                Ok(RecoveryPage {
+                    states: rows.into_iter().map(|(_, state)| state).collect(),
+                    next,
+                })
             }
         )
     }
-
-    #[instrument(name = "dsql.list_started_workflow_tasks_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
-    pub(super) async fn do_list_started_workflow_tasks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WftTimeoutSweepEntry>> {
-        record_dsql_operation!(
-            self,
-            "list_started_workflow_tasks_for_shard",
-            Some(shard_id),
-            {
-                if limit == 0 {
-                    metrics::record_dsql_rows_read("list_started_workflow_tasks_for_shard", 0);
-                    return Ok(Vec::new());
-                }
-
-                let mut permit = self.director.acquire(DbClass::Read).await?;
-                let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                    "SELECT run_key, state_data
-             FROM workflow_hot
-             WHERE shard_id = $1",
-                )
-                .bind(Self::shard_id_to_uuid(shard_id))
-                .fetch_all(permit.connection()?)
-                .await?;
-                metrics::record_dsql_rows_read("list_started_workflow_tasks_for_shard", rows.len());
-
-                collect_started_workflow_task_entries(rows, limit)
-            }
-        )
-    }
-
-    #[instrument(name = "dsql.list_pending_nexus_operations_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
-    pub(super) async fn do_list_pending_nexus_operations_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<NexusSweepEntry>> {
-        record_dsql_operation!(
-            self,
-            "list_pending_nexus_operations_for_shard",
-            Some(shard_id),
-            {
-                if limit == 0 {
-                    metrics::record_dsql_rows_read("list_pending_nexus_operations_for_shard", 0);
-                    return Ok(Vec::new());
-                }
-
-                let mut permit = self.director.acquire(DbClass::Read).await?;
-                let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                    "SELECT run_key, state_data
-             FROM workflow_hot
-             WHERE shard_id = $1",
-                )
-                .bind(Self::shard_id_to_uuid(shard_id))
-                .fetch_all(permit.connection()?)
-                .await?;
-                metrics::record_dsql_rows_read(
-                    "list_pending_nexus_operations_for_shard",
-                    rows.len(),
-                );
-
-                collect_nexus_sweep_entries(rows, limit)
-            }
-        )
-    }
-
-    pub(super) async fn do_list_reconstructible_nexus_deliveries_for_shard(
-        &self,
-        shard_id: ShardId,
-        now: OffsetDateTime,
-        limit: usize,
-    ) -> Result<Vec<ReconstructibleNexusDelivery>> {
-        record_dsql_operation!(
-            self,
-            "list_reconstructible_nexus_deliveries_for_shard",
-            Some(shard_id),
-            {
-                if limit == 0 {
-                    metrics::record_dsql_rows_read(
-                        "list_reconstructible_nexus_deliveries_for_shard",
-                        0,
-                    );
-                    return Ok(Vec::new());
-                }
-                let mut permit = self.director.acquire(DbClass::Read).await?;
-                let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                    "SELECT run_key, state_data
-                     FROM workflow_hot
-                     WHERE shard_id = $1",
-                )
-                .bind(Self::shard_id_to_uuid(shard_id))
-                .fetch_all(permit.connection()?)
-                .await?;
-                metrics::record_dsql_rows_read(
-                    "list_reconstructible_nexus_deliveries_for_shard",
-                    rows.len(),
-                );
-
-                collect_reconstructible_nexus_deliveries(rows, now, limit)
-            }
-        )
-    }
-
-    pub(super) async fn do_list_runs_with_pending_completion_callbacks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<CompletionCallbackSweepEntry>> {
-        record_dsql_operation!(
-            self,
-            "list_runs_with_pending_completion_callbacks_for_shard",
-            Some(shard_id),
-            {
-                if limit == 0 {
-                    metrics::record_dsql_rows_read(
-                        "list_runs_with_pending_completion_callbacks_for_shard",
-                        0,
-                    );
-                    return Ok(Vec::new());
-                }
-
-                let mut permit = self.director.acquire(DbClass::Read).await?;
-                let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                    "SELECT run_key, state_data
-             FROM workflow_hot
-             WHERE shard_id = $1",
-                )
-                .bind(Self::shard_id_to_uuid(shard_id))
-                .fetch_all(permit.connection()?)
-                .await?;
-                metrics::record_dsql_rows_read(
-                    "list_runs_with_pending_completion_callbacks_for_shard",
-                    rows.len(),
-                );
-
-                collect_completion_callback_sweep_entries(rows, limit)
-            }
-        )
-    }
-}
-
-pub(super) fn collect_workflow_timeout_entries(
-    rows: Vec<(Uuid, Vec<u8>)>,
-    limit: usize,
-) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let mut entries = Vec::new();
-    for (run_key, state_data) in rows {
-        // Timeout scanners need enough state to evaluate both execution and
-        // run timeout policies in runtime without reopening history.
-        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
-        if !state.status.is_open()
-            || (state.workflow_execution_timeout.is_none() && state.workflow_run_timeout.is_none())
-        {
-            continue;
-        }
-        entries.push(WorkflowTimeoutSweepEntry {
-            run_key: RunKey(run_key),
-            workflow_execution_timeout: state.workflow_execution_timeout,
-            workflow_run_timeout: state.workflow_run_timeout,
-            started_at: state.started_at,
-            workflow_start_delay: state.workflow_start_delay,
-            first_run_started_at: state.first_run_started_at,
-            has_retry_policy: state.retry_policy.is_some(),
-        });
-        if entries.len() == limit {
-            break;
-        }
-    }
-    Ok(entries)
-}
-
-pub(super) fn collect_started_workflow_task_entries(
-    rows: Vec<(Uuid, Vec<u8>)>,
-    limit: usize,
-) -> Result<Vec<WftTimeoutSweepEntry>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let mut entries = Vec::new();
-    for (run_key, state_data) in rows {
-        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
-        let Some(task) = state.pending_workflow_task else {
-            continue;
-        };
-        let (Some(started_event_id), Some(started_at)) = (task.started_event_id, task.started_at)
-        else {
-            continue;
-        };
-        entries.push(WftTimeoutSweepEntry {
-            run_key: RunKey(run_key),
-            logical_seq: task.logical_seq,
-            started_event_id,
-            started_at,
-            workflow_task_timeout: state.workflow_task_timeout,
-        });
-        if entries.len() == limit {
-            break;
-        }
-    }
-    Ok(entries)
-}
-
-pub(super) fn collect_nexus_sweep_entries(
-    rows: Vec<(Uuid, Vec<u8>)>,
-    limit: usize,
-) -> Result<Vec<NexusSweepEntry>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let mut entries = Vec::new();
-    for (run_key, state_data) in rows {
-        // Nexus timeout tracking currently lives in the workflow snapshot so
-        // this scan filters in Rust after shard-local row selection.
-        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
-        if !state.status.is_open() {
-            continue;
-        }
-        for operation in state.pending_nexus_operations.values() {
-            if operation.schedule_to_close_timeout.is_none()
-                && operation.schedule_to_start_timeout.is_none()
-                && operation.start_to_close_timeout.is_none()
-            {
-                continue;
-            }
-            entries.push(NexusSweepEntry {
-                run_key: RunKey(run_key),
-                operation_id: operation.operation_id.clone(),
-                scheduled_event_id: operation.scheduled_event_id,
-                scheduled_at: operation.scheduled_at,
-            });
-            if entries.len() == limit {
-                return Ok(entries);
-            }
-        }
-    }
-    Ok(entries)
-}
-
-pub(super) fn collect_reconstructible_nexus_deliveries(
-    rows: Vec<(Uuid, Vec<u8>)>,
-    now: OffsetDateTime,
-    limit: usize,
-) -> Result<Vec<ReconstructibleNexusDelivery>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let mut entries = Vec::new();
-    for (run_key, state_data) in rows {
-        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
-        for delivery in crate::reconstructible_nexus_deliveries(&state, now) {
-            entries.push(delivery);
-            if entries.len() == limit {
-                return Ok(entries);
-            }
-        }
-    }
-    Ok(entries)
-}
-
-/// Collect *pending* (`Scheduled` or `BackingOff`) completion callbacks from shard-local
-/// workflow rows. Completion callbacks live in the workflow snapshot, so (like the Nexus
-/// timeout sweep) this filters in Rust after shard-local row selection. Both non-terminal
-/// states are included so a `Scheduled` callback whose first attempt was lost to a crash
-/// is re-driven on takeover.
-pub(super) fn collect_completion_callback_sweep_entries(
-    rows: Vec<(Uuid, Vec<u8>)>,
-    limit: usize,
-) -> Result<Vec<CompletionCallbackSweepEntry>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let mut entries = Vec::new();
-    for (run_key, state_data) in rows {
-        let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
-        for (callback_index, callback) in state.completion_callbacks.iter().enumerate() {
-            if !matches!(
-                callback.state,
-                CallbackState::Scheduled | CallbackState::BackingOff
-            ) {
-                continue;
-            }
-            entries.push(CompletionCallbackSweepEntry {
-                run_key: RunKey(run_key),
-                callback_index,
-            });
-            if entries.len() == limit {
-                return Ok(entries);
-            }
-        }
-    }
-    Ok(entries)
 }

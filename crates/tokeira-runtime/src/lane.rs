@@ -2483,12 +2483,16 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn list_dispatchable_workflow_tasks_for_shard(
+        async fn list_recovery_candidates_for_shard(
             &self,
             _shard_id: ShardId,
+            _cursor: Option<&tokeira_storage::RecoveryCursor>,
             _limit: usize,
-        ) -> Result<Vec<DispatchableWorkflowTask>> {
-            Ok(Vec::new())
+        ) -> Result<tokeira_storage::RecoveryPage> {
+            Ok(tokeira_storage::RecoveryPage {
+                states: Vec::new(),
+                next: None,
+            })
         }
 
         async fn list_due_dispatchable_activity_tasks_for_shard(
@@ -2513,46 +2517,6 @@ mod tests {
 
         async fn delete_due_timer_if_matches(&self, _timer: &DueTimer) -> Result<bool> {
             Ok(false)
-        }
-
-        async fn list_runs_with_workflow_timeouts_for_shard(
-            &self,
-            _shard_id: ShardId,
-            _limit: usize,
-        ) -> Result<Vec<tokeira_storage::WorkflowTimeoutSweepEntry>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_started_workflow_tasks_for_shard(
-            &self,
-            _shard_id: ShardId,
-            _limit: usize,
-        ) -> Result<Vec<tokeira_storage::WftTimeoutSweepEntry>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_open_activities_for_shard(
-            &self,
-            _shard_id: ShardId,
-            _limit: usize,
-        ) -> Result<Vec<tokeira_storage::ActivitySweepEntry>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_pending_nexus_operations_for_shard(
-            &self,
-            _shard_id: ShardId,
-            _limit: usize,
-        ) -> Result<Vec<tokeira_storage::NexusSweepEntry>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_runs_with_pending_completion_callbacks_for_shard(
-            &self,
-            _shard_id: ShardId,
-            _limit: usize,
-        ) -> Result<Vec<tokeira_storage::CompletionCallbackSweepEntry>> {
-            Ok(Vec::new())
         }
     }
 

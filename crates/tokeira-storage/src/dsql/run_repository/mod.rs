@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use sqlx::Connection;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityOp, BasicKernel, CallbackState, DispatchOp, HistoryEvent, LoadedRun, ReplayContext,
-    TimerOp, Transition, WorkflowState, merge_priority,
+    ActivityOp, BasicKernel, DispatchOp, HistoryEvent, LoadedRun, ReplayContext, TimerOp,
+    Transition, WorkflowState, merge_priority,
 };
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads, QueueKey,
@@ -25,18 +25,19 @@ use tracing::{Instrument, instrument};
 use uuid::Uuid;
 
 use crate::{
-    ActivityDispatchIdentity, ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry,
-    BacklogPayload, CommitResult, CompletionCallbackSweepEntry, CurrentExecutionConflictPolicy,
-    DbClass, DeleteRunRequest, DeleteRunResult, DeliveryOrder, DispatchableActivityTask,
-    DispatchableWorkflowTask, DueActivityDispatch, DueTimer, NexusSweepEntry, ProjectionRecord,
-    ReconstructibleNexusDelivery, RequestRecord, RunHistoryStats, RunRepository,
-    TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentVersionKey,
-    WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
+    ActivityDispatchIdentity, AttributedHistoryEvent, BacklogEntry, BacklogPayload, CommitResult,
+    CurrentExecutionConflictPolicy, DbClass, DeleteRunRequest, DeleteRunResult, DeliveryOrder,
+    DispatchableActivityTask, DispatchableWorkflowTask, DueActivityDispatch, DueTimer,
+    ProjectionRecord, RequestRecord, RunHistoryStats, RunRepository, TransitionAuditRecord,
+    WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
     deleted_workflow_projection_context, dispatchable_workflow_task, metrics,
     workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
+use crate::recovery_index::{
+    RecoveryCursor, RecoveryPage, RecoveryPhase, read_candidate_page, recovery_needed,
+};
 
 /// Current projection fanout for records written by this repository.
 ///
@@ -97,16 +98,11 @@ mod visibility;
 mod workflow_rules;
 
 #[cfg(test)]
-use activity::{ActivityDispatchRow, activity_dispatch_from_row, collect_activity_sweep_entries};
+use activity::{ActivityDispatchRow, activity_dispatch_from_row};
 #[cfg(test)]
 use dispatch::collect_dispatchable_workflow_tasks;
 #[cfg(test)]
 use leases::{RenewDecision, decide_renew, interpret_acquire};
-#[cfg(test)]
-use visibility::{
-    collect_nexus_sweep_entries, collect_reconstructible_nexus_deliveries,
-    collect_started_workflow_task_entries, collect_workflow_timeout_entries,
-};
 
 /// Production `RunRepository` backed by Aurora DSQL.
 #[derive(Debug)]
@@ -640,12 +636,13 @@ impl RunRepository for DsqlRunRepository {
         self.do_list_due_timers(now, limit).await
     }
 
-    async fn list_dispatchable_workflow_tasks_for_shard(
+    async fn list_recovery_candidates_for_shard(
         &self,
         shard_id: ShardId,
+        cursor: Option<&RecoveryCursor>,
         limit: usize,
-    ) -> Result<Vec<DispatchableWorkflowTask>> {
-        self.do_list_dispatchable_workflow_tasks_for_shard(shard_id, limit)
+    ) -> Result<RecoveryPage> {
+        self.do_list_recovery_candidates_for_shard(shard_id, cursor, limit)
             .await
     }
 
@@ -673,61 +670,6 @@ impl RunRepository for DsqlRunRepository {
 
     async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
         self.do_delete_due_timer_if_matches(timer).await
-    }
-
-    async fn list_runs_with_workflow_timeouts_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
-        self.do_list_runs_with_workflow_timeouts_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_started_workflow_tasks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WftTimeoutSweepEntry>> {
-        self.do_list_started_workflow_tasks_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_open_activities_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<ActivitySweepEntry>> {
-        self.do_list_open_activities_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_pending_nexus_operations_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<NexusSweepEntry>> {
-        self.do_list_pending_nexus_operations_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_reconstructible_nexus_deliveries_for_shard(
-        &self,
-        shard_id: ShardId,
-        now: OffsetDateTime,
-        limit: usize,
-    ) -> Result<Vec<ReconstructibleNexusDelivery>> {
-        self.do_list_reconstructible_nexus_deliveries_for_shard(shard_id, now, limit)
-            .await
-    }
-
-    async fn list_runs_with_pending_completion_callbacks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<CompletionCallbackSweepEntry>> {
-        self.do_list_runs_with_pending_completion_callbacks_for_shard(shard_id, limit)
-            .await
     }
 }
 
@@ -790,9 +732,8 @@ mod tests {
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{
-        ActivityState, HistoryEvent, HistoryEventKind, PendingNexusOperation, PendingWorkflowTask,
-        TimerState, Transition, VersioningBehavior, WorkerDeploymentVersionRef, WorkflowState,
-        WorkflowVersioningInfo,
+        ActivityState, HistoryEvent, HistoryEventKind, PendingWorkflowTask, TimerState, Transition,
+        WorkflowState,
     };
     use tokeira_types::{
         ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo,
@@ -804,11 +745,9 @@ mod tests {
     use super::{
         ActivityDispatchRow, DEFAULT_HISTORY_PAGE_SIZE, DsqlConnectionAcquirer, DsqlRunRepository,
         RenewDecision, activity_dispatch_from_row, classify_connection_error, classify_outcome,
-        collect_activity_sweep_entries, collect_dispatchable_workflow_tasks,
-        collect_nexus_sweep_entries, collect_reconstructible_nexus_deliveries,
-        collect_started_workflow_task_entries, collect_workflow_timeout_entries, decide_renew,
-        dispatchable_workflow_task, effective_history_limit, epoch_from_sql, epoch_to_sql,
-        extract_sqlstate, interpret_acquire, partition_for, should_check_epoch,
+        collect_dispatchable_workflow_tasks, decide_renew, dispatchable_workflow_task,
+        effective_history_limit, epoch_from_sql, epoch_to_sql, extract_sqlstate, interpret_acquire,
+        partition_for, should_check_epoch,
     };
     use crate::{
         BacklogPayload, CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository,
@@ -1097,10 +1036,7 @@ mod tests {
                 encoded_workflow_row(sample_state(RunKey::new())),
                 encoded_workflow_row(sample_state(RunKey::new())),
             ];
-            prop_assert!(collect_dispatchable_workflow_tasks(rows.clone(), None, limit).unwrap().len() <= limit);
-            prop_assert!(collect_workflow_timeout_entries(rows.clone(), limit).unwrap().len() <= limit);
-            prop_assert!(collect_started_workflow_task_entries(rows.clone(), limit).unwrap().len() <= limit);
-            prop_assert!(collect_nexus_sweep_entries(rows, limit).unwrap().len() <= limit);
+            prop_assert!(collect_dispatchable_workflow_tasks(rows, None, limit).unwrap().len() <= limit);
         }
 
         #[test]
@@ -1350,6 +1286,18 @@ mod tests {
         );
     }
 
+    /// The hot-state upsert stores the recovery flag on insert and on update, in
+    /// the one statement that writes the row (recovery-index Requirement 1).
+    #[test]
+    fn workflow_hot_upsert_writes_the_recovery_flag() {
+        let sql = super::commit::WORKFLOW_HOT_UPSERT_SQL;
+        let (insert, update) = sql.split_once("ON CONFLICT").expect("upsert");
+        assert!(insert.contains("recovery_needed"));
+        assert!(insert.contains("$8"));
+        assert!(update.contains("recovery_needed = EXCLUDED.recovery_needed"));
+        assert_eq!(sql.matches(';').count(), 0);
+    }
+
     #[test]
     fn workflow_dispatch_collects_only_scheduled_unstarted_tasks() {
         let run_key = RunKey::new();
@@ -1375,117 +1323,6 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].run_key, run_key);
         assert_eq!(tasks[0].queue.task_kind, TaskKind::Workflow);
-    }
-
-    #[test]
-    fn workflow_timeout_collects_only_open_runs_with_timeouts() {
-        let run_key = RunKey::new();
-        let mut eligible = sample_state(run_key);
-        eligible.workflow_run_timeout = Some(Duration::seconds(60));
-        let mut no_timeout = sample_state(RunKey::new());
-        no_timeout.workflow_run_timeout = None;
-        no_timeout.workflow_execution_timeout = None;
-        let mut closed = sample_state(RunKey::new());
-        closed.status = ExecutionStatus::Completed;
-        closed.workflow_run_timeout = Some(Duration::seconds(60));
-
-        let entries = collect_workflow_timeout_entries(
-            vec![
-                encoded_workflow_row(no_timeout),
-                encoded_workflow_row(closed),
-                encoded_workflow_row(eligible.clone()),
-            ],
-            10,
-        )
-        .unwrap();
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].run_key, run_key);
-        assert_eq!(
-            entries[0].workflow_run_timeout,
-            eligible.workflow_run_timeout
-        );
-    }
-
-    #[test]
-    fn started_wft_collects_only_started_pending_tasks() {
-        let run_key = RunKey::new();
-        let mut started = sample_state(run_key);
-        if let Some(task) = started.pending_workflow_task.as_mut() {
-            task.started_event_id = Some(10);
-            task.started_at = Some(fixed_now());
-        }
-        let scheduled = sample_state(RunKey::new());
-
-        let entries = collect_started_workflow_task_entries(
-            vec![
-                encoded_workflow_row(scheduled),
-                encoded_workflow_row(started.clone()),
-            ],
-            10,
-        )
-        .unwrap();
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].run_key, run_key);
-        assert_eq!(entries[0].started_event_id, 10);
-    }
-
-    #[test]
-    fn nexus_collect_applies_total_limit_across_runs() {
-        let mut first = sample_state(RunKey::new());
-        first
-            .pending_nexus_operations
-            .insert("op-1".to_owned(), sample_nexus_operation("op-1", true));
-        first
-            .pending_nexus_operations
-            .insert("op-2".to_owned(), sample_nexus_operation("op-2", false));
-        let mut second = sample_state(RunKey::new());
-        second
-            .pending_nexus_operations
-            .insert("op-3".to_owned(), sample_nexus_operation("op-3", true));
-
-        let entries = collect_nexus_sweep_entries(
-            vec![encoded_workflow_row(first), encoded_workflow_row(second)],
-            1,
-        )
-        .unwrap();
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].operation_id, "op-1");
-    }
-
-    #[test]
-    fn nexus_compute_recovery_uses_committed_version_and_due_state() {
-        let mut state = sample_state(RunKey::new());
-        state.versioning_info = Some(WorkflowVersioningInfo {
-            behavior: VersioningBehavior::Pinned,
-            deployment_version: Some(WorkerDeploymentVersionRef {
-                deployment_name: "deployment".to_owned(),
-                build_id: "build".to_owned(),
-            }),
-            ..WorkflowVersioningInfo::default()
-        });
-        state
-            .pending_nexus_operations
-            .insert("ready".to_owned(), sample_nexus_operation("ready", false));
-        let mut backing_off = sample_nexus_operation("later", false);
-        backing_off.next_attempt_at = Some(fixed_now() + Duration::minutes(1));
-        state
-            .pending_nexus_operations
-            .insert("later".to_owned(), backing_off);
-
-        let entries = collect_reconstructible_nexus_deliveries(
-            vec![encoded_workflow_row(state)],
-            fixed_now(),
-            10,
-        )
-        .unwrap();
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].operation_id, "ready");
-        assert_eq!(entries[0].version.deployment_name, "deployment");
-        assert_eq!(entries[0].version.build_id, "build");
     }
 
     #[test]
@@ -1531,39 +1368,6 @@ mod tests {
             Some(DeploymentId("deployment".to_owned()))
         );
         assert_eq!(task.queue.build_id, Some(BuildId("build".to_owned())));
-    }
-
-    #[test]
-    fn activity_sweep_mapping_preserves_state_fields() {
-        let run_key = RunKey::new();
-        let activity = sample_activity_state(7);
-
-        let entries = collect_activity_sweep_entries(vec![(
-            run_key.0,
-            codec::encode_activity_state(&activity).unwrap(),
-        )])
-        .unwrap();
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].run_key, run_key);
-        assert_eq!(entries[0].activity_id, activity.activity_id);
-        assert_eq!(entries[0].schedule_event_id, activity.schedule_event_id);
-        assert_eq!(entries[0].attempt, activity.attempt);
-        assert_eq!(entries[0].original_scheduled_at, activity.scheduled_at);
-        assert_eq!(entries[0].started_at, activity.started_at);
-        assert_eq!(
-            entries[0].schedule_to_close_timeout,
-            activity.schedule_to_close_timeout
-        );
-        assert_eq!(
-            entries[0].schedule_to_start_timeout,
-            activity.schedule_to_start_timeout
-        );
-        assert_eq!(
-            entries[0].start_to_close_timeout,
-            activity.start_to_close_timeout
-        );
-        assert_eq!(entries[0].heartbeat_timeout, activity.heartbeat_timeout);
     }
 
     #[tokio::test]
@@ -1688,12 +1492,6 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            repo.list_dispatchable_workflow_tasks_for_shard(shard_id, 0)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
             repo.list_due_dispatchable_activity_tasks_for_shard(shard_id, fixed_now(), None, 0)
                 .await
                 .unwrap()
@@ -1701,30 +1499,6 @@ mod tests {
         );
         assert!(
             repo.list_due_timers_for_shard(shard_id, fixed_now(), None, 0)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            repo.list_runs_with_workflow_timeouts_for_shard(shard_id, 0)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            repo.list_started_workflow_tasks_for_shard(shard_id, 0)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            repo.list_open_activities_for_shard(shard_id, 0)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            repo.list_pending_nexus_operations_for_shard(shard_id, 0)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1771,28 +1545,6 @@ mod tests {
             state.run_key.0,
             codec::encode_workflow_state(&state).unwrap(),
         )
-    }
-
-    fn sample_nexus_operation(operation_id: &str, with_timeout: bool) -> PendingNexusOperation {
-        PendingNexusOperation {
-            operation_id: operation_id.to_owned(),
-            scheduled_event_id: 42,
-            endpoint: "endpoint".to_owned(),
-            service: "service".to_owned(),
-            operation: "operation".to_owned(),
-            schedule_to_close_timeout: with_timeout.then_some(Duration::seconds(30)),
-            schedule_to_start_timeout: None,
-            start_to_close_timeout: None,
-            scheduled_at: fixed_now(),
-            started: false,
-            started_at: None,
-            attempt: 0,
-            last_attempt_failure: None,
-            next_attempt_at: None,
-            operation_token: String::new(),
-            input: Default::default(),
-            cancellation: None,
-        }
     }
 
     fn sample_transition(run_key: RunKey) -> Transition {

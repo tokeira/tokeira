@@ -31,6 +31,7 @@ pub mod memory;
 pub mod metrics;
 #[cfg(test)]
 mod preservation_property_tests;
+pub mod recovery_index;
 pub mod schema_contract;
 pub mod worker_compute;
 
@@ -38,4 +39,5 @@ pub use api::*;
 pub use chasm::*;
 pub use memory::*;
 pub use metrics::*;
+pub use recovery_index::*;
 pub use worker_compute::*;

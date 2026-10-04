@@ -13,11 +13,10 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokeira_kernel::{HistoryEvent, LoadedRun, Transition};
 use tokeira_storage::{
-    ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, BundleLease, CommitResult,
-    DeleteRunRequest, DeleteRunResult, DispatchableActivityTask, DispatchableWorkflowTask,
-    DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry, RequestRecord, RunHistoryStats,
-    RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentVersionKey,
-    WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
+    AttributedHistoryEvent, BacklogEntry, BundleLease, CommitResult, DeleteRunRequest,
+    DeleteRunResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, LeaseOutcome,
+    LeaseRepository, RequestRecord, RunHistoryStats, RunRepository, TransitionAuditRecord,
+    WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
 };
 use tokeira_types::{
     ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, WorkflowId,
@@ -323,13 +322,14 @@ where
         self.inner.list_due_timers(now, limit).await
     }
 
-    async fn list_dispatchable_workflow_tasks_for_shard(
+    async fn list_recovery_candidates_for_shard(
         &self,
         shard_id: ShardId,
+        cursor: Option<&tokeira_storage::RecoveryCursor>,
         limit: usize,
-    ) -> Result<Vec<DispatchableWorkflowTask>> {
+    ) -> Result<tokeira_storage::RecoveryPage> {
         self.inner
-            .list_dispatchable_workflow_tasks_for_shard(shard_id, limit)
+            .list_recovery_candidates_for_shard(shard_id, cursor, limit)
             .await
     }
 
@@ -359,56 +359,6 @@ where
 
     async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
         self.inner.delete_due_timer_if_matches(timer).await
-    }
-
-    async fn list_runs_with_workflow_timeouts_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
-        self.inner
-            .list_runs_with_workflow_timeouts_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_started_workflow_tasks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<WftTimeoutSweepEntry>> {
-        self.inner
-            .list_started_workflow_tasks_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_open_activities_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<ActivitySweepEntry>> {
-        self.inner
-            .list_open_activities_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_pending_nexus_operations_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<NexusSweepEntry>> {
-        self.inner
-            .list_pending_nexus_operations_for_shard(shard_id, limit)
-            .await
-    }
-
-    async fn list_runs_with_pending_completion_callbacks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<tokeira_storage::CompletionCallbackSweepEntry>> {
-        self.inner
-            .list_runs_with_pending_completion_callbacks_for_shard(shard_id, limit)
-            .await
     }
 }
 

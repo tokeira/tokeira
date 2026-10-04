@@ -2556,14 +2556,16 @@ async fn sweep_rebuilds_backing_off_completion_callbacks() -> Result<()> {
     })
     .await?;
 
-    // The default single-shard store homes every run on shard 0; the rebuild query finds
-    // the backing-off callback there.
-    let entries = store
-        .list_runs_with_pending_completion_callbacks_for_shard(
-            tokeira_types::ShardId(0),
-            usize::MAX,
-        )
+    // The default single-shard store homes every run on shard 0; the run is a
+    // recovery candidate there, and its entries name the backing-off callback.
+    let page = store
+        .list_recovery_candidates_for_shard(tokeira_types::ShardId(0), None, 100)
         .await?;
+    let entries: Vec<_> = page
+        .states
+        .iter()
+        .flat_map(|state| tokeira_storage::recovery_entries(state).completion_callbacks)
+        .collect();
     assert!(
         entries
             .iter()

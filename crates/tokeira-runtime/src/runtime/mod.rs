@@ -3992,12 +3992,16 @@ mod tests {
             }
         }
 
-        async fn list_dispatchable_workflow_tasks_for_shard(
+        async fn list_recovery_candidates_for_shard(
             &self,
-            _shard_id: tokeira_types::ShardId,
+            _shard_id: ShardId,
+            _cursor: Option<&tokeira_storage::RecoveryCursor>,
             _limit: usize,
-        ) -> Result<Vec<DispatchableWorkflowTask>> {
-            panic!("unused in timer scanner tests")
+        ) -> Result<tokeira_storage::RecoveryPage> {
+            Ok(tokeira_storage::RecoveryPage {
+                states: Vec::new(),
+                next: None,
+            })
         }
 
         async fn list_due_dispatchable_activity_tasks_for_shard(
@@ -4026,46 +4030,6 @@ mod tests {
                 .expect("deletes lock poisoned")
                 .push(timer.clone());
             Ok(true)
-        }
-
-        async fn list_runs_with_workflow_timeouts_for_shard(
-            &self,
-            _shard_id: tokeira_types::ShardId,
-            _limit: usize,
-        ) -> Result<Vec<tokeira_storage::WorkflowTimeoutSweepEntry>> {
-            panic!("unused in timer scanner tests")
-        }
-
-        async fn list_started_workflow_tasks_for_shard(
-            &self,
-            _shard_id: tokeira_types::ShardId,
-            _limit: usize,
-        ) -> Result<Vec<tokeira_storage::WftTimeoutSweepEntry>> {
-            panic!("unused in timer scanner tests")
-        }
-
-        async fn list_open_activities_for_shard(
-            &self,
-            _shard_id: tokeira_types::ShardId,
-            _limit: usize,
-        ) -> Result<Vec<tokeira_storage::ActivitySweepEntry>> {
-            panic!("unused in timer scanner tests")
-        }
-
-        async fn list_pending_nexus_operations_for_shard(
-            &self,
-            _shard_id: tokeira_types::ShardId,
-            _limit: usize,
-        ) -> Result<Vec<tokeira_storage::NexusSweepEntry>> {
-            panic!("unused in timer scanner tests")
-        }
-
-        async fn list_runs_with_pending_completion_callbacks_for_shard(
-            &self,
-            _shard_id: tokeira_types::ShardId,
-            _limit: usize,
-        ) -> Result<Vec<tokeira_storage::CompletionCallbackSweepEntry>> {
-            panic!("unused in timer scanner tests")
         }
     }
 }

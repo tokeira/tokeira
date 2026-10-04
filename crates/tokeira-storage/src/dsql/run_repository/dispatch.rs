@@ -258,41 +258,6 @@ impl DsqlRunRepository {
             Ok(drained)
         })
     }
-
-    #[instrument(name = "dsql.list_dispatchable_workflow_tasks_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
-    pub(super) async fn do_list_dispatchable_workflow_tasks_for_shard(
-        &self,
-        shard_id: ShardId,
-        limit: usize,
-    ) -> Result<Vec<DispatchableWorkflowTask>> {
-        record_dsql_operation!(
-            self,
-            "list_dispatchable_workflow_tasks_for_shard",
-            Some(shard_id),
-            {
-                if limit == 0 {
-                    metrics::record_dsql_rows_read("list_dispatchable_workflow_tasks_for_shard", 0);
-                    return Ok(Vec::new());
-                }
-
-                let mut permit = self.director.acquire(DbClass::Read).await?;
-                let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                    "SELECT run_key, state_data
-             FROM workflow_hot
-             WHERE shard_id = $1",
-                )
-                .bind(Self::shard_id_to_uuid(shard_id))
-                .fetch_all(permit.connection()?)
-                .await?;
-                metrics::record_dsql_rows_read(
-                    "list_dispatchable_workflow_tasks_for_shard",
-                    rows.len(),
-                );
-
-                collect_dispatchable_workflow_tasks(rows, None, limit)
-            }
-        )
-    }
 }
 
 pub(super) fn collect_dispatchable_workflow_tasks(

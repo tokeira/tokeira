@@ -1,0 +1,5 @@
+kind: changed
+body: Shard recovery and worker-compute sampling read only runs that hold recoverable work, indexed by a new workflow_hot column (migrations V072 and V073).
+time: 2026-10-04T23:39:08.000000+01:00
+custom:
+    Slice: 79c5226d-48c8-47fb-96db-c770f5e3a819

@@ -35,7 +35,8 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use time::OffsetDateTime;
 use tokeira_storage::{
-    DueActivityDispatch, DueTimer, LeaseOutcome, LeaseRepository, RunRepository,
+    DueActivityDispatch, DueTimer, LeaseOutcome, LeaseRepository, RecoveryCursor, RunRepository,
+    recovery_entries,
 };
 use tokeira_types::{ShardEpoch, ShardId};
 use tokio::sync::oneshot;
@@ -72,6 +73,10 @@ pub struct SweepResult {
     pub completion_callback_entries_reconstructed: usize,
     pub expired_sticky_claims_cleared: usize,
 }
+
+/// Runs the sweep decodes per page of recovery candidates; it holds one page
+/// of states at a time.
+const RECOVERY_PAGE: usize = 100;
 
 /// Rows the sweep reads per page of due timers. A timer row is a few dozen
 /// bytes.
@@ -113,15 +118,96 @@ where
     let mut result = SweepResult::default();
     let now = OffsetDateTime::now_utc();
 
-    for task in repo
-        .list_dispatchable_workflow_tasks_for_shard(shard_id, usize::MAX)
-        .await?
-    {
-        // Recovery republishes the same derived envelope as the hot path. The
-        // fresh broker has no poller observations, so it safely selects the
-        // supplied normal fallback without mutating durable affinity.
-        broker.publish_workflow_task(task, None).await;
-        result.workflow_tasks_republished += 1;
+    // Every run whose stored state holds work to rebuild, a page at a time:
+    // its scheduled workflow task is republished, and its timeouts and
+    // callbacks are tracked again, all from one decode of its state
+    // (recovery-index Requirement 4). Runs with nothing to rebuild are never
+    // read.
+    let mut cursor: Option<RecoveryCursor> = None;
+    loop {
+        let page = repo
+            .list_recovery_candidates_for_shard(shard_id, cursor.as_ref(), RECOVERY_PAGE)
+            .await?;
+        for state in &page.states {
+            let entries = recovery_entries(state);
+            if let Some(task) = entries.dispatchable_workflow_task {
+                // Recovery republishes the same derived envelope as the hot
+                // path. The fresh broker has no poller observations, so it
+                // safely selects the supplied normal fallback without mutating
+                // durable affinity.
+                broker.publish_workflow_task(task, None).await;
+                result.workflow_tasks_republished += 1;
+            }
+            if let Some(entry) = entries.workflow_timeout {
+                workflow_timeout_tracking.insert(WorkflowTimeoutEntry {
+                    run_key: entry.run_key,
+                    shard_id,
+                    workflow_execution_timeout: entry.workflow_execution_timeout,
+                    workflow_run_timeout: entry.workflow_run_timeout,
+                    started_at: entry.started_at,
+                    workflow_start_delay: entry.workflow_start_delay,
+                    first_run_started_at: entry.first_run_started_at,
+                    has_retry_policy: entry.has_retry_policy,
+                });
+                result.workflow_timeout_entries_reconstructed += 1;
+            }
+            if let Some(entry) = entries.started_workflow_task {
+                wft_timeout_tracking.insert(WftTimeoutEntry {
+                    kind: WftTimeoutKind::StartToClose,
+                    run_key: entry.run_key,
+                    shard_id,
+                    logical_seq: entry.logical_seq,
+                    started_event_id: entry.started_event_id,
+                    started_at: entry.started_at,
+                    workflow_task_timeout: entry.workflow_task_timeout,
+                });
+                result.wft_timeout_entries_reconstructed += 1;
+            }
+            for entry in entries.activities {
+                // No heartbeat time is stored, so until the next heartbeat the
+                // heartbeat deadline runs from the activity's start
+                // (runtime-sweeper-recovery Requirement 8.6). Schedule-to-start
+                // re-anchors at the CURRENT attempt's durable dispatch time: a
+                // retry's s2s clock runs from its own dispatch, not from the
+                // original schedule, which stays the schedule-to-close anchor
+                // spanning the whole retry chain (retry.go:108-110 @ v1.31.0).
+                activity_tracking.insert(ActivityTrackingEntry {
+                    run_key: entry.run_key,
+                    shard_id,
+                    activity_id: entry.activity_id,
+                    original_scheduled_at: entry.original_scheduled_at,
+                    last_dispatched_at: entry
+                        .current_attempt_scheduled_at
+                        .unwrap_or(entry.original_scheduled_at),
+                    started_at: entry.started_at,
+                    last_heartbeat_at: None,
+                    cancel_requested: false,
+                });
+                result.activity_tracking_entries_reconstructed += 1;
+            }
+            for entry in entries.nexus_timeouts {
+                nexus_timeout_tracking.insert(NexusTimeoutEntry {
+                    run_key: entry.run_key,
+                    shard_id,
+                    operation_id: entry.operation_id,
+                    scheduled_event_id: entry.scheduled_event_id,
+                    scheduled_at: entry.scheduled_at,
+                });
+                result.nexus_timeout_entries_reconstructed += 1;
+            }
+            for entry in entries.completion_callbacks {
+                completion_callback_tracking.insert(CompletionCallbackTrackingEntry {
+                    run_key: entry.run_key,
+                    shard_id,
+                    callback_index: entry.callback_index,
+                });
+                result.completion_callback_entries_reconstructed += 1;
+            }
+        }
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
     }
 
     // Only rows due at the sweep's `now` republish — a retry inside its
@@ -144,92 +230,6 @@ where
     let timers = fire_due_timers(shard_id, repo, lanes, lane_count, now, DUE_TIMER_PAGE).await?;
     result.due_timers_injected += timers.submitted;
     result.stale_timer_rows_deleted += timers.deleted;
-
-    for entry in repo
-        .list_runs_with_workflow_timeouts_for_shard(shard_id, usize::MAX)
-        .await?
-    {
-        workflow_timeout_tracking.insert(WorkflowTimeoutEntry {
-            run_key: entry.run_key,
-            shard_id,
-            workflow_execution_timeout: entry.workflow_execution_timeout,
-            workflow_run_timeout: entry.workflow_run_timeout,
-            started_at: entry.started_at,
-            workflow_start_delay: entry.workflow_start_delay,
-            first_run_started_at: entry.first_run_started_at,
-            has_retry_policy: entry.has_retry_policy,
-        });
-        result.workflow_timeout_entries_reconstructed += 1;
-    }
-
-    for entry in repo
-        .list_started_workflow_tasks_for_shard(shard_id, usize::MAX)
-        .await?
-    {
-        wft_timeout_tracking.insert(WftTimeoutEntry {
-            kind: WftTimeoutKind::StartToClose,
-            run_key: entry.run_key,
-            shard_id,
-            logical_seq: entry.logical_seq,
-            started_event_id: entry.started_event_id,
-            started_at: entry.started_at,
-            workflow_task_timeout: entry.workflow_task_timeout,
-        });
-        result.wft_timeout_entries_reconstructed += 1;
-    }
-
-    for entry in repo
-        .list_open_activities_for_shard(shard_id, usize::MAX)
-        .await?
-    {
-        // Heartbeat history is volatile and not durable: on rebuild the heartbeat
-        // clock restarts (`last_heartbeat_at: None`). Restarting the heartbeat
-        // clock from takeover avoids spuriously timing out an activity whose last
-        // heartbeat predated the failover. Schedule-to-start re-anchors at the
-        // CURRENT attempt's durable dispatch time — a retry's s2s clock runs
-        // from its own dispatch, not from the original schedule, which stays
-        // the schedule-to-close anchor spanning the whole retry chain
-        // (retry.go:108-110 @ v1.31.0).
-        activity_tracking.insert(ActivityTrackingEntry {
-            run_key: entry.run_key,
-            shard_id,
-            activity_id: entry.activity_id,
-            original_scheduled_at: entry.original_scheduled_at,
-            last_dispatched_at: entry
-                .current_attempt_scheduled_at
-                .unwrap_or(entry.original_scheduled_at),
-            started_at: entry.started_at,
-            last_heartbeat_at: None,
-            cancel_requested: false,
-        });
-        result.activity_tracking_entries_reconstructed += 1;
-    }
-
-    for entry in repo
-        .list_pending_nexus_operations_for_shard(shard_id, usize::MAX)
-        .await?
-    {
-        nexus_timeout_tracking.insert(NexusTimeoutEntry {
-            run_key: entry.run_key,
-            shard_id,
-            operation_id: entry.operation_id,
-            scheduled_event_id: entry.scheduled_event_id,
-            scheduled_at: entry.scheduled_at,
-        });
-        result.nexus_timeout_entries_reconstructed += 1;
-    }
-
-    for entry in repo
-        .list_runs_with_pending_completion_callbacks_for_shard(shard_id, usize::MAX)
-        .await?
-    {
-        completion_callback_tracking.insert(CompletionCallbackTrackingEntry {
-            run_key: entry.run_key,
-            shard_id,
-            callback_index: entry.callback_index,
-        });
-        result.completion_callback_entries_reconstructed += 1;
-    }
 
     Ok(result)
 }

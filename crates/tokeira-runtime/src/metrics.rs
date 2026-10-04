@@ -23,6 +23,14 @@ pub const LANE_SUBMIT_DURATION_SECONDS: &str = "tokeira_runtime_lane_submit_dura
 pub const LANE_QUEUE_WAIT_SECONDS: &str = "tokeira_runtime_lane_queue_wait_seconds";
 pub const LANE_PROCESSING_DURATION_SECONDS: &str =
     "tokeira_runtime_lane_processing_duration_seconds";
+/// Commands waiting for a lane, per lane: its channel plus a command carried
+/// over from the last activation. Sampled after each activation, so an idle
+/// lane reads zero.
+pub const LANE_QUEUE_DEPTH: &str = "tokeira_runtime_lane_queue_depth";
+/// Activations whose drain stopped on another run's command, per lane. The
+/// lane runs that command next instead of re-sending it to its own channel; a
+/// high rate means the runs that share the lane are interleaving.
+pub const LANE_CARRY_OVERS_TOTAL: &str = "tokeira_runtime_lane_carry_overs_total";
 pub const NOT_SHARD_OWNER_TOTAL: &str = "tokeira_runtime_not_shard_owner_total";
 pub const QUERY_DISPATCH_TOTAL: &str = "tokeira_runtime_query_dispatch_total";
 pub const QUERY_BUFFER_WAIT_SECONDS: &str = "tokeira_runtime_query_buffer_wait_seconds";
@@ -124,6 +132,8 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
         LANE_PROCESSING_DURATION_SECONDS,
         MetricType::DurationHistogram,
     ),
+    (LANE_QUEUE_DEPTH, MetricType::Gauge),
+    (LANE_CARRY_OVERS_TOTAL, MetricType::Counter),
     (NOT_SHARD_OWNER_TOTAL, MetricType::Counter),
     (QUERY_DISPATCH_TOTAL, MetricType::Counter),
     (QUERY_BUFFER_WAIT_SECONDS, MetricType::DurationHistogram),
@@ -410,6 +420,16 @@ pub fn record_lane_queue_wait(duration: std::time::Duration) {
 pub fn record_lane_processing_duration(command_type: &'static str, duration: std::time::Duration) {
     histogram!(LANE_PROCESSING_DURATION_SECONDS, "command_type" => command_type)
         .record(duration.as_secs_f64());
+}
+
+/// Record how many commands are waiting for a lane after an activation.
+pub fn set_lane_queue_depth(lane_id: usize, depth: usize) {
+    gauge!(LANE_QUEUE_DEPTH, "lane_id" => lane_id.to_string()).set(depth as f64);
+}
+
+/// Record an activation that carried another run's command into the next one.
+pub fn record_lane_carry_over(lane_id: usize) {
+    counter!(LANE_CARRY_OVERS_TOTAL, "lane_id" => lane_id.to_string()).increment(1);
 }
 
 /// Record a runtime ownership rejection.
@@ -729,6 +749,8 @@ mod tests {
                 "WorkflowTaskCompleted",
                 std::time::Duration::from_millis(19),
             );
+            set_lane_queue_depth(3, 5);
+            record_lane_carry_over(3);
             record_not_shard_owner(NotShardOwnerOperationLabel::Submit);
             record_query_dispatch(
                 QueryDispatchPathLabel::Direct,
@@ -804,6 +826,14 @@ mod tests {
             }
             other => panic!("expected histogram, got {other:?}"),
         }
+
+        let (labels, value) = snapshot.get(LANE_QUEUE_DEPTH).unwrap();
+        assert_eq!(labels.get("lane_id"), Some(&"3".to_string()));
+        assert_eq!(value, &DebugValue::Gauge(5.0.into()));
+
+        let (labels, value) = snapshot.get(LANE_CARRY_OVERS_TOTAL).unwrap();
+        assert_eq!(labels.get("lane_id"), Some(&"3".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
 
         let (labels, value) = snapshot.get(NOT_SHARD_OWNER_TOTAL).unwrap();
         assert_eq!(labels.get("operation"), Some(&"submit".to_string()));

@@ -1,0 +1,5 @@
+kind: added
+body: The runtime reports each lane's backlog as tokeira_runtime_lane_queue_depth and how often its runs interleave as tokeira_runtime_lane_carry_overs_total.
+time: 2026-10-04T16:15:42.000000+01:00
+custom:
+    Slice: 51080029-57cf-4bb8-a1d7-77226876ae00

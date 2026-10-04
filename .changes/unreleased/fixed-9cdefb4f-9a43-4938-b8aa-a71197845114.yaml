@@ -1,0 +1,5 @@
+kind: fixed
+body: A runtime lane no longer deadlocks when its mailbox is full and another run's command waits behind the active run; lane commands keep arrival order.
+time: 2026-10-04T16:15:42.000000+01:00
+custom:
+    Slice: 9cdefb4f-9a43-4938-b8aa-a71197845114

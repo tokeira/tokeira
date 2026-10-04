@@ -670,9 +670,11 @@ where
     /// where the caller addresses the activity by `(run_key, activity_id)`
     /// instead of presenting a token. Stamps the token with the *live* shard
     /// epoch so a token minted here is fenced identically to one handed out at
-    /// poll time. Fails with [`ActivityTokenResolutionError::ActivityNotStarted`]
-    /// if the activity has no `started_event_id`, because a not-yet-started
-    /// activity has no completion identity to address.
+    /// poll time. Fails with [`ActivityTokenResolutionError::RunClosed`] if the
+    /// run is closed, and otherwise with
+    /// [`ActivityTokenResolutionError::ActivityNotStarted`] if the activity has
+    /// no `started_event_id`, because a not-yet-started activity has no
+    /// completion identity to address.
     pub async fn resolve_activity_token(
         &self,
         run_key: RunKey,
@@ -686,6 +688,16 @@ where
         let LoadedRun::Existing(state) = loaded else {
             return Err(ActivityTokenResolutionError::RunNotFound { run_key });
         };
+        // Every by-id verb checks that the run is running before it resolves
+        // the activity id, so a closed run answers `ErrWorkflowCompleted` even
+        // when its activity is gone or never started
+        // (recordactivitytaskheartbeat/api.go:51-53,
+        // respondactivitytaskcompleted/api.go:60-61,
+        // respondactivitytaskfailed/api.go:61-62,
+        // respondactivitytaskcanceled/api.go:59-60 @ v1.31.0).
+        if !state.is_open() {
+            return Err(ActivityTokenResolutionError::RunClosed { run_key });
+        }
         let activity = state.activities.get(activity_id).ok_or_else(|| {
             ActivityTokenResolutionError::ActivityNotFound {
                 run_key,

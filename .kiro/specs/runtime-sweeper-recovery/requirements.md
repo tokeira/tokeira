@@ -151,7 +151,7 @@ Depends on: Feature 1 (Lane OCC Retry and Mailbox Coalescing), Feature 2 (Activi
 2. FOR EACH open activity discovered, THE Sweeper SHALL insert an entry into ActivityTrackingState with the scheduling and start timestamps derived from authoritative state.
 3. THE reconstructed ActivityTrackingState entries SHALL contain sufficient information for the Activity_Timeout_Scanner to evaluate schedule-to-close, schedule-to-start, start-to-close, and heartbeat timeouts.
 4. THE durable `ActivityState` (in `tokeira-kernel`) SHALL be extended with `scheduled_at: OffsetDateTime` and `started_at: Option<OffsetDateTime>` fields so that the sweeper can reconstruct timeout tracking without replaying history. The kernel SHALL populate `scheduled_at` from the `happened_at` timestamp of the `ActivityTaskScheduled` history event. The runtime SHALL populate `started_at` via the existing activity-start OCC upsert (activity starts are runtime-side, not kernel events).
-5. THE `ActivitySweepEntry` returned by `list_open_activities_for_shard` SHALL carry `original_scheduled_at` and `started_at` derived from the durable `ActivityState` fields added in criterion 4.
+5. THE `ActivitySweepEntry` the Sweeper derives for each activity of an open run SHALL carry `original_scheduled_at` and `started_at` derived from the durable `ActivityState` fields added in criterion 4. The Sweeper derives it from the run's workflow state ([recovery-index](../recovery-index/requirements.md) Requirement 4).
 6. WHEN reconstructing `ActivityTrackingEntry` from a sweep entry, THE Sweeper SHALL set `last_heartbeat_at` to `None` and `cancel_requested` to `false`. These fields have no durable source and are best-effort on recovery. Heartbeat timeout evaluation falls back to `started_at` when `last_heartbeat_at` is `None`, which may produce false-positive heartbeat timeouts after failover if the activity had been heartbeating regularly before the failover but the elapsed time since `started_at` exceeds the heartbeat timeout. This is an accepted trade-off: the alternative (suppressing heartbeat timeout evaluation entirely after recovery) would leave genuinely unresponsive activities undetected. Cancellation state will be re-established when the worker next heartbeats.
 
 ---
@@ -178,7 +178,7 @@ Depends on: Feature 1 (Lane OCC Retry and Mailbox Coalescing), Feature 2 (Activi
 2. FOR EACH qualifying Nexus operation discovered, THE Sweeper SHALL insert an entry into NexusTimeoutTrackingState with the operation's timeout configuration and scheduled timestamp.
 3. THE reconstructed NexusTimeoutTrackingState entries SHALL contain sufficient information for the Nexus_Timeout_Scanner to evaluate schedule-to-close timeouts.
 4. THE durable `PendingNexusOperation` (in `tokeira-kernel`) SHALL be extended with `schedule_to_close_timeout: Option<Duration>` and `scheduled_at: OffsetDateTime` fields so that the sweeper can reconstruct Nexus timeout tracking without replaying history. The kernel SHALL populate `scheduled_at` from the `happened_at` timestamp of the `NexusOperationScheduled` history event, and `schedule_to_close_timeout` from the command parameters.
-5. THE `NexusSweepEntry` returned by `list_pending_nexus_operations_for_shard` SHALL carry `schedule_to_close_timeout` and `scheduled_at` derived from the durable `PendingNexusOperation` fields added in criterion 4.
+5. THE `NexusSweepEntry` the Sweeper derives for each pending Nexus operation SHALL carry `schedule_to_close_timeout` and `scheduled_at` derived from the durable `PendingNexusOperation` fields added in criterion 4. The Sweeper derives it from the run's workflow state ([recovery-index](../recovery-index/requirements.md) Requirement 4).
 
 ---
 
@@ -229,10 +229,10 @@ Depends on: Feature 1 (Lane OCC Retry and Mailbox Coalescing), Feature 2 (Activi
 
 1. THE InMemoryStore SHALL maintain a mapping from RunKey to ShardId.
 2. WHEN a run is created, THE InMemoryStore SHALL assign the run to a shard (deterministically derived from the RunKey or explicitly provided).
-3. THE InMemoryStore SHALL support shard-filtered variants of `list_dispatchable_workflow_tasks`, `list_dispatchable_activity_tasks`, and `list_due_timers`.
-4. THE InMemoryStore SHALL support a shard-filtered query to list open runs with timeout configuration for a given shard.
-5. THE InMemoryStore SHALL support a shard-filtered query to list open activities for a given shard.
-6. THE InMemoryStore SHALL support a shard-filtered query to list pending Nexus operations with timeouts for a given shard.
+3. THE InMemoryStore SHALL support shard-filtered variants of `list_dispatchable_activity_tasks` and `list_due_timers`, and SHALL list a shard's recovery candidates ([recovery-index](../recovery-index/requirements.md) Requirement 6), from which the Sweeper derives a shard's dispatchable workflow tasks.
+4. FROM a shard's recovery candidates THE Sweeper SHALL derive the open runs with timeout configuration for that shard.
+5. FROM a shard's recovery candidates THE Sweeper SHALL derive the open activities for that shard.
+6. FROM a shard's recovery candidates THE Sweeper SHALL derive the pending Nexus operations with timeouts for that shard.
 
 ---
 

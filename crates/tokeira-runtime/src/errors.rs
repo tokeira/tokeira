@@ -82,6 +82,12 @@ pub enum ActivityTokenResolutionError {
     #[error("run not found while resolving activity token: {run_key:?}")]
     RunNotFound { run_key: RunKey },
 
+    /// The run is closed. v1.31.0 refuses a by-id call on a closed run before
+    /// it looks the activity up, so this holds whether or not the activity
+    /// exists or has started; the edge renders it as `ErrWorkflowCompleted`.
+    #[error("run is closed while resolving activity token: {run_key:?}")]
+    RunClosed { run_key: RunKey },
+
     /// The run exists but has no activity with this id.
     #[error("activity not found while resolving activity token: {run_key:?}/{activity_id}")]
     ActivityNotFound {

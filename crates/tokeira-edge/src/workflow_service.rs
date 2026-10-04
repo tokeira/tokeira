@@ -8495,6 +8495,11 @@ impl WorkflowService {
                 namespace: namespace.to_string(),
                 workflow_id: workflow_id.to_string(),
             },
+            // v1.31.0's `ErrWorkflowCompleted` (consts/const.go:51 @ v1.31.0),
+            // the answer every other mutation of a closed run gets.
+            ActivityTokenResolutionError::RunClosed { .. } => {
+                EdgeError::NotFound("workflow execution already completed".to_string())
+            }
             ActivityTokenResolutionError::ActivityNotFound { .. } => EdgeError::ActivityNotFound {
                 namespace: namespace.to_string(),
                 workflow_id: workflow_id.to_string(),
@@ -10614,6 +10619,155 @@ mod tests {
         .expect("redispatched task");
         assert_eq!(recovered.run_key, run_key);
         assert!(recovered.token.attempt > first.token.attempt);
+        Ok(())
+    }
+
+    /// Every by-id activity verb on a closed run answers v1.31.0's `ErrWorkflowCompleted`, which
+    /// its history handlers return before resolving the activity id: for a pending activity the
+    /// closed run keeps, and for one it never had.
+    #[tokio::test]
+    async fn by_id_activity_calls_on_a_closed_run_answer_workflow_completed() -> Result<()> {
+        let (service, runtime, namespace_id, workflow_id, run_id) = update_test_service().await?;
+        let task = runtime
+            .poll_workflow_task(
+                tokeira_types::QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName("queue-a".to_string()),
+                    task_kind: TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                },
+                WorkerIdentity("worker-a".to_string()),
+                tokio::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("workflow task");
+        let payload = |data: &[u8]| Payload {
+            metadata: Default::default(),
+            data: data.to_vec(),
+            external_payloads: Vec::new(),
+        };
+        // Scheduling the activity and completing in one task closes the run
+        // with the activity still pending.
+        runtime
+            .complete_workflow_task(tokeira_kernel::WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
+                token: task.token,
+                identity: WorkerIdentity("worker-a".to_string()),
+                sdk_metadata: None,
+                metering_metadata: None,
+                worker_version: None,
+                versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky: None,
+                commands: vec![
+                    WorkflowCommand::ScheduleActivity {
+                        activity_id: "activity-1".to_string(),
+                        activity_type: "activity-type".to_string(),
+                        task_queue: TaskQueueName("activity-q".to_string()),
+                        input: Payloads(vec![payload(b"input")]),
+                        header: None,
+                        request_eager_execution: false,
+                        retry_policy: None,
+                        deployment: None,
+                        build_id: None,
+                        schedule_to_close_timeout: Some(Duration::minutes(5)),
+                        schedule_to_start_timeout: Some(Duration::seconds(30)),
+                        start_to_close_timeout: Some(Duration::minutes(1)),
+                        heartbeat_timeout: Some(Duration::seconds(20)),
+                        priority: None,
+                    },
+                    WorkflowCommand::CompleteWorkflow {
+                        result: Payloads(vec![payload(b"done")]),
+                    },
+                ],
+                force_new_workflow_task: false,
+                limits: Default::default(),
+                delivered_update_ids: Vec::new(),
+                request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+                now: OffsetDateTime::now_utc(),
+            })
+            .await?;
+
+        let headers = HeaderMap::new();
+        let run_id = Some(run_id.0.to_string());
+        for activity_id in ["activity-1", "missing-activity"] {
+            let errors = [
+                service
+                    .record_activity_task_heartbeat_by_id(
+                        &headers,
+                        crate::translate::RecordActivityTaskHeartbeatByIdRequest {
+                            namespace: "default".to_string(),
+                            workflow_id: workflow_id.0.clone(),
+                            run_id: run_id.clone(),
+                            activity_id: activity_id.to_string(),
+                            details: None,
+                            identity: "worker-b".to_string(),
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .expect_err("heartbeat by id"),
+                service
+                    .respond_activity_task_completed_by_id(
+                        &headers,
+                        crate::translate::RespondActivityTaskCompletedByIdRequest {
+                            namespace: "default".to_string(),
+                            workflow_id: workflow_id.0.clone(),
+                            run_id: run_id.clone(),
+                            activity_id: activity_id.to_string(),
+                            result: Payloads(vec![payload(b"result")]),
+                            identity: "worker-b".to_string(),
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .expect_err("completed by id"),
+                service
+                    .respond_activity_task_failed_by_id(
+                        &headers,
+                        crate::translate::RespondActivityTaskFailedByIdRequest {
+                            namespace: "default".to_string(),
+                            workflow_id: workflow_id.0.clone(),
+                            run_id: run_id.clone(),
+                            activity_id: activity_id.to_string(),
+                            failure: payload(b"failure"),
+                            failure_error_type: None,
+                            is_non_retryable: false,
+                            identity: "worker-b".to_string(),
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .expect_err("failed by id"),
+                service
+                    .respond_activity_task_canceled_by_id(
+                        &headers,
+                        crate::translate::RespondActivityTaskCanceledByIdRequest {
+                            namespace: "default".to_string(),
+                            workflow_id: workflow_id.0.clone(),
+                            run_id: run_id.clone(),
+                            activity_id: activity_id.to_string(),
+                            details: None,
+                            identity: "worker-b".to_string(),
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .expect_err("canceled by id"),
+            ];
+            for error in errors {
+                assert!(
+                    matches!(
+                        &error,
+                        EdgeError::NotFound(message)
+                            if message == "workflow execution already completed"
+                    ),
+                    "{activity_id}: {error:?}"
+                );
+            }
+        }
         Ok(())
     }
 

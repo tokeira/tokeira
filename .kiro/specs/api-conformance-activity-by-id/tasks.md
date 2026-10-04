@@ -242,6 +242,14 @@ Property-based tests validate all 15 correctness properties from the revised des
   - [x] 16.2 Run the UpdateActivityOptions and batch activity-options suites twice.
     - _Requirements: 7.1–7.8_
 
+- [x] 17. Refuse ById calls on a closed run before the activity lookup
+  - `resolve_activity_token` returns `RunClosed` for a closed run before it looks the activity up;
+    the edge maps it to `ErrWorkflowCompleted` (`NOT_FOUND`, `workflow execution already completed`)
+    for all four ById verbs, whether or not the activity exists or has started.
+  - Runtime test `resolve_activity_token_refuses_a_closed_run`; edge test
+    `by_id_activity_calls_on_a_closed_run_answer_workflow_completed`.
+  - _Requirements: 1.7_
+
 ## Notes
 
 - All property tests are required — they validate externally-visible correctness contracts.
@@ -280,7 +288,8 @@ Property-based tests validate all 15 correctness properties from the revised des
     { "id": 11, "tasks": ["13.1", "13.2", "13.3"] },
     { "id": 12, "tasks": ["14.1", "14.2", "14.3", "14.4", "14.5"] },
     { "id": 13, "tasks": ["15"] },
-    { "id": 14, "tasks": ["16.1", "16.2"] }
+    { "id": 14, "tasks": ["16.1", "16.2"] },
+    { "id": 15, "tasks": ["17"] }
   ]
 }
 ```

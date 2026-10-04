@@ -479,6 +479,101 @@ async fn resolve_activity_token_distinguishes_missing_and_not_started() -> Resul
     Ok(())
 }
 
+/// v1.31.0 checks that a run is still running before it looks an activity up by id, so a
+/// closed run refuses resolution alike for a pending activity, which it keeps, and for an
+/// activity it never had.
+#[tokio::test]
+async fn resolve_activity_token_refuses_a_closed_run() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let start = runtime
+        .start_workflow(start_request(
+            namespace_id,
+            WorkflowId("activity-by-id-closed".to_string()),
+            "req-start",
+        ))
+        .await?;
+    let run_key = match start {
+        CommitResult::Applied { new_state } => new_state.run_key,
+        other => panic!("unexpected start result: {other:?}"),
+    };
+    let workflow_task = runtime
+        .poll_workflow_task(
+            workflow_queue(namespace_id),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("workflow task should be pollable");
+    // Scheduling the activity and completing in one task closes the run with
+    // the activity still pending.
+    let _ = runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
+            token: workflow_task.token,
+            identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands: vec![
+                WorkflowCommand::ScheduleActivity {
+                    activity_id: "activity-1".to_string(),
+                    activity_type: "activity-type".to_string(),
+                    task_queue: TaskQueueName("activity-q".to_string()),
+                    input: payloads("input"),
+                    header: None,
+                    request_eager_execution: false,
+                    retry_policy: None,
+                    deployment: None,
+                    build_id: None,
+                    schedule_to_close_timeout: Some(Duration::minutes(5)),
+                    schedule_to_start_timeout: Some(Duration::seconds(30)),
+                    start_to_close_timeout: Some(Duration::minutes(1)),
+                    heartbeat_timeout: Some(Duration::seconds(20)),
+                    priority: None,
+                },
+                WorkflowCommand::CompleteWorkflow {
+                    result: payloads("done"),
+                },
+            ],
+            force_new_workflow_task: false,
+            limits: Default::default(),
+            delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+    let LoadedRun::Existing(state) = store.load_run(run_key).await? else {
+        panic!("run should exist");
+    };
+    assert!(!state.is_open());
+    assert!(state.activities.contains_key("activity-1"));
+
+    for activity_id in ["activity-1", "missing-activity"] {
+        let error = runtime
+            .resolve_activity_token(run_key, activity_id)
+            .await
+            .expect_err("a closed run should not resolve an activity token");
+        assert!(
+            matches!(error, ActivityTokenResolutionError::RunClosed { .. }),
+            "{activity_id}: {error:?}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn cancel_activity_task_emits_canceled_history_with_worker_identity() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());

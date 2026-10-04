@@ -110,6 +110,7 @@ silently broaden the v1.31.0 claim.
 4. WHEN the `run_id` field is empty, THE Edge SHALL resolve to the current (latest) run for the given `(namespace, workflow_id)`.
 5. IF the `run_id` field is non-empty but does not parse as a valid `RunId`, THEN THE Edge SHALL return a gRPC `INVALID_ARGUMENT` status.
 6. IF the `activity_id` corresponds to a scheduled but not-yet-started activity and the RPC attempts to complete, fail, or cancel that activity, THEN THE Edge SHALL return a gRPC `FAILED_PRECONDITION` status indicating the activity has not started.
+7. IF the resolved run is closed, THEN THE Edge SHALL return v1.31.0's `ErrWorkflowCompleted`, a gRPC `NOT_FOUND` status with the message `workflow execution already completed`, for every ById activity RPC, whether or not the activity exists or has started; this check precedes criteria 3 and 6 and Requirement 2.4. v1.31.0's history handlers check `IsWorkflowExecutionRunning` before they resolve the activity id (`service/history/api/recordactivitytaskheartbeat/api.go:51-53`, `service/history/api/respondactivitytaskcompleted/api.go:60-61`, `service/history/api/respondactivitytaskfailed/api.go:61-62`, `service/history/api/respondactivitytaskcanceled/api.go:59-60`; `ErrWorkflowCompleted` at `service/history/consts/const.go:51 @ v1.31.0`).
 
 ### Requirement 2: Record Activity Task Heartbeat By ID
 

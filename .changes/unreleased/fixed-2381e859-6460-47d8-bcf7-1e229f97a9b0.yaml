@@ -1,0 +1,5 @@
+kind: fixed
+body: By-id activity calls on a closed workflow run now answer that the workflow execution already completed, even when the activity is gone or never started.
+time: 2026-10-04T21:24:52.000000+01:00
+custom:
+    Slice: 2381e859-6460-47d8-bcf7-1e229f97a9b0

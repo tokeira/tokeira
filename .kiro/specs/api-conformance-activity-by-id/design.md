@@ -315,7 +315,7 @@ async fn resolve_activity_run_key(
 }
 ```
 
-Completion, failure, and cancellation handlers call `runtime.resolve_activity_token(run_key, activity_id)` after this helper. Runtime-side token resolution loads the run state, returns `RunNotFound` when the run is absent, returns `ActivityNotFound` when the activity is missing, returns `ActivityNotStarted` when `started_event_id` is absent, and fills the current shard epoch internally.
+Completion, failure, and cancellation handlers call `runtime.resolve_activity_token(run_key, activity_id)` after this helper. Runtime-side token resolution loads the run state, returns `RunNotFound` when the run is absent, returns `RunClosed` when the run is closed (before any activity lookup, Requirement 1.7), returns `ActivityNotFound` when the activity is missing, returns `ActivityNotStarted` when `started_event_id` is absent, and fills the current shard epoch internally.
 
 ```rust
 let activity = run_state.activities.get(activity_id).ok_or_else(|| {
@@ -326,7 +326,7 @@ let activity = run_state.activities.get(activity_id).ok_or_else(|| {
 })?;
 ```
 
-The edge handler maps `ActivityTokenResolutionError::RunNotFound` to `EdgeError::WorkflowNotFound`, `ActivityTokenResolutionError::ActivityNotFound` to `EdgeError::ActivityNotFound`, and `ActivityTokenResolutionError::ActivityNotStarted` to `EdgeError::ActivityNotStarted`, preserving the gRPC status contract without introducing an edge dependency into `tokeira-runtime`.
+The edge handler maps `ActivityTokenResolutionError::RunNotFound` to `EdgeError::WorkflowNotFound`, `ActivityTokenResolutionError::RunClosed` to `EdgeError::NotFound("workflow execution already completed")` (v1.31.0's `ErrWorkflowCompleted`), `ActivityTokenResolutionError::ActivityNotFound` to `EdgeError::ActivityNotFound`, and `ActivityTokenResolutionError::ActivityNotStarted` to `EdgeError::ActivityNotStarted`, preserving the gRPC status contract without introducing an edge dependency into `tokeira-runtime`.
 
 Heartbeat-by-id uses the same runtime token resolver with different error handling: if token resolution succeeds, it delegates to the normal heartbeat path; if token resolution returns `ActivityNotStarted`, it returns `cancel_requested = false` immediately without runtime heartbeat delegation.
 
@@ -351,6 +351,7 @@ pub struct ActivityTaskToken {
 ```rust
 pub enum ActivityTokenResolutionError {
     RunNotFound { run_key: RunKey },
+    RunClosed { run_key: RunKey },
     ActivityNotFound { run_key: RunKey, activity_id: String },
     ActivityNotStarted { run_key: RunKey, activity_id: String },
 }
@@ -492,6 +493,7 @@ exclusive option combination, the authoritative run state SHALL remain byte-iden
 | Condition | Error | gRPC Status |
 |-----------|-------|-------------|
 | Execution not found | `EdgeError::WorkflowNotFound` | `NOT_FOUND` |
+| Run is closed (any ById verb, activity present or not) | `EdgeError::NotFound` (`workflow execution already completed`) | `NOT_FOUND` |
 | Activity not found in run | `EdgeError::ActivityNotFound` | `NOT_FOUND` |
 | Non-empty malformed `run_id` | `EdgeError::BadRequest` | `INVALID_ARGUMENT` |
 | Activity exists but has not started for completion/failure/cancel | `EdgeError::ActivityNotStarted` | `FAILED_PRECONDITION` |
@@ -510,10 +512,11 @@ The ById handlers validate in this order:
 1. Proto field validation (missing namespace, workflow_id, activity_id)
 2. Non-empty `run_id` parse validation
 3. Execution resolution (namespace/workflow_id/run_id → RunKey)
-4. Activity lookup (activity_id in run state)
-5. Started-state validation for completion/failure/cancel handlers
-6. Token construction (shard epoch)
-7. Runtime delegation (token validation, commit)
+4. Run status: a closed run answers `ErrWorkflowCompleted` (Requirement 1.7)
+5. Activity lookup (activity_id in run state)
+6. Started-state validation for completion/failure/cancel handlers
+7. Token construction (shard epoch)
+8. Runtime delegation (token validation, commit)
 
 This ensures the most specific error is returned first, and no mutation is submitted if the activity cannot be resolved. The `resolve_activity_token` call is a read-only lookup that returns `NOT_FOUND` if the activity is missing.
 

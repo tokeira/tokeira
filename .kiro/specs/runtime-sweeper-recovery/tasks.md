@@ -129,7 +129,7 @@ All code is Rust. The implementation spans `tokeira-types` (no changes needed �
     - `SweepResult` with counts: `workflow_tasks_republished`, `activity_tasks_republished`, `due_timers_injected`, `workflow_timeout_entries_reconstructed`, `activity_tracking_entries_reconstructed`, `nexus_timeout_entries_reconstructed`, `expired_sticky_claims_cleared`
     - Call `list_dispatchable_workflow_tasks_for_shard` → publish each to `InMemoryBroker` (clear expired sticky → `sticky_preferred = None`)
     - Call `list_dispatchable_activity_tasks_for_shard` → publish each to `InMemoryActivityBroker`
-    - Call `list_due_timers_for_shard` → inject `Command::TimerDue` via lane submit
+    - Call `list_due_timers_for_shard` → inject the timer scanner's command (`WorkflowStartDelayElapsed` for the start-delay timer, `TimerDue` otherwise) via lane submit
     - Call `list_runs_with_workflow_timeouts_for_shard` → insert into `WorkflowTimeoutTrackingState`
     - Call `list_open_activities_for_shard` → insert into `ActivityTrackingState`
     - Call `list_pending_nexus_operations_for_shard` → insert into `NexusTimeoutTrackingState`
@@ -148,7 +148,7 @@ All code is Rust. The implementation spans `tokeira-types` (no changes needed �
   - [x] 8.4 Write property test for due timer sweep completeness
     - **Property 7: Due timer sweep completeness**
     - **Validates: Requirements 6.1, 6.2**
-    - Create runs with due timers in a shard; run `sweep_shard`; verify `TimerDue` commands were submitted for each timer
+    - Create runs with due timers in a shard; run `sweep_shard`; verify a timer command was submitted for each timer
 
   - [x] 8.5 Write property test for expired sticky claims
     - **Property 8: Expired sticky claims are republished without sticky preference**
@@ -288,6 +288,12 @@ All code is Rust. The implementation spans `tokeira-types` (no changes needed �
 
 - [x] 17. Final checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 18. Fire due timers as the timer scanner does, and survive rejected rows
+  - The sweep submits the scanner's command for each due timer and settles a failed submission the scanner's way: the row of a closed or missing run is deleted, any other rejection or failure is logged, and the sweep continues
+  - Due timers and due activity dispatches are read in bounded pages, each resuming after the last row read
+  - Tests: `sweep_elapses_a_due_start_delay`, `sweep_survives_timer_rows_the_kernel_rejects`, `sweep_pages_through_due_timers`, `sweep_pages_through_due_activity_dispatches`
+  - _Requirements: 5.1, 6.1, 6.2, 6.5_
 
 ## Notes
 

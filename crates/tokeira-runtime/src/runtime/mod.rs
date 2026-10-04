@@ -4004,6 +4004,7 @@ mod tests {
             &self,
             _shard_id: tokeira_types::ShardId,
             _now: OffsetDateTime,
+            _after: Option<&tokeira_storage::DueActivityDispatch>,
             _limit: usize,
         ) -> Result<Vec<tokeira_storage::DueActivityDispatch>> {
             panic!("unused in timer scanner tests")
@@ -4013,6 +4014,7 @@ mod tests {
             &self,
             _shard_id: tokeira_types::ShardId,
             _now: OffsetDateTime,
+            _after: Option<&DueTimer>,
             limit: usize,
         ) -> Result<Vec<DueTimer>> {
             self.list_due_timers(_now, limit).await

@@ -34,8 +34,9 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use time::OffsetDateTime;
-use tokeira_kernel::Command;
-use tokeira_storage::{LeaseOutcome, LeaseRepository, RunRepository};
+use tokeira_storage::{
+    DueActivityDispatch, DueTimer, LeaseOutcome, LeaseRepository, RunRepository,
+};
 use tokeira_types::{ShardEpoch, ShardId};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -49,7 +50,7 @@ use crate::{
         NexusTimeoutTrackingState,
     },
     runtime::{ActivityRetryDeps, reconcile_activity_dispatch_candidates},
-    scanner::pick_lane_for_run_key,
+    scanner::{command_for_due_timer, pick_lane_for_run_key, settle_failed_due_timer},
     timeout::{WorkflowTimeoutEntry, WorkflowTimeoutTrackingState},
     wft_timeout::{WftTimeoutEntry, WftTimeoutKind, WftTimeoutTrackingState},
 };
@@ -63,6 +64,7 @@ pub struct SweepResult {
     pub workflow_tasks_republished: usize,
     pub activity_tasks_republished: usize,
     pub due_timers_injected: usize,
+    pub stale_timer_rows_deleted: usize,
     pub workflow_timeout_entries_reconstructed: usize,
     pub wft_timeout_entries_reconstructed: usize,
     pub activity_tracking_entries_reconstructed: usize,
@@ -70,6 +72,14 @@ pub struct SweepResult {
     pub completion_callback_entries_reconstructed: usize,
     pub expired_sticky_claims_cleared: usize,
 }
+
+/// Rows the sweep reads per page of due timers. A timer row is a few dozen
+/// bytes.
+const DUE_TIMER_PAGE: usize = 500;
+
+/// Rows the sweep reads per page of due activity dispatches. A dispatch row
+/// carries the activity's input payload, so these pages are smaller.
+const DUE_ACTIVITY_DISPATCH_PAGE: usize = 100;
 
 /// Reconstruct volatile delivery and timeout state for a newly-owned shard.
 ///
@@ -122,27 +132,18 @@ where
     // publication path (via `retry_deps`: the runtime's activity broker,
     // deployment registry, and tracking), and permanently stale rows are
     // conditionally pruned while transient failures stay retriable.
-    let due_activity_dispatches = repo
-        .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, usize::MAX)
-        .await?;
-    result.activity_tasks_republished +=
-        reconcile_activity_dispatch_candidates(retry_deps, due_activity_dispatches, now).await;
+    result.activity_tasks_republished += republish_due_activity_dispatches(
+        shard_id,
+        repo,
+        retry_deps,
+        now,
+        DUE_ACTIVITY_DISPATCH_PAGE,
+    )
+    .await?;
 
-    for due in repo
-        .list_due_timers_for_shard(shard_id, now, usize::MAX)
-        .await?
-    {
-        let lane = pick_lane_for_run_key(lanes, lane_count, due.run_key).clone();
-        lane.submit(
-            due.run_key,
-            Command::TimerDue(tokeira_kernel::TimerDueRequest {
-                timer_id: due.timer_id,
-                fired_at: now,
-            }),
-        )
-        .await?;
-        result.due_timers_injected += 1;
-    }
+    let timers = fire_due_timers(shard_id, repo, lanes, lane_count, now, DUE_TIMER_PAGE).await?;
+    result.due_timers_injected += timers.submitted;
+    result.stale_timer_rows_deleted += timers.deleted;
 
     for entry in repo
         .list_runs_with_workflow_timeouts_for_shard(shard_id, usize::MAX)
@@ -231,6 +232,101 @@ where
     }
 
     Ok(result)
+}
+
+/// Republish a shard's due activity dispatches a page at a time through the
+/// shared preparation gate, returning how many were published.
+///
+/// The cursor advances past every row it reads, so the pass ends even though
+/// reconciliation prunes rows and leaves others for a later pass.
+async fn republish_due_activity_dispatches<R, S>(
+    shard_id: ShardId,
+    repo: &R,
+    retry_deps: &ActivityRetryDeps<S>,
+    now: OffsetDateTime,
+    page_size: usize,
+) -> Result<usize>
+where
+    R: RunRepository + ?Sized,
+    S: RunRepository + 'static,
+{
+    let page_size = page_size.max(1);
+    let mut published = 0;
+    let mut after: Option<DueActivityDispatch> = None;
+    loop {
+        let page = repo
+            .list_due_dispatchable_activity_tasks_for_shard(
+                shard_id,
+                now,
+                after.as_ref(),
+                page_size,
+            )
+            .await?;
+        let more = page.len() == page_size;
+        after = page.last().cloned();
+        published += reconcile_activity_dispatch_candidates(retry_deps, page, now).await;
+        if !more {
+            return Ok(published);
+        }
+    }
+}
+
+/// What firing a shard's due timers did.
+#[derive(Debug, Default)]
+struct DueTimerPass {
+    /// Timers handed to their run's lane and committed.
+    submitted: usize,
+    /// Rows of runs that have closed or gone, deleted.
+    deleted: usize,
+}
+
+/// Fire a shard's due timers a page at a time, exactly as the timer scanner
+/// does.
+///
+/// Each timer is submitted with the scanner's command, so the workflow start
+/// delay elapses rather than firing as a user timer. A row the kernel rejects
+/// because its run is gone is deleted, and any other rejection or failure is
+/// left for the scanner, so one stale or failing row never aborts the sweep
+/// (the kernel rejects a stale `TimerDue` as a harmless no-op). The cursor
+/// advances past every row it reads, so the pass ends even when rows stay.
+async fn fire_due_timers<R>(
+    shard_id: ShardId,
+    repo: &R,
+    lanes: &[LaneHandle],
+    lane_count: usize,
+    now: OffsetDateTime,
+    page_size: usize,
+) -> Result<DueTimerPass>
+where
+    R: RunRepository + ?Sized,
+{
+    let page_size = page_size.max(1);
+    let mut pass = DueTimerPass::default();
+    let mut after: Option<DueTimer> = None;
+    loop {
+        let page = repo
+            .list_due_timers_for_shard(shard_id, now, after.as_ref(), page_size)
+            .await?;
+        let more = page.len() == page_size;
+        after = page.last().cloned();
+        for due in page {
+            let lane = pick_lane_for_run_key(lanes, lane_count, due.run_key).clone();
+            match lane
+                .submit(due.run_key, command_for_due_timer(due.clone(), now))
+                .await
+            {
+                Ok(_) => pass.submitted += 1,
+                Err(error) => {
+                    pass.deleted += usize::from(
+                        settle_failed_due_timer(repo, Some(shard_id), &due, &error).await,
+                    );
+                }
+            }
+        }
+        if !more {
+            return Ok(pass);
+        }
+    }
 }
 
 /// Periodically renew a shard lease until cancelled or fenced.
@@ -1774,5 +1870,278 @@ mod tests {
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
+    }
+
+    async fn commit(store: &InMemoryStore, run_key: RunKey, transition: Transition) {
+        let result = store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+        assert!(matches!(result, CommitResult::Applied { .. }));
+    }
+
+    /// Commit a running run whose state and timer row both hold `timer_id`,
+    /// due at `fixed_now()`.
+    async fn commit_run_with_due_timer(store: &InMemoryStore, timer_id: &str) -> RunKey {
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        let timer = TimerState {
+            timer_id: timer_id.to_string(),
+            started_event_id: 11,
+            fire_at: fixed_now(),
+        };
+        transition.timer_ops.push(TimerOp::Upsert(timer.clone()));
+        transition
+            .next_state
+            .timers
+            .insert(timer_id.to_string(), timer);
+        commit(store, run_key, transition).await;
+        run_key
+    }
+
+    /// Commit a running run with one unstarted activity whose dispatch row is
+    /// due, on queue `q` of namespace `ns`.
+    async fn commit_run_with_due_activity(store: &InMemoryStore, ns: NamespaceId) -> RunKey {
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        transition.next_state.namespace_id = ns;
+        transition.next_state.workflow_id = WorkflowId(format!("wf-{}", run_key.0));
+        let activity = ActivityState {
+            last_attempt_complete_time: None,
+            cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
+            started_identity: None,
+            retry_last_worker_identity: None,
+            activity_id: "act".into(),
+            activity_type: "activity-type".into(),
+            schedule_event_id: 5,
+            task_queue: TaskQueueName("q".into()),
+            deployment: None,
+            build_id: None,
+            input: Payloads::default(),
+            header: None,
+            last_failure: None,
+            heartbeat_details: None,
+            attempt: 1,
+            retry_policy: None,
+            schedule_to_close_timeout: None,
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+            scheduled_at: fixed_now(),
+            current_attempt_scheduled_at: Some(OffsetDateTime::UNIX_EPOCH),
+            started_at: None,
+            started_event_id: None,
+            pause_info: None,
+            stamp: 0,
+            priority: None,
+        };
+        transition
+            .activity_ops
+            .push(ActivityOp::Upsert(activity.clone()));
+        transition
+            .next_state
+            .activities
+            .insert("act".into(), activity);
+        transition
+            .dispatch_ops
+            .push(DispatchOp::EnqueueActivityTask {
+                queue: QueueKey {
+                    namespace_id: ns,
+                    task_queue: TaskQueueName("q".into()),
+                    task_kind: TaskKind::Activity,
+                    deployment: None,
+                    build_id: None,
+                },
+                activity_id: "act".into(),
+                input: Payloads::default(),
+                schedule_event_id: 5,
+                attempt: 1,
+                dispatch_revision: 0,
+                stamp: 0,
+                dispatch_at: OffsetDateTime::UNIX_EPOCH,
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+                priority: None,
+            });
+        commit(store, run_key, transition).await;
+        run_key
+    }
+
+    /// The sweep elapses a due workflow start delay. Fired as a user timer it
+    /// would record a `TimerFired` for a timer the workflow never started.
+    #[tokio::test]
+    async fn sweep_elapses_a_due_start_delay() {
+        let store = InMemoryStore::with_shard_count(1);
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        // A delayed start schedules no workflow task until the delay elapses.
+        transition.next_state.pending_workflow_task = None;
+        let delay = TimerState {
+            timer_id: tokeira_kernel::WORKFLOW_START_DELAY_TIMER_ID.to_string(),
+            started_event_id: 0,
+            fire_at: fixed_now(),
+        };
+        transition.timer_ops.push(TimerOp::Upsert(delay.clone()));
+        transition
+            .next_state
+            .timers
+            .insert(delay.timer_id.clone(), delay);
+        commit(&store, run_key, transition).await;
+        let (lanes, lane_count) = make_lanes(&store);
+
+        let pass = fire_due_timers(
+            ShardId(0),
+            &store,
+            &lanes,
+            lane_count,
+            fixed_now(),
+            DUE_TIMER_PAGE,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pass.submitted, 1);
+        let LoadedRun::Existing(state) = store.load_run(run_key).await.unwrap() else {
+            panic!("run should exist");
+        };
+        assert!(state.timers.is_empty());
+        assert!(state.pending_workflow_task.is_some());
+        let history = store.read_history(run_key, 0, usize::MAX).await.unwrap();
+        assert!(!history.is_empty());
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            tokeira_kernel::HistoryEventKind::TimerFired { .. }
+        )));
+    }
+
+    /// One rejected row never stops the sweep: the row of a closed run is
+    /// deleted, a row the kernel rejects for another reason is left for the
+    /// timer scanner, and the other due timers still fire.
+    #[tokio::test]
+    async fn sweep_survives_timer_rows_the_kernel_rejects() {
+        let store = InMemoryStore::with_shard_count(1);
+        let live = commit_run_with_due_timer(&store, "live").await;
+
+        // A closed run whose timer row an earlier release left behind.
+        let closed = commit_run_with_due_timer(&store, "left-behind").await;
+        let mut close = start_transition(closed);
+        close.expected_seq = TransitionSeq(1);
+        close.next_state.transition_seq = TransitionSeq(2);
+        close.next_state.status = ExecutionStatus::Completed;
+        close.next_state.closed_at = Some(fixed_now());
+        close.next_state.pending_workflow_task = None;
+        commit(&store, closed, close).await;
+
+        // An open run whose state no longer holds the timer its row names.
+        let unknown = RunKey::new();
+        let mut transition = start_transition(unknown);
+        transition.timer_ops.push(TimerOp::Upsert(TimerState {
+            timer_id: "unknown".into(),
+            started_event_id: 11,
+            fire_at: fixed_now(),
+        }));
+        commit(&store, unknown, transition).await;
+
+        let broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let (lanes, lane_count) = make_lanes(&store);
+        let result = sweep_shard(
+            ShardId(0),
+            &store,
+            &broker,
+            &lanes,
+            lane_count,
+            &WorkflowTimeoutTrackingState::default(),
+            &WftTimeoutTrackingState::default(),
+            &ActivityTrackingState::default(),
+            &NexusTimeoutTrackingState::default(),
+            &CompletionCallbackTrackingState::default(),
+            &sweep_retry_deps(&store, &activity_broker),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.due_timers_injected, 1);
+        assert_eq!(result.stale_timer_rows_deleted, 1);
+        let LoadedRun::Existing(state) = store.load_run(live).await.unwrap() else {
+            panic!("run should exist");
+        };
+        assert!(state.timers.is_empty());
+        let remaining = store
+            .list_due_timers_for_shard(ShardId(0), fixed_now(), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].run_key, unknown);
+    }
+
+    /// The sweep reads due timers a page at a time and fires every one.
+    #[tokio::test]
+    async fn sweep_pages_through_due_timers() {
+        let store = InMemoryStore::with_shard_count(1);
+        for index in 0..5 {
+            commit_run_with_due_timer(&store, &format!("timer-{index}")).await;
+        }
+        let (lanes, lane_count) = make_lanes(&store);
+
+        let pass = fire_due_timers(ShardId(0), &store, &lanes, lane_count, fixed_now(), 2)
+            .await
+            .unwrap();
+
+        assert_eq!(pass.submitted, 5);
+        assert!(
+            store
+                .list_due_timers_for_shard(ShardId(0), fixed_now(), None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The sweep reads due activity dispatches a page at a time and
+    /// republishes every one.
+    #[tokio::test]
+    async fn sweep_pages_through_due_activity_dispatches() {
+        let store = InMemoryStore::with_shard_count(1);
+        let ns = NamespaceId::new();
+        let mut runs = Vec::new();
+        for _ in 0..5 {
+            runs.push(commit_run_with_due_activity(&store, ns).await);
+        }
+        let activity_broker = InMemoryActivityBroker::default();
+
+        let published = republish_due_activity_dispatches(
+            ShardId(0),
+            &store,
+            &sweep_retry_deps(&store, &activity_broker),
+            fixed_now(),
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(published, 5);
+        let queue = QueueKey {
+            namespace_id: ns,
+            task_queue: TaskQueueName("q".into()),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        };
+        let mut polled = Vec::new();
+        while let Some((task, _)) = activity_broker
+            .poll_activity_task(&queue, std::time::Duration::from_millis(1))
+            .await
+            .unwrap()
+        {
+            polled.push(task.run_key);
+        }
+        polled.sort_by_key(|run_key| run_key.0);
+        runs.sort_by_key(|run_key| run_key.0);
+        assert_eq!(polled, runs);
     }
 }

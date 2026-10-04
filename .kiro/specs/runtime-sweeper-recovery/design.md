@@ -58,7 +58,7 @@ sequenceDiagram
 
     Runtime->>Store: list_due_timers_for_shard(shard_id, now)
     Store-->>Runtime: due timers
-    Runtime->>Runtime: inject TimerDue commands
+    Runtime->>Runtime: inject the timer scanner's commands
 
     Runtime->>Store: list_open_runs_with_workflow_timeouts(shard_id)
     Store-->>Runtime: runs with timeout config
@@ -480,7 +480,7 @@ pub struct NexusTimeoutEntry {
 
 ### Property 7: Due timer sweep completeness
 
-*For any* set of due timers belonging to runs in a shard, after `sweep_shard` completes, a `Command::TimerDue` SHALL have been submitted to the appropriate lane for each due timer.
+*For any* set of due timers belonging to runs in a shard, after `sweep_shard` completes, the command the timer scanner submits for each due timer (`Command::WorkflowStartDelayElapsed` for the start-delay timer, `Command::TimerDue` otherwise) SHALL have been submitted to the appropriate lane.
 
 **Validates: Requirements 6.1, 6.2**
 
@@ -566,6 +566,7 @@ pub struct NexusTimeoutEntry {
 
 - Storage query failure during sweep (e.g., `list_dispatchable_workflow_tasks_for_shard` fails): Log at error level, retry the failed query with backoff. If the sweep cannot complete after bounded retries, relinquish the shard rather than operating with incomplete state.
 - Broker publication failure during sweep: Log at warn level. The broker is in-memory and should not fail, but if it does (e.g., channel full), retry. This is a transient condition.
+- Due timer command rejected or failing during the sweep: handled as the timer scanner handles it (Requirement 6.5). The row of a closed or missing run is deleted if it still has the fire time that was read; any other rejection is logged at debug level and any other failure at warn level, and the row is left for the scanner. The sweep continues either way.
 
 ### Command Admission Failures
 

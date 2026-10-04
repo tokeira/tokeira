@@ -653,9 +653,10 @@ impl RunRepository for DsqlRunRepository {
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueActivityDispatch>,
         limit: usize,
     ) -> Result<Vec<DueActivityDispatch>> {
-        self.do_list_due_dispatchable_activity_tasks_for_shard(shard_id, now, limit)
+        self.do_list_due_dispatchable_activity_tasks_for_shard(shard_id, now, after, limit)
             .await
     }
 
@@ -663,9 +664,10 @@ impl RunRepository for DsqlRunRepository {
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueTimer>,
         limit: usize,
     ) -> Result<Vec<DueTimer>> {
-        self.do_list_due_timers_for_shard(shard_id, now, limit)
+        self.do_list_due_timers_for_shard(shard_id, now, after, limit)
             .await
     }
 
@@ -1692,13 +1694,13 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            repo.list_due_dispatchable_activity_tasks_for_shard(shard_id, fixed_now(), 0)
+            repo.list_due_dispatchable_activity_tasks_for_shard(shard_id, fixed_now(), None, 0)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            repo.list_due_timers_for_shard(shard_id, fixed_now(), 0)
+            repo.list_due_timers_for_shard(shard_id, fixed_now(), None, 0)
                 .await
                 .unwrap()
                 .is_empty()

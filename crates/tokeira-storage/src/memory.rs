@@ -1794,6 +1794,7 @@ impl RunRepository for InMemoryStore {
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueActivityDispatch>,
         limit: usize,
     ) -> Result<Vec<DueActivityDispatch>> {
         let store = self.inner.lock().await;
@@ -1803,6 +1804,17 @@ impl RunRepository for InMemoryStore {
             .filter(|entry| {
                 store.run_shard_map.get(&entry.task.run_key) == Some(&shard_id)
                     && entry.dispatch_at <= now
+                    && after.is_none_or(|after| {
+                        (
+                            entry.dispatch_at,
+                            entry.task.run_key,
+                            &entry.task.activity_id,
+                        ) > (
+                            after.dispatch_at,
+                            after.task.run_key,
+                            &after.task.activity_id,
+                        )
+                    })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1830,25 +1842,28 @@ impl RunRepository for InMemoryStore {
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueTimer>,
         limit: usize,
     ) -> Result<Vec<DueTimer>> {
         let store = self.inner.lock().await;
-        let mut due = Vec::new();
-        for ((run_key, _), timer) in &store.timer_bucket {
-            if store.run_shard_map.get(run_key) != Some(&shard_id) {
-                continue;
-            }
-            if timer.fire_at <= now {
-                due.push(DueTimer {
-                    run_key: *run_key,
-                    timer_id: timer.timer_id.clone(),
-                    fire_at: timer.fire_at,
-                });
-                if due.len() >= limit {
-                    break;
-                }
-            }
-        }
+        let key = |timer: &DueTimer| (timer.fire_at, timer.run_key, timer.timer_id.clone());
+        let mut due = store
+            .timer_bucket
+            .iter()
+            .filter(|((run_key, _), timer)| {
+                store.run_shard_map.get(run_key) == Some(&shard_id) && timer.fire_at <= now
+            })
+            .map(|((run_key, _), timer)| DueTimer {
+                run_key: *run_key,
+                timer_id: timer.timer_id.clone(),
+                fire_at: timer.fire_at,
+            })
+            .filter(|timer| after.is_none_or(|after| key(timer) > key(after)))
+            .collect::<Vec<_>>();
+        // The DSQL listing's order (`timer_bucket`'s primary key after
+        // `shard_id`), so a cursor resumes the same way in both stores.
+        due.sort_by_key(key);
+        due.truncate(limit);
         Ok(due)
     }
 
@@ -3439,6 +3454,115 @@ mod tests {
         (run_key, queue)
     }
 
+    /// A cursor resumes the due-timer listing strictly after the row it
+    /// names, in `(fire_at, run_key, timer_id)` order, even once that row is
+    /// gone.
+    #[tokio::test]
+    async fn due_timer_listing_resumes_after_its_cursor() {
+        let store = InMemoryStore::default();
+        for (index, offset) in [0, 5, 0].into_iter().enumerate() {
+            let run_key = RunKey::new();
+            let mut transition = start_transition(run_key);
+            let timer = timer_state(
+                &format!("timer-{index}"),
+                fixed_now() + Duration::seconds(offset),
+            );
+            transition.timer_ops.push(TimerOp::Upsert(timer.clone()));
+            transition
+                .next_state
+                .timers
+                .insert(timer.timer_id.clone(), timer);
+            store
+                .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .await
+                .unwrap();
+        }
+        let due_at = fixed_now() + Duration::seconds(10);
+
+        let all = store
+            .list_due_timers_for_shard(ShardId(0), due_at, None, 10)
+            .await
+            .unwrap();
+        let key = |timer: &DueTimer| (timer.fire_at, timer.run_key, timer.timer_id.clone());
+        assert_eq!(all.len(), 3);
+        assert!(all.windows(2).all(|pair| key(&pair[0]) < key(&pair[1])));
+
+        let mut paged = Vec::new();
+        let mut after: Option<DueTimer> = None;
+        loop {
+            let page = store
+                .list_due_timers_for_shard(ShardId(0), due_at, after.as_ref(), 1)
+                .await
+                .unwrap();
+            let Some(row) = page.into_iter().next() else {
+                break;
+            };
+            paged.push(row.clone());
+            after = Some(row);
+        }
+        assert_eq!(paged, all);
+
+        assert!(store.delete_due_timer_if_matches(&all[0]).await.unwrap());
+        let rest = store
+            .list_due_timers_for_shard(ShardId(0), due_at, Some(&all[0]), 10)
+            .await
+            .unwrap();
+        assert_eq!(rest, all[1..]);
+    }
+
+    /// A cursor resumes the due activity-dispatch listing strictly after the
+    /// row it names, even once that row is pruned.
+    #[tokio::test]
+    async fn due_activity_dispatch_listing_resumes_after_its_cursor() {
+        let store = InMemoryStore::default();
+        for offset in [0, 5, 0] {
+            seed_dispatch_row(&store, fixed_now() + Duration::seconds(offset), 1, 0).await;
+        }
+        let due_at = fixed_now() + Duration::seconds(10);
+
+        let all = store
+            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), due_at, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(
+            all.windows(2)
+                .all(|pair| pair[0].dispatch_at <= pair[1].dispatch_at)
+        );
+
+        let mut paged = Vec::new();
+        let mut after: Option<DueActivityDispatch> = None;
+        loop {
+            let page = store
+                .list_due_dispatchable_activity_tasks_for_shard(
+                    ShardId(0),
+                    due_at,
+                    after.as_ref(),
+                    1,
+                )
+                .await
+                .unwrap();
+            let Some(row) = page.into_iter().next() else {
+                break;
+            };
+            paged.push(row.clone());
+            after = Some(row);
+        }
+        assert_eq!(paged, all);
+
+        assert!(
+            store
+                .delete_activity_dispatch_if_matches(&all[0].identity())
+                .await
+                .unwrap()
+        );
+        let rest = store
+            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), due_at, Some(&all[0]), 10)
+            .await
+            .unwrap();
+        assert_eq!(rest, all[1..]);
+    }
+
     #[tokio::test]
     async fn activity_dispatch_due_queries_respect_eligibility_time() {
         let store = InMemoryStore::default();
@@ -3463,7 +3587,7 @@ mod tests {
         );
         assert!(
             store
-                .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), fixed_now(), 10)
+                .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), fixed_now(), None, 10)
                 .await
                 .unwrap()
                 .is_empty()
@@ -3481,7 +3605,7 @@ mod tests {
         assert_eq!(due[0].stamp, 5);
         assert_eq!(due[0].dispatch_revision, 4);
         let due_for_shard = store
-            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), dispatch_at, 10)
+            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), dispatch_at, None, 10)
             .await
             .unwrap();
         assert_eq!(due_for_shard.len(), 1);
@@ -3538,7 +3662,7 @@ mod tests {
         let first_due = fixed_now() + Duration::seconds(5);
         let (run_key, queue) = seed_dispatch_row(&store, first_due, 2, 5).await;
         let observed = store
-            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), first_due, 10)
+            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), first_due, None, 10)
             .await
             .unwrap()
             .remove(0)
@@ -3590,7 +3714,7 @@ mod tests {
             "a superseded observation deletes nothing"
         );
         let current = store
-            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), replaced_due, 10)
+            .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), replaced_due, None, 10)
             .await
             .unwrap()
             .remove(0);
@@ -5593,6 +5717,7 @@ mod tests {
                         .list_due_dispatchable_activity_tasks_for_shard(
                             sid,
                             OffsetDateTime::now_utc(),
+                            None,
                             usize::MAX,
                         )
                         .await
@@ -5612,6 +5737,7 @@ mod tests {
                         .list_due_timers_for_shard(
                             sid,
                             fixed_now(),
+                            None,
                             usize::MAX,
                         )
                         .await

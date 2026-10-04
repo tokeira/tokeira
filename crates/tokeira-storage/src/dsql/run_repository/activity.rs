@@ -114,6 +114,7 @@ impl DsqlRunRepository {
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueActivityDispatch>,
         limit: usize,
     ) -> Result<Vec<DueActivityDispatch>> {
         record_dsql_operation!(
@@ -130,21 +131,49 @@ impl DsqlRunRepository {
                 }
 
                 let mut permit = self.director.acquire(DbClass::Read).await?;
-                let rows = sqlx::query_as::<_, ActivityDispatchRow>(
-                    "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
+                // Ties on `dispatch_at` break on the row key, a total order the
+                // keyset resume below can continue from. Rows written in one
+                // commit share both `dispatch_at` and `created_at`, so
+                // `created_at` never broke those ties anyway.
+                let rows =
+                    match after {
+                        None => sqlx::query_as::<_, ActivityDispatchRow>(
+                            "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
                     deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
                     input_data, priority_data, dispatch_at
              FROM activity_dispatch
              WHERE shard_id = $1
                AND dispatch_at <= $2
-             ORDER BY dispatch_at ASC, created_at ASC
+             ORDER BY dispatch_at ASC, key ASC
              LIMIT $3",
-                )
-                .bind(Self::shard_id_to_uuid(shard_id))
-                .bind(now)
-                .bind(i64::try_from(limit)?)
-                .fetch_all(permit.connection()?)
-                .await?;
+                        )
+                        .bind(Self::shard_id_to_uuid(shard_id))
+                        .bind(now)
+                        .bind(i64::try_from(limit)?)
+                        .fetch_all(permit.connection()?)
+                        .await?,
+                        Some(after) => sqlx::query_as::<_, ActivityDispatchRow>(
+                            "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
+                    deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
+                    input_data, priority_data, dispatch_at
+             FROM activity_dispatch
+             WHERE shard_id = $1
+               AND dispatch_at <= $2
+               AND (dispatch_at > $3 OR (dispatch_at = $3 AND key > $4))
+             ORDER BY dispatch_at ASC, key ASC
+             LIMIT $5",
+                        )
+                        .bind(Self::shard_id_to_uuid(shard_id))
+                        .bind(now)
+                        .bind(after.dispatch_at)
+                        .bind(Self::activity_dispatch_key(
+                            after.task.run_key,
+                            &after.task.activity_id,
+                        ))
+                        .bind(i64::try_from(limit)?)
+                        .fetch_all(permit.connection()?)
+                        .await?,
+                    };
                 metrics::record_dsql_rows_read(
                     "list_due_dispatchable_activity_tasks_for_shard",
                     rows.len(),
@@ -208,7 +237,9 @@ impl DsqlRunRepository {
              LIMIT $2",
             )
             .bind(Self::shard_id_to_uuid(shard_id))
-            .bind(i64::try_from(limit)?)
+            // The recovery sweep asks for every open activity (`usize::MAX`),
+            // which no i64 can hold: saturate rather than fail to bind.
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .fetch_all(permit.connection()?)
             .await?;
             metrics::record_dsql_rows_read("list_open_activities_for_shard", rows.len());

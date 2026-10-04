@@ -72,6 +72,22 @@ fn activity_start_rejected_by_in_flight_transition(state: &WorkflowState) -> boo
         .is_some()
 }
 
+/// Refuse to act on an activity of a closed run.
+///
+/// A closed run keeps its pending activities in state, as v1.31.0 keeps their
+/// infos for Describe, so finding the activity proves nothing. Every v1.31.0
+/// activity API checks that the workflow is running before it looks at the
+/// activity and answers `ErrWorkflowCompleted` otherwise
+/// (recordactivitytaskheartbeat/api.go:51-53, respondactivitytaskcompleted/api.go:60,
+/// respondactivitytaskfailed/api.go:61, respondactivitytaskcanceled/api.go:59
+/// @ v1.31.0); the edge renders `RunClosed` as that error.
+fn ensure_run_open(state: &WorkflowState) -> Result<()> {
+    if state.is_open() {
+        return Ok(());
+    }
+    Err(KernelRejected(tokeira_kernel::Reject::RunClosed(state.status)).into())
+}
+
 /// Map the runtime's retry-exhaustion reason onto the wire `RetryState`
 /// carried by terminal activity resolutions (`nextBackoffInterval`,
 /// retry.go:96-110 @ v1.31.0).
@@ -537,6 +553,7 @@ where
                 }
                 .into());
             };
+            ensure_run_open(&state)?;
             let Some(current) = state.activities.get(&token.activity_id).cloned() else {
                 return Err(ActivityTaskNotFound {
                     reason: "activity not found for heartbeat",
@@ -726,12 +743,7 @@ where
                 }
                 .into());
             };
-            if !state.is_open() {
-                return Err(ActivityTaskNotFound {
-                    reason: "workflow closed for by-id force start",
-                }
-                .into());
-            }
+            ensure_run_open(&state)?;
             let Some(current) = state.activities.get(activity_id).cloned() else {
                 return Err(ActivityTaskNotFound {
                     reason: "activity not found for by-id force start",
@@ -1216,6 +1228,7 @@ where
             }
             .into());
         };
+        ensure_run_open(&state)?;
         let Some(activity) = state.activities.get(&token.activity_id).cloned() else {
             return Err(ActivityTaskNotFound {
                 reason: "activity not found for token",
@@ -1354,6 +1367,8 @@ where
         let LoadedRun::Existing(state) = deps.repo.load_run(run_key).await? else {
             return Err(anyhow!("run not found for activity retry"));
         };
+        // A closed run never schedules another attempt, whoever asks.
+        ensure_run_open(&state)?;
         let Some(current) = state.activities.get(activity_id).cloned() else {
             return Err(anyhow!("activity not found for retry"));
         };
@@ -2840,6 +2855,141 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Close a seeded run the way a worker's close does: its activities stay in state.
+    async fn close_seeded_run(repo: &InMemoryStore, run_key: RunKey) -> WorkflowState {
+        let LoadedRun::Existing(current) = repo.load_run(run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        let mut closed = current.clone();
+        closed.status = ExecutionStatus::Completed;
+        closed.closed_at = Some(OffsetDateTime::now_utc());
+        closed.transition_seq = current.transition_seq.next();
+        let transition = Transition {
+            expected_seq: current.transition_seq,
+            next_state: closed.clone(),
+            history_events: SmallVec::new(),
+            event_principals: SmallVec::new(),
+            request_dedupe_ops: SmallVec::new(),
+            activity_ops: SmallVec::new(),
+            timer_ops: SmallVec::new(),
+            dispatch_ops: SmallVec::new(),
+        };
+        repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .expect("close seeded run");
+        closed
+    }
+
+    fn rejected_as_closed(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<KernelRejected>()
+            .is_some_and(|rejected| {
+                matches!(
+                    rejected.0,
+                    tokeira_kernel::Reject::RunClosed(ExecutionStatus::Completed)
+                )
+            })
+    }
+
+    #[tokio::test]
+    async fn closed_run_refuses_heartbeat_completion_and_retryable_failure() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let (_state, token, queue) = seed_started_activity(&runtime, &repo, None).await;
+        let closed = close_seeded_run(&repo, token.run_key).await;
+
+        let heartbeat = runtime
+            .record_activity_heartbeat(token.clone(), Some(payloads(b"late")), None)
+            .await
+            .expect_err("a closed run refuses a heartbeat");
+        assert!(rejected_as_closed(&heartbeat), "{heartbeat:?}");
+        let failure = runtime
+            .fail_activity_task(
+                token.clone(),
+                payload(b"retryable"),
+                None,
+                false,
+                None,
+                RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await
+            .expect_err("a closed run refuses a retryable failure");
+        assert!(rejected_as_closed(&failure), "{failure:?}");
+        let completion = runtime
+            .complete_activity_task(
+                token.clone(),
+                payloads(b"done"),
+                None,
+                RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await
+            .expect_err("a closed run refuses a completion");
+        assert!(rejected_as_closed(&completion), "{completion:?}");
+
+        let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {
+            panic!("closed run should exist");
+        };
+        assert_eq!(after, closed);
+        assert!(
+            repo.list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_scan_untracks_a_closed_runs_activity_without_retrying_it() {
+        use crate::activity_timeout::{ActivityTrackingEntry, scan_activity_timeouts_once};
+
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let (state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
+        let activity = &state.activities[&token.activity_id];
+        let long_ago = OffsetDateTime::now_utc() - Duration::hours(1);
+        let deps = runtime.activity_retry_deps();
+        deps.tracking.insert(ActivityTrackingEntry {
+            run_key: token.run_key,
+            shard_id: ShardId(0),
+            activity_id: token.activity_id.clone(),
+            original_scheduled_at: activity.scheduled_at,
+            last_dispatched_at: long_ago,
+            started_at: Some(long_ago),
+            last_heartbeat_at: None,
+            cancel_requested: false,
+        });
+        let closed = close_seeded_run(&repo, token.run_key).await;
+
+        scan_activity_timeouts_once(
+            &deps,
+            None,
+            &runtime.lanes,
+            runtime.lanes.len(),
+            &ActivityTimeoutScannerConfig::default(),
+        )
+        .await;
+
+        assert!(deps.tracking.snapshot().is_empty());
+        let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {
+            panic!("closed run should exist");
+        };
+        assert_eq!(after, closed);
     }
 
     #[tokio::test]

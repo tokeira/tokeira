@@ -347,9 +347,10 @@ pub fn evaluate_activity_timeout(
 /// Each entry's run is reloaded from `deps.repo` because the live
 /// `ActivityState` is the authority for the current timeouts and for whether
 /// the activity still exists; the tracking entry only supplies the timing
-/// anchors. An entry whose run is absent, or whose activity is no longer
-/// present in the loaded state, is dropped (it resolved by another path); a
-/// load error is transient and leaves the entry for the next scan.
+/// anchors. An entry whose run is absent or closed, or whose activity is no
+/// longer present in the loaded state, is dropped (it resolved by another
+/// path, or can no longer time out); a load error is transient and leaves the
+/// entry for the next scan.
 pub(crate) async fn scan_activity_timeouts_once<R>(
     deps: &ActivityRetryDeps<R>,
     shard_id: Option<ShardId>,
@@ -389,6 +390,17 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                 continue;
             }
         };
+
+        // A closed run keeps its activities in state, but none of their
+        // timeouts can fire: v1.31.0's activity-timeout task returns
+        // `ErrWorkflowCompleted` for a closed run
+        // (timer_queue_active_task_executor.go:218-221 @ v1.31.0), a NotFound
+        // the queue completes rather than retries (queues/executable.go:401).
+        // Untrack instead of retrying or resolving an activity of a closed run.
+        if !state.is_open() {
+            tracking.remove(entry.run_key, &entry.activity_id);
+            continue;
+        }
 
         let Some(activity) = state.activities.get(&entry.activity_id).cloned() else {
             tracking.remove(entry.run_key, &entry.activity_id);

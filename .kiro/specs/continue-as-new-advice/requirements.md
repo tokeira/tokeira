@@ -440,6 +440,12 @@ the recreate requirement.
 implementation begins, per the root change classification for state-compatibility
 breaks.
 
+10.8 WHERE a change adds to a hot-state blob data that a reader may safely ignore,
+without changing `WorkflowState`'s positional layout, THE storage codec SHALL carry that
+data in the state extension after the state
+([activity-heartbeat-time](../activity-heartbeat-time/requirements.md) Requirement 1)
+rather than in a new envelope version.
+
 ## Iteration and Feedback Notes
 
 - Temporal's own comment on the size statistic: it "doesn't have to be 100% accurate"

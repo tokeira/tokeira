@@ -1757,6 +1757,8 @@ fn terminate_no_open_entities() {
     assert!(transition.timer_ops.is_empty());
 }
 
+/// Terminate deletes the run's timers and keeps its activities: v1.31.0's `TerminateWorkflow`
+/// leaves activity infos in place, and Describe still lists them.
 #[test]
 fn terminate_with_activities_and_timers() {
     let mut state = make_open_state_with_activity("activity-1");
@@ -1802,6 +1804,7 @@ fn terminate_with_activities_and_timers() {
             fire_at: now(),
         },
     );
+    let activities = state.activities.clone();
     let transition = kernel()
         .apply(
             LoadedRun::Existing(state),
@@ -1809,18 +1812,15 @@ fn terminate_with_activities_and_timers() {
         )
         .unwrap();
 
-    assert!(transition.next_state.activities.is_empty());
+    assert_eq!(transition.next_state.activities, activities);
+    assert!(transition.activity_ops.is_empty());
     assert!(transition.next_state.timers.is_empty());
-    assert_eq!(transition.activity_ops.len(), 2);
-    assert_eq!(transition.timer_ops.len(), 1);
-    assert!(matches!(
-        transition.activity_ops[0],
-        tokeira_kernel::ActivityOp::Delete { .. }
-    ));
-    assert!(matches!(
-        transition.timer_ops[0],
-        tokeira_kernel::TimerOp::Delete { .. }
-    ));
+    assert_eq!(
+        transition.timer_ops.to_vec(),
+        vec![tokeira_kernel::TimerOp::Delete {
+            timer_id: "timer-1".into()
+        }]
+    );
 }
 
 /// A worker's close deletes the run's timers, whose rows would otherwise come due and be
@@ -1893,6 +1893,87 @@ fn worker_close_drops_a_timer_started_in_the_same_task() {
             },
         ]
     );
+}
+
+/// Replaying a closed run's history keeps its pending activities and drops its timers, as the
+/// live close does: replay applies each event the way forward execution does.
+#[test]
+fn replayed_close_keeps_pending_activities() {
+    let schedule = vec![
+        WorkflowCommand::ScheduleActivity {
+            activity_id: "activity-1".into(),
+            activity_type: "activity-type".into(),
+            task_queue: TaskQueueName("activity-q".into()),
+            input: payloads("act"),
+            header: None,
+            request_eager_execution: false,
+            retry_policy: None,
+            deployment: None,
+            build_id: None,
+            schedule_to_close_timeout: Some(Duration::minutes(2)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: Some(Duration::seconds(20)),
+            priority: None,
+        },
+        WorkflowCommand::StartTimer {
+            timer_id: "timer-1".into(),
+            fire_at: now() + Duration::minutes(5),
+        },
+    ];
+    let mut complete = schedule.clone();
+    complete.push(WorkflowCommand::CompleteWorkflow {
+        result: payloads("done"),
+    });
+    let cases = [
+        (complete, None),
+        (
+            schedule.clone(),
+            Some(Command::Terminate(make_terminate_request())),
+        ),
+        (
+            schedule.clone(),
+            Some(Command::WorkflowExecutionTimedOut(make_timeout_request())),
+        ),
+        (schedule, Some(Command::Reset(make_reset_request()))),
+    ];
+    for (commands, close) in cases {
+        let start_req = make_start_request();
+        let start = kernel()
+            .apply(LoadedRun::Absent, Command::Start(start_req.clone()))
+            .unwrap();
+        let started = start_pending_task(start.next_state.clone());
+        let request = speculative_completion_request(&started.next_state, commands);
+        let completed = kernel()
+            .apply(
+                LoadedRun::Existing(started.next_state.clone()),
+                Command::WorkflowTaskCompleted(request),
+            )
+            .unwrap();
+        let mut transitions = vec![start, started, completed];
+        if let Some(close) = close.clone() {
+            let state = transitions.last().unwrap().next_state.clone();
+            transitions.push(kernel().apply(LoadedRun::Existing(state), close).unwrap());
+        }
+        let live = &transitions.last().unwrap().next_state;
+        let history = transitions
+            .iter()
+            .flat_map(|transition| transition.history_events.clone())
+            .collect::<Vec<_>>();
+
+        let replayed = kernel()
+            .replay_history_prefix(replay_context_from_start(&start_req), &history)
+            .unwrap();
+
+        assert!(!live.status.is_open(), "{close:?}");
+        assert_eq!(replayed.status, live.status, "{close:?}");
+        assert!(live.activities.contains_key("activity-1"), "{close:?}");
+        assert!(
+            replayed.activities.keys().eq(live.activities.keys()),
+            "{close:?}"
+        );
+        assert!(replayed.timers.is_empty(), "{close:?}");
+    }
 }
 
 #[test]
@@ -2004,8 +2085,9 @@ fn reset_happy_path_with_scheduled_wft() {
     ));
 }
 
+/// Reset terminates the base the way Terminate does: timers deleted, activities kept.
 #[test]
-fn reset_cleans_up_activities_and_timers() {
+fn reset_deletes_timers_and_keeps_activities() {
     let mut state = make_open_state_with_activity("activity-1");
     state.activities.insert(
         "activity-2".into(),
@@ -2050,6 +2132,7 @@ fn reset_cleans_up_activities_and_timers() {
         },
     );
 
+    let activities = state.activities.clone();
     let transition = kernel()
         .apply(
             LoadedRun::Existing(state),
@@ -2057,21 +2140,14 @@ fn reset_cleans_up_activities_and_timers() {
         )
         .unwrap();
 
-    assert!(transition.next_state.activities.is_empty());
+    assert_eq!(transition.next_state.activities, activities);
+    assert!(transition.activity_ops.is_empty());
     assert!(transition.next_state.timers.is_empty());
-    assert_eq!(transition.activity_ops.len(), 2);
-    assert_eq!(transition.timer_ops.len(), 1);
-    assert!(
-        transition
-            .activity_ops
-            .iter()
-            .all(|op| matches!(op, tokeira_kernel::ActivityOp::Delete { .. }))
-    );
-    assert!(
-        transition
-            .timer_ops
-            .iter()
-            .all(|op| matches!(op, tokeira_kernel::TimerOp::Delete { .. }))
+    assert_eq!(
+        transition.timer_ops.to_vec(),
+        vec![tokeira_kernel::TimerOp::Delete {
+            timer_id: "timer-1".into()
+        }]
     );
 }
 
@@ -3553,6 +3629,8 @@ fn workflow_execution_timed_out_no_entities() {
     ));
 }
 
+/// A workflow timeout deletes the run's timers and keeps its activities, as Terminate does
+/// (`TimeoutWorkflow` leaves activity infos in place in v1.31.0).
 #[test]
 fn workflow_execution_timed_out_with_entities() {
     let mut state = make_open_state_with_activity("activity-1");
@@ -3598,6 +3676,7 @@ fn workflow_execution_timed_out_with_entities() {
             fire_at: now(),
         },
     );
+    let activities = state.activities.clone();
     let transition = kernel()
         .apply(
             LoadedRun::Existing(state),
@@ -3605,10 +3684,15 @@ fn workflow_execution_timed_out_with_entities() {
         )
         .unwrap();
 
-    assert!(transition.next_state.activities.is_empty());
+    assert_eq!(transition.next_state.activities, activities);
+    assert!(transition.activity_ops.is_empty());
     assert!(transition.next_state.timers.is_empty());
-    assert_eq!(transition.activity_ops.len(), 2);
-    assert_eq!(transition.timer_ops.len(), 1);
+    assert_eq!(
+        transition.timer_ops.to_vec(),
+        vec![tokeira_kernel::TimerOp::Delete {
+            timer_id: "timer-1".into()
+        }]
+    );
 }
 
 #[test]

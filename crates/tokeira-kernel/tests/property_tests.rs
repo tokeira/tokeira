@@ -3593,12 +3593,14 @@ proptest! {
             "sticky-worker",
             now,
         );
+        let activity_ids = state.activities.keys().cloned().collect::<Vec<_>>();
         let transition = kernel().apply(LoadedRun::Existing(state), Command::Terminate(req)).unwrap();
+        let kept = transition.next_state.activities.keys().cloned().collect::<Vec<_>>();
         prop_assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);
         prop_assert!(transition.next_state.closed_at.is_some());
         prop_assert!(transition.next_state.pending_workflow_task.is_none());
         prop_assert!(transition.next_state.sticky.is_none());
-        prop_assert!(transition.next_state.activities.is_empty());
+        prop_assert_eq!(kept, activity_ids);
         prop_assert!(transition.next_state.timers.is_empty());
         prop_assert!(transition.dispatch_ops.is_empty());
     }
@@ -3643,14 +3645,14 @@ proptest! {
         );
         state = with_timer(state, "timer-1", now);
         let transition = kernel().apply(LoadedRun::Existing(state), Command::Terminate(req)).unwrap();
-        prop_assert_eq!(transition.activity_ops.len(), 2);
+        let deletes_an_activity = transition
+            .activity_ops
+            .iter()
+            .any(|op| matches!(op, ActivityOp::Delete { .. }));
+        let kept = transition.next_state.activities.keys().cloned().collect::<Vec<_>>();
+        prop_assert!(!deletes_an_activity);
+        prop_assert_eq!(kept, vec!["activity-1".to_string(), "activity-2".to_string()]);
         prop_assert_eq!(transition.timer_ops.len(), 1);
-        for op in &transition.activity_ops {
-            match op {
-                ActivityOp::Delete { activity_id } => prop_assert!(activity_id == "activity-1" || activity_id == "activity-2"),
-                _ => panic!("unexpected activity op"),
-            }
-        }
         match &transition.timer_ops[0] {
             TimerOp::Delete { timer_id } => prop_assert_eq!(timer_id, "timer-1"),
             _ => panic!("unexpected timer op"),
@@ -3821,12 +3823,14 @@ proptest! {
             "sticky-worker",
             now,
         );
+        let activity_ids = state.activities.keys().cloned().collect::<Vec<_>>();
         let transition = kernel().apply(LoadedRun::Existing(state), Command::WorkflowExecutionTimedOut(req)).unwrap();
+        let kept = transition.next_state.activities.keys().cloned().collect::<Vec<_>>();
         prop_assert_eq!(transition.next_state.status, ExecutionStatus::TimedOut);
         prop_assert!(transition.next_state.closed_at.is_some());
         prop_assert!(transition.next_state.pending_workflow_task.is_none());
         prop_assert!(transition.next_state.sticky.is_none());
-        prop_assert!(transition.next_state.activities.is_empty());
+        prop_assert_eq!(kept, activity_ids);
         prop_assert!(transition.next_state.timers.is_empty());
         prop_assert!(transition.dispatch_ops.is_empty());
     }
@@ -3871,9 +3875,49 @@ proptest! {
         );
         state = with_timer(state, "timer-1", now);
         let transition = kernel().apply(LoadedRun::Existing(state), Command::WorkflowExecutionTimedOut(req)).unwrap();
-        prop_assert_eq!(transition.activity_ops.len(), 2);
+        let deletes_an_activity = transition
+            .activity_ops
+            .iter()
+            .any(|op| matches!(op, ActivityOp::Delete { .. }));
+        let kept = transition.next_state.activities.keys().cloned().collect::<Vec<_>>();
+        prop_assert!(!deletes_an_activity);
+        prop_assert_eq!(kept, vec!["activity-1".to_string(), "activity-2".to_string()]);
         prop_assert_eq!(transition.timer_ops.len(), 1);
-        prop_assert!(transition.next_state.activities.is_empty());
+        match &transition.timer_ops[0] {
+            TimerOp::Delete { timer_id } => prop_assert_eq!(timer_id, "timer-1"),
+            _ => panic!("unexpected timer op"),
+        }
+        prop_assert!(transition.next_state.timers.is_empty());
+    }
+
+    // Feature: kernel-reset, Property 2: Reset entity cleanup ops match input state
+    // Reset terminates an open base the way Terminate does: every open timer
+    // is deleted and every pending activity is kept. (Req 2.3.1, 2.3.2, 6.4, 7.2)
+    #[test]
+    fn property_reset_entity_cleanup(
+        (state, req) in arb_open_state_for_reset(fixed_now()).prop_flat_map(|state| {
+            arb_reset_request(state.clone(), fixed_now()).prop_map(move |req| (state.clone(), req))
+        })
+    ) {
+        let activity_ids = state.activities.keys().cloned().collect::<Vec<_>>();
+        let timer_ids = state.timers.keys().cloned().collect::<Vec<_>>();
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::Reset(req)).unwrap();
+        let deletes_an_activity = transition
+            .activity_ops
+            .iter()
+            .any(|op| matches!(op, ActivityOp::Delete { .. }));
+        let kept = transition.next_state.activities.keys().cloned().collect::<Vec<_>>();
+        let deleted_timers = transition
+            .timer_ops
+            .iter()
+            .map(|op| match op {
+                TimerOp::Delete { timer_id } => Some(timer_id.clone()),
+                TimerOp::Upsert(_) => None,
+            })
+            .collect::<Vec<_>>();
+        prop_assert!(!deletes_an_activity);
+        prop_assert_eq!(kept, activity_ids);
+        prop_assert_eq!(deleted_timers, timer_ids.into_iter().map(Some).collect::<Vec<_>>());
         prop_assert!(transition.next_state.timers.is_empty());
     }
 

@@ -27,7 +27,7 @@ Add Reset command support to `tokeira-kernel` — the final kernel feature (10 o
 - [x] 2. Implement kernel logic
   - [x] 2.1 Add `apply_reset` method and `Command::Reset` match arm in `kernel.rs`
     - New match arm in `BasicKernel::apply`: `Command::Reset(req) => self.apply_reset(loaded, req)`
-    - `apply_reset` follows Terminate pattern: `expect_open` → validate `fork_event_id` in `[1, last_event_id]` (reject `ResetConstraintViolation`) → determine `scheduled_event_id`/`started_event_id` from pending WFT (or 0/0 sentinels) → `logical_seq = state.next_workflow_task_seq` → emit `RequestDedupeOp` → emit `WorkflowTaskFailed` with `ResetWorkflow` cause and reset metadata (`base_run_id: Some(run_id)`, `new_run_id: Some(req.new_run_id)`, `fork_event_id: Some(req.fork_event_id)`, `fork_event_version: None`) → `close(Terminated)` → `std::mem::take` activities/timers + emit Delete ops → `apply_parent_close_policy` → `finish`
+    - `apply_reset` follows Terminate pattern: `expect_open` → validate `fork_event_id` in `[1, last_event_id]` (reject `ResetConstraintViolation`) → determine `scheduled_event_id`/`started_event_id` from pending WFT (or 0/0 sentinels) → `logical_seq = state.next_workflow_task_seq` → emit `RequestDedupeOp` → emit `WorkflowTaskFailed` with `ResetWorkflow` cause and reset metadata (`base_run_id: Some(run_id)`, `new_run_id: Some(req.new_run_id)`, `fork_event_id: Some(req.fork_event_id)`, `fork_event_version: None`) → `close(Terminated)` (which deletes the timers; pending activities stay, Requirement 2.3) → `apply_parent_close_policy` → `finish`
     - _Requirements: 2.1.1–2.1.5, 2.2.1–2.2.6, 2.3.1–2.3.4, 2.4.1–2.4.4, 3.1.1–3.1.2, 4.1.1–4.1.2_
 
 - [x] 3. Fix downstream breakage
@@ -59,8 +59,8 @@ Add Reset command support to `tokeira-kernel` — the final kernel feature (10 o
     - Reset against open run with pending scheduled-but-not-started WFT. Assert: `WorkflowTaskFailed` event uses pending WFT's scheduled_event_id and `started_event_id=0`.
     - _Requirements: 2.2.2_
 
-  - [x] 5.4 Add `reset_cleans_up_activities_and_timers` test
-    - Reset against run with open activities and timers. Assert: `ActivityOp::Delete` and `TimerOp::Delete` for each, maps empty in next_state.
+  - [x] 5.4 Add `reset_deletes_timers_and_keeps_activities` test
+    - Reset against run with open activities and timers. Assert: `TimerOp::Delete` for each timer and the timers map empty in next_state; every activity kept in next_state with no `ActivityOp::Delete`.
     - _Requirements: 2.3.1, 2.3.2, 6.4.1–6.4.4_
 
   - [x] 5.5 Add `reset_applies_parent_close_policy` test
@@ -103,12 +103,12 @@ Add Reset command support to `tokeira-kernel` — the final kernel feature (10 o
     - _Requirements: 6.1.1–6.1.2, 6.2.1_
 
   - [x] 6.2 Add Property 1 test: Reset closes the run with terminal state invariants
-    - `proptest!` block: generate random open state with entities, apply Reset with valid fork_event_id, assert status=Terminated, closed_at=Some, pending_workflow_task=None, sticky=None, all entity maps empty
+    - `proptest!` block: generate random open state with entities, apply Reset with valid fork_event_id, assert status=Terminated, closed_at=Some, pending_workflow_task=None, sticky=None, activities keep the input state's IDs, all other entity maps empty
     - **Property 1: Reset closes the run with terminal state invariants**
     - **Validates: Requirements 2.1.3, 2.3.4, 6.3.1–6.3.11, 7.1.1**
 
   - [x] 6.3 Add Property 2 test: Reset entity cleanup ops match input state
-    - `proptest!` block: generate random open state with N activities and M timers, apply Reset, assert activity_ops has N Deletes, timer_ops has M Deletes, all IDs match input state
+    - `proptest!` block: generate random open state with N activities and M timers, apply Reset, assert activity_ops has no Delete, next_state.activities keeps the N input IDs, timer_ops has M Deletes, all timer IDs match input state
     - **Property 2: Reset entity cleanup ops match input state**
     - **Validates: Requirements 2.3.1, 2.3.2, 6.4.1–6.4.4, 7.2.1**
 

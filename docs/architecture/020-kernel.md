@@ -482,7 +482,7 @@ Termination is a hard stop.[^terminate] The workflow code does not get a chance 
 1. Emit `RequestDedupeOp` for the request ID.
 2. Emit `WorkflowExecutionTerminated` event carrying the reason, optional details, and the identity of the caller.
 3. Close the run with `ExecutionStatus::Terminated`: set terminal status, clear pending WFT, clear sticky affinity.
-4. Clear activity and timer maps in `next_state`. Emit `ActivityOp::Delete` for each open activity and `TimerOp::Delete` for each open timer.
+4. Clear the timer map in `next_state` and emit `TimerOp::Delete` for each open timer (every close does this). Pending activities stay in `next_state`, with no `ActivityOp`: v1.31.0's `TerminateWorkflow` keeps a run's activity infos and `DescribeWorkflowExecution` still lists them (`service/history/workflow/util.go`, `service/history/api/describeworkflow/api.go @ v1.31.0`). The runtime refuses heartbeats, responses, and retries for a closed run's activities.
 5. For open child workflows, apply Parent Close Policy (see `ChildResolved`).
 
 **Events produced:** `WorkflowExecutionTerminated`.
@@ -623,7 +623,7 @@ This command is issued by the runtime when the workflow's execution timeout or r
 
 1. Emit `WorkflowExecutionTimedOut` event carrying the timeout type and retry state.
 2. Close the run with `ExecutionStatus::TimedOut`.
-3. Clean up open entities (same as `Terminate`).
+3. Delete open timers and keep pending activities (same as `Terminate`).
 4. For open child workflows, apply Parent Close Policy.
 5. If the workflow has a retry policy and should be retried, emit metadata for the runtime to create a retry run.
 

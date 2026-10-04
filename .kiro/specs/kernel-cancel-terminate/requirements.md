@@ -9,9 +9,9 @@ The authoritative specification is [docs/architecture/020-kernel.md](../../../do
 Feature 3 adds two top-level kernel commands (Cancel and Terminate) and three workflow commands (CancelWorkflow, RequestCancelActivity, CancelTimer). These commands implement the two cancellation paradigms in Temporal's model:
 
 - **Cancel** is cooperative (two-phase): the kernel records the request and schedules a WFT so the workflow code can decide how to handle it. The run stays open.
-- **Terminate** is unconditional: the kernel closes the run immediately with `ExecutionStatus::Terminated`, cleans up all open entities, and does NOT schedule a WFT.
+- **Terminate** is unconditional: the kernel closes the run immediately with `ExecutionStatus::Terminated`, deletes its open timers, keeps its pending activities, and does NOT schedule a WFT.
 
-Both Cancel and Terminate are external API commands that carry `RequestContext` and emit `RequestDedupeOp`. Cancel follows the same WFT coalescing pattern as Signal (schedule WFT if none pending). Terminate follows the same close mechanics as CompleteWorkflow/FailWorkflow but additionally cleans up open activities and timers.
+Both Cancel and Terminate are external API commands that carry `RequestContext` and emit `RequestDedupeOp`. Cancel follows the same WFT coalescing pattern as Signal (schedule WFT if none pending). Terminate follows the same close mechanics as CompleteWorkflow/FailWorkflow: the run's open timers are deleted and its pending activities are kept (Requirement 3.2).
 
 The three workflow commands are issued by workflow code within `WorkflowTaskCompleted`:
 - **CancelWorkflow** is a terminal command that closes the run with `ExecutionStatus::Cancelled` after the workflow has performed cleanup.
@@ -168,17 +168,19 @@ The three workflow commands are issued by workflow code within `WorkflowTaskComp
 4. WHEN a Terminate command is received, THE Kernel SHALL NOT schedule a workflow task; the worker is not consulted.
 5. WHEN a Terminate command is received, THE Kernel SHALL NOT emit any DispatchOp (no WFT, no activity tasks, no timer tasks).
 
-### Requirement 3.2: Terminate Entity Cleanup
+### Requirement 3.2: Terminate Timer Cleanup and Activity Retention
 
-**User Story:** As a Tokeira developer, I want Terminate to clean up all open entities, so that no orphaned activities or timers remain after a hard stop.
+**User Story:** As a Tokeira developer, I want Terminate to delete the run's open timers and keep its pending activities, so that no timer comes due for a closed run and DescribeWorkflowExecution lists the activities that were pending when the run was terminated, as v1.31.0 does.
 
-**Scope note:** The architecture doc (020-kernel.md) specifies that Terminate should also apply Parent Close Policy to open child workflows. Child workflow tracking is not yet implemented (it is Feature 5). Feature 3 implements Terminate's cleanup for activities and timers only. When Feature 5 adds child workflow support, Terminate's cleanup logic must be extended to apply Parent Close Policy to open children.
+**Scope note:** The architecture doc (020-kernel.md) specifies that Terminate should also apply Parent Close Policy to open child workflows. Child workflow tracking is not yet implemented (it is Feature 5). Feature 3 implements Terminate's cleanup for timers only. When Feature 5 adds child workflow support, Terminate's cleanup logic must be extended to apply Parent Close Policy to open children.
+
+**Ground truth:** v1.31.0 keeps a terminated run's activity infos. `TerminateWorkflow` fails a started workflow task and appends `WorkflowExecutionTerminated`; neither it nor `ApplyWorkflowExecutionTerminatedEvent` touches the run's activities (`service/history/workflow/util.go:105-147`, `service/history/workflow/mutable_state_impl.go:5599-5616 @ v1.31.0`). `DeleteActivity` (`mutable_state_impl.go:2066`) is called only when an activity's completed, failed, timed-out or canceled event is applied (`:4249`, `:4299`, `:4351`, `:4484`) and for replication tombstones (`:8890`). `DescribeWorkflowExecution` lists `GetPendingActivityInfos()` without checking that the run is open (`service/history/api/describeworkflow/api.go:202-209 @ v1.31.0`). Refusing work on a closed run's activities is the runtime's job.
 
 #### Acceptance Criteria
 
-1. WHEN a Terminate command is received and open activities exist, THE Kernel SHALL emit an ActivityOp::Delete for each open activity.
+1. WHEN a Terminate command is received and open activities exist, THE Kernel SHALL keep each open activity in next_state.activities and SHALL NOT emit an ActivityOp::Delete for it.
 2. WHEN a Terminate command is received and open timers exist, THE Kernel SHALL emit a TimerOp::Delete for each open timer.
-3. WHEN a Terminate command is received, THE Kernel SHALL clear the activities map in next_state (next_state.activities SHALL be empty).
+3. WHEN a Terminate command is received, THE Kernel SHALL keep every entry of the activities map in next_state (next_state.activities SHALL hold exactly the activity IDs of the input state's activities map).
 4. WHEN a Terminate command is received, THE Kernel SHALL clear the timers map in next_state (next_state.timers SHALL be empty).
 5. WHEN a Terminate command is received with no open activities or timers, THE Kernel SHALL emit no ActivityOp or TimerOp (cleanup is a no-op when there are no open entities).
 
@@ -342,19 +344,19 @@ The three workflow commands are issued by workflow code within `WorkflowTaskComp
 2. FOR ALL Terminate transitions, next_state.sticky SHALL be None.
 3. FOR ALL Terminate transitions, next_state.closed_at SHALL be Some.
 4. FOR ALL Terminate transitions, next_state.status SHALL be ExecutionStatus::Terminated.
-5. FOR ALL Terminate transitions, next_state.activities SHALL be empty.
+5. FOR ALL Terminate transitions, next_state.activities SHALL hold exactly the activity IDs of the input state's activities map (Requirement 3.2).
 6. FOR ALL Terminate transitions, next_state.timers SHALL be empty.
 7. FOR ALL Terminate transitions, dispatch_ops SHALL be empty (no WFT is scheduled).
 
 ### Requirement 9.5: Entity Cleanup Consistency for Terminate
 
-**User Story:** As a Tokeira developer, I want the number of ActivityOp::Delete and TimerOp::Delete ops emitted by Terminate to match the number of open entities in the input state, so that cleanup is complete and not over-counted.
+**User Story:** As a Tokeira developer, I want the number of TimerOp::Delete ops emitted by Terminate to match the number of open timers in the input state, and no activity to be deleted, so that timer cleanup is complete and not over-counted and pending activities survive the close.
 
 #### Acceptance Criteria
 
-1. FOR ALL Terminate transitions, THE number of ActivityOp::Delete ops SHALL equal the number of entries in the input state's activities map.
+1. FOR ALL Terminate transitions, THE activity_ops SHALL contain no ActivityOp::Delete.
 2. FOR ALL Terminate transitions, THE number of TimerOp::Delete ops SHALL equal the number of entries in the input state's timers map.
-3. FOR ALL Terminate transitions, every ActivityOp::Delete SHALL reference an activity_id that existed in the input state's activities map.
+3. FOR ALL Terminate transitions, every activity_id in the input state's activities map SHALL be present in next_state.activities.
 4. FOR ALL Terminate transitions, every TimerOp::Delete SHALL reference a timer_id that existed in the input state's timers map.
 
 ### Requirement 9.6: CancelWorkflow Terminal State Invariants
@@ -422,13 +424,13 @@ The three workflow commands are issued by workflow code within `WorkflowTaskComp
 
 1. FOR ALL valid open WorkflowState and FOR ALL valid TerminateRequest values, WHEN Terminate is applied, THE next_state.status SHALL be ExecutionStatus::Terminated and next_state.closed_at SHALL be Some.
 
-### Requirement 10.5: Terminate Cleans Up All Open Entities Property
+### Requirement 10.5: Terminate Deletes Timers and Keeps Activities Property
 
-**User Story:** As a Tokeira developer, I want a property test verifying that Terminate cleans up all open activities and timers, so that no orphaned entities remain.
+**User Story:** As a Tokeira developer, I want a property test verifying that Terminate deletes all open timers and keeps all pending activities, so that no timer outlives the run and Describe still lists its activities.
 
 #### Acceptance Criteria
 
-1. FOR ALL valid open WorkflowState with N open activities and M open timers, WHEN Terminate is applied, THE activity_ops SHALL contain exactly N ActivityOp::Delete ops and THE timer_ops SHALL contain exactly M TimerOp::Delete ops, and next_state.activities and next_state.timers SHALL both be empty.
+1. FOR ALL valid open WorkflowState with N open activities and M open timers, WHEN Terminate is applied, THE activity_ops SHALL contain no ActivityOp::Delete, THE timer_ops SHALL contain exactly M TimerOp::Delete ops, next_state.activities SHALL hold the same N activity IDs, and next_state.timers SHALL be empty.
 
 ### Requirement 10.6: Terminate Emits No Dispatch Ops Property
 
@@ -529,11 +531,11 @@ The three workflow commands are issued by workflow code within `WorkflowTaskComp
 
 ### Requirement 11.6: Terminate with Open Activities and Timers Golden Test
 
-**User Story:** As a Tokeira developer, I want a golden test for Terminate on an open run with open activities and timers, so that entity cleanup is pinned.
+**User Story:** As a Tokeira developer, I want a golden test for Terminate on an open run with open activities and timers, so that timer cleanup and activity retention are pinned.
 
 #### Acceptance Criteria
 
-1. WHEN a Terminate command is applied to an open run with two open activities and one open timer, THE test SHALL assert the exact Transition including: one WorkflowExecutionTerminated event; next_state with empty activities and timers; two ActivityOp::Delete ops (one per activity); one TimerOp::Delete op; one RequestDedupeOp; one ProjectionOp::CloseExecution; empty dispatch_ops.
+1. WHEN a Terminate command is applied to an open run with two open activities and one open timer, THE test SHALL assert the exact Transition including: one WorkflowExecutionTerminated event; next_state with both activities unchanged and empty timers; no ActivityOp; one TimerOp::Delete op; one RequestDedupeOp; one ProjectionOp::CloseExecution; empty dispatch_ops.
 
 ### Requirement 11.7: Terminate with Pending WFT Golden Test
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Reset is a top-level kernel command issued by an operator that terminates the current workflow execution and emits metadata for the runtime to create a successor run replaying from a chosen historical event. It follows the Terminate pattern: `expect_open` → validate `fork_event_id` → emit `RequestDedupeOp` → emit `WorkflowTaskFailed` event with `RESET_WORKFLOW` cause and reset metadata → `close(Terminated)` → entity cleanup (`std::mem::take` activities/timers + `apply_parent_close_policy`) → `finish`.
+Reset is a top-level kernel command issued by an operator that terminates the current workflow execution and emits metadata for the runtime to create a successor run replaying from a chosen historical event. It follows the Terminate pattern: `expect_open` → validate `fork_event_id` → emit `RequestDedupeOp` → emit `WorkflowTaskFailed` event with `RESET_WORKFLOW` cause and reset metadata → `close(Terminated)` → entity cleanup (`close` deletes the timers, pending activities stay, `apply_parent_close_policy`) → `finish`.
 
 The kernel does NOT copy history or construct the successor run. The runtime reads the `WorkflowTaskFailed` event's reset metadata (`base_run_id`, `new_run_id`) and issues a `Start` command for the new run.
 
@@ -22,7 +22,7 @@ sequenceDiagram
     participant Runtime
 
     Operator->>Kernel: Command::Reset(ResetRequest { fork_event_id, new_run_id, reason, ... })
-    Note over Kernel: expect_open(loaded)<br/>validate fork_event_id in [1, last_event_id]<br/>emit RequestDedupeOp<br/>emit WorkflowTaskFailed { cause: ResetWorkflow, base_run_id, new_run_id }<br/>close(Terminated)<br/>cleanup activities/timers<br/>apply_parent_close_policy<br/>finish()
+    Note over Kernel: expect_open(loaded)<br/>validate fork_event_id in [1, last_event_id]<br/>emit RequestDedupeOp<br/>emit WorkflowTaskFailed { cause: ResetWorkflow, base_run_id, new_run_id }<br/>close(Terminated): delete timers<br/>keep pending activities<br/>apply_parent_close_policy<br/>finish()
     Kernel-->>Runtime: Transition committed
 
     Note over Runtime: Read WorkflowTaskFailed event<br/>Extract base_run_id, new_run_id, fork_event_id<br/>Load history up to fork_event_id<br/>Issue Start command for successor run
@@ -139,17 +139,10 @@ fn apply_reset(&self, loaded: LoadedRun, req: ResetRequest) -> Result<Transition
         fork_event_version: None,
         fork_event_id: Some(req.fork_event_id),
     });
+    // `close` also deletes every open timer (TimerOp::Delete each). Pending
+    // activities stay: v1.31.0 terminates the run through `TerminateWorkflow`,
+    // which keeps its activity infos (Requirement 2.3).
     builder.close(ExecutionStatus::Terminated);
-
-    let activities = std::mem::take(&mut builder.state.activities);
-    for (activity_id, _) in activities {
-        builder.activity_ops.push(ActivityOp::Delete { activity_id });
-    }
-
-    let timers = std::mem::take(&mut builder.state.timers);
-    for (timer_id, _) in timers {
-        builder.timer_ops.push(TimerOp::Delete { timer_id });
-    }
 
     builder.apply_parent_close_policy();
 
@@ -192,13 +185,13 @@ The reset metadata is carried in the history event, not in `WorkflowState`. The 
 
 ### Property 1: Reset closes the run with terminal state invariants
 
-*For any* valid open `WorkflowState` with `last_event_id >= 1` and *for any* valid `ResetRequest` with `fork_event_id` in `[1, last_event_id]`, when Reset is applied: `next_state.status` shall be `ExecutionStatus::Terminated`, `next_state.closed_at` shall be `Some`, `next_state.pending_workflow_task` shall be `None`, `next_state.sticky` shall be `None`, and all entity maps (`activities`, `timers`, `children`, `pending_external_signals`, `pending_external_cancels`, `pending_updates`, `pending_nexus_operations`) shall be empty.
+*For any* valid open `WorkflowState` with `last_event_id >= 1` and *for any* valid `ResetRequest` with `fork_event_id` in `[1, last_event_id]`, when Reset is applied: `next_state.status` shall be `ExecutionStatus::Terminated`, `next_state.closed_at` shall be `Some`, `next_state.pending_workflow_task` shall be `None`, `next_state.sticky` shall be `None`, `next_state.activities` shall hold exactly the input state's activity IDs, and the other entity maps (`timers`, `children`, `pending_external_signals`, `pending_external_cancels`, `pending_updates`, `pending_nexus_operations`) shall be empty.
 
 **Validates: Requirements 2.1.3, 2.3.4, 6.3.1, 6.3.2, 6.3.3, 6.3.4, 6.3.5, 6.3.6, 6.3.7, 6.3.8, 6.3.9, 6.3.10, 6.3.11, 7.1.1**
 
 ### Property 2: Reset entity cleanup ops match input state
 
-*For any* valid open `WorkflowState` with N open activities and M open timers, when Reset is applied with a valid `fork_event_id`: the `activity_ops` shall contain exactly N `ActivityOp::Delete` ops, the `timer_ops` shall contain exactly M `TimerOp::Delete` ops, every `ActivityOp::Delete` shall reference an `activity_id` that existed in the input state's activities map, and every `TimerOp::Delete` shall reference a `timer_id` that existed in the input state's timers map.
+*For any* valid open `WorkflowState` with N open activities and M open timers, when Reset is applied with a valid `fork_event_id`: the `activity_ops` shall contain no `ActivityOp::Delete`, `next_state.activities` shall hold the same N activity IDs as the input state, the `timer_ops` shall contain exactly M `TimerOp::Delete` ops, and every `TimerOp::Delete` shall reference a `timer_id` that existed in the input state's timers map.
 
 **Validates: Requirements 2.3.1, 2.3.2, 6.4.1, 6.4.2, 6.4.3, 6.4.4, 7.2.1**
 
@@ -252,7 +245,7 @@ Individual `#[test]` functions covering:
 1. `reset_happy_path_no_pending_wft` — Reset against open run with no pending WFT. Assert: `WorkflowTaskFailed` event with `ResetWorkflow` cause, `scheduled_event_id=0`, `started_event_id=0`, `base_run_id=Some(run_id)`, `new_run_id=Some(req.new_run_id)`, status=Terminated, closed_at=Some, one RequestDedupeOp, no EnqueueWorkflowTask dispatch ops.
 2. `reset_happy_path_with_started_wft` — Reset against open run with pending started WFT. Assert: `WorkflowTaskFailed` event references pending WFT's scheduled/started event IDs.
 3. `reset_happy_path_with_scheduled_wft` — Reset against open run with pending scheduled-but-not-started WFT. Assert: `WorkflowTaskFailed` event uses pending WFT's scheduled_event_id and `started_event_id=0`.
-4. `reset_cleans_up_activities_and_timers` — Reset against run with open activities and timers. Assert: `ActivityOp::Delete` and `TimerOp::Delete` for each, maps empty in next_state.
+4. `reset_deletes_timers_and_keeps_activities` — Reset against run with open activities and timers. Assert: `TimerOp::Delete` for each timer and the timers map empty in next_state; every activity kept in next_state with no `ActivityOp::Delete`.
 5. `reset_applies_parent_close_policy` — Reset against run with open children. Assert: appropriate `DispatchOp::TerminateChild`/`CancelChild` ops, children map empty.
 6. `reset_rejects_fork_event_id_zero` — Assert: `Reject::ResetConstraintViolation`.
 7. `reset_rejects_fork_event_id_negative` — Assert: `Reject::ResetConstraintViolation`.
@@ -278,7 +271,7 @@ The existing `arb_wft_failed_cause` strategy must be extended to include `Workfl
 
 Property tests to implement (one `proptest!` test per property):
 1. Property 1 — new test: generate random open state with entities, apply Reset, assert all terminal state invariants.
-2. Property 2 — new test: generate random open state with N activities and M timers, apply Reset, assert cleanup op counts and ID references.
+2. Property 2 — new test: generate random open state with N activities and M timers, apply Reset, assert no activity delete op, the activity IDs kept, and the timer delete op count and ID references.
 3. Property 3 — new test: generate random valid Reset, assert exactly one RequestDedupeOp with correct request_id.
 4. Property 4 — new test: generate random open state and invalid fork_event_id (<=0 or >last_event_id), assert ResetConstraintViolation.
 5. Property 5 — new test: generate random valid Reset, assert WorkflowTaskFailed event metadata fields.

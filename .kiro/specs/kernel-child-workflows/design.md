@@ -67,14 +67,14 @@ graph TD
 
 The `close()` method on `TransitionBuilder` already handles clearing pending WFT, sticky, and emitting `ProjectionOp::CloseExecution`. The Parent Close Policy helper is called AFTER `close()` but BEFORE `finish()` on every close path:
 
-- **Terminate**: emit event → `close(Terminated)` → `std::mem::take` activities/timers → `apply_parent_close_policy()` → `finish()`
-- **WorkflowExecutionTimedOut**: emit event → `close(TimedOut)` → `std::mem::take` activities/timers → `apply_parent_close_policy()` → `finish()`
+- **Terminate**: emit event → `close(Terminated)` (takes the timers; activities stay) → `apply_parent_close_policy()` → `finish()`
+- **WorkflowExecutionTimedOut**: emit event → `close(TimedOut)` (takes the timers; activities stay) → `apply_parent_close_policy()` → `finish()`
 - **CompleteWorkflow**: emit event → `close(Completed)` → `apply_parent_close_policy()` → return true
 - **FailWorkflow**: emit event → `close(Failed)` → `apply_parent_close_policy()` → return true
 - **CancelWorkflow**: emit event → `close(Cancelled)` → `apply_parent_close_policy()` → return true
 - **ContinueAsNew**: emit event → `close(ContinuedAsNew)` → `apply_parent_close_policy()` → return true
 
-For Terminate and WorkflowExecutionTimedOut, the existing `std::mem::take` pattern for activities/timers is preserved. Children cleanup follows the same pattern.
+For Terminate and WorkflowExecutionTimedOut, `close` takes the timers and pending activities stay in state, as v1.31.0 keeps a closed run's activity infos (kernel-cancel-terminate Requirement 3.2). Children cleanup follows the `std::mem::take` pattern.
 
 ## Components and Interfaces
 

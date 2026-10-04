@@ -298,7 +298,7 @@ The implementation is organized into 10 incremental features with explicit depen
 2. WHEN a Terminate command is received, THE Kernel SHALL emit a WorkflowExecutionTerminated event carrying the reason, optional details, and caller identity.
 3. WHEN a Terminate command is received, THE Kernel SHALL close the run with ExecutionStatus::Terminated (set terminal status, clear pending WFT, clear StickyAffinity).
 4. WHEN a Terminate command is received, THE Kernel SHALL emit a ProjectionOp::CloseExecution with Terminated status.
-5. WHEN a Terminate command is received, THE Kernel SHALL clear the activities map and emit an ActivityOp::Delete for each open activity.
+5. WHEN a Terminate command is received, THE Kernel SHALL keep each open activity in the activities map and SHALL NOT emit an ActivityOp::Delete for it (v1.31.0 keeps a terminated run's activity infos; kernel-cancel-terminate Requirement 3.2).
 6. WHEN a Terminate command is received, THE Kernel SHALL clear the timers map and emit a TimerOp::Delete for each open timer.
 7. WHEN a Terminate command is received and open child workflows exist, THE Kernel SHALL apply Parent Close Policy for each open child.
 8. WHEN a Terminate command is received for a missing run, THE Kernel SHALL reject with MissingRun.
@@ -334,12 +334,12 @@ The implementation is organized into 10 incremental features with explicit depen
 
 ### Requirement 3.6: Open Entity Cleanup on Terminal Close
 
-**User Story:** As a Tokeira developer, I want the Kernel to clean up all open entities when a run reaches a terminal state via Terminate, so that no orphaned entities remain.
+**User Story:** As a Tokeira developer, I want the Kernel to clean up the open timers when a run reaches a terminal state via Terminate and keep its pending activities, so that no orphaned timer remains and Describe lists the activities that were pending, as v1.31.0 does.
 
 #### Acceptance Criteria
 
-1. WHEN the Kernel closes a run via Terminate, THE Kernel SHALL emit ActivityOp::Delete for every open activity and TimerOp::Delete for every open timer.
-2. WHEN the Kernel closes a run via Terminate, THE Kernel SHALL clear the activities and timers maps in next_state.
+1. WHEN the Kernel closes a run via Terminate, THE Kernel SHALL emit TimerOp::Delete for every open timer and SHALL NOT emit ActivityOp::Delete for any open activity.
+2. WHEN the Kernel closes a run via Terminate, THE Kernel SHALL clear the timers map in next_state and keep every entry of the activities map.
 
 ### Requirement 3.7: ActivityResolved with Canceled and TimedOut Resolutions
 
@@ -376,7 +376,7 @@ The implementation is organized into 10 incremental features with explicit depen
 1. WHEN a WorkflowExecutionTimedOut command is received for an open run, THE Kernel SHALL emit a WorkflowExecutionTimedOut event carrying the timeout type and retry state.
 2. WHEN a WorkflowExecutionTimedOut command is received, THE Kernel SHALL close the run with ExecutionStatus::TimedOut.
 3. WHEN a WorkflowExecutionTimedOut command is received, THE Kernel SHALL emit a ProjectionOp::CloseExecution with TimedOut status.
-4. WHEN a WorkflowExecutionTimedOut command is received, THE Kernel SHALL clean up open entities (activities, timers, children) using the same cleanup logic as Terminate.
+4. WHEN a WorkflowExecutionTimedOut command is received, THE Kernel SHALL clean up open entities (timers, children) and keep pending activities, using the same logic as Terminate.
 5. WHEN a WorkflowExecutionTimedOut command is received and the workflow has a retry_policy, THE Kernel SHALL emit retry metadata (attempt count, retry state) for the runtime to decide whether to create a retry run.
 
 ### Requirement 4.3: Workflow-Level Retry Metadata Emission

@@ -5,7 +5,7 @@
 This feature adds the `ContinueAsNew` workflow command, the `WorkflowExecutionTimedOut` top-level command, and retry metadata emission to `tokeira-kernel`. It also extends `ExecutionStatus` with two new terminal variants.
 
 - **ContinueAsNew** is a workflow command within `WorkflowTaskCompleted`. It emits `WorkflowExecutionContinuedAsNew`, calls `close(ContinuedAsNew)`, and returns `true`. The kernel does NOT create the successor run; the runtime reads the event and issues a `Start`.
-- **WorkflowExecutionTimedOut** is a top-level command following the same pattern as `apply_terminate`: `expect_open` → emit event → `close(TimedOut)` → entity cleanup via `std::mem::take`. No request dedup, no WFT dispatch.
+- **WorkflowExecutionTimedOut** is a top-level command following the same pattern as `apply_terminate`: `expect_open` → emit event → `close(TimedOut)`, which deletes the open timers; pending activities stay, as v1.31.0 keeps a timed-out run's activity infos (Requirement 3.2). No request dedup, no WFT dispatch.
 - **Retry metadata** is added to `WorkflowExecutionFailed`: the event gains `retry_state` and `attempt` fields. The kernel sets `retry_state` based on retry policy presence but does NOT evaluate retry logic.
 
 Downstream breakage: `WorkflowCommand`, `Command`, `ExecutionStatus`, and `HistoryEventKind` all gain variants. `WorkflowExecutionFailed` gains fields. All exhaustive matches across the workspace must be updated.
@@ -25,8 +25,8 @@ graph TD
     subgraph "Timeout Path (like Terminate)"
         AET --> E1[emit WorkflowExecutionTimedOut event]
         E1 --> CL1[close TimedOut]
-        CL1 --> CLEANUP1["std::mem::take activities → ActivityOp::Delete each"]
-        CLEANUP1 --> CLEANUP2["std::mem::take timers → TimerOp::Delete each"]
+        CL1 --> CLEANUP1["std::mem::take timers → TimerOp::Delete each"]
+        CLEANUP1 --> KEEP1["pending activities stay in state"]
     end
 
     subgraph "Workflow Command in WFT Completed"
@@ -50,8 +50,8 @@ Follows the exact same pattern as `apply_terminate`:
 1. `expect_open`
 2. Construct `TransitionBuilder`
 3. Emit `WorkflowExecutionTimedOut` event (timeout_type, retry_state from request)
-4. Call `close(ExecutionStatus::TimedOut)`
-5. Entity cleanup: `std::mem::take(&mut builder.state.activities)` → `ActivityOp::Delete` each; `std::mem::take(&mut builder.state.timers)` → `TimerOp::Delete` each
+4. Call `close(ExecutionStatus::TimedOut)`, which also deletes the timers: `std::mem::take(&mut builder.state.timers)` → `TimerOp::Delete` each
+5. Pending activities stay in `builder.state.activities`, with no `ActivityOp`. v1.31.0's `TimeoutWorkflow` leaves a run's activity infos in place and `DescribeWorkflowExecution` still lists them (`service/history/workflow/util.go:71-99`, `service/history/api/describeworkflow/api.go:202-209 @ v1.31.0`)
 6. `finish()`
 
 No `RequestDedupeOp`. No `DispatchOp`. The worker is never consulted.
@@ -63,7 +63,7 @@ In `apply_workflow_command`, new match arm:
 2. Call `builder.close(ExecutionStatus::ContinuedAsNew)`
 3. Return `Ok(true)` — run is closed, subsequent commands rejected with `CommandsAfterClose`
 
-No `DispatchOp`. No entity cleanup (the `close` method handles clearing pending WFT and sticky; activities/timers remain in state but the run is terminal).
+No `DispatchOp`. No entity cleanup beyond `close`, which clears pending WFT and sticky and deletes the timers; activities remain in state but the run is terminal.
 
 ### FailWorkflow Enhancement
 
@@ -284,13 +284,13 @@ No new data model types beyond `WorkflowExecutionTimedOutRequest`, `WorkflowTime
 
 ### Property 4: WorkflowExecutionTimedOut closes with full terminal state invariants
 
-*For any* valid open WorkflowState (with or without pending WFT, activities, timers, sticky) and *for any* valid WorkflowExecutionTimedOutRequest, when WorkflowExecutionTimedOut is applied: `next_state.status` SHALL be `ExecutionStatus::TimedOut`, `next_state.closed_at` SHALL be `Some`, `next_state.pending_workflow_task` SHALL be `None`, `next_state.sticky` SHALL be `None`, `next_state.activities` SHALL be empty, `next_state.timers` SHALL be empty, and `dispatch_ops` SHALL be empty.
+*For any* valid open WorkflowState (with or without pending WFT, activities, timers, sticky) and *for any* valid WorkflowExecutionTimedOutRequest, when WorkflowExecutionTimedOut is applied: `next_state.status` SHALL be `ExecutionStatus::TimedOut`, `next_state.closed_at` SHALL be `Some`, `next_state.pending_workflow_task` SHALL be `None`, `next_state.sticky` SHALL be `None`, `next_state.activities` SHALL hold exactly the input state's activity IDs, `next_state.timers` SHALL be empty, and `dispatch_ops` SHALL be empty.
 
 **Validates: Requirements 3.1.2, 3.1.3, 3.1.4, 7.4.1, 7.4.2, 7.4.3, 7.4.4, 7.4.5, 7.4.6, 7.4.7, 8.4.1, 8.6.1**
 
 ### Property 5: WorkflowExecutionTimedOut entity cleanup count and consistency
 
-*For any* valid open WorkflowState with N open activities and M open timers and *for any* valid WorkflowExecutionTimedOutRequest, when WorkflowExecutionTimedOut is applied: `activity_ops` SHALL contain exactly N `ActivityOp::Delete` ops, `timer_ops` SHALL contain exactly M `TimerOp::Delete` ops, every `ActivityOp::Delete` SHALL reference an `activity_id` that existed in the input state's activities map, and every `TimerOp::Delete` SHALL reference a `timer_id` that existed in the input state's timers map.
+*For any* valid open WorkflowState with N open activities and M open timers and *for any* valid WorkflowExecutionTimedOutRequest, when WorkflowExecutionTimedOut is applied: `activity_ops` SHALL contain no `ActivityOp::Delete`, `next_state.activities` SHALL hold the same N activity IDs as the input state, `timer_ops` SHALL contain exactly M `TimerOp::Delete` ops, and every `TimerOp::Delete` SHALL reference a `timer_id` that existed in the input state's timers map.
 
 **Validates: Requirements 3.2.1, 3.2.2, 3.2.3, 3.2.4, 7.5.1, 7.5.2, 7.5.3, 7.5.4, 8.5.1**
 
@@ -374,7 +374,7 @@ Individual `#[test]` functions in `tests/golden_tests.rs`. Each test constructs 
 
 **WorkflowExecutionTimedOut happy path tests (3 tests):**
 - `workflow_execution_timed_out_no_entities` — Timeout on open run, no activities/timers
-- `workflow_execution_timed_out_with_entities` — Timeout with 2 activities + 1 timer, verify cleanup ops
+- `workflow_execution_timed_out_with_entities` — Timeout with 2 activities + 1 timer, verify the timer delete op and that both activities are kept with no activity op
 - `workflow_execution_timed_out_with_pending_wft` — Timeout clears pending WFT and sticky
 
 **WorkflowExecutionTimedOut rejection tests (2 tests):**

@@ -5,7 +5,7 @@
 This feature adds two top-level kernel commands (Cancel, Terminate) and three workflow commands (CancelWorkflow, RequestCancelActivity, CancelTimer) to `tokeira-kernel`. These implement Temporal's two cancellation paradigms:
 
 - **Cancel** is cooperative: record the request, schedule a WFT, let the workflow decide. Follows the same pattern as Signal (expect_open → emit dedupe → emit event → coalesce WFT).
-- **Terminate** is unconditional: close the run immediately with `Terminated`, clean up all open entities. Follows the close pattern (like CompleteWorkflow/FailWorkflow) but adds an entity cleanup loop.
+- **Terminate** is unconditional: close the run immediately with `Terminated`. Follows the close pattern (like CompleteWorkflow/FailWorkflow): `close` deletes the open timers, and pending activities stay in state, as v1.31.0 keeps a terminated run's activity infos (Requirement 3.2).
 
 The three workflow commands are issued by workflow code within `WorkflowTaskCompleted`:
 - **CancelWorkflow**: terminal command, emits `WorkflowExecutionCanceled`, calls `close(Canceled)`.
@@ -42,8 +42,8 @@ graph TD
         AT --> D2[emit RequestDedupeOp]
         D2 --> E2[emit WorkflowExecutionTerminated]
         E2 --> CL[close Terminated]
-        CL --> CLEANUP[for each activity: ActivityOp::Delete + clear map]
-        CLEANUP --> CLEANUP2[for each timer: TimerOp::Delete + clear map]
+        CL --> CLEANUP[for each timer: TimerOp::Delete + clear map]
+        CLEANUP --> KEEP[pending activities stay in state]
     end
 
     subgraph "Workflow Commands in WFT Completed"
@@ -71,11 +71,9 @@ The run stays open. No `ProjectionOp`, no `ActivityOp`, no `TimerOp`.
 2. Construct `TransitionBuilder`
 3. Push `RequestDedupeOp`
 4. Emit `WorkflowExecutionTerminated` event
-5. Call `close(ExecutionStatus::Terminated)` — sets terminal status, clears pending WFT, clears sticky, emits `ProjectionOp::CloseExecution`
-6. Entity cleanup loop:
-   - For each entry in `state.activities`: push `ActivityOp::Delete`, then `state.activities.clear()`
-   - For each entry in `state.timers`: push `TimerOp::Delete`, then `state.timers.clear()`
-   - Note: Parent Close Policy for open child workflows is deferred to Feature 5. When child workflow tracking is added, this cleanup loop must be extended.
+5. Call `close(ExecutionStatus::Terminated)` — sets terminal status, clears pending WFT, clears sticky, emits `ProjectionOp::CloseExecution`, and deletes every open timer (pushes `TimerOp::Delete` for each entry in `state.timers`, then clears the map; every close does this)
+6. Pending activities stay in `state.activities`, with no `ActivityOp`. v1.31.0's `TerminateWorkflow` leaves a run's activity infos in place and `DescribeWorkflowExecution` still lists them (`service/history/workflow/util.go:105-147`, `service/history/api/describeworkflow/api.go:202-209 @ v1.31.0`); the runtime refuses heartbeats, responses and retries for a closed run's activities.
+   - Note: Parent Close Policy for open child workflows is deferred to Feature 5. When child workflow tracking is added, this step must be extended.
 7. `finish()`
 
 No `DispatchOp` is emitted. The worker is never consulted.
@@ -260,13 +258,13 @@ No new data model types beyond `ExternalWorkflowExecution`, `CancelRequest`, and
 
 ### Property 5: Terminate closes with full terminal state invariants
 
-*For any* valid open WorkflowState and *for any* valid TerminateRequest, when Terminate is applied: `next_state.status` SHALL be `ExecutionStatus::Terminated`, `next_state.closed_at` SHALL be `Some`, `next_state.pending_workflow_task` SHALL be `None`, `next_state.sticky` SHALL be `None`, `next_state.activities` SHALL be empty, `next_state.timers` SHALL be empty, and `dispatch_ops` SHALL be empty.
+*For any* valid open WorkflowState and *for any* valid TerminateRequest, when Terminate is applied: `next_state.status` SHALL be `ExecutionStatus::Terminated`, `next_state.closed_at` SHALL be `Some`, `next_state.pending_workflow_task` SHALL be `None`, `next_state.sticky` SHALL be `None`, `next_state.activities` SHALL hold exactly the input state's activity IDs, `next_state.timers` SHALL be empty, and `dispatch_ops` SHALL be empty.
 
 **Validates: Requirements 3.1.3, 3.1.4, 3.1.5, 9.4.1, 9.4.2, 9.4.3, 9.4.4, 9.4.5, 9.4.6, 9.4.7, 10.4.1, 10.6.1**
 
 ### Property 6: Terminate entity cleanup count and consistency
 
-*For any* valid open WorkflowState with N open activities and M open timers and *for any* valid TerminateRequest, when Terminate is applied: `activity_ops` SHALL contain exactly N `ActivityOp::Delete` ops, `timer_ops` SHALL contain exactly M `TimerOp::Delete` ops, every `ActivityOp::Delete` SHALL reference an `activity_id` that existed in the input state's activities map, and every `TimerOp::Delete` SHALL reference a `timer_id` that existed in the input state's timers map.
+*For any* valid open WorkflowState with N open activities and M open timers and *for any* valid TerminateRequest, when Terminate is applied: `activity_ops` SHALL contain no `ActivityOp::Delete`, `next_state.activities` SHALL hold the same N activity IDs as the input state, `timer_ops` SHALL contain exactly M `TimerOp::Delete` ops, and every `TimerOp::Delete` SHALL reference a `timer_id` that existed in the input state's timers map.
 
 **Validates: Requirements 3.2.1, 3.2.2, 3.2.3, 3.2.4, 9.5.1, 9.5.2, 9.5.3, 9.5.4, 10.5.1**
 

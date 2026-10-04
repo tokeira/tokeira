@@ -1823,6 +1823,78 @@ fn terminate_with_activities_and_timers() {
     ));
 }
 
+/// A worker's close deletes the run's timers, whose rows would otherwise come due and be
+/// rejected on every scan, and keeps its activities, which Describe still lists.
+#[test]
+fn worker_close_deletes_pending_timers_and_keeps_activities() {
+    let closes = [
+        WorkflowCommand::CompleteWorkflow {
+            result: payloads("done"),
+        },
+        WorkflowCommand::FailWorkflow {
+            failure: payload("nope"),
+        },
+        WorkflowCommand::CancelWorkflow { details: None },
+        make_continue_as_new_command(),
+    ];
+    for close in closes {
+        let mut state = make_open_state_with_started_wft();
+        state.retry_policy = None;
+        state.activities = make_open_state_with_activity("activity-1").activities;
+        state.timers = with_pending_timer_started_wft().timers;
+
+        let transition = close_via_wft(state, vec![close.clone()]);
+
+        assert!(!transition.next_state.status.is_open(), "{close:?}");
+        assert!(transition.next_state.timers.is_empty(), "{close:?}");
+        assert_eq!(
+            transition.timer_ops.to_vec(),
+            vec![tokeira_kernel::TimerOp::Delete {
+                timer_id: "timer-1".into()
+            }],
+            "{close:?}"
+        );
+        assert!(
+            transition.next_state.activities.contains_key("activity-1"),
+            "{close:?}"
+        );
+        assert!(transition.activity_ops.is_empty(), "{close:?}");
+    }
+}
+
+#[test]
+fn worker_close_drops_a_timer_started_in_the_same_task() {
+    let transition = close_via_wft(
+        with_pending_timer_started_wft(),
+        vec![
+            WorkflowCommand::StartTimer {
+                timer_id: "timer-2".into(),
+                fire_at: now() + Duration::minutes(5),
+            },
+            WorkflowCommand::CompleteWorkflow {
+                result: payloads("done"),
+            },
+        ],
+    );
+
+    assert!(transition.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::TimerStarted { timer_id, .. } if timer_id == "timer-2"
+    )));
+    assert!(transition.next_state.timers.is_empty());
+    assert_eq!(
+        transition.timer_ops.to_vec(),
+        vec![
+            tokeira_kernel::TimerOp::Delete {
+                timer_id: "timer-1".into()
+            },
+            tokeira_kernel::TimerOp::Delete {
+                timer_id: "timer-2".into()
+            },
+        ]
+    );
+}
+
 #[test]
 fn terminate_with_pending_wft() {
     let state = make_open_state_with_pending_wft();

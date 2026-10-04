@@ -20,7 +20,7 @@ impl DsqlRunRepository {
                     break;
                 }
                 due.extend(
-                    self.do_list_due_timers_for_shard(ShardId(shard_index), now, remaining)
+                    self.do_list_due_timers_for_shard(ShardId(shard_index), now, None, remaining)
                         .await?,
                 );
             }
@@ -35,6 +35,7 @@ impl DsqlRunRepository {
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueTimer>,
         limit: usize,
     ) -> Result<Vec<DueTimer>> {
         record_dsql_operation!(self, "list_due_timers_for_shard", Some(shard_id), {
@@ -44,18 +45,44 @@ impl DsqlRunRepository {
             }
 
             let mut permit = self.director.acquire(DbClass::Read).await?;
-            let rows = sqlx::query_as::<_, (Uuid, String, OffsetDateTime)>(
-                "SELECT run_key, timer_id, fire_at
-             FROM timer_bucket
-             WHERE shard_id = $1 AND fire_at <= $2
-             ORDER BY fire_at ASC
-             LIMIT $3",
-            )
-            .bind(Self::shard_id_to_uuid(shard_id))
-            .bind(now)
-            .bind(i64::try_from(limit)?)
-            .fetch_all(permit.connection()?)
-            .await?;
+            // Ordered by `timer_bucket`'s primary key after `shard_id`, so the
+            // keyset resume below is an index range scan.
+            let rows = match after {
+                None => {
+                    sqlx::query_as::<_, (Uuid, String, OffsetDateTime)>(
+                        "SELECT run_key, timer_id, fire_at
+                 FROM timer_bucket
+                 WHERE shard_id = $1 AND fire_at <= $2
+                 ORDER BY fire_at ASC, run_key ASC, timer_id ASC
+                 LIMIT $3",
+                    )
+                    .bind(Self::shard_id_to_uuid(shard_id))
+                    .bind(now)
+                    .bind(i64::try_from(limit)?)
+                    .fetch_all(permit.connection()?)
+                    .await?
+                }
+                Some(after) => {
+                    sqlx::query_as::<_, (Uuid, String, OffsetDateTime)>(
+                        "SELECT run_key, timer_id, fire_at
+                 FROM timer_bucket
+                 WHERE shard_id = $1 AND fire_at <= $2
+                   AND (fire_at > $3
+                        OR (fire_at = $3
+                            AND (run_key > $4 OR (run_key = $4 AND timer_id > $5))))
+                 ORDER BY fire_at ASC, run_key ASC, timer_id ASC
+                 LIMIT $6",
+                    )
+                    .bind(Self::shard_id_to_uuid(shard_id))
+                    .bind(now)
+                    .bind(after.fire_at)
+                    .bind(after.run_key.0)
+                    .bind(&after.timer_id)
+                    .bind(i64::try_from(limit)?)
+                    .fetch_all(permit.connection()?)
+                    .await?
+                }
+            };
             metrics::record_dsql_rows_read("list_due_timers_for_shard", rows.len());
 
             Ok(rows

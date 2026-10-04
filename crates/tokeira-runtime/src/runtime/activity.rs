@@ -1719,7 +1719,7 @@ where
 {
     let due = match deps
         .repo
-        .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, limit)
+        .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, None, limit)
         .await
     {
         Ok(due) => due,
@@ -3480,7 +3480,7 @@ mod tests {
         // Pass 2 (same budget): forward progress — the live row is admitted
         // and republished into the broker.
         let due_after_prune = repo
-            .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, 10)
+            .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, None, 10)
             .await
             .expect("list due rows");
         assert_eq!(

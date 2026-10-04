@@ -1,0 +1,5 @@
+kind: fixed
+body: Shard recovery on DSQL no longer fails binding its page sizes, elapses a delayed start instead of firing a timer, and skips timer rows the engine rejects.
+time: 2026-10-04T22:31:32.000000+01:00
+custom:
+    Slice: cc54a013-83b1-4a12-b350-d11ca8537ce3

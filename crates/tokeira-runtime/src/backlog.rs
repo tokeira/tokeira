@@ -534,6 +534,7 @@ mod tests {
             &self,
             _shard_id: ShardId,
             _now: time::OffsetDateTime,
+            _after: Option<&tokeira_storage::DueActivityDispatch>,
             _limit: usize,
         ) -> Result<Vec<tokeira_storage::DueActivityDispatch>> {
             Ok(Vec::new())
@@ -542,6 +543,7 @@ mod tests {
             &self,
             _shard_id: ShardId,
             _now: time::OffsetDateTime,
+            _after: Option<&DueTimer>,
             _limit: usize,
         ) -> Result<Vec<DueTimer>> {
             Ok(Vec::new())

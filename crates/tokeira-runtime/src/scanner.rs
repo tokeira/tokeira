@@ -78,7 +78,15 @@ pub(crate) fn pick_lane_for_run_key(
     &lanes[lane_index_for_run_key(run_key, lane_count.max(1)) % lanes.len()]
 }
 
-fn command_for_due_timer(due: DueTimer, fired_at: OffsetDateTime) -> Command {
+/// The command that fires `due`: the workflow start delay elapses through
+/// `WorkflowStartDelayElapsed`, every other timer through `TimerDue`.
+///
+/// v1.31.0 keeps the two apart: the start delay is a workflow backoff timer
+/// that schedules the first workflow task (`executeWorkflowBackoffTimerTask`),
+/// a user timer fires through `executeUserTimerTimeoutTask`
+/// (timer_queue_active_task_executor.go:137, 462 @ v1.31.0). A `TimerDue` for
+/// the start delay would record a `TimerFired` for a timer no workflow started.
+pub(crate) fn command_for_due_timer(due: DueTimer, fired_at: OffsetDateTime) -> Command {
     if due.timer_id == WORKFLOW_START_DELAY_TIMER_ID {
         Command::WorkflowStartDelayElapsed(WorkflowStartDelayElapsedRequest { fired_at })
     } else {
@@ -102,6 +110,45 @@ fn rejected_because_run_is_gone(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<KernelRejected>()
         .is_some_and(|rejected| matches!(rejected.0, Reject::RunClosed(_) | Reject::MissingRun))
+}
+
+/// Settle a due timer whose submission failed, as every pass over due timers
+/// does.
+///
+/// A rejection because the run has closed or is gone deletes the row if it is
+/// still the row that was read, since that timer can never fire. Any other
+/// rejection or failure is logged and the row stays for a later pass. Returns
+/// whether a row was deleted.
+pub(crate) async fn settle_failed_due_timer<R>(
+    repo: &R,
+    shard_id: Option<ShardId>,
+    due: &DueTimer,
+    error: &anyhow::Error,
+) -> bool
+where
+    R: RunRepository + ?Sized,
+{
+    if rejected_because_run_is_gone(error) {
+        return delete_stale_due_timer(repo, due).await;
+    }
+    if error.to_string().contains("kernel rejected") {
+        tracing::debug!(
+            ?error,
+            ?shard_id,
+            run_key = ?due.run_key,
+            timer_id = due.timer_id,
+            "due timer rejected by kernel"
+        );
+    } else {
+        tracing::warn!(
+            ?error,
+            ?shard_id,
+            run_key = ?due.run_key,
+            timer_id = due.timer_id,
+            "failed to submit due timer"
+        );
+    }
+    false
 }
 
 /// Delete the row of a due timer whose run is gone, if it is still the row
@@ -148,26 +195,7 @@ pub(crate) async fn scan_due_timers_once<R, F, Fut>(
 
     for due in due_timers {
         if let Err(error) = submit_due_timer(due.clone(), fired_at).await {
-            if rejected_because_run_is_gone(&error) {
-                delete_stale_due_timer(repo, &due).await;
-                continue;
-            }
-            let message = error.to_string();
-            if message.contains("kernel rejected") {
-                tracing::debug!(
-                    ?error,
-                    run_key = ?due.run_key,
-                    timer_id = due.timer_id,
-                    "timer scanner due timer rejected by kernel"
-                );
-            } else {
-                tracing::warn!(
-                    ?error,
-                    run_key = ?due.run_key,
-                    timer_id = due.timer_id,
-                    "timer scanner failed to submit due timer"
-                );
-            }
+            settle_failed_due_timer(repo, None, &due, &error).await;
         }
     }
 }
@@ -184,7 +212,7 @@ pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
 {
     let fired_at = OffsetDateTime::now_utc();
     let due_timers = match repo
-        .list_due_timers_for_shard(shard_id, fired_at, config.max_timers_per_scan)
+        .list_due_timers_for_shard(shard_id, fired_at, None, config.max_timers_per_scan)
         .await
     {
         Ok(due_timers) => due_timers,
@@ -201,28 +229,8 @@ pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
     let mut deleted = 0usize;
     for due in due_timers {
         if let Err(error) = submit_due_timer(due.clone(), fired_at).await {
-            if rejected_because_run_is_gone(&error) {
-                deleted += usize::from(delete_stale_due_timer(repo, &due).await);
-                continue;
-            }
-            let message = error.to_string();
-            if message.contains("kernel rejected") {
-                tracing::debug!(
-                    ?error,
-                    shard_id = ?shard_id,
-                    run_key = ?due.run_key,
-                    timer_id = due.timer_id,
-                    "timer scanner due timer rejected by kernel"
-                );
-            } else {
-                tracing::warn!(
-                    ?error,
-                    shard_id = ?shard_id,
-                    run_key = ?due.run_key,
-                    timer_id = due.timer_id,
-                    "timer scanner failed to submit due timer"
-                );
-            }
+            deleted +=
+                usize::from(settle_failed_due_timer(repo, Some(shard_id), &due, &error).await);
         }
     }
     if deleted > 0 {

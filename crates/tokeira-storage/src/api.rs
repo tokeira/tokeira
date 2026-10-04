@@ -1087,11 +1087,15 @@ pub trait RunRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>>;
 
-    /// List activity dispatch rows due at `now` for a specific shard, in
-    /// `(dispatch_at, insertion)` order, carrying each row's durable
-    /// eligibility time so reconciliation can identify the exact row version
-    /// it observed (see
+    /// List activity dispatch rows due at `now` for a specific shard, ordered
+    /// by `dispatch_at` and then by a stable per-row key, carrying each row's
+    /// durable eligibility time so reconciliation can identify the exact row
+    /// version it observed (see
     /// [`RunRepository::delete_activity_dispatch_if_matches`]).
+    ///
+    /// `after`, a row an earlier call returned, resumes the listing strictly
+    /// after it, so a caller can page through every due row even while it
+    /// prunes some of them.
     ///
     /// Due-only for the same reason as the queue variant: recovery and
     /// reconciliation must not surface a retry before its backoff elapses.
@@ -1099,6 +1103,7 @@ pub trait RunRepository: Send + Sync {
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueActivityDispatch>,
         limit: usize,
     ) -> Result<Vec<DueActivityDispatch>>;
 
@@ -1117,11 +1122,17 @@ pub trait RunRepository: Send + Sync {
         candidate: &ActivityDispatchIdentity,
     ) -> Result<bool>;
 
-    /// List due timers for a specific shard.
+    /// List due timers for a specific shard, ordered by
+    /// `(fire_at, run_key, timer_id)`.
+    ///
+    /// `after`, a timer an earlier call returned, resumes the listing strictly
+    /// after it, so a caller can page through every due timer even while some
+    /// of them are fired or deleted.
     async fn list_due_timers_for_shard(
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueTimer>,
         limit: usize,
     ) -> Result<Vec<DueTimer>>;
 
@@ -2516,10 +2527,11 @@ where
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueActivityDispatch>,
         limit: usize,
     ) -> Result<Vec<DueActivityDispatch>> {
         (**self)
-            .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, limit)
+            .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, after, limit)
             .await
     }
 
@@ -2527,10 +2539,11 @@ where
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueTimer>,
         limit: usize,
     ) -> Result<Vec<DueTimer>> {
         (**self)
-            .list_due_timers_for_shard(shard_id, now, limit)
+            .list_due_timers_for_shard(shard_id, now, after, limit)
             .await
     }
 

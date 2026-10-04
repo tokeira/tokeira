@@ -337,10 +337,11 @@ where
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&tokeira_storage::DueActivityDispatch>,
         limit: usize,
     ) -> Result<Vec<tokeira_storage::DueActivityDispatch>> {
         self.inner
-            .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, limit)
+            .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, after, limit)
             .await
     }
 
@@ -348,10 +349,11 @@ where
         &self,
         shard_id: ShardId,
         now: OffsetDateTime,
+        after: Option<&DueTimer>,
         limit: usize,
     ) -> Result<Vec<DueTimer>> {
         self.inner
-            .list_due_timers_for_shard(shard_id, now, limit)
+            .list_due_timers_for_shard(shard_id, now, after, limit)
             .await
     }
 

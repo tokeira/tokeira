@@ -949,7 +949,7 @@ where
             return Ok(None);
         };
 
-        let history = self.repo.read_history(run_key, 0, usize::MAX).await?;
+        let history = self.repo.read_history_to_end(run_key, 0).await?;
         let history_size_bytes =
             tokeira_edge::translate::history_serializer::serialized_history_size_bytes(&history);
         match self.repo.load_run(run_key).await? {

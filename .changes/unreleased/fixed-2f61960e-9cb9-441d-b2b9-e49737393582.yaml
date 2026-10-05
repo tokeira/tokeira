@@ -1,0 +1,5 @@
+kind: fixed
+body: Histories longer than 1,000 events on DSQL are no longer cut short, and GetWorkflowExecutionHistory and its reverse page at most 256 events, as Temporal does.
+time: 2026-10-05T19:45:45.000000+01:00
+custom:
+    Slice: 2f61960e-9cb9-441d-b2b9-e49737393582

@@ -2124,7 +2124,7 @@ mod tests {
         };
         assert!(state.timers.is_empty());
         assert!(state.pending_workflow_task.is_some());
-        let history = store.read_history(run_key, 0, usize::MAX).await.unwrap();
+        let history = store.read_history_to_end(run_key, 0).await.unwrap();
         assert!(!history.is_empty());
         assert!(!history.iter().any(|event| matches!(
             event.kind,

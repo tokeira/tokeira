@@ -685,7 +685,7 @@ where
             run_id: Some(state.run_id),
             ..execution
         };
-        let history = self.repo.read_history(run_key, 0, usize::MAX).await?;
+        let history = self.repo.read_history_to_end(run_key, 0).await?;
 
         let mut accepted = None;
         for event in history {

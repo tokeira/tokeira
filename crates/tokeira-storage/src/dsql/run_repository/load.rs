@@ -1,5 +1,17 @@
 use super::*;
 
+/// History batches after a cursor, in order, a page at a time, so a history
+/// read fetches only the batches it returns (`history-pagination` criterion 2.3).
+pub(super) const READ_HISTORY_BATCHES_SQL: &str = "
+    SELECT first_event_id, last_event_id, events_data, principals_data
+    FROM history_batch
+    WHERE run_key = $1 AND last_event_id > $2
+    ORDER BY first_event_id ASC
+    LIMIT $3";
+
+/// History batches each statement of a history read fetches.
+const HISTORY_BATCH_PAGE: usize = 64;
+
 impl DsqlRunRepository {
     #[instrument(name = "dsql.resolve_execution", skip(self), fields(namespace_id = %execution.namespace_id.0, workflow_id = %execution.workflow_id.0))]
     pub(super) async fn do_resolve_execution(
@@ -144,8 +156,7 @@ impl DsqlRunRepository {
             "read_history",
             Some(self.shard_for_run_key(run_key)),
             {
-                let effective_limit = effective_history_limit(limit);
-                if effective_limit == 0 {
+                if limit == 0 {
                     metrics::record_dsql_rows_read("read_history", 0);
                     return Ok(Vec::new());
                 }
@@ -153,34 +164,46 @@ impl DsqlRunRepository {
                 let mut permit = self.director.acquire(DbClass::Read).await?;
                 // History is stored in transition batches. A batch may straddle
                 // `after_event_id`, so decoding and per-event filtering remain in Rust.
-                let rows = sqlx::query_as::<_, (i64, i64, Vec<u8>, Option<Vec<u8>>)>(
-                    "SELECT first_event_id, last_event_id, events_data, principals_data
-             FROM history_batch
-             WHERE run_key = $1 AND last_event_id > $2
-             ORDER BY first_event_id ASC",
-                )
-                .bind(run_key.0)
-                .bind(after_event_id)
-                .fetch_all(permit.connection()?)
-                .await?;
-                metrics::record_dsql_rows_read("read_history", rows.len());
-
+                // Batches come a page at a time, each statement continuing after the
+                // last batch read, until the read holds `limit` events or no batches
+                // remain.
+                let batch_page = i64::try_from(HISTORY_BATCH_PAGE)?;
                 let mut events = Vec::new();
-                for (_first_event_id, _last_event_id, events_data, principals_data) in rows {
-                    for attributed in decode_attributed_history_batch(
-                        run_key,
-                        &events_data,
-                        principals_data.as_deref(),
-                    )? {
-                        if attributed.event.event_id <= after_event_id {
-                            continue;
-                        }
-                        events.push(attributed);
-                        if events.len() == effective_limit {
-                            return Ok(events);
+                let mut batch_cursor = after_event_id;
+                let mut rows_read = 0;
+                loop {
+                    let rows = sqlx::query_as::<_, (i64, i64, Vec<u8>, Option<Vec<u8>>)>(
+                        READ_HISTORY_BATCHES_SQL,
+                    )
+                    .bind(run_key.0)
+                    .bind(batch_cursor)
+                    .bind(batch_page)
+                    .fetch_all(permit.connection()?)
+                    .await?;
+                    rows_read += rows.len();
+                    let more_batches = rows.len() == HISTORY_BATCH_PAGE;
+                    for (_first_event_id, last_event_id, events_data, principals_data) in rows {
+                        batch_cursor = last_event_id;
+                        for attributed in decode_attributed_history_batch(
+                            run_key,
+                            &events_data,
+                            principals_data.as_deref(),
+                        )? {
+                            if attributed.event.event_id <= after_event_id {
+                                continue;
+                            }
+                            events.push(attributed);
+                            if events.len() == limit {
+                                metrics::record_dsql_rows_read("read_history", rows_read);
+                                return Ok(events);
+                            }
                         }
                     }
+                    if !more_batches {
+                        break;
+                    }
                 }
+                metrics::record_dsql_rows_read("read_history", rows_read);
                 Ok(events)
             }
         );

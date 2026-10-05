@@ -732,6 +732,10 @@ pub struct RunHistoryStats {
     pub history_size_bytes: i64,
 }
 
+/// Events per page when [`RunRepository::read_history_to_end`] or
+/// [`RunRepository::read_attributed_history_to_end`] reads a run's history.
+pub const HISTORY_READ_PAGE: usize = 1024;
+
 /// Query surface the runtime needs from storage.
 ///
 /// The interface is intentionally shaped around semantics rather than a
@@ -783,12 +787,43 @@ pub trait RunRepository: Send + Sync {
     }
 
     /// Read the authoritative history stream after a known event id.
+    ///
+    /// Returns the events after `after_event_id` in order, at most `limit` of
+    /// them, and fewer than `limit` only when no more events exist: a short page
+    /// means the end. No implementation substitutes a smaller limit
+    /// (`history-pagination` criterion 2.1). A caller that needs every event
+    /// uses [`Self::read_history_to_end`].
     async fn read_history(
         &self,
         run_key: RunKey,
         after_event_id: i64,
         limit: usize,
     ) -> Result<Vec<HistoryEvent>>;
+
+    /// Read every event after `after_event_id`, in pages of
+    /// [`HISTORY_READ_PAGE`] events until a short page (`history-pagination`
+    /// criterion 2.2).
+    async fn read_history_to_end(
+        &self,
+        run_key: RunKey,
+        after_event_id: i64,
+    ) -> Result<Vec<HistoryEvent>> {
+        let mut events = Vec::new();
+        let mut cursor = after_event_id;
+        loop {
+            let page = self
+                .read_history(run_key, cursor, HISTORY_READ_PAGE)
+                .await?;
+            let short = page.len() < HISTORY_READ_PAGE;
+            if let Some(last) = page.last() {
+                cursor = last.event_id;
+            }
+            events.extend(page);
+            if short {
+                return Ok(events);
+            }
+        }
+    }
 
     /// Read authoritative history with durable event attribution.
     ///
@@ -810,6 +845,31 @@ pub trait RunRepository: Send + Sync {
                 principal: None,
             })
             .collect())
+    }
+
+    /// Read every attributed event after `after_event_id`, in pages of
+    /// [`HISTORY_READ_PAGE`] events until a short page (`history-pagination`
+    /// criterion 2.2).
+    async fn read_attributed_history_to_end(
+        &self,
+        run_key: RunKey,
+        after_event_id: i64,
+    ) -> Result<Vec<AttributedHistoryEvent>> {
+        let mut events = Vec::new();
+        let mut cursor = after_event_id;
+        loop {
+            let page = self
+                .read_attributed_history(run_key, cursor, HISTORY_READ_PAGE)
+                .await?;
+            let short = page.len() < HISTORY_READ_PAGE;
+            if let Some(last) = page.last() {
+                cursor = last.event.event_id;
+            }
+            events.extend(page);
+            if short {
+                return Ok(events);
+            }
+        }
     }
 
     /// Lookup request dedupe state for a workflow execution reference.

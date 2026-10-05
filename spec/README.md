@@ -21,12 +21,16 @@ spec/
   tla/
     00_execution_contract.tla
     00_execution_contract.cfg
+    30_bundle_lease.tla
+    30_bundle_lease.cfg
+    30_bundle_lease_for_update.cfg
     40_dispatch_handoff.tla
     40_dispatch_handoff.cfg
     40_dispatch_handoff_order.cfg
     40_dispatch_handoff_migration.cfg
     40_dispatch_handoff_stale_rows.cfg
     negative/
+      30_bundle_lease_*.cfg
       40_dispatch_handoff_*.cfg
 ```
 
@@ -60,6 +64,41 @@ It keeps the first spec readable and lets us pin down the kernel's semantic cont
 
 This is the TLC model configuration for the first spec.
 It gives the constants small finite values so TLC can exhaustively explore the state space.
+
+### `tla/30_bundle_lease.tla`
+
+This models how a bundle's lease fences writes on Aurora DSQL, which takes no locks.
+DSQL adjudicates conflicts at commit time, and of two conflicting transactions, whichever commits last fails.
+The model encodes AWS's conflict rules between key writes, updates of non-key columns, `SELECT ... FOR UPDATE` and `SELECT ... FOR KEY SHARE`.
+A plain `SELECT` never conflicts.
+
+The protocol it checks:
+
+- `epoch` is a key column, through a unique index on `(shard_id, epoch)`;
+- every run commit, creation and deletion reads the lease row `FOR KEY SHARE` in its own transaction and checks owner and epoch;
+- only an acquisition or a release writes `epoch`, and renewal updates only the expiry, without `FOR UPDATE`;
+- an owner whose lease has expired by its own clock stops starting commits.
+
+It checks that no run write commits unless its node owns the lease at the epoch it checked (`NoStaleOwnerCommit`).
+It checks that renewals and the owner's other commits never abort the owner's commits (`NoSpuriousAbort`).
+And it checks that an expired lease is eventually taken over, renewed or released (`LapsedLeaseResolves`).
+
+The last property depends on the owner stopping at its expiry.
+Under DSQL's rule, a fenced commit that lands first aborts a concurrent takeover, so an owner that keeps committing can starve every takeover.
+Safety never depends on the owner stopping; failover does.
+
+| Configuration | What it exercises | Expected |
+|---|---|---|
+| `30_bundle_lease.cfg` | the protocol above: two nodes, two runs, three epochs | pass |
+| `30_bundle_lease_for_update.cfg` | run writes that read the lease `FOR UPDATE`, with `NoSpuriousAbort` unchecked | pass: safe, but contended |
+| `negative/30_bundle_lease_plain_read.cfg` | a plain read of the epoch inside the commit | `NoStaleOwnerCommit` fails |
+| `negative/30_bundle_lease_separate_check.cfg` | the epoch checked in its own transaction before the commit | `NoStaleOwnerCommit` fails |
+| `negative/30_bundle_lease_epoch_not_key.cfg` | `epoch` outside any unique index | `NoStaleOwnerCommit` fails |
+| `negative/30_bundle_lease_renew_for_update.cfg` | renewal that reads the lease `FOR UPDATE` | `NoSpuriousAbort` fails |
+| `negative/30_bundle_lease_commit_for_update.cfg` | run writes that read the lease `FOR UPDATE` | `NoSpuriousAbort` fails |
+| `negative/30_bundle_lease_no_self_fence.cfg` | an owner that keeps committing after its lease expires | `LapsedLeaseResolves` fails |
+
+The first four negative controls are today's code, so the model also shows what has to change: the in-transaction read and the controller-mode check are plain reads, `shard_lease` is keyed on `shard_id` alone, and renewal reads `FOR UPDATE`.
 
 ### `tla/40_dispatch_handoff.tla`
 
@@ -207,19 +246,21 @@ cd spec/tla
 java -cp /path/to/tla2tools.jar tla2sany.SANY 00_execution_contract.tla
 ```
 
-### Checking `40_dispatch_handoff` with TLC
+### Checking the protocol models with TLC
 
-Run every configuration. The four at the top level must pass, and each one under `negative/` must report a violation.
+Run every configuration of a module. Those at the top level must pass, and each one under `negative/` must report a violation.
 `-metadir` keeps TLC's working files out of the tree.
 
 ```bash
 cd spec/tla
-for cfg in 40_dispatch_handoff*.cfg negative/40_dispatch_handoff_*.cfg; do
-  java -cp /path/to/tla2tools.jar tlc2.TLC -workers auto -metadir /tmp/tlc -config "$cfg" 40_dispatch_handoff.tla
+for module in 30_bundle_lease 40_dispatch_handoff; do
+  for cfg in "$module"*.cfg negative/"$module"_*.cfg; do
+    java -cp /path/to/tla2tools.jar tlc2.TLC -workers auto -metadir /tmp/tlc -config "$cfg" "$module.tla"
+  done
 done
 ```
 
-The main configuration explores about 240,000 distinct states and takes about a minute; the others take seconds.
+The largest configurations, `40_dispatch_handoff.cfg` and `30_bundle_lease_for_update.cfg`, explore about 240,000 and 285,000 distinct states and take about a minute each; the others take seconds.
 
 ### Option C: tla-rs
 
@@ -234,7 +275,11 @@ tla 40_dispatch_handoff.tla --config 40_dispatch_handoff.cfg --max-states 200000
 ```
 
 Its default limits (1,000,000 states and depth 100) are smaller than models like this may need, so set them explicitly.
-It runs on one thread, so the main configuration takes about three minutes.
+It runs on one thread, so the largest configurations take a few minutes.
+
+If the two checkers disagree, TLC is the reference.
+Write each action as a flat conjunction, one action per outcome, rather than branching with `CASE` or `IF` over primed assignments.
+tla-rs 0.21.2 misjudged the fairness of the branching form in a draft of `30_bundle_lease`.
 
 ## What TLC will do on the first run
 
@@ -256,7 +301,7 @@ As Tokeira evolves, the intended spec sequence is:
 1. `00_execution_contract.tla`
 2. `10_history_authority.tla`
 3. `20_current_execution.tla`
-4. `30_bundle_lease.tla`
+4. `30_bundle_lease.tla`, written.
 5. `40_dispatch_handoff.tla`, written. It replaces the planned `40_broker_reservations.tla`: claiming a task writes nothing, so there are no broker reservations to model.
 6. `70_projection_prefix.tla`
 

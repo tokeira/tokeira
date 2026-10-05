@@ -184,8 +184,9 @@ DispatchOp::StartChildWorkflow {
     parent_workflow_id,
     initiated_event_id,
 } => {
-    let child_run_key = RunKey::new();
+    // Once per start: every retry reuses them (Requirement 1.2).
     let child_run_id = RunId::new();
+    let child_run_key = RunKey::derive(*namespace_id, child_workflow_id, child_run_id);
     let now = OffsetDateTime::now_utc();
 
     let start_request = StartRequest {
@@ -211,33 +212,37 @@ DispatchOp::StartChildWorkflow {
         now,
     };
 
-    let confirm_result = match self.pick_lane(child_run_key)
-        .submit(child_run_key, Command::Start(start_request))
-        .await
-    {
-        Ok(CommitResult::Applied { .. }) => {
-            ChildStartResult::Started {
-                child_run_id,
-                workflow_type: workflow_type.clone(),
+    // Retry until a definitive outcome (Requirement 7.1). The run key, run id
+    // and request id stay fixed, so a repeat of a start that committed is
+    // recognised as the runtime's own (Requirement 1.7). TERMINATE_EXISTING
+    // terminates the incumbent once and retries; that path is not shown.
+    let mut backoff = TaskRescheduleBackoff::new(); // 1 s, x1.1, at most 3 min
+    let confirm_result = loop {
+        match self.pick_lane(child_run_key)
+            .submit(child_run_key, Command::Start(start_request.clone()))
+            .await
+        {
+            Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {
+                break ChildStartResult::Started { child_run_id, workflow_type: workflow_type.clone() };
             }
-        }
-        Ok(CommitResult::Conflict { reason }) | Err(_) => {
-            ChildStartResult::Failed {
-                cause: /* error description */,
+            Err(error) if is_run_already_exists(&error) => {
+                break ChildStartResult::Started { child_run_id, workflow_type: workflow_type.clone() };
             }
-        }
-        Ok(CommitResult::Duplicate) => {
-            // Duplicate means the request was already committed,
-            // but we don't know the actual child RunId. Treat as
-            // failure — the sweeper (Feature 11) will reconcile
-            // if the child was actually started by a prior attempt.
-            ChildStartResult::Failed {
-                cause: "duplicate start request".to_string(),
+            Ok(CommitResult::CurrentExecutionConflict { .. }) => {
+                // FAIL policy (Requirement 1.5)
+                break ChildStartResult::Failed { cause: "WORKFLOW_ALREADY_EXISTS".to_string() };
+            }
+            Ok(CommitResult::Conflict { .. }) | Err(_) => {
+                sleep(backoff.next_delay()).await;
+                if !self.parent_awaits_child(*parent_run_key, child_workflow_id, *initiated_event_id).await {
+                    return; // Requirement 7.5: no start, no confirmation
+                }
             }
         }
     };
 
-    // Always confirm back to parent
+    // Confirm to the parent, retrying anything but a kernel rejection
+    // (Requirement 7.2).
     let confirm_command = Command::ChildStartConfirmed(
         ChildStartConfirmedRequest {
             child_workflow_id: child_workflow_id.clone(),
@@ -246,11 +251,19 @@ DispatchOp::StartChildWorkflow {
             now: OffsetDateTime::now_utc(),
         },
     );
-    if let Err(error) = self.pick_lane(*parent_run_key)
-        .submit(*parent_run_key, confirm_command)
-        .await
-    {
-        tracing::warn!(?error, "failed to deliver ChildStartConfirmed to parent");
+    let mut backoff = TaskRescheduleBackoff::new();
+    loop {
+        match self.pick_lane(*parent_run_key)
+            .submit(*parent_run_key, confirm_command.clone())
+            .await
+        {
+            Ok(_) => break,
+            Err(error) if is_kernel_rejection(&error) => {
+                tracing::warn!(?error, "parent no longer awaits ChildStartConfirmed");
+                break;
+            }
+            Err(_) => sleep(backoff.next_delay()).await,
+        }
     }
 }
 ```
@@ -391,12 +404,16 @@ Parent WFT Completed with StartChildWorkflow command
     }
   → Lane commits parent transition
   → Publisher.publish() handles StartChildWorkflow:
-      1. child_run_key = RunKey::new()
-      2. child_run_id = RunId::new()
-      3. Build StartRequest with parent_run_key, parent_workflow_id
-      4. Submit Command::Start to child lane
-      5. Build ChildStartConfirmedRequest from result
-      6. Submit Command::ChildStartConfirmed to parent lane
+      1. child_run_id = RunId::new(); child_run_key derived from it (once per start)
+      2. Build StartRequest with parent_run_key, parent_workflow_id
+      3. Submit Command::Start to child lane, until a definitive outcome:
+           Applied, Duplicate, or RunAlreadyExists for child_run_key → Started
+           CurrentExecutionConflict under FAIL → Failed { WORKFLOW_ALREADY_EXISTS }
+           anything else → back off (1 s, x1.1, at most 3 min), re-read the
+             parent, stop if it no longer awaits the child, and resubmit
+      4. Build ChildStartConfirmedRequest from the outcome
+      5. Submit Command::ChildStartConfirmed to parent lane, retrying errors
+         other than a kernel rejection with the same backoff
 ```
 
 ### Data flow: Child Resolution
@@ -451,9 +468,9 @@ Parent run closes (complete, fail, cancel, terminate, timeout, reset, CAN)
 
 **Validates: Requirements 1.4, 1.6**
 
-### Property 3: Failed child start produces Failed confirmation
+### Property 3: Only an existing workflow fails a child start
 
-*For any* `DispatchOp::StartChildWorkflow` where the child `Command::Start` fails (returns an error or `CommitResult::Conflict` after retry exhaustion), the publisher shall submit a `Command::ChildStartConfirmed` to the parent run with `ChildStartResult::Failed { cause }` containing a non-empty failure description, and `initiated_event_id` matching the dispatch op's `initiated_event_id`.
+*For any* `DispatchOp::StartChildWorkflow` and any sequence of start outcomes, the publisher shall confirm `ChildStartResult::Failed` only with cause `WORKFLOW_ALREADY_EXISTS`, only after a `CommitResult::CurrentExecutionConflict` under the FAIL policy, and with `initiated_event_id` matching the dispatch op's. Errors and `CommitResult::Conflict` outcomes are retried, never confirmed as failures.
 
 **Validates: Requirements 1.5, 1.6, 7.1**
 
@@ -486,15 +503,33 @@ Parent run closes (complete, fail, cancel, terminate, timeout, reset, CAN)
 
 **Validates: Requirements 6.2**
 
+### Property 8: A start that already committed confirms as started
+
+*For any* `DispatchOp::StartChildWorkflow` whose start commits on an attempt that reports an error, the retry's `CommitResult::Duplicate` or `RunAlreadyExists` outcome shall produce exactly one `ChildStartResult::Started` confirmation, carrying the `child_run_id` assigned to the start.
+
+**Validates: Requirements 1.2, 1.7**
+
+### Property 9: Retries stop when the parent stops awaiting the child
+
+*For any* sequence of retried start outcomes, once the parent is absent or closed, or no longer holds the child as initiated and unconfirmed, the publisher shall submit no further `Command::Start` and no `Command::ChildStartConfirmed`.
+
+**Validates: Requirement 7.5**
+
+### Property 10: Confirmation is retried until applied or rejected
+
+*For any* sequence of confirmation outcomes, the publisher shall resubmit `Command::ChildStartConfirmed` after each error other than a kernel rejection, and shall stop after the first applied outcome or kernel rejection.
+
+**Validates: Requirement 7.2**
+
 ## Error Handling
 
 ### Child start failure
 
-If the child `Command::Start` fails for any reason (storage error, lane channel closed, OCC exhaustion, `Reject::RunAlreadyExists`), the publisher constructs a `ChildStartResult::Failed { cause }` with a description of the failure and delivers `Command::ChildStartConfirmed` to the parent. This ensures the parent is never left waiting indefinitely for a child that will never start.
+Only a running execution with the child's workflow id, under the FAIL conflict policy, fails a child start: the publisher confirms `ChildStartResult::Failed { cause: "WORKFLOW_ALREADY_EXISTS" }` (Requirement 1.5). Every other failure (a storage error, a closed lane channel, OCC exhaustion, a `CommitResult::Conflict` such as a shard the node doesn't own yet) is retried with the same run key, run id and request id, backing off as v1.31.0 does (Requirement 7.1). `Reject::RunAlreadyExists` or `CommitResult::Duplicate` on a retry means an earlier attempt committed, so the start confirms as `Started` (Requirement 1.7). The parent is re-read before each retry, and the retries stop without a start or a confirmation once it no longer awaits the child (Requirement 7.5).
 
 ### ChildStartConfirmed delivery failure
 
-If the `Command::ChildStartConfirmed` delivery to the parent fails (parent lane closed, OCC exhaustion), the publisher logs at `warn` level. The parent's `ChildWorkflowState` remains in the initiated-but-unconfirmed state. The sweeper (Feature 11) or a future reconciliation mechanism will resolve this by re-checking the child's existence and delivering the confirmation.
+If the `Command::ChildStartConfirmed` delivery to the parent fails with an error other than a kernel rejection (parent lane closed, OCC exhaustion), the publisher retries it with the same backoff. A kernel rejection means the parent has closed or no longer awaits this confirmation, so the publisher logs at `warn` level and stops (Requirement 7.2). Retries live in memory: a crash still loses a pending start or confirmation until child starts gain a durable representation (Requirement 7.6).
 
 ### ChildResolved delivery failure
 
@@ -516,7 +551,7 @@ Parent close policy dispatch ops are processed after the parent's transition is 
 
 ### Property-based testing
 
-All 7 correctness properties will be implemented as property-based tests using the [`proptest`](https://docs.rs/proptest) crate, consistent with the existing test infrastructure in `tokeira-runtime`.
+All 10 correctness properties will be implemented as property-based tests using the [`proptest`](https://docs.rs/proptest) crate, consistent with the existing test infrastructure in `tokeira-runtime`.
 
 Each property test will:
 - Run a minimum of 100 iterations (proptest default is 256).
@@ -530,7 +565,7 @@ Each correctness property MUST be implemented by a SINGLE property-based test.
 
 **Property 2 (Successful child start confirmation):** A generator produces random dispatch ops. The mock child lane returns `CommitResult::Applied`. A mock parent lane captures the `Command::ChildStartConfirmed`. The test verifies the `Started` variant with correct `child_run_id`, `workflow_type`, and `initiated_event_id`.
 
-**Property 3 (Failed child start confirmation):** A generator produces random dispatch ops. The mock child lane returns an error. A mock parent lane captures the `Command::ChildStartConfirmed`. The test verifies the `Failed` variant with a non-empty cause and correct `initiated_event_id`.
+**Property 3 (Only an existing workflow fails a child start):** A generator produces random dispatch ops and a random sequence of start outcomes: errors, `CommitResult::Conflict`, and a final definitive outcome. A mock parent lane captures the `Command::ChildStartConfirmed`. The test verifies that errors and conflicts are retried, and that `Failed` appears only with `WORKFLOW_ALREADY_EXISTS` after a `CurrentExecutionConflict` under FAIL. Backoff runs under `tokio::time::pause()`.
 
 **Property 4 (TerminateChild and CancelChild dispatch):** A generator produces random `TerminateChild` and `CancelChild` dispatch ops with random `child_run_id` and `reason`. Mock lanes capture submitted commands. The test verifies the correct `Command::Terminate` or `Command::Cancel` is submitted with the matching `reason`.
 
@@ -539,6 +574,12 @@ Each correctness property MUST be implemented by a SINGLE property-based test.
 **Property 6 (Dispatch continues after failure):** A generator produces random batches of `TerminateChild`/`CancelChild` ops and random failure patterns (which ops fail). Mock lanes are configured to fail on specific ops. The test verifies that all non-failing ops are still dispatched and that the parent's commit result is unaffected.
 
 **Property 7 (Parent identity round-trip):** A generator produces random `RunKey` and `WorkflowId` values. The test creates a child workflow with these as parent identity, commits it to an `InMemoryStore`, reloads the state, and verifies `parent_run_key` and `parent_workflow_id` are preserved.
+
+**Property 8 (A start that already committed confirms as started):** The mock child lane commits the start but reports an error, then answers the retry with `CommitResult::Duplicate` or a `RunAlreadyExists` rejection. The test verifies exactly one `Started` confirmation with the assigned `child_run_id`.
+
+**Property 9 (Retries stop when the parent stops awaiting):** The mock child lane keeps failing, and the mock repository closes the parent, or removes or confirms the child, at a random retry. The test verifies that no `Command::Start` follows and that no confirmation is sent.
+
+**Property 10 (Confirmation retried until applied or rejected):** The mock parent lane returns a random number of errors, then an applied outcome or a kernel rejection. The test verifies one resubmission per error and none after the final outcome.
 
 ### Unit tests
 

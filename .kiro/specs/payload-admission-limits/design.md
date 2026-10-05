@@ -60,7 +60,7 @@ _For any_ activity response with a result, cancellation details or heartbeat det
 
 ### Limits (`crates/tokeira-edge/src/grpc/payload_limits.rs`, new)
 
-- Constants for v1.31.0's defaults, and accessors that read the conformance overrides of criterion 2.12 under `#[cfg(feature = "conformance")]`, as `callback_header_max_size` does in `grpc/translate.rs`.
+- Constants for v1.31.0's values (criterion 2.12), each read through an accessor as the callback limits are in `grpc/translate.rs`. The Temporal functional harness's build can override the accessors; `conformance-config-override` owns that wiring, and production builds compile the constants alone.
 - `check_blob_size(size, operation)` and `check_memo_size(size, operation)`: log a warning above the warn limit, and return the v1.31.0 error above the error limit.
 - `check_search_attribute_count(&SearchAttributes)` and `check_search_attribute_sizes(&SearchAttributes)`: the key count, then each value's data length and the map's encoded size, with v1.31.0's messages. They are separate so that a standalone activity's registered-key check can sit between them.
 - `server_failure(message)` builds the server failure, and `truncate_failure(&Failure, max_size)` ports `TruncateWithDepth` with a depth of 20.
@@ -82,13 +82,13 @@ _For any_ activity response with a result, cancellation details or heartbeat det
 - **RespondActivityTaskFailed**, by task token and by id: over the limit, drop the last heartbeat details and add their server failure to the response. Over the limit, replace the failure with "Failure exceeds size limit.", its cause truncated to the warn limit, and add that failure to the response too. Heartbeat details are checked first, as in v1.31.0.
 - **RespondWorkflowTaskFailed:** over the limit, replace the failure as above. The response is unchanged.
 
-### Conformance (`crates/tokeira-conformance/src/lib.rs`)
+### Functional harness wiring
 
-- `limit.blobSize.error` becomes `Wired`, and the other keys of criterion 2.12 are registered as `Wired`. The command-time checks, and the other size limits, stay `NotEnforced` until they exist.
+- The harness's key registry (`crates/tokeira-conformance/src/lib.rs`) marks the seven keys `Wired`, as `conformance-config-override`'s key table records. This serves only the Temporal functional harness, whose tests shrink the limits to exercise them. It is not a Tokeira setting.
 
 ### Other specs
 
-- `conformance-config-override` lists these keys among the limits with no consult site; it points here for the admission checks.
+- `conformance-config-override` listed `limit.blobSize.error` among the limits with no consult site. Its key table now records the seven keys as overridable by the harness at request admission.
 - `activity-heartbeat-time` says Tokeira enforces no blob size limit on heartbeat details; it points here.
 
 ### Out of scope

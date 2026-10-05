@@ -65,9 +65,11 @@ observable effect is inside a conformance build.
 - **Not enforced anywhere (necessary-but-not-sufficient):** the size-limit settings
   (`MutableStateSizeLimitError` 8MiB, `BlobSizeLimitError` 2MiB, `HistorySizeLimitError` 50MiB,
   `HistoryCountLimitError` 50×1024, `HistorySizeSuggestContinueAsNew` 4MiB) have **no consult site** in
-  tokeira today — an override cannot bite until the enforcement exists. `BlobSizeLimitError` has
-  consult sites when a request arrives since [payload-admission-limits](../payload-admission-limits/bugfix.md)
-  (criterion 2.12), with the memo and search attribute limits; a workflow task's commands still have none.
+  tokeira today — an override cannot bite until the enforcement exists. Since
+  [payload-admission-limits](../payload-admission-limits/bugfix.md), `BlobSizeLimitError` and the memo
+  and search attribute limits have consult sites when a request arrives, which the harness build can
+  override (key table below); production builds keep v1.31.0's values. A workflow task's commands still
+  have none.
 - **The harness seam:** `FunctionalTestBase.OverrideDynamicConfig(setting dynamicconfig.GenericSetting,
   value any) (cleanup func())` (`tests/testcore/functional_test_base.go:645`),
   `TestCluster.OverrideDynamicConfig` (`tests/testcore/test_cluster.go:636`), and the tokeira onebox
@@ -170,7 +172,7 @@ so an override is Unsupported until enforcement lands under another spec.
 | `component.callbacks.allowedAddresses` | callback admission (edge) | **Overridable — Tier 5.32, structured JSON** | fork serializes the v1.31.0 address-rule list as JSON; production policy remains a separate decision |
 | `history.workflowIdReuseMinimalInterval` (1s) | `CONTINUE_AS_NEW_MIN_INTERVAL` (kernel) | **Kernel-excluded** | separate decision (independent-run build or kernel→runtime move) |
 | `history.maximumBufferedEventsBatch` (100) | `MAX_BUFFERED_EVENTS` (kernel) | **Kernel-excluded** | no corpus leaf overrides it today |
-| `limit.blobSize.error`, `limit.blobSize.warn`, `limit.memoSize.error`, `limit.memoSize.warn`, `frontend.searchAttributesNumberOfKeysLimit`, `frontend.searchAttributesSizeOfValueLimit`, `frontend.searchAttributesTotalSizeLimit` | request admission (edge) | **Overridable** | [payload-admission-limits](../payload-admission-limits/bugfix.md) criterion 2.12; a workflow task's commands aren't checked yet |
+| `limit.blobSize.error`, `limit.blobSize.warn`, `limit.memoSize.error`, `limit.memoSize.warn`, `frontend.searchAttributesNumberOfKeysLimit`, `frontend.searchAttributesSizeOfValueLimit`, `frontend.searchAttributesTotalSizeLimit` | `grpc/payload_limits.rs` accessors (edge) | **Overridable** | admission checks from [payload-admission-limits](../payload-admission-limits/bugfix.md); production builds compile v1.31.0's values; a workflow task's commands aren't checked yet |
 | `limit.mutableStateSize.error`, `limit.historySize.error`, `limit.historyCount.error`, `limit.historySize.suggestContinueAsNew` | none | **Not-enforced** | Unsupported until enforcement exists |
 
 ---

@@ -54,7 +54,7 @@ This spec covers the limits v1.31.0 applies when a request arrives. The limits o
 
 2.11 The checks SHALL apply alike to workflow activities and standalone activities, and above the warn limit the system SHALL only log.
 
-2.12 Production builds SHALL use v1.31.0's defaults. Conformance builds SHALL read `limit.blobSize.error`, `limit.blobSize.warn`, `limit.memoSize.error`, `limit.memoSize.warn`, `frontend.searchAttributesNumberOfKeysLimit`, `frontend.searchAttributesSizeOfValueLimit` and `frontend.searchAttributesTotalSizeLimit` from overrides, as they do the callback limits.
+2.12 The limits SHALL be v1.31.0's default values, given in the introduction, and SHALL be fixed: Tokeira offers no setting to change them.
 
 ### Unchanged Behavior (Regression Prevention)
 

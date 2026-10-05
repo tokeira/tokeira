@@ -7,7 +7,7 @@ Check every payload a request carries against v1.31.0's limits in the edge's gRP
 ## Tasks
 
 - [ ] 1. Limits
-  - [ ] 1.1 Add `crates/tokeira-edge/src/grpc/payload_limits.rs` with v1.31.0's defaults, the conformance accessors, `check_blob_size`, `check_memo_size`, `check_search_attribute_count` and `check_search_attribute_sizes`
+  - [ ] 1.1 Add `crates/tokeira-edge/src/grpc/payload_limits.rs` with v1.31.0's values behind accessors, `check_blob_size`, `check_memo_size`, `check_search_attribute_count` and `check_search_attribute_sizes`
     - _Requirements: 2.3, 2.10, 2.11, 2.12_
   - [ ] 1.2 Add `server_failure` and `truncate_failure`, a port of `TruncateWithDepth`
     - _Requirements: 2.6_
@@ -41,8 +41,8 @@ Check every payload a request carries against v1.31.0's limits in the edge's gRP
     - **Property 3: Oversized worker responses become failures**
     - **Validates: Requirements 2.5, 2.6, 2.7, 2.8, 2.11**
 
-- [ ] 4. Register and wire the conformance keys of criterion 2.12
-  - _Requirements: 2.12_
+- [ ] 4. Wire the seven keys for the Temporal functional harness, as `conformance-config-override`'s key table records: the harness's overrides in the accessors, and `Wired` in its key registry
+  - _Harness only: `conformance-config-override`_
 
 - [ ] 5. Checkpoint: the full bar of root `AGENTS.md` §10.4
 

@@ -140,7 +140,7 @@ pub struct StateExtensionError {
   - activity listed twice.
 - `apply_state_extension` sets `last_heartbeat_at` for each listed activity the state holds, skips ids it does not hold, and ignores unknown tags.
 
-`history_batch` blobs and `history_batch_encoded_len` do not change. `dsql/codec.rs` re-exports the new names next to the envelope functions. `encode_activity_state` keeps writing the side-table blob without the time, because the field is skipped.
+`history_batch` blobs and `history_batch_encoded_len` do not change. `dsql/codec.rs` re-exports the new names next to the envelope functions. `encode_activity_state` encodes the side-table blob without the time, because the field is skipped. Since [activity-state-writes](../activity-state-writes/bugfix.md), no commit writes that blob.
 
 ### Snapshot (`crates/tokeira-storage/src/memory.rs`)
 
@@ -157,7 +157,7 @@ pub const RUN_STATE_EXTENSION_SECTION: u32 = 1;
 - A malformed extension, an unknown run or a run listed twice is a new `SnapshotError::Extension(&'static str)`. Bytes after the document that do not open with the snapshot extension magic stay `SnapshotError::TrailingBytes`, as before.
 - `SNAPSHOT_FORMAT_VERSION` stays 4. The bump rule's doc comment gains a sentence: data carried in the Snapshot_Extension does not change the document and needs no bump.
 
-The in-memory `runs` map holds `WorkflowState` values, so committed times are returned as written. The `activity_state_table` mirror carries the time in memory. Its snapshot encoding drops the time, and nothing reads that table back.
+The in-memory `runs` map holds `WorkflowState` values, so committed times are returned as written. Since [activity-state-writes](../activity-state-writes/bugfix.md), the store keeps no `activity_state_table` mirror, and snapshots write its slot empty.
 
 ### Runtime (`crates/tokeira-runtime`)
 

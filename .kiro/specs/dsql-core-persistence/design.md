@@ -10,7 +10,7 @@ The central design principle is **one workflow transition = one fenced DSQL tran
 2. Validates the transition sequence fence (compares `expected_seq` against `workflow_hot.transition_seq`)
 3. Checks request deduplication (queries `request_dedupe`)
 4. Checks start-workflow conflict policy (queries `current_execution`)
-5. Writes the full transition write set atomically (upserts/deletes across `workflow_hot`, `history_batch`, `request_dedupe`, `current_execution`, `activity_state`, `timer_bucket`, `projection_log`)
+5. Writes the full transition write set atomically (upserts/deletes across `workflow_hot`, `history_batch`, `request_dedupe`, `current_execution`, `activity_dispatch`, `timer_bucket`, `projection_log`). It writes no `activity_state` row ([activity-state-writes](../activity-state-writes/bugfix.md))
 
 Read operations (`load_run`, `resolve_execution`, `find_latest_run`, `read_history`, `lookup_request_dedupe`) are single-statement queries outside any explicit transaction, using `DbClass::Read` connections.
 
@@ -128,7 +128,7 @@ sequenceDiagram
     REPO->>DB: INSERT/UPDATE workflow_hot
     REPO->>DB: INSERT history_batch (if events)
     REPO->>DB: INSERT request_dedupe (if dedupe ops)
-    REPO->>DB: INSERT/UPDATE/DELETE activity_state (if activity ops)
+    REPO->>DB: INSERT/UPDATE/DELETE activity_dispatch (if activity or dispatch ops)
     REPO->>DB: INSERT/UPDATE/DELETE timer_bucket (if timer ops)
     REPO->>DB: INSERT/UPDATE current_execution
     REPO->>DB: INSERT projection_log (if projection ops)
@@ -302,20 +302,9 @@ VALUES ($1, $2, $3, $4, $5, now());
 INSERT INTO request_dedupe (namespace_id, workflow_id, request_id, run_key, run_id, first_seen_transition_seq, created_at)
 VALUES ($1, $2, $3, $4, $5, $6, now());
 
--- Upsert/delete activity_state for each ActivityOp
--- Upsert:
-INSERT INTO activity_state (run_key, schedule_event_id, shard_id, activity_id, queue_namespace, queue_name, attempt, state_data, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
-ON CONFLICT (run_key, schedule_event_id) DO UPDATE SET
-    state_data = EXCLUDED.state_data,
-    attempt = EXCLUDED.attempt,
-    updated_at = EXCLUDED.updated_at;
--- Delete: uses non-PK WHERE clause (activity_id is not part of the PK).
--- DSQL supports DELETE with arbitrary WHERE clauses; only FOR UPDATE
--- requires PK equality. Validated against live DSQL cluster.
--- Migration V021 adds an async index on (run_key, activity_id) to
--- prevent table scans on the hot delete path.
-DELETE FROM activity_state WHERE run_key = $1 AND activity_id = $2;
+-- ActivityOps write no activity_state row: the activity lives in the run's
+-- state, and each op maintains its activity_dispatch row instead
+-- (dsql-side-tables Requirement 16; activity-state-writes).
 
 -- Upsert/delete timer_bucket for each TimerOp
 -- Upsert:
@@ -458,7 +447,6 @@ sequenceDiagram
     REPO->>DB: INSERT INTO workflow_hot (successor)
     REPO->>DB: INSERT INTO history_batch (successor, copied events)
     REPO->>DB: INSERT INTO current_execution (successor)
-    REPO->>DB: INSERT INTO activity_state (for each activity in successor state)
     REPO->>DB: INSERT INTO timer_bucket (for each timer in successor state)
     REPO->>DB: COMMIT
 ```
@@ -492,14 +480,14 @@ fn is_serialization_failure(err: &sqlx::Error) -> bool {
 
 | Operation | Tables Read | Tables Written |
 |-----------|------------|----------------|
-| `commit_transition` | `shard_lease`, `workflow_hot`, `request_dedupe`, `current_execution` | `workflow_hot`, `history_batch`, `request_dedupe`, `current_execution`, `activity_state`, `timer_bucket`, `projection_log` |
+| `commit_transition` | `shard_lease`, `workflow_hot`, `request_dedupe`, `current_execution` | `workflow_hot`, `history_batch`, `request_dedupe`, `current_execution`, `activity_dispatch`, `timer_bucket`, `projection_log` |
 | `load_run` | `workflow_hot` | — |
 | `resolve_execution` | `current_execution`, `workflow_hot` | — |
 | `find_latest_run` | `current_execution` | — |
 | `read_history` | `history_batch` | — |
 | `lookup_request_dedupe` | `request_dedupe` | — |
 | `read_transition_audit` | `history_batch` | — |
-| `materialize_reset_successor` | `workflow_hot`, `history_batch` | `workflow_hot`, `history_batch`, `current_execution`, `activity_state`, `timer_bucket` |
+| `materialize_reset_successor` | `workflow_hot`, `history_batch` | `workflow_hot`, `history_batch`, `current_execution`, `timer_bucket` |
 
 ### Write Set Size Analysis
 
@@ -511,7 +499,7 @@ The commit transaction write set per transition:
 | `history_batch` | 1 | One batch per transition (if events exist) |
 | `request_dedupe` | 0–1 | At most one dedupe record per transition |
 | `current_execution` | 0–1 | Start transitions: upsert with is_open=true. Close transitions: update is_open=false. Intermediate open transitions: no write. |
-| `activity_state` | 0–N | One per ActivityOp (typically < 10) |
+| `activity_dispatch` | 0–N | One per ActivityOp or activity enqueue (typically < 10). No `activity_state` row is written ([activity-state-writes](../activity-state-writes/bugfix.md)) |
 | `timer_bucket` | 0–N | One per TimerOp (typically < 10) |
 | `projection_log` | 0–1 | One record per transition (if projection ops exist) |
 

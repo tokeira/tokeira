@@ -11,7 +11,7 @@ This feature introduces:
 3. **Drain loop** — a periodic background task that retrieves persisted tasks via `drain_backlog` and re-publishes them to the broker for matching with waiting pollers.
 4. **Deduplication coordination** across tiers to prevent double dispatch.
 
-The authoritative pending-task state remains with the run (`pending_wft`, `activity_state`). If the broker dies before durable backlog is written, the sweeper (Feature 11) reconstructs delivery candidates from authoritative state. Live-ready and backlog are optimizations, not correctness dependencies.
+The authoritative pending-task state remains with the run (`pending_wft` and the activities in its state; `activity_state` is no longer written, see [activity-state-writes](../activity-state-writes/bugfix.md)). If the broker dies before durable backlog is written, the sweeper (Feature 11) reconstructs delivery candidates from authoritative state. Live-ready and backlog are optimizations, not correctness dependencies.
 
 ## Architecture
 

@@ -141,7 +141,7 @@ serialized; restored store gets the default).
 | `dispatch_backlog` | persisted | Ordered durable backlog; restart must not lose undelivered tasks. |
 | `conflict_injections` | **reset** | Test-only OCC conflict hook. |
 | `conflict_policy` | **reset** | Test-only injected conflict policy; restored store gets the default policy. |
-| `activity_state_table` | persisted | Activity timeout/sweep materialization read by sweeps. |
+| `activity_state_table` | slot kept, written empty | The store keeps no activity state table ([activity-state-writes](../activity-state-writes/bugfix.md)). The document keeps the slot so its layout and version don't change; restore discards entries that earlier releases wrote. |
 | `timer_bucket` | persisted | Timer sweep materialization; fire times are absolute `OffsetDateTime`. |
 | `run_shard_map` | persisted | Deterministic run→shard assignment must survive restart or runs change shards. |
 | `shard_count` | persisted | Shard-count configuration participates in shard assignment; a restored store must shard identically. |

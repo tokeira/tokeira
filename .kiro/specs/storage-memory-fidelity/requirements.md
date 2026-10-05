@@ -13,7 +13,7 @@ This feature closes those gaps by adding activity task dispatch tracking and swe
 - **Transition**: The `tokeira_kernel::Transition` struct representing one fenced commit containing next state, history events, activity ops, timer ops, dispatch ops, projection ops, and request dedupe ops.
 - **CommitResult**: The enum (`Applied`, `Conflict`, `Duplicate`) returned by `commit_transition` to classify the outcome of a fenced commit.
 - **DispatchOp**: The enum in `transition.rs` describing side-effect dispatch instructions produced by the kernel, including `EnqueueWorkflowTask`, `EnqueueActivityTask`, `StartChildWorkflow`, and others.
-- **ActivityOp**: The enum (`Upsert(ActivityState)`, `Delete { activity_id }`) describing mutations to the normalized activity state table.
+- **ActivityOp**: The enum (`Upsert(ActivityState)`, `Delete { activity_id }`) describing an activity's changes, which the stores apply to its dispatch row. The activity itself is recorded only in run state ([activity-state-writes](../activity-state-writes/bugfix.md)).
 - **TimerOp**: The enum (`Upsert(TimerState)`, `Delete { timer_id }`) describing mutations to the timer bucket table.
 - **DispatchBacklog**: A durable fallback structure for unmatched workflow and activity tasks, modeled after the `dispatch_backlog` table in the DSQL schema. Per the delivery broker architecture (040-delivery-broker), backlog is Tier C — entries are only persisted when the broker explicitly decides to (after the live-ready grace window, under pressure, or on shard unload), not automatically on every enqueue.
 - **OCC_Conflict_Injection**: A test-only mechanism on InMemoryStore that allows callers to force `CommitResult::Conflict` on the next N commits for a given run, enabling retry/conflict path testing.
@@ -94,17 +94,17 @@ The following policies are intentionally deferred from this spec:
 
 ### Requirement 6: Faithful Activity and Timer State Tracking
 
-**User Story:** As a runtime developer, I want the InMemoryStore to maintain independent activity state and timer bucket tracking structures that mirror the DSQL `activity_state` and `timer_bucket` tables, so that sweep queries and state inspection operate on normalized data rather than only on the embedded `WorkflowState` maps.
+**User Story:** As a runtime developer, I want the InMemoryStore to maintain an independent timer bucket tracking structure that mirrors the DSQL `timer_bucket` table, so that timer queries operate on normalized data rather than only on the embedded `WorkflowState` maps. Activities are recorded only in run state on both stores ([activity-state-writes](../activity-state-writes/bugfix.md)).
 
 #### Acceptance Criteria
 
-1. WHEN `commit_transition` processes an `ActivityOp::Upsert(activity_state)`, THE InMemoryStore SHALL insert or update the activity in an independent activity state tracking structure keyed by `(run_key, activity_id)`.
-2. WHEN `commit_transition` processes an `ActivityOp::Delete { activity_id }`, THE InMemoryStore SHALL remove the entry from the independent activity state tracking structure for that `(run_key, activity_id)`.
+1. WHEN `commit_transition` processes an `ActivityOp::Upsert(activity_state)`, THE InMemoryStore SHALL NOT record the activity outside the run's state, as the DSQL store writes no `activity_state` row ([activity-state-writes](../activity-state-writes/bugfix.md), criterion 2.1).
+2. WHEN `commit_transition` processes an `ActivityOp::Delete { activity_id }`, THE InMemoryStore SHALL NOT keep an activity state tracking structure to remove it from (criterion 1).
 3. WHEN `commit_transition` processes a `TimerOp::Upsert(timer_state)`, THE InMemoryStore SHALL insert or update the timer in an independent timer bucket tracking structure keyed by `(run_key, timer_id)`.
 4. WHEN `commit_transition` processes a `TimerOp::Delete { timer_id }`, THE InMemoryStore SHALL remove the entry from the independent timer bucket tracking structure for that `(run_key, timer_id)`.
 5. THE `list_due_timers` method SHALL query the independent timer bucket tracking structure instead of iterating over `WorkflowState.timers` maps.
-6. WHEN `commit_transition` returns `CommitResult::Conflict` or `CommitResult::Duplicate`, THE InMemoryStore SHALL leave the independent activity state and timer bucket tracking structures unchanged for that transition.
-7. FOR ALL committed transitions, the independent activity state tracking structure SHALL contain the same entries as the union of all `WorkflowState.activities` maps across stored runs (round-trip consistency).
+6. WHEN `commit_transition` returns `CommitResult::Conflict` or `CommitResult::Duplicate`, THE InMemoryStore SHALL leave the independent timer bucket tracking structure unchanged for that transition.
+7. Withdrawn: the activity state tracking structure it checked is gone ([activity-state-writes](../activity-state-writes/bugfix.md)).
 8. FOR ALL committed transitions, the independent timer bucket tracking structure SHALL contain the same entries as the union of all `WorkflowState.timers` maps across stored runs (round-trip consistency).
 
 ### Requirement 7: Dispatch Backlog Consistency Invariants

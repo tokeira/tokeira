@@ -106,7 +106,7 @@ Depends on: Feature 1 (Lane OCC Retry and Mailbox Coalescing), Feature 2 (Activi
 
 #### Acceptance Criteria
 
-1. WHEN a runtime node acquires a shard, THE Sweeper SHALL scan `activity_state` for dispatchable activity attempts belonging to runs in that shard.
+1. WHEN a runtime node acquires a shard, THE Sweeper SHALL find the dispatchable activity attempts belonging to runs in that shard in their due `activity_dispatch` rows, a page at a time. It SHALL NOT read `activity_state`, which nothing writes ([activity-state-writes](../activity-state-writes/bugfix.md)).
 2. WHEN a dispatchable activity task is discovered, THE Sweeper SHALL republish the task to the Activity_Broker using the activity's QueueKey.
 3. THE Sweeper SHALL use the existing `republish_activity_queue` helper or an equivalent shard-scoped variant to batch-republish activity tasks.
 4. THE Sweeper SHALL use a `DbClass::Maintenance` permit for storage queries during the sweep.

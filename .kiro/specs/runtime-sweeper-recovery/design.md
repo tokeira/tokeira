@@ -7,7 +7,7 @@ This design covers the sweeper and recovery subsystem for the Tokeira runtime. T
 The feature spans five areas:
 
 1. **Shard lifecycle** — lease acquisition with epoch fencing, periodic renewal, and graceful relinquish/drain.
-2. **Post-failover reconstruction** — sweeping `workflow_hot`, `activity_state`, and `timer_bucket` to republish pending tasks and due timers.
+2. **Post-failover reconstruction** — sweeping `workflow_hot` (through the recovery candidate listing), due `activity_dispatch` rows, and `timer_bucket` to republish pending tasks and due timers. `activity_state` is not read ([activity-state-writes](../activity-state-writes/bugfix.md)).
 3. **Timeout tracking reconstruction** — rebuilding `ActivityTrackingState`, `WorkflowTimeoutTrackingState`, and `NexusTimeoutTrackingState` from authoritative storage.
 4. **Shard-scoped scanning** — restricting all background scanners (timer, workflow timeout, activity timeout, Nexus timeout) to runs belonging to owned shards.
 5. **InMemoryStore shard awareness** — adding shard-to-run mapping and shard-filtered query variants to the development store.

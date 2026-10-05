@@ -46,7 +46,6 @@ graph TD
 
     subgraph "tokeira-storage::memory StoreState"
         AD[activity_dispatch: HashMap]
-        AS[activity_state_table: HashMap]
         TB[timer_bucket: HashMap]
         BL[dispatch_backlog: VecDeque]
         CI[conflict_injections: HashMap]
@@ -60,7 +59,6 @@ graph TD
     RR -->|list_dispatchable_activity_tasks| AD
     RR -->|persist_to_backlog| BL
     RR -->|drain_backlog| BL
-    RR -->|commit_transition| AS
     RR -->|commit_transition| TB
     RR -->|commit_transition| AD
     RR -->|list_due_timers| TB
@@ -75,7 +73,7 @@ Within `commit_transition`, after the existing OCC fence check and before return
 
 1. **Conflict injection check** — if `conflict_injections[run_key] > 0`, decrement and return `Conflict` immediately.
 2. **Current-execution conflict policy** — on seq-zero open-status transitions, apply the configured policy (`Reject` or `AllowAfterClose`) instead of the current hardcoded reject.
-3. **Activity ops → independent activity state table** — `Upsert` inserts/updates, `Delete` removes.
+3. **Activity ops → run state only** — activities are recorded only in `WorkflowState.activities`, as on DSQL ([activity-state-writes](../activity-state-writes/bugfix.md)). Their dispatch upkeep is step 6 and `dsql-side-tables` Requirement 19.
 4. **Timer ops → independent timer bucket** — `Upsert` inserts/updates, `Delete` removes.
 5. **Dispatch ops → activity dispatch** — `EnqueueActivityTask` populates the activity dispatch tracking structure.
 6. **Activity delete → activity dispatch cleanup** — `ActivityOp::Delete` also removes from the activity dispatch map.
@@ -188,8 +186,7 @@ struct StoreState {
     // Req 5: current-execution conflict policy
     conflict_policy: CurrentExecutionConflictPolicy,
 
-    // Req 6: independent normalized structures
-    activity_state_table: HashMap<(RunKey, String), ActivityState>,
+    // Req 6: independent normalized structure
     timer_bucket: HashMap<(RunKey, String), TimerState>,
 }
 ```
@@ -198,7 +195,7 @@ struct StoreState {
 
 ### Activity Dispatch Tracking (Req 1)
 
-Keyed by `(RunKey, activity_id: String)`. Populated from `DispatchOp::EnqueueActivityTask`. Cleaned up on `ActivityOp::Delete`. This mirrors the DSQL `activity_state` table's role in dispatch queries.
+Keyed by `(RunKey, activity_id: String)`. Populated from `DispatchOp::EnqueueActivityTask`. Cleaned up on `ActivityOp::Delete`. This mirrors the DSQL `activity_dispatch` table (`dsql-side-tables` Requirements 15–19).
 
 | Field | Type | Source |
 |---|---|---|
@@ -214,7 +211,7 @@ Timeout fields (`schedule_to_close_timeout`, `schedule_to_start_timeout`, `start
 
 A `VecDeque<BacklogEntry>` with a monotonic `backlog_next_seq` counter. Each entry carries a `BacklogTaskKind` discriminant. Entries are inserted via `persist_to_backlog` (called by the broker when it decides a task should be durably backed, per the Tier C model in 040-delivery-broker). `drain_backlog` filters by `QueueKey`, removes matching entries, and returns them in insertion-sequence order.
 
-`commit_transition` does NOT write to the backlog. The durable fact is pending work in `workflow_hot` and `activity_state`; the backlog is a broker-managed fallback.
+`commit_transition` does NOT write to the backlog. The durable fact is pending work in the run's state in `workflow_hot`; the backlog is a broker-managed fallback.
 
 | Field | Type | Source |
 |---|---|---|
@@ -223,9 +220,9 @@ A `VecDeque<BacklogEntry>` with a monotonic `backlog_next_seq` counter. Each ent
 | kind | BacklogTaskKind | Workflow or Activity{activity_id} |
 | insertion_seq | u64 | monotonic counter (assigned by persist_to_backlog) |
 
-### Independent Activity State Table (Req 6)
+### Activity State (Req 6)
 
-Keyed by `(RunKey, activity_id: String)`. Value is `ActivityState` from `tokeira_kernel::state`. Populated from `ActivityOp::Upsert`, removed on `ActivityOp::Delete`. This is a denormalized mirror of the data that also lives in `WorkflowState.activities`.
+No independent structure. An activity lives only in `WorkflowState.activities`, as on DSQL, where nothing reads the `activity_state` table that earlier releases wrote ([activity-state-writes](../activity-state-writes/bugfix.md)).
 
 ### Independent Timer Bucket (Req 6)
 
@@ -266,7 +263,7 @@ A single `CurrentExecutionConflictPolicy` value on `StoreState`, defaulting to `
 
 ### Property 3: Failed commits leave all structures unchanged
 
-*For any* transition that results in `CommitResult::Conflict` or `CommitResult::Duplicate`, the activity dispatch tracking structure, the independent activity state table, and the independent timer bucket shall all remain identical to their state before the commit attempt.
+*For any* transition that results in `CommitResult::Conflict` or `CommitResult::Duplicate`, the activity dispatch tracking structure and the independent timer bucket shall both remain identical to their state before the commit attempt.
 
 **Validates: Requirements 1.4, 6.6**
 
@@ -306,17 +303,17 @@ A single `CurrentExecutionConflictPolicy` value on `StoreState`, defaulting to `
 
 **Validates: Requirements 5.4**
 
-### Property 10: Independent activity and timer state upsert/delete
+### Property 10: Independent timer state upsert/delete
 
-*For any* transition containing `ActivityOp::Upsert` or `TimerOp::Upsert` ops, after a successful commit, the independent activity state table and timer bucket shall contain the upserted entries keyed by `(run_key, activity_id)` and `(run_key, timer_id)` respectively. For any transition containing `ActivityOp::Delete` or `TimerOp::Delete`, the corresponding entries shall be removed.
+*For any* transition containing `TimerOp::Upsert` ops, after a successful commit, the independent timer bucket shall contain the upserted entries keyed by `(run_key, timer_id)`. For any transition containing `TimerOp::Delete`, the corresponding entries shall be removed. Activity ops record nothing outside run state, which [activity-state-writes](../activity-state-writes/design.md) Property 1 checks for Requirements 6.1 and 6.2.
 
-**Validates: Requirements 6.1, 6.2, 6.3, 6.4**
+**Validates: Requirements 6.3, 6.4**
 
-### Property 11: Independent structures mirror WorkflowState maps
+### Property 11: Independent timer structure mirrors WorkflowState maps
 
-*For any* sequence of successfully committed transitions, the independent activity state table shall contain exactly the same entries as the union of all `WorkflowState.activities` maps across stored runs, and the independent timer bucket shall contain exactly the same entries as the union of all `WorkflowState.timers` maps across stored runs.
+*For any* sequence of successfully committed transitions, the independent timer bucket shall contain exactly the same entries as the union of all `WorkflowState.timers` maps across stored runs.
 
-**Validates: Requirements 6.7, 6.8**
+**Validates: Requirements 6.8**
 
 ### Property 12: Backlog size invariant
 

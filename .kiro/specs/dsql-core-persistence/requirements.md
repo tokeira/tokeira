@@ -112,8 +112,8 @@ The `RunRepository` trait methods assigned to Feature 2 in the umbrella spec aud
 
 1. WHEN `commit_transition` succeeds, THE DsqlRunRepository SHALL have upserted the `workflow_hot` row with the new `WorkflowState` serialized via the codec module, updating `transition_seq`, `state_data`, `shard_id`, and `updated_at`.
 2. WHEN `commit_transition` succeeds and the transition contains history events, THE DsqlRunRepository SHALL have inserted a `history_batch` row containing the serialized events with `first_event_id`, `last_event_id`, and `transition_seq`.
-3. WHEN `commit_transition` succeeds and the transition contains `ActivityOp::Upsert` entries, THE DsqlRunRepository SHALL have upserted corresponding rows in `activity_state`.
-4. WHEN `commit_transition` succeeds and the transition contains `ActivityOp::Delete` entries, THE DsqlRunRepository SHALL have deleted corresponding rows from `activity_state`.
+3. WHEN `commit_transition` succeeds and the transition contains `ActivityOp::Upsert` entries, THE DsqlRunRepository SHALL NOT have written `activity_state`: the run's state in `workflow_hot` (criterion 1) is the only record of an activity, and the op maintains the activity's dispatch row (`dsql-side-tables` Requirement 16) ([activity-state-writes](../activity-state-writes/bugfix.md), criterion 2.1).
+4. WHEN `commit_transition` succeeds and the transition contains `ActivityOp::Delete` entries, THE DsqlRunRepository SHALL NOT have written `activity_state`. Rows that earlier releases wrote are deleted with their run ([activity-state-writes](../activity-state-writes/bugfix.md), criteria 2.1 and 3.2).
 5. WHEN `commit_transition` succeeds and the transition contains `TimerOp::Upsert` entries, THE DsqlRunRepository SHALL have upserted corresponding rows in `timer_bucket`.
 6. WHEN `commit_transition` succeeds and the transition contains `TimerOp::Delete` entries, THE DsqlRunRepository SHALL have deleted corresponding rows from `timer_bucket`.
 7. WHEN `commit_transition` succeeds and the transition contains `RequestDedupeOp` entries, THE DsqlRunRepository SHALL have inserted records into `request_dedupe`.
@@ -203,7 +203,7 @@ The `RunRepository` trait methods assigned to Feature 2 in the umbrella spec aud
 4. WHEN `materialize_reset_successor` is called, THE DsqlRunRepository SHALL insert a `workflow_hot` row for the successor run with the derived state.
 5. WHEN `materialize_reset_successor` is called, THE DsqlRunRepository SHALL insert a `current_execution` row for the successor run.
 6. IF `fork_event_id` is beyond the base run's committed history, THEN THE DsqlRunRepository SHALL return an error.
-7. THE DsqlRunRepository SHALL reconstruct activity state and timer state from the replayed successor state and persist them to `activity_state` and `timer_bucket` respectively.
+7. THE DsqlRunRepository SHALL persist the replayed successor state's timers to `timer_bucket`. The successor's activities are recorded only in its `workflow_hot` row (criterion 4), and no `activity_state` row is written ([activity-state-writes](../activity-state-writes/bugfix.md), criterion 2.2).
 
 ### Requirement 12: OCC Conflict Classification
 

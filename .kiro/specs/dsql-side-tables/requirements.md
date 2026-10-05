@@ -8,6 +8,8 @@ These 10 methods are currently `bail!("Feature 3: dsql-side-tables")` stubs. Thi
 
 The key insight: `activity_state` is a materialized open-activity table for timeout/sweep reconstruction — it is not a dispatch queue. Activities that are started, paused, or otherwise not ready for dispatch remain in `activity_state`. Dispatch should come from a dedicated table derived from `DispatchOp::EnqueueActivityTask`, matching the in-memory store's `activity_dispatch` HashMap.
 
+Since [activity-state-writes](../activity-state-writes/bugfix.md), no release writes `activity_state` and none reads it. `recovery-index` replaced the open-activity listing with run state, where every activity already lives (Requirement 9).
+
 ### Scope
 
 | Method | Table(s) | Category |
@@ -20,7 +22,7 @@ The key insight: `activity_state` is a materialized open-activity table for time
 | `list_due_timers_for_shard` | `timer_bucket` | Shard-filtered timer sweep |
 | `list_runs_with_workflow_timeouts_for_shard` | `workflow_hot` | Shard-filtered timeout sweep |
 | `list_started_workflow_tasks_for_shard` | `workflow_hot` | Shard-filtered WFT timeout sweep |
-| `list_open_activities_for_shard` | `activity_state` | Shard-filtered activity timeout sweep |
+| `list_open_activities_for_shard` | `activity_state` | Shard-filtered activity timeout sweep (withdrawn, Requirement 9) |
 | `list_pending_nexus_operations_for_shard` | `workflow_hot` | Shard-filtered Nexus timeout sweep |
 
 ### What This Spec Does NOT Cover
@@ -34,7 +36,7 @@ The key insight: `activity_state` is a materialized open-activity table for time
 ### Dependencies
 
 - Feature 1 (`dsql-schema-connection`) provides: schema DDL for `activity_state`, `timer_bucket`, `workflow_hot` with their secondary indexes; `DsqlConnectionDirector` and `DsqlPermit`; codec module for postcard serialization.
-- Feature 2 (`dsql-core-persistence`) provides: `DsqlRunRepository` struct, `shard_for_run_key`, `shard_id_to_uuid`, and the `commit_transition` implementation that writes to all three side tables.
+- Feature 2 (`dsql-core-persistence`) provides: `DsqlRunRepository` struct, `shard_for_run_key`, `shard_id_to_uuid`, and the `commit_transition` implementation that writes the side tables. It no longer writes `activity_state` ([activity-state-writes](../activity-state-writes/bugfix.md)).
 - `dsql-spread-keys` provides: `RunKey::derive`, `dsql_spread_uuid`, and the revised `shard_id_to_uuid` using BLAKE3.
 
 ### Key Design Constraints
@@ -42,7 +44,7 @@ The key insight: `activity_state` is a materialized open-activity table for time
 - All queries use `DbClass::Read` connections — no transactions, no writes.
 - `shard_id` is bound as UUID via `DsqlRunRepository::shard_id_to_uuid(shard_id)`.
 - `workflow_hot.state_data` stores the full `WorkflowState` as postcard-serialized BYTEA. The dispatch and sweep methods deserialize it to extract specific fields (`pending_workflow_task`, `workflow_execution_timeout`, `workflow_run_timeout`, `pending_nexus_operations`, etc.).
-- `activity_state.state_data` stores `ActivityState` as postcard-serialized BYTEA. Used by sweep methods only (`list_open_activities_for_shard`). Activity dispatch queries read from the dedicated `activity_dispatch` table instead.
+- `activity_state.state_data` stores `ActivityState` as postcard-serialized BYTEA in rows that earlier releases wrote. Nothing reads it, and nothing writes it since [activity-state-writes](../activity-state-writes/bugfix.md). Activity dispatch queries read from the dedicated `activity_dispatch` table.
 - `activity_dispatch` stores dispatch-ready activity tasks with denormalized queue identity columns. Dispatch queries do not deserialize `ActivityState`; they decode only `input_data` as postcard-encoded `Payloads`.
 - `timer_bucket.timer_data` stores `TimerState` as postcard-serialized BYTEA.
 - The `limit` parameter bounds the result set size for all methods.
@@ -50,7 +52,7 @@ The key insight: `activity_state` is a materialized open-activity table for time
 
 ### Schema Reference
 
-**activity_state** — PK: `(run_key, schedule_event_id)`, indexes: `(shard_id)`, `(queue_namespace, queue_name)`, `(run_key, activity_id)`. Used by sweep queries only (`list_open_activities_for_shard`).
+**activity_state** — PK: `(run_key, schedule_event_id)`, indexes: `(shard_id)`, `(queue_namespace, queue_name)`, `(run_key, activity_id)`. Neither read nor written since [activity-state-writes](../activity-state-writes/bugfix.md); run deletion removes the rows that earlier releases wrote.
 
 **activity_dispatch** — PK: `(key)` spread UUID, indexes: `(shard_id)`, `(queue_namespace, queue_name, task_kind, deployment, build_id)`, `(run_key)`. Added by this spec. Used by dispatch queries (`list_dispatchable_activity_tasks`, `list_dispatchable_activity_tasks_for_shard`) and run-scoped dispatch cleanup on workflow pause.
 
@@ -63,7 +65,7 @@ The key insight: `activity_state` is a materialized open-activity table for time
 - **DsqlRunRepository**: The struct implementing `RunRepository` against Aurora DSQL, using `DsqlConnectionDirector` for connection management and the codec module for serialization.
 - **RunRepository**: The primary storage trait in `tokeira-storage/src/api.rs` defining methods for durable run persistence.
 - **WorkflowState**: The full current state of a workflow run, serialized to BYTEA in `workflow_hot.state_data` using postcard. Contains `pending_workflow_task`, `activities`, `timers`, `pending_nexus_operations`, timeout configuration, and lifecycle status.
-- **ActivityState**: The current state of an open activity, serialized to BYTEA in `activity_state.state_data` using postcard. Contains `activity_id`, `schedule_event_id`, `attempt`, timeouts, `started_at`, `task_queue`, `deployment`, `build_id`, and scheduling metadata. Used by sweep queries only — NOT the dispatch source.
+- **ActivityState**: The current state of an open activity, held in `WorkflowState.activities`. Contains `activity_id`, `schedule_event_id`, `attempt`, timeouts, `started_at`, `task_queue`, `deployment`, `build_id`, and scheduling metadata. NOT the dispatch source.
 - **ActivityDispatch**: A DSQL table storing one row per currently dispatchable activity task. Derived from `DispatchOp::EnqueueActivityTask`. Rows are refreshed on re-enqueue, removed when an activity starts, pauses, resolves, or the workflow pauses, and updated in place for still-dispatchable activity metadata changes. This is the DSQL equivalent of the in-memory store's `activity_dispatch` HashMap.
 - **TimerState**: The state of a pending timer, serialized to BYTEA in `timer_bucket.timer_data` using postcard. Contains `timer_id`, `started_event_id`, and `fire_at`.
 - **PendingWorkflowTask**: A workflow task that has been scheduled but not yet completed. Contains `logical_seq`, `scheduled_event_id`, `started_event_id`, `started_at`, and `attempt`. A task is dispatchable when `started_event_id` is `None`.
@@ -182,6 +184,8 @@ The key insight: `activity_state` is a materialized open-activity table for time
 
 ### Requirement 9: Shard-Filtered Open Activity Sweep
 
+**Withdrawn.** `recovery-index` removed `list_open_activities_for_shard`: the sweep takes a shard's activities from run state through the recovery candidate listing, and since [activity-state-writes](../activity-state-writes/bugfix.md) nothing writes `activity_state`. The criteria below record what the method did.
+
 **User Story:** As a Tokeira developer, I want `list_open_activities_for_shard` to query DSQL for open activities within a specific shard, so that shard-based sweep recovery can reconstruct activity timeout tracking after failover.
 
 #### Acceptance Criteria
@@ -213,7 +217,7 @@ The key insight: `activity_state` is a materialized open-activity table for time
 #### Acceptance Criteria
 
 1. ALL shard-filtered queries SHALL bind `shard_id` as UUID using `DsqlRunRepository::shard_id_to_uuid(shard_id)`, which uses `dsql_spread_uuid` with the `"shard"` domain prefix.
-2. THE shard UUID encoding SHALL be identical to the encoding used by `commit_transition` when writing `shard_id` to `workflow_hot`, `activity_state`, and `timer_bucket`.
+2. THE shard UUID encoding SHALL be identical to the encoding used by `commit_transition` when writing `shard_id` to `workflow_hot`, `activity_dispatch`, and `timer_bucket`.
 
 ### Requirement 12: Read Connection Class
 
@@ -231,7 +235,7 @@ The key insight: `activity_state` is a materialized open-activity table for time
 #### Acceptance Criteria
 
 1. THE DsqlRunRepository SHALL deserialize `workflow_hot.state_data` using `codec::decode_workflow_state`.
-2. THE DsqlRunRepository SHALL deserialize `activity_state.state_data` using `codec::decode_activity_state`.
+2. Withdrawn with Requirement 9: no query reads `activity_state.state_data`. Rows that earlier releases wrote keep the `codec::decode_activity_state` layout.
 3. IF deserialization fails, THEN THE DsqlRunRepository SHALL return an error with context identifying the table and row key.
 
 ### Requirement 14: Tracing Instrumentation
@@ -261,7 +265,7 @@ The key insight: `activity_state` is a materialized open-activity table for time
 #### Acceptance Criteria
 
 1. WHEN `commit_transition` processes a `DispatchOp::EnqueueActivityTask`, THE DsqlRunRepository SHALL insert a row into `activity_dispatch` with the full queue identity, input, and scheduling metadata using `INSERT ... ON CONFLICT (key) DO UPDATE` so that re-enqueue after reset/retry/unpause refreshes the existing row rather than failing on a primary-key conflict.
-2. WHEN `commit_transition` processes an `ActivityOp::Delete`, THE DsqlRunRepository SHALL delete the corresponding row from `activity_dispatch` (by computing the spread key from `run_key` and `activity_id`) in addition to `activity_state`.
+2. WHEN `commit_transition` processes an `ActivityOp::Delete`, THE DsqlRunRepository SHALL delete the corresponding row from `activity_dispatch` (by computing the spread key from `run_key` and `activity_id`). It writes nothing to `activity_state` ([activity-state-writes](../activity-state-writes/bugfix.md)).
 3. WHEN `commit_transition` processes an `ActivityOp::Upsert` where the upserted `ActivityState` has `pause_info.is_some()` or `started_at.is_some()`, THE DsqlRunRepository SHALL delete the corresponding row from `activity_dispatch` — paused and started activities are not dispatchable.
 4. WHEN `commit_transition` processes an `ActivityOp::Upsert` where the upserted `ActivityState` has `pause_info.is_none()` and `started_at.is_none()` and a corresponding `activity_dispatch` row exists, THE DsqlRunRepository SHALL UPDATE (not INSERT) the row with the current queue identity, attempt, and input from the upserted state — this handles `UpdateActivityOptions` which can change the task queue. Only `DispatchOp::EnqueueActivityTask` creates new dispatch rows.
 5. WHEN `commit_transition` transitions the workflow to `ExecutionStatus::Paused`, THE DsqlRunRepository SHALL delete all `activity_dispatch` rows for the run — a paused workflow suppresses all activity dispatch.

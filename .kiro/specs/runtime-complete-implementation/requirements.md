@@ -517,7 +517,7 @@ The implementation is organized into 15 incremental features with explicit depen
 
 1. WHEN a runtime node acquires a shard, THE Sweeper SHALL scan authoritative state for that shard to discover all pending dispatchable work.
 2. THE Sweeper SHALL scan `workflow_hot` for runs with pending workflow tasks (scheduled but not started) and republish them to the Broker.
-3. THE Sweeper SHALL scan `activity_state` for dispatchable activity attempts and republish them to the Activity_Broker.
+3. THE Sweeper SHALL find dispatchable activity attempts in their due `activity_dispatch` rows and republish them to the Activity_Broker (`runtime-sweeper-recovery` Requirement 5.1). It SHALL NOT read `activity_state` ([activity-state-writes](../activity-state-writes/bugfix.md)).
 4. THE Sweeper SHALL scan `timer_bucket` for due timers and inject `TimerDue` commands into the appropriate run actor mailboxes.
 
 ### Requirement 11.2: Expired Sticky Claim Cleanup

@@ -28,6 +28,7 @@ pub mod buffered_queries;
 #[cfg(test)]
 mod bug_condition_exploration_tests;
 pub mod chasm;
+mod child_start;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod deployment_registry;

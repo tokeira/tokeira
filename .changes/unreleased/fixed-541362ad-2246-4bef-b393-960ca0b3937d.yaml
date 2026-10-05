@@ -1,0 +1,5 @@
+kind: fixed
+body: A child workflow start that hits a transient error is now retried, as Temporal does, instead of being reported to its parent as failed, and so is its confirmation.
+time: 2026-10-05T19:02:14.207738+01:00
+custom:
+    Slice: 541362ad-2246-4bef-b393-960ca0b3937d

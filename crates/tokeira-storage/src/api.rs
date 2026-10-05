@@ -1435,6 +1435,57 @@ pub struct BacklogEntry {
     pub order: DeliveryOrder,
 }
 
+impl BacklogEntry {
+    /// This entry's backlog identity: see [`BacklogIdentity`].
+    pub(crate) fn identity(&self) -> BacklogIdentity {
+        let task = match &self.payload {
+            BacklogPayload::Workflow { logical_seq } => BacklogTask::Workflow(*logical_seq),
+            BacklogPayload::Activity {
+                activity_id,
+                attempt,
+                stamp,
+                ..
+            } => BacklogTask::Activity {
+                activity_id: activity_id.clone(),
+                attempt: *attempt,
+                stamp: *stamp,
+            },
+        };
+        BacklogIdentity {
+            queue: self.queue.clone(),
+            run_key: self.run_key,
+            task,
+        }
+    }
+}
+
+/// What makes two backlog entries the same task: the queue, the run, and the logical
+/// task. Delivery order, priority, timestamps and the rest of the payload are not part
+/// of it.
+///
+/// DSQL derives a row's `key` from the same fields, so both stores agree on duplicates:
+/// persisting an entry whose identity is already stored keeps the stored entry
+/// (`runtime-durable-backlog` criterion 3.8).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BacklogIdentity {
+    queue: QueueKey,
+    run_key: RunKey,
+    task: BacklogTask,
+}
+
+/// The logical task inside a [`BacklogIdentity`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum BacklogTask {
+    /// A workflow task, by its sequence.
+    Workflow(tokeira_types::LogicalTaskSeq),
+    /// An activity task, by its id, attempt and stamp.
+    Activity {
+        activity_id: String,
+        attempt: u32,
+        stamp: u64,
+    },
+}
+
 /// Durable backlog observation for one effective priority band.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BacklogBandStats {

@@ -1742,7 +1742,18 @@ impl RunRepository for InMemoryStore {
 
     async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
         let mut store = self.inner.lock().await;
-        store.dispatch_backlog.extend(entries);
+        // An entry whose backlog identity is already held keeps the held entry, as
+        // DSQL's `ON CONFLICT (key) DO NOTHING` does (runtime-durable-backlog 3.8).
+        let mut held = store
+            .dispatch_backlog
+            .iter()
+            .map(BacklogEntry::identity)
+            .collect::<std::collections::HashSet<_>>();
+        for entry in entries {
+            if held.insert(entry.identity()) {
+                store.dispatch_backlog.push_back(entry);
+            }
+        }
         Ok(())
     }
 
@@ -4635,6 +4646,82 @@ mod tests {
                 let drained = store.drain_backlog(&queue, drain).await.unwrap();
                 let remaining = store.drain_backlog(&queue, usize::MAX).await.unwrap();
                 assert_eq!(remaining.len(), first + second - drained.len().min(first + second));
+            });
+        }
+
+        // Feature: runtime-durable-backlog, Property 10: Backlog persistence is idempotent
+        #[test]
+        fn property_backlog_persistence_is_idempotent(
+            batches in proptest::collection::vec(
+                proptest::collection::vec((0usize..2, 0usize..2, 0usize..4, any::<u64>()), 0..6),
+                0..6,
+            ),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let store = InMemoryStore::default();
+                let workflow_queues =
+                    [sample_queue(TaskKind::Workflow), sample_queue(TaskKind::Workflow)];
+                let activity_queues =
+                    [sample_queue(TaskKind::Activity), sample_queue(TaskKind::Activity)];
+                let runs = [RunKey::new(), RunKey::new()];
+                let mut first = HashMap::new();
+                for batch in batches {
+                    let entries: Vec<_> = batch
+                        .into_iter()
+                        .map(|(queue, run, task, tie)| {
+                            let (queue, payload) = if task < 2 {
+                                (
+                                    workflow_queues[queue].clone(),
+                                    crate::api::BacklogPayload::Workflow {
+                                        logical_seq: LogicalTaskSeq(task as u64 + 1),
+                                    },
+                                )
+                            } else {
+                                (
+                                    activity_queues[queue].clone(),
+                                    crate::api::BacklogPayload::Activity {
+                                        activity_id: "a1".into(),
+                                        input: tokeira_types::Payloads::default(),
+                                        schedule_event_id: 7,
+                                        attempt: task as u32 - 1,
+                                        dispatch_revision: 0,
+                                        stamp: 0,
+                                    },
+                                )
+                            };
+                            BacklogEntry {
+                                run_key: runs[run],
+                                queue,
+                                payload,
+                                priority: None,
+                                scheduled_at: fixed_now(),
+                                // Outside the identity, so a duplicate differs from the
+                                // entry it duplicates.
+                                order: DeliveryOrder {
+                                    priority_key: 3,
+                                    fair_pass: 0,
+                                    insertion_tie: tie,
+                                },
+                            }
+                        })
+                        .collect();
+                    for entry in &entries {
+                        first.entry(entry.identity()).or_insert_with(|| entry.clone());
+                    }
+                    // Every call succeeds, duplicates included.
+                    store.persist_to_backlog(entries).await.unwrap();
+                }
+
+                // One entry per identity, and it is the first one persisted.
+                let mut stored = Vec::new();
+                for queue in workflow_queues.iter().chain(&activity_queues) {
+                    stored.extend(store.drain_backlog(queue, usize::MAX).await.unwrap());
+                }
+                assert_eq!(stored.len(), first.len());
+                for entry in &stored {
+                    assert_eq!(first.get(&entry.identity()), Some(entry));
+                }
             });
         }
     }

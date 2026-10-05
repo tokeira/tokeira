@@ -3618,8 +3618,11 @@ fn pending_activity_to_proto(
         last_started_time: act.started_at.map(to_proto_timestamp),
         last_failure: act.last_failure.as_ref().map(payload_to_failure),
         // Present only once a heartbeat has been recorded
-        // (`GetPendingActivityInfo`, activity.go:147-150 @ v1.31.0).
+        // (`GetPendingActivityInfo`, activity.go:147-150 @ v1.31.0). A state
+        // written before the time was stored can hold details without it; the
+        // details are still reported then.
         heartbeat_details: act.heartbeat_details.as_ref().map(payloads_from_domain),
+        last_heartbeat_time: act.last_heartbeat_at.map(to_proto_timestamp),
         last_worker_identity: act.last_worker_identity.clone(),
         paused: act.paused,
         pause_info: act.pause_info.as_ref().map(|info| {
@@ -5974,6 +5977,7 @@ pub fn respond_activity_failed_to_edge(
         failure,
         failure_error_type,
         is_non_retryable,
+        last_heartbeat_details: req.last_heartbeat_details.as_ref().map(payloads_to_domain),
         identity: req.identity,
     })
 }
@@ -9664,6 +9668,80 @@ mod tests {
             Some("CustomActivityError")
         );
         assert!(edge.is_non_retryable);
+        assert_eq!(edge.last_heartbeat_details, None);
+    }
+
+    #[test]
+    fn respond_activity_failed_carries_last_heartbeat_details() {
+        // A retry records the details as progress
+        // (respondactivitytaskfailed/api.go:87-94 @ v1.31.0).
+        use tokeira_proto::conversions::common::payloads_from_domain;
+        let details = Payloads(vec![tokeira_types::Payload {
+            data: b"throttled-progress".to_vec(),
+            metadata: Default::default(),
+            external_payloads: Vec::new(),
+        }]);
+        let edge =
+            respond_activity_failed_to_edge(workflowservice::RespondActivityTaskFailedRequest {
+                failure: Some(failure_proto::Failure {
+                    message: "activity error".to_string(),
+                    ..Default::default()
+                }),
+                last_heartbeat_details: Some(payloads_from_domain(&details)),
+                identity: "worker".to_string(),
+                ..Default::default()
+            })
+            .expect("failure translates");
+        assert_eq!(edge.last_heartbeat_details, Some(details));
+    }
+
+    #[test]
+    fn pending_activity_reports_its_last_heartbeat_time() {
+        let heartbeat_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(90);
+        let details = Payloads(vec![tokeira_types::Payload {
+            data: b"progress".to_vec(),
+            metadata: Default::default(),
+            external_payloads: Vec::new(),
+        }]);
+        let description = |heartbeat_details: Option<Payloads>, last_heartbeat_at| {
+            crate::translate::PendingActivityDescription {
+                activity_id: "activity-1".to_string(),
+                activity_type: "activity-type".to_string(),
+                is_started: true,
+                cancel_requested: false,
+                attempt: 1,
+                maximum_attempts: 0,
+                scheduled_at: OffsetDateTime::UNIX_EPOCH,
+                started_at: Some(OffsetDateTime::UNIX_EPOCH),
+                last_failure: None,
+                heartbeat_details,
+                last_worker_identity: String::new(),
+                paused: false,
+                pause_info: None,
+                activity_options: crate::translate::ActivityOptions::default(),
+                last_heartbeat_at,
+            }
+        };
+
+        // `GetPendingActivityInfo` reports the time and the details together
+        // (activity.go:147-150 @ v1.31.0).
+        let heartbeated =
+            pending_activity_to_proto(&description(Some(details.clone()), Some(heartbeat_at)));
+        assert_eq!(
+            heartbeated.last_heartbeat_time,
+            Some(to_proto_timestamp(heartbeat_at))
+        );
+        assert!(heartbeated.heartbeat_details.is_some());
+
+        let never = pending_activity_to_proto(&description(None, None));
+        assert_eq!(never.last_heartbeat_time, None);
+        assert_eq!(never.heartbeat_details, None);
+
+        // State written before the time was stored holds details only; they are
+        // still reported (activity-heartbeat-time, Requirement 6.3).
+        let legacy = pending_activity_to_proto(&description(Some(details), None));
+        assert_eq!(legacy.last_heartbeat_time, None);
+        assert!(legacy.heartbeat_details.is_some());
     }
 
     #[test]
@@ -10138,6 +10216,7 @@ mod tests {
                 paused,
                 pause_info: None,
                 activity_options: crate::translate::ActivityOptions::default(),
+                last_heartbeat_at: None,
             };
 
         let parked = pending_activity_to_proto(&description(false, true, false));

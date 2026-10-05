@@ -1328,7 +1328,10 @@ impl BasicKernel {
                     activity.attempt = 1;
                 }
                 if req.reset_heartbeat {
+                    // Details and their time clear together
+                    // (`UnpauseActivity`, activity.go:401-404 @ v1.31.0).
                     activity.heartbeat_details = None;
+                    activity.last_heartbeat_at = None;
                 }
                 if activity.started_event_id.is_none() {
                     activity.current_attempt_scheduled_at = Some(req.dispatch_at);
@@ -1412,8 +1415,11 @@ impl BasicKernel {
                     }
                     if req.reset_heartbeat {
                         // No worker owns a scheduled activity, so there is no
-                        // current-instance heartbeat stream to preserve.
+                        // current-instance heartbeat stream to preserve; the
+                        // details and their time clear together
+                        // (`ResetActivity`, activity.go:361-365 @ v1.31.0).
                         activity.heartbeat_details = None;
+                        activity.last_heartbeat_at = None;
                     }
                     activity.current_attempt_scheduled_at = Some(req.dispatch_at);
                     activity.clone()
@@ -4273,6 +4279,7 @@ impl BasicKernel {
                         pause_info: None,
                         stamp: 0,
                         priority: priority.clone(),
+                        last_heartbeat_at: None,
                     },
                 );
             }
@@ -5114,6 +5121,7 @@ fn apply_workflow_command(
                 pause_info: None,
                 stamp: 0,
                 priority,
+                last_heartbeat_at: None,
             };
             builder
                 .state

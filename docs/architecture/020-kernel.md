@@ -728,7 +728,7 @@ This command allows updating workflow execution options on a running workflow, s
 
 1. Emit `RequestDedupeOp` for the request ID.
 2. Reset the activity attempt counter to `1`.
-3. Accept `reset_heartbeat` for API compatibility, but treat it as a no-op until heartbeat details are persisted in state.
+3. With `reset_heartbeat`, clear a scheduled activity's heartbeat details and last heartbeat time at once. A started activity keeps both and is flagged `reset_heartbeats`, so the running worker can keep heartbeating; retry preparation clears them (`ResetActivity`, `UpdateActivityInfoForRetries`, `service/history/workflow/activity.go @ v1.31.0`).
 4. Increment the activity's `stamp`.
 5. Emit `ActivityOp::Upsert`.
 6. If the workflow itself is not paused, emit `DispatchOp::EnqueueActivityTask`. If the workflow is paused, defer redispatch until `UnpauseWorkflow`.
@@ -1011,7 +1011,9 @@ Heartbeat processing lives entirely in the runtime. When heartbeats stop arrivin
 
 ### Activity heartbeat details in state
 
-When an activity is retried after a heartbeat timeout, the last heartbeat details should be available to the retry attempt. This is a runtime concern, but `ActivityState` may eventually need a `last_heartbeat_details` field that the runtime updates outside the kernel's transition path.
+`ActivityState` holds the last heartbeat details and the time they were recorded (`LastHeartbeatDetails` and `LastHeartbeatUpdateTime` @ v1.31.0). The runtime sets both, outside the kernel's transition path: on every heartbeat, and on a failure that reports heartbeat details before the retry. A retry and an attempt start keep them, so the next attempt receives the details. The kernel only clears them, when an unpause or a reset asks for a heartbeat reset, so it reads no clock.
+
+The heartbeat deadline is the later of the attempt's start and the last heartbeat time, plus the heartbeat timeout, as in Temporal. Because the time is durable, a node that takes over a shard computes the same deadline as the previous owner. The time is not part of `ActivityState`'s positional layout: it is skipped by serde and stored in the state extension (see [storage](../crates/storage.md)).
 
 ## Concurrency limits
 

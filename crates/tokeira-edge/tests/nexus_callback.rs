@@ -164,6 +164,7 @@ impl WorkflowRuntimeApi for FakeRuntime {
         _failure: Payload,
         _failure_error_type: Option<String>,
         _is_non_retryable: bool,
+        _last_heartbeat_details: Option<Payloads>,
         _worker_identity: Option<WorkerIdentity>,
         _request: RequestContext,
     ) -> Result<()> {

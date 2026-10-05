@@ -1,0 +1,5 @@
+kind: fixed
+body: A shard takeover no longer times out an activity that is still heartbeating. Each heartbeat's time is stored with the run, and Describe reports last_heartbeat_time.
+time: 2026-10-05T00:58:37.000000+01:00
+custom:
+    Slice: 6b2e40b7-0ced-4d1f-babe-af5b94c4a3ea

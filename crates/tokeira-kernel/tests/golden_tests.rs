@@ -726,6 +726,7 @@ fn make_paused_state_with_activity(id: &str) -> WorkflowState {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         },
     );
     state
@@ -765,6 +766,7 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         },
     );
     state
@@ -1794,6 +1796,7 @@ fn terminate_with_activities_and_timers() {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         },
     );
     state.timers.insert(
@@ -2121,6 +2124,7 @@ fn reset_deletes_timers_and_keeps_activities() {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         },
     );
     state.timers.insert(
@@ -2291,6 +2295,7 @@ fn pause_workflow_happy_path() {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         },
     );
 
@@ -2417,6 +2422,7 @@ fn unpause_workflow_happy_path() {
             pause_info: None,
             stamp: 1,
             priority: None,
+            last_heartbeat_at: None,
         },
     );
     let transition = kernel()
@@ -2955,6 +2961,42 @@ fn unpause_activity_happy_path() {
 }
 
 #[test]
+fn unpause_activity_heartbeat_reset_clears_details_and_time() {
+    for reset_heartbeat in [false, true] {
+        let mut state = make_open_state_with_activity("activity-1");
+        if let Some(activity) = state.activities.get_mut("activity-1") {
+            activity.pause_info = Some(ActivityPauseInfo {
+                pause_time: now(),
+                identity: "operator".into(),
+                reason: "pause".into(),
+                rule_id: None,
+            });
+            activity.heartbeat_details = Some(Payloads::default());
+            activity.last_heartbeat_at = Some(now());
+        }
+        let transition = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::UnpauseActivity(UnpauseActivityRequest {
+                    reset_heartbeat,
+                    ..make_unpause_activity_request("activity-1")
+                }),
+            )
+            .unwrap();
+        let activity = transition.next_state.activities.get("activity-1").unwrap();
+        // `UnpauseActivity` clears both together when asked
+        // (activity.go:401-404 @ v1.31.0).
+        let (details, time) = if reset_heartbeat {
+            (None, None)
+        } else {
+            (Some(Payloads::default()), Some(now()))
+        };
+        assert_eq!(activity.heartbeat_details, details);
+        assert_eq!(activity.last_heartbeat_at, time);
+    }
+}
+
+#[test]
 fn unpause_activity_not_paused_is_noop() {
     let transition = kernel()
         .apply(
@@ -2983,6 +3025,7 @@ fn reset_activity_happy_path() {
     if let Some(activity) = state.activities.get_mut("activity-1") {
         activity.attempt = 5;
         activity.heartbeat_details = Some(Payloads::default());
+        activity.last_heartbeat_at = Some(now());
     }
     let transition = kernel()
         .apply(
@@ -2994,6 +3037,9 @@ fn reset_activity_happy_path() {
     assert_eq!(activity.attempt, 1);
     assert_eq!(activity.stamp, 1);
     assert!(activity.heartbeat_details.is_none());
+    // A scheduled activity's reset clears the time with the details
+    // (`ResetActivity`, activity.go:361-365 @ v1.31.0).
+    assert_eq!(activity.last_heartbeat_at, None);
     assert_eq!(transition.dispatch_ops.len(), 1);
     assert!(transition.history_events.is_empty());
 }
@@ -3009,6 +3055,7 @@ fn reset_activity_preserves_heartbeat_without_reset_flag() {
     if let Some(activity) = state.activities.get_mut("activity-1") {
         activity.attempt = 5;
         activity.heartbeat_details = Some(heartbeat.clone());
+        activity.last_heartbeat_at = Some(now());
     }
     let transition = kernel()
         .apply(
@@ -3022,6 +3069,31 @@ fn reset_activity_preserves_heartbeat_without_reset_flag() {
     let activity = transition.next_state.activities.get("activity-1").unwrap();
     assert_eq!(activity.attempt, 1);
     assert_eq!(activity.heartbeat_details, Some(heartbeat));
+    assert_eq!(activity.last_heartbeat_at, Some(now()));
+}
+
+#[test]
+fn reset_activity_of_a_started_activity_defers_the_heartbeat_clear() {
+    // The running worker may keep heartbeating, so a reset of a started
+    // activity only flags the clear; retry preparation applies it
+    // (`UpdateActivityInfoForRetries`, activity.go:86-90 @ v1.31.0).
+    let mut state = make_open_state_with_activity("activity-1");
+    if let Some(activity) = state.activities.get_mut("activity-1") {
+        activity.started_at = Some(now());
+        activity.started_event_id = Some(6);
+        activity.heartbeat_details = Some(Payloads::default());
+        activity.last_heartbeat_at = Some(now());
+    }
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::ResetActivity(make_reset_activity_request("activity-1")),
+        )
+        .unwrap();
+    let activity = transition.next_state.activities.get("activity-1").unwrap();
+    assert!(activity.reset_heartbeats);
+    assert_eq!(activity.heartbeat_details, Some(Payloads::default()));
+    assert_eq!(activity.last_heartbeat_at, Some(now()));
 }
 
 #[test]
@@ -3666,6 +3738,7 @@ fn workflow_execution_timed_out_with_entities() {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         },
     );
     state.timers.insert(
@@ -4543,6 +4616,7 @@ fn reject_duplicate_activity_id() {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         },
     );
     assert_eq!(
@@ -5967,6 +6041,7 @@ fn with_pending_activity_started_wft() -> WorkflowState {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         },
     );
     state

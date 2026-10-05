@@ -18,8 +18,8 @@ use tokeira_types::{EventPrincipal, Payloads, ProjectionCursor, WorkflowRuleReco
 // `crate::codec` so the in-memory store accounts the History Size with the
 // same bytes; they are re-exported here so DSQL call sites keep one codec path.
 pub use crate::codec::{
-    BlobFormatError, decode_history_events, decode_workflow_state, encode_history_events,
-    encode_workflow_state, history_batch_encoded_len,
+    BlobFormatError, StateExtensionError, decode_history_events, decode_workflow_state,
+    encode_history_events, encode_workflow_state, history_batch_encoded_len,
 };
 use crate::{
     BacklogPayload, ProjectionContext, StoredTaskQueueConfig, StoredTaskQueueConfigKind,

@@ -14,7 +14,7 @@ the schema.
 This file is the **canonical** home of the root heading *Adding or Changing a DSQL
 Migration* (the root keeps the name and points here). The rules:
 
-- **Baseline lock discipline.** The tracked baseline through V071 prevents
+- **Baseline lock discipline.** The tracked baseline through V073 prevents
   uncoordinated edits and makes any migration/lock mismatch a build failure. Before
   Tokeira declares its first durable release baseline, an explicitly approved schema
   re-cut may replace a locked migration only when migration bytes, baseline metadata,
@@ -24,10 +24,11 @@ Migration* (the root keeps the name and points here). The rules:
   every schema change is a new migration above the current head, including any
   supported, idempotent `ALTER TABLE` operation.
 - **Contiguous versions.** No gaps or duplicate `VNNN`; the immutable prefix now ends
-  at V071. V068 (the per-run history size) was the first forward-only migration above
-  the original V067 baseline; V069–V071 add the archetype pointer and backfill marker.
-  The next schema change is V072. The release target must include every migration
-  needed by unconditional startup, including CHASM backfill with activity gates off.
+  at V073. V068 (the per-run history size) was the first forward-only migration above
+  the original V067 baseline; V069–V071 add the archetype pointer and backfill marker;
+  V072–V073 add the recovery flag and its index. The next schema change is V074. The
+  release target must include every migration needed by unconditional startup,
+  including CHASM backfill with activity gates off.
 - **DSQL DDL subset always.** One statement per file; secondary indexes created `ASYNC`;
   no `CHECK` constraints (validate in the application); no `BIGSERIAL` (generate IDs
   in-app). `src/dsql/validation.rs` (`DdlValidator`) enforces the safe subset — if it

@@ -398,6 +398,7 @@ where
         failure: Payload,
         failure_error_type: Option<String>,
         is_non_retryable: bool,
+        last_heartbeat_details: Option<Payloads>,
         worker_identity: Option<tokeira_types::WorkerIdentity>,
         request: RequestContext,
     ) -> Result<()> {
@@ -407,6 +408,7 @@ where
                 failure,
                 failure_error_type,
                 is_non_retryable,
+                last_heartbeat_details,
                 worker_identity,
                 request,
             )

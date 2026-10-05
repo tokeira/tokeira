@@ -164,9 +164,10 @@ where
                 result.wft_timeout_entries_reconstructed += 1;
             }
             for entry in entries.activities {
-                // No heartbeat time is stored, so until the next heartbeat the
-                // heartbeat deadline runs from the activity's start
-                // (runtime-sweeper-recovery Requirement 8.6). Schedule-to-start
+                // The last heartbeat time comes from the run's state, so the
+                // heartbeat deadline is the one the previous owner would have
+                // evaluated (runtime-sweeper-recovery Requirement 8.6;
+                // timer_sequence.go:341-351 @ v1.31.0). Schedule-to-start
                 // re-anchors at the CURRENT attempt's durable dispatch time: a
                 // retry's s2s clock runs from its own dispatch, not from the
                 // original schedule, which stays the schedule-to-close anchor
@@ -180,7 +181,7 @@ where
                         .current_attempt_scheduled_at
                         .unwrap_or(entry.original_scheduled_at),
                     started_at: entry.started_at,
-                    last_heartbeat_at: None,
+                    last_heartbeat_at: entry.last_heartbeat_at,
                     cancel_requested: false,
                 });
                 result.activity_tracking_entries_reconstructed += 1;
@@ -834,6 +835,7 @@ mod tests {
                         pause_info: None,
                         stamp: 0,
                         priority: None,
+                        last_heartbeat_at: None,
                     };
                     t.activity_ops
                         .push(ActivityOp::Upsert(act.clone()));
@@ -1011,6 +1013,7 @@ mod tests {
                     pause_info: None,
                     stamp: activity_stamp,
                     priority: activity_priority.clone(),
+                    last_heartbeat_at: None,
                 };
                 transition.activity_ops.push(ActivityOp::Upsert(act.clone()));
                 transition
@@ -1336,13 +1339,14 @@ mod tests {
     // ── Property 9: Activity tracking reconstruction
     //    fidelity ────────────────────────────────────
     // Feature: runtime-sweeper-recovery
-    // **Validates: Requirements 8.1, 8.2, 8.3**
+    // **Validates: Requirements 8.1, 8.2, 8.3, 8.6**
+    // Feature: activity-heartbeat-time, Property 8: The Sweep restores the time
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
         #[test]
         fn activity_tracking_reconstruction_fidelity(
-            _seed in 0u32..100,
+            heartbeat_offset in proptest::option::of(-10_000_000_000i64..10_000_000_000),
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
@@ -1394,6 +1398,10 @@ mod tests {
                     pause_info: None,
                     stamp: 0,
                     priority: None,
+                    // Any stored time, before or after the attempt's start.
+                    last_heartbeat_at: heartbeat_offset.map(|offset| {
+                        fixed_now() + Duration::nanoseconds(offset)
+                    }),
                 };
                 t.activity_ops.push(ActivityOp::Upsert(
                     act.clone(),
@@ -1463,7 +1471,7 @@ mod tests {
                 );
                 prop_assert_eq!(
                     entry.last_heartbeat_at,
-                    None,
+                    act.last_heartbeat_at,
                 );
                 prop_assert_eq!(
                     entry.cancel_requested,
@@ -1476,6 +1484,110 @@ mod tests {
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
+    }
+
+    #[tokio::test]
+    async fn takeover_times_out_only_activities_that_stopped_heartbeating() {
+        // After a takeover the heartbeat deadline runs from the stored last
+        // heartbeat (activity-heartbeat-time, Requirements 5.1 and 5.3). Each
+        // attempt started an hour ago with a 10s heartbeat timeout: the one
+        // that heartbeated 2s ago keeps running, while the one silent for a
+        // minute and the one that never heartbeated time out and retry.
+        let store = InMemoryStore::with_shard_count(1);
+        let shard_id = ShardId(0);
+        let now = OffsetDateTime::now_utc();
+        let started_at = now - Duration::hours(1);
+        let mut runs = Vec::new();
+        for last_heartbeat_at in [
+            Some(now - Duration::seconds(2)),
+            Some(now - Duration::seconds(60)),
+            None,
+        ] {
+            let run_key = RunKey::new();
+            let mut t = start_transition(run_key);
+            let act = ActivityState {
+                last_attempt_complete_time: None,
+                cancel_requested: false,
+                activity_reset: false,
+                reset_heartbeats: false,
+                started_identity: None,
+                retry_last_worker_identity: None,
+                activity_id: "act-1".into(),
+                activity_type: "activity-type".into(),
+                schedule_event_id: 7,
+                task_queue: TaskQueueName("q".into()),
+                deployment: None,
+                build_id: None,
+                input: Payloads::default(),
+                header: None,
+                last_failure: None,
+                heartbeat_details: None,
+                attempt: 1,
+                retry_policy: Some(tokeira_types::RetryPolicy {
+                    initial_interval: Duration::seconds(1),
+                    backoff_coefficient: 2.0,
+                    maximum_interval: None,
+                    maximum_attempts: 0,
+                    non_retryable_error_types: Vec::new(),
+                }),
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: Some(Duration::hours(2)),
+                heartbeat_timeout: Some(Duration::seconds(10)),
+                scheduled_at: started_at - Duration::seconds(1),
+                current_attempt_scheduled_at: Some(started_at - Duration::seconds(1)),
+                started_at: Some(started_at),
+                started_event_id: Some(8),
+                pause_info: None,
+                stamp: 0,
+                priority: None,
+                last_heartbeat_at,
+            };
+            t.activity_ops.push(ActivityOp::Upsert(act.clone()));
+            t.next_state.activities.insert("act-1".into(), act);
+            store
+                .commit_transition(run_key, t, ShardEpoch::ZERO)
+                .await
+                .unwrap();
+            runs.push(run_key);
+        }
+
+        let broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let (lanes, lane_count) = make_lanes(&store);
+        let deps = sweep_retry_deps(&store, &activity_broker);
+        sweep_shard(
+            shard_id,
+            &store,
+            &broker,
+            &lanes,
+            lane_count,
+            &WorkflowTimeoutTrackingState::default(),
+            &WftTimeoutTrackingState::default(),
+            &deps.tracking,
+            &NexusTimeoutTrackingState::default(),
+            &CompletionCallbackTrackingState::default(),
+            &deps,
+        )
+        .await
+        .unwrap();
+        crate::activity_timeout::scan_activity_timeouts_once(
+            &deps,
+            None,
+            &lanes,
+            lane_count,
+            &crate::activity_timeout::ActivityTimeoutScannerConfig::default(),
+        )
+        .await;
+
+        let mut attempts = Vec::new();
+        for run_key in runs {
+            let LoadedRun::Existing(state) = store.load_run(run_key).await.unwrap() else {
+                panic!("seeded run should exist");
+            };
+            attempts.push(state.activities["act-1"].attempt);
+        }
+        assert_eq!(attempts, vec![1, 2, 2]);
     }
 
     #[tokio::test]
@@ -1519,6 +1631,7 @@ mod tests {
             pause_info: None,
             stamp: 1,
             priority: None,
+            last_heartbeat_at: None,
         };
         t.activity_ops.push(ActivityOp::Upsert(act.clone()));
         t.next_state
@@ -1936,6 +2049,7 @@ mod tests {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         };
         transition
             .activity_ops

@@ -296,9 +296,9 @@ impl Default for ActivityTimeoutScannerConfig {
 /// schedule-to-close bounds the whole activity and so is checked first; then, if
 /// the activity has started, heartbeat is checked before start-to-close (a
 /// heartbeat lapse is the tighter, more specific failure); if it has *not* started
-/// yet, only schedule-to-start applies. The heartbeat clock falls back to
-/// `started_at` when no heartbeat has been received, so the first interval is
-/// measured from start. A zero timeout never fires: v1.31.0 creates a timeout
+/// yet, only schedule-to-start applies. The heartbeat clock runs from the later
+/// of `started_at` and the last heartbeat, so the first interval is measured
+/// from start and a heartbeat from an earlier attempt never shortens it. A zero timeout never fires: v1.31.0 creates a timeout
 /// timer only for positive durations (`timer_sequence.go:268-271 @ v1.31.0`) —
 /// zero/unset means "no deadline" (the edge already normalizes present-zero
 /// SDK durations to `None`; the guards here are defense in depth).
@@ -318,7 +318,13 @@ pub fn evaluate_activity_timeout(
         if let Some(timeout) = activity.heartbeat_timeout
             && !timeout.is_zero()
         {
-            let heartbeat_at = entry.last_heartbeat_at.unwrap_or(started_at);
+            // The later of the attempt's start and the last heartbeat
+            // (`getActivityHeartbeatTimeout`, timer_sequence.go:341-351 @
+            // v1.31.0): a time restored from durable state may predate the
+            // current attempt, whose clock then runs from its start.
+            let heartbeat_at = entry
+                .last_heartbeat_at
+                .map_or(started_at, |at| at.max(started_at));
             if now - heartbeat_at > timeout {
                 return Some(TimeoutViolation::Heartbeat);
             }
@@ -480,6 +486,8 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                         // (`processSingleActivityTimeoutTask` builds it via
                         // `failure.NewTimeoutFailure` @ v1.31.0).
                         Some(timeout_failure_payload(violation)),
+                        // A timeout carries no worker progress.
+                        None,
                     )
                     .await;
                     match result {
@@ -776,6 +784,7 @@ mod tests {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         }
     }
 
@@ -816,6 +825,38 @@ mod tests {
                 cancel_requested: false,
             };
             prop_assert_eq!(evaluate_activity_timeout(&entry, &sample_activity(), now + Duration::seconds(60)), None);
+        }
+
+        // Feature: activity-heartbeat-time, Property 6: The heartbeat deadline is
+        // v1.31.0's
+        #[test]
+        fn property_heartbeat_deadline_runs_from_the_later_of_start_and_heartbeat(
+            started_offset in -10_000i64..10_000,
+            heartbeat_offset in proptest::option::of(-20_000i64..20_000),
+            timeout_secs in 1i64..5_000,
+            now_offset in -10_000i64..40_000,
+        ) {
+            let base = OffsetDateTime::UNIX_EPOCH + Duration::days(20_000);
+            let started_at = base + Duration::seconds(started_offset);
+            let last_heartbeat_at = heartbeat_offset.map(|offset| base + Duration::seconds(offset));
+            let now = base + Duration::seconds(now_offset);
+            let entry = ActivityTrackingEntry {
+                run_key: RunKey::new(),
+                shard_id: ShardId(0),
+                activity_id: "a".into(),
+                original_scheduled_at: started_at,
+                last_dispatched_at: started_at,
+                started_at: Some(started_at),
+                last_heartbeat_at,
+                cancel_requested: false,
+            };
+            let mut activity = sample_activity();
+            activity.heartbeat_timeout = Some(Duration::seconds(timeout_secs));
+            let anchor = last_heartbeat_at.map_or(started_at, |at| at.max(started_at));
+            prop_assert_eq!(
+                evaluate_activity_timeout(&entry, &activity, now) == Some(TimeoutViolation::Heartbeat),
+                now - anchor > Duration::seconds(timeout_secs),
+            );
         }
     }
 

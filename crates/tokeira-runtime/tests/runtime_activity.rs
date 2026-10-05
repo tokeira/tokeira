@@ -121,6 +121,7 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
             Some("retryable".to_string()),
             false,
             None,
+            None,
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         )
         .await?;
@@ -223,6 +224,7 @@ async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
             Some("retryable".to_string()),
             false,
             None,
+            None,
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         )
         .await?;
@@ -302,6 +304,7 @@ async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()
             Payload::new(b"boom".to_vec()),
             Some("fatal".to_string()),
             false,
+            None,
             None,
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         )
@@ -1074,6 +1077,7 @@ async fn retry_backoff_is_respected_by_reconciliation_and_recovery() -> Result<(
             Some("retryable".to_string()),
             false,
             None,
+            None,
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         )
         .await?;
@@ -1237,6 +1241,7 @@ async fn backoff_interval_rule_between_publication_and_start_pauses_durably() ->
             Payload::new(b"boom".to_vec()),
             Some("retryable".to_string()),
             false,
+            None,
             None,
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         )

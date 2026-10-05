@@ -1,7 +1,7 @@
 # 000 Overview
 
 **Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
-**Related docs:** [010-history-as-authority](010-history-as-authority.md), [015-configuration](015-configuration.md), [020-kernel](020-kernel.md), [025-system-services](025-system-services.md), [030-runtime-lanes](030-runtime-lanes.md), [035-placement-and-membership](035-placement-and-membership.md), [037-dynamic-placement](037-dynamic-placement.md), [040-delivery-broker](040-delivery-broker.md), [045-autoscaling-on-ecs-ec2](045-autoscaling-on-ecs-ec2.md), [050-dsql-storage](050-dsql-storage.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md), [065-runtime-auto-tune](065-runtime-auto-tune.md), [070-projection-plane](070-projection-plane.md), [075-archival-to-s3](075-archival-to-s3.md), [080-sql-visibility](080-sql-visibility.md), [090-failover-and-recovery](090-failover-and-recovery.md), [120-iac-framework](120-iac-framework.md)
+**Related docs:** [010-history-as-authority](010-history-as-authority.md), [015-configuration](015-configuration.md), [020-kernel](020-kernel.md), [025-system-services](025-system-services.md), [030-runtime-lanes](030-runtime-lanes.md), [035-placement-and-membership](035-placement-and-membership.md), [037-dynamic-placement](037-dynamic-placement.md), [040-delivery-broker](040-delivery-broker.md), [042-durable-actionable-state](042-durable-actionable-state.md), [045-autoscaling-on-ecs-ec2](045-autoscaling-on-ecs-ec2.md), [050-dsql-storage](050-dsql-storage.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md), [065-runtime-auto-tune](065-runtime-auto-tune.md), [070-projection-plane](070-projection-plane.md), [075-archival-to-s3](075-archival-to-s3.md), [080-sql-visibility](080-sql-visibility.md), [090-failover-and-recovery](090-failover-and-recovery.md), [120-iac-framework](120-iac-framework.md)
 
 ## Intent
 
@@ -130,6 +130,8 @@ Temporal workflows can wait for external signals, timers, activities, and child 
 
 Worker polling and sync matching should live primarily in memory. Durable backlog is a fallback and recovery aid, not the default path. If a task can be scheduled and started without persisting a queue row, that should be the fast path.
 
+[042-durable-actionable-state](042-durable-actionable-state.md) proposes revising this principle: matching stays in memory, but each task's dispatch intent becomes a row committed with the transition that schedules it, and the durable backlog retires.
+
 ### 5. Visibility is a projection, not a side database bolted onto correctness
 
 Temporal’s visibility model already distinguishes a visibility store from the core persistence store, supports SQL backends, List Filters, custom Search Attributes, and dual visibility for migration.[^visibility][^dual-visibility][^list-filter][^search-attributes] Tokeira generalizes this into a typed projection log with replayable sinks.
@@ -255,6 +257,7 @@ It does **not** mean preserving internal service boundaries or today’s exact q
 - Read [020-kernel](020-kernel.md) for the deterministic state transition contract.
 - Read [025-system-services](025-system-services.md) for the replacement of a Temporal-style Worker Service.
 - Read [030-runtime-lanes](030-runtime-lanes.md) and [040-delivery-broker](040-delivery-broker.md) for execution and polling.
+- Read the proposed [042-durable-actionable-state](042-durable-actionable-state.md) for durable dispatch, outbound operations and projection passes.
 - Read [035-placement-and-membership](035-placement-and-membership.md) and [037-dynamic-placement](037-dynamic-placement.md) for queue-aware placement, cell routing, and storage-aware rebalance.
 - Read [050-dsql-storage](050-dsql-storage.md) and [060-connection-management](060-connection-management.md) for persistence and DSQL-specific control.
 - Read [070-projection-plane](070-projection-plane.md), [075-archival-to-s3](075-archival-to-s3.md), and [080-sql-visibility](080-sql-visibility.md) for read models, archival, and visibility.
@@ -264,7 +267,7 @@ It does **not** mean preserving internal service boundaries or today’s exact q
 
 1. Is the compatibility boundary stated tightly enough, or should it explicitly enumerate more Temporal APIs?
 2. Are we comfortable stating “history as authority” even though `workflow_hot` remains a persisted summary?
-3. Do we want to treat delivery backlog as purely derived from run state, or do we want a stronger durable outbox abstraction inside storage?
+3. Do we want to treat delivery backlog as purely derived from run state, or do we want a stronger durable outbox abstraction inside storage? [042-durable-actionable-state](042-durable-actionable-state.md) proposes an answer: rows derived from run state, plus intent rows only for what a close still owes.
 4. Is the queue-aware / execution-scoped split clear enough to reason about multi-cell routing?
 5. Which internal jobs truly justify running as durable system workflows, and which should remain plain control services?
 

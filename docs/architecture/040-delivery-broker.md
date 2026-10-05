@@ -1,7 +1,7 @@
 # 040 Delivery Broker
 
 **Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
-**Related docs:** [010-history-as-authority](010-history-as-authority.md), [030-runtime-lanes](030-runtime-lanes.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md)
+**Related docs:** [010-history-as-authority](010-history-as-authority.md), [030-runtime-lanes](030-runtime-lanes.md), [042-durable-actionable-state](042-durable-actionable-state.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md)
 
 ## Purpose
 

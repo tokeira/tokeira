@@ -1,7 +1,7 @@
 # 090 Failover and Recovery
 
 **Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
-**Related docs:** [030-runtime-lanes](030-runtime-lanes.md), [040-delivery-broker](040-delivery-broker.md), [060-connection-management](060-connection-management.md)
+**Related docs:** [030-runtime-lanes](030-runtime-lanes.md), [040-delivery-broker](040-delivery-broker.md), [042-durable-actionable-state](042-durable-actionable-state.md), [060-connection-management](060-connection-management.md)
 
 ## Purpose
 

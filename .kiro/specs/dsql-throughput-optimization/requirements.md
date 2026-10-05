@@ -80,7 +80,7 @@ Target: 130 wf/s sustained on compose DSQL deployment with sub-200ms p50 latency
 2. WHEN the runtime calls `read_history`, THE runtime SHALL pass the `maximum_page_size` as the limit parameter to the storage layer.
 3. THE DsqlRunRepository SHALL NOT use `usize::MAX` as the page size when a finite `maximum_page_size` is provided by the caller.
 4. WHEN `maximum_page_size` is provided, THE DsqlRunRepository SHALL return at most `maximum_page_size` events per read_history call.
-5. WHEN `maximum_page_size` is not provided (legacy callers), THE DsqlRunRepository SHALL fall back to a sensible default (1000 events) rather than `usize::MAX`.
+5. WHEN a caller needs a run's whole history, THE caller SHALL read it in bounded pages until a short page, and no repository SHALL substitute a smaller limit for the one requested ([history-pagination](../history-pagination/bugfix.md), criteria 2.1 and 2.2). The 1,000-event fallback this criterion first prescribed for `usize::MAX` truncated every whole-history reader on DSQL without saying so.
 
 ### Requirement 5: Avoid Full-History WFT Poll Reads
 

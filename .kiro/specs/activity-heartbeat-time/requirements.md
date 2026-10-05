@@ -54,7 +54,7 @@ Amends:
 - In-memory snapshots written by 0.2.0–0.5.1 still restore, and snapshots carry the times.
 - The State_Extension can be reused: a later feature adds data to stored state with a new Extension_Section, without a new envelope version.
 - Out of scope:
-  - **Blob-size limits on heartbeat details.** v1.31.0 drops oversize failure details and returns a server failure to the worker (`frontend/workflow_handler.go:1804-1822`). Tokeira enforces no blob-size limit on heartbeat details today.
+  - **Blob-size limits on heartbeat details.** v1.31.0 drops oversize failure details and returns a server failure to the worker (`frontend/workflow_handler.go:1804-1822`). Tokeira enforces no blob-size limit on heartbeat details today. [payload-admission-limits](../payload-admission-limits/bugfix.md) adds it (criteria 2.7 and 2.8).
   - **Standalone (CHASM) activities.** They already persist their heartbeat time (`crates/tokeira-chasm-activity/src/state.rs:339`).
   - **The `activity_state` side-table blob.** It keeps its layout and carries no time. No reader has used it since recovery-index.
   - **History batch blobs.**

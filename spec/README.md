@@ -21,6 +21,13 @@ spec/
   tla/
     00_execution_contract.tla
     00_execution_contract.cfg
+    40_dispatch_handoff.tla
+    40_dispatch_handoff.cfg
+    40_dispatch_handoff_order.cfg
+    40_dispatch_handoff_migration.cfg
+    40_dispatch_handoff_stale_rows.cfg
+    negative/
+      40_dispatch_handoff_*.cfg
 ```
 
 ### `refinement/kernel.md`
@@ -53,6 +60,43 @@ It keeps the first spec readable and lets us pin down the kernel's semantic cont
 
 This is the TLC model configuration for the first spec.
 It gives the constants small finite values so TLC can exhaustively explore the state space.
+
+### `tla/40_dispatch_handoff.tla`
+
+This models how a scheduled task reaches a worker when dispatch is durable state rather than a message.
+The commit that schedules a task also writes a dispatch row.
+Queue homes find rows with discovery passes that start at the head of the queue every time.
+Claiming a task writes nothing, and the run's start transition, which checks the task's incarnation, is the only fence.
+Notifications, broker memory, offers and start replies may all be lost.
+
+It is a sibling of `00_execution_contract`, not a refinement of it.
+It keeps only the part of a run's state that dispatch depends on, and models the layers around it: storage rows, brokers, pollers and shard ownership.
+Activity tasks have the same shape.
+
+It checks, using weak fairness only and none on notifications:
+
+- at most one start commits per incarnation, and never for a stale incarnation;
+- a serving shard has exactly the dispatch rows its committed state derives;
+- an incarnation that stays wanted, on a queue a compatible poller serves, is eventually started or no longer wanted;
+- a sticky incarnation, which only a notification announces, is eventually started or converted into one that discovery can find.
+
+Each configuration exercises one shape, and each file under `negative/` breaks one part of the protocol.
+Every negative control must fail: a property that no broken variant violates proves nothing.
+
+| Configuration | What it exercises | Expected |
+|---|---|---|
+| `40_dispatch_handoff.cfg` | one run, two queue homes that overlap, sticky incarnations | pass |
+| `40_dispatch_handoff_order.cfg` | two runs; the head run's routing class has no poller | pass |
+| `40_dispatch_handoff_migration.cfg` | writes by an old release, repaired at acquisition | pass |
+| `40_dispatch_handoff_stale_rows.cfg` | stale rows left in place, with `RowsAreWanted` unchecked | pass |
+| `negative/40_dispatch_handoff_no_incarnation_check.cfg` | a start that doesn't check the incarnation | a start-safety invariant fails |
+| `negative/40_dispatch_handoff_bare_limit.cfg` | discovery that reads a fixed window with no paging | `EventuallyResolved` fails |
+| `negative/40_dispatch_handoff_durable_cursor.cfg` | discovery that continues after a durable cursor | `EventuallyResolved` fails |
+| `negative/40_dispatch_handoff_no_sticky_timeout.cfg` | no sticky schedule-to-start timeout | `StickyConverts` fails |
+| `negative/40_dispatch_handoff_reconcile_skips_inserts.cfg` | acquisition that leaves rows missing | `WantedRowsExist` fails |
+| `negative/40_dispatch_handoff_reconcile_skips_deletes.cfg` | acquisition that leaves stale rows | `RowsAreWanted` fails |
+
+The stale-rows configuration shows why the two row invariants are separate: a stale dispatch row only costs an offer that the start transition rejects, while a missing one can stop work for ever.
 
 ## What this first spec does **not** model
 
@@ -163,6 +207,35 @@ cd spec/tla
 java -cp /path/to/tla2tools.jar tla2sany.SANY 00_execution_contract.tla
 ```
 
+### Checking `40_dispatch_handoff` with TLC
+
+Run every configuration. The four at the top level must pass, and each one under `negative/` must report a violation.
+`-metadir` keeps TLC's working files out of the tree.
+
+```bash
+cd spec/tla
+for cfg in 40_dispatch_handoff*.cfg negative/40_dispatch_handoff_*.cfg; do
+  java -cp /path/to/tla2tools.jar tlc2.TLC -workers auto -metadir /tmp/tlc -config "$cfg" 40_dispatch_handoff.tla
+done
+```
+
+The main configuration explores about 240,000 distinct states and takes about a minute; the others take seconds.
+
+### Option C: tla-rs
+
+[tla-rs](https://github.com/fabracht/tla-rs) is a TLA+ model checker written in Rust that reads the same modules and configuration files.
+It is useful for fast feedback and for its interactive explorer (`-i`).
+Treat TLC as the reference, and record a result only when both agree.
+
+```bash
+cargo install tla-checker --version 0.21.2 --locked
+cd spec/tla
+tla 40_dispatch_handoff.tla --config 40_dispatch_handoff.cfg --max-states 20000000 --max-depth 10000
+```
+
+Its default limits (1,000,000 states and depth 100) are smaller than models like this may need, so set them explicitly.
+It runs on one thread, so the main configuration takes about three minutes.
+
 ## What TLC will do on the first run
 
 The configuration deliberately uses:
@@ -184,7 +257,7 @@ As Tokeira evolves, the intended spec sequence is:
 2. `10_history_authority.tla`
 3. `20_current_execution.tla`
 4. `30_bundle_lease.tla`
-5. `40_broker_reservations.tla`
+5. `40_dispatch_handoff.tla`, written. It replaces the planned `40_broker_reservations.tla`: claiming a task writes nothing, so there are no broker reservations to model.
 6. `70_projection_prefix.tla`
 
 Each later spec should either:

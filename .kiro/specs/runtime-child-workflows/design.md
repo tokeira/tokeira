@@ -171,7 +171,7 @@ impl<R: RunRepository> RuntimeDispatchPublisher<R> {
 
 ### DispatchPublisher::publish — child workflow handling
 
-The `publish` method gains three new match arms:
+The `publish` method gains three new match arms. The child start's retries live in `crates/tokeira-runtime/src/child_start.rs`: `start_child` and `confirm_child_start` reach lanes, storage and the clock through a `ChildStartIo` trait, which the publisher implements and tests script. The sketch below shows the same decisions inline.
 
 ```rust
 DispatchOp::StartChildWorkflow {
@@ -257,12 +257,12 @@ DispatchOp::StartChildWorkflow {
             .submit(*parent_run_key, confirm_command.clone())
             .await
         {
-            Ok(_) => break,
+            Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => break,
             Err(error) if is_kernel_rejection(&error) => {
                 tracing::warn!(?error, "parent no longer awaits ChildStartConfirmed");
                 break;
             }
-            Err(_) => sleep(backoff.next_delay()).await,
+            Ok(_) | Err(_) => sleep(backoff.next_delay()).await,
         }
     }
 }
@@ -565,7 +565,7 @@ Each correctness property MUST be implemented by a SINGLE property-based test.
 
 **Property 2 (Successful child start confirmation):** A generator produces random dispatch ops. The mock child lane returns `CommitResult::Applied`. A mock parent lane captures the `Command::ChildStartConfirmed`. The test verifies the `Started` variant with correct `child_run_id`, `workflow_type`, and `initiated_event_id`.
 
-**Property 3 (Only an existing workflow fails a child start):** A generator produces random dispatch ops and a random sequence of start outcomes: errors, `CommitResult::Conflict`, and a final definitive outcome. A mock parent lane captures the `Command::ChildStartConfirmed`. The test verifies that errors and conflicts are retried, and that `Failed` appears only with `WORKFLOW_ALREADY_EXISTS` after a `CurrentExecutionConflict` under FAIL. Backoff runs under `tokio::time::pause()`.
+**Property 3 (Only an existing workflow fails a child start):** A generator produces random dispatch ops and a random sequence of start outcomes: errors, `CommitResult::Conflict`, and a final definitive outcome. A mock parent lane captures the `Command::ChildStartConfirmed`. The test verifies that errors and conflicts are retried, and that `Failed` appears only with `WORKFLOW_ALREADY_EXISTS` after a `CurrentExecutionConflict` under FAIL. The backoff's wait goes through the same trait as the start, so the test records each delay instead of sleeping: `tokeira-runtime` doesn't enable tokio's `test-util` feature.
 
 **Property 4 (TerminateChild and CancelChild dispatch):** A generator produces random `TerminateChild` and `CancelChild` dispatch ops with random `child_run_id` and `reason`. Mock lanes capture submitted commands. The test verifies the correct `Command::Terminate` or `Command::Cancel` is submitted with the matching `reason`.
 

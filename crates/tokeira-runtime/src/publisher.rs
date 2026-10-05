@@ -45,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     activity_timeout::ActivityTrackingState,
     broker::{InMemoryActivityBroker, InMemoryBroker},
+    child_start::{self, ChildStartIo, ChildStartOutcome, Submitted},
     deployment_registry::DeploymentRegistry,
     fairness::DeliveryMetrics,
     lane::{DispatchPublisher, LaneHandle},
@@ -182,6 +183,81 @@ struct StartChildDispatch {
     cron_schedule: Option<String>,
     reuse_policy: tokeira_kernel::WorkflowIdReusePolicy,
     priority: Option<tokeira_kernel::Priority>,
+}
+
+/// A child start's lanes, repository and clock, for [`child_start::start_child`] and
+/// [`child_start::confirm_child_start`]. Every attempt reuses the child's run key, run id
+/// and request id (runtime-child-workflows Requirement 1.2).
+struct PublisherChildStart<'a, R> {
+    publisher: &'a RuntimeDispatchPublisher<R>,
+    child_run_key: RunKey,
+    child_run_id: RunId,
+    start_request: StartRequest,
+    parent_run_key: RunKey,
+    child_workflow_id: WorkflowId,
+    initiated_event_id: i64,
+    /// The outcome to deliver, once the start is definitive.
+    confirmation: Option<ChildStartConfirmedRequest>,
+}
+
+impl<R> ChildStartIo for PublisherChildStart<'_, R>
+where
+    R: RunRepository + 'static,
+{
+    async fn submit_start(&mut self) -> Submitted {
+        // A retry happens later than the first attempt, so it carries the current time.
+        let mut request = self.start_request.clone();
+        request.now = OffsetDateTime::now_utc();
+        let result = self
+            .publisher
+            .pick_lane(self.child_run_key)
+            .submit(self.child_run_key, Command::Start(request))
+            .await;
+        Submitted::from_result(result)
+    }
+
+    async fn terminate_incumbent(&mut self, run_key: RunKey) {
+        self.publisher
+            .terminate_conflicting_incumbent(run_key, self.child_run_id)
+            .await;
+    }
+
+    async fn parent_awaits_child(&mut self) -> bool {
+        match self.publisher.repo.load_run(self.parent_run_key).await {
+            Ok(LoadedRun::Existing(parent)) => child_start::awaits_child(
+                parent.status.is_open(),
+                parent.children.get(&self.child_workflow_id),
+                self.initiated_event_id,
+            ),
+            Ok(LoadedRun::Absent) => false,
+            Err(error) => {
+                // A parent that can't be read may still await the child: keep retrying.
+                tracing::warn!(
+                    ?error,
+                    parent_run_key = ?self.parent_run_key,
+                    "failed to read the parent before retrying a child start"
+                );
+                true
+            }
+        }
+    }
+
+    async fn submit_confirmation(&mut self) -> Submitted {
+        let Some(mut request) = self.confirmation.clone() else {
+            return Submitted::Rejected("no child start outcome to confirm".to_string());
+        };
+        request.now = OffsetDateTime::now_utc();
+        let result = self
+            .publisher
+            .pick_lane(self.parent_run_key)
+            .submit(self.parent_run_key, Command::ChildStartConfirmed(request))
+            .await;
+        Submitted::from_result(result)
+    }
+
+    async fn wait(&mut self, delay: std::time::Duration) {
+        tokio::time::sleep(delay).await;
+    }
 }
 
 /// [`DispatchPublisher`] that forwards dispatch ops to
@@ -715,86 +791,54 @@ where
             conflict_policy,
             tokeira_kernel::WorkflowIdConflictPolicy::TerminateExisting
         );
-        let mut terminated_incumbent = false;
-        let confirmation = loop {
-            let result = self
-                .pick_lane(child_run_key)
-                .submit(child_run_key, Command::Start(start_request.clone()))
-                .await;
-            match result {
-                Ok(CommitResult::Applied { .. }) => {
-                    tracing::debug!(
-                        ?child_workflow_id,
-                        ?child_run_key,
-                        ?child_run_id,
-                        task_queue = %task_queue_name,
-                        "child workflow started successfully"
-                    );
-                    break ChildStartResult::Started {
-                        child_run_id,
-                        workflow_type: workflow_type.clone(),
-                    };
-                }
-                Ok(CommitResult::CurrentExecutionConflict {
-                    existing_run_key, ..
-                }) => {
-                    if terminate_on_conflict && !terminated_incumbent {
-                        terminated_incumbent = true;
-                        self.terminate_conflicting_incumbent(existing_run_key, child_run_id)
-                            .await;
-                        continue;
-                    }
-                    tracing::warn!(
-                        ?child_workflow_id,
-                        ?existing_run_key,
-                        "child workflow start hit a running duplicate workflow id"
-                    );
-                    break ChildStartResult::Failed {
-                        cause: "WORKFLOW_ALREADY_EXISTS".to_string(),
-                    };
-                }
-                Ok(CommitResult::Conflict { reason }) => {
-                    // A closed-run reuse-policy rejection (RejectDuplicate /
-                    // AllowDuplicateFailedOnly) also surfaces to the parent as
-                    // WORKFLOW_ALREADY_EXISTS (generateWorkflowAlreadyStartedError,
-                    // workflow_id_dedup.go:233-249).
-                    tracing::warn!(?child_workflow_id, %reason, "child workflow start conflict");
-                    break ChildStartResult::Failed {
-                        cause: "WORKFLOW_ALREADY_EXISTS".to_string(),
-                    };
-                }
-                Ok(CommitResult::Duplicate) => {
-                    break ChildStartResult::Failed {
-                        cause: "WORKFLOW_ALREADY_EXISTS".to_string(),
-                    };
-                }
-                Err(error) => {
-                    tracing::warn!(?child_workflow_id, ?error, "child workflow start error");
-                    break ChildStartResult::Failed {
-                        cause: error.to_string(),
-                    };
-                }
-            }
-        };
-
-        let confirm = Command::ChildStartConfirmed(ChildStartConfirmedRequest {
+        // v1.31.0 retries a child start until it is definitive and records a failed start
+        // only for an existing workflow or a missing namespace
+        // (transfer_queue_active_task_executor.go:1032-1074 @ v1.31.0;
+        // runtime-child-workflows Requirements 1.5, 1.7, 7.1).
+        let mut io = PublisherChildStart {
+            publisher: self,
+            child_run_key,
+            child_run_id,
+            start_request,
+            parent_run_key,
             child_workflow_id: child_workflow_id.clone(),
             initiated_event_id,
-            result: confirmation,
+            confirmation: None,
+        };
+        let result = match child_start::start_child(
+            &mut io,
+            &child_workflow_id,
+            terminate_on_conflict,
+        )
+        .await
+        {
+            ChildStartOutcome::Started => {
+                tracing::debug!(
+                    ?child_workflow_id,
+                    ?child_run_key,
+                    ?child_run_id,
+                    task_queue = %task_queue_name,
+                    "child workflow started successfully"
+                );
+                ChildStartResult::Started {
+                    child_run_id,
+                    workflow_type: workflow_type.clone(),
+                }
+            }
+            ChildStartOutcome::AlreadyExists => ChildStartResult::Failed {
+                cause: "WORKFLOW_ALREADY_EXISTS".to_string(),
+            },
+            // The parent no longer awaits the child: nothing to start or confirm
+            // (Requirement 7.5).
+            ChildStartOutcome::Abandoned => return,
+        };
+        io.confirmation = Some(ChildStartConfirmedRequest {
+            child_workflow_id: child_workflow_id.clone(),
+            initiated_event_id,
+            result,
             now: OffsetDateTime::now_utc(),
         });
-        if let Err(error) = self
-            .pick_lane(parent_run_key)
-            .submit(parent_run_key, confirm)
-            .await
-        {
-            tracing::warn!(
-                ?error,
-                parent_run_key = ?parent_run_key,
-                child_workflow_id = ?child_workflow_id,
-                "failed to deliver child start confirmation"
-            );
-        }
+        child_start::confirm_child_start(&mut io, &child_workflow_id).await;
     }
 
     /// Terminate the running incumbent a TERMINATE_IF_RUNNING child start is

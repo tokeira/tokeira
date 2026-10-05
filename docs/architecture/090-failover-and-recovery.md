@@ -53,7 +53,6 @@ But the authoritative state remains:
 
 - `workflow_hot`,
 - `history_batch`,
-- `activity_state`,
 - `timer_bucket`.
 
 So actor recovery is simple:

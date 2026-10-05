@@ -158,9 +158,9 @@ struct StoreState {
     budget_version: u64,
     /// Durable dispatch source for activity work.
     ///
-    /// Do not infer dispatchability from `activity_state_table`: started,
-    /// paused, or workflow-paused activities can still have durable activity
-    /// state while being intentionally absent from this map.
+    /// Do not infer dispatchability from run state: started, paused, or
+    /// workflow-paused activities stay in `WorkflowState::activities` while
+    /// being intentionally absent from this map.
     activity_dispatch: HashMap<(RunKey, String), ActivityDispatchEntry>,
     /// Ordered backlog for tasks that could not be immediately handed to a worker.
     dispatch_backlog: VecDeque<BacklogEntry>,
@@ -168,9 +168,8 @@ struct StoreState {
     conflict_injections: HashMap<RunKey, usize>,
     /// Current workflow-id conflict behavior for start transitions.
     conflict_policy: CurrentExecutionConflictPolicy,
-    /// Activity timeout/sweep materialization.
-    activity_state_table: HashMap<(RunKey, String), tokeira_kernel::ActivityState>,
-    /// Timer sweep materialization.
+    /// Timer sweep materialization. Activities have no counterpart: they live
+    /// only in run state, as on DSQL (`activity-state-writes`).
     timer_bucket: HashMap<(RunKey, String), tokeira_kernel::TimerState>,
     /// Deterministic run-to-shard mapping.
     run_shard_map: HashMap<RunKey, ShardId>,
@@ -534,6 +533,9 @@ struct SnapshotDoc {
     budget_version: u64,
     activity_dispatch: Vec<((RunKey, String), ActivityDispatchEntry)>,
     dispatch_backlog: Vec<BacklogEntry>,
+    /// Always written empty, and discarded on restore: the store keeps no
+    /// activity state table (`activity-state-writes`). The slot keeps the
+    /// document's layout, so snapshots decode across releases unchanged.
     activity_state_table: Vec<((RunKey, String), tokeira_kernel::ActivityState)>,
     timer_bucket: Vec<((RunKey, String), tokeira_kernel::TimerState)>,
     run_shard_map: Vec<(RunKey, ShardId)>,
@@ -630,7 +632,6 @@ impl SnapshotDoc {
             dispatch_backlog,
             conflict_injections: _,
             conflict_policy: _,
-            activity_state_table,
             timer_bucket,
             run_shard_map,
             shard_count,
@@ -670,7 +671,7 @@ impl SnapshotDoc {
             budget_version: *budget_version,
             activity_dispatch: sorted_pairs(activity_dispatch),
             dispatch_backlog: dispatch_backlog.iter().cloned().collect(),
-            activity_state_table: sorted_pairs(activity_state_table),
+            activity_state_table: Vec::new(),
             timer_bucket: sorted_pairs(timer_bucket),
             run_shard_map: sorted_pairs(run_shard_map),
             shard_count: *shard_count,
@@ -709,7 +710,8 @@ impl SnapshotDoc {
             // durable state, and durable state has no synthetic conflicts.
             conflict_injections: HashMap::new(),
             conflict_policy: CurrentExecutionConflictPolicy::default(),
-            activity_state_table: self.activity_state_table.into_iter().collect(),
+            // `self.activity_state_table` is discarded: entries there come from
+            // earlier releases, and nothing reads them.
             timer_bucket: self.timer_bucket.into_iter().collect(),
             run_shard_map: self.run_shard_map.into_iter().collect(),
             shard_count: self.shard_count,
@@ -1186,16 +1188,14 @@ impl RunRepository for InMemoryStore {
             );
         }
 
+        // The activity itself lives only in the run's state; an activity op
+        // maintains its dispatch entry and records nothing else, as on DSQL
+        // (`activity-state-writes` criterion 2.1).
         for op in &transition.activity_ops {
             match op {
                 ActivityOp::Upsert(activity) => {
-                    store
-                        .activity_state_table
-                        .insert((run_key, activity.activity_id.clone()), activity.clone());
-                    // Activity state and activity dispatch are intentionally
-                    // separate. Upserts always refresh state, but dispatch rows
-                    // only survive while the activity remains eligible to be
-                    // offered to a worker.
+                    // Dispatch entries only survive while the activity remains
+                    // eligible to be offered to a worker.
                     if activity.started_at.is_some() || activity.pause_info.is_some() {
                         store
                             .activity_dispatch
@@ -1236,9 +1236,6 @@ impl RunRepository for InMemoryStore {
                     }
                 }
                 ActivityOp::Delete { activity_id } => {
-                    store
-                        .activity_state_table
-                        .remove(&(run_key, activity_id.clone()));
                     store
                         .activity_dispatch
                         .remove(&(run_key, activity_id.clone()));
@@ -1305,7 +1302,7 @@ impl RunRepository for InMemoryStore {
         }
         if state.status == ExecutionStatus::Paused {
             // Workflow pause suppresses all queued activity dispatch for this
-            // run while preserving activity_state_table for later unpause.
+            // run; its activities stay in run state for the unpause to re-enqueue.
             store
                 .activity_dispatch
                 .retain(|(entry_run_key, _), _| entry_run_key != &run_key);
@@ -1490,9 +1487,6 @@ impl RunRepository for InMemoryStore {
             .request_dedupe
             .retain(|_, record| record.run_key != run_key);
         store
-            .activity_state_table
-            .retain(|(candidate, _), _| *candidate != run_key);
-        store
             .timer_bucket
             .retain(|(candidate, _), _| *candidate != run_key);
         store
@@ -1628,12 +1622,8 @@ impl RunRepository for InMemoryStore {
             );
         }
 
-        for activity in successor_state.activities.values() {
-            store.activity_state_table.insert(
-                (successor_run_key, activity.activity_id.clone()),
-                activity.clone(),
-            );
-        }
+        // The successor's activities live only in its state
+        // (`activity-state-writes` criterion 2.2).
         for timer in successor_state.timers.values() {
             store
                 .timer_bucket
@@ -4581,7 +4571,7 @@ mod tests {
             });
         }
 
-        // Feature: storage-memory-fidelity, Property 11: Independent structures mirror WorkflowState maps
+        // Feature: storage-memory-fidelity, Property 11: Independent timer structure mirrors WorkflowState maps
         #[test]
         fn property_independent_structures_mirror_workflow_state(activity_id in arb_activity_id()) {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -4601,17 +4591,10 @@ mod tests {
 
                 let inner = store.inner.lock().await;
                 for (rk, state) in &inner.runs {
-                    for (aid, act_state) in &state.activities {
-                        assert_eq!(inner.activity_state_table.get(&(*rk, aid.clone())), Some(act_state));
-                    }
                     for (tid, tmr_state) in &state.timers {
                         assert_eq!(inner.timer_bucket.get(&(*rk, tid.clone())), Some(tmr_state));
                     }
                 }
-                assert_eq!(
-                    inner.activity_state_table.len(),
-                    inner.runs.values().map(|s| s.activities.len()).sum::<usize>()
-                );
                 assert_eq!(
                     inner.timer_bucket.len(),
                     inner.runs.values().map(|s| s.timers.len()).sum::<usize>()
@@ -6110,14 +6093,6 @@ mod tests {
                     );
                     prop_assert_eq!(
                         inner
-                            .activity_state_table
-                            .keys()
-                            .filter(|(candidate, _)| *candidate == run_key)
-                            .count(),
-                        side_row_count,
-                    );
-                    prop_assert_eq!(
-                        inner
                             .timer_bucket
                             .keys()
                             .filter(|(candidate, _)| *candidate == run_key)
@@ -6190,7 +6165,6 @@ mod tests {
                 prop_assert!(!inner.run_shard_map.contains_key(&run_key));
                 prop_assert!(!inner.conflict_injections.contains_key(&run_key));
                 prop_assert!(inner.request_dedupe.values().all(|record| record.run_key != run_key));
-                prop_assert!(inner.activity_state_table.keys().all(|(candidate, _)| *candidate != run_key));
                 prop_assert!(inner.timer_bucket.keys().all(|(candidate, _)| *candidate != run_key));
                 prop_assert!(inner.activity_dispatch.keys().all(|(candidate, _)| *candidate != run_key));
                 prop_assert!(inner.dispatch_backlog.iter().all(|entry| entry.run_key != run_key));
@@ -7232,6 +7206,185 @@ mod tests {
                 assert!(state.runs.contains_key(run_key));
             }
             assert_eq!(state.runs.len(), state.execution_index.len());
+        }
+    }
+
+    // ── activity-state-writes ──
+
+    /// One generated change to activity `index`: 0 schedules it, 1 starts it,
+    /// 2 moves it to another task queue, 3 deletes it.
+    fn arb_activity_steps() -> impl Strategy<Value = Vec<(usize, u8)>> {
+        prop::collection::vec((0usize..3, 0u8..4), 1..24)
+    }
+
+    /// Commits a start and then one transition per step to a new run, and
+    /// returns the run with the dispatch queue each activity should still
+    /// have, by the dispatch rules of `dsql-side-tables` Requirement 19.
+    async fn commit_activity_steps(
+        store: &InMemoryStore,
+        steps: &[(usize, u8)],
+    ) -> (RunKey, BTreeMap<String, String>) {
+        let run_key = RunKey::new();
+        let base = sample_state(run_key);
+        let mut start = start_transition(run_key);
+        start.next_state = base.clone();
+        let _ = store
+            .commit_transition(run_key, start, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let mut activities = BTreeMap::new();
+        let mut expected_dispatch = BTreeMap::new();
+        let mut seq = 1;
+        for (index, action) in steps {
+            let activity_id = format!("activity-{index}");
+            let mut transition = start_transition(run_key);
+            transition.expected_seq = TransitionSeq(seq);
+            transition.next_state = base.clone();
+            transition.next_state.transition_seq = TransitionSeq(seq + 1);
+            match action {
+                0 => {
+                    let activity = activity_state(&activity_id);
+                    transition
+                        .dispatch_ops
+                        .push(DispatchOp::EnqueueActivityTask {
+                            queue: QueueKey {
+                                namespace_id: base.namespace_id,
+                                task_queue: activity.task_queue.clone(),
+                                task_kind: TaskKind::Activity,
+                                deployment: None,
+                                build_id: None,
+                            },
+                            activity_id: activity_id.clone(),
+                            input: tokeira_types::Payloads::default(),
+                            schedule_event_id: activity.schedule_event_id,
+                            attempt: activity.attempt,
+                            dispatch_revision: 0,
+                            stamp: activity.stamp,
+                            dispatch_at: fixed_now(),
+                            schedule_to_close_timeout: None,
+                            schedule_to_start_timeout: None,
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            priority: None,
+                        });
+                    transition
+                        .activity_ops
+                        .push(ActivityOp::Upsert(activity.clone()));
+                    expected_dispatch.insert(activity_id.clone(), activity.task_queue.0.clone());
+                    activities.insert(activity_id, activity);
+                }
+                1 | 2 => {
+                    let Some(mut activity) = activities.get(&activity_id).cloned() else {
+                        continue;
+                    };
+                    if *action == 1 {
+                        activity.started_at = Some(fixed_now());
+                        expected_dispatch.remove(&activity_id);
+                    } else {
+                        activity.task_queue = TaskQueueName("activity-q-moved".into());
+                        if let Some(queue) = expected_dispatch.get_mut(&activity_id) {
+                            queue.clone_from(&activity.task_queue.0);
+                        }
+                    }
+                    transition
+                        .activity_ops
+                        .push(ActivityOp::Upsert(activity.clone()));
+                    activities.insert(activity_id, activity);
+                }
+                _ => {
+                    if activities.remove(&activity_id).is_none() {
+                        continue;
+                    }
+                    transition.activity_ops.push(ActivityOp::Delete {
+                        activity_id: activity_id.clone(),
+                    });
+                    expected_dispatch.remove(&activity_id);
+                }
+            }
+            transition.next_state.activities = activities.clone().into_iter().collect();
+            let result = store
+                .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .await
+                .unwrap();
+            assert!(matches!(result, CommitResult::Applied { .. }));
+            seq += 1;
+        }
+        (run_key, expected_dispatch)
+    }
+
+    /// The snapshot document a store writes, decoded.
+    async fn snapshot_doc(store: &InMemoryStore) -> SnapshotDoc {
+        let bytes = store.snapshot().await.unwrap();
+        let (_, rest) = postcard::take_from_bytes::<u32>(&bytes).unwrap();
+        postcard::take_from_bytes::<SnapshotDoc>(rest).unwrap().0
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        // Feature: activity-state-writes, Property 1: No activity state outside run state
+        #[test]
+        fn property_activity_ops_record_nothing_outside_run_state(steps in arb_activity_steps()) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            rt.block_on(async {
+                let store = InMemoryStore::default();
+                let (run_key, expected_dispatch) = commit_activity_steps(&store, &steps).await;
+
+                let dispatch: BTreeMap<String, String> = store
+                    .inner
+                    .lock()
+                    .await
+                    .activity_dispatch
+                    .iter()
+                    .filter(|((candidate, _), _)| *candidate == run_key)
+                    .map(|((_, activity_id), entry)| {
+                        (activity_id.clone(), entry.task.queue.task_queue.0.clone())
+                    })
+                    .collect();
+                prop_assert_eq!(dispatch, expected_dispatch);
+                prop_assert!(snapshot_doc(&store).await.activity_state_table.is_empty());
+                Ok(())
+            })?;
+        }
+
+        // Feature: activity-state-writes, Property 2: Snapshots from earlier releases restore
+        #[test]
+        fn property_earlier_release_snapshots_restore(
+            steps in arb_activity_steps(),
+            earlier in prop::collection::vec(arb_activity_id(), 0..6),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            rt.block_on(async {
+                let store = InMemoryStore::default();
+                let (run_key, _) = commit_activity_steps(&store, &steps).await;
+                let bytes = store.snapshot().await.unwrap();
+
+                // The same snapshot, with the activity state table an earlier
+                // release would have written.
+                let (version, rest) = postcard::take_from_bytes::<u32>(&bytes).unwrap();
+                let (mut doc, extension) = postcard::take_from_bytes::<SnapshotDoc>(rest).unwrap();
+                prop_assert!(doc.activity_state_table.is_empty());
+                doc.activity_state_table = earlier
+                    .iter()
+                    .map(|activity_id| ((run_key, activity_id.clone()), activity_state(activity_id)))
+                    .collect();
+                let mut filled = postcard::to_allocvec(&version).unwrap();
+                filled.extend_from_slice(&postcard::to_allocvec(&doc).unwrap());
+                filled.extend_from_slice(extension);
+
+                let from_filled = InMemoryStore::from_snapshot(&filled).unwrap();
+                let from_empty = InMemoryStore::from_snapshot(&bytes).unwrap();
+                prop_assert_eq!(from_filled.snapshot().await.unwrap(), bytes.clone());
+                prop_assert_eq!(from_empty.snapshot().await.unwrap(), bytes);
+                Ok(())
+            })?;
         }
     }
 }

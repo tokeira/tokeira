@@ -363,15 +363,16 @@ async fn write_transition(
         .execute(&mut **tx)
         .await?;
     }
+    // The activity itself lives only in the run's state above; an activity op
+    // maintains its dispatch row and writes nothing to `activity_state`
+    // (`activity-state-writes` criterion 2.1).
     for op in &transition.activity_ops {
         match op {
             ActivityOp::Upsert(activity) => {
-                upsert_activity(tx, run_key, shard_id, state.namespace_id, activity).await?;
-                // `activity_dispatch` is the durable dispatch source, not
-                // `activity_state`. Started or paused activities must disappear
-                // from dispatch immediately; still-dispatchable upserts only
-                // update an existing row so a paused workflow cannot create a
-                // dispatch row by changing activity options.
+                // Started or paused activities must disappear from dispatch
+                // immediately; still-dispatchable upserts only update an
+                // existing row so a paused workflow cannot create a dispatch
+                // row by changing activity options.
                 if activity.started_at.is_some() || activity.pause_info.is_some() {
                     delete_activity_dispatch(tx, run_key, &activity.activity_id).await?;
                 } else {
@@ -380,11 +381,6 @@ async fn write_transition(
                 }
             }
             ActivityOp::Delete { activity_id } => {
-                sqlx::query("DELETE FROM activity_state WHERE run_key = $1 AND activity_id = $2")
-                    .bind(run_key.0)
-                    .bind(activity_id)
-                    .execute(&mut **tx)
-                    .await?;
                 delete_activity_dispatch(tx, run_key, activity_id).await?;
             }
         }
@@ -567,38 +563,6 @@ pub(super) async fn insert_history_batch(
         "append_history",
         started.elapsed(),
     );
-    Ok(())
-}
-
-pub(super) async fn upsert_activity(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    run_key: RunKey,
-    shard_id: ShardId,
-    namespace_id: NamespaceId,
-    activity: &tokeira_kernel::ActivityState,
-) -> Result<()> {
-    // Activity state is keyed by schedule_event_id for timer/sweep stability.
-    // The human activity_id is still stored for operator-facing mapping and
-    // secondary delete predicates.
-    sqlx::query(
-        "INSERT INTO activity_state
-         (run_key, schedule_event_id, shard_id, activity_id, queue_namespace, queue_name, attempt, state_data, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
-         ON CONFLICT (run_key, schedule_event_id) DO UPDATE SET
-             state_data = EXCLUDED.state_data,
-             attempt = EXCLUDED.attempt,
-             updated_at = EXCLUDED.updated_at",
-    )
-    .bind(run_key.0)
-    .bind(activity.schedule_event_id)
-    .bind(DsqlRunRepository::shard_id_to_uuid(shard_id))
-    .bind(&activity.activity_id)
-    .bind(namespace_id.0)
-    .bind(&activity.task_queue.0)
-    .bind(i32::try_from(activity.attempt)?)
-    .bind(codec::encode_activity_state(activity)?)
-    .execute(&mut **tx)
-    .await?;
     Ok(())
 }
 

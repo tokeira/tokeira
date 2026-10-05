@@ -70,7 +70,6 @@ RunAuthority(run) =
   (
     workflow_hot(run),
     history_batches(run),
-    activity_state(run, *),
     timer_rows(run, *),
     request_dedupe(run, *)
   )
@@ -80,7 +79,7 @@ where:
 
 - `workflow_hot` contains the latest transition sequence, last event ID, status, wait bits, sticky hints, and small summary fields,
 - `history_batches` are immutable append-only event batches,
-- `activity_state` holds the normalized current state of each open activity,
+- `activity_dispatch` holds a row for each activity that can be offered to a worker, while the activity itself lives in the run's state (`activity_state` is no longer written; see the `activity-state-writes` spec),
 - `timer_rows` hold outstanding due-time obligations,
 - `request_dedupe` prevents duplicate state transitions on retry.
 
@@ -137,7 +136,7 @@ In Tokeira, that single transition can produce:
 - `WorkflowTaskCompleted`
 - `ActivityTaskScheduled`
 - updated `workflow_hot` with no outstanding WFT,
-- `activity_state` for the new activity,
+- the new activity in the run's state, with its `activity_dispatch` row,
 - a derived `DispatchActivityTask` effect,
 - optional visibility changes.
 
@@ -175,7 +174,7 @@ Per-run single-writer transitions are easier to model than cross-service queue c
 
 ### Easier rebuild
 
-If dispatch backlog disappears, rebuild it from `workflow_hot` and `activity_state`.  
+If dispatch backlog disappears, rebuild it from `workflow_hot` and `activity_dispatch`.\
 If visibility disappears, rebuild it from projection logs or even from history plus summary state.
 
 ### Better fit for Aurora DSQL

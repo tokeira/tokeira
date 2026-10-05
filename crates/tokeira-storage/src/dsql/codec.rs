@@ -94,7 +94,9 @@ pub fn decode_history_principals(bytes: &[u8]) -> Result<Vec<Option<EventPrincip
     decode(bytes)
 }
 
-/// Serialize the activity materialization used by timeout sweepers.
+/// Serialize an `activity_state` row. Nothing writes these rows any more, and
+/// sweeps read activities from run state; the layout stays for rows that
+/// earlier releases wrote (`activity-state-writes`).
 pub fn encode_activity_state(state: &ActivityState) -> Result<Vec<u8>> {
     encode(state)
 }

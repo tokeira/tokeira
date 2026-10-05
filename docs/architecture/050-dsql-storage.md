@@ -98,7 +98,7 @@ Idempotency and duplicate suppression.
 
 ### `core.activity_state`
 
-Normalized current state of open activities.
+No longer written or read: activities live in the run's state in `workflow_hot`. The table keeps the rows that earlier releases wrote until run deletion removes them (the `activity-state-writes` spec).
 
 ### `core.timer_bucket`
 

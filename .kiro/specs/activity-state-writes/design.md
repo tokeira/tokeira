@@ -68,30 +68,30 @@ _For any_ store, restoring a snapshot whose activity state table holds entries S
 
 ### Comments and documents
 
-- `crates/tokeira-storage/src/dsql/codec.rs` and `docs/architecture/010-history-as-authority.md` call `activity_state` the timeout sweep's source; both say instead that run state is.
+- `crates/tokeira-storage/src/dsql/codec.rs` and `docs/architecture/010-history-as-authority.md` call `activity_state` the timeout sweep's source; both say instead that run state is. Architecture docs 040, 050 and 090 also presented it as live state, and are corrected too.
 
 ### Other specs
 
 - `dsql-core-persistence` Requirements 3.3, 3.4 and 11.7, and the design's write sets, point here.
 - `storage-memory-fidelity` Requirement 6's activity criteria, and its design, point here.
 - `dsql-side-tables`: Requirements 9 and 13.2 are withdrawn with the listing they describe, Requirements 11.2 and 16.2 drop `activity_state`, and the overview says no release reads it.
-- `runtime-sweeper-recovery` Requirement 5.1 and `runtime-complete-implementation` Requirement 11.1.3 take activities from run state, as `recovery-index` does.
+- `runtime-sweeper-recovery` Requirement 5.1 and `runtime-complete-implementation` Requirement 11.1.3 name the due `activity_dispatch` rows that the sweep pages through, instead of `activity_state`.
 - `inmemory-store-snapshots`, `runtime-durable-backlog` and `activity-heartbeat-time` describe the table as it now is.
 
 ## Testing Strategy
 
 ### Exploratory Bug Condition Checking
 
-- Before the fix, an in-memory property test shows the activity state table filling with every activity a transition upserts. After it, the snapshot's table stays empty.
+- A negative control that writes the snapshot's table from run state, as the store's copy used to fill it, fails Properties 1 and 2.
 
 ### Property-Based Tests
 
-- Property 1 on the in-memory store, with generated activity upserts, deletes, resets and run deletions.
+- Property 1 on the in-memory store, with generated schedules, starts, task queue moves and deletes of activities on one run. The run's dispatch entries are checked against a model of `dsql-side-tables` Requirement 19. Resets and run deletions can't fill a table the store no longer holds, so the snapshot's slot is what the property observes.
 - Property 2 on the in-memory store, restoring generated snapshots with the activity state table filled and empty.
 
 ### Unit Tests
 
-- Run deletion's statements still include the `activity_state` delete.
+- The existing run-deletion statement test (`authoritative_delete_covers_every_run_owned_table_and_history_is_last`) still asserts the `activity_state` delete.
 
 ### Preservation Checking
 

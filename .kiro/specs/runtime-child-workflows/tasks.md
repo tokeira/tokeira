@@ -240,6 +240,28 @@ Wire the runtime's `DispatchPublisher` to handle the three child workflow dispat
 - [x] 15. Final checkpoint
   - Ensure all tests pass, ask the user if questions arise.
 
+- [ ] 16. Retry child starts and their confirmations as v1.31.0 does
+  - [ ] 16.1 Retry the child `Command::Start` with the same `RunKey`, `RunId` and request id, backing off from 1 s by a factor of 1.1 to at most 3 minutes, until a definitive outcome
+    - _Requirements: 1.2, 7.1_
+  - [ ] 16.2 Map the outcomes: `Applied`, `Duplicate`, and `RunAlreadyExists` for the child's own run key confirm `Started`; `CurrentExecutionConflict` under FAIL confirms `Failed { cause: "WORKFLOW_ALREADY_EXISTS" }`; every other outcome is retried
+    - _Requirements: 1.4, 1.5, 1.7, 7.1_
+  - [ ] 16.3 Re-read the parent before each retry, and stop without starting or confirming when it is absent or closed, or no longer holds the child as initiated and unconfirmed
+    - _Requirements: 7.5_
+  - [ ] 16.4 Retry `Command::ChildStartConfirmed` after errors other than a kernel rejection, with the same backoff, and stop on a kernel rejection
+    - _Requirements: 7.2_
+
+- [ ] 17. Tests for the retries
+  - [ ] 17.1 Write a property test for the amended Property 3: errors and `CommitResult::Conflict` are retried, and only `CurrentExecutionConflict` under FAIL confirms `Failed`
+    - **Property 3: Only an existing workflow fails a child start**
+    - **Validates: Requirements 1.5, 1.6, 7.1**
+  - [ ] 17.2 Write property tests for Properties 8, 9 and 10, with backoff under `tokio::time::pause()`
+    - **Property 8: A start that already committed confirms as started**
+    - **Property 9: Retries stop when the parent stops awaiting the child**
+    - **Property 10: Confirmation is retried until applied or rejected**
+    - **Validates: Requirements 1.2, 1.7, 7.2, 7.5**
+
+- [ ] 18. Checkpoint: the full bar of root `AGENTS.md` §10.4
+
 ## Notes
 
 - All property tests are required (not optional) per project convention

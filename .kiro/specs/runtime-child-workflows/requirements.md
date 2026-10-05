@@ -49,11 +49,12 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 #### Acceptance Criteria
 
 1. WHEN a committed transition contains a `DispatchOp::StartChildWorkflow`, THE Runtime SHALL issue a `Command::Start` for the child workflow with the `namespace_id`, `child_workflow_id` (as the child's `workflow_id`), `workflow_type`, `task_queue`, and `input` from the dispatch op.
-2. THE Runtime SHALL assign a fresh `RunKey` and `RunId` for the child workflow run.
+2. THE Runtime SHALL assign a fresh `RunKey` and `RunId` for the child workflow run, once per start: every retry of the start reuses them (Requirement 7).
 3. THE Runtime SHALL record the parent-child relationship so that the parent's `RunKey` is discoverable from the child's context for later resolution delivery.
 4. WHEN the child `Command::Start` succeeds (returns `CommitResult::Applied`), THE Runtime SHALL submit a `Command::ChildStartConfirmed` to the parent run with `ChildStartResult::Started { child_run_id, workflow_type }`.
-5. WHEN the child `Command::Start` fails (returns an error or `CommitResult::Conflict` after retry exhaustion), THE Runtime SHALL submit a `Command::ChildStartConfirmed` to the parent run with `ChildStartResult::Failed { cause }` describing the failure reason.
+5. WHEN the child `Command::Start` reports a running execution with the child's workflow id (`CommitResult::CurrentExecutionConflict`) under the FAIL conflict policy, THE Runtime SHALL submit a `Command::ChildStartConfirmed` to the parent run with `ChildStartResult::Failed { cause: "WORKFLOW_ALREADY_EXISTS" }`. No other outcome of the start is recorded as a failure. v1.31.0 records a failed child start only for an existing workflow or a missing namespace, and retries every other error (`service/history/transfer_queue_active_task_executor.go:1050-1074 @ v1.31.0`). Requirement 7 covers the retries.
 6. THE Runtime SHALL set the `initiated_event_id` field in the `ChildStartConfirmedRequest` to match the `initiated_event_id` recorded in the parent's `ChildWorkflowState` for the child.
+7. WHEN a retried child `Command::Start` finds that an earlier attempt already committed (`CommitResult::Duplicate`, or the kernel's `RunAlreadyExists` rejection for the child's own `RunKey`), THE Runtime SHALL treat the start as succeeded and submit `ChildStartResult::Started` as in criterion 4. The `RunKey` and `RunId` are assigned once per start (criterion 2), so a run already under that key is the runtime's own earlier attempt. v1.31.0 makes a repeated start idempotent the same way, by passing the initiated child's create request id (`service/history/transfer_queue_active_task_executor.go:1032-1049 @ v1.31.0`).
 
 ---
 
@@ -131,10 +132,12 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. IF the child `Command::Start` encounters a transient error (storage unavailable, lane channel closed), THEN THE Runtime SHALL still deliver a `Command::ChildStartConfirmed` with a failure variant to the parent run so the parent is not left waiting indefinitely.
-2. IF the `Command::ChildStartConfirmed` delivery to the parent fails (parent lane closed, OCC exhaustion), THEN THE Runtime SHALL log the failure at warn level. The parent's `ChildWorkflowState` will remain in the initiated-but-unconfirmed state until the sweeper (Feature 11) or a future reconciliation mechanism resolves it.
+1. IF the child `Command::Start` returns an error, a `CommitResult::Conflict`, or any outcome that criteria 1.4, 1.5 and 1.7 don't cover, THEN THE Runtime SHALL retry the start with the same `RunKey`, `RunId` and request id. It SHALL wait between attempts with an exponential backoff that starts at 1 s, grows by a factor of 1.1 and is capped at 3 minutes, without expiry, as v1.31.0 reschedules a failed transfer task (`CreateTaskReschedulePolicy`, `common/util.go:69-71, 225-230`; `service/history/queues/executable.go:794 @ v1.31.0`). A transient error is never recorded as a failed start.
+2. IF the `Command::ChildStartConfirmed` delivery to the parent fails with an error other than a kernel rejection (parent lane closed, OCC exhaustion, storage unavailable), THEN THE Runtime SHALL retry the delivery with the backoff of criterion 1. IF the kernel rejects it, because the parent has closed or no longer awaits this child's confirmation, THEN THE Runtime SHALL stop and log at warn level. v1.31.0 drops the task when recording the child's start finds the parent closed or the child not pending (`recordChildExecutionStarted`, `service/history/transfer_queue_active_task_executor.go:1316-1322`; `service/history/queues/executable.go:401-403 @ v1.31.0`).
 3. IF the `Command::ChildResolved` delivery to the parent fails (parent lane closed, OCC exhaustion), THEN THE Runtime SHALL log the failure at warn level. The parent's `ChildWorkflowState` will remain in the started-but-unresolved state until the sweeper (Feature 11) or a future reconciliation mechanism resolves it.
 4. IF a `DispatchOp::TerminateChild` or `DispatchOp::CancelChild` encounters a transient error, THEN THE Runtime SHALL log the failure at warn level and continue processing remaining dispatch ops in the batch.
+5. Before each retry of the start, THE Runtime SHALL re-read the parent run. IF the parent is absent or closed, or no longer holds this child as initiated and unconfirmed for the dispatch's `initiated_event_id`, THEN THE Runtime SHALL stop without starting the child or confirming, as v1.31.0 drops the start when the parent is no longer running and the child has not started (`service/history/transfer_queue_active_task_executor.go:816-837 @ v1.31.0`).
+6. Retries are held in memory, so a process crash still loses a pending start or confirmation until child starts gain a durable representation ([042-durable-actionable-state](../../../docs/architecture/042-durable-actionable-state.md)).
 
 ---
 

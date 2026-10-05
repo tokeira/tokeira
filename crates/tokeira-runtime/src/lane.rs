@@ -764,7 +764,7 @@ where
                                         original_scheduled_at: activity.scheduled_at,
                                         last_dispatched_at: activity.scheduled_at,
                                         started_at: activity.started_at,
-                                        last_heartbeat_at: None,
+                                        last_heartbeat_at: activity.last_heartbeat_at,
                                         cancel_requested: false,
                                     },
                                 );

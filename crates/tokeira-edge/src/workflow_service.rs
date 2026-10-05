@@ -807,12 +807,15 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         request: RequestContext,
     ) -> Result<WorkflowMutationOutcome>;
 
+    /// `last_heartbeat_details` is the progress reported with the failure,
+    /// which a retry records as a heartbeat; the by-id path passes `None`.
     async fn fail_activity_task(
         &self,
         token: ActivityTaskToken,
         failure: Payload,
         failure_error_type: Option<String>,
         is_non_retryable: bool,
+        last_heartbeat_details: Option<Payloads>,
         worker_identity: Option<tokeira_types::WorkerIdentity>,
         request: RequestContext,
     ) -> Result<()>;
@@ -7041,6 +7044,7 @@ impl WorkflowService {
                         req.failure,
                         req.failure_error_type,
                         req.is_non_retryable,
+                        req.last_heartbeat_details,
                         Some(tokeira_types::WorkerIdentity(req.identity)),
                         request,
                     )
@@ -7419,12 +7423,15 @@ impl WorkflowService {
                         &req.workflow_id,
                     )
                     .await?;
+                // v1.31.0's frontend drops `last_heartbeat_details` on the
+                // by-id path (frontend/workflow_handler.go:1965-1969).
                 self.runtime
                     .fail_activity_task(
                         token,
                         req.failure,
                         req.failure_error_type,
                         req.is_non_retryable,
+                        None,
                         worker_identity_from_request(req.identity),
                         request,
                     )
@@ -10625,6 +10632,149 @@ mod tests {
     /// Every by-id activity verb on a closed run answers v1.31.0's `ErrWorkflowCompleted`, which
     /// its history handlers return before resolving the activity id: for a pending activity the
     /// closed run keeps, and for one it never had.
+    #[tokio::test]
+    async fn failed_by_id_drops_the_heartbeat_details_it_carries() -> Result<()> {
+        // v1.31.0's frontend builds the history request for
+        // RespondActivityTaskFailedById without `last_heartbeat_details`
+        // (frontend/workflow_handler.go:1965-1969), so the retry keeps the
+        // progress the last heartbeat recorded (activity-heartbeat-time,
+        // Requirement 4.4).
+        let (service, runtime, namespace_id, workflow_id, run_id) = update_test_service().await?;
+        let payload = |data: &[u8]| Payload {
+            metadata: Default::default(),
+            data: data.to_vec(),
+            external_payloads: Vec::new(),
+        };
+        let task = runtime
+            .poll_workflow_task(
+                tokeira_types::QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName("queue-a".to_string()),
+                    task_kind: TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                },
+                WorkerIdentity("worker-a".to_string()),
+                tokio::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("workflow task");
+        let run_key = task.token.run_key;
+        runtime
+            .complete_workflow_task(tokeira_kernel::WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
+                token: task.token,
+                identity: WorkerIdentity("worker-a".to_string()),
+                sdk_metadata: None,
+                metering_metadata: None,
+                worker_version: None,
+                versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky: None,
+                commands: vec![WorkflowCommand::ScheduleActivity {
+                    activity_id: "activity-1".to_string(),
+                    activity_type: "activity-type".to_string(),
+                    task_queue: TaskQueueName("activity-q".to_string()),
+                    input: Payloads(vec![payload(b"input")]),
+                    header: None,
+                    request_eager_execution: false,
+                    retry_policy: Some(tokeira_types::RetryPolicy {
+                        initial_interval: Duration::seconds(1),
+                        backoff_coefficient: 2.0,
+                        maximum_interval: None,
+                        maximum_attempts: 0,
+                        non_retryable_error_types: Vec::new(),
+                    }),
+                    deployment: None,
+                    build_id: None,
+                    schedule_to_close_timeout: Some(Duration::minutes(5)),
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: Some(Duration::minutes(1)),
+                    heartbeat_timeout: Some(Duration::seconds(20)),
+                    priority: None,
+                }],
+                force_new_workflow_task: false,
+                limits: Default::default(),
+                delivered_update_ids: Vec::new(),
+                request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+                now: OffsetDateTime::now_utc(),
+            })
+            .await?;
+        runtime
+            .poll_activity_task(
+                tokeira_types::QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName("activity-q".to_string()),
+                    task_kind: TaskKind::Activity,
+                    deployment: None,
+                    build_id: None,
+                },
+                WorkerIdentity("worker-b".to_string()),
+                tokio::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("activity task");
+
+        let headers = HeaderMap::new();
+        let run_id = Some(run_id.0.to_string());
+        service
+            .record_activity_task_heartbeat_by_id(
+                &headers,
+                crate::translate::RecordActivityTaskHeartbeatByIdRequest {
+                    namespace: "default".to_string(),
+                    workflow_id: workflow_id.0.clone(),
+                    run_id: run_id.clone(),
+                    activity_id: "activity-1".to_string(),
+                    details: Some(Payloads(vec![payload(b"heartbeat")])),
+                    identity: "worker-b".to_string(),
+                },
+            )
+            .await?;
+        let tokeira_kernel::LoadedRun::Existing(heartbeated) =
+            runtime.repo().load_run(run_key).await?
+        else {
+            panic!("run exists");
+        };
+        let heartbeated = heartbeated.activities["activity-1"].clone();
+        assert!(heartbeated.last_heartbeat_at.is_some());
+
+        // The proto request carries details; its translation drops them.
+        let request = crate::grpc::translate::respond_activity_failed_by_id_to_edge(
+            tokeira_proto::workflowservice::RespondActivityTaskFailedByIdRequest {
+                namespace: "default".to_string(),
+                workflow_id: workflow_id.0.clone(),
+                run_id: run_id.clone().unwrap_or_default(),
+                activity_id: "activity-1".to_string(),
+                failure: Some(tokeira_proto::failure::Failure {
+                    message: "retryable".to_string(),
+                    ..Default::default()
+                }),
+                identity: "worker-b".to_string(),
+                last_heartbeat_details: Some(
+                    tokeira_proto::conversions::common::payloads_from_domain(&Payloads(vec![
+                        payload(b"reported-with-failure"),
+                    ])),
+                ),
+                ..Default::default()
+            },
+        )
+        .expect("failure translates");
+        service
+            .respond_activity_task_failed_by_id(&headers, request)
+            .await?;
+
+        let tokeira_kernel::LoadedRun::Existing(after) = runtime.repo().load_run(run_key).await?
+        else {
+            panic!("run exists");
+        };
+        let retried = &after.activities["activity-1"];
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(retried.heartbeat_details, heartbeated.heartbeat_details);
+        assert_eq!(retried.last_heartbeat_at, heartbeated.last_heartbeat_at);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn by_id_activity_calls_on_a_closed_run_answer_workflow_completed() -> Result<()> {
         let (service, runtime, namespace_id, workflow_id, run_id) = update_test_service().await?;

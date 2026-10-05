@@ -178,6 +178,7 @@ impl StoreExecutionResolver {
                                         }
                                     }),
                                 },
+                                last_heartbeat_at: None,
                             },
                         )
                         .collect(),

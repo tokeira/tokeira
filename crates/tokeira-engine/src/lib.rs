@@ -4719,6 +4719,7 @@ where
                                 started_at: activity.started_at,
                                 last_failure: activity.last_failure.clone(),
                                 heartbeat_details: activity.heartbeat_details.clone(),
+                                last_heartbeat_at: activity.last_heartbeat_at,
                                 last_worker_identity: {
                                     // `LastWorkerIdentity = StartedIdentity`, falling
                                     // back to `RetryLastWorkerIdentity` when empty and

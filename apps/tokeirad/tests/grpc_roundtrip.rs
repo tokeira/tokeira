@@ -1031,6 +1031,7 @@ where
                                         }
                                     }),
                                 },
+                                last_heartbeat_at: None,
                             },
                         )
                         .collect(),

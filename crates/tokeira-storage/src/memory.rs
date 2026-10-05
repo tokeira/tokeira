@@ -14,7 +14,7 @@
 //! across Tokeira versions — mismatched snapshots are refused, never migrated.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Instant,
 };
@@ -50,6 +50,10 @@ use crate::{
         WorkerTaskProvenanceStore, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
         deleted_workflow_projection_context, dispatchable_workflow_task,
         workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
+    },
+    codec::{
+        ExtensionSection, apply_state_extension, decode_exact, decode_extension, encode_extension,
+        encode_state_extension,
     },
     metrics as storage_metrics,
     recovery_index::{
@@ -363,14 +367,22 @@ impl InMemoryStore {
     /// refused — never migrated — by any other (see
     /// [`InMemoryStore::from_snapshot`]). Test-only hooks (injected OCC
     /// conflicts, injected conflict policy) are not part of the snapshot.
+    ///
+    /// Data that runs carry outside `WorkflowState`'s positional layout (each
+    /// activity's last heartbeat time) follows the document as a snapshot
+    /// extension: [`SNAPSHOT_EXTENSION_MAGIC`], then a section listing each
+    /// such run's state extension in run-key order. A store with no such data
+    /// writes no extension, so its snapshot is byte-identical to one written by
+    /// Tokeira 0.2.0–0.5.1 (activity-heartbeat-time, Requirement 7).
     pub async fn snapshot(&self) -> Result<Vec<u8>, SnapshotError> {
-        let doc = {
+        let (doc, extension) = {
             let store = self.inner.lock().await;
-            SnapshotDoc::capture(&store)
+            (SnapshotDoc::capture(&store), snapshot_extension(&store)?)
         };
         let mut bytes =
             postcard::to_allocvec(&SNAPSHOT_FORMAT_VERSION).map_err(SnapshotError::Encode)?;
         bytes.extend_from_slice(&postcard::to_allocvec(&doc).map_err(SnapshotError::Encode)?);
+        bytes.extend_from_slice(&extension);
         Ok(bytes)
     }
 
@@ -398,7 +410,9 @@ impl InMemoryStore {
     /// [`SNAPSHOT_FORMAT_VERSION`] (checked before any payload decoding);
     /// [`SnapshotError::Decode`] for truncated or corrupt input;
     /// [`SnapshotError::TrailingBytes`] when decodable payload is followed by
-    /// leftover bytes. Never panics on any input.
+    /// bytes that do not open a snapshot extension;
+    /// [`SnapshotError::Extension`] when the snapshot extension is malformed.
+    /// Never panics on any input.
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
         let (found, rest) =
             postcard::take_from_bytes::<u32>(bytes).map_err(SnapshotError::Decode)?;
@@ -410,11 +424,19 @@ impl InMemoryStore {
         }
         let (doc, trailing) =
             postcard::take_from_bytes::<SnapshotDoc>(rest).map_err(SnapshotError::Decode)?;
+        let mut state = doc.into_state();
         if !trailing.is_empty() {
-            return Err(SnapshotError::TrailingBytes(trailing.len()));
+            let opens_extension = matches!(
+                postcard::take_from_bytes::<u32>(trailing),
+                Ok((magic, _)) if magic == SNAPSHOT_EXTENSION_MAGIC
+            );
+            if !opens_extension {
+                return Err(SnapshotError::TrailingBytes(trailing.len()));
+            }
+            apply_snapshot_extension(&mut state, trailing).map_err(SnapshotError::Extension)?;
         }
         Ok(Self {
-            inner: Arc::new(Mutex::new(doc.into_state())),
+            inner: Arc::new(Mutex::new(state)),
         })
     }
 }
@@ -434,7 +456,21 @@ impl InMemoryStore {
 // v4: the per-run `history_size` map, plus the continue-as-new advice fields on
 // `WorkflowState` and `HistoryEventKind::WorkflowTaskStarted` that changed the
 // positional layout of every `runs` and `history` entry.
+//
+// Data carried in the snapshot extension after the document (each activity's
+// last heartbeat time) does not change the document and needs no bump; releases
+// without the extension refuse it as trailing bytes (activity-heartbeat-time,
+// Requirement 7).
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
+
+/// Magic that opens the snapshot extension after a snapshot's document (`"TKSX"`).
+pub const SNAPSHOT_EXTENSION_MAGIC: u32 = 0x544B_5358;
+
+/// Snapshot-extension tag of the section listing each run's state extension.
+///
+/// The payload is a `Vec<(RunKey, Vec<u8>)>` in run-key order, holding exactly
+/// the bytes the hot-state codec appends after that run's state.
+pub const RUN_STATE_EXTENSION_SECTION: u32 = 1;
 
 /// Errors from the [`InMemoryStore`] snapshot persist/restore surface.
 #[derive(Debug, thiserror::Error)]
@@ -455,10 +491,14 @@ pub enum SnapshotError {
     /// The payload failed to decode (truncated or corrupt input).
     #[error("failed to decode snapshot: {0}")]
     Decode(postcard::Error),
-    /// Decodable payload followed by leftover bytes — the input is not a
-    /// snapshot this build wrote.
+    /// Decodable payload followed by leftover bytes that do not open a
+    /// snapshot extension — the input is not a snapshot this build wrote.
     #[error("snapshot has {0} trailing bytes after the payload")]
     TrailingBytes(usize),
+    /// The snapshot extension after the payload is malformed, or names a run
+    /// the snapshot does not hold or names one twice.
+    #[error("snapshot extension is malformed: {0}")]
+    Extension(&'static str),
     /// The state failed to encode.
     #[error("failed to encode snapshot: {0}")]
     Encode(postcard::Error),
@@ -498,6 +538,53 @@ struct SnapshotDoc {
     timer_bucket: Vec<((RunKey, String), tokeira_kernel::TimerState)>,
     run_shard_map: Vec<(RunKey, ShardId)>,
     shard_count: u32,
+}
+
+/// The snapshot extension for `state`, or no bytes when no run has a state
+/// extension.
+fn snapshot_extension(state: &StoreState) -> Result<Vec<u8>, SnapshotError> {
+    let mut run_keys = state.runs.keys().collect::<Vec<_>>();
+    run_keys.sort_unstable();
+    let mut runs = Vec::new();
+    for run_key in run_keys {
+        let extension =
+            encode_state_extension(&state.runs[run_key]).map_err(SnapshotError::Encode)?;
+        if !extension.is_empty() {
+            runs.push((*run_key, extension));
+        }
+    }
+    let mut sections = Vec::new();
+    if !runs.is_empty() {
+        sections.push(ExtensionSection {
+            tag: RUN_STATE_EXTENSION_SECTION,
+            payload: postcard::to_allocvec(&runs).map_err(SnapshotError::Encode)?,
+        });
+    }
+    encode_extension(SNAPSHOT_EXTENSION_MAGIC, &sections).map_err(SnapshotError::Encode)
+}
+
+/// Apply a snapshot extension to the store restored from the same snapshot.
+fn apply_snapshot_extension(state: &mut StoreState, bytes: &[u8]) -> Result<(), &'static str> {
+    for section in decode_extension(SNAPSHOT_EXTENSION_MAGIC, bytes)? {
+        if section.tag != RUN_STATE_EXTENSION_SECTION {
+            // A later release's section: its data is safe to drop by rule.
+            continue;
+        }
+        let runs = decode_exact::<Vec<(RunKey, Vec<u8>)>>(&section.payload)
+            .ok_or("undecodable run state extension section")?;
+        let mut listed = BTreeSet::new();
+        for (run_key, extension) in runs {
+            if !listed.insert(run_key) {
+                return Err("run listed twice in the snapshot extension");
+            }
+            let run = state
+                .runs
+                .get_mut(&run_key)
+                .ok_or("snapshot extension names a run the snapshot does not hold")?;
+            apply_state_extension(run, &extension)?;
+        }
+    }
+    Ok(())
 }
 
 /// Clone a map into sorted-key pair order for canonical encoding.
@@ -3305,6 +3392,7 @@ mod tests {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         }
     }
 
@@ -5524,6 +5612,7 @@ mod tests {
                         pause_info: None,
                         stamp: 0,
                         priority: None,
+                        last_heartbeat_at: None,
                     };
                     t.activity_ops.push(
                         tokeira_kernel::ActivityOp::Upsert(
@@ -6531,6 +6620,231 @@ mod tests {
                         .unwrap();
                 }
             }
+        }
+    }
+
+    /// Commit one run per entry of `runs`, each holding the listed activities
+    /// with their optional heartbeat times (seconds after `fixed_now`).
+    async fn store_with_heartbeat_times(
+        runs: &[BTreeMap<String, Option<i64>>],
+    ) -> (
+        InMemoryStore,
+        Vec<(RunKey, BTreeMap<String, Option<OffsetDateTime>>)>,
+    ) {
+        let store = InMemoryStore::default();
+        let mut expected = Vec::new();
+        for activities in runs {
+            let run_key = RunKey::new();
+            let mut transition = start_transition(run_key);
+            let mut times = BTreeMap::new();
+            for (activity_id, offset) in activities {
+                let mut activity = activity_state(activity_id);
+                activity.last_heartbeat_at =
+                    offset.map(|offset| fixed_now() + Duration::nanoseconds(offset));
+                times.insert(activity_id.clone(), activity.last_heartbeat_at);
+                transition
+                    .next_state
+                    .activities
+                    .insert(activity_id.clone(), activity.clone());
+                transition.activity_ops.push(ActivityOp::Upsert(activity));
+            }
+            store
+                .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .await
+                .unwrap();
+            expected.push((run_key, times));
+        }
+        (store, expected)
+    }
+
+    /// The bytes after a snapshot's document.
+    fn snapshot_trailer(snapshot: &[u8]) -> &[u8] {
+        let (_, rest) = postcard::take_from_bytes::<u32>(snapshot).unwrap();
+        let (_, trailer) = postcard::take_from_bytes::<SnapshotDoc>(rest).unwrap();
+        trailer
+    }
+
+    fn framed_snapshot_extension(magic: u32, sections: &[ExtensionSection]) -> Vec<u8> {
+        postcard::to_allocvec(&(magic, sections)).unwrap()
+    }
+
+    fn run_state_section(runs: &[(RunKey, Vec<u8>)]) -> ExtensionSection {
+        ExtensionSection {
+            tag: RUN_STATE_EXTENSION_SECTION,
+            payload: postcard::to_allocvec(&runs).unwrap(),
+        }
+    }
+
+    /// One way to make the bytes after a snapshot's document not a well-formed
+    /// snapshot extension.
+    #[derive(Clone, Debug)]
+    enum MalformedSnapshotExtension {
+        WrongMagic(u32),
+        Truncated(prop::sample::Index),
+        Trailing(Vec<u8>),
+        RepeatedTag,
+        UnknownRun,
+        RunListedTwice,
+        BadRunExtension(Vec<u8>),
+    }
+
+    fn arb_malformed_snapshot_extension() -> impl Strategy<Value = MalformedSnapshotExtension> {
+        prop_oneof![
+            any::<u32>()
+                .prop_filter("not the magic", |magic| *magic != SNAPSHOT_EXTENSION_MAGIC)
+                .prop_map(MalformedSnapshotExtension::WrongMagic),
+            any::<prop::sample::Index>().prop_map(MalformedSnapshotExtension::Truncated),
+            prop::collection::vec(any::<u8>(), 1..8).prop_map(MalformedSnapshotExtension::Trailing),
+            Just(MalformedSnapshotExtension::RepeatedTag),
+            Just(MalformedSnapshotExtension::UnknownRun),
+            Just(MalformedSnapshotExtension::RunListedTwice),
+            // Never a valid state extension: empty, or not opened by its magic.
+            prop::collection::vec(any::<u8>(), 0..8)
+                .prop_filter("not the state extension magic", |bytes| {
+                    !matches!(
+                        postcard::take_from_bytes::<u32>(bytes),
+                        Ok((magic, _)) if magic == crate::codec::WORKFLOW_STATE_EXTENSION_MAGIC
+                    )
+                })
+                .prop_map(MalformedSnapshotExtension::BadRunExtension),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        // Feature: activity-heartbeat-time, Property 9: Snapshots carry the times and
+        // stay compatible
+        #[test]
+        fn property_snapshots_carry_heartbeat_times(
+            runs in prop::collection::vec(
+                prop::collection::btree_map(
+                    "[a-z]{1,6}",
+                    prop::option::of(-1_000_000_000_000i64..1_000_000_000_000),
+                    0..4,
+                ),
+                0..4,
+            ),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let (store, expected) = store_with_heartbeat_times(&runs).await;
+                let snapshot = store.snapshot().await.unwrap();
+                let restored = InMemoryStore::from_snapshot(&snapshot).unwrap();
+                for (run_key, times) in &expected {
+                    let LoadedRun::Existing(state) = restored.load_run(*run_key).await.unwrap()
+                    else {
+                        panic!("restored run {run_key:?} is missing");
+                    };
+                    for (activity_id, time) in times {
+                        prop_assert_eq!(state.activities[activity_id].last_heartbeat_at, *time);
+                    }
+                }
+                prop_assert_eq!(&restored.snapshot().await.unwrap(), &snapshot);
+                // Without a time anywhere the snapshot is the document alone, as
+                // Tokeira 0.2.0–0.5.1 write it.
+                let any_time = expected
+                    .iter()
+                    .any(|(_, times)| times.values().any(Option::is_some));
+                prop_assert_eq!(snapshot_trailer(&snapshot).is_empty(), !any_time);
+                Ok(())
+            })?;
+        }
+
+        // Feature: activity-heartbeat-time, Property 10: Malformed snapshot
+        // extensions are rejected
+        #[test]
+        fn property_malformed_snapshot_extensions_are_rejected(
+            malformed in arb_malformed_snapshot_extension(),
+            unknown_tag in 2u32..64,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let runs = [BTreeMap::from([("a".to_owned(), Some(5))])];
+                let (store, expected) = store_with_heartbeat_times(&runs).await;
+                let run_key = expected[0].0;
+                let snapshot = store.snapshot().await.unwrap();
+                let document = &snapshot[..snapshot.len() - snapshot_trailer(&snapshot).len()];
+                let run_extension = encode_state_extension(
+                    &match store.load_run(run_key).await.unwrap() {
+                        LoadedRun::Existing(state) => state,
+                        LoadedRun::Absent => panic!("seeded run is missing"),
+                    },
+                )
+                .unwrap();
+                let valid = run_state_section(&[(run_key, run_extension.clone())]);
+
+                // An unknown tag next to the known section is ignored.
+                let mut tolerant = document.to_vec();
+                tolerant.extend(framed_snapshot_extension(
+                    SNAPSHOT_EXTENSION_MAGIC,
+                    &[
+                        valid.clone(),
+                        ExtensionSection { tag: unknown_tag, payload: vec![1, 2, 3] },
+                    ],
+                ));
+                prop_assert!(InMemoryStore::from_snapshot(&tolerant).is_ok());
+
+                let full = framed_snapshot_extension(SNAPSHOT_EXTENSION_MAGIC, &[valid.clone()]);
+                let magic_len = postcard::to_allocvec(&SNAPSHOT_EXTENSION_MAGIC).unwrap().len();
+                let suffix = match &malformed {
+                    MalformedSnapshotExtension::WrongMagic(magic) => {
+                        framed_snapshot_extension(*magic, &[valid.clone()])
+                    }
+                    // Cut after the magic, so the bytes still open an extension.
+                    MalformedSnapshotExtension::Truncated(cut) => {
+                        full[..magic_len + cut.index(full.len() - magic_len)].to_vec()
+                    }
+                    MalformedSnapshotExtension::Trailing(extra) => {
+                        let mut bytes = full.clone();
+                        bytes.extend_from_slice(extra);
+                        bytes
+                    }
+                    MalformedSnapshotExtension::RepeatedTag => framed_snapshot_extension(
+                        SNAPSHOT_EXTENSION_MAGIC,
+                        &[valid.clone(), valid.clone()],
+                    ),
+                    MalformedSnapshotExtension::UnknownRun => framed_snapshot_extension(
+                        SNAPSHOT_EXTENSION_MAGIC,
+                        &[run_state_section(&[(RunKey::new(), run_extension.clone())])],
+                    ),
+                    MalformedSnapshotExtension::RunListedTwice => framed_snapshot_extension(
+                        SNAPSHOT_EXTENSION_MAGIC,
+                        &[run_state_section(&[
+                            (run_key, run_extension.clone()),
+                            (run_key, run_extension.clone()),
+                        ])],
+                    ),
+                    MalformedSnapshotExtension::BadRunExtension(bytes) => {
+                        framed_snapshot_extension(
+                            SNAPSHOT_EXTENSION_MAGIC,
+                            &[run_state_section(&[(run_key, bytes.clone())])],
+                        )
+                    }
+                };
+                let mut bytes = document.to_vec();
+                bytes.extend_from_slice(&suffix);
+                let result = InMemoryStore::from_snapshot(&bytes);
+                if matches!(malformed, MalformedSnapshotExtension::WrongMagic(_)) {
+                    // Bytes that do not open an extension are refused as before.
+                    prop_assert!(
+                        matches!(result, Err(SnapshotError::TrailingBytes(count)) if count == suffix.len())
+                    );
+                } else {
+                    prop_assert!(
+                        matches!(result, Err(SnapshotError::Extension(_))),
+                        "expected an extension error, got {:?}",
+                        result.err()
+                    );
+                }
+                Ok(())
+            })?;
         }
     }
 

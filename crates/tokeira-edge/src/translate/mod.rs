@@ -500,6 +500,9 @@ pub struct PendingActivityDescription {
     /// recorded heartbeat, `service/history/workflow/activity.go:147-150 @
     /// v1.31.0`).
     pub heartbeat_details: Option<Payloads>,
+    /// `LastHeartbeatTime`: when the activity's progress was last recorded
+    /// (`GetPendingActivityInfo`, activity.go:147-150 @ v1.31.0).
+    pub last_heartbeat_at: Option<OffsetDateTime>,
     /// `LastWorkerIdentity`: the starting worker's identity, falling back —
     /// only under a retry policy — to the retry bookkeeping identity written
     /// by heartbeats/retries (`GetPendingActivityInfo`,
@@ -798,6 +801,9 @@ pub struct RespondActivityTaskFailedRequest {
     pub failure: Payload,
     pub failure_error_type: Option<String>,
     pub is_non_retryable: bool,
+    /// Progress the worker reports with the failure; a retry records it as a
+    /// heartbeat (respondactivitytaskfailed/api.go:87-94 @ v1.31.0).
+    pub last_heartbeat_details: Option<Payloads>,
     pub identity: String,
 }
 

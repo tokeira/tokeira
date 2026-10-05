@@ -830,6 +830,20 @@ pub struct ActivityState {
     /// self-describing formats only.
     #[serde(default)]
     pub last_attempt_complete_time: Option<OffsetDateTime>,
+    /// When this activity's progress was last recorded
+    /// (`LastHeartbeatUpdateTime` @ v1.31.0). The runtime sets it on every
+    /// heartbeat and on a failure that carries heartbeat details
+    /// (`UpdateActivityProgress`, mutable_state_impl.go:1956-1966); a
+    /// heartbeat reset clears it together with `heartbeat_details`
+    /// (activity.go:86-90, 361-365, 401-404). Retries and attempt starts keep
+    /// it. The kernel only ever clears it, so it reads no clock.
+    ///
+    /// Not part of the positional layout: `#[serde(skip)]` leaves every
+    /// postcard encoding of `ActivityState` unchanged, and the storage codec
+    /// persists the value in the state extension's heartbeat section
+    /// (activity-heartbeat-time Requirement 3).
+    #[serde(skip)]
+    pub last_heartbeat_at: Option<OffsetDateTime>,
 }
 
 /// Metadata recorded when a workflow is paused.
@@ -1837,6 +1851,7 @@ pub(crate) mod tests {
             pause_info: None,
             stamp: 1,
             priority: None,
+            last_heartbeat_at: None,
         };
         let encoded = postcard::to_allocvec(&activity).expect("encode activity state");
         let legacy = &encoded[..encoded.len() - 1];

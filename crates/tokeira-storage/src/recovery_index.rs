@@ -137,6 +137,7 @@ pub fn recovery_entries(state: &WorkflowState) -> RecoveryEntries {
                     original_scheduled_at: activity.scheduled_at,
                     current_attempt_scheduled_at: activity.current_attempt_scheduled_at,
                     started_at: activity.started_at,
+                    last_heartbeat_at: activity.last_heartbeat_at,
                     schedule_to_close_timeout: activity.schedule_to_close_timeout,
                     schedule_to_start_timeout: activity.schedule_to_start_timeout,
                     start_to_close_timeout: activity.start_to_close_timeout,
@@ -401,6 +402,7 @@ mod tests {
             started_event_id: Some(6),
             pause_info: None,
             stamp: 0,
+            last_heartbeat_at: None,
         }
     }
 

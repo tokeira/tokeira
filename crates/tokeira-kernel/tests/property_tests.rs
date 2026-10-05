@@ -386,6 +386,7 @@ fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         },
     );
     state
@@ -3641,6 +3642,7 @@ proptest! {
                 pause_info: None,
                 stamp: 0,
                 priority: None,
+                last_heartbeat_at: None,
             },
         );
         state = with_timer(state, "timer-1", now);
@@ -3871,6 +3873,7 @@ proptest! {
                 pause_info: None,
                 stamp: 0,
                 priority: None,
+                last_heartbeat_at: None,
             },
         );
         state = with_timer(state, "timer-1", now);

@@ -1066,6 +1066,7 @@ fn arb_pending_activity() -> impl Strategy<Value = PendingActivityDescription> {
                 paused: false,
                 pause_info: None,
                 activity_options: tokeira_edge::translate::ActivityOptions::default(),
+                last_heartbeat_at: None,
             },
         )
 }

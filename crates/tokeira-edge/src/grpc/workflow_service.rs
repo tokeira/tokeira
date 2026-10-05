@@ -4183,6 +4183,7 @@ mod tests {
             _failure: tokeira_types::Payload,
             _failure_error_type: Option<String>,
             _is_non_retryable: bool,
+            _last_heartbeat_details: Option<tokeira_types::Payloads>,
             _worker_identity: Option<tokeira_types::WorkerIdentity>,
             _request: tokeira_types::RequestContext,
         ) -> Result<()> {
@@ -4373,6 +4374,7 @@ mod tests {
             _failure: tokeira_types::Payload,
             _failure_error_type: Option<String>,
             _is_non_retryable: bool,
+            _last_heartbeat_details: Option<tokeira_types::Payloads>,
             _worker_identity: Option<tokeira_types::WorkerIdentity>,
             _request: tokeira_types::RequestContext,
         ) -> Result<()> {
@@ -4561,6 +4563,7 @@ mod tests {
             _failure: tokeira_types::Payload,
             _failure_error_type: Option<String>,
             _is_non_retryable: bool,
+            _last_heartbeat_details: Option<tokeira_types::Payloads>,
             _worker_identity: Option<tokeira_types::WorkerIdentity>,
             _request: tokeira_types::RequestContext,
         ) -> Result<()> {

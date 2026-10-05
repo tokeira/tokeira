@@ -112,12 +112,12 @@ struct ActivityHeartbeat {
 pub(crate) fn encode_state_extension(state: &WorkflowState) -> Result<Vec<u8>>;
 
 /// Apply State_Extension bytes to a state decoded from the same blob or run.
+/// Returns the defect when the extension is malformed; the caller names the
+/// blob and run in the error it raises.
 pub(crate) fn apply_state_extension(
     state: &mut WorkflowState,
-    kind: &'static str,
-    run_key: RunKey,
     bytes: &[u8],
-) -> Result<()>;
+) -> std::result::Result<(), &'static str>;
 
 /// A State_Extension whose framing is malformed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -131,7 +131,7 @@ pub struct StateExtensionError {
 
 - `encode_workflow_state` returns `encode_enveloped(WORKFLOW_STATE_ENVELOPE_VERSION, state)` followed by `encode_state_extension(state)`.
 - `decode_workflow_state` checks the version as today. It then decodes the state with `take_from_bytes` and, when bytes remain, calls `apply_state_extension`.
-- `apply_state_extension` reads the magic, then the section sequence, and requires both to consume the bytes exactly. Each defect is one `StateExtensionError` with a fixed `defect` text:
+- `apply_state_extension` reads the magic, then the section sequence, and requires both to consume the bytes exactly. Each defect becomes one `StateExtensionError` with a fixed `defect` text:
   - wrong magic;
   - undecodable sections;
   - bytes after the sections;
@@ -154,7 +154,7 @@ pub const RUN_STATE_EXTENSION_SECTION: u32 = 1;
 
 - `snapshot()` writes the version and document as today. It then computes `encode_state_extension` for each run in run-key order. When any result is non-empty, it appends the Snapshot_Extension with one section listing those runs.
 - `from_snapshot()` keeps its version check and document decode. Any bytes after the document are parsed as a Snapshot_Extension. Each listed run's bytes are applied to that run's restored state with `apply_state_extension`.
-- A malformed extension, an unknown run or a run listed twice is a new `SnapshotError::Extension(&'static str)`.
+- A malformed extension, an unknown run or a run listed twice is a new `SnapshotError::Extension(&'static str)`. Bytes after the document that do not open with the snapshot extension magic stay `SnapshotError::TrailingBytes`, as before.
 - `SNAPSHOT_FORMAT_VERSION` stays 4. The bump rule's doc comment gains a sentence: data carried in the Snapshot_Extension does not change the document and needs no bump.
 
 The in-memory `runs` map holds `WorkflowState` values, so committed times are returned as written. The `activity_state_table` mirror carries the time in memory. Its snapshot encoding drops the time, and nothing reads that table back.
@@ -273,7 +273,7 @@ No schema migration. The `activity_state` blob and the history batch blob keep t
 
 ### Property 10: Malformed snapshot extensions are rejected
 
-*For any* snapshot and *for any* suffix that is not a well-formed Snapshot_Extension, restore SHALL fail with `SnapshotError::Extension` and construct no store. The generated suffixes cover:
+*For any* snapshot and *for any* suffix that is not a well-formed Snapshot_Extension, restore SHALL fail and construct no store: with `SnapshotError::TrailingBytes` when the suffix does not open with the snapshot extension magic, as before, and with `SnapshotError::Extension` otherwise. The generated suffixes cover:
 - a wrong magic;
 - undecodable sections;
 - bytes after them;
@@ -289,7 +289,7 @@ Unknown tags SHALL be ignored.
 | Condition | Internal error | External behaviour |
 |---|---|---|
 | Hot-state blob with a malformed State_Extension | `StateExtensionError` (storage) | `INTERNAL` on the RPC that loaded the run; the Sweep fails, as for `BlobFormatError` |
-| Snapshot with a malformed Snapshot_Extension | `SnapshotError::Extension` | Engine startup fails with the restore error, as for any undecodable snapshot |
+| Snapshot with a malformed Snapshot_Extension | `SnapshotError::Extension`, or `SnapshotError::TrailingBytes` when the bytes do not open with the magic | Engine startup fails with the restore error, as for any undecodable snapshot |
 | Heartbeat_Section entry for an activity the state does not hold | None, skipped | None |
 | Unknown extension tag | None, ignored | None |
 | A 0.2.0–0.5.1 node reads a blob with a State_Extension | None; that node ignores the extension | The node does not see the times. When it rewrites the run, the times are lost |

@@ -1690,6 +1690,7 @@ mod tests {
             started_event_id: None,
             pause_info: None,
             stamp: seed,
+            last_heartbeat_at: None,
         }
     }
 

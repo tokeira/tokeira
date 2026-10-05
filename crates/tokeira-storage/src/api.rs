@@ -1531,6 +1531,10 @@ pub struct ActivitySweepEntry {
     /// When the activity was started (None if not yet
     /// started).
     pub started_at: Option<OffsetDateTime>,
+    /// When the activity's progress was last recorded, which the Sweep
+    /// restores into activity tracking (activity-heartbeat-time,
+    /// Requirement 5.3).
+    pub last_heartbeat_at: Option<OffsetDateTime>,
     /// Maximum time from schedule to completion.
     pub schedule_to_close_timeout: Option<time::Duration>,
     /// Maximum time from schedule to worker pickup.

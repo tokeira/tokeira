@@ -432,6 +432,7 @@ mod tests {
             priority: None,
             activity_reset: false,
             reset_heartbeats: false,
+            last_heartbeat_at: None,
         }
     }
 

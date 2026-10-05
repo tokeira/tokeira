@@ -385,12 +385,20 @@ where
     /// Record an activity failure. If the retry policy
     /// allows, the activity is re-dispatched at the next
     /// attempt; otherwise it is resolved as failed.
+    ///
+    /// `last_heartbeat_details` are the progress a worker reports with the
+    /// failure. A retry records them, and their time, as a heartbeat does
+    /// (respondactivitytaskfailed/api.go:87-94 @ v1.31.0); a terminal failure
+    /// removes the activity, so they have nowhere to go.
+    /// `RespondActivityTaskFailedById` passes `None`: v1.31.0's frontend drops
+    /// them on that path (frontend/workflow_handler.go:1965-1969).
     pub async fn fail_activity_task(
         &self,
         token: ActivityTaskToken,
         failure: Payload,
         failure_error_type: Option<String>,
         is_non_retryable: bool,
+        last_heartbeat_details: Option<Payloads>,
         worker_identity: Option<WorkerIdentity>,
         request: RequestContext,
     ) -> Result<()> {
@@ -433,7 +441,7 @@ where
                     next_attempt,
                     backoff,
                     Some(failure.clone()),
-                    worker_identity.clone(),
+                    last_heartbeat_details,
                 )
                 .await
             {
@@ -586,6 +594,12 @@ where
             next_state.transition_seq = state.transition_seq.next();
             let mut next_activity = current;
             next_activity.heartbeat_details = details.clone();
+            // `UpdateActivityProgress` records the time with the details
+            // (mutable_state_impl.go:1964-1966 @ v1.31.0). The same instant
+            // goes to volatile tracking below, so the deadline the owning node
+            // evaluates and the one a new owner restores agree.
+            let now = OffsetDateTime::now_utc();
+            next_activity.last_heartbeat_at = Some(now);
             // A heartbeat carrying a non-empty identity updates the retry
             // bookkeeping identity, Describe's `LastWorkerIdentity` fallback
             // (`ai.RetryLastWorkerIdentity = req.HeartbeatRequest.Identity`,
@@ -642,11 +656,7 @@ where
                     // recordactivitytaskheartbeat/api.go:83 @ v1.31.0; K4).
                     let tracking_cancel = self
                         .activity_tracking
-                        .record_heartbeat(
-                            token.run_key,
-                            &token.activity_id,
-                            OffsetDateTime::now_utc(),
-                        )
+                        .record_heartbeat(token.run_key, &token.activity_id, now)
                         .unwrap_or(false);
                     return Ok(ActivityHeartbeatOutcome {
                         cancel_requested: outcome.cancel_requested || tracking_cancel,
@@ -1276,7 +1286,7 @@ where
         next_attempt: u32,
         backoff: time::Duration,
         failure: Option<Payload>,
-        _worker_identity: Option<WorkerIdentity>,
+        progress: Option<Payloads>,
     ) -> Result<()> {
         commit_activity_retry(
             &self.activity_retry_deps(),
@@ -1289,6 +1299,7 @@ where
             next_attempt,
             backoff,
             failure,
+            progress,
         )
         .await
     }
@@ -1368,6 +1379,7 @@ pub(crate) async fn commit_activity_retry<R>(
     next_attempt: u32,
     backoff: time::Duration,
     failure: Option<Payload>,
+    progress: Option<Payloads>,
 ) -> Result<()>
 where
     R: RunRepository + 'static,
@@ -1424,13 +1436,23 @@ where
         // itself is deliberately NOT cleared
         // (`UpdateActivityInfoForRetries`, activity.go:81 @ v1.31.0).
         next_activity.retry_last_worker_identity = next_activity.started_identity.clone();
+        // A failure that carries heartbeat details records them as a
+        // heartbeat does, before the retry applies any pending heartbeat reset
+        // (`UpdateActivityProgress` ahead of `RetryActivity`,
+        // respondactivitytaskfailed/api.go:87-105 @ v1.31.0).
+        if let Some(details) = progress.clone() {
+            next_activity.heartbeat_details = Some(details);
+            next_activity.last_heartbeat_at = Some(completed_at);
+        }
         // Reset-heartbeat applies to the NEXT instance, never destructively to
         // a still-running worker. Retry preparation is the point at which
-        // v1.31.0 clears those details, then always consumes both reset flags
-        // so a later retry cannot repeat the reset side effects
-        // (`UpdateActivityInfoForRetries`, activity.go:63-97 @ v1.31.0).
+        // v1.31.0 clears those details and their time, then always consumes
+        // both reset flags so a later retry cannot repeat the reset side
+        // effects (`UpdateActivityInfoForRetries`, activity.go:63-97 @
+        // v1.31.0). Without a reset, the retry keeps both.
         if next_activity.reset_heartbeats {
             next_activity.heartbeat_details = None;
+            next_activity.last_heartbeat_at = None;
         }
         next_activity.activity_reset = false;
         next_activity.reset_heartbeats = false;
@@ -2255,6 +2277,7 @@ mod tests {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         };
         state
             .activities
@@ -2352,6 +2375,7 @@ mod tests {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         };
         state
             .activities
@@ -2756,6 +2780,7 @@ mod tests {
                     None,
                     !retryable,
                     None,
+                    None,
                     RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
                 )
                 .await
@@ -2805,6 +2830,7 @@ mod tests {
             2,
             backoff,
             Some(payload(b"retryable")),
+            None,
         )
         .await
         .expect("commit delayed retry");
@@ -2931,6 +2957,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
                 RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
             )
             .await
@@ -3031,6 +3058,11 @@ mod tests {
             after_heartbeat.activities["activity-1"].heartbeat_details,
             Some(details.clone())
         );
+        let heartbeat_at = after_heartbeat.activities["activity-1"].last_heartbeat_at;
+        assert!(
+            heartbeat_at.is_some(),
+            "the heartbeat commit records its time"
+        );
 
         runtime
             .fail_activity_task(
@@ -3038,6 +3070,7 @@ mod tests {
                 payload(b"retryable"),
                 None,
                 false,
+                None,
                 None,
                 RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
             )
@@ -3051,6 +3084,9 @@ mod tests {
         let retried = after_retry.activities.get("activity-1").unwrap();
         assert_eq!(retried.attempt, 2);
         assert_eq!(retried.heartbeat_details, Some(details.clone()));
+        // A retry without a heartbeat reset keeps the time
+        // (`UpdateActivityInfoForRetries`, activity.go:86-90 @ v1.31.0).
+        assert_eq!(retried.last_heartbeat_at, heartbeat_at);
         assert!(retried.current_attempt_scheduled_at.is_some());
 
         // The retried attempt is published only after the 1s retry backoff
@@ -3072,6 +3108,15 @@ mod tests {
             started.current_attempt_scheduled_time,
             retried.current_attempt_scheduled_at
         );
+        // Starting the attempt leaves the time alone.
+        let LoadedRun::Existing(after_start) =
+            repo.load_run(after_heartbeat.run_key).await.unwrap()
+        else {
+            panic!("seeded run should exist after start");
+        };
+        let restarted = &after_start.activities["activity-1"];
+        assert!(restarted.started_at.is_some());
+        assert_eq!(restarted.last_heartbeat_at, heartbeat_at);
     }
 
     #[tokio::test]
@@ -3120,6 +3165,7 @@ mod tests {
                 payload(b"retryable"),
                 None,
                 false,
+                None,
                 None,
                 RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
             )
@@ -3184,6 +3230,15 @@ mod tests {
             .await
             .expect("attempt-one token remains valid after reset");
         assert!(outcome.activity_reset);
+        let LoadedRun::Existing(heartbeated) = repo.load_run(token.run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        assert!(
+            heartbeated.activities[&token.activity_id]
+                .last_heartbeat_at
+                .is_some(),
+            "the running attempt keeps recording progress after the reset"
+        );
 
         runtime
             .fail_activity_task(
@@ -3191,6 +3246,7 @@ mod tests {
                 payload(b"retryable"),
                 None,
                 false,
+                None,
                 None,
                 RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
             )
@@ -3201,8 +3257,311 @@ mod tests {
         };
         let retried = &after.activities[&token.activity_id];
         assert!(retried.heartbeat_details.is_none());
+        assert!(retried.last_heartbeat_at.is_none());
         assert!(!retried.activity_reset);
         assert!(!retried.reset_heartbeats);
+    }
+
+    /// Load the seeded run's activity.
+    async fn seeded_activity(
+        repo: &InMemoryStore,
+        token: &ActivityTaskToken,
+    ) -> tokeira_kernel::ActivityState {
+        let LoadedRun::Existing(state) = repo.load_run(token.run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        state.activities[&token.activity_id].clone()
+    }
+
+    /// Mark the activity's current attempt started, the way the start path
+    /// does, and return its token. This skips the retry backoff that the
+    /// dispatch path waits out.
+    async fn start_current_attempt(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        repo: &InMemoryStore,
+        token: &ActivityTaskToken,
+    ) -> ActivityTaskToken {
+        let LoadedRun::Existing(state) = repo.load_run(token.run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        let mut next_state = state.clone();
+        next_state.transition_seq = state.transition_seq.next();
+        let activity = next_state
+            .activities
+            .get_mut(&token.activity_id)
+            .expect("seeded activity");
+        activity.started_at = Some(OffsetDateTime::now_utc());
+        activity.started_event_id = Some(tokeira_kernel::TRANSIENT_ACTIVITY_STARTED_EVENT_ID);
+        let activity = activity.clone();
+        let transition = Transition {
+            expected_seq: state.transition_seq,
+            next_state,
+            history_events: SmallVec::new(),
+            event_principals: SmallVec::new(),
+            request_dedupe_ops: SmallVec::new(),
+            activity_ops: smallvec![ActivityOp::Upsert(activity.clone())],
+            timer_ops: SmallVec::new(),
+            dispatch_ops: SmallVec::new(),
+        };
+        repo.commit_transition(token.run_key, transition, ShardEpoch::ZERO)
+            .await
+            .expect("start the current attempt");
+        ActivityTaskToken {
+            attempt: activity.attempt,
+            shard_epoch: runtime
+                .shard_epoch_for_completion(token.run_key)
+                .await
+                .expect("runtime owns seeded run"),
+            ..token.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_commit_records_the_same_time_in_tracking() {
+        use crate::activity_timeout::ActivityTrackingEntry;
+
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let (state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
+        let activity = &state.activities[&token.activity_id];
+        let deps = runtime.activity_retry_deps();
+        deps.tracking.insert(ActivityTrackingEntry {
+            run_key: token.run_key,
+            shard_id: ShardId(0),
+            activity_id: token.activity_id.clone(),
+            original_scheduled_at: activity.scheduled_at,
+            last_dispatched_at: activity.scheduled_at,
+            started_at: activity.started_at,
+            last_heartbeat_at: None,
+            cancel_requested: false,
+        });
+
+        runtime
+            .record_activity_heartbeat(token.clone(), Some(payloads(b"progress")), None)
+            .await
+            .expect("heartbeat should persist");
+
+        let persisted = seeded_activity(&repo, &token).await.last_heartbeat_at;
+        assert!(persisted.is_some());
+        let tracked = deps.tracking.snapshot();
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].last_heartbeat_at, persisted);
+    }
+
+    #[tokio::test]
+    async fn failure_with_heartbeat_details_records_progress_in_the_retry() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let (_state, token, _queue) =
+            seed_started_activity(&runtime, &repo, Some(payloads(b"heartbeat"))).await;
+        let reported = payloads(b"throttled-progress");
+
+        runtime
+            .fail_activity_task(
+                token.clone(),
+                payload(b"retryable"),
+                None,
+                false,
+                Some(reported.clone()),
+                None,
+                RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await
+            .expect("retryable failure should re-dispatch activity");
+
+        // The failure's details become the activity's progress, timed by the
+        // retry commit (respondactivitytaskfailed/api.go:87-94 @ v1.31.0).
+        let retried = seeded_activity(&repo, &token).await;
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(retried.heartbeat_details, Some(reported));
+        assert!(retried.last_heartbeat_at.is_some());
+        assert_eq!(
+            retried.last_heartbeat_at,
+            retried.last_attempt_complete_time
+        );
+    }
+
+    #[tokio::test]
+    async fn running_reset_clears_progress_reported_with_the_failure() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let (_state, token, _queue) =
+            seed_started_activity(&runtime, &repo, Some(payloads(b"before-reset"))).await;
+        let now = OffsetDateTime::now_utc();
+        runtime
+            .reset_activities(
+                token.run_key,
+                ResetActivitiesRequest {
+                    target: ActivityControlTarget::Id(token.activity_id.clone()),
+                    reset_heartbeat: true,
+                    keep_paused: false,
+                    jitter: None,
+                    restore_original_options: false,
+                    request: RequestContext {
+                        request_id: RequestId("reset-running".to_string()),
+                        caller_identity: Some("operator".to_string()),
+                        principal: None,
+                        received_at: now,
+                    },
+                    now,
+                },
+            )
+            .await
+            .expect("running activity should reset");
+
+        runtime
+            .fail_activity_task(
+                token.clone(),
+                payload(b"retryable"),
+                None,
+                false,
+                Some(payloads(b"reported-with-failure")),
+                None,
+                RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await
+            .expect("retry preparation should consume reset flags");
+
+        // Progress is recorded first and the pending reset then clears it,
+        // the order of `UpdateActivityProgress` and `RetryActivity`
+        // (respondactivitytaskfailed/api.go:87-105 @ v1.31.0).
+        let retried = seeded_activity(&repo, &token).await;
+        assert!(retried.heartbeat_details.is_none());
+        assert!(retried.last_heartbeat_at.is_none());
+        assert!(!retried.reset_heartbeats);
+    }
+
+    /// One worker call in a heartbeat-time scenario.
+    #[derive(Clone, Copy, Debug)]
+    enum ProgressOp {
+        Heartbeat,
+        FailWithDetails,
+        FailWithoutDetails,
+    }
+
+    fn arb_progress_ops() -> impl Strategy<Value = Vec<ProgressOp>> {
+        prop::collection::vec(
+            prop_oneof![
+                Just(ProgressOp::Heartbeat),
+                Just(ProgressOp::FailWithDetails),
+                Just(ProgressOp::FailWithoutDetails),
+            ],
+            0..8,
+        )
+        .prop_map(|ops| {
+            // The seeded retry policy allows three attempts, so keep at most
+            // two retries and the activity never resolves.
+            let mut failures = 0;
+            ops.into_iter()
+                .take_while(|op| {
+                    if matches!(op, ProgressOp::Heartbeat) {
+                        return true;
+                    }
+                    failures += 1;
+                    failures <= 2
+                })
+                .collect()
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        // Feature: activity-heartbeat-time, Property 7: The time follows progress
+        // records and resets
+        #[test]
+        fn property_heartbeat_time_follows_progress_records(ops in arb_progress_ops()) {
+            let runtime_handle = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime_handle.block_on(async {
+                let repo = Arc::new(InMemoryStore::default());
+                let runtime = TokeiraRuntime::new(
+                    repo.clone(),
+                    1,
+                    LaneConfig::default(),
+                    TimerScannerConfig::default(),
+                    WorkflowTimeoutScannerConfig::default(),
+                    BacklogConfig::default(),
+                );
+                let (_state, mut token, _queue) =
+                    seed_started_activity(&runtime, &repo, None).await;
+                // The model: the commit time of the latest progress record.
+                let mut expected: Option<OffsetDateTime> = None;
+                for (step, op) in ops.into_iter().enumerate() {
+                    match op {
+                        ProgressOp::Heartbeat => {
+                            runtime
+                                .record_activity_heartbeat(
+                                    token.clone(),
+                                    Some(payloads(format!("beat-{step}").as_bytes())),
+                                    None,
+                                )
+                                .await
+                                .expect("heartbeat should persist");
+                            let recorded = seeded_activity(&repo, &token).await.last_heartbeat_at;
+                            prop_assert!(recorded.is_some());
+                            prop_assert!(recorded >= expected);
+                            expected = recorded;
+                        }
+                        ProgressOp::FailWithDetails | ProgressOp::FailWithoutDetails => {
+                            let with_details = matches!(op, ProgressOp::FailWithDetails);
+                            runtime
+                                .fail_activity_task(
+                                    token.clone(),
+                                    payload(b"retryable"),
+                                    None,
+                                    false,
+                                    with_details
+                                        .then(|| payloads(format!("fail-{step}").as_bytes())),
+                                    None,
+                                    RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+                                )
+                                .await
+                                .expect("retryable failure should re-dispatch activity");
+                            let retried = seeded_activity(&repo, &token).await;
+                            if with_details {
+                                prop_assert_eq!(
+                                    retried.last_heartbeat_at,
+                                    retried.last_attempt_complete_time
+                                );
+                                expected = retried.last_heartbeat_at;
+                            }
+                            prop_assert_eq!(retried.last_heartbeat_at, expected);
+                            token = start_current_attempt(&runtime, &repo, &token).await;
+                            // Starting the next attempt leaves the time alone.
+                            prop_assert_eq!(
+                                seeded_activity(&repo, &token).await.last_heartbeat_at,
+                                expected
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
     }
 
     proptest! {
@@ -3335,6 +3694,7 @@ mod tests {
             pause_info: None,
             stamp: 0,
             priority: None,
+            last_heartbeat_at: None,
         }
     }
 

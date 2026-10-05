@@ -18,18 +18,68 @@ impl<R> TokeiraRuntime<R>
 where
     R: RunRepository + 'static,
 {
-    /// Record a shard as locally owned and immediately `Active`, skipping the
-    /// sweep phase.
+    /// Bring a shard whose lease this node took itself into service: record it
+    /// `Sweeping`, rebuild its volatile state with the recovery sweep, and only
+    /// then mark it `Active`.
     ///
-    /// For single-node / no-controller deployments (and tests) where there is
-    /// no durable lease and no volatile state to reconstruct, so the
-    /// Sweeping→Active staging that [`acquire_shard`](Self::acquire_shard)
-    /// performs is unnecessary. Controller-managed deployments must use
-    /// `acquire_shard` instead so the sweep runs before admission.
-    pub fn record_self_assigned_shard(&self, shard_id: ShardId, epoch: ShardEpoch) {
-        let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
-        let _ = owner.record_acquired(shard_id, epoch);
-        owner.mark_active(shard_id);
+    /// For deployments without a placement controller, which take every
+    /// shard's lease at boot. With no other node to fence, no lease renewer
+    /// runs. The sweep still must: the previous process's offered workflow
+    /// tasks and timeout tracking ended with it, and Temporal likewise rebuilds
+    /// a shard's pending work from its persisted task queues whenever the shard
+    /// loads (`newQueueBase`, `service/history/queues/queue_base.go:104-132 @
+    /// v1.31.0`; runtime-sweeper-recovery Requirement 11.6).
+    ///
+    /// If the sweep fails, the shard is dropped locally, so it admits nothing,
+    /// and the error is returned. Releasing the durable lease is the caller's
+    /// job, because the caller holds the lease's owner and epoch.
+    pub async fn recover_self_assigned_shard(
+        &self,
+        shard_id: ShardId,
+        epoch: ShardEpoch,
+    ) -> Result<SweepResult> {
+        {
+            let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
+            let _ = owner.record_acquired(shard_id, epoch);
+        }
+        let swept = sweep_shard(
+            shard_id,
+            self.repo.as_ref(),
+            &self.broker,
+            &self.lanes,
+            self.lanes.len(),
+            &self.workflow_timeout_tracking,
+            &self.wft_timeout_tracking,
+            &self.activity_tracking,
+            &self.nexus_timeout_tracking,
+            &self.completion_callback_tracking,
+            &self.activity_retry_deps(),
+        )
+        .await;
+        self.settle_self_assigned_recovery(shard_id, swept).await
+    }
+
+    /// Finish a self-assigned shard's recovery: activate it after a successful
+    /// sweep; after a failed one, relinquish it so it admits nothing and keeps
+    /// no partly rebuilt tracking.
+    async fn settle_self_assigned_recovery(
+        &self,
+        shard_id: ShardId,
+        swept: Result<SweepResult>,
+    ) -> Result<SweepResult> {
+        match swept {
+            Ok(result) => {
+                self.shard_owner
+                    .write()
+                    .expect("shard_owner lock poisoned")
+                    .mark_active(shard_id);
+                Ok(result)
+            }
+            Err(error) => {
+                self.relinquish_shard(shard_id).await;
+                Err(error)
+            }
+        }
     }
     /// Acquire a durable lease on `shard_id`, reconstruct its volatile state,
     /// and bring it into service.
@@ -409,6 +459,93 @@ mod tests {
         // under an epoch this node no longer holds.
         let refused = runtime.start_workflow(start_request()).await;
         assert!(refused.is_err(), "start after relinquish must be refused");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn self_assigned_recovery_sweeps_before_activating_the_shard() -> Result<()> {
+        let store = Arc::new(InMemoryStore::default());
+        // The previous process left a pending first workflow task.
+        let (previous, _) = runtime_with_membership_client(Arc::clone(&store));
+        previous
+            .recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO)
+            .await?;
+        let request = start_request();
+        let run_key = request.run_key;
+        let queue = QueueKey {
+            namespace_id: request.namespace_id,
+            task_queue: request.task_queue.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        assert!(matches!(
+            previous.start_workflow(request).await?,
+            CommitResult::Applied { .. }
+        ));
+
+        // A restarted process admits nothing until it has recovered the
+        // shard, and the recovery offers the task again.
+        let (restarted, _) = runtime_with_membership_client(store);
+        assert!(restarted.active_shards().is_empty());
+        let swept = restarted
+            .recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO)
+            .await?;
+        assert_eq!(swept.workflow_tasks_republished, 1);
+        assert_eq!(restarted.active_shards(), vec![ShardId(0)]);
+        let task = restarted
+            .poll_workflow_task(
+                queue,
+                WorkerIdentity("worker".to_owned()),
+                tokio::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("the recovered workflow task is offered");
+        assert_eq!(task.run_key, run_key);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_self_assigned_recovery_relinquishes_the_shard() -> Result<()> {
+        use crate::activity_timeout::ActivityTrackingEntry;
+
+        let (runtime, _) = runtime_with_membership_client(Arc::new(InMemoryStore::default()));
+        {
+            let mut owner = runtime
+                .shard_owner
+                .write()
+                .expect("shard_owner lock poisoned");
+            let _ = owner.record_acquired(ShardId(0), ShardEpoch(3));
+        }
+        // Tracking the failed sweep had already rebuilt.
+        let now = OffsetDateTime::now_utc();
+        runtime.activity_tracking.insert(ActivityTrackingEntry {
+            run_key: RunKey::new(),
+            shard_id: ShardId(0),
+            activity_id: "activity-1".to_owned(),
+            original_scheduled_at: now,
+            last_dispatched_at: now,
+            started_at: Some(now),
+            last_heartbeat_at: None,
+            cancel_requested: false,
+        });
+
+        let error = runtime
+            .settle_self_assigned_recovery(ShardId(0), Err(anyhow!("candidate listing failed")))
+            .await
+            .expect_err("the sweep's error is returned");
+
+        assert!(error.to_string().contains("candidate listing failed"));
+        assert!(runtime.active_shards().is_empty());
+        assert_eq!(
+            runtime
+                .shard_owner
+                .read()
+                .expect("shard_owner lock poisoned")
+                .epoch_of(ShardId(0)),
+            None
+        );
+        assert!(runtime.activity_tracking.snapshot().is_empty());
         Ok(())
     }
 

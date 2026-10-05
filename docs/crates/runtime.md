@@ -34,6 +34,11 @@ Only a successful commit can publish broker work, timers, visibility, or other
 side effects. Queues are disposable; the authoritative transition log and
 durable backlog provide recovery.
 
+Every shard a node takes is swept before it admits commands, whether a placement
+controller grants it or the node assigns it to itself at boot. The sweep rebuilds
+offered workflow and activity tasks, due timers, and timeout tracking from durable
+state, so a restart loses none of them.
+
 ## CHASM side effects
 
 A committed transition stages tasks in the node itself; dispatching them is a

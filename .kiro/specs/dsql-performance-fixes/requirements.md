@@ -33,12 +33,13 @@ Target: move compose+DSQL from 5 wf/s to 50–100 wf/s at c=20 by eliminating ar
 #### Acceptance Criteria
 
 1. WHILE `controller_endpoint` is not configured, WHEN tokeirad starts, THE Server SHALL call `try_acquire_bundle` for each shard in `0..shard_count`.
-2. WHILE `controller_endpoint` is not configured, WHEN tokeirad starts, THE Server SHALL record each successfully acquired shard in the ShardOwner with the epoch returned by `LeaseOutcome::Acquired { epoch }` or `LeaseOutcome::Renewed { epoch }`.
+2. WHILE `controller_endpoint` is not configured, WHEN tokeirad starts, THE Server SHALL record each successfully acquired shard in the ShardOwner with the epoch returned by `LeaseOutcome::Acquired { epoch }` or `LeaseOutcome::Renewed { epoch }`, run the recovery sweep for it, and only then mark it Active ([runtime-sweeper-recovery](../runtime-sweeper-recovery/requirements.md) Requirement 11.6).
 3. IF `try_acquire_bundle` fails for any shard during self-assignment, THEN THE Server SHALL log a warning and continue attempting the remaining shards.
 4. WHILE `controller_endpoint` is configured, THE Server SHALL NOT perform self-assignment and SHALL rely on the placement controller for shard/bundle acquisition.
 5. WHEN self-assignment completes, THE Server SHALL log the count of successfully acquired shards at info level.
 6. THE Server SHALL default `shard_count` to 32 for compose+DSQL deployments.
 7. THE Server SHALL default `partition_count` to 4 for compose+DSQL deployments.
+8. IF the recovery sweep of a self-assigned shard fails, THEN THE Server SHALL release that shard's lease, log a warning, and continue with the remaining shards; the shard admits no commands until a later start recovers it.
 
 ### Requirement 2: Eliminate Per-Transition Lease Row Locking in Single-Node Mode
 

@@ -66,7 +66,7 @@ use crate::{
     },
     publisher::{RuntimeDispatchPublisher, run_completion_callback_scanner},
     query::{QueryResult, QueryTask},
-    recovery::{lease_rejected_error, run_lease_renewer, sweep_shard},
+    recovery::{SweepResult, lease_rejected_error, run_lease_renewer, sweep_shard},
     retry::{RetryDecision, RetryExhaustedReason, evaluate_activity_retry},
     scanner::{
         TimerScannerConfig, lane_index_for_run_key, pick_lane_for_run_key, run_timer_scanner,

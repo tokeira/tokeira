@@ -1,0 +1,5 @@
+kind: fixed
+body: A single node without a placement controller now runs the recovery sweep for each shard at startup, so pending workflow tasks and timeouts resume after a restart.
+time: 2026-10-05T01:31:52.000000+01:00
+custom:
+    Slice: 22f30676-614a-41b2-932a-3f6d6fd79cdc

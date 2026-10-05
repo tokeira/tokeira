@@ -88,8 +88,17 @@ if effective_config.infrastructure.placement.controller_endpoint.is_none() {
             node_endpoint.as_authority(),
         ).await {
             Ok(LeaseOutcome::Acquired { epoch } | LeaseOutcome::Renewed { epoch }) => {
-                runtime.record_self_assigned_shard(shard_id, epoch);
-                acquired += 1;
+                // Sweeping, then the recovery sweep, then Active.
+                match runtime.recover_self_assigned_shard(shard_id, epoch).await {
+                    Ok(_) => acquired += 1,
+                    Err(error) => {
+                        // The runtime dropped the shard; release its lease too.
+                        let _ = run_repository
+                            .relinquish_bundle(shard_id, node_id.to_string(), epoch)
+                            .await;
+                        tracing::warn!(%shard_index, ?error, "failed to recover self-assigned shard");
+                    }
+                }
             }
             Ok(LeaseOutcome::Rejected { current_owner, current_epoch }) => {
                 tracing::warn!(
@@ -110,7 +119,7 @@ if effective_config.infrastructure.placement.controller_endpoint.is_none() {
 
 **Design decisions:**
 - Epoch comes from `LeaseOutcome::Acquired { epoch }` or `LeaseOutcome::Renewed { epoch }`; self-assignment never hard-codes epoch 1.
-- Shards are marked `Active` immediately (no sweep phase needed — the node is the only owner).
+- Each shard is recorded `Sweeping`, swept, and then marked `Active`, as a controller-placed shard is. Being the only owner removes the need for a lease renewer, not for recovery: the previous process's offered tasks and timeout tracking ended with it (runtime-sweeper-recovery Requirement 11.6).
 - Lease duration remains repository configuration (`DsqlPoolConfig::lease_duration`), not an argument to the lease API.
 - Failures are logged and skipped — partial assignment is acceptable for a dev deployment.
 

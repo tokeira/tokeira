@@ -193,6 +193,7 @@ Depends on: Feature 1 (Lane OCC Retry and Mailbox Coalescing), Feature 2 (Activi
 3. THE Runtime SHALL NOT eagerly rehydrate all run actors after shard acquisition; run actors SHALL be loaded on demand when a command or due timer targets them.
 4. WHEN the Sweeper completes its initial scan, THE Runtime SHALL transition the shard to an active state that accepts commands.
 5. Shard-scoped background scanners (Timer_Scanner, Workflow_Timeout_Scanner, Activity_Timeout_Scanner, Nexus_Timeout_Scanner) SHALL NOT begin scanning for a shard until that shard has reached the Active state. This prevents scanners from injecting commands into lanes before the sweep has reconstructed the volatile state they depend on.
+6. WHEN a node without a placement controller takes a shard's lease itself at boot (self-assignment), THE Runtime SHALL run steps (1), (3) and (4) of criterion 1 for that shard, and SHALL skip step (2): with no other node to fence, no Lease_Renewer runs. Being the only owner does not make the Sweeper unnecessary, because the previous process's offered tasks and tracking state ended with it. Temporal v1.31.0 likewise rebuilds a shard's pending work from its persisted task queues whenever the shard loads, including a single-node restart (`newQueueBase`, `service/history/queues/queue_base.go:104-132 @ v1.31.0`).
 
 ---
 

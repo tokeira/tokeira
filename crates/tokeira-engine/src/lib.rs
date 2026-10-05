@@ -263,11 +263,11 @@ use tokeira_runtime::{
     NexusEndpointRegistry, NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore,
     NexusNamespaceResolver, NexusWorkerComputeProvider, OBSERVATION_CHANNEL_CAPACITY,
     RECONCILE_CHANNEL_CAPACITY, RepositoryBackedTaskQueueConfigStore, RuntimeConfig,
-    RuntimeShutdownHandle, ScheduleEngineConfig, ScheduleStore, SystemWorkerComputeClock,
-    TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime, WorkerComputeControllerService,
-    WorkerComputeOutbox, WorkerComputeReconciler, WorkflowTaskReportedProblem,
-    nexus_payload_to_body, reported_problem_from_state, run_schedule_engine,
-    system_callback_post_url,
+    RuntimeShutdownHandle, ScheduleEngineConfig, ScheduleStore, SweepResult,
+    SystemWorkerComputeClock, TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime,
+    WorkerComputeControllerService, WorkerComputeOutbox, WorkerComputeReconciler,
+    WorkflowTaskReportedProblem, nexus_payload_to_body, reported_problem_from_state,
+    run_schedule_engine, system_callback_post_url,
 };
 use tokeira_storage::{
     ConnectionDirector, DbClass, InMemoryStore, InMemoryWorkerComputeRepository, LeaseOutcome,
@@ -4303,6 +4303,7 @@ where
     }
 
     let mut acquired = Vec::new();
+    let mut recovered = SweepResult::default();
     let owner = node_id.to_string();
     for shard_index in 0..shard_count {
         let shard_id = ShardId(shard_index);
@@ -4311,12 +4312,43 @@ where
             .await
         {
             Ok(LeaseOutcome::Acquired { epoch } | LeaseOutcome::Renewed { epoch }) => {
-                runtime.record_self_assigned_shard(shard_id, epoch);
-                acquired.push(SelfAssignedShardLease {
-                    shard_id,
-                    owner: owner.clone(),
-                    epoch,
-                });
+                // Being the only owner removes the need for a lease renewer,
+                // not for recovery: the previous process's offered workflow
+                // tasks and timeout tracking ended with it, so the shard is
+                // swept before it admits anything (runtime-sweeper-recovery
+                // Requirement 11.6).
+                match runtime.recover_self_assigned_shard(shard_id, epoch).await {
+                    Ok(swept) => {
+                        recovered.workflow_tasks_republished += swept.workflow_tasks_republished;
+                        recovered.activity_tasks_republished += swept.activity_tasks_republished;
+                        recovered.due_timers_injected += swept.due_timers_injected;
+                        recovered.activity_tracking_entries_reconstructed +=
+                            swept.activity_tracking_entries_reconstructed;
+                        acquired.push(SelfAssignedShardLease {
+                            shard_id,
+                            owner: owner.clone(),
+                            epoch,
+                        });
+                    }
+                    Err(error) => {
+                        // The runtime has dropped the shard; release its lease.
+                        let _ = lease_repository
+                            .relinquish_bundle(shard_id, owner.clone(), epoch)
+                            .await;
+                        if require_all {
+                            rollback_self_assigned_shards(runtime, lease_repository, &acquired)
+                                .await;
+                            return Err(error).context(format!(
+                                "failed to recover embedded DSQL shard {shard_index}"
+                            ));
+                        }
+                        tracing::warn!(
+                            shard_index,
+                            ?error,
+                            "failed to recover self-assigned shard; leaving it unowned"
+                        );
+                    }
+                }
             }
             Ok(LeaseOutcome::Rejected {
                 current_owner,
@@ -4349,7 +4381,12 @@ where
     }
     info!(
         acquired = acquired.len(),
-        shard_count, "self-assigned DSQL shards (no controller)"
+        shard_count,
+        workflow_tasks_republished = recovered.workflow_tasks_republished,
+        activity_tasks_republished = recovered.activity_tasks_republished,
+        due_timers_injected = recovered.due_timers_injected,
+        activity_tracking_entries_reconstructed = recovered.activity_tracking_entries_reconstructed,
+        "self-assigned and recovered DSQL shards (no controller)"
     );
     Ok(acquired)
 }
@@ -5645,6 +5682,177 @@ mod tests {
                 "cause=WorkflowTaskTimedOutCauseStartToClose".to_string(),
             ]))
         );
+    }
+
+    fn self_assigning_runtime(
+        store: Arc<InMemoryStore>,
+        shard_count: u32,
+    ) -> Arc<TokeiraRuntime<InMemoryStore>> {
+        Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
+            store,
+            2,
+            tokeira_runtime::LaneConfig::default(),
+            tokeira_runtime::TimerScannerConfig::default(),
+            tokeira_runtime::WorkflowTimeoutScannerConfig::default(),
+            tokeira_runtime::BacklogConfig::default(),
+            tokeira_runtime::ActivityTimeoutScannerConfig::default(),
+            tokeira_runtime::NexusTimeoutScannerConfig::default(),
+            NexusEndpointRegistry::default(),
+            Arc::new(tokeira_runtime::NoopNexusHttpClient),
+            NexusCompletionDeps::default(),
+            shard_count,
+            IncarnationId::new().to_string(),
+            "127.0.0.1:7233".to_owned(),
+            false,
+            None,
+        ))
+    }
+
+    fn boot_start_request(
+        namespace_id: tokeira_types::NamespaceId,
+        index: usize,
+    ) -> tokeira_kernel::StartRequest {
+        let run_id = tokeira_types::RunId::new();
+        let workflow_id = tokeira_types::WorkflowId(format!("boot-{index}"));
+        let now = time::OffsetDateTime::now_utc();
+        tokeira_kernel::StartRequest {
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+            initiator: None,
+            run_key: tokeira_types::RunKey::derive(namespace_id, &workflow_id, run_id),
+            namespace_id,
+            workflow_id,
+            run_id,
+            workflow_type: tokeira_types::WorkflowType("boot".to_owned()),
+            task_queue: tokeira_types::TaskQueueName("boot-queue".to_owned()),
+            input: tokeira_types::Payloads::default(),
+            header: None,
+            memo: tokeira_types::Memo::default(),
+            search_attributes: tokeira_types::SearchAttributes::default(),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: time::Duration::seconds(10),
+            retry_policy: None,
+            conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+            deployment: None,
+            build_id: None,
+            versioning_override: None,
+            workflow_start_delay: None,
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            on_conflict_options: None,
+            priority: None,
+            attempt: 1,
+            continued_execution_run_id: None,
+            first_execution_run_id: None,
+            parent_run_key: None,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_namespace_name: None,
+            parent_initiated_event_id: 0,
+            root_workflow_id: None,
+            root_run_id: None,
+            original_execution_run_id: Some(run_id),
+            continued_failure: None,
+            last_completion_result: None,
+            first_run_started_at: None,
+            request: tokeira_types::RequestContext {
+                request_id: tokeira_types::RequestId(format!("boot-start-{index}")),
+                caller_identity: None,
+                principal: None,
+                received_at: now,
+            },
+            now,
+            client_cron_schedule: None,
+            cron_schedule: None,
+            eager_execution_accepted: false,
+            reserved_poller_identity: None,
+            inherited_versioning_info: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn self_assigned_dsql_boot_recovers_every_shard_before_admission() -> Result<()> {
+        // A single node without a controller takes every shard's lease at
+        // boot. It must also sweep each shard: the previous process's offered
+        // workflow tasks ended with it (runtime-sweeper-recovery
+        // Requirement 11.6).
+        let shard_count = 2;
+        let store = Arc::new(InMemoryStore::with_shard_count(shard_count));
+        let endpoint = NodeEndpoint {
+            host: "127.0.0.1".to_owned(),
+            port: 7233,
+        };
+        let namespace_id = tokeira_types::NamespaceId::new();
+
+        let previous = self_assigning_runtime(Arc::clone(&store), shard_count);
+        self_assign_dsql_shards(
+            previous.as_ref(),
+            store.as_ref(),
+            shard_count,
+            &IncarnationId::new(),
+            &endpoint,
+            true,
+        )
+        .await?;
+        let mut started = Vec::new();
+        let mut shards = std::collections::BTreeSet::new();
+        for index in 0..8 {
+            let request = boot_start_request(namespace_id, index);
+            shards.insert(tokeira_types::execution_home_bundle(
+                namespace_id.0.as_bytes(),
+                request.workflow_id.0.as_bytes(),
+                shard_count,
+            ));
+            started.push(request.run_key);
+            let result = previous.start_workflow(request).await?;
+            assert!(matches!(
+                result,
+                tokeira_storage::CommitResult::Applied { .. }
+            ));
+        }
+        assert_eq!(shards.len(), 2, "the seeded runs span both shards");
+
+        let restarted = self_assigning_runtime(Arc::clone(&store), shard_count);
+        let leases = self_assign_dsql_shards(
+            restarted.as_ref(),
+            store.as_ref(),
+            shard_count,
+            &IncarnationId::new(),
+            &endpoint,
+            true,
+        )
+        .await?;
+        assert_eq!(leases.len(), 2);
+        let mut active = restarted.active_shards();
+        active.sort();
+        assert_eq!(active, vec![ShardId(0), ShardId(1)]);
+
+        let queue = tokeira_types::QueueKey {
+            namespace_id,
+            task_queue: tokeira_types::TaskQueueName("boot-queue".to_owned()),
+            task_kind: tokeira_types::TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let mut offered = Vec::new();
+        while offered.len() < started.len() {
+            let task = restarted
+                .poll_workflow_task(
+                    queue.clone(),
+                    tokeira_types::WorkerIdentity("worker".to_owned()),
+                    tokio::time::Duration::from_secs(1),
+                )
+                .await?
+                .expect("every pending first workflow task is offered again");
+            offered.push(task.run_key);
+        }
+        offered.sort();
+        started.sort();
+        assert_eq!(offered, started);
+        Ok(())
     }
 
     #[tokio::test]

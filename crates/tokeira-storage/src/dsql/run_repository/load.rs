@@ -433,16 +433,8 @@ impl DsqlRunRepository {
                     &successor_state,
                 )
                 .await?;
-                for activity in successor_state.activities.values() {
-                    crate::dsql::run_repository::commit::upsert_activity(
-                        &mut tx,
-                        successor_run_key,
-                        successor_shard,
-                        successor_state.namespace_id,
-                        activity,
-                    )
-                    .await?;
-                }
+                // The successor's activities live only in its `workflow_hot`
+                // state (`activity-state-writes` criterion 2.2).
                 for timer in successor_state.timers.values() {
                     crate::dsql::run_repository::commit::upsert_timer(
                         &mut tx,

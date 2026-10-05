@@ -13,6 +13,8 @@ const CURRENT_EXECUTION_DELETE_STATEMENT: &str =
     "DELETE FROM current_execution WHERE key = $1 AND run_key = $2";
 const RUN_OWNED_DELETE_STATEMENTS: [&str; 7] = [
     "DELETE FROM request_dedupe WHERE run_key = $1",
+    // Nothing writes `activity_state` any more; this clears the rows that
+    // earlier releases wrote (`activity-state-writes` criterion 3.2).
     "DELETE FROM activity_state WHERE run_key = $1",
     "DELETE FROM timer_bucket WHERE run_key = $1",
     "DELETE FROM activity_dispatch WHERE run_key = $1",

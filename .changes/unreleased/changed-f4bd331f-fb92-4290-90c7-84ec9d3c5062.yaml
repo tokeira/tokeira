@@ -1,0 +1,5 @@
+kind: changed
+body: DSQL commits no longer copy each activity into the activity_state table, which nothing read; activities stay in run state, and run deletion still clears old rows.
+time: 2026-10-05T22:18:59.000000+01:00
+custom:
+    Slice: f4bd331f-fb92-4290-90c7-84ec9d3c5062

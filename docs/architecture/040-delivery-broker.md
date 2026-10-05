@@ -65,7 +65,7 @@ Only if a task survives past the live-ready grace window, or the node is under p
 This is safe because the authoritative pending-task state lives with the run:
 
 - `workflow_hot.pending_wft`,
-- `activity_state` for open activities.
+- the activities in the run's state, with an `activity_dispatch` row for each one a worker can be offered.
 
 If the broker process dies before durable backlog is written, a sweeper reconstructs delivery candidates from authoritative state. That means live-ready is an optimization, not a correctness dependency.
 

@@ -77,6 +77,7 @@ The authoritative specifications are [040-delivery-broker](../../../docs/archite
 5. THE Grace_Scanner SHALL batch multiple expired tasks into a single `persist_to_backlog` call when multiple tasks expire in the same scan cycle.
 6. THE Grace_Scanner scan interval SHALL be configurable, with a default shorter than the Grace_Window to ensure timely persistence.
 7. IF `persist_to_backlog` fails with a transient error, THEN THE Grace_Scanner SHALL retain the expired tasks in the Live_Ready_Tier and retry on the next scan cycle. Tasks are not lost because the Live_Ready_Tier still holds them.
+8. WHEN `persist_to_backlog` receives an entry whose backlog identity is already stored, THE repository SHALL keep the stored entry and SHALL NOT fail the batch. The backlog identity is the task's queue and logical identity, from which DSQL derives the row key. Otherwise a task demoted while a copy is still stored would fail every persist of its batch, and criterion 7 would retain and retry that batch on every cycle. A copy can be stored when the Sweeper or the activity reconciliation pass republishes a task that Durable_Backlog already holds.
 
 ---
 
@@ -145,7 +146,7 @@ The authoritative specifications are [040-delivery-broker](../../../docs/archite
 1. WHEN the Sweeper (Feature 11) republishes workflow or activity tasks to the Broker or Activity_Broker after shard acquisition, THE republished tasks SHALL enter the Live_Ready_Tier with a fresh entry timestamp.
 2. WHEN a sweeper-republished task is not matched within the Grace_Window, THE Grace_Scanner SHALL persist it to Durable_Backlog following the same path as any other live-ready task.
 3. THE Sweeper SHALL NOT write directly to Durable_Backlog. The Sweeper publishes to the Broker, and the Broker decides when to persist to backlog via the Grace_Scanner.
-4. WHEN the Sweeper republishes a task that already exists in Durable_Backlog (from a previous runtime's Grace_Scanner), THE Drain_Loop will eventually drain the stale backlog entry. The Broker's deduplication set SHALL prevent double dispatch if the task has already been matched from the live-ready tier.
+4. WHEN the Sweeper republishes a task that already exists in Durable_Backlog (from a previous runtime's Grace_Scanner), THE Drain_Loop will eventually drain the stale backlog entry. The Broker's deduplication set suppresses the drained copy while the live copy is still in the Live_Ready_Tier. Taking a task removes its deduplication key, so if the live copy was already matched, the drained copy is offered again and its start is rejected as stale; the task still runs once.
 
 ---
 

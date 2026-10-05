@@ -391,6 +391,12 @@ When the drain loop receives a `BacklogEntry`, it reconstructs the dispatchable 
 
 **Validates: Requirements 6.3, 7.3**
 
+### Property 10: Backlog persistence is idempotent
+
+*For any* sequence of `persist_to_backlog` calls, every call succeeds, and the stored backlog holds one entry per backlog identity: the first one persisted. An entry whose identity is already stored leaves the stored entry unchanged, and the rest of its batch is still persisted.
+
+**Validates: Requirement 3.8**
+
 ## Error Handling
 
 ### `persist_to_backlog` Failure
@@ -398,6 +404,12 @@ When the drain loop receives a `BacklogEntry`, it reconstructs the dispatchable 
 - **Behavior**: Grace scanner retains expired tasks in the live-ready tier. Dedup keys are NOT removed. Tasks are retried on the next scan cycle.
 - **Safety**: Tasks remain deliverable from live-ready. No data loss.
 - **Logging**: `tracing::warn!` with the error, queue, and count of affected tasks.
+
+### Duplicate Backlog Identity
+
+- **Cause**: A task can be demoted while a copy is already stored. The Sweeper or the activity reconciliation pass republishes a task that Durable_Backlog holds, and the Grace_Scanner demotes the republished copy when it expires.
+- **Behavior**: DSQL inserts with `ON CONFLICT (key) DO NOTHING`, where `key` is derived from the backlog identity (`dispatch_backlog_key`). The in-memory store skips an entry whose identity it already holds. The stored entry is kept (Property 10).
+- **Safety**: The duplicate is the same logical task, so nothing is lost. Without this, the plain insert fails the whole batch on DSQL, the Grace_Scanner retains it (Requirement 3.7), and every later persist of that batch fails the same way.
 
 ### `drain_backlog` Failure
 
@@ -442,6 +454,7 @@ Tests will use:
 - Batching: multiple expired tasks produce a single `persist_to_backlog` call (Requirement 3.5).
 - No-waiters skip: drain loop makes zero `drain_backlog` calls when no pollers are registered (Requirement 10.4).
 - `BacklogEntry` construction: correct `BacklogPayload` variant for workflow vs activity tasks (Requirement 9.3).
+- DSQL `persist_to_backlog` statement shape: the insert carries `ON CONFLICT (key) DO NOTHING` (Requirement 3.8).
 
 ### Integration Tests
 

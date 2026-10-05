@@ -29,7 +29,7 @@ A read misbehaves when it asks the DSQL repository for `usize::MAX` events and t
 ### Preservation Requirements
 
 - A page that ends with the history still returns exactly the remaining events (3.1).
-- `wait_new_event` and the close-event filter keep today's per-page rules (3.2).
+- `wait_new_event` and the close-event filter keep today's per-page rules, except that a close-event read reads on past full pages that hold no close event, and the close event's page ends the read (3.2, 2.5).
 - A workflow task's poll response still carries the history up to the event the task started at, read with an exact limit (3.3).
 - Page tokens keep their encoding, so tokens issued before the fix stay valid (3.4).
 
@@ -47,7 +47,7 @@ _For any_ history and any limit of at least 1, reading pages from event 0, each 
 
 Property 2: Forward pages follow v1.31.0's page size
 
-_For any_ history and any requested page size, GetWorkflowExecutionHistory SHALL page through the whole history in pages of the effective page size, with a token after every full page and none after the last, short page.
+_For any_ history of an open run and any requested page size, GetWorkflowExecutionHistory SHALL page through the whole history in pages of the effective page size, with a token after every full page and none after the last, short page.
 
 **Validates: Requirements 2.4, 2.5**
 
@@ -75,6 +75,8 @@ The edge's last event id SHALL equal the run state's `last_event_id`, and each r
 
 - `effective_history_page_size(requested)` returns 256 (`HISTORY_MAX_PAGE_SIZE`) for 0 or less or for more than 256, and the requested size otherwise.
 - GetWorkflowExecutionHistory reads with the effective page size. Its existing full-page check (`history.len() >= limit`) then decides the token, since the limit is finite.
+- The page that holds the run's close event carries no token, even when it is full (criterion 2.5). Before this fix only a finite requested size could fill a page. At the default size of 256, a closed run whose close event ends a page would otherwise hand a token to a client following the history with `wait_new_event`, and that client would then wait on a closed run, 20 s at a time.
+- A close-event read skips a full page that holds no close event and reads the next one, rather than returning that page or waiting on it (criterion 3.2). Waiting there would hold a long poll for its 20 s expiry once per page before it reached the close event.
 - GetWorkflowExecutionHistoryReverse takes `before` from the token, or as the run's `last_event_id` plus 1 from `load_run`. It reads the events from `max(1, before - size)` to `before - 1`, which works because event ids are dense, reverses them, and sets the token to the page's smallest event id unless that id is 1.
 - `read_last_event_id` returns the run state's `last_event_id`, or 0 for an absent run.
 - Reset validation, batch reset, batch reset target resolution and the direct query's poll response read the history with the to-end methods.
@@ -103,12 +105,15 @@ Poll responses still carry the whole history in one message, where v1.31.0 sends
 ### Property-Based Tests
 
 - Property 1 on the in-memory repository, with histories of up to 3,000 events and limits from 1 to 2,000, including `read_history_to_end`.
-- Properties 2 and 3 at the edge on the in-memory repository, with histories longer than 256 events.
+- Properties 2 and 3 at the edge on the in-memory repository, with open runs of 2 to 701 events, weighted towards exactly one and two full pages, and requested page sizes weighted towards 0, 256 and 257. The expected page size comes from a reference copy of v1.31.0's rule, not from `effective_history_page_size`.
+- The reverse window's arithmetic, for cursors up to 5,000 and page sizes up to 600.
 
 ### Unit Tests
 
 - `effective_history_page_size` at 0, 1, 256, 257 and a large value.
 - Property 4: the last event id on a run whose history is longer than a page, and an activity options restore that reads its scheduled event by id.
+- A closed run whose close event ends a full page: that page carries no token, with either filter, with and without `wait_new_event`.
+- A close-event long poll on a closed run whose close event lies past the first page returns at once, with the close event.
 
 ### Preservation Checking
 

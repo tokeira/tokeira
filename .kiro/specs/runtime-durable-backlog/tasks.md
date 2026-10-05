@@ -213,18 +213,18 @@ Adds Tier C (durable backlog) to the three-tier delivery model. The implementati
 - [x] 14. Final checkpoint
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 15. Idempotent backlog persistence
-  - [ ] 15.1 DSQL `persist_to_backlog` inserts with `ON CONFLICT (key) DO NOTHING` (`tokeira-storage/src/dsql/run_repository/dispatch.rs`)
+- [x] 15. Idempotent backlog persistence
+  - [x] 15.1 DSQL `persist_to_backlog` inserts with `ON CONFLICT (key) DO NOTHING` (`tokeira-storage/src/dsql/run_repository/dispatch.rs`)
     - _Requirements: 3.8_
 
-  - [ ] 15.2 The in-memory store's `persist_to_backlog` skips an entry whose backlog identity it already holds (`tokeira-storage/src/memory.rs`)
+  - [x] 15.2 The in-memory store's `persist_to_backlog` skips an entry whose backlog identity it already holds (`tokeira-storage/src/memory.rs`)
     - _Requirements: 3.8_
 
-  - [ ] 15.3 Write property test for idempotent persistence on the in-memory store, and a unit test of the DSQL statement shape
+  - [x] 15.3 Write property test for idempotent persistence on the in-memory store, and a unit test of the DSQL statement shape
     - **Property 10: Backlog persistence is idempotent**
     - **Validates: Requirement 3.8**
 
-- [ ] 16. Checkpoint: the full bar of root `AGENTS.md` §10.4
+- [x] 16. Checkpoint: the full bar of root `AGENTS.md` §10.4
 
 ## Notes
 

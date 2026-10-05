@@ -1,0 +1,5 @@
+kind: fixed
+body: On DSQL, demoting a task whose copy the durable backlog already holds no longer fails the grace scanner's whole batch on every retry; the stored copy is kept.
+time: 2026-10-05T17:12:34.810122+01:00
+custom:
+    Slice: b4908d22-3597-42f9-9536-356248073b14

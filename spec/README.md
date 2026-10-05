@@ -107,6 +107,7 @@ The commit that schedules a task also writes a dispatch row.
 Queue homes find rows with discovery passes that start at the head of the queue every time.
 Claiming a task writes nothing, and the run's start transition, which checks the task's incarnation, is the only fence.
 Notifications, broker memory, offers and start replies may all be lost.
+The design it checks is the proposed [042-durable-actionable-state](../docs/architecture/042-durable-actionable-state.md).
 
 It is a sibling of `00_execution_contract`, not a refinement of it.
 It keeps only the part of a run's state that dispatch depends on, and models the layers around it: storage rows, brokers, pollers and shard ownership.

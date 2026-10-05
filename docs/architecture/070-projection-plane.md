@@ -1,7 +1,7 @@
 # 070 Projection Plane
 
 **Status:** draft for architecture review  
-**Related docs:** [010-history-as-authority](010-history-as-authority.md), [075-archival-to-s3](075-archival-to-s3.md), [080-sql-visibility](080-sql-visibility.md), [090-failover-and-recovery](090-failover-and-recovery.md)
+**Related docs:** [010-history-as-authority](010-history-as-authority.md), [042-durable-actionable-state](042-durable-actionable-state.md), [075-archival-to-s3](075-archival-to-s3.md), [080-sql-visibility](080-sql-visibility.md), [090-failover-and-recovery](090-failover-and-recovery.md)
 
 ## Purpose
 

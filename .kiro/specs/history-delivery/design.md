@@ -42,7 +42,7 @@ flowchart TD
 The data flow for `PollWorkflowTaskQueue`:
 
 1. `from_internal::poll_response` receives a `StartedWorkflowTask` **and** a `&dyn RunRepository`.
-2. It calls `repo.read_history(run_key, 0, usize::MAX)` to load the full history.
+2. It reads the history after `workflow_task_history_after_event_id`, up to the event the task started at, with an exact limit ([history-pagination](../history-pagination/bugfix.md), criterion 3.3).
 3. It populates `WorkflowTaskPayloadDto.history` with the loaded events.
 4. `translate::poll_response_to_proto` calls `history_serializer::serialize_history(&events)` to produce proto-encoded bytes.
 5. The bytes are set as `history_blob` on the gRPC response.
@@ -245,7 +245,10 @@ pub async fn poll_response(
     started: StartedWorkflowTask,
     repo: &dyn RunRepository,
 ) -> Result<PollWorkflowTaskQueueResponse> {
-    let history = repo.read_history(started.run_key, 0, usize::MAX).await?;
+    // The history up to the event the task started at (history-pagination 3.3).
+    let after_event_id = workflow_task_history_after_event_id(&started);
+    let limit = usize::try_from(started.last_event_id_at_start - after_event_id).unwrap_or(0);
+    let history = repo.read_history(started.run_key, after_event_id, limit).await?;
     Ok(PollWorkflowTaskQueueResponse {
         task_token: serde_json::to_vec(&started.token)?,
         started_event_id: started.token.started_event_id,
@@ -360,11 +363,8 @@ pub async fn get_workflow_execution_history(
     req: GetWorkflowExecutionHistoryRequest,
 ) -> EdgeResult<GetWorkflowExecutionHistoryResponse> {
     let run_key = self.resolve_run_key(&req.namespace, &req.workflow_id).await?;
-    let limit = if req.maximum_page_size > 0 {
-        req.maximum_page_size
-    } else {
-        usize::MAX
-    };
+    // 256 for a page size of 0 or less, or above 256 (history-pagination 2.4)
+    let limit = effective_history_page_size(req.maximum_page_size);
     let history = self.repo.read_history(run_key, 0, limit).await?;
     Ok(GetWorkflowExecutionHistoryResponse { history })
 }

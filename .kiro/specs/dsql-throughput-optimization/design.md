@@ -134,14 +134,7 @@ let history = self.repo.read_history(run_key, after_event_id, page_size).await?;
 
 #### Component: `tokeira-storage/src/dsql/run_repository.rs`
 
-The `read_history` method already accepts a `limit: usize` parameter. The change ensures callers never pass `usize::MAX`:
-
-```rust
-// Default page size when no explicit limit is provided
-const DEFAULT_HISTORY_PAGE_SIZE: usize = 1000;
-```
-
-No structural change to the storage trait — the interface already supports bounded reads. The fix is in callers that currently pass `usize::MAX`.
+The `read_history` method accepts a `limit: usize` and returns at most that many events, fewer only at the end of the history. Callers that need every event use `read_history_to_end`, which reads bounded pages, and no repository substitutes a smaller limit. [history-pagination](../history-pagination/design.md) replaces the earlier 1,000-event default for `usize::MAX`, which truncated whole-history reads on DSQL.
 
 ---
 

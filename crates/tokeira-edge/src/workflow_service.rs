@@ -3629,7 +3629,7 @@ impl WorkflowService {
         let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
         let history = self
             .repo
-            .read_history(run_key, 0, usize::MAX)
+            .read_history_to_end(run_key, 0)
             .await
             .map_err(EdgeError::from)?;
         validate_reset_target(&history, fork_event_id)?;
@@ -3810,7 +3810,7 @@ impl WorkflowService {
         let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
         let history = self
             .repo
-            .read_history(run_key, 0, usize::MAX)
+            .read_history_to_end(run_key, 0)
             .await
             .map_err(EdgeError::from)?;
         if let BatchResetTarget::BuildId(build_id) = target {
@@ -4344,7 +4344,7 @@ impl WorkflowService {
         } else {
             let attributed = self
                 .repo
-                .read_attributed_history(query.run_key, 0, usize::MAX)
+                .read_attributed_history_to_end(query.run_key, 0)
                 .await
                 .map_err(EdgeError::from)?;
             attributed
@@ -6408,7 +6408,7 @@ impl WorkflowService {
                     .await?;
                 let history = self
                     .repo
-                    .read_history(run_key, 0, usize::MAX)
+                    .read_history_to_end(run_key, 0)
                     .await
                     .map_err(EdgeError::from)?;
                 validate_reset_target(&history, req.workflow_task_finish_event_id)?;
@@ -8260,24 +8260,31 @@ impl WorkflowService {
                         .and_then(|value| value.to_str().ok()),
                     Some("temporal-cli") | Some("temporal-ui")
                 );
-                let limit = if req.maximum_page_size > 0 {
-                    req.maximum_page_size
-                } else {
-                    usize::MAX
-                };
+                let limit = effective_history_page_size(req.maximum_page_size);
+                let mut cursor = caller_last_event_id;
 
                 loop {
                     let history = self
                         .repo
-                        .read_attributed_history(run_key, caller_last_event_id, limit)
+                        .read_attributed_history(run_key, cursor, limit)
                         .await
                         .map_err(EdgeError::from)?;
                     let current_last_event_id = history
                         .last()
                         .map(|attributed| attributed.event.event_id)
-                        .unwrap_or(caller_last_event_id);
+                        .unwrap_or(cursor);
                     let filtered =
                         filter_attributed_history_events(&history, req.history_event_filter_type);
+                    // A close-event read skips a full page that holds no close event:
+                    // more events follow it, so waiting for new ones would stall the
+                    // poll until it expired, once per page.
+                    if req.history_event_filter_type == 2
+                        && filtered.is_empty()
+                        && history.len() >= limit
+                    {
+                        cursor = current_last_event_id;
+                        continue;
+                    }
 
                     tracing::debug!(
                         run_key = ?run_key,
@@ -8302,8 +8309,12 @@ impl WorkflowService {
                         let reached_close = history
                             .iter()
                             .any(|attributed| is_close_history_event(&attributed.event.kind));
+                        // Nothing follows a run's close event, so the page that holds it
+                        // ends the read even when it is full, as v1.31.0 ends a closed
+                        // run's read (api.go:327-398, 488 @ v1.31.0). A token there would
+                        // send a following client to wait on a closed run.
                         let next_page_token =
-                            if more_events || (req.wait_new_event && !reached_close) {
+                            if !reached_close && (more_events || req.wait_new_event) {
                                 encode_history_page_token(current_last_event_id)
                             } else {
                                 Vec::new()
@@ -8412,35 +8423,33 @@ impl WorkflowService {
                         req.run_id.as_deref(),
                     )
                     .await?;
-                let history = self
-                    .repo
-                    .read_attributed_history(run_key, 0, usize::MAX)
-                    .await
-                    .map_err(EdgeError::from)?;
-
-                let before_event_id = decode_reverse_history_page_token(&req.next_page_token)
-                    .map_err(EdgeError::BadRequest)?;
-                let limit = if req.maximum_page_size > 0 {
-                    req.maximum_page_size
-                } else {
-                    usize::MAX
+                let page_size = effective_history_page_size(req.maximum_page_size);
+                // The first page ends at the run's last event, from its state.
+                let before_event_id = match decode_reverse_history_page_token(&req.next_page_token)
+                    .map_err(EdgeError::BadRequest)?
+                {
+                    Some(before_event_id) => before_event_id,
+                    None => read_last_event_id(self.repo.as_ref(), run_key).await? + 1,
                 };
-
-                let mut reversed: Vec<_> = history
-                    .into_iter()
-                    .filter(|attributed| {
-                        before_event_id
-                            .map(|value| attributed.event.event_id < value)
-                            .unwrap_or(true)
-                    })
-                    .collect();
-                reversed.sort_by_key(|attributed| std::cmp::Reverse(attributed.event.event_id));
-
-                let page: Vec<_> = reversed.into_iter().take(limit).collect();
-                let next_page_token = page
-                    .last()
-                    .map(|attributed| encode_reverse_history_page_token(attributed.event.event_id))
-                    .unwrap_or_default();
+                // Event ids are dense, so the page before `before_event_id` is a
+                // forward read of the events ending at `before_event_id - 1`.
+                let (after_event_id, count) = reverse_history_window(before_event_id, page_size);
+                let mut page = if count == 0 {
+                    Vec::new()
+                } else {
+                    self.repo
+                        .read_attributed_history(run_key, after_event_id, count)
+                        .await
+                        .map_err(EdgeError::from)?
+                };
+                page.reverse();
+                // Empty once the page reaches event 1: nothing is older.
+                let next_page_token = match page.last() {
+                    Some(oldest) if oldest.event.event_id > 1 => {
+                        encode_reverse_history_page_token(oldest.event.event_id)
+                    }
+                    _ => Vec::new(),
+                };
                 let (history, history_principals): (Vec<_>, Vec<_>) = page
                     .into_iter()
                     .map(|attributed| (attributed.event, attributed.principal))
@@ -9440,13 +9449,37 @@ fn map_update_lifecycle_error(
     }
 }
 
+/// The run's last event id, from its state rather than its history
+/// (`history-pagination` criterion 2.7).
 async fn read_last_event_id(repo: &dyn RunRepository, run_key: RunKey) -> Result<i64> {
-    Ok(repo
-        .read_history(run_key, 0, usize::MAX)
-        .await?
-        .last()
-        .map(|event| event.event_id)
-        .unwrap_or(0))
+    Ok(match repo.load_run(run_key).await? {
+        LoadedRun::Existing(state) => state.last_event_id,
+        LoadedRun::Absent => 0,
+    })
+}
+
+/// The page size both history calls use: 256 when the request asks for 0 or for
+/// more than 256, as v1.31.0 does (`service/frontend/workflow_handler.go:909-927,
+/// 976-992`; `common/primitives/constants.go:20-21 @ v1.31.0`).
+fn effective_history_page_size(requested: usize) -> usize {
+    if requested == 0 || requested > HISTORY_MAX_PAGE_SIZE {
+        HISTORY_MAX_PAGE_SIZE
+    } else {
+        requested
+    }
+}
+
+/// The largest history page, v1.31.0's `GetHistoryMaxPageSize`.
+const HISTORY_MAX_PAGE_SIZE: usize = 256;
+
+/// The forward read that yields the reverse page before `before_event_id`:
+/// the cursor to read after and how many events to read, for at most
+/// `page_size` events ending at `before_event_id - 1`.
+fn reverse_history_window(before_event_id: i64, page_size: usize) -> (i64, usize) {
+    let page_size = i64::try_from(page_size).unwrap_or(i64::MAX);
+    let first_event_id = before_event_id.saturating_sub(page_size).max(1);
+    let count = usize::try_from(before_event_id - first_event_id).unwrap_or(0);
+    (first_event_id - 1, count)
 }
 
 /// Validate a namespace state transition against the v1.31.0 rules.
@@ -11342,7 +11375,7 @@ mod tests {
         assert!(response.eager_workflow_task.is_some());
         let history = runtime
             .repo()
-            .read_history(response.run_key, 0, usize::MAX)
+            .read_history_to_end(response.run_key, 0)
             .await?;
         assert_eq!(
             history[0].kind.eager_execution_accepted(),
@@ -11368,7 +11401,7 @@ mod tests {
         assert!(non_eager.eager_workflow_task.is_none());
         let non_eager_history = runtime
             .repo()
-            .read_history(non_eager.run_key, 0, usize::MAX)
+            .read_history_to_end(non_eager.run_key, 0)
             .await?;
         assert_eq!(
             non_eager_history[0].kind.eager_execution_accepted(),
@@ -11891,5 +11924,307 @@ mod tests {
             error,
             EdgeError::BadRequest(message) if message == "Priority is not provided"
         ));
+    }
+
+    // ── history-pagination ──
+
+    /// A started run with `signals` signals appended after its first two events,
+    /// and its whole history.
+    async fn run_with_signals(
+        signals: usize,
+    ) -> Result<(
+        WorkflowService,
+        Arc<TokeiraRuntime<InMemoryStore>>,
+        ExecutionRef,
+        RunKey,
+        Vec<tokeira_kernel::HistoryEvent>,
+    )> {
+        let (service, runtime, namespace_id, workflow_id, run_id) = update_test_service().await?;
+        let execution = ExecutionRef {
+            namespace_id,
+            workflow_id,
+            run_id: Some(run_id),
+        };
+        for index in 0..signals {
+            runtime
+                .signal_workflow(
+                    execution.clone(),
+                    tokeira_kernel::SignalRequest {
+                        signal_name: "tick".to_string(),
+                        input: Payloads::default(),
+                        header: None,
+                        links: Vec::new(),
+                        request: RequestContext {
+                            request_id: RequestId(format!("history-signal-{index}")),
+                            caller_identity: None,
+                            principal: None,
+                            received_at: OffsetDateTime::now_utc(),
+                        },
+                        now: OffsetDateTime::now_utc(),
+                    },
+                )
+                .await?;
+        }
+        let run_key = service
+            .repo
+            .resolve_execution(&execution)
+            .await?
+            .expect("the run exists");
+        let history = service.repo.read_history_to_end(run_key, 0).await?;
+        Ok((service, runtime, execution, run_key, history))
+    }
+
+    fn history_request(
+        execution: &ExecutionRef,
+        maximum_page_size: usize,
+        next_page_token: Vec<u8>,
+    ) -> crate::translate::GetWorkflowExecutionHistoryRequest {
+        crate::translate::GetWorkflowExecutionHistoryRequest {
+            namespace: "default".to_string(),
+            workflow_id: execution.workflow_id.0.clone(),
+            run_id: execution.run_id.map(|run_id| run_id.0.to_string()),
+            maximum_page_size,
+            wait_new_event: false,
+            history_event_filter_type: 1,
+            next_page_token,
+        }
+    }
+
+    #[test]
+    fn history_page_size_follows_v1_31() {
+        assert_eq!(super::effective_history_page_size(0), 256);
+        assert_eq!(super::effective_history_page_size(1), 1);
+        assert_eq!(super::effective_history_page_size(256), 256);
+        assert_eq!(super::effective_history_page_size(257), 256);
+        assert_eq!(super::effective_history_page_size(usize::MAX), 256);
+    }
+
+    proptest! {
+        #[test]
+        fn reverse_window_reads_the_events_before_the_cursor(
+            before in 0i64..5_000,
+            page_size in 1usize..600,
+        ) {
+            let (after, count) = super::reverse_history_window(before, page_size);
+            let expected = usize::try_from((before - 1).max(0)).unwrap_or(0).min(page_size);
+            prop_assert_eq!(count, expected);
+            if count > 0 {
+                // the window ends at `before - 1`
+                prop_assert_eq!(after + i64::try_from(count).unwrap_or(0), before - 1);
+            }
+        }
+    }
+
+    /// Signals for a run of `signals + 2` events, weighted towards histories of
+    /// exactly one and two full pages of 256.
+    fn history_signals() -> impl Strategy<Value = usize> {
+        prop_oneof![0usize..700, Just(254usize), Just(510usize)]
+    }
+
+    /// v1.31.0's page size for a history call, the reference for Properties 2
+    /// and 3 (`service/frontend/workflow_handler.go:909-927 @ v1.31.0`).
+    fn v1_31_page_size(requested: usize) -> usize {
+        if requested == 0 || requested > 256 {
+            256
+        } else {
+            requested
+        }
+    }
+
+    /// Requested page sizes, weighted towards v1.31.0's bounds.
+    fn requested_history_page_size() -> impl Strategy<Value = usize> {
+        prop_oneof![
+            Just(0usize),
+            1usize..300,
+            Just(256usize),
+            Just(257usize),
+            257usize..100_000,
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: history-pagination, Property 2: Forward pages follow v1.31.0's page size
+        #[test]
+        fn forward_history_pages_follow_the_v1_31_page_size(
+            signals in history_signals(),
+            requested in requested_history_page_size(),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let (service, _runtime, execution, _run_key, history) =
+                    run_with_signals(signals).await.expect("run");
+                prop_assert_eq!(history.len(), signals + 2);
+                let size = v1_31_page_size(requested);
+                let mut token = Vec::new();
+                let mut read = Vec::new();
+                loop {
+                    let page = service
+                        .get_workflow_execution_history(
+                            &HeaderMap::new(),
+                            history_request(&execution, requested, token),
+                        )
+                        .await
+                        .expect("page");
+                    prop_assert!(page.history.len() <= size);
+                    // A token follows every full page and no short one.
+                    prop_assert_eq!(page.next_page_token.is_empty(), page.history.len() < size);
+                    read.extend(page.history);
+                    if page.next_page_token.is_empty() {
+                        break;
+                    }
+                    token = page.next_page_token;
+                }
+                prop_assert_eq!(read, history);
+                Ok(())
+            })?;
+        }
+
+        // Feature: history-pagination, Property 3: Reverse pages start at the last event
+        #[test]
+        fn reverse_history_pages_start_at_the_last_event(
+            signals in history_signals(),
+            requested in requested_history_page_size(),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let (service, _runtime, execution, _run_key, history) =
+                    run_with_signals(signals).await.expect("run");
+                prop_assert_eq!(history.len(), signals + 2);
+                let newest_first: Vec<_> = history.iter().rev().cloned().collect();
+                let size = v1_31_page_size(requested);
+                let mut token = Vec::new();
+                let mut read = Vec::new();
+                loop {
+                    let page = service
+                        .get_workflow_execution_history_reverse(
+                            &HeaderMap::new(),
+                            crate::translate::GetWorkflowExecutionHistoryReverseRequest {
+                                namespace: "default".to_string(),
+                                workflow_id: execution.workflow_id.0.clone(),
+                                run_id: execution.run_id.map(|run_id| run_id.0.to_string()),
+                                maximum_page_size: requested,
+                                next_page_token: token,
+                            },
+                        )
+                        .await
+                        .expect("page");
+                    let reaches_first =
+                        page.history.last().is_some_and(|event| event.event_id == 1);
+                    // Every page is full except the one that reaches event 1,
+                    // and only that page leaves the token empty.
+                    if reaches_first {
+                        prop_assert!(page.history.len() <= size);
+                    } else {
+                        prop_assert_eq!(page.history.len(), size);
+                    }
+                    prop_assert_eq!(page.next_page_token.is_empty(), reaches_first);
+                    read.extend(page.history);
+                    if page.next_page_token.is_empty() {
+                        break;
+                    }
+                    token = page.next_page_token;
+                }
+                prop_assert_eq!(read, newest_first);
+                Ok(())
+            })?;
+        }
+    }
+
+    async fn terminate_run(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        execution: &ExecutionRef,
+    ) -> Result<()> {
+        runtime
+            .terminate_workflow(
+                execution.clone(),
+                tokeira_kernel::TerminateRequest {
+                    reason: "done".to_string(),
+                    details: None,
+                    identity: "history-test".to_string(),
+                    links: Vec::new(),
+                    request: RequestContext {
+                        request_id: RequestId("history-terminate".to_string()),
+                        caller_identity: None,
+                        principal: None,
+                        received_at: OffsetDateTime::now_utc(),
+                    },
+                    now: OffsetDateTime::now_utc(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_full_page_ending_at_the_close_event_carries_no_token() -> Result<()> {
+        // 253 signals and the termination make 256 events, so the close event
+        // ends the first full page.
+        let (service, runtime, execution, run_key, _history) = run_with_signals(253).await?;
+        terminate_run(&runtime, &execution).await?;
+        assert_eq!(
+            service.repo.read_history_to_end(run_key, 0).await?.len(),
+            256
+        );
+        for (filter_type, events) in [(1, 256), (2, 1)] {
+            for wait_new_event in [false, true] {
+                let mut request = history_request(&execution, 0, Vec::new());
+                request.history_event_filter_type = filter_type;
+                request.wait_new_event = wait_new_event;
+                let page = service
+                    .get_workflow_execution_history(&HeaderMap::new(), request)
+                    .await?;
+                let case = format!("filter {filter_type}, wait_new_event {wait_new_event}");
+                assert_eq!(page.history.len(), events, "{case}");
+                assert!(
+                    page.history
+                        .last()
+                        .is_some_and(|event| super::is_close_history_event(&event.kind)),
+                    "{case}"
+                );
+                assert!(page.next_page_token.is_empty(), "{case}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_event_poll_finds_the_close_event_past_the_first_page() -> Result<()> {
+        let (service, runtime, execution, _run_key, _history) = run_with_signals(300).await?;
+        terminate_run(&runtime, &execution).await?;
+        let mut request = history_request(&execution, 0, Vec::new());
+        request.wait_new_event = true;
+        request.history_event_filter_type = 2;
+        // Without skipping full pages, the poll would wait out its 20 s expiry
+        // once per page before it reached the close event.
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.get_workflow_execution_history(&HeaderMap::new(), request),
+        )
+        .await
+        .expect("the close-event poll returns without waiting")?;
+        assert_eq!(page.history.len(), 1);
+        assert!(super::is_close_history_event(&page.history[0].kind));
+        assert!(page.next_page_token.is_empty());
+        Ok(())
+    }
+
+    // Feature: history-pagination, Property 4: Single facts come from state or by id
+    #[tokio::test]
+    async fn last_event_id_comes_from_run_state() -> Result<()> {
+        let (service, _runtime, _execution, run_key, history) = run_with_signals(300).await?;
+        let last = history.last().expect("history").event_id;
+        assert_eq!(
+            super::read_last_event_id(service.repo.as_ref(), run_key).await?,
+            last
+        );
+        Ok(())
     }
 }

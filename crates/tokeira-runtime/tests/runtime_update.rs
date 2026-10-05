@@ -476,7 +476,7 @@ async fn terminal_update_outcome_survives_runtime_recreation() -> Result<()> {
         })
     );
 
-    let history = store.read_history(run_key, 0, usize::MAX).await?;
+    let history = store.read_history_to_end(run_key, 0).await?;
     let terminal_events = history
         .iter()
         .filter(|event| {
@@ -528,7 +528,7 @@ async fn poll_update_is_read_only_for_known_and_unknown_updates() -> Result<()> 
         tokeira_kernel::LoadedRun::Existing(state) => state,
         tokeira_kernel::LoadedRun::Absent => anyhow::bail!("run disappeared"),
     };
-    let before_history = store.read_history(run_key, 0, usize::MAX).await?;
+    let before_history = store.read_history_to_end(run_key, 0).await?;
 
     let current = runtime
         .poll_workflow_update(
@@ -559,7 +559,7 @@ async fn poll_update_is_read_only_for_known_and_unknown_updates() -> Result<()> 
         tokeira_kernel::LoadedRun::Existing(state) => state,
         tokeira_kernel::LoadedRun::Absent => anyhow::bail!("run disappeared"),
     };
-    let after_history = store.read_history(run_key, 0, usize::MAX).await?;
+    let after_history = store.read_history_to_end(run_key, 0).await?;
     assert_eq!(after_state, before_state);
     assert_eq!(after_history, before_history);
     Ok(())

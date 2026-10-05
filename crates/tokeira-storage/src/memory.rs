@@ -4726,6 +4726,70 @@ mod tests {
         }
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        // Feature: history-pagination, Property 1: Pages concatenate to the history
+        #[test]
+        fn property_history_pages_concatenate_to_the_history(
+            event_count in 0usize..=3_000,
+            limit in 1usize..=2_000,
+            start in 0usize..=3_000,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let store = InMemoryStore::default();
+                let run_key = RunKey::new();
+                let history: Vec<HistoryEvent> = (1..=event_count as i64)
+                    .map(|event_id| {
+                        history_event(
+                            event_id,
+                            fixed_now(),
+                            HistoryEventKind::WorkflowExecutionTerminated {
+                                reason: format!("event-{event_id}"),
+                                details: None,
+                                identity: "history-test".to_string(),
+                                links: Vec::new(),
+                            },
+                        )
+                    })
+                    .collect();
+                store.inner.lock().await.history.insert(run_key, history.clone());
+
+                // Pages from event 0, each after the previous page's last event.
+                let mut pages = Vec::new();
+                let mut cursor = 0;
+                loop {
+                    let page = store.read_history(run_key, cursor, limit).await.unwrap();
+                    assert!(page.len() <= limit);
+                    let short = page.len() < limit;
+                    if let Some(last) = page.last() {
+                        cursor = last.event_id;
+                    }
+                    pages.push(page);
+                    if short {
+                        break;
+                    }
+                }
+                let (last_page, full_pages) = pages.split_last().unwrap();
+                assert!(full_pages.iter().all(|page| page.len() == limit));
+                assert!(last_page.len() < limit);
+                let concatenated: Vec<HistoryEvent> = pages.concat();
+                assert_eq!(concatenated, history);
+
+                assert_eq!(store.read_history_to_end(run_key, 0).await.unwrap(), history);
+                let after = start.min(event_count);
+                assert_eq!(
+                    store
+                        .read_history_to_end(run_key, after as i64)
+                        .await
+                        .unwrap(),
+                    history[after..].to_vec()
+                );
+            });
+        }
+    }
+
     #[tokio::test]
     async fn default_policy_is_reject() {
         let store = InMemoryStore::default();
@@ -6106,7 +6170,7 @@ mod tests {
                     store.load_run(run_key).await.unwrap(),
                     LoadedRun::Absent
                 ));
-                prop_assert!(store.read_history(run_key, 0, usize::MAX).await.unwrap().is_empty());
+                prop_assert!(store.read_history_to_end(run_key, 0).await.unwrap().is_empty());
                 prop_assert_eq!(
                     store
                         .resolve_execution(&ExecutionRef {

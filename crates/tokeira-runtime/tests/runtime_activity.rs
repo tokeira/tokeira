@@ -9,7 +9,7 @@ use tokeira_kernel::{
 };
 use tokeira_runtime::{
     ActivityTokenResolutionError, BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    UpdateActivitiesOptionsRequest, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -698,6 +698,95 @@ async fn update_activity_options_applies_field_changes_to_scheduled_activity() -
     );
     assert_eq!(activity.start_to_close_timeout, Some(Duration::minutes(2)));
     assert_eq!(activity.heartbeat_timeout, None);
+    Ok(())
+}
+
+// Feature: history-pagination, Property 4: Single facts come from state or by id
+#[tokio::test]
+async fn restoring_activity_options_reads_the_scheduled_event_by_id() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let run_key = start_and_schedule_activity(
+        &runtime,
+        NamespaceId::new(),
+        WorkflowId("restore-activity-options".to_string()),
+        "activity-1",
+        None,
+    )
+    .await?;
+    let request = |request_id: &str| RequestContext {
+        request_id: RequestId(request_id.to_string()),
+        caller_identity: Some("operator".to_string()),
+        principal: None,
+        received_at: OffsetDateTime::now_utc(),
+    };
+
+    // Move the options away from those the activity was scheduled with...
+    runtime
+        .submit(
+            run_key,
+            Command::UpdateActivityOptions(UpdateActivityOptionsRequest {
+                target: tokeira_kernel::ActivityControlTarget::Id("activity-1".to_string()),
+                task_queue: FieldChange::Set(TaskQueueName("activity-q-b".to_string())),
+                schedule_to_close_timeout: FieldChange::Set(Some(Duration::minutes(9))),
+                schedule_to_start_timeout: FieldChange::Unchanged,
+                start_to_close_timeout: FieldChange::Set(Some(Duration::minutes(2))),
+                heartbeat_timeout: FieldChange::Clear,
+                retry_policy: tokeira_kernel::ActivityRetryPolicyPatch::default(),
+                priority: ActivityPriorityPatch::Unchanged,
+                original_options: std::collections::BTreeMap::new(),
+                restore_original_options: false,
+                reschedule_at: std::collections::BTreeMap::new(),
+                request: request("req-change-activity-options"),
+                now: OffsetDateTime::now_utc(),
+            }),
+        )
+        .await?;
+    // ...then restore them, which reads the activity's scheduled event.
+    runtime
+        .update_activity_options(
+            run_key,
+            UpdateActivitiesOptionsRequest {
+                target: tokeira_kernel::ActivityControlTarget::Id("activity-1".to_string()),
+                task_queue: FieldChange::Unchanged,
+                schedule_to_close_timeout: FieldChange::Unchanged,
+                schedule_to_start_timeout: FieldChange::Unchanged,
+                start_to_close_timeout: FieldChange::Unchanged,
+                heartbeat_timeout: FieldChange::Unchanged,
+                retry_policy: tokeira_kernel::ActivityRetryPolicyPatch::default(),
+                priority: ActivityPriorityPatch::Unchanged,
+                restore_original_options: true,
+                request: request("req-restore-activity-options"),
+                now: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+
+    let LoadedRun::Existing(state) = store.load_run(run_key).await? else {
+        panic!("run should exist after the restore");
+    };
+    let activity = state
+        .activities
+        .get("activity-1")
+        .expect("activity should still be tracked");
+    assert_eq!(activity.task_queue, TaskQueueName("activity-q".to_string()));
+    assert_eq!(
+        activity.schedule_to_close_timeout,
+        Some(Duration::minutes(5))
+    );
+    assert_eq!(
+        activity.schedule_to_start_timeout,
+        Some(Duration::seconds(30))
+    );
+    assert_eq!(activity.start_to_close_timeout, Some(Duration::minutes(1)));
+    assert_eq!(activity.heartbeat_timeout, Some(Duration::seconds(20)));
     Ok(())
 }
 

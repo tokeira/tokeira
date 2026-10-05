@@ -44,15 +44,6 @@ use crate::recovery_index::{
 /// The schema supports partitioned projection scans; the MVP uses one logical
 /// fanout value while still assigning deterministic partitions.
 const PROJECTION_FANOUT: i16 = 1;
-const DEFAULT_HISTORY_PAGE_SIZE: usize = 1000;
-
-fn effective_history_limit(limit: usize) -> usize {
-    if limit == usize::MAX {
-        DEFAULT_HISTORY_PAGE_SIZE
-    } else {
-        limit
-    }
-}
 
 fn dsql_retry_operation_label(
     operation: &str,
@@ -743,11 +734,11 @@ mod tests {
     };
 
     use super::{
-        ActivityDispatchRow, DEFAULT_HISTORY_PAGE_SIZE, DsqlConnectionAcquirer, DsqlRunRepository,
-        RenewDecision, activity_dispatch_from_row, classify_connection_error, classify_outcome,
+        ActivityDispatchRow, DsqlConnectionAcquirer, DsqlRunRepository, RenewDecision,
+        activity_dispatch_from_row, classify_connection_error, classify_outcome,
         collect_dispatchable_workflow_tasks, decide_renew, dispatchable_workflow_task,
-        effective_history_limit, epoch_from_sql, epoch_to_sql, extract_sqlstate, interpret_acquire,
-        partition_for, should_check_epoch,
+        epoch_from_sql, epoch_to_sql, extract_sqlstate, interpret_acquire, partition_for,
+        should_check_epoch,
     };
     use crate::{
         BacklogPayload, CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository,
@@ -774,16 +765,6 @@ mod tests {
             let partition_id = partition_for(run_key, partition_count);
 
             prop_assert!(partition_id < partition_count);
-        }
-
-        #[test]
-        fn read_history_effective_limit_preserves_finite_limits(limit in 0usize..10_000) {
-            prop_assert_eq!(effective_history_limit(limit), limit);
-        }
-
-        #[test]
-        fn read_history_legacy_unbounded_limit_uses_default_page_size(_seed in any::<u64>()) {
-            prop_assert_eq!(effective_history_limit(usize::MAX), DEFAULT_HISTORY_PAGE_SIZE);
         }
 
         #[test]
@@ -1447,6 +1428,13 @@ mod tests {
             .await;
 
         assert_eq!(recorder.classes(), vec![DbClass::Control, DbClass::Control]);
+    }
+
+    #[test]
+    fn read_history_fetches_batches_a_page_at_a_time() {
+        let sql = super::load::READ_HISTORY_BATCHES_SQL;
+        assert!(sql.contains("ORDER BY first_event_id ASC"));
+        assert!(sql.trim_end().ends_with("LIMIT $3"));
     }
 
     #[tokio::test]

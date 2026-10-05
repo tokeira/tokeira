@@ -2104,10 +2104,7 @@ mod tests {
         else {
             panic!("fresh eager start should exist");
         };
-        let before_history = repo
-            .read_history(request.run_key, 0, usize::MAX)
-            .await
-            .unwrap();
+        let before_history = repo.read_history_to_end(request.run_key, 0).await.unwrap();
 
         let immediate = runtime
             .start_workflow_with_policy(request.clone())
@@ -2127,9 +2124,7 @@ mod tests {
         };
         assert_eq!(immediate_state.transition_seq, before_state.transition_seq);
         assert_eq!(
-            repo.read_history(request.run_key, 0, usize::MAX)
-                .await
-                .unwrap(),
+            repo.read_history_to_end(request.run_key, 0).await.unwrap(),
             before_history
         );
 
@@ -2149,10 +2144,7 @@ mod tests {
         let LoadedRun::Existing(after_state) = repo.load_run(request.run_key).await.unwrap() else {
             panic!("deduped eager start should still exist");
         };
-        let after_history = repo
-            .read_history(request.run_key, 0, usize::MAX)
-            .await
-            .unwrap();
+        let after_history = repo.read_history_to_end(request.run_key, 0).await.unwrap();
         assert_eq!(after_state.transition_seq, before_state.transition_seq);
         assert_eq!(after_history, before_history);
     }
@@ -2292,10 +2284,7 @@ mod tests {
         let LoadedRun::Existing(before_state) = repo.load_run(first.run_key).await.unwrap() else {
             panic!("started run should still exist");
         };
-        let before_history = repo
-            .read_history(first.run_key, 0, usize::MAX)
-            .await
-            .unwrap();
+        let before_history = repo.read_history_to_end(first.run_key, 0).await.unwrap();
 
         let mut second = sample_start_request(None, None);
         second.namespace_id = first.namespace_id;
@@ -2330,10 +2319,7 @@ mod tests {
         let LoadedRun::Existing(after_state) = repo.load_run(first.run_key).await.unwrap() else {
             panic!("rejected attachment must preserve the run");
         };
-        let after_history = repo
-            .read_history(first.run_key, 0, usize::MAX)
-            .await
-            .unwrap();
+        let after_history = repo.read_history_to_end(first.run_key, 0).await.unwrap();
         assert_eq!(after_state, before_state);
         assert_eq!(after_history, before_history);
     }

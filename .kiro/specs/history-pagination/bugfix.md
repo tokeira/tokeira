@@ -40,7 +40,7 @@ Each DSQL read also fetches every history batch after its cursor before decoding
 
 2.4 WHEN GetWorkflowExecutionHistory or GetWorkflowExecutionHistoryReverse is called with a `maximum_page_size` of 0 or less, or above 256, THEN the edge SHALL use 256, as v1.31.0 does (`service/frontend/workflow_handler.go:909-927, 976-992 @ v1.31.0`).
 
-2.5 WHEN a GetWorkflowExecutionHistory page is full THEN the response SHALL carry a `next_page_token` for the events after it. WHEN the page is shorter THEN the token SHALL be empty, except where `wait_new_event` keeps a token on an open run, as it does today.
+2.5 WHEN a GetWorkflowExecutionHistory page is full THEN the response SHALL carry a `next_page_token` for the events after it, unless the page holds the run's close event. WHEN the page is shorter, or holds the run's close event, THEN the token SHALL be empty, except where `wait_new_event` keeps a token on an open run, as it does today. Nothing follows a close event, and v1.31.0 ends a closed run's read there (`service/history/api/getworkflowexecutionhistory/api.go:327-398 @ v1.31.0`).
 
 2.6 WHEN GetWorkflowExecutionHistoryReverse is called without a token THEN its first page SHALL end at the run's last event, taken from the run's state. Each page SHALL hold the page size's worth of events before its token's event id, newest first, and the token SHALL be empty on the page that includes event 1.
 
@@ -54,7 +54,7 @@ Each DSQL read also fetches every history batch after its cursor before decoding
 
 3.1 WHEN a page has fewer events than the limit because the history ends THEN both repositories SHALL CONTINUE TO return exactly the remaining events
 
-3.2 WHEN GetWorkflowExecutionHistory is called with `wait_new_event` or with the close-event filter THEN the edge SHALL CONTINUE TO apply today's token and filtering rules to each page
+3.2 WHEN GetWorkflowExecutionHistory is called with `wait_new_event` or with the close-event filter THEN the edge SHALL CONTINUE TO apply today's token and filtering rules to each page it returns, except that a close-event read reads on past a full page that holds no close event, rather than returning that page or waiting on it, and the page that holds the close event ends the read (criterion 2.5)
 
 3.3 WHEN a workflow task is delivered THEN its poll response SHALL CONTINUE TO carry the history up to the event the task started at, read with an exact limit (`translate/from_internal.rs`)
 

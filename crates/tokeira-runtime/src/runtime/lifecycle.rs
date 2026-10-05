@@ -1339,21 +1339,21 @@ where
         state: &tokeira_kernel::WorkflowState,
         target: &ActivityControlTarget,
     ) -> Result<std::collections::BTreeMap<String, tokeira_kernel::ActivityOriginalOptions>> {
-        let history = self.repo.read_history(run_key, 0, usize::MAX).await?;
-        // Index the schedule events once so a type/all restore is O(H + A)
-        // rather than a full-history scan per matching activity.
-        let events_by_id: std::collections::HashMap<i64, &_> = history
-            .iter()
-            .map(|event| (event.event_id, event))
-            .collect();
         let mut options = std::collections::BTreeMap::new();
         for activity in state
             .activities
             .values()
             .filter(|activity| target.matches(activity))
         {
-            let scheduled = events_by_id
-                .get(&activity.schedule_event_id)
+            // Read the schedule event by its id rather than the whole history
+            // (`history-pagination` criterion 2.8).
+            let scheduled = self
+                .repo
+                .read_history(run_key, activity.schedule_event_id - 1, 1)
+                .await?
+                .into_iter()
+                .next()
+                .filter(|event| event.event_id == activity.schedule_event_id)
                 .ok_or_else(|| anyhow!("activity schedule event not found"))?;
             let HistoryEventKind::ActivityTaskScheduled {
                 task_queue,
@@ -1957,7 +1957,7 @@ mod tests {
             LoadedRun::Absent
         ));
         assert!(
-            repo.read_history(run_key, 0, usize::MAX)
+            repo.read_history_to_end(run_key, 0)
                 .await
                 .unwrap()
                 .is_empty()

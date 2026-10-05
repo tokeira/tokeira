@@ -708,7 +708,9 @@ attempts conditional release.
 
 The embedded-owner claim complements rather than replaces the existing per-shard DSQL
 leases and epochs. After owner acquisition, the existing self-assignment path acquires all
-configured shards for the same process incarnation before admission opens. Clean shutdown
+configured shards for the same process incarnation, and runs the recovery sweep for each,
+before admission opens (runtime-sweeper-recovery Requirement 11.6). A shard whose lease
+or sweep fails rolls back the shards already taken and fails startup. Clean shutdown
 relinquishes those shard leases before releasing the singleton owner claim; crash recovery
 waits for their existing expiry/fencing rules. No shard epoch or transition shape changes.
 

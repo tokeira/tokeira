@@ -83,7 +83,8 @@ second transport for the transport-independence evidence.
 | State format | Kernel state and history batches are unversioned positional postcard; a trailing field addition makes older blobs undecodable (verified by a scratch round trip: old→new fails with `DeserializeUnexpectedEnd`). | Hot state and history batches carry Blob Envelopes; pre-envelope blobs fail loudly with a named error; startup refuses to migrate a cluster whose hot table holds pre-envelope rows. |
 
 Out of scope: enforcing `limit.historySize.error`, `limit.historyCount.error`, or
-`history.maxTotalUpdates` as hard limits; forcing continuation; changing SDK behaviour;
+`history.maxTotalUpdates` as hard limits ([run-growth-limits](../run-growth-limits/bugfix.md)
+enforces the first two); forcing continuation; changing SDK behaviour;
 warning-level thresholds; envelopes for activity, timer, and other side-table blobs.
 
 ## Evidence From Current Code
@@ -458,6 +459,7 @@ rather than in a new envelope version.
   events whose next started event is 4096 already meets it, exactly as `nextEventID` does
   in v1.31.0.
 - The hard limits `limit.historySize.error` and `limit.historyCount.error` stay
-  `NotEnforced`; enforcing them is a separate decision.
+  `NotEnforced` here; [run-growth-limits](../run-growth-limits/bugfix.md) enforces them
+  against this spec's History Size.
 - The scratch postcard round trip that verified the layout break is not committed; the
   design records the result.

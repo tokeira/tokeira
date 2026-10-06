@@ -6,7 +6,7 @@ Temporal v1.31.0 bounds what a client or worker can send. Each payload field may
 
 Tokeira checks none of these limits when a request arrives. Only the gRPC layer's 4 MiB message cap bounds a payload. So payloads that v1.31.0 refuses, up to 4 MiB, reach the runtime and storage. There they are either stored, which v1.31.0 never does, or fail at DSQL's 1 MiB column limit with a storage error instead of v1.31.0's answer.
 
-This spec covers the limits v1.31.0 applies when a request arrives. The limits on a workflow task's commands are in [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md). Those on a run's signals, updates, history and state are a separate change.
+This spec covers the limits v1.31.0 applies when a request arrives. The limits on a workflow task's commands are in [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md). Those on a run's history, state, history batches and buffered events are in [run-growth-limits](../run-growth-limits/bugfix.md); those on its signals and updates are a separate change.
 
 ## Bug Analysis
 
@@ -67,6 +67,6 @@ This spec covers the limits v1.31.0 applies when a request arrives. The limits o
 ### Out of Scope
 
 - Limits on a workflow task's commands, which v1.31.0 enforces by failing the task and terminating the run: [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md).
-- The limits on a run's signals (10,000), updates, buffered events, history, state and history batches.
+- The limits on a run's buffered events, history, state and history batches, which [run-growth-limits](../run-growth-limits/bugfix.md) covers, and on its signals (10,000) and updates.
 - Payloads between 1 and 2 MiB, which v1.31.0 accepts and which DSQL still can't store in one column.
 - Registered-key checks on a workflow start. v1.31.0 rejects a key that isn't registered (`common/searchattribute/validator.go:101 @ v1.31.0`); Tokeira's workflow starts don't check, which is a separate gap.

@@ -58,6 +58,7 @@ adopts the observable contract, not Temporal's structures.
 
 - Hard limits (`limit.historySize.error`, `limit.historyCount.error`,
   `history.maxTotalUpdates` enforcement) and warning thresholds.
+  [run-growth-limits](../run-growth-limits/bugfix.md) enforces the first two.
 - Forcing continuation or any lifecycle change driven by the Advice.
 - Envelopes for activity, timer, dispatch, or side-table blobs.
 - Public-proto byte accounting; the statistic is the store's own encoding.

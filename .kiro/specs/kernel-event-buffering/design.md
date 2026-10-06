@@ -130,7 +130,8 @@ fn append_external(kind) -> event id:
 Every kernel site that records an externally-originated event calls it: signal, cancel request, timer
 fired, activity started and resolved, child started and resolved, external signal and cancel results,
 Nexus started, resolved and cancel-request results, pause, unpause, options update. The sites keep their
-surrounding logic (no second WFT while one is pending, the buffered-event limit after a buffer). Paths
+surrounding logic (no second WFT while one is pending, the buffered-event limit after a buffer, which
+[run-growth-limits](../run-growth-limits/bugfix.md) moves to the end of every transition). Paths
 that write the workflow task's own events, command events, update events or run-closing events keep
 calling `emit` directly. The per-site `materialize_scheduled_speculative()` calls fold into this rule.
 

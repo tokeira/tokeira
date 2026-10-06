@@ -110,7 +110,7 @@ _For any_ generated payloads, memos and search attributes, the sizes the kernel 
 ### Out of scope
 
 - Search attribute validation on ContinueAsNew and StartChild beyond the key count, and Nexus command validation beyond the input size and pending count (bugfix Out of Scope).
-- A run's growth limits, and its signal and update limits, which separate changes cover.
+- A run's growth limits, which [run-growth-limits](../run-growth-limits/bugfix.md) covers, and its signal and update limits, which a separate change covers.
 
 ## Testing Strategy
 

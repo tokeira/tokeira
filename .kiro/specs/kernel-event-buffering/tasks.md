@@ -89,6 +89,8 @@ warnings`, `cargo +nightly fmt`, and `cargo test -p tokeira-kernel`.
 > `TestBufferedEventsMutableStateSizeLimit` needs
 > `OverrideDynamicConfig(MutableStateSizeLimitError=410KB)`, undeliverable
 > out-of-process, so it is a registered OverrideDynamicConfig-class skip.
+> [run-growth-limits](../run-growth-limits/bugfix.md) implements the state
+> size limit, which the functional harness's build can override.
 
 ### Phase 2, second slice — the remaining externally-originated events
 
@@ -115,7 +117,9 @@ warnings`, `cargo +nightly fmt`, and `cargo test -p tokeira-kernel`.
   the existing signal, cancel, timer, activity and options sites; the
   per-site `materialize_scheduled_speculative()` calls folded into the rule.
   The buffered-event limit is still checked when a signal buffers, as before:
-  other kinds count toward it but do not trigger it themselves.)**
+  other kinds count toward it but do not trigger it themselves.)** Since
+  [run-growth-limits](../run-growth-limits/bugfix.md), it is checked at the
+  end of every transition, whichever kind buffered.
 - [x] 2.6 Child started-id wiring: the sentinel while
   `ChildWorkflowExecutionStarted` is buffered; the flush back-fills the pending
   child's started id and patches flushed child completions (keyed by initiated

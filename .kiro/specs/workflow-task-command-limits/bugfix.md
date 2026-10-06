@@ -6,7 +6,7 @@ Temporal v1.31.0 checks what a workflow task's completion carries as it applies 
 
 Tokeira checks none of these when a completion is applied. An oversized command is written into history and run state, where it is either stored or fails at DSQL's 1 MiB column limit with a storage error instead of v1.31.0's answer. A run can also hold more search attributes and pending Nexus operations than v1.31.0 allows.
 
-This spec covers the limits on a workflow task's completion and on query results. The limits checked when a request arrives are in [payload-admission-limits](../payload-admission-limits/bugfix.md). The limits on a run's growth (history, state, buffered events) and on its signals and updates are separate changes.
+This spec covers the limits on a workflow task's completion and on query results. The limits checked when a request arrives are in [payload-admission-limits](../payload-admission-limits/bugfix.md). The limits on a run's growth (history, state, buffered events) are in [run-growth-limits](../run-growth-limits/bugfix.md); those on its signals and updates are a separate change.
 
 ## Bug Analysis
 
@@ -81,5 +81,5 @@ This spec covers the limits on a workflow task's completion and on query results
 
 - Registered-key, predefined-key and value-type validation of the search attributes on ContinueAsNewWorkflowExecution and StartChildWorkflowExecution commands. Tokeira checks registered keys only on upserts, which is a separate gap.
 - Nexus command validation beyond the input size and the pending count: endpoint lookup, the service and operation name lengths (1,000), the header size (8 KiB) and disallowed headers. Tokeira doesn't carry a Nexus command's header today, which is a separate gap.
-- The limits on a run's history, state, history batches and buffered events, and on its signals and updates.
+- The limits on a run's history, state, history batches and buffered events, which [run-growth-limits](../run-growth-limits/bugfix.md) covers, and on its signals and updates.
 - The `__temporal_system` endpoint's input, which v1.31.0 doesn't check.

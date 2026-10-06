@@ -71,6 +71,11 @@ observable effect is inside a conformance build.
   override (key table below); production builds keep v1.31.0's values. Since
   [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md), they also have consult sites
   in the runtime's limits for a workflow task's commands, as does the pending Nexus operation limit.
+  Since [run-growth-limits](../run-growth-limits/bugfix.md), `HistorySizeLimitError`,
+  `HistoryCountLimitError` and `MutableStateSizeLimitError` have consult sites in the runtime's limits
+  for each commit, as do `TransactionSizeLimit` and the stored activity failure limit.
+  `HistorySizeSuggestContinueAsNew` has had one since
+  [continue-as-new-advice](../continue-as-new-advice/requirements.md).
 - **The harness seam:** `FunctionalTestBase.OverrideDynamicConfig(setting dynamicconfig.GenericSetting,
   value any) (cleanup func())` (`tests/testcore/functional_test_base.go:645`),
   `TestCluster.OverrideDynamicConfig` (`tests/testcore/test_cluster.go:636`), and the tokeira onebox
@@ -175,7 +180,9 @@ so an override is Unsupported until enforcement lands under another spec.
 | `history.maximumBufferedEventsBatch` (100) | `MAX_BUFFERED_EVENTS` (kernel) | **Kernel-excluded** | no corpus leaf overrides it today |
 | `limit.blobSize.error`, `limit.blobSize.warn`, `limit.memoSize.error`, `limit.memoSize.warn`, `frontend.searchAttributesNumberOfKeysLimit`, `frontend.searchAttributesSizeOfValueLimit`, `frontend.searchAttributesTotalSizeLimit` | `grpc/payload_limits.rs` accessors (edge); `workflow_task_completion_limits` (runtime) | **Overridable** | admission checks from [payload-admission-limits](../payload-admission-limits/bugfix.md), and a workflow task's commands from [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md); production builds compile v1.31.0's values |
 | `component.nexusoperations.limit.operation.concurrency` (30) | `workflow_task_completion_limits` (runtime) | **Overridable** | the pending Nexus operation check from [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md); production builds compile v1.31.0's value |
-| `limit.mutableStateSize.error`, `limit.historySize.error`, `limit.historyCount.error`, `limit.historySize.suggestContinueAsNew` | none | **Not-enforced** | Unsupported until enforcement exists |
+| `limit.historySize.error`, `limit.historyCount.error`, `limit.mutableStateSize.error`, `system.transactionSizeLimit`, `limit.mutableStateActivityFailureSize.error` | the growth and stored activity failure limits (runtime) | **Overridable** | the run growth checks from [run-growth-limits](../run-growth-limits/bugfix.md); production builds compile v1.31.0's values |
+| `history.maximumBufferedEventsSizeInBytes` (2 MiB) | the buffered event size limit (kernel) | **Kernel-excluded** | from [run-growth-limits](../run-growth-limits/bugfix.md); consulted in the pure kernel, like the count |
+| `limit.historySize.suggestContinueAsNew`, `limit.historyCount.suggestContinueAsNew` | `continue_as_new_advice_policy` (runtime) | **Overridable** | the advice thresholds from [continue-as-new-advice](../continue-as-new-advice/requirements.md) |
 
 ---
 

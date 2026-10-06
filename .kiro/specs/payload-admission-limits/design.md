@@ -102,7 +102,7 @@ The standalone activity calls are checked in their gRPC handlers:
 
 ### Out of scope
 
-- A workflow task's commands, which [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md) covers, and a run's signals, updates, buffered events, history, state and history batches, which a separate change covers.
+- A workflow task's commands, which [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md) covers; a run's buffered events, history, state and history batches, which [run-growth-limits](../run-growth-limits/bugfix.md) covers; and its signals and updates, which a separate change covers.
 - Schedules. v1.31.0 checks a schedule's start action when it creates a CHASM schedule (`service/frontend/workflow_handler.go:3446-3466 @ v1.31.0`), and otherwise when the start happens. Tokeira's schedules start runs inside the runtime.
 
 ## Testing Strategy

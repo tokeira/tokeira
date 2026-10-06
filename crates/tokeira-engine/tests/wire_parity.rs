@@ -33,7 +33,7 @@ use prost::Message;
 use serde_json::{Value, json};
 use tokeira_engine::{Engine, TokeiradHandle};
 use tokeira_proto::{
-    common::{Payload, Payloads, WorkflowType},
+    common::WorkflowType,
     enums::WorkflowIdReusePolicy,
     workflowservice::{
         DeprecateNamespaceRequest, DescribeNamespaceRequest, DescribeWorkflowExecutionRequest,
@@ -502,35 +502,54 @@ async fn status_catalogue_matches_the_golden_on_every_surface() -> Result<()> {
 // Decode-limit boundary
 // ---------------------------------------------------------------------------
 
-/// A start request whose encoded length is exactly `target` bytes: the payload
-/// is grown until the varint-prefixed encoding lands on the target.
-fn start_of_exact_size(workflow_id: &str, target: usize) -> Result<Vec<u8>> {
-    let mut data_len = target.saturating_sub(256);
-    for _ in 0..8 {
-        let request = StartWorkflowExecutionRequest {
-            namespace: NAMESPACE.to_owned(),
-            workflow_id: workflow_id.to_owned(),
-            workflow_type: Some(WorkflowType {
-                name: "wire-parity".to_owned(),
-            }),
-            task_queue: Some(task_queue("wire-parity-size")),
-            request_id: format!("{workflow_id}-request"),
-            input: Some(Payloads {
-                payloads: vec![Payload {
-                    metadata: BTreeMap::from([("encoding".to_owned(), b"binary/plain".to_vec())]),
-                    data: vec![b'x'; data_len],
-                    ..Default::default()
-                }],
-            }),
-            ..Default::default()
-        };
-        let encoded = request.encode_to_vec();
-        if encoded.len() == target {
-            return Ok(encoded);
-        }
-        data_len = (data_len + target).saturating_sub(encoded.len());
+/// An unknown field number on StartWorkflowExecutionRequest, for padding.
+const PADDING_FIELD: u64 = 10_000;
+
+fn varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
     }
-    bail!("could not size a start request to exactly {target} bytes")
+    out.push(value as u8);
+}
+
+fn varint_len(value: u64) -> usize {
+    let mut encoded = Vec::new();
+    varint(value, &mut encoded);
+    encoded.len()
+}
+
+/// A start request whose encoded length is exactly `target` bytes: a small
+/// valid start padded with an unknown length-delimited field. Decoders skip
+/// the field, so only the transport's decode limit sees the size, and no
+/// limit on what a start carries can change the answer.
+fn start_of_exact_size(workflow_id: &str, target: usize) -> Result<Vec<u8>> {
+    let mut encoded = StartWorkflowExecutionRequest {
+        namespace: NAMESPACE.to_owned(),
+        workflow_id: workflow_id.to_owned(),
+        workflow_type: Some(WorkflowType {
+            name: "wire-parity".to_owned(),
+        }),
+        task_queue: Some(task_queue("wire-parity-size")),
+        request_id: format!("{workflow_id}-request"),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let key = PADDING_FIELD << 3 | 2;
+    let fixed = encoded.len() + varint_len(key);
+    // The length prefix grows at varint boundaries, so settle on a padding
+    // length whose prefix fits the remaining bytes.
+    let mut padding = target.saturating_sub(fixed);
+    while padding > 0 && fixed + varint_len(padding as u64) + padding > target {
+        padding -= 1;
+    }
+    if fixed + varint_len(padding as u64) + padding != target {
+        bail!("could not size a start request to exactly {target} bytes");
+    }
+    varint(key, &mut encoded);
+    varint(padding as u64, &mut encoded);
+    encoded.resize(encoded.len() + padding, b'x');
+    Ok(encoded)
 }
 
 // Feature: tonic-0-14-grpc-stack, Property 5: decode-limit boundary

@@ -372,15 +372,50 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::KernelExcluded,
     },
+    // Payload limits checked when a request arrives (`payload-admission-limits`),
+    // read through the edge's `grpc/payload_limits.rs` accessors. Production
+    // builds compile v1.31.0's values; only this harness overrides them, so its
+    // tests that shrink a limit can run. A workflow task's commands aren't
+    // checked yet.
+    KeySpec {
+        key: "limit.blobSize.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.blobSize.warn",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.memoSize.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.memoSize.warn",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "frontend.searchAttributesNumberOfKeysLimit",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "frontend.searchAttributesSizeOfValueLimit",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "frontend.searchAttributesTotalSizeLimit",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
     // Size limits tokeira does not enforce — there is no consult site to
     // override, so an override is rejected rather than fabricating a limit.
     KeySpec {
         key: "limit.mutableStateSize.error",
-        value_type: ValueType::Int,
-        disposition: Disposition::NotEnforced,
-    },
-    KeySpec {
-        key: "limit.blobSize.error",
         value_type: ValueType::Int,
         disposition: Disposition::NotEnforced,
     },

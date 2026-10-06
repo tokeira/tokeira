@@ -1265,39 +1265,42 @@
       "temporal_key": "frontend.searchAttributesNumberOfKeysLimit",
       "temporal_default": "100",
       "temporal_scope": "Namespace",
-      "classification": "pinned-behavioral-constant",
-      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
-      "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:807",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/payload-admission-limits/bugfix.md"
       ]
     },
     {
       "temporal_key": "frontend.searchAttributesSizeOfValueLimit",
       "temporal_default": "2 * 1024",
       "temporal_scope": "Namespace",
-      "classification": "pinned-behavioral-constant",
-      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
-      "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:812",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/payload-admission-limits/bugfix.md"
       ]
     },
     {
       "temporal_key": "frontend.searchAttributesTotalSizeLimit",
       "temporal_default": "40 * 1024",
       "temporal_scope": "Namespace",
-      "classification": "pinned-behavioral-constant",
-      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
-      "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:817",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/payload-admission-limits/bugfix.md"
       ]
     },
     {
@@ -4775,26 +4778,28 @@
       "temporal_key": "limit.blobSize.error",
       "temporal_default": "2 * 1024 * 1024",
       "temporal_scope": "Namespace",
-      "classification": "architecturally-irrelevant-or-excluded",
-      "tokeira_treatment": "No production raw-key control; the Temporal topology or feature is collapsed, unavailable, or explicitly excluded in Tokeira.",
-      "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "not-enforced",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:316",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/payload-admission-limits/bugfix.md"
       ]
     },
     {
       "temporal_key": "limit.blobSize.warn",
       "temporal_default": "512 * 1024",
       "temporal_scope": "Namespace",
-      "classification": "pinned-behavioral-constant",
-      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
-      "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:321",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/payload-admission-limits/bugfix.md"
       ]
     },
     {
@@ -4970,26 +4975,28 @@
       "temporal_key": "limit.memoSize.error",
       "temporal_default": "2 * 1024 * 1024",
       "temporal_scope": "Namespace",
-      "classification": "pinned-behavioral-constant",
-      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
-      "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:326",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/payload-admission-limits/bugfix.md"
       ]
     },
     {
       "temporal_key": "limit.memoSize.warn",
       "temporal_default": "2 * 1024",
       "temporal_scope": "Namespace",
-      "classification": "pinned-behavioral-constant",
-      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
-      "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:331",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/payload-admission-limits/bugfix.md"
       ]
     },
     {

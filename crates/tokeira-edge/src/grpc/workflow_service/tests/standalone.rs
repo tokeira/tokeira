@@ -38,11 +38,18 @@ impl Harness {
     }
 
     fn with_config(config: ActivityConfig) -> Self {
+        Self::with_visibility(config, Arc::new(EmptyVisibilityApi))
+    }
+
+    fn with_visibility(
+        config: ActivityConfig,
+        visibility: Arc<dyn crate::workflow_service::VisibilityApi>,
+    ) -> Self {
         let cache = Arc::new(StaticNamespaceCache);
         let service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
             Arc::new(PollNoneRuntime),
             Arc::new(NoopResolver),
-            Arc::new(EmptyVisibilityApi),
+            visibility,
             Arc::new(tokeira_storage::InMemoryStore::default()),
             Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
             cache.clone(),
@@ -1092,4 +1099,307 @@ proptest! {
             Ok(())
         })?;
     }
+}
+
+// ── payload-admission-limits ──
+
+fn oversized_payloads() -> tokeira_proto::common::Payloads {
+    payloads(&vec![b'x'; 2 * 1024 * 1024 + 1])
+}
+
+/// A one-payload `Payloads` message that encodes to exactly `size` bytes.
+fn payloads_encoding_to(size: usize) -> tokeira_proto::common::Payloads {
+    let mut data_len = size;
+    while payloads(&vec![b'x'; data_len]).encoded_len() > size {
+        data_len -= 1;
+    }
+    let found = payloads(&vec![b'x'; data_len]);
+    assert_eq!(
+        found.encoded_len(),
+        size,
+        "no Payloads message encodes to {size} bytes"
+    );
+    found
+}
+
+fn start_activity_request(
+    id: &str,
+    input: tokeira_proto::common::Payloads,
+    search_attributes: Option<tokeira_proto::common::SearchAttributes>,
+) -> workflowservice::StartActivityExecutionRequest {
+    workflowservice::StartActivityExecutionRequest {
+        namespace: "default".into(),
+        activity_id: id.into(),
+        request_id: format!("start-{id}"),
+        activity_type: Some(tokeira_proto::common::ActivityType {
+            name: "GoldenActivity".into(),
+        }),
+        task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+            name: QUEUE.into(),
+            ..Default::default()
+        }),
+        start_to_close_timeout: Some(prost_types::Duration {
+            seconds: 10,
+            nanos: 0,
+        }),
+        input: Some(input),
+        search_attributes,
+        ..Default::default()
+    }
+}
+
+fn keyword_attributes(values: &[(&str, usize)]) -> tokeira_proto::common::SearchAttributes {
+    tokeira_proto::common::SearchAttributes {
+        indexed_fields: values
+            .iter()
+            .map(|(name, len)| {
+                (
+                    (*name).to_owned(),
+                    tokeira_proto::common::Payload {
+                        metadata: [("encoding".to_owned(), b"json/plain".to_vec())].into(),
+                        data: vec![b'x'; *len],
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// The failure the activity closed with: a server failure is terminal for a
+/// standalone activity, as any failure but a retryable application failure is.
+async fn standalone_failure(h: &Harness, id: &str, run: &str) -> tokeira_proto::failure::Failure {
+    let response = h
+        .grpc
+        .describe_activity_execution(Request::new(
+            workflowservice::DescribeActivityExecutionRequest {
+                namespace: "default".into(),
+                activity_id: id.into(),
+                run_id: run.into(),
+                include_outcome: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let outcome = response.outcome.and_then(|outcome| match outcome.value {
+        Some(tokeira_proto::public::temporal::api::activity::v1::activity_execution_outcome::Value::Failure(failure)) => Some(failure),
+        _ => None,
+    });
+    outcome.expect("the activity closed with a failure")
+}
+
+fn is_server_failure(failure: &tokeira_proto::failure::Failure, message: &str) -> bool {
+    failure.message == message
+        && matches!(
+            failure.failure_info,
+            Some(tokeira_proto::failure::failure::FailureInfo::ServerFailureInfo(ref info))
+                if info.non_retryable
+        )
+}
+
+// `payload-admission-limits` criterion 2.9.
+#[tokio::test]
+async fn standalone_inputs_and_reasons_over_the_blob_size_limit_are_refused() {
+    let h = Harness::new();
+    let limit = 2 * 1024 * 1024;
+    let error = h
+        .grpc
+        .start_activity_execution(Request::new(start_activity_request(
+            "too-large",
+            payloads_encoding_to(limit + 1),
+            None,
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert_eq!(error.message(), "input exceeds length limit");
+    h.grpc
+        .start_activity_execution(Request::new(start_activity_request(
+            "at-the-limit",
+            payloads_encoding_to(limit),
+            None,
+        )))
+        .await
+        .expect("an input at the limit is accepted");
+
+    // Each at-the-limit call closes its activity, so each has its own.
+    let canceled = "00000000-0000-4000-8000-0000000000a1";
+    let terminated = "00000000-0000-4000-8000-0000000000a4";
+    let mut trace = Trace::default();
+    h.start("canceled", canceled, &mut trace).await;
+    h.start("terminated", terminated, &mut trace).await;
+    let cancel =
+        |request_id: &str, reason: String| workflowservice::RequestCancelActivityExecutionRequest {
+            namespace: "default".into(),
+            activity_id: "canceled".into(),
+            run_id: canceled.into(),
+            request_id: request_id.into(),
+            identity: "client".into(),
+            reason,
+            ..Default::default()
+        };
+    let terminate =
+        |request_id: &str, reason: String| workflowservice::TerminateActivityExecutionRequest {
+            namespace: "default".into(),
+            activity_id: "terminated".into(),
+            run_id: terminated.into(),
+            request_id: request_id.into(),
+            identity: "client".into(),
+            reason,
+            ..Default::default()
+        };
+    let refused = h
+        .grpc
+        .request_cancel_activity_execution(Request::new(cancel("cancel-1", "x".repeat(limit + 1))))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert_eq!(refused.message(), "reason exceeds length limit");
+    let refused = h
+        .grpc
+        .terminate_activity_execution(Request::new(terminate(
+            "terminate-1",
+            "x".repeat(limit + 1),
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert_eq!(refused.message(), "reason exceeds length limit");
+
+    // At the limit, both are accepted.
+    h.grpc
+        .request_cancel_activity_execution(Request::new(cancel("cancel-2", "x".repeat(limit))))
+        .await
+        .expect("a cancellation reason at the limit is accepted");
+    h.grpc
+        .terminate_activity_execution(Request::new(terminate("terminate-2", "x".repeat(limit))))
+        .await
+        .expect("a termination reason at the limit is accepted");
+}
+
+// `payload-admission-limits` criteria 2.3 and 2.9: on a standalone activity's
+// start, the input, then the key count, the registered-key check, and the
+// sizes (`chasm/lib/activity/validator.go:344-363 @ v1.31.0`).
+#[tokio::test]
+async fn standalone_start_checks_search_attributes_around_the_registered_key_check() {
+    let store = tokeira_projection::InMemoryVisibilityStore::default();
+    tokeira_projection::store::VisibilityStore::register_attr(
+        &store,
+        crate::translate::to_internal::namespace_id_for("default"),
+        "CustomKeywordField".to_owned(),
+        tokeira_projection::types::SearchAttrType::Keyword,
+    )
+    .await
+    .unwrap();
+    let h = Harness::with_visibility(
+        ActivityConfig {
+            enable_standalone: true,
+            ..Default::default()
+        },
+        Arc::new(tokeira_projection::VisibilityQueryService::new(store)),
+    );
+    let refusal = |id: &str,
+                   input: tokeira_proto::common::Payloads,
+                   attributes: tokeira_proto::common::SearchAttributes| {
+        let request = start_activity_request(id, input, Some(attributes));
+        let grpc = &h.grpc;
+        async move {
+            let status = grpc
+                .start_activity_execution(Request::new(request))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            status.message().to_owned()
+        }
+    };
+    let unregistered: Vec<String> = (0..101).map(|i| format!("Unregistered{i:03}")).collect();
+    let many: Vec<(&str, usize)> = unregistered.iter().map(|name| (name.as_str(), 1)).collect();
+
+    // The input comes first.
+    assert_eq!(
+        refusal(
+            "input-first",
+            oversized_payloads(),
+            keyword_attributes(&many)
+        )
+        .await,
+        "input exceeds length limit"
+    );
+    // The key count comes before the registered-key check.
+    assert_eq!(
+        refusal("count-first", payloads(b"input"), keyword_attributes(&many)).await,
+        "number of search attributes 101 exceeds limit 100"
+    );
+    // The registered-key check comes before the sizes.
+    assert_eq!(
+        refusal(
+            "keys-before-sizes",
+            payloads(b"input"),
+            keyword_attributes(&[("Unregistered", 3000)])
+        )
+        .await,
+        "search attribute Unregistered is not defined"
+    );
+    // A registered key's oversized value is refused by the sizes.
+    assert_eq!(
+        refusal(
+            "sizes-last",
+            payloads(b"input"),
+            keyword_attributes(&[("CustomKeywordField", 3000)])
+        )
+        .await,
+        "search attribute CustomKeywordField value size 3000 exceeds size limit 2048"
+    );
+}
+
+// `payload-admission-limits` criteria 2.5, 2.7 and 2.11.
+#[tokio::test]
+async fn oversized_standalone_completion_and_heartbeat_fail_the_activity() {
+    let h = Harness::new();
+    let mut trace = Trace::default();
+
+    let completed = "00000000-0000-4000-8000-0000000000a2";
+    h.start("big-result", completed, &mut trace).await;
+    let token = h.poll(&mut trace, "poll/big-result").await;
+    h.grpc
+        .respond_activity_task_completed(Request::new(
+            workflowservice::RespondActivityTaskCompletedRequest {
+                namespace: "default".into(),
+                task_token: token,
+                result: Some(oversized_payloads()),
+                identity: "golden-worker".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("the completion still succeeds");
+    assert!(is_server_failure(
+        &standalone_failure(&h, "big-result", completed).await,
+        "Complete result exceeds size limit."
+    ));
+
+    let heartbeat = "00000000-0000-4000-8000-0000000000a3";
+    h.start("big-heartbeat", heartbeat, &mut trace).await;
+    let token = h.poll(&mut trace, "poll/big-heartbeat").await;
+    let response = h
+        .grpc
+        .record_activity_task_heartbeat(Request::new(
+            workflowservice::RecordActivityTaskHeartbeatRequest {
+                namespace: "default".into(),
+                task_token: token,
+                details: Some(oversized_payloads()),
+                identity: "golden-worker".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("the heartbeat still succeeds")
+        .into_inner();
+    assert!(response.cancel_requested);
+    assert!(is_server_failure(
+        &standalone_failure(&h, "big-heartbeat", heartbeat).await,
+        "Heartbeat details exceed size limit."
+    ));
 }

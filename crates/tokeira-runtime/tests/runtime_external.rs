@@ -67,6 +67,7 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -143,6 +144,7 @@ async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_origina
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -225,6 +227,7 @@ async fn external_signal_cross_namespace_uses_target_namespace() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -294,6 +297,7 @@ async fn external_signal_not_found_delivers_failed_resolution() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 

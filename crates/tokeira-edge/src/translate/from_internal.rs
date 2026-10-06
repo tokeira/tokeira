@@ -268,9 +268,11 @@ pub fn query_response(
             }
         }
         // Unreachable from the edge handler (a Failed result returns the
-        // typed QueryFailed error before response translation); kept
-        // exhaustive-and-inert for any other caller.
-        tokeira_runtime::QueryResult::Failed { .. } => crate::translate::QueryWorkflowResponse {
+        // typed QueryFailed error, and an oversized one InvalidArgument,
+        // before response translation); kept exhaustive-and-inert for any
+        // other caller.
+        tokeira_runtime::QueryResult::Failed { .. }
+        | tokeira_runtime::QueryResult::ResultTooLarge => crate::translate::QueryWorkflowResponse {
             result: None,
             rejected_status: None,
         },

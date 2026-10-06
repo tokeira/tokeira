@@ -823,6 +823,7 @@ where
                                         history_size_bytes: successor_stats.history_size_bytes,
                                         advice_policy:
                                             crate::runtime::continue_as_new_advice_policy(),
+                                        terminate_reason: None,
                                     },
                                 );
                                 let publisher = publisher.clone();

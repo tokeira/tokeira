@@ -19,8 +19,8 @@ Counts below include dynamic settings and the separately audited static groups.
 |---|---:|
 | deployment policy | 10 |
 | pinned behavioral constant | 205 |
-| auto-tuned mechanical setting | 360 |
-| conformance-only override | 39 |
+| auto-tuned mechanical setting | 359 |
+| conformance-only override | 40 |
 | architecturally irrelevant or excluded | 11 |
 
 ## Static Temporal server configuration
@@ -62,7 +62,7 @@ Counts below include dynamic settings and the separately audited static groups.
 | `component.nexusoperations.disallowedHeaders` | global / `Typed` | `[]string{ 	"request-timeout", 	interceptor.DCRedirectionApiHeaderName, 	interceptor.DCRedirectionContextHeaderName, 	headers.CallerNameHeaderName, 	headers.CallerTypeHeaderName, 	headers.CallOriginHeaderName, 	headers.PrincipalTypeHeaderName, 	headers.PrincipalNameHeaderName, }` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `components/nexusoperations/config.go:91` |
 | `component.nexusoperations.limit.dispatch.task.timeout.min` | namespace / `Duration` | `time.Second` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `components/nexusoperations/config.go:28` |
 | `component.nexusoperations.limit.header.size` | namespace / `Int` | `8192` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `components/nexusoperations/config.go:70` |
-| `component.nexusoperations.limit.operation.concurrency` | namespace / `Int` | `30` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `components/nexusoperations/config.go:36` |
+| `component.nexusoperations.limit.operation.concurrency` | namespace / `Int` | `30` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `components/nexusoperations/config.go:36` |
 | `component.nexusoperations.limit.operation.name.length` | namespace / `Int` | `1000` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `components/nexusoperations/config.go:53` |
 | `component.nexusoperations.limit.operation.token.length` | namespace / `Int` | `4096` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `components/nexusoperations/config.go:61` |
 | `component.nexusoperations.limit.request.timeout.min` | namespace / `Duration` | `time.Millisecond * 1500` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `components/nexusoperations/config.go:21` |

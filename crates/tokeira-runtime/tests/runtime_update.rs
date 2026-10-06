@@ -77,6 +77,7 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -154,6 +155,7 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -225,6 +227,7 @@ async fn update_accepted_wait_returns_stage_without_outcome() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -362,6 +365,7 @@ async fn poll_update_waits_for_history_stage_or_returns_reached_stage() -> Resul
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -447,6 +451,7 @@ async fn terminal_update_outcome_survives_runtime_recreation() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -626,6 +631,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -696,6 +702,7 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -813,6 +820,7 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 

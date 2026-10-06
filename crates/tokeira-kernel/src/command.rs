@@ -316,6 +316,26 @@ pub enum WorkflowTaskFailedCause {
     /// request limit. Appended to preserve every existing postcard
     /// discriminant.
     PendingRequestCancelLimitExceeded,
+    /// A `FailWorkflowExecution` command's failure is over the blob size
+    /// limit (`WORKFLOW_TASK_FAILED_CAUSE_BAD_FAIL_WORKFLOW_EXECUTION_ATTRIBUTES
+    /// = 8`, `failed_cause.proto`; workflow_task_completed_handler.go:760-766
+    /// @ v1.31.0). Appended to preserve every existing postcard discriminant.
+    BadFailWorkflowExecutionAttributes,
+    /// A `ModifyWorkflowProperties` command's memo is over a limit
+    /// (`WORKFLOW_TASK_FAILED_CAUSE_BAD_MODIFY_WORKFLOW_PROPERTIES_ATTRIBUTES
+    /// = 25`; workflow_task_completed_handler.go:1292-1311 @ v1.31.0).
+    /// Appended to preserve every existing postcard discriminant.
+    BadModifyWorkflowPropertiesAttributes,
+    /// A `ScheduleNexusOperation` command's input is over the blob size limit
+    /// (`WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES =
+    /// 32`; components/nexusoperations/workflow/commands.go:144-150 @
+    /// v1.31.0). Appended to preserve every existing postcard discriminant.
+    BadScheduleNexusOperationAttributes,
+    /// The completion would exceed the pending Nexus operation limit
+    /// (`WORKFLOW_TASK_FAILED_CAUSE_PENDING_NEXUS_OPERATIONS_LIMIT_EXCEEDED =
+    /// 33`; commands.go:173-181 @ v1.31.0). Appended to preserve every
+    /// existing postcard discriminant.
+    PendingNexusOperationsLimitExceeded,
 }
 
 impl WorkflowTaskFailedCause {
@@ -353,6 +373,10 @@ impl WorkflowTaskFailedCause {
             Self::PendingActivitiesLimitExceeded => "PendingActivitiesLimitExceeded",
             Self::PendingSignalsLimitExceeded => "PendingSignalsLimitExceeded",
             Self::PendingRequestCancelLimitExceeded => "PendingRequestCancelLimitExceeded",
+            Self::BadFailWorkflowExecutionAttributes => "BadFailWorkflowExecutionAttributes",
+            Self::BadModifyWorkflowPropertiesAttributes => "BadModifyWorkflowPropertiesAttributes",
+            Self::BadScheduleNexusOperationAttributes => "BadScheduleNexusOperationAttributes",
+            Self::PendingNexusOperationsLimitExceeded => "PendingNexusOperationsLimitExceeded",
         }
     }
 }
@@ -1321,7 +1345,7 @@ pub struct WorkflowTaskWorkerVersion {
     pub stamp: Option<WorkerVersionStamp>,
 }
 
-/// Concrete pending-command limits for one workflow-task completion.
+/// Concrete limits for one workflow-task completion.
 ///
 /// The runtime resolves policy before invoking the pure kernel. These values
 /// are command input only and are never retained in workflow state.
@@ -1335,6 +1359,56 @@ pub struct WorkflowTaskCompletionLimits {
     pub pending_signals: Option<usize>,
     /// Maximum pending external cancellation requests, or `None` when disabled.
     pub pending_cancel_requests: Option<usize>,
+    /// The size above which a command's payload field is over the blob size
+    /// limit ([`crate::limits::effective_limit`] of `limit.blobSize.*`).
+    #[serde(default = "default_blob_size_limit")]
+    pub blob_size_limit: usize,
+    /// The size above which a memo is over the memo size limit.
+    #[serde(default = "default_memo_size_limit")]
+    pub memo_size_limit: usize,
+    /// `frontend.searchAttributesNumberOfKeysLimit`.
+    #[serde(default = "default_search_attributes_keys_limit")]
+    pub search_attributes_keys_limit: usize,
+    /// `frontend.searchAttributesSizeOfValueLimit`.
+    #[serde(default = "default_search_attribute_value_size_limit")]
+    pub search_attribute_value_size_limit: usize,
+    /// `frontend.searchAttributesTotalSizeLimit`.
+    #[serde(default = "default_search_attributes_total_size_limit")]
+    pub search_attributes_total_size_limit: usize,
+    /// Maximum pending Nexus operations. v1.31.0 has no disabled value: a
+    /// limit of 0 refuses every operation (`commands.go:173-181 @ v1.31.0`).
+    #[serde(default = "default_pending_nexus_operations")]
+    pub pending_nexus_operations: usize,
+}
+
+fn default_blob_size_limit() -> usize {
+    crate::limits::effective_limit(
+        crate::limits::BLOB_SIZE_LIMIT_WARN,
+        crate::limits::BLOB_SIZE_LIMIT_ERROR,
+    )
+}
+
+fn default_memo_size_limit() -> usize {
+    crate::limits::effective_limit(
+        crate::limits::MEMO_SIZE_LIMIT_WARN,
+        crate::limits::MEMO_SIZE_LIMIT_ERROR,
+    )
+}
+
+fn default_search_attributes_keys_limit() -> usize {
+    crate::limits::SEARCH_ATTRIBUTES_NUMBER_OF_KEYS_LIMIT
+}
+
+fn default_search_attribute_value_size_limit() -> usize {
+    crate::limits::SEARCH_ATTRIBUTES_SIZE_OF_VALUE_LIMIT
+}
+
+fn default_search_attributes_total_size_limit() -> usize {
+    crate::limits::SEARCH_ATTRIBUTES_TOTAL_SIZE_LIMIT
+}
+
+fn default_pending_nexus_operations() -> usize {
+    crate::limits::PENDING_NEXUS_OPERATIONS_LIMIT
 }
 
 impl Default for WorkflowTaskCompletionLimits {
@@ -1345,8 +1419,77 @@ impl Default for WorkflowTaskCompletionLimits {
             pending_activities: Some(DEFAULT_PENDING_COMMAND_LIMIT),
             pending_signals: Some(DEFAULT_PENDING_COMMAND_LIMIT),
             pending_cancel_requests: Some(DEFAULT_PENDING_COMMAND_LIMIT),
+            blob_size_limit: default_blob_size_limit(),
+            memo_size_limit: default_memo_size_limit(),
+            search_attributes_keys_limit: default_search_attributes_keys_limit(),
+            search_attribute_value_size_limit: default_search_attribute_value_size_limit(),
+            search_attributes_total_size_limit: default_search_attributes_total_size_limit(),
+            pending_nexus_operations: default_pending_nexus_operations(),
         }
     }
+}
+
+/// What the edge measured on one command of a workflow-task completion, as
+/// Temporal v1.31.0 measures it (`workflow-task-command-limits` criterion
+/// 2.12). The kernel checks these where v1.31.0 checks them. Command input
+/// only, never retained in workflow state.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandPayloadSizes {
+    /// The command's limited payload field: an input, result, failure or
+    /// marker details (criterion 2.1). `None` when the command has none, or
+    /// for a Nexus operation to the system endpoint.
+    pub payload: Option<usize>,
+    /// ContinueAsNew and StartChild: the memo's encoded size.
+    pub memo: Option<usize>,
+    /// ContinueAsNew and StartChild: the search attributes as sent.
+    pub search_attributes: Option<SearchAttributeSizes>,
+    /// An upsert or ModifyWorkflowProperties: the upserted fields.
+    pub upserted_fields: Option<UpsertedFieldSizes>,
+    /// A protocol message: its body.
+    pub protocol_message: Option<ProtocolMessageSize>,
+}
+
+/// A command's search attributes as `ValidateSize` measures them
+/// (`common/searchattribute/validator.go:148-177 @ v1.31.0`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchAttributeSizes {
+    /// The number of keys (`validator.go:60-75 @ v1.31.0`).
+    pub keys: usize,
+    /// Each value's data length, by key.
+    pub value_sizes: BTreeMap<String, usize>,
+    /// The map's encoded size.
+    pub total: usize,
+}
+
+/// An upsert's fields, for its own blob check and the run's merged map.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpsertedFieldSizes {
+    /// Each field's key length plus its payload's data length, summed
+    /// (`payloadsMapSize`, workflow_task_completed_handler.go:1318-1326 @
+    /// v1.31.0).
+    pub fields_size: usize,
+    /// Each field the command sets, by key.
+    pub set_fields: BTreeMap<String, PayloadSize>,
+}
+
+/// A payload's data length and encoded size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PayloadSize {
+    /// The data's length.
+    pub data: usize,
+    /// The payload's protobuf-encoded size.
+    pub encoded: usize,
+}
+
+/// A protocol message's body (`workflow_task_completed_handler.go:358-365 @
+/// v1.31.0`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolMessageSize {
+    /// The encoded size of the body's `Any`.
+    pub body: usize,
+    /// The body's full message name, such as
+    /// `temporal.api.update.v1.Acceptance`.
+    pub type_name: String,
 }
 
 /// Request from a worker that has finished processing a
@@ -1394,6 +1537,10 @@ pub struct WorkflowTaskCompletedRequest {
     /// Ordered list of workflow commands produced by the
     /// worker's replay/execution.
     pub commands: Vec<WorkflowCommand>,
+    /// What the edge measured on each command, by index. Empty means
+    /// unmeasured, which checks no size (`workflow-task-command-limits`).
+    #[serde(default)]
+    pub command_sizes: Vec<CommandPayloadSizes>,
     /// If true, the kernel schedules a new WFT even when no
     /// commands require one.
     pub force_new_workflow_task: bool,
@@ -1449,6 +1596,13 @@ pub struct WorkflowTaskFailedRequest {
     pub history_size_bytes: i64,
     /// Thresholds in force for that synthesized start.
     pub advice_policy: ContinueAsNewAdvicePolicy,
+    /// A command over a size limit terminates the workflow: after the
+    /// failure and the buffered events, the run is terminated with this
+    /// reason, no details and the `history-service` identity, and no
+    /// workflow task is scheduled (`respondworkflowtaskcompleted/api.go:
+    /// 489-510 @ v1.31.0`; `workflow-task-command-limits` criterion 2.8).
+    #[serde(default)]
+    pub terminate_reason: Option<String>,
 }
 
 /// Request from the runtime when `RespondWorkflowTaskFailed` arrives with

@@ -163,6 +163,7 @@ fn fail_request(started_event_id: i64) -> WorkflowTaskFailedRequest {
         request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
         now: now(),
         reset_reapply: Vec::new(),
+        terminate_reason: None,
     }
 }
 
@@ -209,6 +210,7 @@ fn transient_failure_counts_without_touching_recorded_cause() {
             LoadedRun::Existing(state),
             Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
                 failure_cause: WorkflowTaskFailedCause::NonDeterminismError,
+                terminate_reason: None,
                 ..fail_request(11)
             }),
         )
@@ -453,6 +455,7 @@ fn completion_clears_count_and_recorded_problem() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();

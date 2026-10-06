@@ -29,8 +29,9 @@ use prost::Message as _;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    FieldChange, MemoPatch, SearchAttributesPatch, WorkerVersionStamp, WorkflowCommand,
-    WorkflowTaskWorkerVersion,
+    CommandPayloadSizes, FieldChange, MemoPatch, PayloadSize, ProtocolMessageSize,
+    SearchAttributeSizes, SearchAttributesPatch, UpsertedFieldSizes, WorkerVersionStamp,
+    WorkflowCommand, WorkflowTaskWorkerVersion,
     state::{
         CallbackSpec as KernelCallbackSpec, CallbackState as KernelCallbackState,
         CallbackTrigger as KernelCallbackTrigger, CompletionCallback as KernelCompletionCallback,
@@ -1174,6 +1175,10 @@ pub fn wft_failed_cause_from_proto(value: i32) -> tokeira_kernel::WorkflowTaskFa
         Ok(P::PendingActivitiesLimitExceeded) => K::PendingActivitiesLimitExceeded,
         Ok(P::PendingSignalsLimitExceeded) => K::PendingSignalsLimitExceeded,
         Ok(P::PendingRequestCancelLimitExceeded) => K::PendingRequestCancelLimitExceeded,
+        Ok(P::BadFailWorkflowExecutionAttributes) => K::BadFailWorkflowExecutionAttributes,
+        Ok(P::BadModifyWorkflowPropertiesAttributes) => K::BadModifyWorkflowPropertiesAttributes,
+        Ok(P::BadScheduleNexusOperationAttributes) => K::BadScheduleNexusOperationAttributes,
+        Ok(P::PendingNexusOperationsLimitExceeded) => K::PendingNexusOperationsLimitExceeded,
         _ => K::WorkflowWorkerUnhandledFailure,
     }
 }
@@ -2572,8 +2577,11 @@ pub fn respond_completed_request_to_edge(
     // namespace inherit it (workflow_task_completed_handler.go @ v1.31.0).
     let request_namespace = req.namespace.clone();
 
-    let mut commands = Vec::new();
+    // Each command keeps what was measured on its proto with it, through the
+    // splice of leftover messages below (`workflow-task-command-limits`).
+    let mut commands: Vec<(WorkflowCommand, CommandPayloadSizes)> = Vec::new();
     for cmd in req.commands {
+        let sizes = command_payload_sizes(&cmd);
         match proto_command_to_workflow_command(cmd, &request_namespace) {
             Ok(WorkflowCommand::ProtocolMessage { message_id, .. }) => {
                 // Resolve the body from the messages index. A command
@@ -2588,22 +2596,31 @@ pub fn respond_completed_request_to_edge(
                 // seam keeps the caller-visible WorkflowNotReady abort uniform
                 // (`TestValidateWorkerMessages/command-reference-missed-message`).
                 if let Some(msg) = messages_by_id.remove(&message_id) {
+                    let sizes = protocol_message_sizes(msg.body.as_ref());
                     let body = msg
                         .body
                         .map(|body| body.encode_to_vec())
                         .unwrap_or_default();
-                    commands.push(WorkflowCommand::ProtocolMessage {
-                        message_id,
-                        body: resolve_protocol_message_body(&body, msg.protocol_instance_id)?,
-                    });
+                    commands.push((
+                        WorkflowCommand::ProtocolMessage {
+                            message_id,
+                            body: resolve_protocol_message_body(&body, msg.protocol_instance_id)?,
+                        },
+                        sizes,
+                    ));
                 } else {
-                    commands.push(WorkflowCommand::ProtocolMessage {
-                        message_id: message_id.clone(),
-                        body: tokeira_kernel::UpdateProtocolBody::UnresolvedMessage { message_id },
-                    });
+                    commands.push((
+                        WorkflowCommand::ProtocolMessage {
+                            message_id: message_id.clone(),
+                            body: tokeira_kernel::UpdateProtocolBody::UnresolvedMessage {
+                                message_id,
+                            },
+                        },
+                        CommandPayloadSizes::default(),
+                    ));
                 }
             }
-            Ok(cmd) => commands.push(cmd),
+            Ok(cmd) => commands.push((cmd, sizes)),
             Err(e) => return Err(e),
         }
     }
@@ -2621,19 +2638,23 @@ pub fn respond_completed_request_to_edge(
     let mut leftover_commands = Vec::new();
     for id in &message_order {
         if let Some(msg) = messages_by_id.remove(id) {
+            let sizes = protocol_message_sizes(msg.body.as_ref());
             let body = msg
                 .body
                 .map(|body| body.encode_to_vec())
                 .unwrap_or_default();
-            leftover_commands.push(WorkflowCommand::ProtocolMessage {
-                message_id: msg.id,
-                body: resolve_protocol_message_body(&body, msg.protocol_instance_id)?,
-            });
+            leftover_commands.push((
+                WorkflowCommand::ProtocolMessage {
+                    message_id: msg.id,
+                    body: resolve_protocol_message_body(&body, msg.protocol_instance_id)?,
+                },
+                sizes,
+            ));
         }
     }
     let close_at = commands
         .iter()
-        .position(|command| {
+        .position(|(command, _)| {
             matches!(
                 command,
                 WorkflowCommand::CompleteWorkflow { .. }
@@ -2646,6 +2667,7 @@ pub fn respond_completed_request_to_edge(
     for (offset, command) in leftover_commands.into_iter().enumerate() {
         commands.insert(close_at + offset, command);
     }
+    let (commands, command_sizes): (Vec<_>, Vec<_>) = commands.into_iter().unzip();
     let remaining_messages: Vec<ProtocolMessageDto> = Vec::new();
     let deployment_version = worker_deployment_version_from_options(
         req.deployment_options.as_ref(),
@@ -2692,6 +2714,7 @@ pub fn respond_completed_request_to_edge(
             .capabilities
             .is_some_and(|capabilities| capabilities.discard_speculative_workflow_task_with_events),
         commands,
+        command_sizes,
         force_create_new_workflow_task: req.force_create_new_workflow_task,
         return_new_workflow_task: req.return_new_workflow_task,
         query_results: req
@@ -2701,6 +2724,18 @@ pub fn respond_completed_request_to_edge(
                 let dto = match enums::QueryResultType::try_from(result.result_type)
                     .unwrap_or(enums::QueryResultType::Failed)
                 {
+                    // An answer over the blob size limit fails that query
+                    // (`handleBufferedQueries`, respondworkflowtaskcompleted/
+                    // api.go:956-991 @ v1.31.0; `workflow-task-command-limits`
+                    // criterion 2.11).
+                    enums::QueryResultType::Answered
+                        if payload_limits::blob_exceeds_limit(
+                            payload_limits::encoded_size(result.answer.as_ref()),
+                            "ConsistentQuery",
+                        ) =>
+                    {
+                        QueryResultDto::ResultTooLarge
+                    }
                     enums::QueryResultType::Answered => QueryResultDto::Answered {
                         result: result
                             .answer
@@ -4834,6 +4869,142 @@ fn search_attributes_patch_to_domain(
 }
 
 #[allow(deprecated)]
+/// What v1.31.0 measures on a workflow task's command, on the proto it
+/// arrived as (`workflow-task-command-limits` criterion 2.12). A field above
+/// its warn limit is logged; the kernel checks the limits where v1.31.0 does.
+pub fn command_payload_sizes(cmd: &command::Command) -> CommandPayloadSizes {
+    use command::command::Attributes;
+    let mut sizes = CommandPayloadSizes::default();
+    match cmd.attributes.as_ref() {
+        Some(Attributes::ScheduleActivityTaskCommandAttributes(attrs)) => {
+            sizes.payload = Some(payload_limits::encoded_size(attrs.input.as_ref()));
+        }
+        Some(Attributes::CompleteWorkflowExecutionCommandAttributes(attrs)) => {
+            sizes.payload = Some(payload_limits::encoded_size(attrs.result.as_ref()));
+        }
+        Some(Attributes::FailWorkflowExecutionCommandAttributes(attrs)) => {
+            sizes.payload = Some(payload_limits::encoded_size(attrs.failure.as_ref()));
+        }
+        Some(Attributes::RecordMarkerCommandAttributes(attrs)) => {
+            // `GetPayloadsMapSize` (`common/util.go:653-661 @ v1.31.0`).
+            sizes.payload = Some(
+                attrs
+                    .details
+                    .iter()
+                    .map(|(key, payloads)| key.len() + payloads.encoded_len())
+                    .sum(),
+            );
+        }
+        Some(Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(attrs)) => {
+            sizes.payload = Some(payload_limits::encoded_size(attrs.input.as_ref()));
+            sizes.memo = Some(payload_limits::encoded_size(attrs.memo.as_ref()));
+            sizes.search_attributes = attrs.search_attributes.as_ref().map(search_attribute_sizes);
+        }
+        Some(Attributes::StartChildWorkflowExecutionCommandAttributes(attrs)) => {
+            sizes.payload = Some(payload_limits::encoded_size(attrs.input.as_ref()));
+            sizes.memo = Some(payload_limits::encoded_size(attrs.memo.as_ref()));
+            sizes.search_attributes = attrs.search_attributes.as_ref().map(search_attribute_sizes);
+        }
+        Some(Attributes::SignalExternalWorkflowExecutionCommandAttributes(attrs)) => {
+            sizes.payload = Some(payload_limits::encoded_size(attrs.input.as_ref()));
+        }
+        Some(Attributes::UpsertWorkflowSearchAttributesCommandAttributes(attrs)) => {
+            sizes.upserted_fields = Some(upserted_field_sizes(
+                attrs
+                    .search_attributes
+                    .as_ref()
+                    .map(|attributes| &attributes.indexed_fields),
+            ));
+        }
+        Some(Attributes::ModifyWorkflowPropertiesCommandAttributes(attrs)) => {
+            sizes.upserted_fields = Some(upserted_field_sizes(
+                attrs.upserted_memo.as_ref().map(|memo| &memo.fields),
+            ));
+        }
+        Some(Attributes::ScheduleNexusOperationCommandAttributes(attrs))
+            if attrs.endpoint != tokeira_kernel::limits::SYSTEM_NEXUS_ENDPOINT =>
+        {
+            sizes.payload = Some(payload_limits::encoded_size(attrs.input.as_ref()));
+        }
+        _ => {}
+    }
+    let operation = cmd.command_type().as_str_name();
+    if let Some(size) = sizes.payload {
+        payload_limits::note_blob_size(size, operation);
+    }
+    if let Some(size) = sizes.memo {
+        payload_limits::note_memo_size(size, operation);
+    }
+    sizes
+}
+
+/// Search attributes as `ValidateSize` measures them: the key count, each
+/// value's data length and the map's encoded size
+/// (`common/searchattribute/validator.go:60-75, 148-177 @ v1.31.0`).
+fn search_attribute_sizes(attributes: &proto_common::SearchAttributes) -> SearchAttributeSizes {
+    SearchAttributeSizes {
+        keys: attributes.indexed_fields.len(),
+        value_sizes: attributes
+            .indexed_fields
+            .iter()
+            .map(|(key, payload)| (key.clone(), payload.data.len()))
+            .collect(),
+        total: attributes.encoded_len(),
+    }
+}
+
+/// An upsert's fields: their key and data lengths summed (`payloadsMapSize`,
+/// workflow_task_completed_handler.go:1318-1326 @ v1.31.0), and each field it
+/// sets, for the kernel's merged map. A field that removes its key isn't set.
+fn upserted_field_sizes(
+    fields: Option<&BTreeMap<String, proto_common::Payload>>,
+) -> UpsertedFieldSizes {
+    let Some(fields) = fields else {
+        return UpsertedFieldSizes::default();
+    };
+    UpsertedFieldSizes {
+        fields_size: fields
+            .iter()
+            .map(|(key, payload)| key.len() + payload.data.len())
+            .sum(),
+        set_fields: fields
+            .iter()
+            .filter(|(_, payload)| !is_temporal_nil_payload(payload))
+            .map(|(key, payload)| {
+                (
+                    key.clone(),
+                    PayloadSize {
+                        data: payload.data.len(),
+                        encoded: payload.encoded_len(),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// A protocol message's body: the encoded size of its `Any` and its full
+/// message name (`proto.Size(message.Body)` and `protocol.Identify`,
+/// workflow_task_completed_handler.go:354-365; common/protocol/naming.go:44-63
+/// @ v1.31.0).
+fn protocol_message_sizes(body: Option<&prost_types::Any>) -> CommandPayloadSizes {
+    let Some(body) = body else {
+        return CommandPayloadSizes::default();
+    };
+    CommandPayloadSizes {
+        protocol_message: Some(ProtocolMessageSize {
+            body: body.encoded_len(),
+            type_name: body
+                .type_url
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+        }),
+        ..CommandPayloadSizes::default()
+    }
+}
+
 pub fn proto_command_to_workflow_command(
     cmd: command::Command,
     default_namespace: &str,

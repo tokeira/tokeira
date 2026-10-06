@@ -238,13 +238,14 @@
       "temporal_key": "component.nexusoperations.limit.operation.concurrency",
       "temporal_default": "30",
       "temporal_scope": "Namespace",
-      "classification": "auto-tuned-mechanical-setting",
-      "tokeira_treatment": "No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern.",
-      "owner": "crates/tokeira-runtime",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "components/nexusoperations/config.go:36",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/workflow-task-command-limits/bugfix.md"
       ]
     },
     {
@@ -1272,7 +1273,8 @@
       "evidence": [
         "common/dynamicconfig/constants.go:807",
         ".kiro/specs/configuration-policy/requirements.md",
-        ".kiro/specs/payload-admission-limits/bugfix.md"
+        ".kiro/specs/payload-admission-limits/bugfix.md",
+        ".kiro/specs/workflow-task-command-limits/bugfix.md"
       ]
     },
     {
@@ -1286,7 +1288,8 @@
       "evidence": [
         "common/dynamicconfig/constants.go:812",
         ".kiro/specs/configuration-policy/requirements.md",
-        ".kiro/specs/payload-admission-limits/bugfix.md"
+        ".kiro/specs/payload-admission-limits/bugfix.md",
+        ".kiro/specs/workflow-task-command-limits/bugfix.md"
       ]
     },
     {
@@ -1300,7 +1303,8 @@
       "evidence": [
         "common/dynamicconfig/constants.go:817",
         ".kiro/specs/configuration-policy/requirements.md",
-        ".kiro/specs/payload-admission-limits/bugfix.md"
+        ".kiro/specs/payload-admission-limits/bugfix.md",
+        ".kiro/specs/workflow-task-command-limits/bugfix.md"
       ]
     },
     {
@@ -4785,7 +4789,8 @@
       "evidence": [
         "common/dynamicconfig/constants.go:316",
         ".kiro/specs/configuration-policy/requirements.md",
-        ".kiro/specs/payload-admission-limits/bugfix.md"
+        ".kiro/specs/payload-admission-limits/bugfix.md",
+        ".kiro/specs/workflow-task-command-limits/bugfix.md"
       ]
     },
     {
@@ -4799,7 +4804,8 @@
       "evidence": [
         "common/dynamicconfig/constants.go:321",
         ".kiro/specs/configuration-policy/requirements.md",
-        ".kiro/specs/payload-admission-limits/bugfix.md"
+        ".kiro/specs/payload-admission-limits/bugfix.md",
+        ".kiro/specs/workflow-task-command-limits/bugfix.md"
       ]
     },
     {
@@ -4982,7 +4988,8 @@
       "evidence": [
         "common/dynamicconfig/constants.go:326",
         ".kiro/specs/configuration-policy/requirements.md",
-        ".kiro/specs/payload-admission-limits/bugfix.md"
+        ".kiro/specs/payload-admission-limits/bugfix.md",
+        ".kiro/specs/workflow-task-command-limits/bugfix.md"
       ]
     },
     {
@@ -4996,7 +5003,8 @@
       "evidence": [
         "common/dynamicconfig/constants.go:331",
         ".kiro/specs/configuration-policy/requirements.md",
-        ".kiro/specs/payload-admission-limits/bugfix.md"
+        ".kiro/specs/payload-admission-limits/bugfix.md",
+        ".kiro/specs/workflow-task-command-limits/bugfix.md"
       ]
     },
     {

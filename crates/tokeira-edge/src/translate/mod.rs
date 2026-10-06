@@ -343,6 +343,9 @@ pub struct RespondWorkflowTaskCompletedRequest {
     pub worker_instance_key: String,
     pub worker_control_task_queue: String,
     pub commands: Vec<WorkflowCommand>,
+    /// What was measured on each command's proto, by index
+    /// (`workflow-task-command-limits`).
+    pub command_sizes: Vec<tokeira_kernel::CommandPayloadSizes>,
     pub return_new_workflow_task: bool,
     pub force_create_new_workflow_task: bool,
     pub query_results: HashMap<String, QueryResultDto>,
@@ -366,6 +369,9 @@ pub enum QueryResultDto {
         /// typed `QueryFailed` serviceerror.
         failure: Option<Payload>,
     },
+    /// The answer was over the blob size limit, so the query fails with
+    /// `InvalidArgument` (`workflow-task-command-limits` criterion 2.11).
+    ResultTooLarge,
 }
 
 #[derive(Clone, Debug, PartialEq)]

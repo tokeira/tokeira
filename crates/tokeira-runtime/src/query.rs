@@ -72,6 +72,10 @@ pub enum QueryResult {
     Rejected {
         status: tokeira_types::ExecutionStatus,
     },
+    /// The worker's answer was over the blob size limit; the caller gets
+    /// `InvalidArgument` (`handleBufferedQueries`,
+    /// respondworkflowtaskcompleted/api.go:956-991 @ v1.31.0).
+    ResultTooLarge,
 }
 
 #[cfg(test)]
@@ -707,6 +711,7 @@ mod tests {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: OffsetDateTime::now_utc(),
+                command_sizes: Vec::new(),
             })
             .await
             .unwrap();

@@ -447,6 +447,7 @@ async fn quiesce_workflow(
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
     Ok(())

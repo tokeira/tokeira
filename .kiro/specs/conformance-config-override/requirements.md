@@ -68,8 +68,9 @@ observable effect is inside a conformance build.
   tokeira today — an override cannot bite until the enforcement exists. Since
   [payload-admission-limits](../payload-admission-limits/bugfix.md), `BlobSizeLimitError` and the memo
   and search attribute limits have consult sites when a request arrives, which the harness build can
-  override (key table below); production builds keep v1.31.0's values. A workflow task's commands still
-  have none.
+  override (key table below); production builds keep v1.31.0's values. Since
+  [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md), they also have consult sites
+  in the runtime's limits for a workflow task's commands, as does the pending Nexus operation limit.
 - **The harness seam:** `FunctionalTestBase.OverrideDynamicConfig(setting dynamicconfig.GenericSetting,
   value any) (cleanup func())` (`tests/testcore/functional_test_base.go:645`),
   `TestCluster.OverrideDynamicConfig` (`tests/testcore/test_cluster.go:636`), and the tokeira onebox
@@ -172,7 +173,8 @@ so an override is Unsupported until enforcement lands under another spec.
 | `component.callbacks.allowedAddresses` | callback admission (edge) | **Overridable — Tier 5.32, structured JSON** | fork serializes the v1.31.0 address-rule list as JSON; production policy remains a separate decision |
 | `history.workflowIdReuseMinimalInterval` (1s) | `CONTINUE_AS_NEW_MIN_INTERVAL` (kernel) | **Kernel-excluded** | separate decision (independent-run build or kernel→runtime move) |
 | `history.maximumBufferedEventsBatch` (100) | `MAX_BUFFERED_EVENTS` (kernel) | **Kernel-excluded** | no corpus leaf overrides it today |
-| `limit.blobSize.error`, `limit.blobSize.warn`, `limit.memoSize.error`, `limit.memoSize.warn`, `frontend.searchAttributesNumberOfKeysLimit`, `frontend.searchAttributesSizeOfValueLimit`, `frontend.searchAttributesTotalSizeLimit` | `grpc/payload_limits.rs` accessors (edge) | **Overridable** | admission checks from [payload-admission-limits](../payload-admission-limits/bugfix.md); production builds compile v1.31.0's values; a workflow task's commands aren't checked yet |
+| `limit.blobSize.error`, `limit.blobSize.warn`, `limit.memoSize.error`, `limit.memoSize.warn`, `frontend.searchAttributesNumberOfKeysLimit`, `frontend.searchAttributesSizeOfValueLimit`, `frontend.searchAttributesTotalSizeLimit` | `grpc/payload_limits.rs` accessors (edge); `workflow_task_completion_limits` (runtime) | **Overridable** | admission checks from [payload-admission-limits](../payload-admission-limits/bugfix.md), and a workflow task's commands from [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md); production builds compile v1.31.0's values |
+| `component.nexusoperations.limit.operation.concurrency` (30) | `workflow_task_completion_limits` (runtime) | **Overridable** | the pending Nexus operation check from [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md); production builds compile v1.31.0's value |
 | `limit.mutableStateSize.error`, `limit.historySize.error`, `limit.historyCount.error`, `limit.historySize.suggestContinueAsNew` | none | **Not-enforced** | Unsupported until enforcement exists |
 
 ---

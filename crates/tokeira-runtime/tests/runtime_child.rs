@@ -78,6 +78,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -122,6 +123,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -205,6 +207,7 @@ async fn parent_close_policy_terminate_closes_started_child() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -276,6 +279,7 @@ async fn parent_close_policy_request_cancel_requests_cancel_on_child() -> Result
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -366,6 +370,7 @@ async fn duplicate_child_start_delivers_failed_confirmation_to_parent() -> Resul
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -443,6 +448,7 @@ async fn start_parent_with_child(
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 

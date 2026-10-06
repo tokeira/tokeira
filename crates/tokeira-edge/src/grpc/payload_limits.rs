@@ -12,26 +12,18 @@
 //! (`conformance-config-override`).
 
 use prost::Message as _;
+// v1.31.0's values, defined once in the kernel crate, which the runtime also
+// hands to the kernel for a workflow task's commands.
+use tokeira_kernel::limits::{
+    BLOB_SIZE_LIMIT_ERROR, BLOB_SIZE_LIMIT_WARN, MEMO_SIZE_LIMIT_ERROR, MEMO_SIZE_LIMIT_WARN,
+    SEARCH_ATTRIBUTES_NUMBER_OF_KEYS_LIMIT, SEARCH_ATTRIBUTES_SIZE_OF_VALUE_LIMIT,
+    SEARCH_ATTRIBUTES_TOTAL_SIZE_LIMIT,
+};
 use tokeira_proto::{
     conversions::ProtoConversionError,
     public::temporal::api::{common::v1 as proto_common, failure::v1 as failure_proto},
 };
 use tracing::warn;
-
-/// `limit.blobSize.error` (`common/dynamicconfig/constants.go:316-320 @ v1.31.0`).
-const BLOB_SIZE_LIMIT_ERROR: usize = 2 * 1024 * 1024;
-/// `limit.blobSize.warn` (`constants.go:321-325 @ v1.31.0`).
-const BLOB_SIZE_LIMIT_WARN: usize = 512 * 1024;
-/// `limit.memoSize.error` (`constants.go:326-330 @ v1.31.0`).
-const MEMO_SIZE_LIMIT_ERROR: usize = 2 * 1024 * 1024;
-/// `limit.memoSize.warn` (`constants.go:331-335 @ v1.31.0`).
-const MEMO_SIZE_LIMIT_WARN: usize = 2 * 1024;
-/// `frontend.searchAttributesNumberOfKeysLimit` (`constants.go:807-811 @ v1.31.0`).
-const SEARCH_ATTRIBUTES_NUMBER_OF_KEYS_LIMIT: usize = 100;
-/// `frontend.searchAttributesSizeOfValueLimit` (`constants.go:812-816 @ v1.31.0`).
-const SEARCH_ATTRIBUTES_SIZE_OF_VALUE_LIMIT: usize = 2 * 1024;
-/// `frontend.searchAttributesTotalSizeLimit` (`constants.go:817-821 @ v1.31.0`).
-const SEARCH_ATTRIBUTES_TOTAL_SIZE_LIMIT: usize = 40 * 1024;
 
 /// `common.ErrBlobSizeExceedsLimit` (`common/util.go:118 @ v1.31.0`).
 pub(crate) const BLOB_SIZE_EXCEEDS_LIMIT: &str = "Blob data size exceeds limit.";
@@ -157,6 +149,18 @@ pub(crate) fn memo_exceeds_limit(size: usize, operation: &str) -> bool {
         memo_size_limit_error(),
         operation,
     )
+}
+
+/// Logs a workflow task command's payload above the blob warn limit, as
+/// v1.31.0 does; the kernel decides whether it is over the limit
+/// (`workflow-task-command-limits` criterion 2.13).
+pub(crate) fn note_blob_size(size: usize, operation: &str) {
+    let _ = blob_exceeds_limit(size, operation);
+}
+
+/// Logs a workflow task command's memo above the memo warn limit.
+pub(crate) fn note_memo_size(size: usize, operation: &str) {
+    let _ = memo_exceeds_limit(size, operation);
 }
 
 /// The encoded size of an optional message; an absent field has size 0, as
@@ -889,5 +893,253 @@ mod tests {
                 .to_string(),
             MEMO_SIZE_EXCEEDS_LIMIT
         );
+    }
+
+    // ── workflow-task-command-limits: what the edge measures on a command ──
+
+    use tokeira_proto::public::temporal::api::command::v1 as command;
+
+    fn arb_wire_payload() -> impl Strategy<Value = proto_common::Payload> {
+        (
+            prop::collection::btree_map(
+                "[a-z]{1,8}",
+                prop::collection::vec(any::<u8>(), 0..12),
+                0..3,
+            ),
+            prop::collection::vec(any::<u8>(), 0..400),
+        )
+            .prop_map(|(metadata, data)| proto_common::Payload {
+                metadata,
+                data,
+                ..Default::default()
+            })
+    }
+
+    fn arb_wire_payloads() -> impl Strategy<Value = proto_common::Payloads> {
+        prop::collection::vec(arb_wire_payload(), 0..3)
+            .prop_map(|payloads| proto_common::Payloads { payloads })
+    }
+
+    /// A payload map in which some fields remove their key (JSON `null`).
+    fn arb_upserted_fields() -> impl Strategy<Value = BTreeMap<String, proto_common::Payload>> {
+        prop::collection::btree_map(
+            "[A-Za-z]{1,8}",
+            prop_oneof![
+                arb_wire_payload(),
+                Just(proto_common::Payload {
+                    metadata: BTreeMap::from([("encoding".to_owned(), b"json/plain".to_vec())]),
+                    data: b"null".to_vec(),
+                    ..Default::default()
+                }),
+            ],
+            0..5,
+        )
+    }
+
+    fn sent_command(attributes: command::command::Attributes) -> command::Command {
+        command::Command {
+            attributes: Some(attributes),
+            ..Default::default()
+        }
+    }
+
+    // Feature: workflow-task-command-limits, Property 3: Sizes match v1.31.0's measurements
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn property_command_sizes_match_v1_31(
+            input in arb_wire_payloads(),
+            single in arb_wire_payload(),
+            details in prop::collection::btree_map("[a-z]{1,8}", arb_wire_payloads(), 0..3),
+            memo in prop::collection::btree_map("[a-z]{1,8}", arb_wire_payload(), 0..3),
+            attributes in prop::collection::btree_map("[A-Za-z]{1,8}", arb_wire_payload(), 0..4),
+            upserted in arb_upserted_fields(),
+        ) {
+            use command::command::Attributes;
+            let memo = proto_common::Memo { fields: memo };
+            let search_attributes = proto_common::SearchAttributes { indexed_fields: attributes };
+            let expected_attributes = tokeira_kernel::SearchAttributeSizes {
+                keys: search_attributes.indexed_fields.len(),
+                value_sizes: search_attributes
+                    .indexed_fields
+                    .iter()
+                    .map(|(key, payload)| (key.clone(), payload.data.len()))
+                    .collect(),
+                total: search_attributes.encoded_len(),
+            };
+
+            let schedule = translate::command_payload_sizes(&sent_command(
+                Attributes::ScheduleActivityTaskCommandAttributes(command::ScheduleActivityTaskCommandAttributes {
+                    input: Some(input.clone()),
+                    ..Default::default()
+                }),
+            ));
+            prop_assert_eq!(schedule.payload, Some(input.encoded_len()));
+
+            let marker = translate::command_payload_sizes(&sent_command(
+                Attributes::RecordMarkerCommandAttributes(command::RecordMarkerCommandAttributes {
+                    details: details.clone(),
+                    ..Default::default()
+                }),
+            ));
+            let marker_size: usize = details.iter().map(|(key, payloads)| key.len() + payloads.encoded_len()).sum();
+            prop_assert_eq!(marker.payload, Some(marker_size));
+
+            let child = translate::command_payload_sizes(&sent_command(
+                Attributes::StartChildWorkflowExecutionCommandAttributes(
+                    command::StartChildWorkflowExecutionCommandAttributes {
+                        input: Some(input.clone()),
+                        memo: Some(memo.clone()),
+                        search_attributes: Some(search_attributes.clone()),
+                        ..Default::default()
+                    },
+                ),
+            ));
+            prop_assert_eq!(child.payload, Some(input.encoded_len()));
+            prop_assert_eq!(child.memo, Some(memo.encoded_len()));
+            prop_assert_eq!(child.search_attributes.as_ref(), Some(&expected_attributes));
+
+            let continued = translate::command_payload_sizes(&sent_command(
+                Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(
+                    command::ContinueAsNewWorkflowExecutionCommandAttributes {
+                        input: Some(input.clone()),
+                        memo: Some(memo.clone()),
+                        search_attributes: Some(search_attributes.clone()),
+                        ..Default::default()
+                    },
+                ),
+            ));
+            prop_assert_eq!(continued, child);
+
+            let upsert = translate::command_payload_sizes(&sent_command(
+                Attributes::UpsertWorkflowSearchAttributesCommandAttributes(
+                    command::UpsertWorkflowSearchAttributesCommandAttributes {
+                        search_attributes: Some(proto_common::SearchAttributes {
+                            indexed_fields: upserted.clone(),
+                        }),
+                    },
+                ),
+            ));
+            let fields = upsert.upserted_fields.expect("an upsert's fields are measured");
+            let fields_size: usize = upserted.iter().map(|(key, payload)| key.len() + payload.data.len()).sum();
+            prop_assert_eq!(fields.fields_size, fields_size);
+            let set: BTreeMap<String, tokeira_kernel::PayloadSize> = upserted
+                .iter()
+                .filter(|(_, payload)| payload.data != b"null")
+                .map(|(key, payload)| (key.clone(), tokeira_kernel::PayloadSize {
+                    data: payload.data.len(),
+                    encoded: payload.encoded_len(),
+                }))
+                .collect();
+            prop_assert_eq!(fields.set_fields, set);
+
+            let nexus = |endpoint: &str| translate::command_payload_sizes(&sent_command(
+                Attributes::ScheduleNexusOperationCommandAttributes(
+                    command::ScheduleNexusOperationCommandAttributes {
+                        endpoint: endpoint.to_owned(),
+                        input: Some(single.clone()),
+                        ..Default::default()
+                    },
+                ),
+            ));
+            prop_assert_eq!(nexus("endpoint").payload, Some(single.encoded_len()));
+            prop_assert_eq!(nexus("__temporal_system").payload, None);
+        }
+    }
+
+    #[test]
+    fn leftover_messages_keep_their_sizes_through_the_splice() {
+        use command::command::Attributes;
+        use tokeira_proto::public::temporal::api::{
+            protocol::v1 as protocol, update::v1 as update,
+        };
+        let input = payloads_of_size(1000);
+        let result = payloads_of_size(2000);
+        let acceptance = update::Acceptance {
+            accepted_request_message_id: "request".to_owned(),
+            accepted_request_sequencing_event_id: 3,
+            accepted_request: Some(update::Request {
+                meta: Some(update::Meta {
+                    update_id: "update".to_owned(),
+                    identity: "client".to_owned(),
+                }),
+                input: Some(update::Input {
+                    header: None,
+                    name: "update".to_owned(),
+                    args: None,
+                }),
+            }),
+        };
+        let body = prost_types::Any {
+            type_url: "type.googleapis.com/temporal.api.update.v1.Acceptance".to_owned(),
+            value: acceptance.encode_to_vec(),
+        };
+        let request = workflowservice::RespondWorkflowTaskCompletedRequest {
+            commands: vec![
+                sent_command(Attributes::ScheduleActivityTaskCommandAttributes(
+                    command::ScheduleActivityTaskCommandAttributes {
+                        activity_id: "activity".to_owned(),
+                        input: Some(input.clone()),
+                        ..Default::default()
+                    },
+                )),
+                sent_command(Attributes::CompleteWorkflowExecutionCommandAttributes(
+                    command::CompleteWorkflowExecutionCommandAttributes {
+                        result: Some(result.clone()),
+                    },
+                )),
+            ],
+            // Not referenced by a command: it is spliced in before the close.
+            messages: vec![protocol::Message {
+                id: "message".to_owned(),
+                protocol_instance_id: "update".to_owned(),
+                body: Some(body.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let translated = translate::respond_completed_request_to_edge(request).unwrap();
+        assert_eq!(translated.commands.len(), 3);
+        assert!(matches!(
+            translated.commands[1],
+            tokeira_kernel::WorkflowCommand::ProtocolMessage { .. }
+        ));
+        assert_eq!(translated.command_sizes.len(), 3);
+        assert_eq!(translated.command_sizes[0].payload, Some(1000));
+        assert_eq!(
+            translated.command_sizes[1].protocol_message,
+            Some(tokeira_kernel::ProtocolMessageSize {
+                body: body.encoded_len(),
+                type_name: "temporal.api.update.v1.Acceptance".to_owned(),
+            })
+        );
+        assert_eq!(translated.command_sizes[2].payload, Some(2000));
+    }
+
+    #[test]
+    fn an_oversized_query_answer_in_a_completion_fails_that_query() {
+        use tokeira_proto::public::temporal::api::query::v1 as query;
+        let answered = |size: usize| query::WorkflowQueryResult {
+            result_type: tokeira_proto::enums::QueryResultType::Answered as i32,
+            answer: Some(payloads_of_size(size)),
+            ..Default::default()
+        };
+        let request = workflowservice::RespondWorkflowTaskCompletedRequest {
+            query_results: BTreeMap::from([
+                ("over".to_owned(), answered(2 * 1024 * 1024 + 1)),
+                ("at".to_owned(), answered(2 * 1024 * 1024)),
+            ]),
+            ..Default::default()
+        };
+        let translated = translate::respond_completed_request_to_edge(request).unwrap();
+        assert_eq!(
+            translated.query_results["over"],
+            crate::translate::QueryResultDto::ResultTooLarge
+        );
+        assert!(matches!(
+            translated.query_results["at"],
+            crate::translate::QueryResultDto::Answered { .. }
+        ));
     }
 }

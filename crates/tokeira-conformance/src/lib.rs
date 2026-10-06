@@ -246,6 +246,15 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::Wired,
     },
+    // The pending Nexus operation limit, resolved with the limits above for a
+    // workflow task's commands (`workflow-task-command-limits`). v1.31.0
+    // defaults it to 30 and has no disabled value
+    // (`components/nexusoperations/config.go:36-43 @ v1.31.0`).
+    KeySpec {
+        key: "component.nexusoperations.limit.operation.concurrency",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
     // Schedule starts are paced at a live runtime consult site. v1.31.0 owns
     // this as a namespace-scoped scheduler-worker rate
     // (`service/worker/scheduler/fx.go:116-133 @ v1.31.0`).
@@ -373,10 +382,10 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         disposition: Disposition::KernelExcluded,
     },
     // Payload limits checked when a request arrives (`payload-admission-limits`),
-    // read through the edge's `grpc/payload_limits.rs` accessors. Production
-    // builds compile v1.31.0's values; only this harness overrides them, so its
-    // tests that shrink a limit can run. A workflow task's commands aren't
-    // checked yet.
+    // read through the edge's `grpc/payload_limits.rs` accessors, and on a
+    // workflow task's commands (`workflow-task-command-limits`), resolved by the
+    // runtime for the kernel. Production builds compile v1.31.0's values; only
+    // this harness overrides them, so its tests that shrink a limit can run.
     KeySpec {
         key: "limit.blobSize.error",
         value_type: ValueType::Int,

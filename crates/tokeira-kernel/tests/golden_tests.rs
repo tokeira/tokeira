@@ -1024,6 +1024,7 @@ fn complete_wft_with_nexus_cancel(state: WorkflowState) -> Transition {
                 delivered_update_ids: Vec::new(),
                 request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap()
@@ -1475,6 +1476,7 @@ fn sticky_completion_dispatches_next_wft_sticky_then_s2s_times_out() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -2614,6 +2616,7 @@ fn wft_failed_paused_workflow_no_redispatch() {
                 ),
                 now: now(),
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             }),
         )
         .unwrap();
@@ -2720,6 +2723,7 @@ fn wft_completed_paused_workflow_no_force_wft() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -2760,6 +2764,7 @@ fn wft_completion_tracks_previous_started_event_id() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -3385,6 +3390,7 @@ fn workflow_task_completed_with_activity_and_timer() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -3461,6 +3467,7 @@ fn workflow_task_completed_with_complete_workflow() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -3508,6 +3515,7 @@ fn workflow_task_completed_with_fail_workflow() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -3594,6 +3602,7 @@ fn continue_as_new_closes_run() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -3668,6 +3677,7 @@ fn continue_as_new_then_another_command() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         ),
         Err(Reject::CommandsAfterClose { index: 1 })
@@ -3843,6 +3853,7 @@ fn fail_workflow_with_retry_policy() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -3891,6 +3902,7 @@ fn fail_workflow_without_retry_policy() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -4056,6 +4068,7 @@ fn wft_failed_with_started_wft() {
                 ),
                 now: now(),
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             }),
         )
         .unwrap();
@@ -4187,6 +4200,7 @@ fn wft_failed_no_sticky() {
                 ),
                 now: now(),
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             }),
         )
         .unwrap();
@@ -4461,6 +4475,7 @@ fn reject_wft_completed_no_pending() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             })
         ),
         Err(Reject::NoPendingWorkflowTask)
@@ -4497,6 +4512,7 @@ fn reject_wft_completed_not_started() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             })
         ),
         Err(Reject::WorkflowTaskNotStarted { logical_seq: 3 })
@@ -4534,6 +4550,7 @@ fn reject_wft_completed_seq_mismatch() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             })
         ),
         Err(Reject::WorkflowTaskSeqMismatch {
@@ -4574,6 +4591,7 @@ fn reject_wft_completed_token_mismatch() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             })
         ),
         Err(Reject::WorkflowTaskTokenMismatch)
@@ -4662,6 +4680,7 @@ fn reject_duplicate_activity_id() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             })
         ),
         Err(Reject::DuplicateActivityId("dup".into()))
@@ -4711,6 +4730,7 @@ fn reject_duplicate_timer_id() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             })
         ),
         Err(Reject::DuplicateTimerId("dup".into()))
@@ -4735,6 +4755,7 @@ fn reject_wft_failed_absent_run() {
                 ),
                 now: now(),
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             })
         ),
         Err(Reject::MissingRun)
@@ -4759,6 +4780,7 @@ fn reject_wft_failed_closed_run() {
                 ),
                 now: now(),
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             })
         ),
         Err(Reject::RunClosed(ExecutionStatus::Completed))
@@ -4783,6 +4805,7 @@ fn reject_wft_failed_no_pending() {
                 ),
                 now: now(),
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             })
         ),
         Err(Reject::NoPendingWorkflowTask)
@@ -4807,6 +4830,7 @@ fn reject_wft_failed_not_started() {
                 ),
                 now: now(),
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             })
         ),
         Err(Reject::WorkflowTaskNotStarted { logical_seq: 3 })
@@ -4831,6 +4855,7 @@ fn reject_wft_failed_seq_mismatch() {
                 ),
                 now: now(),
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             })
         ),
         Err(Reject::WorkflowTaskSeqMismatch {
@@ -4858,6 +4883,7 @@ fn reject_wft_failed_started_event_mismatch() {
                 ),
                 now: now(),
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             })
         ),
         Err(Reject::WorkflowTaskTokenMismatch)
@@ -5034,6 +5060,7 @@ fn reject_commands_after_close() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             })
         ),
         Err(Reject::CommandsAfterClose { index: 1 })
@@ -5071,6 +5098,7 @@ fn cancel_workflow_command() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -5126,6 +5154,7 @@ fn cancel_workflow_then_another_command() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         ),
         Err(Reject::CommandsAfterClose { index: 1 })
@@ -5165,6 +5194,7 @@ fn request_cancel_activity() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -5224,6 +5254,7 @@ fn request_cancel_activity_started_sets_durable_cancel_requested() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -5277,6 +5308,7 @@ fn request_cancel_activity_unknown() {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
+            command_sizes: Vec::new(),
         }),
     );
 
@@ -5344,6 +5376,7 @@ fn close_command_with_buffered_events_is_unhandled_command() {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
+            command_sizes: Vec::new(),
         }),
     );
     assert_eq!(
@@ -5388,6 +5421,7 @@ fn cancel_timer() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -5433,6 +5467,7 @@ fn cancel_timer_unknown() {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
+            command_sizes: Vec::new(),
         }),
     );
 
@@ -5490,6 +5525,7 @@ fn record_marker_missing_name_fails_wft() {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
+            command_sizes: Vec::new(),
         }),
     );
     assert_eq!(
@@ -5576,6 +5612,7 @@ fn workflow_property_and_search_attribute_patches_record_merge_and_replay() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -5656,6 +5693,7 @@ fn invalid_search_attribute_uses_bad_search_attributes_failure_cause() {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
+            command_sizes: Vec::new(),
         }),
     );
 
@@ -5730,6 +5768,7 @@ fn transient_completion_materializes_scheduled_started_with_task_times() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -5836,6 +5875,7 @@ fn cancel_timer_fired_and_buffered_deletes_buffered_fired_event() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -5887,6 +5927,7 @@ fn request_cancel_activity_then_resolved_canceled() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -5997,6 +6038,7 @@ fn cancel_then_cancel_workflow_e2e() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -6196,6 +6238,7 @@ fn start_child_workflow_happy_path() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -6367,6 +6410,7 @@ fn signal_external_workflow_happy_path() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -6445,6 +6489,7 @@ fn request_cancel_external_workflow_happy_path() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -6667,6 +6712,7 @@ fn update_completed_happy_path() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -6723,6 +6769,7 @@ fn update_rejected_happy_path() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -6777,6 +6824,7 @@ fn update_completed_unknown_update() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap_err();
@@ -6818,6 +6866,7 @@ fn update_rejected_unknown_update_is_tolerated() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -6872,6 +6921,7 @@ fn protocol_message_accepted_body() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -6927,6 +6977,7 @@ fn protocol_message_completed_body() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -6985,6 +7036,7 @@ fn protocol_message_rejected_body() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -7051,6 +7103,7 @@ fn complete_workflow_clears_pending_updates() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -7096,6 +7149,7 @@ fn record_marker_happy_path() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -7158,6 +7212,7 @@ fn record_marker_after_close_rejected() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap_err();
@@ -7488,6 +7543,7 @@ fn close_via_wft(state: WorkflowState, commands: Vec<WorkflowCommand>) -> Transi
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap()
@@ -7787,6 +7843,7 @@ fn schedule_nexus_operation_happy_path() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -7850,6 +7907,7 @@ fn schedule_nexus_operation_duplicate_rejected() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap_err();
@@ -7891,6 +7949,7 @@ fn cancel_nexus_operation_happy_path() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -8165,6 +8224,7 @@ fn cancel_nexus_operation_unknown() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap_err();
@@ -8721,6 +8781,7 @@ fn close_via_complete_clears_pending_nexus_operations() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now: now(),
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -8977,6 +9038,7 @@ fn speculative_completion_request(
         delivered_update_ids: Vec::new(),
         request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
         now: now(),
+        command_sizes: Vec::new(),
     }
 }
 
@@ -9723,6 +9785,7 @@ fn speculative_explicit_fail_materializes_and_keeps_update_admitted() {
                 ),
                 now: now() + Duration::seconds(1),
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             }),
         )
         .unwrap();

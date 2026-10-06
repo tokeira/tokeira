@@ -22,14 +22,15 @@ use crate::{
     command::{
         ActivityControlTarget, ActivityResolvedRequest, ActivityStartMode, ActivityStartRequest,
         CallbackAttemptOutcome, CancelRequest, ChildResolution, ChildResolvedRequest,
-        ChildStartConfirmedRequest, ChildStartResult, Command, CompletionCallbackAttemptedRequest,
-        ContinueAsNewInitiator, CronContinuation, ExternalCancelResolvedRequest,
-        ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult, FieldChange,
-        MemoPatch, NexusCancellationAttemptOutcome, NexusCancellationAttemptedRequest,
-        NexusCancellationRetryRequest, NexusCompletionOutcome, NexusOperationResolvedRequest,
-        NexusOperationRetryRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
-        ResetActivityRequest, ResetRequest, ResetStickyRequest, RetryContinuation, RetryState,
-        ScheduleQueryTaskRequest, SearchAttributesPatch, SignalRequest, SignalWithStartRequest,
+        ChildStartConfirmedRequest, ChildStartResult, Command, CommandPayloadSizes,
+        CompletionCallbackAttemptedRequest, ContinueAsNewInitiator, CronContinuation,
+        ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
+        ExternalSignalResult, FieldChange, MemoPatch, NexusCancellationAttemptOutcome,
+        NexusCancellationAttemptedRequest, NexusCancellationRetryRequest, NexusCompletionOutcome,
+        NexusOperationResolvedRequest, NexusOperationRetryRequest, NexusResolution,
+        PauseActivityRequest, PauseWorkflowRequest, ResetActivityRequest, ResetRequest,
+        ResetStickyRequest, RetryContinuation, RetryState, ScheduleQueryTaskRequest,
+        SearchAttributeSizes, SearchAttributesPatch, SignalRequest, SignalWithStartRequest,
         StartAndUpdateRequest, StartRequest, StartWorkflowTaskRequest,
         TerminateOnWorkflowTaskFailedRequest, TerminateRequest, TimerDueRequest,
         UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
@@ -2114,6 +2115,7 @@ impl BasicKernel {
             });
 
         let limits = req.limits;
+        let command_sizes = req.command_sizes;
         let mut closed = false;
         for (index, command) in req.commands.into_iter().enumerate() {
             if closed {
@@ -2128,6 +2130,7 @@ impl BasicKernel {
             closed = apply_workflow_command(
                 &mut builder,
                 command,
+                command_sizes.get(index),
                 wft_completed_event_id,
                 cron_continuation.as_ref(),
                 retry_continuation.as_ref(),
@@ -3488,6 +3491,16 @@ impl BasicKernel {
         // the retry re-dispatch (`failWorkflowTask` fails then flushes,
         // `service/history/workflow/util.go:26 @ v1.31.0`).
         let flushed = builder.flush_buffered();
+        // A command over a size limit terminates the workflow after the
+        // failure and the buffered events, and schedules no workflow task
+        // (respondworkflowtaskcompleted/api.go:489-510 @ v1.31.0;
+        // `workflow-task-command-limits` criterion 2.8). The failed task is no
+        // longer pending, so the terminate tail writes no force-close event.
+        if let Some(reason) = req.terminate_reason {
+            builder.state.pending_workflow_task = None;
+            builder.terminate_run(reason, None, "history-service".to_string(), Vec::new());
+            return Ok(builder.finish());
+        }
         let paused = builder.state.status == ExecutionStatus::Paused;
         // A reset re-drives from the fork point on a FRESH normal attempt-1 task
         // with a real `WorkflowTaskScheduled` (v1.31.0 `ScheduleWorkflowTask` after
@@ -4885,6 +4898,113 @@ fn reject_if_pending_limit_reached(
     Ok(())
 }
 
+/// A command's field over its size limit terminates the workflow
+/// (`checkIfPayloadSizeExceedsLimit` and `terminateWorkflow`,
+/// workflow_size_checker.go:54-105 and workflow_task_completed_handler.go:
+/// 1477-1491 @ v1.31.0; `workflow-task-command-limits` criteria 2.1-2.6).
+/// An unmeasured field is not checked.
+fn reject_if_over_limit(
+    size: Option<usize>,
+    limit: usize,
+    cause: WorkflowTaskFailedCause,
+    message: &str,
+) -> Result<(), Reject> {
+    if size.is_some_and(|size| size > limit) {
+        return Err(Reject::CommandExceedsLimit {
+            cause,
+            message: message.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Search attributes over the value or total limit terminate the workflow
+/// with `cause` and `ValidateSize`'s messages, values in key order
+/// (`common/searchattribute/validator.go:148-177 @ v1.31.0`).
+fn reject_if_search_attributes_too_large(
+    value_sizes: &BTreeMap<String, usize>,
+    total: usize,
+    limits: &WorkflowTaskCompletionLimits,
+    cause: WorkflowTaskFailedCause,
+) -> Result<(), Reject> {
+    let value_limit = limits.search_attribute_value_size_limit;
+    if let Some((name, size)) = value_sizes.iter().find(|(_, size)| **size > value_limit) {
+        return Err(Reject::CommandExceedsLimit {
+            cause,
+            message: format!(
+                "search attribute {name} value size {size} exceeds size limit {value_limit}"
+            ),
+        });
+    }
+    let total_limit = limits.search_attributes_total_size_limit;
+    if total > total_limit {
+        return Err(Reject::CommandExceedsLimit {
+            cause,
+            message: format!(
+                "total size of search attributes {total} exceeds size limit {total_limit}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// More search attributes than the key limit fail the workflow task with
+/// `BadSearchAttributes` (`validator.go:60-75 @ v1.31.0`); `wrap` adds the
+/// command's context as its validator does.
+fn reject_if_too_many_search_attributes(
+    sizes: Option<&SearchAttributeSizes>,
+    limits: &WorkflowTaskCompletionLimits,
+    wrap: impl FnOnce(String) -> String,
+) -> Result<(), Reject> {
+    let limit = limits.search_attributes_keys_limit;
+    match sizes {
+        Some(sizes) if sizes.keys > limit => Err(Reject::InvalidCommandAttributes {
+            cause: WorkflowTaskFailedCause::BadSearchAttributes,
+            message: Some(wrap(format!(
+                "number of search attributes {} exceeds limit {limit}",
+                sizes.keys
+            ))),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// ContinueAsNew's and StartChild's input, memo and search attribute sizes, in
+/// that order (workflow_task_completed_handler.go:983-1006, 1106-1129 @
+/// v1.31.0).
+fn reject_if_start_payloads_too_large(
+    sizes: Option<&CommandPayloadSizes>,
+    limits: &WorkflowTaskCompletionLimits,
+    cause: WorkflowTaskFailedCause,
+    input_message: &str,
+    memo_message: &str,
+) -> Result<(), Reject> {
+    let Some(sizes) = sizes else {
+        return Ok(());
+    };
+    reject_if_over_limit(
+        sizes.payload,
+        limits.blob_size_limit,
+        cause.clone(),
+        input_message,
+    )?;
+    reject_if_over_limit(
+        sizes.memo,
+        limits.memo_size_limit,
+        cause.clone(),
+        memo_message,
+    )?;
+    if let Some(search_attributes) = &sizes.search_attributes {
+        reject_if_search_attributes_too_large(
+            &search_attributes.value_sizes,
+            search_attributes.total,
+            limits,
+            cause,
+        )?;
+    }
+    Ok(())
+}
+
 fn evolve_auto_reset_points(
     state: &mut WorkflowState,
     worker_version: Option<&WorkflowTaskWorkerVersion>,
@@ -5025,6 +5145,7 @@ fn normalize_activity_command(
 fn apply_workflow_command(
     builder: &mut TransitionBuilder,
     command: WorkflowCommand,
+    sizes: Option<&CommandPayloadSizes>,
     workflow_task_completed_event_id: i64,
     cron_continuation: Option<&CronContinuation>,
     retry_continuation: Option<&RetryContinuation>,
@@ -5067,6 +5188,14 @@ fn apply_workflow_command(
             let heartbeat_timeout = normalized.heartbeat_timeout;
             let effective_priority =
                 merge_priority(builder.state.priority.as_ref(), priority.as_ref());
+            // The input after attribute validation, before the pending count
+            // (workflow_task_completed_handler.go:472-481 @ v1.31.0).
+            reject_if_over_limit(
+                sizes.and_then(|sizes| sizes.payload),
+                limits.blob_size_limit,
+                WorkflowTaskFailedCause::BadScheduleActivityAttributes,
+                "ScheduleActivityTaskCommandAttributes.Input exceeds size limit.",
+            )?;
             reject_if_pending_limit_reached(
                 limits.pending_activities,
                 builder.state.activities.len(),
@@ -5188,6 +5317,26 @@ fn apply_workflow_command(
             Ok(false)
         }
         WorkflowCommand::UpsertMemoPatch(patch) => {
+            // The upserted fields, then the merged memo
+            // (workflow_task_completed_handler.go:1292-1311 @ v1.31.0).
+            if let Some(upserted) = sizes.and_then(|sizes| sizes.upserted_fields.as_ref()) {
+                reject_if_over_limit(
+                    Some(upserted.fields_size),
+                    limits.blob_size_limit,
+                    WorkflowTaskFailedCause::BadModifyWorkflowPropertiesAttributes,
+                    "ModifyWorkflowPropertiesCommandAttributes exceeds size limit.",
+                )?;
+                reject_if_over_limit(
+                    Some(crate::payload_size::merged_memo_encoded_len(
+                        &builder.state.memo,
+                        &patch,
+                        &upserted.set_fields,
+                    )),
+                    limits.memo_size_limit,
+                    WorkflowTaskFailedCause::BadModifyWorkflowPropertiesAttributes,
+                    "ModifyWorkflowPropertiesCommandAttributes. Memo exceeds size limit.",
+                )?;
+            }
             builder.emit(HistoryEventKind::WorkflowPropertiesModified {
                 workflow_task_completed_event_id,
                 patch: patch.clone(),
@@ -5196,6 +5345,28 @@ fn apply_workflow_command(
             Ok(false)
         }
         WorkflowCommand::UpsertSearchAttributesPatch(patch) => {
+            // The key count was checked by the edge, before its registered-key
+            // check; here the upserted fields, then the merged map
+            // (workflow_task_completed_handler.go:1241-1264 @ v1.31.0).
+            if let Some(upserted) = sizes.and_then(|sizes| sizes.upserted_fields.as_ref()) {
+                reject_if_over_limit(
+                    Some(upserted.fields_size),
+                    limits.blob_size_limit,
+                    WorkflowTaskFailedCause::BadSearchAttributes,
+                    "UpsertWorkflowSearchAttributesCommandAttributes exceeds size limit.",
+                )?;
+                let (value_sizes, total) = crate::payload_size::merged_search_attribute_sizes(
+                    &builder.state.search_attributes,
+                    &patch,
+                    &upserted.set_fields,
+                );
+                reject_if_search_attributes_too_large(
+                    &value_sizes,
+                    total,
+                    limits,
+                    WorkflowTaskFailedCause::BadSearchAttributes,
+                )?;
+            }
             builder.emit(HistoryEventKind::UpsertWorkflowSearchAttributes {
                 workflow_task_completed_event_id,
                 patch: patch.clone(),
@@ -5226,6 +5397,12 @@ fn apply_workflow_command(
                     message: Some("MarkerName is not set on RecordMarkerCommand.".to_string()),
                 });
             }
+            reject_if_over_limit(
+                sizes.and_then(|sizes| sizes.payload),
+                limits.blob_size_limit,
+                WorkflowTaskFailedCause::BadRecordMarkerAttributes,
+                "RecordMarkerCommandAttributes.Details exceeds size limit.",
+            )?;
             builder.emit(HistoryEventKind::MarkerRecorded {
                 workflow_task_completed_event_id,
                 marker_name,
@@ -5248,6 +5425,15 @@ fn apply_workflow_command(
                     message: None,
                 });
             }
+            // v1.31.0 reports an oversized result with
+            // BAD_SCHEDULE_ACTIVITY_ATTRIBUTES
+            // (workflow_task_completed_handler.go:705-711 @ v1.31.0).
+            reject_if_over_limit(
+                sizes.and_then(|sizes| sizes.payload),
+                limits.blob_size_limit,
+                WorkflowTaskFailedCause::BadScheduleActivityAttributes,
+                "CompleteWorkflowExecutionCommandAttributes.Result exceeds size limit.",
+            )?;
             // A cron run closes with its REAL outcome carrying the successor
             // run id (`WorkflowExecutionCompleted.NewExecutionRunId`), NOT a
             // ContinueAsNew — the successor is a separate run the runtime starts
@@ -5275,6 +5461,12 @@ fn apply_workflow_command(
                     message: None,
                 });
             }
+            reject_if_over_limit(
+                sizes.and_then(|sizes| sizes.payload),
+                limits.blob_size_limit,
+                WorkflowTaskFailedCause::BadFailWorkflowExecutionAttributes,
+                "FailWorkflowExecutionCommandAttributes.Failure exceeds size limit.",
+            )?;
             builder.state.close_failure = Some(failure.clone());
             let attempt = builder.state.attempt;
             // Precedence is resolved in the runtime, which supplies at most one
@@ -5404,6 +5596,29 @@ fn apply_workflow_command(
                     )),
                 });
             }
+            // The key count ends attribute validation; then the input, memo
+            // and search attribute sizes (command_attr_validator.go:446-448;
+            // workflow_task_completed_handler.go:983-1006 @ v1.31.0). v1.31.0
+            // prints the task queue as protobuf text.
+            reject_if_too_many_search_attributes(
+                sizes.and_then(|sizes| sizes.search_attributes.as_ref()),
+                limits,
+                |count_message| {
+                    format!(
+                        "invalid SearchAttributes on ContinueAsNewWorkflowExecutionCommand: \
+                         {count_message}. WorkflowType={} TaskQueue=name:\"{}\" \
+                         kind:TASK_QUEUE_KIND_NORMAL",
+                        workflow_type.0, task_queue.0
+                    )
+                },
+            )?;
+            reject_if_start_payloads_too_large(
+                sizes,
+                limits,
+                WorkflowTaskFailedCause::BadContinueAsNewAttributes,
+                "ContinueAsNewWorkflowExecutionCommandAttributes. Input exceeds size limit.",
+                "ContinueAsNewWorkflowExecutionCommandAttributes. Memo exceeds size limit.",
+            )?;
             // Throttle rapid CaN so each generation lives at least the minimal
             // interval — the successor's first WFT is delayed accordingly.
             // Lifetime is measured from the run's EXECUTION time (start + its
@@ -5648,6 +5863,30 @@ fn apply_workflow_command(
                     )),
                 });
             }
+            // The key count ends attribute validation; then the input, memo
+            // and search attribute sizes, before the pending count
+            // (command_attr_validator.go:524-526;
+            // workflow_task_completed_handler.go:1106-1134 @ v1.31.0).
+            reject_if_too_many_search_attributes(
+                sizes.and_then(|sizes| sizes.search_attributes.as_ref()),
+                limits,
+                |count_message| {
+                    format!(
+                        "invalid SearchAttributes on StartChildWorkflowCommand: {count_message}. \
+                         WorkflowId={} WorkflowType={} Namespace={}",
+                        child_workflow_id.0,
+                        workflow_type.0,
+                        namespace.as_deref().unwrap_or_default()
+                    )
+                },
+            )?;
+            reject_if_start_payloads_too_large(
+                sizes,
+                limits,
+                WorkflowTaskFailedCause::BadStartChildExecutionAttributes,
+                "StartChildWorkflowExecutionCommandAttributes. Input exceeds size limit.",
+                "StartChildWorkflowExecutionCommandAttributes.Memo exceeds size limit.",
+            )?;
             reject_if_pending_limit_reached(
                 limits.pending_child_workflows,
                 builder.state.children.len(),
@@ -5745,6 +5984,14 @@ fn apply_workflow_command(
                 builder.state.pending_external_signals.len(),
                 WorkflowTaskFailedCause::PendingSignalsLimitExceeded,
                 "signals to external workflows",
+            )?;
+            // The input after the pending count, unlike the other commands
+            // (workflow_task_completed_handler.go:1182-1194 @ v1.31.0).
+            reject_if_over_limit(
+                sizes.and_then(|sizes| sizes.payload),
+                limits.blob_size_limit,
+                WorkflowTaskFailedCause::BadSignalWorkflowExecutionAttributes,
+                "SignalExternalWorkflowExecutionCommandAttributes.Input exceeds size limit.",
             )?;
             let dispatch_header = header.clone();
             let initiated_event_id =
@@ -5906,6 +6153,26 @@ fn apply_workflow_command(
             {
                 return Err(Reject::DuplicateNexusOperationId(operation_id));
             }
+            // The input (the edge leaves it unmeasured for the system
+            // endpoint), then the pending count, which earlier operations of
+            // this completion are in (components/nexusoperations/workflow/
+            // commands.go:144-181 @ v1.31.0).
+            reject_if_over_limit(
+                sizes.and_then(|sizes| sizes.payload),
+                limits.blob_size_limit,
+                WorkflowTaskFailedCause::BadScheduleNexusOperationAttributes,
+                "ScheduleNexusOperationCommandAttributes.Input exceeds size limit",
+            )?;
+            let pending_limit = limits.pending_nexus_operations;
+            if builder.state.pending_nexus_operations.len() >= pending_limit {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::PendingNexusOperationsLimitExceeded,
+                    message: Some(format!(
+                        "workflow has reached the pending nexus operation limit of \
+                         {pending_limit} for this namespace"
+                    )),
+                });
+            }
             let scheduled_event_id = builder.emit(HistoryEventKind::NexusOperationScheduled {
                 workflow_task_completed_event_id,
                 operation_id: operation_id.clone(),
@@ -6050,6 +6317,16 @@ fn apply_workflow_command(
             message_id: _,
             body,
         } => {
+            // The body before the message is processed
+            // (workflow_task_completed_handler.go:358-365 @ v1.31.0).
+            if let Some(message) = sizes.and_then(|sizes| sizes.protocol_message.as_ref()) {
+                reject_if_over_limit(
+                    Some(message.body),
+                    limits.blob_size_limit,
+                    WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage,
+                    &format!("Message type {} exceeds size limit.", message.type_name),
+                )?;
+            }
             match body {
                 UpdateProtocolBody::Accepted {
                     update_id,
@@ -7544,6 +7821,18 @@ pub enum Reject {
     InvalidCommandAttributes {
         cause: WorkflowTaskFailedCause,
         message: Option<String>,
+    },
+    /// A workflow command's payload, memo or search attributes are over a
+    /// size limit. v1.31.0 fails the workflow task with `cause` and
+    /// TERMINATES the workflow (`terminateWorkflow`,
+    /// workflow_task_completed_handler.go:1477-1491 @ v1.31.0); the runtime
+    /// records both through `WorkflowTaskFailedRequest::terminate_reason`
+    /// (`workflow-task-command-limits` criterion 2.8). The wire message is
+    /// `"{cause}: {message}"`.
+    #[error("command exceeds limit ({cause:?}): {message}")]
+    CommandExceedsLimit {
+        cause: WorkflowTaskFailedCause,
+        message: String,
     },
     /// A `Start` command was issued but the run already
     /// exists in durable storage.

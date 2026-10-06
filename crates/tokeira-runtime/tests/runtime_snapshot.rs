@@ -439,6 +439,7 @@ async fn scheduled_activity_recovers_identically_from_restored_store() -> Result
             delivered_update_ids: Vec::new(),
             request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
             now,
+            command_sizes: Vec::new(),
         })
         .await?;
 

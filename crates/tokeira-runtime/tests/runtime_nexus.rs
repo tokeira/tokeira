@@ -220,6 +220,7 @@ async fn nexus_schedule_sync_complete_delivers_completed_resolution() -> Result<
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -305,6 +306,7 @@ async fn nexus_async_started_times_out_via_scanner() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -386,6 +388,7 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -456,6 +459,7 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -589,6 +593,7 @@ async fn nexus_schedule_to_start_times_out_via_scanner() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -704,6 +709,7 @@ async fn worker_targeted_nexus_schedule_publishes_to_broker() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -809,6 +815,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
     let start_task = runtime
@@ -900,6 +907,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -1003,6 +1011,7 @@ async fn worker_targeted_cancel_before_start_is_delivered_after_started_resoluti
             delivered_update_ids: Vec::new(),
             request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -1074,6 +1083,7 @@ async fn worker_targeted_cancel_before_start_is_delivered_after_started_resoluti
             delivered_update_ids: Vec::new(),
             request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -1205,6 +1215,7 @@ proptest! {
                         time::OffsetDateTime::UNIX_EPOCH,
                     ),
                     now: OffsetDateTime::now_utc(),
+                    command_sizes: Vec::new(),
                 })
                 .await
                 .expect("schedule nexus op");
@@ -1359,6 +1370,7 @@ proptest! {
                         time::OffsetDateTime::UNIX_EPOCH,
                     ),
                     now: OffsetDateTime::now_utc(),
+                    command_sizes: Vec::new(),
                 })
                 .await
                 .expect("cancel nexus op");
@@ -1474,6 +1486,7 @@ async fn nexus_unknown_endpoint_delivers_failed_resolution() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -1573,6 +1586,7 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -2159,6 +2173,7 @@ async fn close_workflow_with_callbacks(
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
     Ok(run_key)

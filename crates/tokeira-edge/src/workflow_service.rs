@@ -5049,6 +5049,7 @@ impl WorkflowService {
                                 message: error_message.clone(),
                                 failure: failure.clone(),
                             },
+                            QueryResultDto::ResultTooLarge => QueryResult::ResultTooLarge,
                         });
                     }
                 }
@@ -5067,6 +5068,22 @@ impl WorkflowService {
                         }
                         _ => continue,
                     };
+                    // The key count comes before the registered-key check, as
+                    // in v1.31.0's `Validate` (`common/searchattribute/
+                    // validator.go:60-75 @ v1.31.0`;
+                    // `workflow-task-command-limits` criterion 2.5).
+                    let keys_limit =
+                        crate::grpc::payload_limits::search_attributes_number_of_keys_limit();
+                    if keys.len() > keys_limit {
+                        req.commands[command_index] =
+                            tokeira_kernel::WorkflowCommand::InvalidSearchAttributes {
+                                message: format!(
+                                    "number of search attributes {} exceeds limit {keys_limit}",
+                                    keys.len()
+                                ),
+                            };
+                        break;
+                    }
                     if let Some(unknown) = self
                         .visibility
                         .unknown_search_attribute(namespace_id, &keys)
@@ -8016,6 +8033,14 @@ impl WorkflowService {
                 if let tokeira_runtime::QueryResult::Failed { message, failure } = result {
                     return Err(EdgeError::QueryFailed { message, failure });
                 }
+                // An answer over the blob size limit is v1.31.0's plain
+                // `ErrBlobSizeExceedsLimit` (`workflow-task-command-limits`
+                // criterion 2.11).
+                if matches!(result, tokeira_runtime::QueryResult::ResultTooLarge) {
+                    return Err(EdgeError::BadRequest(
+                        crate::grpc::payload_limits::BLOB_SIZE_EXCEEDS_LIMIT.to_owned(),
+                    ));
+                }
 
                 Ok(from_internal::query_response(result))
             },
@@ -10580,6 +10605,7 @@ mod tests {
             worker_instance_key: "worker-instance-a".to_owned(),
             worker_control_task_queue: "worker-control-a".to_owned(),
             commands,
+            command_sizes: Vec::new(),
             return_new_workflow_task: false,
             force_create_new_workflow_task: false,
             query_results: std::collections::HashMap::new(),
@@ -10732,6 +10758,7 @@ mod tests {
                 delivered_update_ids: Vec::new(),
                 request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
                 now: OffsetDateTime::now_utc(),
+                command_sizes: Vec::new(),
             })
             .await?;
         runtime
@@ -10870,6 +10897,7 @@ mod tests {
                 delivered_update_ids: Vec::new(),
                 request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
                 now: OffsetDateTime::now_utc(),
+                command_sizes: Vec::new(),
             })
             .await?;
 

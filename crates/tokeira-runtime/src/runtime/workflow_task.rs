@@ -152,12 +152,53 @@ fn pending_command_limit(key: &str) -> Option<usize> {
     normalize_pending_command_limit(crate::conformance::reads().get_i64(key))
 }
 
+/// A size or count limit for a workflow task's commands: v1.31.0's value,
+/// which only the Temporal functional harness's build overrides
+/// (`workflow-task-command-limits` criterion 2.13; `conformance-config-override`).
+#[cfg(not(feature = "conformance"))]
+fn command_limit(_key: &str, default: usize) -> usize {
+    default
+}
+
+#[cfg(feature = "conformance")]
+fn command_limit(key: &str, default: usize) -> usize {
+    crate::conformance::reads()
+        .get_i64(key)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(default)
+}
+
 fn workflow_task_completion_limits() -> WorkflowTaskCompletionLimits {
+    use tokeira_kernel::limits;
     WorkflowTaskCompletionLimits {
         pending_child_workflows: pending_command_limit("limit.numPendingChildExecutions.error"),
         pending_activities: pending_command_limit("limit.numPendingActivities.error"),
         pending_signals: pending_command_limit("limit.numPendingSignals.error"),
         pending_cancel_requests: pending_command_limit("limit.numPendingCancelRequests.error"),
+        blob_size_limit: limits::effective_limit(
+            command_limit("limit.blobSize.warn", limits::BLOB_SIZE_LIMIT_WARN),
+            command_limit("limit.blobSize.error", limits::BLOB_SIZE_LIMIT_ERROR),
+        ),
+        memo_size_limit: limits::effective_limit(
+            command_limit("limit.memoSize.warn", limits::MEMO_SIZE_LIMIT_WARN),
+            command_limit("limit.memoSize.error", limits::MEMO_SIZE_LIMIT_ERROR),
+        ),
+        search_attributes_keys_limit: command_limit(
+            "frontend.searchAttributesNumberOfKeysLimit",
+            limits::SEARCH_ATTRIBUTES_NUMBER_OF_KEYS_LIMIT,
+        ),
+        search_attribute_value_size_limit: command_limit(
+            "frontend.searchAttributesSizeOfValueLimit",
+            limits::SEARCH_ATTRIBUTES_SIZE_OF_VALUE_LIMIT,
+        ),
+        search_attributes_total_size_limit: command_limit(
+            "frontend.searchAttributesTotalSizeLimit",
+            limits::SEARCH_ATTRIBUTES_TOTAL_SIZE_LIMIT,
+        ),
+        pending_nexus_operations: command_limit(
+            "component.nexusoperations.limit.operation.concurrency",
+            limits::PENDING_NEXUS_OPERATIONS_LIMIT,
+        ),
     }
 }
 
@@ -1176,19 +1217,29 @@ where
         // which is dropped to time out instead), and the completion call
         // errors with INVALID_ARGUMENT carrying the cause message
         // (respondworkflowtaskcompleted/api.go:455-485,739-742).
-        if let Err(error) = &result
-            && let Some(crate::lane::KernelRejected(
+        // A command over a size limit takes the same path and also terminates
+        // the workflow (`terminateWorkflow`, workflow_task_completed_handler.go:
+        // 1477-1491; api.go:489-510 @ v1.31.0; `workflow-task-command-limits`
+        // criterion 2.8).
+        let rejected_command = match result.as_ref().err().and_then(|error| error.downcast_ref()) {
+            Some(crate::lane::KernelRejected(
                 tokeira_kernel::Reject::InvalidCommandAttributes { cause, message },
-            )) = error.downcast_ref()
-        {
-            let cause = cause.clone();
+            )) => Some((cause.clone(), message.clone(), false)),
+            Some(crate::lane::KernelRejected(tokeira_kernel::Reject::CommandExceedsLimit {
+                cause,
+                message,
+            })) => Some((cause.clone(), Some(message.clone()), true)),
+            _ => None,
+        };
+        if let Some((cause, message, terminates)) = rejected_command {
             // The wire message mirrors `workflowTaskFailedCause.Message()`:
             // `"{cause}: {causeErr}"` when a cause error exists, the bare
             // cause name otherwise (workflow_task_completed_handler.go:
             // 1502-1510 @ v1.31.0). The same rendering is persisted as the
             // WFT-failed event's server failure
             // (`failure.NewServerFailure(wtFailedCause.Message(), false)`,
-            // respondworkflowtaskcompleted/api.go:1049-1059 @ v1.31.0).
+            // respondworkflowtaskcompleted/api.go:1049-1059 @ v1.31.0), and as
+            // the termination's reason.
             let wire_message = match message {
                 Some(cause_err) => format!("{}: {}", cause.as_str(), cause_err),
                 None => cause.as_str().to_string(),
@@ -1221,6 +1272,7 @@ where
                             // event; a worker-reported failure never does.
                             history_size_bytes: 0,
                             advice_policy: continue_as_new_advice_policy(),
+                            terminate_reason: terminates.then(|| wire_message.clone()),
                         }),
                     )
                     .await
@@ -1306,6 +1358,7 @@ where
                             // event; a worker-reported failure never does.
                             history_size_bytes: 0,
                             advice_policy: continue_as_new_advice_policy(),
+                            terminate_reason: None,
                         }),
                     )
                     .await
@@ -1448,6 +1501,7 @@ where
                 // worker-reported failure never does.
                 history_size_bytes: 0,
                 advice_policy: continue_as_new_advice_policy(),
+                terminate_reason: None,
             })
         };
         // The consecutive-problem accumulator advances inside the kernel's

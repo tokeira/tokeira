@@ -1,0 +1,5 @@
+kind: fixed
+body: A workflow task's command over Temporal's payload limits now terminates the workflow, as Temporal does; too many search attributes or Nexus operations fail the task.
+time: 2026-10-06T21:26:01.000000+01:00
+custom:
+    Slice: 388b00da-88e2-41de-b87f-c823de60bfa2

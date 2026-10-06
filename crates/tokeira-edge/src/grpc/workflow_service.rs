@@ -2160,9 +2160,20 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let request = _request;
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
+        // A result over the blob size limit is delivered as a failed result
+        // and the call succeeds (`workflow_handler.go:2914-2934 @ v1.31.0`;
+        // `workflow-task-command-limits` criterion 2.11).
+        let oversized = payload_limits::blob_exceeds_limit(
+            payload_limits::encoded_size(req.query_result.as_ref()),
+            "RespondQueryTaskCompleted",
+        );
         let result = match tokeira_proto::enums::QueryResultType::try_from(req.completed_type)
             .unwrap_or(tokeira_proto::enums::QueryResultType::Failed)
         {
+            _ if oversized => tokeira_runtime::QueryResult::Failed {
+                message: payload_limits::BLOB_SIZE_EXCEEDS_LIMIT.to_owned(),
+                failure: None,
+            },
             tokeira_proto::enums::QueryResultType::Answered => {
                 tokeira_runtime::QueryResult::Completed {
                     result: req

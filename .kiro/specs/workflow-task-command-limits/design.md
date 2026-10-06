@@ -63,8 +63,8 @@ _For any_ generated payloads, memos and search attributes, the sizes the kernel 
 
 ### Limits (`crates/tokeira-kernel/src/command.rs`)
 
-- v1.31.0's blob, memo, search attribute and pending Nexus values become constants in the kernel crate, beside the pending-entity default. The edge's `grpc/payload_limits.rs` uses them, so each value has one definition (criterion 2.13).
-- `WorkflowTaskCompletionLimits` gains the blob, memo and search attribute limits and `pending_nexus_operations`. The runtime resolves them as it resolves the pending-entity limits (`runtime/workflow_task.rs`). The Temporal functional harness's build reads its overrides for the same keys; `conformance-config-override` owns that wiring, and production builds use the constants.
+- v1.31.0's blob, memo, search attribute and pending Nexus values become constants in a new `tokeira_kernel::limits` module. The edge's `grpc/payload_limits.rs` uses them, so each value has one definition (criterion 2.13).
+- `WorkflowTaskCompletionLimits` gains the blob, memo and search attribute limits and `pending_nexus_operations`. The runtime resolves them as it resolves the pending-entity limits (`runtime/workflow_task.rs`). The blob and memo limits are the larger of each warn and error value, since `CheckEventBlobSizeLimit` errors only for a size above both (`common/util.go:578-608 @ v1.31.0`); with v1.31.0's values that is the error limit. The pending Nexus limit has no disabled value: v1.31.0 compares with `>=`, so 0 refuses every operation. The Temporal functional harness's build reads its overrides for the same keys; `conformance-config-override` owns that wiring, and production builds use the constants.
 
 ### Measurement (`crates/tokeira-edge/src/grpc/translate.rs`)
 
@@ -84,23 +84,23 @@ _For any_ generated payloads, memos and search attributes, the sizes the kernel 
 - A payload, memo or search attribute size over its limit returns a new terminating rejection, `Reject::CommandExceedsLimit { cause, message }`.
 - A key count over 100 fails the workflow task with `BadSearchAttributes` (criterion 2.5). On ContinueAsNewWorkflowExecution and StartChildWorkflowExecution the kernel tests the measured count with `Reject::InvalidCommandAttributes`. On an upsert the edge's registered-key check tests it first, and marks the command as it marks one naming an unregistered key, so the command keeps its place in the order.
 - For an upsert, the kernel builds the merged map's sizes from the stored values and the upserted fields' measured sizes. A stored search attribute value is measured as the payload Tokeira encodes for it (`search_attr_value_to_payload`), without the `type` metadata that Tokeira adds and an SDK needn't send, so the merged check can't terminate a run over metadata Tokeira added. A stored memo field is measured as its payload's encoding. `payload_size.rs` holds this arithmetic, which mirrors protobuf's encoding of the domain types.
-- ScheduleNexusOperation counts `pending_nexus_operations`, which already includes operations scheduled earlier in the completion, against `limits.pending_nexus_operations`, and fails with `PendingNexusOperationsLimitExceeded` (criterion 2.7).
+- ScheduleNexusOperation counts `pending_nexus_operations`, which already includes operations scheduled earlier in the completion, against `limits.pending_nexus_operations`, and fails with `PendingNexusOperationsLimitExceeded` (criterion 2.7). Like the pending-entity limits, it applies to unmeasured completions too.
 - A protocol message's body size is checked before the message is applied, for referenced and leftover messages alike (criterion 2.6).
 - `WorkflowTaskFailedCause` gains the four causes it lacks, appended after the last variant because the enum is encoded by position in history events (criterion 2.14). The edge's proto mapping and history serializer carry their v1.31.0 values. As with the four pending-entity causes, a node of an earlier release can't decode a `WorkflowTaskFailed` event that carries one.
 
 ### Recording a termination (kernel and `crates/tokeira-runtime/src/runtime/workflow_task.rs`)
 
-- `WorkflowTaskFailedRequest` gains `terminate_reason: Option<String>`. With a reason, `apply_workflow_task_failed` records the failure as it does today, then flushes the buffered events and terminates the run through `terminate_run` with that reason, no details and the `history-service` identity, and schedules no workflow task (criterion 2.8).
+- `WorkflowTaskFailedRequest` gains `terminate_reason: Option<String>`. With a reason, `apply_workflow_task_failed` records the failure as it does today and flushes the buffered events. It then clears the failed task, so the terminate tail writes no force-close event, and terminates the run through `terminate_run` with that reason, no details and the `history-service` identity, scheduling no workflow task (criterion 2.8). The lane drains the run's update waiters, as it does whenever a commit closes a run.
 - The runtime's invalid-command seam handles `CommandExceedsLimit` as it handles `InvalidCommandAttributes`: the same `"{cause}: {message}"` message, the same abort of updates sent on the task, the same drop on an attempt greater than 1 (criterion 2.10), and the same `InvalidArgument` answer. It submits `WorkflowTaskFailed` with the message as `terminate_reason`.
 
 ### Query results
 
-- **In a completion** (`grpc/translate.rs`, `workflow_service.rs`): an answer over the blob size limit becomes a rejected result, and the waiting query fails with `InvalidArgument` `Blob data size exceeds limit.` (criterion 2.11). The runtime's `QueryResult` gains that variant; a worker-failed result keeps today's QueryFailed answer.
+- **In a completion** (`grpc/translate.rs`, `workflow_service.rs`): an answer over the blob size limit becomes `QueryResultDto::ResultTooLarge`, and the waiting query fails with `InvalidArgument` `Blob data size exceeds limit.` (criterion 2.11). The runtime's `QueryResult` gains `ResultTooLarge`; a worker-failed result keeps today's QueryFailed answer.
 - **RespondQueryTaskCompleted** (`grpc/workflow_service.rs`): a result over the blob size limit is replaced by a failed result with the error message `Blob data size exceeds limit.` and no failure, and the call succeeds.
 
 ### Functional harness wiring
 
-- The harness's key registry (`crates/tokeira-conformance/src/lib.rs`) adds `component.nexusoperations.limit.operation.concurrency` as `Wired`, and the compatibility ledger classifies it as a conformance-only override. The seven size keys are already wired; the runtime now reads them too. This serves only the Temporal functional harness, as `conformance-config-override`'s key table records. It is not a Tokeira setting.
+- The harness's key registry (`crates/tokeira-conformance/src/lib.rs`) adds `component.nexusoperations.limit.operation.concurrency` as `Wired`, and the compatibility ledger classifies it as a conformance-only override, from which `docs/conformance/v1.31.0/temporal-configuration.md` is regenerated. The seven size keys are already wired; the runtime now reads them too. This serves only the Temporal functional harness, as `conformance-config-override`'s key table records. It is not a Tokeira setting.
 
 ### Other specs
 
@@ -116,20 +116,20 @@ _For any_ generated payloads, memos and search attributes, the sizes the kernel 
 
 ### Exploratory Bug Condition Checking
 
-- Negative controls: with each check removed or moved, the test that covers it fails.
+- Negative controls: with each check removed or moved, the test that covers it fails. Twelve were run: an unchecked activity input, the memo before the input, no termination, a strict Nexus count, no merged-map total, a wrong map-entry size, marker details without keys, a measured system endpoint, the key count after the registered-key check, an unchecked answer in a completion and in RespondQueryTaskCompleted, and a seam that doesn't terminate.
 
 ### Property-Based Tests
 
 - Property 1 in the kernel, over generated completions of commands each just within or just over each limit, against a model of v1.31.0's check order.
-- Property 2 through the engine's in-process gRPC endpoint on the in-memory store, with signals buffered while the workflow task is started, on first and later attempts.
-- Property 3 in the kernel, comparing `payload_size.rs` with `prost` encoded lengths of the payloads `tokeira-proto` encodes, and at the edge, comparing measurements with `prost` encoded lengths.
+- Property 2 through the engine's in-process gRPC endpoint on the in-memory store (`crates/tokeira-engine/tests/workflow_task_command_limits.rs`): every terminating command, with and without a signal buffered while the workflow task is started. A close command with a buffered signal fails with `UnhandledCommand` before its size is checked, as in v1.31.0. A later attempt is a unit test there.
+- Property 3 in the kernel (`crates/tokeira-kernel/tests/command_limits.rs`), comparing `payload_size.rs` with `prost` encoded lengths of the payloads `tokeira-proto` encodes, merged maps included, and at the edge, comparing measurements with `prost` encoded lengths.
 
 ### Unit Tests
 
 - Each command at each of its limits and one byte over, with v1.31.0's cause and message.
 - The count message on an upsert that also names an unregistered key.
 - The `__temporal_system` endpoint's input stays unchecked.
-- A query result over the limit, in a completion and in RespondQueryTaskCompleted.
+- A query result over the limit, in a completion and in RespondQueryTaskCompleted: a unit test of the translation, and an engine test of both paths. A query that reaches the runtime after the workflow task is polled is answered as a query task, which the engine test accepts.
 
 ### Preservation Checking
 

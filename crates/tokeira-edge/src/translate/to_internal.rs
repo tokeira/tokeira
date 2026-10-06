@@ -448,6 +448,7 @@ pub fn workflow_task_completed_request(
             received_at: context.received_at,
         },
         now: OffsetDateTime::now_utc(),
+        command_sizes: req.command_sizes,
     })
 }
 
@@ -991,6 +992,7 @@ mod tests {
             worker_control_task_queue: String::new(),
             client_discards_speculative_with_events: false,
             commands: Vec::new(),
+            command_sizes: Vec::new(),
             return_new_workflow_task: false,
             force_create_new_workflow_task: false,
             query_results: std::collections::HashMap::new(),

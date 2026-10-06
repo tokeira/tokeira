@@ -78,6 +78,7 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -355,6 +356,7 @@ async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> 
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time,
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -516,6 +518,7 @@ async fn restart_preserves_delayed_start_callbacks_and_versioning_route() -> Res
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time + Duration::seconds(31),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -577,6 +580,7 @@ async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> 
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time,
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -677,6 +681,7 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time,
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -880,6 +885,7 @@ async fn retryable_failure_starts_attempt_two_successor() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 
@@ -978,6 +984,7 @@ async fn non_retryable_failure_is_terminal_without_successor() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 

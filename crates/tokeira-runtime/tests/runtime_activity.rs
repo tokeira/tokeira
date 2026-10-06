@@ -556,6 +556,7 @@ async fn resolve_activity_token_refuses_a_closed_run() -> Result<()> {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
     let LoadedRun::Existing(state) = store.load_run(run_key).await? else {
@@ -872,6 +873,7 @@ async fn start_and_schedule_activity_with_version(
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
+            command_sizes: Vec::new(),
         })
         .await?;
 

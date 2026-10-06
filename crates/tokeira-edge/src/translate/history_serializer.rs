@@ -2060,6 +2060,18 @@ fn wft_failed_cause_i32(c: &WorkflowTaskFailedCause) -> i32 {
         WorkflowTaskFailedCause::PendingRequestCancelLimitExceeded => {
             C::PendingRequestCancelLimitExceeded
         }
+        WorkflowTaskFailedCause::BadFailWorkflowExecutionAttributes => {
+            C::BadFailWorkflowExecutionAttributes
+        }
+        WorkflowTaskFailedCause::BadModifyWorkflowPropertiesAttributes => {
+            C::BadModifyWorkflowPropertiesAttributes
+        }
+        WorkflowTaskFailedCause::BadScheduleNexusOperationAttributes => {
+            C::BadScheduleNexusOperationAttributes
+        }
+        WorkflowTaskFailedCause::PendingNexusOperationsLimitExceeded => {
+            C::PendingNexusOperationsLimitExceeded
+        }
     }) as i32
 }
 

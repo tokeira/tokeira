@@ -260,6 +260,7 @@ fn completion_request(
         delivered_update_ids: Vec::new(),
         request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         now,
+        command_sizes: Vec::new(),
     }
 }
 
@@ -1172,6 +1173,7 @@ fn arb_wft_failed_request(
                 ),
                 now,
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             }
         })
 }
@@ -1632,6 +1634,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             };
             (
                 LoadedRun::Existing(state),
@@ -1724,6 +1727,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             };
             (
                 LoadedRun::Existing(state),
@@ -1763,6 +1767,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             };
             (
                 LoadedRun::Existing(state),
@@ -1802,6 +1807,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             };
             (
                 LoadedRun::Existing(state),
@@ -1840,6 +1846,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             };
             (
                 LoadedRun::Existing(state),
@@ -2229,6 +2236,7 @@ proptest! {
             pending_activities: None,
             pending_signals: None,
             pending_cancel_requests: None,
+            ..WorkflowTaskCompletionLimits::default()
         };
         match resource {
             0 => limits.pending_child_workflows = selected_limit,
@@ -2400,6 +2408,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         );
 
@@ -2774,6 +2783,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
 
@@ -2871,6 +2881,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
         let expected_deployment = activity_deployment.clone().or_else(|| workflow_deployment.clone());
@@ -3159,6 +3170,7 @@ proptest! {
                         time::OffsetDateTime::UNIX_EPOCH,
                     ),
                     now,
+                    command_sizes: Vec::new(),
                 }),
             ).unwrap();
             state = transition.next_state;
@@ -3692,6 +3704,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
         prop_assert_eq!(transition.next_state.status, ExecutionStatus::ContinuedAsNew);
@@ -3732,6 +3745,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
         match (&transition.history_events[1].kind, &cmd) {
@@ -3811,6 +3825,7 @@ proptest! {
                         time::OffsetDateTime::UNIX_EPOCH,
                     ),
                     now,
+                    command_sizes: Vec::new(),
                 }),
             ),
             Err(tokeira_kernel::Reject::CommandsAfterClose { index: 1 })
@@ -3987,6 +4002,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
         match &transition.history_events[1].kind {
@@ -4453,6 +4469,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
 
@@ -5032,6 +5049,7 @@ fn property_23_request_cancel_activity_preserves_activity() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -5087,6 +5105,7 @@ fn property_24_cancel_timer_removes_timer() {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         )
         .unwrap();
@@ -5155,6 +5174,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
 
@@ -5236,6 +5256,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
 
@@ -5375,6 +5396,7 @@ fn property_42_parent_close_policy_all_paths() {
                             time::OffsetDateTime::UNIX_EPOCH,
                         ),
                         now,
+                        command_sizes: Vec::new(),
                     }),
                 )
                 .unwrap()
@@ -5530,6 +5552,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
         prop_assert!(!completed.next_state.pending_updates.contains_key(&update_id));
@@ -5560,6 +5583,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
         prop_assert!(!rejected.next_state.pending_updates.contains_key(&rejected_update_id));
@@ -5608,6 +5632,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
         prop_assert!(accepted.next_state.pending_updates.contains_key("update-1"));
@@ -5647,6 +5672,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
         prop_assert!(!completed.next_state.pending_updates.contains_key("update-1"));
@@ -5685,6 +5711,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
         prop_assert!(!rejected.next_state.pending_updates.contains_key("update-1"));
@@ -5738,6 +5765,7 @@ fn property_57_close_clears_pending_updates() {
                         time::OffsetDateTime::UNIX_EPOCH,
                     ),
                     now,
+                    command_sizes: Vec::new(),
                 }),
             )
             .unwrap()
@@ -5821,6 +5849,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
 
@@ -5873,6 +5902,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
 
@@ -6191,6 +6221,7 @@ fn property_63_close_preserves_execution_options() {
                         time::OffsetDateTime::UNIX_EPOCH,
                     ),
                     now,
+                    command_sizes: Vec::new(),
                 }),
             )
             .unwrap()
@@ -6356,6 +6387,7 @@ fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now,
+            command_sizes: Vec::new(),
         })
     };
     let command = match kind {
@@ -6495,6 +6527,7 @@ proptest! {
                         time::OffsetDateTime::UNIX_EPOCH,
                     ),
                     now,
+                    command_sizes: Vec::new(),
                 }),
             ),
             ContinuationCloseKind::RetryFailure => kernel().apply(
@@ -6575,6 +6608,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
 
@@ -6753,6 +6787,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
 
@@ -6812,6 +6847,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         );
         prop_assert_eq!(result, Err(tokeira_kernel::Reject::DuplicateNexusOperationId(operation_id)));
@@ -6856,6 +6892,7 @@ proptest! {
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
+                command_sizes: Vec::new(),
             }),
         ).unwrap();
         prop_assert_eq!(
@@ -7051,6 +7088,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
                         time::OffsetDateTime::UNIX_EPOCH,
                     ),
                     now,
+                    command_sizes: Vec::new(),
                 }),
             )
             .unwrap()
@@ -7243,6 +7281,7 @@ proptest! {
                 time::OffsetDateTime::UNIX_EPOCH,
             ),
             now,
+            command_sizes: Vec::new(),
         };
         let transition = kernel
             .apply(LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
@@ -7343,6 +7382,7 @@ proptest! {
                         received_at: now,
                     },
                     now,
+                    command_sizes: Vec::new(),
                 }),
             )
             .unwrap();
@@ -7470,6 +7510,7 @@ proptest! {
                         time::OffsetDateTime::UNIX_EPOCH,
                     ),
                     now,
+                    command_sizes: Vec::new(),
                 }),
             );
             prop_assert_eq!(
@@ -7498,6 +7539,7 @@ proptest! {
                         ),
                         now,
                         reset_reapply: Vec::new(),
+                        terminate_reason: None,
                     }),
                 )
                 .unwrap();
@@ -7576,6 +7618,7 @@ fn fail_workflow_completion_request(state: &WorkflowState) -> WorkflowTaskComple
         delivered_update_ids: Vec::new(),
         request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
         now: fixed_now(),
+        command_sizes: Vec::new(),
     }
 }
 
@@ -7751,6 +7794,7 @@ fn wft_failed_with_buffered_events_schedules_fresh_normal_task() {
                 ),
                 now,
                 reset_reapply: Vec::new(),
+                terminate_reason: None,
             }),
         )
         .unwrap();
@@ -8040,6 +8084,7 @@ fn advice_wft_failed_request(
         request: tokeira_types::RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         now,
         reset_reapply: Vec::new(),
+        terminate_reason: None,
     }
 }
 
@@ -8750,6 +8795,7 @@ fn step_input(
             request,
             now: at,
             reset_reapply: Vec::new(),
+            terminate_reason: None,
         }),
         RunStep::TimeOutStartToClose => {
             Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {

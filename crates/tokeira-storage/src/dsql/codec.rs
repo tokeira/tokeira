@@ -19,7 +19,7 @@ use tokeira_types::{EventPrincipal, Payloads, ProjectionCursor, WorkflowRuleReco
 // same bytes; they are re-exported here so DSQL call sites keep one codec path.
 pub use crate::codec::{
     BlobFormatError, StateExtensionError, decode_history_events, decode_workflow_state,
-    encode_history_events, encode_workflow_state, history_batch_encoded_len,
+    encode_history_events, encode_workflow_state, history_batch_encoded_len, measured_state_len,
 };
 use crate::{
     BacklogPayload, ProjectionContext, StoredTaskQueueConfig, StoredTaskQueueConfigKind,

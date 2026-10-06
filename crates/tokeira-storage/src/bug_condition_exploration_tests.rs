@@ -125,6 +125,8 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
+            events_numbered_at_close: 0,
+            growth_limits: None,
         }
     }
 
@@ -194,6 +196,8 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
+            events_numbered_at_close: 0,
+            growth_limits: None,
         };
 
         // Runtime A (stale) calls commit_transition_for_bundle with its old epoch.
@@ -289,6 +293,8 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
+                    events_numbered_at_close: 0,
+                    growth_limits: None,
                 };
 
                 // Stale caller uses commit_transition_for_bundle with old epoch.

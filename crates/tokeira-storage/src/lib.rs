@@ -27,6 +27,7 @@ pub mod chasm;
 pub mod codec;
 #[cfg(feature = "dsql")]
 pub mod dsql;
+mod growth;
 pub mod memory;
 pub mod metrics;
 #[cfg(test)]

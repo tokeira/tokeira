@@ -1,18 +1,23 @@
 //! Protobuf-encoded sizes of the run's stored memo and search attributes, as
 //! Temporal v1.31.0 measures them (`workflow-task-command-limits` criterion
-//! 2.12).
+//! 2.12), and of the payloads a buffered event carries (`run-growth-limits`
+//! criterion 2.9).
 //!
 //! The edge measures what a command carries on the proto it received. Only an
-//! upsert's merged map needs the run's stored values, which the kernel holds
-//! as domain types, so this mirrors protobuf's encoding of
-//! `temporal.api.common.v1.Payload`, `Memo` and `SearchAttributes` for them.
+//! upsert's merged map and the buffered events need the run's stored values,
+//! which the kernel holds as domain types, so this mirrors protobuf's encoding
+//! of `temporal.api.common.v1.Payload`, `Payloads`, `Header`, `Memo` and
+//! `SearchAttributes` for them.
 
 use std::collections::BTreeMap;
 
 use time::format_description::well_known::Rfc3339;
-use tokeira_types::{Memo, Payload, SearchAttrValue, SearchAttributes};
+use tokeira_types::{Headers, Memo, Payload, Payloads, SearchAttrValue, SearchAttributes};
 
-use crate::command::{FieldChange, MemoPatch, PayloadSize, SearchAttributesPatch};
+use crate::{
+    command::{FieldChange, MemoPatch, PayloadSize, SearchAttributesPatch},
+    event::HistoryEventKind,
+};
 
 /// The length of `value` as a protobuf varint.
 fn varint_len(mut value: u64) -> usize {
@@ -64,6 +69,120 @@ pub fn payload_encoded_len(payload: &Payload) -> usize {
         })
         .sum();
     metadata + len_field(payload.data.len()) + external
+}
+
+/// A `Payloads` message's encoded size: each payload in its repeated field 1,
+/// written even when empty.
+pub fn payloads_encoded_len(payloads: &Payloads) -> usize {
+    payloads
+        .0
+        .iter()
+        .map(|payload| {
+            let len = payload_encoded_len(payload);
+            1 + varint_len(len as u64) + len
+        })
+        .sum()
+}
+
+/// A `Header` message's encoded size: its fields (field 1, `map<string, Payload>`).
+pub fn headers_encoded_len(headers: &Headers) -> usize {
+    headers
+        .0
+        .iter()
+        .map(|(key, payload)| map_entry(key.len(), payload_encoded_len(payload)))
+        .sum()
+}
+
+/// A failure's encoded size. The kernel keeps a failure as a payload whose data
+/// is the encoded `Failure`, which is what v1.31.0's event holds.
+fn failure_len(failure: &Payload) -> usize {
+    failure.data.len()
+}
+
+/// The size of the payloads a buffered event carries: its input, result,
+/// details, failure and header. v1.31.0 sums each buffered event's whole
+/// encoded size (`SizeInBytesOfBufferedEvents`, event_store.go:120-129 @
+/// v1.31.0). The kernel holds domain events, and their payloads are what make
+/// them large, so this errs low by each event's other fields.
+///
+/// The match is exhaustive, so a new event kind doesn't compile until it is
+/// measured here.
+pub fn buffered_event_payload_size(kind: &HistoryEventKind) -> usize {
+    match kind {
+        HistoryEventKind::WorkflowExecutionSignaled { input, header, .. } => {
+            payloads_encoded_len(input) + header.as_ref().map_or(0, headers_encoded_len)
+        }
+        HistoryEventKind::ActivityTaskStarted { last_failure, .. } => {
+            last_failure.as_ref().map_or(0, failure_len)
+        }
+        HistoryEventKind::ActivityTaskCompleted { result, .. }
+        | HistoryEventKind::ChildWorkflowExecutionCompleted { result, .. }
+        | HistoryEventKind::NexusOperationCompleted { result, .. } => payloads_encoded_len(result),
+        HistoryEventKind::ActivityTaskFailed { failure, .. }
+        | HistoryEventKind::ChildWorkflowExecutionFailed { failure, .. }
+        | HistoryEventKind::NexusOperationFailed { failure, .. }
+        | HistoryEventKind::NexusOperationCancelRequestFailed { failure, .. }
+        | HistoryEventKind::WorkflowExecutionUpdateRejected { failure, .. } => failure_len(failure),
+        HistoryEventKind::ActivityTaskTimedOut { failure, .. } => {
+            failure.as_ref().map_or(0, failure_len)
+        }
+        HistoryEventKind::ActivityTaskCanceled { details, .. }
+        | HistoryEventKind::ChildWorkflowExecutionCanceled { details, .. } => {
+            details.as_ref().map_or(0, payloads_encoded_len)
+        }
+        HistoryEventKind::ChildWorkflowExecutionStarted { header, .. } => {
+            header.as_ref().map_or(0, headers_encoded_len)
+        }
+        HistoryEventKind::WorkflowExecutionUpdateAdmitted { input, .. } => {
+            payloads_encoded_len(input)
+        }
+        // Buffered kinds that carry no payload.
+        HistoryEventKind::TimerFired { .. }
+        | HistoryEventKind::WorkflowExecutionCancelRequested { .. }
+        | HistoryEventKind::StartChildWorkflowExecutionFailed { .. }
+        | HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
+        | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+        | HistoryEventKind::ExternalWorkflowExecutionSignaled { .. }
+        | HistoryEventKind::SignalExternalWorkflowExecutionFailed { .. }
+        | HistoryEventKind::ExternalWorkflowExecutionCancelRequested { .. }
+        | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed { .. }
+        | HistoryEventKind::NexusOperationStarted { .. }
+        | HistoryEventKind::NexusOperationCanceled { .. }
+        | HistoryEventKind::NexusOperationTimedOut { .. }
+        | HistoryEventKind::NexusOperationCancelRequestCompleted { .. }
+        | HistoryEventKind::WorkflowExecutionPaused { .. }
+        | HistoryEventKind::WorkflowExecutionUnpaused { .. }
+        | HistoryEventKind::WorkflowExecutionOptionsUpdated { .. } => 0,
+        // Kinds that never buffer.
+        HistoryEventKind::WorkflowExecutionStarted { .. }
+        | HistoryEventKind::WorkflowExecutionStartedV2 { .. }
+        | HistoryEventKind::WorkflowExecutionCompleted { .. }
+        | HistoryEventKind::WorkflowExecutionFailed { .. }
+        | HistoryEventKind::WorkflowExecutionTimedOut { .. }
+        | HistoryEventKind::WorkflowExecutionTerminated { .. }
+        | HistoryEventKind::WorkflowExecutionContinuedAsNew { .. }
+        | HistoryEventKind::WorkflowExecutionCanceled { .. }
+        | HistoryEventKind::WorkflowTaskScheduled { .. }
+        | HistoryEventKind::WorkflowTaskStarted { .. }
+        | HistoryEventKind::WorkflowTaskCompleted { .. }
+        | HistoryEventKind::WorkflowTaskFailed { .. }
+        | HistoryEventKind::WorkflowTaskTimedOut { .. }
+        | HistoryEventKind::ActivityTaskScheduled { .. }
+        | HistoryEventKind::ActivityTaskCancelRequested { .. }
+        | HistoryEventKind::TimerStarted { .. }
+        | HistoryEventKind::TimerCanceled { .. }
+        | HistoryEventKind::MarkerRecorded { .. }
+        | HistoryEventKind::StartChildWorkflowExecutionInitiated { .. }
+        | HistoryEventKind::SignalExternalWorkflowExecutionInitiated { .. }
+        | HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated { .. }
+        | HistoryEventKind::UpsertWorkflowSearchAttributes { .. }
+        | HistoryEventKind::WorkflowPropertiesModified { .. }
+        | HistoryEventKind::NexusOperationScheduled { .. }
+        | HistoryEventKind::NexusOperationCancelRequested { .. }
+        | HistoryEventKind::WorkflowExecutionUpdateAccepted { .. }
+        | HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
+        | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { .. } => 0,
+    }
 }
 
 /// A memo's encoded size: its fields (field 1, `map<string, Payload>`).

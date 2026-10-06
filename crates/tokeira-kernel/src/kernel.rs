@@ -42,6 +42,7 @@ use crate::{
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind, UpdateEventOutcome},
     integrity::{PriorRun, check_transition},
+    limits,
     state::{
         ActivityPauseInfo, ActivityState, AutoResetPoint, ChildWorkflowState,
         DEFAULT_HISTORY_MAX_AUTO_RESET_POINTS, EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
@@ -854,10 +855,8 @@ impl BasicKernel {
         // follow-up delivery. Otherwise a scheduled speculative task converts
         // first: Scheduled(5), Signaled(6), Started(7) in the corpus.
         if builder.append_external(kind) == BUFFERED_EVENT_ID {
-            // A signal flood that pushes the buffer over the count limit
-            // force-closes the started WFT (v1.31.0
-            // closeTransactionHandleBufferedEventsLimit).
-            builder.enforce_buffered_event_limit();
+            // A signal flood that pushes the buffer over a limit force-closes
+            // the started WFT when the transition finishes.
             return Ok(builder.finish());
         }
 
@@ -2286,7 +2285,7 @@ impl BasicKernel {
         let snapshot = started.clone();
         builder.activity_ops.push(ActivityOp::Upsert(snapshot));
 
-        let transition = builder.finish();
+        let transition = builder.finish_without_buffered_limits();
         check_transition(&prior, &transition)?;
         Ok(transition)
     }
@@ -2742,7 +2741,7 @@ impl BasicKernel {
                 // transition must deliver a task so the worker observes the started
                 // event, exactly like the terminal resolutions below.
                 if builder.state.pending_workflow_task.is_none() {
-                    builder.schedule_workflow_task();
+                    builder.schedule_workflow_task_on_close();
                 }
             }
             NexusResolution::Completed { result, links } => {
@@ -2757,7 +2756,7 @@ impl BasicKernel {
                     .pending_nexus_operations
                     .remove(&pending.operation_id);
                 if builder.state.pending_workflow_task.is_none() {
-                    builder.schedule_workflow_task();
+                    builder.schedule_workflow_task_on_close();
                 }
             }
             NexusResolution::Failed { failure } => {
@@ -2771,7 +2770,7 @@ impl BasicKernel {
                     .pending_nexus_operations
                     .remove(&pending.operation_id);
                 if builder.state.pending_workflow_task.is_none() {
-                    builder.schedule_workflow_task();
+                    builder.schedule_workflow_task_on_close();
                 }
             }
             NexusResolution::AttemptFailed {
@@ -2813,7 +2812,7 @@ impl BasicKernel {
                     .pending_nexus_operations
                     .remove(&pending.operation_id);
                 if builder.state.pending_workflow_task.is_none() {
-                    builder.schedule_workflow_task();
+                    builder.schedule_workflow_task_on_close();
                 }
             }
             NexusResolution::CompletionReceived {
@@ -2872,7 +2871,7 @@ impl BasicKernel {
                     .pending_nexus_operations
                     .remove(&pending.operation_id);
                 if builder.state.pending_workflow_task.is_none() {
-                    builder.schedule_workflow_task();
+                    builder.schedule_workflow_task_on_close();
                 }
             }
             NexusResolution::TimedOut { timeout_type } => {
@@ -2896,7 +2895,7 @@ impl BasicKernel {
                     .pending_nexus_operations
                     .remove(&pending.operation_id);
                 if builder.state.pending_workflow_task.is_none() {
-                    builder.schedule_workflow_task();
+                    builder.schedule_workflow_task_on_close();
                 }
             }
         }
@@ -3044,7 +3043,7 @@ impl BasicKernel {
         if let Some(kind) = history_kind {
             builder.append_external(kind);
             if builder.state.pending_workflow_task.is_none() {
-                builder.schedule_workflow_task();
+                builder.schedule_workflow_task_on_close();
             }
         }
         Ok(builder.finish())
@@ -6608,13 +6607,6 @@ pub const TRANSIENT_ACTIVITY_STARTED_EVENT_ID: i64 = -124;
 /// v1.31.0). A child workflow may not target it.
 const PER_NS_WORKER_TASK_QUEUE: &str = "temporal-sys-per-ns-tq";
 
-/// v1.31.0's `MaximumBufferedEventsBatch` default (`constants.go:2340`): the
-/// per-run cap on events buffered during a started WFT. Exceeding it force-closes
-/// the started task (`closeTransactionHandleBufferedEventsLimit`,
-/// mutable_state_impl.go:8202-8231 @ v1.31.0). Pinned as a constant — the corpus
-/// leaf relies on this default, not an override (`TestMaxBufferedEventsLimit`).
-const MAX_BUFFERED_EVENTS: usize = 100;
-
 /// Whether an event kind records something that happened outside the workflow
 /// task — and so buffers while a task is started — following v1.31.0's
 /// `bufferEvent` (event_store.go:263-318 @ v1.31.0): every kind buffers except
@@ -6757,6 +6749,13 @@ struct TransitionBuilder {
     /// The `TransitionSeq` captured at construction time,
     /// used as the optimistic concurrency fence.
     expected_seq: TransitionSeq,
+    /// Where this transition's finishing events begin in `history_events`:
+    /// the run of events at its end that v1.31.0 numbers only when it
+    /// finishes the write, after its growth checks (`run-growth-limits`
+    /// criterion 2.2).
+    finishing_from: Option<usize>,
+    /// Whether a finishing step is writing events.
+    finishing_step: bool,
 }
 
 impl TransitionBuilder {
@@ -6779,7 +6778,33 @@ impl TransitionBuilder {
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
             expected_seq,
+            finishing_from: None,
+            finishing_step: false,
         }
+    }
+
+    /// Track where this transition's finishing events begin. v1.31.0 numbers
+    /// an externally originated event only when it flushes it
+    /// (event_store.go:74-95 @ v1.31.0), and it runs its finishing steps when
+    /// it closes the transaction, after the growth checks
+    /// (mutable_state_impl.go:7086-7100, 7191-7250 @ v1.31.0). Any other event
+    /// was numbered while handling the request, and since v1.31.0 numbers
+    /// events in order, so was every event before it.
+    fn track_finishing(&mut self, kind: &HistoryEventKind) {
+        if self.finishing_step || is_externally_originated(kind) {
+            self.finishing_from.get_or_insert(self.history_events.len());
+        } else {
+            self.finishing_from = None;
+        }
+    }
+
+    /// Run `step` as a finishing step, whose events v1.31.0 writes when it
+    /// closes the transaction.
+    fn finishing<T>(&mut self, step: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = std::mem::replace(&mut self.finishing_step, true);
+        let result = step(self);
+        self.finishing_step = outer;
+        result
     }
 
     /// Append a history event and return its assigned event
@@ -6796,6 +6821,7 @@ impl TransitionBuilder {
     /// `AddWorkflowTaskCompletedEvent`,
     /// workflow_task_state_machine.go:768-800 @ v1.31.0).
     fn emit_at(&mut self, happened_at: OffsetDateTime, kind: HistoryEventKind) -> i64 {
+        self.track_finishing(&kind);
         let event_id = self.state.last_event_id + 1;
         self.state.last_event_id = event_id;
         let event = HistoryEvent {
@@ -6848,7 +6874,7 @@ impl TransitionBuilder {
             self.buffer(kind);
             return BUFFERED_EVENT_ID;
         }
-        self.materialize_scheduled_speculative();
+        self.finishing(Self::materialize_scheduled_speculative);
         self.emit(kind)
     }
 
@@ -6991,6 +7017,7 @@ impl TransitionBuilder {
                 }
                 _ => {}
             }
+            self.track_finishing(&kind);
             self.history_events.push(HistoryEvent {
                 event_id,
                 happened_at: event.admitted_at,
@@ -7005,16 +7032,28 @@ impl TransitionBuilder {
     }
 
     /// v1.31.0's `closeTransactionHandleBufferedEventsLimit`
-    /// (mutable_state_impl.go:8202-8231): when the buffered batch exceeds
-    /// [`MAX_BUFFERED_EVENTS`] while a workflow task is started, force-fail that
+    /// (mutable_state_impl.go:8191-8231): when the buffered batch exceeds
+    /// [`limits::MAXIMUM_BUFFERED_EVENTS_BATCH`] events, or
+    /// [`limits::MAXIMUM_BUFFERED_EVENTS_SIZE_IN_BYTES`] of the payloads they
+    /// carry (`run-growth-limits` criterion 2.7), while a workflow task is
+    /// started, force-fail that
     /// task with `FORCE_CLOSE_COMMAND`, flush the buffered batch, and schedule a
     /// fresh normal task to redeliver it. The workflow SURVIVES and every
     /// buffered event is preserved — distinct from a size-limit terminate
     /// (`TestMaxBufferedEventsLimit` / `TestRateLimitBufferedEvents`: exactly
     /// one `WorkflowTaskFailed(FORCE_CLOSE_COMMAND)`, all 101 signals delivered).
-    /// Returns true if it fired. Call at the end of a buffering transition.
+    /// Returns true if it fired. [`Self::finish`] calls it at the end of every
+    /// transition, whichever kind of event buffered.
     fn enforce_buffered_event_limit(&mut self) -> bool {
-        if self.state.buffered_events.len() <= MAX_BUFFERED_EVENTS {
+        let buffered_size: usize = self
+            .state
+            .buffered_events
+            .iter()
+            .map(|event| crate::payload_size::buffered_event_payload_size(&event.kind))
+            .sum();
+        if self.state.buffered_events.len() <= limits::MAXIMUM_BUFFERED_EVENTS_BATCH
+            && buffered_size <= limits::MAXIMUM_BUFFERED_EVENTS_SIZE_IN_BYTES
+        {
             return false;
         }
         let Some(pending) = self.state.pending_workflow_task.clone() else {
@@ -7278,6 +7317,15 @@ impl TransitionBuilder {
     /// No-ops if the workflow is paused.
     fn schedule_workflow_task(&mut self) {
         self.schedule_workflow_task_typed(WorkflowTaskType::Normal);
+    }
+
+    /// Schedule a workflow task for a Nexus operation's event. v1.31.0 does it
+    /// when it closes the transaction, for every event a state machine marks
+    /// as a workflow task trigger (`closeTransactionHandleWorkflowTaskScheduling`,
+    /// mutable_state_impl.go:7209-7236;
+    /// `components/nexusoperations/events.go @ v1.31.0`).
+    fn schedule_workflow_task_on_close(&mut self) {
+        self.finishing(Self::schedule_workflow_task);
     }
 
     /// Fence and regenerate delivery for an unstarted WFT after its deployment target changes.
@@ -7658,8 +7706,20 @@ impl TransitionBuilder {
     /// [`Transition`]. Increments `transition_seq` exactly
     /// once.
     fn finish(mut self) -> Transition {
+        self.finishing(Self::enforce_buffered_event_limit);
+        self.finish_without_buffered_limits()
+    }
+
+    /// [`Self::finish`] for a transition the runtime commits outside the
+    /// run's lane, an activity's start, which can't deliver a workflow task
+    /// a force-close would schedule. The run's next transition checks the
+    /// buffered event limits instead.
+    fn finish_without_buffered_limits(mut self) -> Transition {
         self.state.transition_seq = self.state.transition_seq.next();
         debug_assert_eq!(self.history_events.len(), self.event_principals.len());
+        let events_numbered_at_close = self
+            .finishing_from
+            .map_or(0, |from| self.history_events.len() - from);
         Transition {
             expected_seq: self.expected_seq,
             next_state: self.state,
@@ -7669,6 +7729,8 @@ impl TransitionBuilder {
             activity_ops: self.activity_ops,
             timer_ops: self.timer_ops,
             dispatch_ops: self.dispatch_ops,
+            events_numbered_at_close: u32::try_from(events_numbered_at_close).unwrap_or(u32::MAX),
+            growth_limits: None,
         }
     }
 
@@ -7694,6 +7756,8 @@ impl TransitionBuilder {
             activity_ops: self.activity_ops,
             timer_ops: self.timer_ops,
             dispatch_ops: self.dispatch_ops,
+            events_numbered_at_close: 0,
+            growth_limits: None,
         }
     }
 }

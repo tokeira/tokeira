@@ -443,6 +443,7 @@ mod tests {
             delivery_metrics: crate::DeliveryMetrics::new(),
             tracking: ActivityTrackingState::default(),
             worker_deployment_registry: Arc::new(RwLock::new(None)),
+            lanes: Vec::new(),
         }
     }
 
@@ -563,6 +564,8 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
+            events_numbered_at_close: 0,
+            growth_limits: None,
         }
     }
 

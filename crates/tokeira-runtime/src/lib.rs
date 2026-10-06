@@ -47,6 +47,7 @@ pub mod query;
 pub mod query_consistency_model;
 pub mod recovery;
 pub mod retry;
+mod run_growth;
 pub mod runtime;
 pub use runtime::continue_as_new_advice_policy;
 pub mod scanner;

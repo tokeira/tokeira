@@ -18,13 +18,13 @@
 //!   republishes the offer instead of making the worker wait on a lock.
 use super::*;
 use crate::{
-    lane::KernelRejected,
+    lane::{KernelRejected, LaneHandle},
     runtime::workflow_task::{
         ResolvedWorkflowTaskTarget, poller_deployment_version,
         resolve_workflow_task_target_version, route_activity_task_queue,
     },
 };
-use tokeira_kernel::{ActivityStartMode, ActivityStartRequest};
+use tokeira_kernel::{ActivityStartMode, ActivityStartRequest, limits::RunLimitExceeded};
 use tokeira_observability::OutcomeLabel;
 use tokeira_types::{TaskKind, WorkerTaskClass, WorkerTaskOrigin};
 use tracing::Instrument as _;
@@ -625,6 +625,8 @@ where
                 activity_ops: smallvec![ActivityOp::Upsert(next_activity)],
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
+                events_numbered_at_close: 0,
+                growth_limits: Some(crate::run_growth::run_growth_limits()),
             };
 
             let (bundle, commit_epoch) = {
@@ -643,11 +645,11 @@ where
                 (bundle_id, epoch)
             };
 
-            match self
+            let committed = self
                 .repo
                 .commit_transition_for_bundle(token.run_key, bundle, transition, commit_epoch)
-                .await?
-            {
+                .await;
+            match terminate_on_growth_breach(&self.lanes, token.run_key, committed).await? {
                 CommitResult::Applied { .. } | CommitResult::Duplicate => {
                     // Reset the volatile heartbeat clock; the CANCEL signal
                     // itself comes from the durable state loaded above — the
@@ -789,7 +791,7 @@ where
             // and passes the transition check. The fabricated start carries the
             // completing caller's identity (respondactivitytaskcompleted/api.go:96
             // @ v1.31.0).
-            let transition = BasicKernel
+            let mut transition = BasicKernel
                 .apply_activity_started(
                     LoadedRun::Existing(state.clone()),
                     ActivityStartRequest {
@@ -801,6 +803,7 @@ where
                     },
                 )
                 .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
+            transition.growth_limits = Some(crate::run_growth::run_growth_limits());
 
             // Same commit-epoch rule as start_activity_task: ZERO without a
             // placement controller (no lease to fence), real local epoch under
@@ -821,11 +824,11 @@ where
                 (bundle_id, epoch)
             };
 
-            match self
+            let committed = self
                 .repo
                 .commit_transition_for_bundle(run_key, bundle, transition, commit_epoch)
-                .await?
-            {
+                .await;
+            match terminate_on_growth_breach(&self.lanes, run_key, committed).await? {
                 CommitResult::Applied { .. } => {
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
                     self.activity_tracking.record_started(
@@ -1096,7 +1099,7 @@ where
             // worker's identity becomes `started_identity`, Describe's primary
             // `LastWorkerIdentity` source (workflow/activity.go:159 @ v1.31.0).
             let now = OffsetDateTime::now_utc();
-            let transition = BasicKernel
+            let mut transition = BasicKernel
                 .apply_activity_started(
                     LoadedRun::Existing(state.clone()),
                     ActivityStartRequest {
@@ -1108,6 +1111,7 @@ where
                     },
                 )
                 .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
+            transition.growth_limits = Some(crate::run_growth::run_growth_limits());
             let next_activity = transition
                 .next_state
                 .activities
@@ -1137,11 +1141,22 @@ where
                 (bundle_id, epoch)
             };
 
-            match self
+            let committed = self
                 .repo
                 .commit_transition_for_bundle(task.run_key, bundle, transition, commit_epoch)
-                .await?
+                .await;
+            let committed = terminate_on_growth_breach(&self.lanes, task.run_key, committed).await;
+            // A start refused for a growth limit terminated the run, so the poll
+            // goes on, as for a task whose run has closed (`run-growth-limits`
+            // criterion 2.4).
+            if committed
+                .as_ref()
+                .is_err_and(|error| error.downcast_ref::<RunLimitExceeded>().is_some())
             {
+                runtime_metrics::record_activity_task_started(OutcomeLabel::Failure);
+                return Ok(None);
+            }
+            match committed? {
                 CommitResult::Applied { .. } => {
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
                     self.delivery_metrics
@@ -1317,6 +1332,7 @@ where
             delivery_metrics: self.delivery_metrics.clone(),
             tracking: self.activity_tracking.clone(),
             worker_deployment_registry: self.worker_deployment_registry.clone(),
+            lanes: self.lanes.clone(),
         }
     }
 }
@@ -1333,6 +1349,9 @@ pub(crate) struct ActivityRetryDeps<R> {
     pub delivery_metrics: DeliveryMetrics,
     pub tracking: ActivityTrackingState,
     pub worker_deployment_registry: Arc<RwLock<Option<DeploymentRegistry>>>,
+    /// The runtime's lanes, through which a run whose activity write was
+    /// refused for a growth limit is terminated.
+    pub lanes: Vec<LaneHandle>,
 }
 
 impl<R> Clone for ActivityRetryDeps<R> {
@@ -1346,8 +1365,51 @@ impl<R> Clone for ActivityRetryDeps<R> {
             delivery_metrics: self.delivery_metrics.clone(),
             tracking: self.tracking.clone(),
             worker_deployment_registry: self.worker_deployment_registry.clone(),
+            lanes: self.lanes.clone(),
         }
     }
+}
+
+/// Terminate the run through its lane when an activity write's commit was
+/// refused for a growth limit that terminates the run, and hand the commit's
+/// outcome on, so the writer's caller answers with the breach
+/// (`run-growth-limits` criteria 2.4 and 2.5).
+pub(crate) async fn terminate_on_growth_breach(
+    lanes: &[LaneHandle],
+    run_key: RunKey,
+    committed: Result<CommitResult>,
+) -> Result<CommitResult> {
+    let breach = match &committed {
+        Err(error) => crate::run_growth::terminating_breach(error, false),
+        Ok(_) => None,
+    };
+    let Some(breach) = breach else {
+        return committed;
+    };
+    if lanes.is_empty() {
+        tracing::error!(
+            ?run_key,
+            limit = ?breach.limit,
+            "no lane to terminate a run over a growth limit"
+        );
+        return committed;
+    }
+    let lane = crate::scanner::pick_lane_for_run_key(lanes, lanes.len(), run_key);
+    if let Err(error) = lane
+        .submit(
+            run_key,
+            crate::run_growth::terminate_command(run_key, &breach),
+        )
+        .await
+    {
+        tracing::error!(
+            ?error,
+            ?run_key,
+            limit = ?breach.limit,
+            "failed to terminate a run over a growth limit"
+        );
+    }
+    committed
 }
 
 /// The staleness fence for a retry commit: which activity incarnation the
@@ -1386,6 +1448,15 @@ where
 {
     let run_key = target.run_key;
     let activity_id = target.activity_id;
+    // The failure is stored cut to the stored activity failure limit, as
+    // v1.31.0 stores it, before anything reads it (`run-growth-limits`
+    // criterion 2.8).
+    let failure = failure.map(|failure| {
+        crate::run_growth::stored_activity_failure(
+            failure,
+            crate::run_growth::stored_activity_failure_limit(),
+        )
+    });
     let mut attempts = 0u32;
     loop {
         let LoadedRun::Existing(state) = deps.repo.load_run(run_key).await? else {
@@ -1523,6 +1594,8 @@ where
             activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
             timer_ops: SmallVec::new(),
             dispatch_ops,
+            events_numbered_at_close: 0,
+            growth_limits: Some(crate::run_growth::run_growth_limits()),
         };
 
         // Same commit-epoch rule as start_activity_task: ZERO without a
@@ -1544,11 +1617,11 @@ where
             (bundle_id, epoch)
         };
 
-        match deps
+        let committed = deps
             .repo
             .commit_transition_for_bundle(run_key, bundle, transition, commit_epoch)
-            .await?
-        {
+            .await;
+        match terminate_on_growth_breach(&deps.lanes, run_key, committed).await? {
             CommitResult::Applied { .. } => {
                 if paused {
                     deps.tracking.remove(run_key, activity_id);
@@ -1937,6 +2010,8 @@ where
             activity_ops: smallvec![ActivityOp::Upsert(next_activity)],
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
+            events_numbered_at_close: 0,
+            growth_limits: Some(crate::run_growth::run_growth_limits()),
         };
         let (bundle, commit_epoch) = {
             let owner = deps.shard_owner.read().expect("shard_owner lock poisoned");
@@ -1954,11 +2029,11 @@ where
             (bundle_id, epoch)
         };
 
-        match deps
+        let committed = deps
             .repo
             .commit_transition_for_bundle(task.run_key, bundle, transition, commit_epoch)
-            .await?
-        {
+            .await;
+        match terminate_on_growth_breach(&deps.lanes, task.run_key, committed).await? {
             CommitResult::Applied { .. } => {
                 deps.tracking.remove(task.run_key, &task.activity_id);
                 return Ok(Preparation::SuppressedByRule);
@@ -2298,6 +2373,8 @@ mod tests {
             activity_ops: smallvec![ActivityOp::Upsert(activity.clone())],
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
+            events_numbered_at_close: 0,
+            growth_limits: None,
         };
         repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
             .await
@@ -2424,6 +2501,8 @@ mod tests {
                 heartbeat_timeout: activity.heartbeat_timeout,
                 priority: None,
             }],
+            events_numbered_at_close: 0,
+            growth_limits: None,
         };
         repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
             .await
@@ -2913,6 +2992,8 @@ mod tests {
             activity_ops: SmallVec::new(),
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
+            events_numbered_at_close: 0,
+            growth_limits: None,
         };
         repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
             .await
@@ -3302,6 +3383,8 @@ mod tests {
             activity_ops: smallvec![ActivityOp::Upsert(activity.clone())],
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
+            events_numbered_at_close: 0,
+            growth_limits: None,
         };
         repo.commit_transition(token.run_key, transition, ShardEpoch::ZERO)
             .await
@@ -3817,6 +3900,8 @@ mod tests {
                 heartbeat_timeout: None,
                 priority: None,
             }],
+            events_numbered_at_close: 0,
+            growth_limits: None,
         };
         repo.commit_transition(zombie_run, zombie_transition, ShardEpoch::ZERO)
             .await

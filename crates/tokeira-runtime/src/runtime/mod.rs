@@ -828,6 +828,7 @@ where
                     delivery_metrics: delivery_metrics.clone(),
                     tracking: activity_tracking.clone(),
                     worker_deployment_registry: worker_deployment_registry.clone(),
+                    lanes: lanes.clone(),
                 },
                 lanes.clone(),
                 lane_count,
@@ -2728,6 +2729,8 @@ mod tests {
                 activity_ops: SmallVec::new(),
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
+                events_numbered_at_close: 0,
+                growth_limits: None,
             },
             ShardEpoch::ZERO,
         )

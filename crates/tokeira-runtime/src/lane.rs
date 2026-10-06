@@ -448,8 +448,46 @@ where
         )
         .instrument(processing_span.clone())
         .await;
+        // A commit refused for a limit that terminates the run: terminate the
+        // run as stored in this activation, treat the terminate as the
+        // committed command so every post-commit step runs for it, and answer
+        // the caller with the breach (`run-growth-limits` criteria 2.1-2.3,
+        // 2.5 and 2.6).
+        let breach = result.as_ref().err().and_then(|error| {
+            crate::run_growth::terminating_breach(
+                error,
+                crate::run_growth::completes_workflow_task(&committed_command),
+            )
+        });
+        let (result, committed_command) = match &breach {
+            Some(breach) => {
+                let terminate = crate::run_growth::terminate_command(message.run_key, breach);
+                let terminated = handle_message_with_cache(
+                    kernel,
+                    repo,
+                    shard_owner,
+                    message.run_key,
+                    terminate.clone(),
+                    config,
+                    config.max_occ_retries,
+                    cache,
+                )
+                .instrument(processing_span.clone())
+                .await;
+                if let Err(error) = &terminated {
+                    tracing::error!(
+                        ?error,
+                        run_key = ?message.run_key,
+                        limit = ?breach.limit,
+                        "failed to terminate a run over a growth limit"
+                    );
+                }
+                (terminated, terminate)
+            }
+            None => (result, committed_command),
+        };
 
-        let stop_draining = result.is_err();
+        let stop_draining = result.is_err() || breach.is_some();
         let reply = match result {
             Ok((commit_result, mut dispatch_ops, history_events)) => {
                 let mut reset_materialization_error = None;
@@ -1385,6 +1423,10 @@ where
             }
             Err(error) => Err(error),
         };
+        let reply = match breach {
+            Some(breach) => Err(anyhow::Error::new(breach)),
+            None => reply,
+        };
         runtime_metrics::record_lane_processing_duration(command_type, processing_start.elapsed());
         let _ = message.reply_tx.send(reply);
         drained += 1;
@@ -1529,11 +1571,14 @@ where
                 loaded
             }
         };
-        let transition = transition_span.in_scope(|| {
+        let mut transition = transition_span.in_scope(|| {
             kernel
                 .apply(loaded, command.clone())
                 .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))
         })?;
+        // The store checks the commit's growth against these limits and writes
+        // nothing of a commit over one (`run-growth-limits`).
+        transition.growth_limits = Some(crate::run_growth::run_growth_limits());
         transition_span.record("tokeira.run_id", transition.next_state.run_id.0.to_string());
         transition_span.record(
             "tokeira.workflow_type",
@@ -2204,6 +2249,8 @@ mod tests {
                     activity_ops: SmallVec::new(),
                     timer_ops: SmallVec::new(),
                     dispatch_ops: SmallVec::new(),
+                    events_numbered_at_close: 0,
+                    growth_limits: None,
                 });
             }
 
@@ -2245,6 +2292,8 @@ mod tests {
                 activity_ops: SmallVec::<[tokeira_kernel::ActivityOp; 4]>::new(),
                 timer_ops: SmallVec::<[TimerOp; 4]>::new(),
                 dispatch_ops: state.dispatch_ops.clone(),
+                events_numbered_at_close: 0,
+                growth_limits: None,
             })
         }
     }
@@ -2760,6 +2809,8 @@ mod tests {
                 activity_ops: SmallVec::new(),
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
+                events_numbered_at_close: 0,
+                growth_limits: None,
             })
         }
     }
@@ -2794,6 +2845,8 @@ mod tests {
                 activity_ops: SmallVec::new(),
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
+                events_numbered_at_close: 0,
+                growth_limits: None,
             })
         }
     }

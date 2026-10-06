@@ -18,10 +18,10 @@ Counts below include dynamic settings and the separately audited static groups.
 | Tokeira treatment | Count |
 |---|---:|
 | deployment policy | 10 |
-| pinned behavioral constant | 211 |
+| pinned behavioral constant | 205 |
 | auto-tuned mechanical setting | 360 |
-| conformance-only override | 32 |
-| architecturally irrelevant or excluded | 12 |
+| conformance-only override | 39 |
+| architecturally irrelevant or excluded | 11 |
 
 ## Static Temporal server configuration
 
@@ -141,9 +141,9 @@ Counts below include dynamic settings and the separately audited static groups.
 | `frontend.reachabilityQuerySetDurationSinceDefault` | global / `Duration` | `5 * time.Minute` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:526` |
 | `frontend.rps` | global / `Int` | `2400` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:638` |
 | `frontend.rps.namespaceReplicationInducingAPIs` | global / `Int` | `20` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:648` |
-| `frontend.searchAttributesNumberOfKeysLimit` | namespace / `Int` | `100` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:807` |
-| `frontend.searchAttributesSizeOfValueLimit` | namespace / `Int` | `2 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:812` |
-| `frontend.searchAttributesTotalSizeLimit` | namespace / `Int` | `40 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:817` |
+| `frontend.searchAttributesNumberOfKeysLimit` | namespace / `Int` | `100` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:807` |
+| `frontend.searchAttributesSizeOfValueLimit` | namespace / `Int` | `2 * 1024` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:812` |
+| `frontend.searchAttributesTotalSizeLimit` | namespace / `Int` | `40 * 1024` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:817` |
 | `frontend.sendRawWorkflowHistory` | namespace / `Bool` | `false` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:802` |
 | `frontend.shutdownDrainDuration` | global / `Duration` | `0 * time.Second` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:772` |
 | `frontend.shutdownFailHealthCheckDuration` | global / `Duration` | `0 * time.Second` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:777` |
@@ -411,8 +411,8 @@ Counts below include dynamic settings and the separately audited static groups.
 | `history.xdcCacheMaxSizeBytes` | global / `Int` | `8 * 1024 * 1024` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:1663` |
 | `internal-frontend.globalNamespaceRPS` | namespace / `Int` | `0` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:736` |
 | `internal-frontend.globalNamespaceRPS.visibility` | namespace / `Int` | `0` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:760` |
-| `limit.blobSize.error` | namespace / `Int` | `2 * 1024 * 1024` | architecturally irrelevant or excluded — No production raw-key control; the Temporal topology or feature is collapsed, unavailable, or explicitly excluded in Tokeira. | not-enforced | `common/dynamicconfig/constants.go:316` |
-| `limit.blobSize.warn` | namespace / `Int` | `512 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:321` |
+| `limit.blobSize.error` | namespace / `Int` | `2 * 1024 * 1024` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:316` |
+| `limit.blobSize.warn` | namespace / `Int` | `512 * 1024` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:321` |
 | `limit.endpointDescriptionMaxSize` | namespace / `Int` | `20000` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:554` |
 | `limit.endpointExternalURLMaxLength` | global / `Int` | `4 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:549` |
 | `limit.endpointListDefaultPageSize` | global / `Int` | `100` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:559` |
@@ -426,8 +426,8 @@ Counts below include dynamic settings and the separately audited static groups.
 | `limit.historySize.suggestContinueAsNew` | namespace / `Int` | `4 * 1024 * 1024` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:370` |
 | `limit.historySize.warn` | namespace / `Int` | `10 * 1024 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:365` |
 | `limit.maxIDLength` | global / `Int` | `1000` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:423` |
-| `limit.memoSize.error` | namespace / `Int` | `2 * 1024 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:326` |
-| `limit.memoSize.warn` | namespace / `Int` | `2 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:331` |
+| `limit.memoSize.error` | namespace / `Int` | `2 * 1024 * 1024` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:326` |
+| `limit.memoSize.warn` | namespace / `Int` | `2 * 1024` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:331` |
 | `limit.mutableStateActivityFailureSize.error` | namespace / `Int` | `4 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:386` |
 | `limit.mutableStateActivityFailureSize.warn` | namespace / `Int` | `2 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:392` |
 | `limit.mutableStateSize.error` | global / `Int` | `8 * 1024 * 1024` | architecturally irrelevant or excluded — No production raw-key control; the Temporal topology or feature is collapsed, unavailable, or explicitly excluded in Tokeira. | not-enforced | `common/dynamicconfig/constants.go:397` |

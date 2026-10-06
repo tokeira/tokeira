@@ -42,7 +42,7 @@ use crate::{
             worker_versioning_v2_disabled_status, workflow_already_started_status,
         },
         metadata::metadata_to_header_map,
-        translate,
+        payload_limits, translate,
     },
     translate::{batch, nexus, schedule, to_internal, worker_heartbeat},
     workflow_service::WorkflowService,
@@ -186,6 +186,135 @@ impl WorkflowServiceGrpc {
             .resolve_namespace_id(namespace)
             .await
             .map_err(namespace_resolution_status)
+    }
+
+    /// RespondActivityTaskFailed's routing: a standalone activity's token goes
+    /// to the CHASM bridge, a workflow activity's through translation to
+    /// `WorkflowService`. The payload limits reuse it to fail an activity whose
+    /// completion, cancellation or heartbeat is over the blob size limit, so
+    /// that call is admitted as RespondActivityTaskFailed
+    /// (`payload-admission-limits` criterion 2.5).
+    async fn fail_activity_task(
+        &self,
+        headers: &http::HeaderMap,
+        req: workflowservice::RespondActivityTaskFailedRequest,
+    ) -> Result<(), Status> {
+        if let Some(bridge) = &self.chasm_activity
+            && bridge.owns_task_token(&req.task_token)
+        {
+            let context = self
+                .inner
+                .admit_worker_request(
+                    headers,
+                    Some(&req.namespace),
+                    Action::RespondActivityTaskFailed,
+                    false,
+                )
+                .await?;
+            let provenance = self
+                .inner
+                .authorize_standalone_task_token(
+                    &context,
+                    Action::RespondActivityTaskFailed,
+                    &req.task_token,
+                )
+                .await?;
+            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+            let failure = req
+                .failure
+                .as_ref()
+                .map(|f| f.message.clone())
+                .unwrap_or_default();
+            // Carry the full structured Failure (e.g. ApplicationFailureInfo) so the
+            // describe outcome round-trips it, not just the message (Req 5).
+            let failure_payload = req
+                .failure
+                .as_ref()
+                .map(|f| f.encode_to_vec())
+                .unwrap_or_default();
+            let heartbeat_details = req
+                .last_heartbeat_details
+                .map(|p| p.encode_to_vec())
+                .unwrap_or_default();
+            bridge
+                .respond_activity_task_failed(
+                    &req.task_token,
+                    &namespace_id.0.to_string(),
+                    failure,
+                    failure_payload,
+                    heartbeat_details,
+                    req.identity,
+                )
+                .await?;
+            self.inner
+                .delete_consumed_task_provenance(provenance, Action::RespondActivityTaskFailed)
+                .await;
+            return Ok(());
+        }
+        let edge_req =
+            translate::respond_activity_failed_to_edge(req).map_err(proto_conversion_status)?;
+        let _edge_resp = self
+            .inner
+            .respond_activity_task_failed(headers, edge_req)
+            .await?;
+        Ok(())
+    }
+
+    /// RespondActivityTaskFailedById's routing, as [`Self::fail_activity_task`]:
+    /// an empty workflow id names a standalone activity.
+    async fn fail_activity_task_by_id(
+        &self,
+        headers: &http::HeaderMap,
+        req: workflowservice::RespondActivityTaskFailedByIdRequest,
+    ) -> Result<(), Status> {
+        if let Some(bridge) = &self.chasm_activity
+            && req.workflow_id.is_empty()
+        {
+            self.inner
+                .admit_request(
+                    headers,
+                    Some(&req.namespace),
+                    Action::RespondActivityTaskFailedById,
+                    false,
+                )
+                .await?;
+            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+            let failure = req
+                .failure
+                .as_ref()
+                .map(|f| f.message.clone())
+                .unwrap_or_default();
+            // Carry the full structured Failure so the describe outcome round-trips
+            // it, not just the message (Req 5), matching the by-token path.
+            let failure_payload = req
+                .failure
+                .as_ref()
+                .map(|f| f.encode_to_vec())
+                .unwrap_or_default();
+            let heartbeat_details = req
+                .last_heartbeat_details
+                .map(|p| p.encode_to_vec())
+                .unwrap_or_default();
+            bridge
+                .fail_by_id(
+                    &namespace_id.0.to_string(),
+                    &req.activity_id,
+                    &req.run_id,
+                    failure,
+                    failure_payload,
+                    heartbeat_details,
+                    req.identity,
+                )
+                .await?;
+            return Ok(());
+        }
+        let edge_req = translate::respond_activity_failed_by_id_to_edge(req)
+            .map_err(proto_conversion_status)?;
+        let _edge_resp = self
+            .inner
+            .respond_activity_task_failed_by_id(headers, edge_req)
+            .await?;
+        Ok(())
     }
 
     /// Build a CHASM [`tokeira_chasm::ExecutionKey`] for a standalone-activity
@@ -616,7 +745,7 @@ fn validate_sa_run_id(run_id: &str) -> Result<(), Status> {
 /// verbatim v1.31.0 messages (`chasm/lib/activity/frontend.go @ v1.31.0`). Length is
 /// compared in bytes (Go `len(string)`). Skipped when standalone activities are
 /// disabled — the RPC then returns `Unimplemented` downstream. (`reason` is bound by
-/// `BlobSizeLimitError`, validated separately where that limit is available.)
+/// `BlobSizeLimitError`, which `validate_sa_reason` checks.)
 fn validate_sa_request_metadata(
     enabled: bool,
     max_id_length: usize,
@@ -639,6 +768,18 @@ fn validate_sa_request_metadata(
             identity.len(),
             max_id_length
         )));
+    }
+    Ok(())
+}
+
+/// Validate a standalone-activity cancellation or termination reason against
+/// the blob size limit, by its length in bytes, with v1.31.0's message
+/// (`chasm/lib/activity/validator.go:402-412, 475-485 @ v1.31.0`;
+/// `payload-admission-limits` criterion 2.9). Skipped when standalone
+/// activities are disabled, as the request metadata check is.
+fn validate_sa_reason(enabled: bool, reason: &str, operation: &str) -> Result<(), Status> {
+    if enabled && payload_limits::standalone_blob_exceeds_limit(reason.len(), operation) {
+        return Err(Status::invalid_argument("reason exceeds length limit"));
     }
     Ok(())
 }
@@ -1146,6 +1287,28 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::RespondActivityTaskCompletedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
+        // `payload-admission-limits` criterion 2.5.
+        if payload_limits::blob_exceeds_limit(
+            payload_limits::encoded_size(req.result.as_ref()),
+            "RespondActivityTaskCompleted",
+        ) {
+            self.fail_activity_task(
+                &headers,
+                workflowservice::RespondActivityTaskFailedRequest {
+                    namespace: req.namespace,
+                    task_token: req.task_token,
+                    failure: Some(payload_limits::server_failure(
+                        payload_limits::COMPLETE_RESULT_EXCEEDS_LIMIT,
+                    )),
+                    identity: req.identity,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            return Ok(Response::new(
+                translate::respond_activity_completed_to_proto(),
+            ));
+        }
         // Route to the CHASM path only when the token is one the bridge issued; a
         // workflow-activity token falls through unchanged.
         if let Some(bridge) = &self.chasm_activity
@@ -1204,66 +1367,17 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondActivityTaskFailedRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskFailedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let req = request.into_inner();
-        if let Some(bridge) = &self.chasm_activity
-            && bridge.owns_task_token(&req.task_token)
-        {
-            let context = self
-                .inner
-                .admit_worker_request(
-                    &headers,
-                    Some(&req.namespace),
-                    Action::RespondActivityTaskFailed,
-                    false,
-                )
-                .await?;
-            let provenance = self
-                .inner
-                .authorize_standalone_task_token(
-                    &context,
-                    Action::RespondActivityTaskFailed,
-                    &req.task_token,
-                )
-                .await?;
-            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
-            let failure = req
-                .failure
-                .as_ref()
-                .map(|f| f.message.clone())
-                .unwrap_or_default();
-            // Carry the full structured Failure (e.g. ApplicationFailureInfo) so the
-            // describe outcome round-trips it, not just the message (Req 5).
-            let failure_payload = req
-                .failure
-                .as_ref()
-                .map(|f| f.encode_to_vec())
-                .unwrap_or_default();
-            let heartbeat_details = req
-                .last_heartbeat_details
-                .map(|p| p.encode_to_vec())
-                .unwrap_or_default();
-            bridge
-                .respond_activity_task_failed(
-                    &req.task_token,
-                    &namespace_id.0.to_string(),
-                    failure,
-                    failure_payload,
-                    heartbeat_details,
-                    req.identity,
-                )
-                .await?;
-            self.inner
-                .delete_consumed_task_provenance(provenance, Action::RespondActivityTaskFailed)
-                .await;
-            return Ok(Response::new(translate::respond_activity_failed_to_proto()));
-        }
-        let edge_req =
-            translate::respond_activity_failed_to_edge(req).map_err(proto_conversion_status)?;
-        let _edge_resp = self
-            .inner
-            .respond_activity_task_failed(&headers, edge_req)
-            .await?;
-        Ok(Response::new(translate::respond_activity_failed_to_proto()))
+        let mut req = request.into_inner();
+        // `payload-admission-limits` criteria 2.6 and 2.8.
+        let failures = payload_limits::limit_activity_failure(
+            &mut req.last_heartbeat_details,
+            &mut req.failure,
+            "RespondActivityTaskFailed",
+        );
+        self.fail_activity_task(&headers, req).await?;
+        Ok(Response::new(
+            workflowservice::RespondActivityTaskFailedResponse { failures },
+        ))
     }
 
     async fn record_activity_task_heartbeat(
@@ -1272,6 +1386,31 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::RecordActivityTaskHeartbeatResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
+        // `payload-admission-limits` criterion 2.7.
+        if payload_limits::blob_exceeds_limit(
+            payload_limits::encoded_size(req.details.as_ref()),
+            "RecordActivityTaskHeartbeat",
+        ) {
+            self.fail_activity_task(
+                &headers,
+                workflowservice::RespondActivityTaskFailedRequest {
+                    namespace: req.namespace,
+                    task_token: req.task_token,
+                    failure: Some(payload_limits::server_failure(
+                        payload_limits::HEARTBEAT_DETAILS_EXCEED_LIMIT,
+                    )),
+                    identity: req.identity,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            return Ok(Response::new(
+                workflowservice::RecordActivityTaskHeartbeatResponse {
+                    cancel_requested: true,
+                    ..Default::default()
+                },
+            ));
+        }
         // Standalone-activity heartbeat: validate the worker token at the frontend
         // boundary (Temporal's generic task-token errors) and route to the bridge.
         // Deviation: on a standalone-enabled server a non-empty token that is not a
@@ -1568,7 +1707,13 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondWorkflowTaskFailedRequest>,
     ) -> Result<Response<workflowservice::RespondWorkflowTaskFailedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        // `payload-admission-limits` criterion 2.6.
+        if let Some(replacement) =
+            payload_limits::oversized_replacement(req.failure.as_ref(), "RespondWorkflowTaskFailed")
+        {
+            req.failure = Some(replacement);
+        }
         let failure_cause = translate::wft_failed_cause_from_proto(req.cause);
         let failure_details = req
             .failure
@@ -1595,6 +1740,33 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::RecordActivityTaskHeartbeatByIdResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
+        // `payload-admission-limits` criterion 2.7.
+        if payload_limits::blob_exceeds_limit(
+            payload_limits::encoded_size(req.details.as_ref()),
+            "RecordActivityTaskHeartbeatById",
+        ) {
+            self.fail_activity_task_by_id(
+                &headers,
+                workflowservice::RespondActivityTaskFailedByIdRequest {
+                    namespace: req.namespace,
+                    workflow_id: req.workflow_id,
+                    run_id: req.run_id,
+                    activity_id: req.activity_id,
+                    failure: Some(payload_limits::server_failure(
+                        payload_limits::HEARTBEAT_DETAILS_EXCEED_LIMIT,
+                    )),
+                    identity: req.identity,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            return Ok(Response::new(
+                workflowservice::RecordActivityTaskHeartbeatByIdResponse {
+                    cancel_requested: true,
+                    ..Default::default()
+                },
+            ));
+        }
         // Empty workflow id discriminates a standalone activity, as on the other
         // by-id RPCs (`workflow_handler.go:1671 @ v1.31.0`).
         if let Some(bridge) = &self.chasm_activity
@@ -1641,6 +1813,30 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::RespondActivityTaskCompletedByIdResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
+        // `payload-admission-limits` criterion 2.5.
+        if payload_limits::blob_exceeds_limit(
+            payload_limits::encoded_size(req.result.as_ref()),
+            "RespondActivityTaskCompletedById",
+        ) {
+            self.fail_activity_task_by_id(
+                &headers,
+                workflowservice::RespondActivityTaskFailedByIdRequest {
+                    namespace: req.namespace,
+                    workflow_id: req.workflow_id,
+                    run_id: req.run_id,
+                    activity_id: req.activity_id,
+                    failure: Some(payload_limits::server_failure(
+                        payload_limits::COMPLETE_RESULT_EXCEEDS_LIMIT,
+                    )),
+                    identity: req.identity,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            return Ok(Response::new(
+                translate::respond_activity_completed_by_id_to_proto(),
+            ));
+        }
         // An empty workflow id on a by-id respond is v1.31.0's discriminator for a
         // standalone activity (`workflow_handler.go:1671 @ v1.31.0` — empty
         // workflow_id ⇒ build a component-ref token). A present workflow id is a
@@ -1686,58 +1882,16 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondActivityTaskFailedByIdRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskFailedByIdResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let req = request.into_inner();
-        if let Some(bridge) = &self.chasm_activity
-            && req.workflow_id.is_empty()
-        {
-            self.inner
-                .admit_request(
-                    &headers,
-                    Some(&req.namespace),
-                    Action::RespondActivityTaskFailedById,
-                    false,
-                )
-                .await?;
-            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
-            let failure = req
-                .failure
-                .as_ref()
-                .map(|f| f.message.clone())
-                .unwrap_or_default();
-            // Carry the full structured Failure so the describe outcome round-trips
-            // it, not just the message (Req 5), matching the by-token path.
-            let failure_payload = req
-                .failure
-                .as_ref()
-                .map(|f| f.encode_to_vec())
-                .unwrap_or_default();
-            let heartbeat_details = req
-                .last_heartbeat_details
-                .map(|p| p.encode_to_vec())
-                .unwrap_or_default();
-            bridge
-                .fail_by_id(
-                    &namespace_id.0.to_string(),
-                    &req.activity_id,
-                    &req.run_id,
-                    failure,
-                    failure_payload,
-                    heartbeat_details,
-                    req.identity,
-                )
-                .await?;
-            return Ok(Response::new(
-                translate::respond_activity_failed_by_id_to_proto(),
-            ));
-        }
-        let edge_req = translate::respond_activity_failed_by_id_to_edge(req)
-            .map_err(proto_conversion_status)?;
-        let _edge_resp = self
-            .inner
-            .respond_activity_task_failed_by_id(&headers, edge_req)
-            .await?;
+        let mut req = request.into_inner();
+        // `payload-admission-limits` criteria 2.6 and 2.8.
+        let failures = payload_limits::limit_activity_failure(
+            &mut req.last_heartbeat_details,
+            &mut req.failure,
+            "RespondActivityTaskFailedById",
+        );
+        self.fail_activity_task_by_id(&headers, req).await?;
         Ok(Response::new(
-            translate::respond_activity_failed_by_id_to_proto(),
+            workflowservice::RespondActivityTaskFailedByIdResponse { failures },
         ))
     }
     async fn respond_activity_task_canceled(
@@ -1746,6 +1900,28 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::RespondActivityTaskCanceledResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
+        // `payload-admission-limits` criterion 2.5.
+        if payload_limits::blob_exceeds_limit(
+            payload_limits::encoded_size(req.details.as_ref()),
+            "RespondActivityTaskCanceled",
+        ) {
+            self.fail_activity_task(
+                &headers,
+                workflowservice::RespondActivityTaskFailedRequest {
+                    namespace: req.namespace,
+                    task_token: req.task_token,
+                    failure: Some(payload_limits::server_failure(
+                        payload_limits::CANCEL_DETAILS_EXCEED_LIMIT,
+                    )),
+                    identity: req.identity,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            return Ok(Response::new(
+                translate::respond_activity_canceled_to_proto(),
+            ));
+        }
         // Standalone-activity token: route to the CHASM bridge for token validation
         // and the CANCEL_REQUESTED → CANCELED transition; a workflow-activity token
         // falls through unchanged (the two share this RPC).
@@ -1801,6 +1977,30 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::RespondActivityTaskCanceledByIdResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
+        // `payload-admission-limits` criterion 2.5.
+        if payload_limits::blob_exceeds_limit(
+            payload_limits::encoded_size(req.details.as_ref()),
+            "RespondActivityTaskCanceledById",
+        ) {
+            self.fail_activity_task_by_id(
+                &headers,
+                workflowservice::RespondActivityTaskFailedByIdRequest {
+                    namespace: req.namespace,
+                    workflow_id: req.workflow_id,
+                    run_id: req.run_id,
+                    activity_id: req.activity_id,
+                    failure: Some(payload_limits::server_failure(
+                        payload_limits::CANCEL_DETAILS_EXCEED_LIMIT,
+                    )),
+                    identity: req.identity,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            return Ok(Response::new(
+                translate::respond_activity_canceled_by_id_to_proto(),
+            ));
+        }
         if let Some(bridge) = &self.chasm_activity
             && req.workflow_id.is_empty()
         {
@@ -3308,6 +3508,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             &req.request_id,
             &req.identity,
         )?;
+        // The input, then the search attribute count, the registered-key check
+        // and the search attribute sizes, as v1.31.0's validator orders them
+        // (`chasm/lib/activity/validator.go:344-363` and `common/searchattribute/
+        // validator.go:60-175 @ v1.31.0`; `payload-admission-limits` criteria
+        // 2.3 and 2.9).
+        if bridge.is_enabled() {
+            if payload_limits::standalone_blob_exceeds_limit(
+                payload_limits::encoded_size(req.input.as_ref()),
+                "StartActivityExecution",
+            ) {
+                return Err(Status::invalid_argument("input exceeds length limit"));
+            }
+            payload_limits::check_search_attribute_count(req.search_attributes.as_ref())
+                .map_err(Status::invalid_argument)?;
+        }
         let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
         // Reject unregistered search-attribute keys before the start commits
         // (`standalone_activity_test.go:521`). Keys are read here, before the
@@ -3317,6 +3532,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             self.inner
                 .validate_search_attribute_keys(namespace_id, &keys)
                 .await?;
+        }
+        if bridge.is_enabled() {
+            payload_limits::check_search_attribute_sizes(req.search_attributes.as_ref())
+                .map_err(Status::invalid_argument)?;
         }
         // Map the id reuse/conflict policy before minting a run id — an unsupported
         // policy is rejected with InvalidArgument, mirroring the chasm activity
@@ -3609,6 +3828,11 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             &req.request_id,
             &req.identity,
         )?;
+        validate_sa_reason(
+            bridge.is_enabled(),
+            &req.reason,
+            "RequestCancelActivityExecution",
+        )?;
         let key = self
             .activity_execution_key(bridge, &req.namespace, req.activity_id, req.run_id)
             .await?;
@@ -3649,6 +3873,11 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             bridge.max_id_length(),
             &req.request_id,
             &req.identity,
+        )?;
+        validate_sa_reason(
+            bridge.is_enabled(),
+            &req.reason,
+            "TerminateActivityExecution",
         )?;
         let key = self
             .activity_execution_key(bridge, &req.namespace, req.activity_id, req.run_id)

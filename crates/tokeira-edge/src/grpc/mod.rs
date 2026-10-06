@@ -2,6 +2,7 @@ pub mod admin_service;
 pub mod errors;
 pub mod metadata;
 pub mod operator_service;
+pub(crate) mod payload_limits;
 pub mod runtime_adapter;
 pub mod tracing_interceptor;
 pub mod translate;

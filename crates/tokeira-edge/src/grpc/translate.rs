@@ -84,6 +84,7 @@ use tokeira_types::{
 use tonic::{Code, Status, metadata::MetadataMap};
 use uuid::Uuid;
 
+use super::payload_limits;
 use crate::translate::{
     ActivityExecutionSummary, CompletionCallback as EdgeCompletionCallback,
     CountActivityExecutionsRequest, CountActivityExecutionsResponse,
@@ -711,6 +712,15 @@ fn on_conflict_options_to_edge(
 }
 
 fn activity_retry_classification(failure: &failure_proto::Failure) -> (Option<String>, bool) {
+    // A server failure retries unless it is marked non-retryable, as in
+    // v1.31.0's `isRetryable` (`service/history/workflow/retry.go:115-150 @
+    // v1.31.0`); the payload limits record such failures for oversized
+    // worker responses (`payload-admission-limits` criteria 2.5 and 2.7).
+    if let Some(failure_proto::failure::FailureInfo::ServerFailureInfo(info)) =
+        &failure.failure_info
+    {
+        return (None, info.non_retryable);
+    }
     let mut cursor = Some(failure);
     while let Some(current) = cursor {
         if let Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(info)) =
@@ -1232,6 +1242,13 @@ pub fn start_request_to_edge(
         &req.links,
         &req.completion_callbacks,
     ))?;
+    // v1.31.0's payload limits (`payload-admission-limits` criteria 2.2, 2.3).
+    payload_limits::check_start_payloads(
+        req.search_attributes.as_ref(),
+        req.input.as_ref(),
+        req.memo.as_ref(),
+        "StartWorkflowExecution",
+    )?;
 
     Ok(StartWorkflowExecutionRequest {
         namespace: req.namespace,
@@ -1297,6 +1314,11 @@ pub fn signal_request_to_edge(
             "SignalWorkflowExecutionRequest.workflow_execution",
         ))?;
     validate_links(&req.links)?;
+    // `payload-admission-limits` criterion 2.1.
+    payload_limits::check_blob(
+        payload_limits::encoded_size(req.input.as_ref()),
+        "SignalWorkflowExecution",
+    )?;
     Ok(SignalWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
@@ -4680,6 +4702,19 @@ pub fn signal_with_start_request_to_edge(
 
     let cron_schedule = non_empty(req.cron_schedule);
     validate_client_cron_schedule(cron_schedule.as_deref())?;
+    // The start's limits, then the signal input's, as v1.31.0 orders them
+    // (`signalwithstartworkflow/api.go:68`, `signal_with_start_workflow.go:85
+    // @ v1.31.0`; `payload-admission-limits` criteria 2.1-2.3).
+    payload_limits::check_start_payloads(
+        req.search_attributes.as_ref(),
+        req.input.as_ref(),
+        req.memo.as_ref(),
+        "SignalWithStartWorkflowExecution",
+    )?;
+    payload_limits::check_blob(
+        payload_limits::encoded_size(req.signal_input.as_ref()),
+        "SignalWithStartWorkflowExecution",
+    )?;
 
     Ok(EdgeSignalWithStartWorkflowExecutionRequest {
         namespace: req.namespace,
@@ -6379,6 +6414,11 @@ pub fn query_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "QueryWorkflowRequest.query",
         ))?;
+    // `payload-admission-limits` criterion 2.4.
+    payload_limits::check_blob(
+        payload_limits::encoded_size(query.query_args.as_ref()),
+        "QueryWorkflow",
+    )?;
 
     Ok(crate::translate::QueryWorkflowRequest {
         namespace: req.namespace,

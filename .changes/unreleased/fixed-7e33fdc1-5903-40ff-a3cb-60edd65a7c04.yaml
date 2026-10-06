@@ -1,0 +1,5 @@
+kind: fixed
+body: Requests over Temporal's payload limits (2 MiB per payload or memo, 100 search attributes within 40 KiB) are refused, or recorded as server failures, as Temporal does.
+time: 2026-10-06T00:42:15.000000+01:00
+custom:
+    Slice: 7e33fdc1-5903-40ff-a3cb-60edd65a7c04

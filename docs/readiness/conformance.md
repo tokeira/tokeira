@@ -45,7 +45,7 @@ unfinished / 19 pass / 21 skip at the 2026-06-09 baseline, then targeted fixes b
 | C5a | Completion-callback admission validation | ✅ | `TestCallbacksSuiteHSM` validation leaves 6/6 green twice | Conformance overrides exercise `allowedAddresses`; production address-policy configuration remains an explicit bounded deviation. |
 | C5b | Other admission validators (links, …) | ✅ | done | Residuals driven by a corpus re-run. |
 | C6 | Over-rejection (cron, nil/empty SA+memo) | ✅ | done | Full corpus re-run pending. |
-| C1 | Standalone / first-class activity RPCs | ✅ | Tier 6.33: **174 pass / 0 fail / 0 native skips / 0 unfinished**, with 3 existing registry exclusions; CHASM stage 16 rerun on 2026-09-17 | Input-size and cancellation/termination reason-size override cases remain excluded because `limit.blobSize.error` is not enforced. |
+| C1 | Standalone / first-class activity RPCs | ✅ | Tier 6.33: **174 pass / 0 fail / 0 native skips / 0 unfinished**, with 3 existing registry exclusions; CHASM stage 16 rerun on 2026-09-17 | Input-size and cancellation/termination reason-size override cases remain excluded until the suite is rerun; `payload-admission-limits` now enforces `limit.blobSize.error` and wires its override for the harness. |
 | C2 | Worker deployment / versioning | ✅ | Tier 8.39 `TestWorkerDeploymentSuite`: 57 pass / 0 fail / 3 corpus-native skips; Tier 8.40 `TestDeploymentVersionSuite`: 64 active methods pass / 0 fail / 1 exact classified exclusion; Tier 8.41 `TestVersioning3FunctionalSuite`: 319 pass / 0 fail / 4 corpus-native skips plus 33 exact internal-topology exclusions; Tier 8.42 `TestWorkerRegistryTestSuite`: 7 pass / 0 fail / 0 skip; all clean twice | The 406-test `TestVersioningFunctionalSuite` enabled path is out of surface per the resolved V1/V2 decision (`.kiro/specs/worker-deployments/reference/v1-v2-conformance-decision.md`); stock-default rejection behavior is covered separately. |
 | C3 | Visibility list/query + search attributes | ✅ | Advanced Visibility unified + legacy: 40 active leaves pass, 0 fail, 2 corpus-native skips; 22 deprecated enabled-path exclusions | Tier 4.24 clean twice consecutively in both converter modes. `ORDER BY` self-skips because the corpus limits it to Elasticsearch. The 11 V1/V2 enabled-path methods per mode are excluded by the resolved stock-default Worker Versioning decision; shared `WorkerVersionStamp`/`BuildIds` fidelity remains active and passes. |
 | C4b | Nexus operation execution / task transport | ✅ | Tier 7.37 `TestNexusWorkflowTestSuite` clean twice; Tier 7.38 both `TestNexusApiTestSuite` failure modes clean twice with 39 outcomes each, 0 fail | Full corpus re-run pending. |
@@ -104,8 +104,9 @@ nested subtests, so **174 is an outcome count, not a count of leaf methods**. Th
 three unchanged registry exclusions are `TestStart/RequestValidations/InputTooLarge`,
 `TestRequestCancel/RequestValidations/ReasonTooLong`, and
 `TestTerminate/RequestValidations/ReasonTooLong`, all under that suite. They require
-the unenforced `limit.blobSize.error` override; see its `NotEnforced` classification
-in `crates/tokeira-conformance/src/lib.rs`. Excluded leaves emit no test outcome and
+the `limit.blobSize.error` override, which was unenforced for this run; the
+`payload-admission-limits` spec has since wired it for the harness, and the leaves
+stay excluded until the suite is rerun with it. Excluded leaves emit no test outcome and
 are counted separately from native skips, matching the [release evidence](corpus-evidence.md).
 This rerun covers the public standalone-activity corpus on in-memory storage;
 live DSQL and embedded snapshot recovery are outside its evidence.

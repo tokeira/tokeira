@@ -485,6 +485,9 @@ impl DsqlRunRepository {
                 let materialized_at = time::OffsetDateTime::now_utc();
                 successor_state.started_at = materialized_at;
                 successor_state.first_run_started_at = Some(materialized_at);
+                // Reset must use the same placement as a regular commit now:
+                // otherwise its timers sit on the run-hash shard until a later
+                // transition, while dispatch and ownership use the execution home.
                 let successor_shard = tokeira_types::execution_home_bundle(
                     successor_state.namespace_id.0.as_bytes(),
                     successor_state.workflow_id.0.as_bytes(),

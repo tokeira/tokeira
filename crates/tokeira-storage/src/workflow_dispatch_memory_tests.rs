@@ -3,6 +3,7 @@
 use super::*;
 use crate::workflow_dispatch_tests::{
     Backend, ordered_pages, reset_materialization, routing_and_home_pages, run_atomic_cases,
+    speculative_legacy_delivery,
 };
 
 #[async_trait]
@@ -44,6 +45,11 @@ async fn workflow_dispatch_ordered_pages_and_snapshot_reconstruction() {
         store.inner.lock().await.workflow_dispatch,
         restored.inner.lock().await.workflow_dispatch
     );
+}
+
+#[tokio::test]
+async fn workflow_dispatch_preserves_speculative_legacy_delivery() {
+    speculative_legacy_delivery(&InMemoryStore::default()).await;
 }
 
 #[tokio::test]

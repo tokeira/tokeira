@@ -163,7 +163,7 @@ async fn signal_with_start_existing_run_preserves_signal_metadata() -> Result<()
 }
 
 #[tokio::test]
-async fn workflow_dispatch_resume_publishes_and_mints_the_renewed_sequence() -> Result<()> {
+async fn workflow_dispatch_paused_poll_is_empty_then_resume_mints_renewed_sequence() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
     let runtime = TokeiraRuntime::new(
         store.clone(),
@@ -198,6 +198,28 @@ async fn workflow_dispatch_resume_publishes_and_mints_the_renewed_sequence() -> 
             },
         )
         .await?;
+    assert!(
+        runtime
+            .poll_workflow_activation(
+                queue(namespace_id, "queue-a"),
+                None,
+                WorkerIdentity("worker".into()),
+                tokio::time::Duration::ZERO,
+            )
+            .await?
+            .is_none()
+    );
+    let LoadedRun::Existing(paused) = store.load_run(key).await? else {
+        panic!("paused run missing")
+    };
+    assert!(
+        paused
+            .pending_workflow_task
+            .as_ref()
+            .unwrap()
+            .started_event_id
+            .is_none()
+    );
     let resumed = runtime
         .unpause_workflow(
             execution,

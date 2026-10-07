@@ -1305,6 +1305,9 @@ impl PartialEq for DispatchableWorkflowTask {
 /// The preferred sticky queue and normal fallback are disposable delivery
 /// choices only. The pending task's own deadline is surfaced for timeout
 /// fencing; no read mutates or expires the run's durable sticky affinity.
+/// Recovery and legacy listings also deliver stored speculative tasks. Only
+/// `derive_workflow_dispatch` excludes them from the durable dispatch table;
+/// applying that exclusion here would strand work after losing the broker.
 pub(crate) fn dispatchable_workflow_task(
     state: &WorkflowState,
 ) -> Option<DispatchableWorkflowTask> {
@@ -1312,9 +1315,7 @@ pub(crate) fn dispatchable_workflow_task(
         return None;
     }
     let pending = state.pending_workflow_task.as_ref()?;
-    if pending.started_event_id.is_some()
-        || pending.task_type != tokeira_kernel::WorkflowTaskType::Normal
-    {
+    if pending.started_event_id.is_some() {
         return None;
     }
 

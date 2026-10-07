@@ -25,7 +25,8 @@ point them at a database holding application data.
 | Storage `dsql_chasm_node_store_round_trips_and_fences` | 1 | CHASM nodes, atomic pointers and fencing; `--features dsql`, URL gate only |
 | Storage `dsql_concurrent_starts_fence_pointer_and_roll_back_losing_nodes` | 1 | Concurrent CHASM creates and superseding pointers reject stale admission without orphaned nodes; `--features dsql`, URL gate only |
 | Storage `workflow_dispatch_live_atomic_reference_traces` | 1 | 100 generated atomic state/dispatch cases, reset materialization, duplicate/CAS rejection, rollback, and deletion; `dsql-integration`, URL gate only |
-| Storage `workflow_dispatch_live_ordered_pages` | 1 | Normal/Exact paging, home scans including sticky rows, reset boundaries, and forced digest collisions; `dsql-integration`, URL gate only |
+| Storage `workflow_dispatch_live_ordered_pages` | 1 | Normal/Exact paging, home scans including sticky rows, reset boundaries, speculative legacy delivery, and forced digest collisions; `dsql-integration`, URL gate only |
+| Storage `workflow_dispatch_live_reset_uses_execution_home` | 1 | Eight-shard reset placement of hot state, timers and dispatch before any follow-up commit, with execution home distinct from the successor run-hash shard; `dsql-integration`, URL gate only |
 
 Run the suites and their test cases serially against the selected database. The shard
 fixtures reuse a deterministic shard ID across nextest's separate test processes:

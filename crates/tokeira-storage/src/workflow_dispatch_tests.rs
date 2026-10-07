@@ -328,6 +328,36 @@ pub(crate) async fn reset_materialization(backend: &impl Backend) {
     }
 }
 
+pub(crate) async fn speculative_legacy_delivery(backend: &impl Backend) {
+    let mut transition = fresh_transition(RunKey::new());
+    transition
+        .next_state
+        .pending_workflow_task
+        .as_mut()
+        .unwrap()
+        .task_type = WorkflowTaskType::Speculative;
+    let state = applied(commit(backend, transition).await.unwrap());
+    let queue = tokeira_types::QueueKey {
+        namespace_id: state.namespace_id,
+        task_queue: state.task_queue.clone(),
+        task_kind: tokeira_types::TaskKind::Workflow,
+        deployment: state.deployment.clone(),
+        build_id: state.build_id.clone(),
+    };
+    let tasks = backend
+        .repo()
+        .list_dispatchable_workflow_tasks(&queue, 1)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].run_key, state.run_key);
+    assert_eq!(
+        tasks[0].logical_seq,
+        state.pending_workflow_task.as_ref().unwrap().logical_seq
+    );
+    assert!(backend.row(state.run_key).await.unwrap().is_none());
+}
+
 pub(crate) async fn ordered_pages(backend: &impl Backend) {
     let initial = fresh_transition(RunKey::new());
     let range = WorkflowDiscoveryRange {

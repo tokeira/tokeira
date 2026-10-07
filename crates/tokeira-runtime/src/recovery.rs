@@ -594,6 +594,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_dispatch_recovery_preserves_stored_speculative_delivery() {
+        let store = InMemoryStore::default();
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        transition.next_state.next_workflow_task_seq = LogicalTaskSeq(2);
+        transition
+            .next_state
+            .pending_workflow_task
+            .as_mut()
+            .unwrap()
+            .task_type = tokeira_kernel::WorkflowTaskType::Speculative;
+        let namespace_id = transition.next_state.namespace_id;
+        assert!(matches!(
+            store
+                .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .await
+                .unwrap(),
+            CommitResult::Applied { .. }
+        ));
+        let broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let (lanes, lane_count) = make_lanes(&store);
+        let result = sweep_shard(
+            ShardId(0),
+            &store,
+            &broker,
+            &lanes,
+            lane_count,
+            &WorkflowTimeoutTrackingState::default(),
+            &WftTimeoutTrackingState::default(),
+            &ActivityTrackingState::default(),
+            &NexusTimeoutTrackingState::default(),
+            &CompletionCallbackTrackingState::default(),
+            &sweep_retry_deps(&store, &activity_broker),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.workflow_tasks_republished, 1);
+        let queue = QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName("q".into()),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let (task, _) = broker
+            .poll_workflow_task(
+                &queue,
+                &WorkerIdentity("worker".into()),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .into_queued()
+            .unwrap();
+        assert_eq!(task.run_key, run_key);
+        assert_eq!(task.logical_seq, LogicalTaskSeq(1));
+        assert!(
+            store
+                .list_workflow_dispatch_for_home(
+                    ShardId(0),
+                    None,
+                    std::num::NonZeroU32::new(1).unwrap(),
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn sweep_shard_reconstructs_started_workflow_task_timeouts() {
         let shard_count = 1u32;
         let store = InMemoryStore::with_shard_count(shard_count);

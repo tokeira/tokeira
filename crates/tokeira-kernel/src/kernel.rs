@@ -7946,6 +7946,7 @@ impl TransitionBuilder {
     /// a force-close would schedule. The run's next transition checks the
     /// buffered event limits instead.
     fn finish_without_buffered_limits(mut self) -> Transition {
+        debug_assert!(self.allocation_error.is_none());
         self.state.transition_seq = self.state.transition_seq.next();
         debug_assert_eq!(self.history_events.len(), self.event_principals.len());
         let events_numbered_at_close = self

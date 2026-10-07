@@ -2118,8 +2118,12 @@ fn server_failure_payload(message: &str) -> Payload {
 
 /// Whether a failed workflow-task START means the polled broker entry is stale —
 /// the run's current pending task is a different one (superseded by a timeout
-/// reschedule), already started, or gone. Such a task is discarded and the poll
-/// retries rather than surfacing the error to the worker (Invariant I.1).
+/// reschedule), already started, gone, or paused. Such a task is discarded and
+/// the poll retries rather than surfacing the error to the worker (Invariant I.1).
+/// Pause invalidates pending offers in Temporal v1.31.0 too: see
+/// `ApplyWorkflowExecutionPausedEvent` in `service/history/workflow/mutable_state_impl.go`,
+/// the stamp check in `service/history/api/recordworkflowtaskstarted/api.go`, and
+/// `ObsoleteMatchingTask` handling in `service/matching/matching_engine.go`.
 fn is_stale_workflow_task_start(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::lane::KernelRejected>()
@@ -2129,6 +2133,7 @@ fn is_stale_workflow_task_start(error: &anyhow::Error) -> bool {
                 tokeira_kernel::Reject::WorkflowTaskSeqMismatch { .. }
                     | tokeira_kernel::Reject::WorkflowTaskAlreadyStarted { .. }
                     | tokeira_kernel::Reject::NoPendingWorkflowTask
+                    | tokeira_kernel::Reject::WorkflowPaused
             )
         })
 }

@@ -4482,6 +4482,7 @@ mod tests {
             _request: tokeira_types::RequestContext,
             _timeout: std::time::Duration,
             _wait_policy: tokeira_runtime::UpdateWaitPolicy,
+            _request_bytes: u64,
         ) -> Result<tokeira_runtime::UpdateLifecycleSnapshot> {
             unreachable!()
         }
@@ -4673,6 +4674,7 @@ mod tests {
             _request: tokeira_types::RequestContext,
             _timeout: std::time::Duration,
             _wait_policy: tokeira_runtime::UpdateWaitPolicy,
+            _request_bytes: u64,
         ) -> Result<tokeira_runtime::UpdateLifecycleSnapshot> {
             unreachable!()
         }
@@ -4862,6 +4864,7 @@ mod tests {
             _request: tokeira_types::RequestContext,
             _timeout: std::time::Duration,
             _wait_policy: tokeira_runtime::UpdateWaitPolicy,
+            _request_bytes: u64,
         ) -> Result<tokeira_runtime::UpdateLifecycleSnapshot> {
             unreachable!()
         }

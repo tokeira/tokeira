@@ -316,6 +316,7 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         _request: RequestContext,
         _timeout: Duration,
         _wait_policy: UpdateWaitPolicy,
+        _request_bytes: u64,
     ) -> Result<UpdateLifecycleSnapshot> {
         unreachable!()
     }

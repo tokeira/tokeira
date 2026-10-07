@@ -371,7 +371,8 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
     // Kernel-consulted constants — never overridable. A runtime-mutable read
     // inside the pure kernel would make the same history replay differently
     // (`CONTINUE_AS_NEW_MIN_INTERVAL` @ tokeira-kernel; the buffered event
-    // limits in `tokeira_kernel::limits`, `run-growth-limits`).
+    // limits in `tokeira_kernel::limits`, `run-growth-limits`; the signal limit,
+    // `signal-update-limits`, which no corpus test overrides).
     KeySpec {
         key: "history.workflowIdReuseMinimalInterval",
         value_type: ValueType::Duration,
@@ -384,6 +385,11 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
     },
     KeySpec {
         key: "history.maximumBufferedEventsSizeInBytes",
+        value_type: ValueType::Int,
+        disposition: Disposition::KernelExcluded,
+    },
+    KeySpec {
+        key: "history.maximumSignalsPerExecution",
         value_type: ValueType::Int,
         disposition: Disposition::KernelExcluded,
     },
@@ -485,6 +491,9 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::Wired,
     },
+    // The total update limit sets the advice's update threshold with its ratio,
+    // and is itself enforced, with the in-flight update limit, when an update is
+    // admitted (`tokeira_runtime::update::update_limits`, `signal-update-limits`).
     KeySpec {
         key: "history.maxTotalUpdates",
         value_type: ValueType::Int,
@@ -493,6 +502,11 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
     KeySpec {
         key: "history.maxTotalUpdates.suggestContinueAsNewThreshold",
         value_type: ValueType::Double,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "history.maxInFlightUpdates",
+        value_type: ValueType::Int,
         disposition: Disposition::Wired,
     },
 ];
@@ -878,6 +892,16 @@ mod tests {
             ),
             Err(OverrideError::KernelExcluded(_))
         ));
+        assert!(matches!(
+            overrides.set("history.maximumSignalsPerExecution", OverrideValue::Int(10)),
+            Err(OverrideError::KernelExcluded(_))
+        ));
+        // The update limits the corpus lowers are wired (`signal-update-limits`).
+        assert!(
+            overrides
+                .set("history.maxInFlightUpdates", OverrideValue::Int(1))
+                .is_ok()
+        );
         assert!(matches!(
             overrides.set("", OverrideValue::Int(1)),
             Err(OverrideError::MissingKey)

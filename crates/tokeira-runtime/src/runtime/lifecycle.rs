@@ -484,6 +484,7 @@ where
         update_request: RequestContext,
         update_timeout: Duration,
         wait_policy: UpdateWaitPolicy,
+        update_request_bytes: u64,
     ) -> Result<MultiOperationResult> {
         let current = ExecutionRef {
             namespace_id: request.namespace_id,
@@ -555,6 +556,7 @@ where
                             &update_request,
                             update_timeout,
                             wait_policy.clone(),
+                            update_request_bytes,
                         )
                         .await?
                     {
@@ -579,6 +581,7 @@ where
                             &update_request,
                             update_timeout,
                             wait_policy.clone(),
+                            update_request_bytes,
                         )
                         .await?
                     {
@@ -604,6 +607,7 @@ where
                             update_request,
                             update_timeout,
                             wait_policy,
+                            update_request_bytes,
                         )
                         .await
                         .map_err(|source| MultiOperationError::UpdateFailed {
@@ -652,6 +656,7 @@ where
         update_request: &RequestContext,
         update_timeout: Duration,
         wait_policy: UpdateWaitPolicy,
+        update_request_bytes: u64,
     ) -> Result<Option<MultiOperationResult>> {
         let (wait_tx, wait_rx) = oneshot::channel();
         self.update_registry.register(
@@ -660,6 +665,7 @@ where
             update_name.to_string(),
             update_input.clone(),
             update_request.caller_identity.clone().unwrap_or_default(),
+            update_request_bytes,
             wait_policy.clone(),
             wait_tx,
         );
@@ -765,8 +771,12 @@ where
                     workflow_id: request.workflow_id.clone(),
                     run_id: Some(run_id),
                 };
+                // v1.31.0 checks this signal's count and closing before its
+                // request id (`signal_with_start_workflow.go:273-300 @
+                // v1.31.0`), so a repeat at the limit or to a closing run is
+                // refused, not answered as a duplicate.
                 match self
-                    .signal_workflow(
+                    .signal_run(
                         execution,
                         SignalRequest {
                             signal_name: request.signal_name,
@@ -776,6 +786,7 @@ where
                             request: request.request,
                             now: request.now,
                         },
+                        DuplicateOrder::AfterRefusals,
                     )
                     .await?
                 {
@@ -840,17 +851,42 @@ where
         }
     }
 
-    /// Deliver an external signal to a running workflow.
+    /// Deliver a client's signal (SignalWorkflowExecution, or a batch
+    /// operation's) to a run. A repeat of a request the run already applied
+    /// succeeds as a duplicate, even when the run has since closed, is closing,
+    /// or has reached the signal limit (`signal-update-limits` criterion 2.2).
     pub async fn signal_workflow(
         &self,
         execution: ExecutionRef,
         request: SignalRequest,
+    ) -> Result<CommitResult> {
+        self.signal_run(execution, request, DuplicateOrder::BeforeRefusals)
+            .await
+    }
+
+    /// Deliver a signal to a run, answering its refusals in `order` with its
+    /// request id.
+    async fn signal_run(
+        &self,
+        execution: ExecutionRef,
+        request: SignalRequest,
+        order: DuplicateOrder,
     ) -> Result<CommitResult> {
         let run_key = self
             .repo
             .resolve_execution(&execution)
             .await?
             .ok_or_else(|| anyhow!("execution not found"))?;
+        let request_id = request.request.request_id.clone();
+        let applied = || {
+            crate::signal_limits::run_applied_request(
+                self.repo.as_ref(),
+                run_key,
+                execution.namespace_id,
+                &execution.workflow_id,
+                &request_id,
+            )
+        };
         // A workflow that already ATTEMPTED to close (a close command bounced
         // off buffered events with UnhandledCommand) rejects new signals while
         // the retrying WFT is started — otherwise a steady signal stream could
@@ -865,11 +901,20 @@ where
         {
             match self.repo.load_run(run_key).await? {
                 LoadedRun::Existing(state) if state.status.is_open() => {
+                    // v1.31.0 checks the count before closing
+                    // (`signal_workflow_util.go:53-70 @ v1.31.0`): a run at the
+                    // limit goes on to the kernel, whose refusal answers
+                    // (`signal-update-limits` criterion 2.3).
                     if state
                         .pending_workflow_task
                         .as_ref()
                         .is_some_and(|pending| pending.started_event_id.is_some())
+                        && state.signal_count
+                            < tokeira_kernel::limits::MAXIMUM_SIGNALS_PER_EXECUTION
                     {
+                        if order == DuplicateOrder::BeforeRefusals && applied().await? {
+                            return Ok(CommitResult::Duplicate);
+                        }
                         return Err(crate::errors::WorkflowClosing.into());
                     }
                 }
@@ -883,7 +928,19 @@ where
                 }
             }
         }
-        self.submit(run_key, Command::Signal(request)).await
+        match self.submit(run_key, Command::Signal(request)).await {
+            Err(error)
+                if order == DuplicateOrder::BeforeRefusals
+                    && crate::signal_limits::SignalRefusal::of(&error).is_some() =>
+            {
+                if applied().await? {
+                    Ok(CommitResult::Duplicate)
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
     }
 
     /// Clear a run's sticky affinity (`ResetStickyTaskQueue` @ v1.31.0;
@@ -2037,4 +2094,17 @@ mod tests {
             );
         }
     }
+}
+
+/// Where a signal's request id comes against its refusals: the run is closed,
+/// closing, or at the signal limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuplicateOrder {
+    /// A repeat of a request the run already applied succeeds whatever the
+    /// refusal, as for SignalWorkflowExecution (`signalworkflow/api.go:40-66 @
+    /// v1.31.0`).
+    BeforeRefusals,
+    /// The refusals stand, as for SignalWithStart's signal to a running run
+    /// (`signal_with_start_workflow.go:273-300 @ v1.31.0`).
+    AfterRefusals,
 }

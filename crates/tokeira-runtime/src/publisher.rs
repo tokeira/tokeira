@@ -1040,7 +1040,7 @@ where
             let resolve = Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
                 initiated_event_id,
                 result: ExternalSignalResult::Failed {
-                    cause: "external workflow execution not found (self-signal)".to_string(),
+                    cause: crate::signal_limits::EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND.to_string(),
                 },
                 now: OffsetDateTime::now_utc(),
             });
@@ -1058,7 +1058,12 @@ where
             }
             return;
         }
-        let signal_result = match self
+        // A target named without a run id is its workflow's current run, which
+        // v1.31.0 still finds after it closes, and answers by request id first
+        // (`signalworkflow/api.go:40-53 @ v1.31.0`). Tokeira's current-run index
+        // drops a closed run, so the latest run stands in for it; the kernel
+        // then refuses it as closed, unless it already applied this delivery.
+        let target_run = match self
             .repo
             .resolve_execution(&ExecutionRef {
                 namespace_id,
@@ -1067,21 +1072,33 @@ where
             })
             .await
         {
+            Ok(None) if target_run_id.is_none() => {
+                self.repo
+                    .find_latest_run(namespace_id, &target_workflow_id)
+                    .await
+            }
+            other => other,
+        };
+        let signal_result = match target_run {
             Ok(Some(target_run_key)) => {
                 // The delivered signal carries the command's header and the
                 // history service's identity, exactly as the transfer executor
                 // forwards them (Identity=consts.IdentityHistoryService +
                 // Header: attributes.Header,
                 // transfer_queue_active_task_executor.go:1574-1604 @ v1.31.0).
+                // Every delivery of this signal carries the same request id, as
+                // v1.31.0's transfer executor reuses the initiated signal's
+                // (`transfer_queue_active_task_executor.go:1580-1602 @ v1.31.0`).
+                let request_id = RequestId(format!(
+                    "ext-signal-{originator_run_key:?}-{initiated_event_id}"
+                ));
                 let command = Command::Signal(SignalRequest {
                     signal_name,
                     input,
                     header,
                     links: Vec::new(),
                     request: RequestContext {
-                        request_id: RequestId(format!(
-                            "ext-signal-{originator_run_key:?}-{initiated_event_id}"
-                        )),
+                        request_id: request_id.clone(),
                         caller_identity: Some("history-service".to_string()),
                         principal: None,
                         received_at: OffsetDateTime::now_utc(),
@@ -1106,13 +1123,39 @@ where
                             cause: "unexpected current-execution conflict".to_string(),
                         }
                     }
-                    Err(error) => ExternalSignalResult::Failed {
-                        cause: error.to_string(),
+                    // A closed target or one at the signal limit fails the
+                    // sender with v1.31.0's cause, unless the target already
+                    // recorded this signal, which v1.31.0's target answers as a
+                    // duplicate first (`signal-update-limits` criterion 2.5).
+                    // Any other failure is recorded as it always was.
+                    Err(error) => match crate::signal_limits::SignalRefusal::of(&error) {
+                        Some(refusal) => match crate::signal_limits::run_applied_request(
+                            self.repo.as_ref(),
+                            target_run_key,
+                            namespace_id,
+                            &target_workflow_id,
+                            &request_id,
+                        )
+                        .await
+                        {
+                            Ok(true) => ExternalSignalResult::Signaled,
+                            Ok(false) => ExternalSignalResult::Failed {
+                                cause: refusal.external_cause().to_string(),
+                            },
+                            Err(lookup_error) => ExternalSignalResult::Failed {
+                                cause: lookup_error.to_string(),
+                            },
+                        },
+                        None => ExternalSignalResult::Failed {
+                            cause: error.to_string(),
+                        },
                     },
                 }
             }
+            // v1.31.0's target answers a missing workflow or run `NotFound`
+            // (`transfer_queue_active_task_executor.go:715-716 @ v1.31.0`).
             Ok(None) => ExternalSignalResult::Failed {
-                cause: format!("target workflow not found: {}", target_workflow_id.0),
+                cause: crate::signal_limits::EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND.to_string(),
             },
             Err(error) => ExternalSignalResult::Failed {
                 cause: error.to_string(),

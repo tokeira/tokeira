@@ -563,6 +563,7 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::NotFound(_) => Code::NotFound,
         EdgeError::AlreadyExists(_) => Code::AlreadyExists,
         EdgeError::ResourceExhausted(_) => Code::ResourceExhausted,
+        EdgeError::ConcurrentLimitExceeded(_) => Code::ResourceExhausted,
         EdgeError::WorkflowClosing => Code::ResourceExhausted,
         EdgeError::ConsistentQueryBufferExceeded => Code::ResourceExhausted,
         EdgeError::WorkflowNotReady(_) => Code::FailedPrecondition,
@@ -1748,6 +1749,7 @@ proptest! {
             input: input.clone(),
             wait_policy,
             timeout: Duration::from_secs(30),
+            request_bytes: 0,
         };
         let proto =
             workflowservice::UpdateWorkflowExecutionRequest {
@@ -1777,9 +1779,11 @@ proptest! {
                 ),
                 ..Default::default()
             };
+        let request_bytes =
+            prost::Message::encoded_len(proto.request.as_ref().unwrap()) as u64;
         let roundtrip =
             update_request_to_edge(proto).unwrap();
-        prop_assert_eq!(roundtrip, edge);
+        prop_assert_eq!(roundtrip, UpdateWorkflowExecutionRequest { request_bytes, ..edge });
     }
 
     // Property 5h: Update response projection

@@ -65,6 +65,7 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -142,6 +143,7 @@ async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_origina
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -225,6 +227,7 @@ async fn external_signal_cross_namespace_uses_target_namespace() -> Result<()> {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -295,6 +298,7 @@ async fn external_signal_not_found_delivers_failed_resolution() -> Result<()> {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -309,7 +313,8 @@ async fn external_signal_not_found_delivers_failed_resolution() -> Result<()> {
                     target_workflow_id,
                     cause,
                     ..
-                } if target_workflow_id == &missing_target && cause.contains("not found")
+                } if target_workflow_id == &missing_target
+                    && cause == "EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND"
             )
         })
     })

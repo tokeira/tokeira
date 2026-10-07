@@ -3014,26 +3014,28 @@
       "temporal_key": "history.maxInFlightUpdatePayloads",
       "temporal_default": "20 * 1024 * 1024",
       "temporal_scope": "Namespace",
-      "classification": "auto-tuned-mechanical-setting",
-      "tokeira_treatment": "No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern.",
-      "owner": "crates/tokeira-runtime",
+      "classification": "pinned-behavioral-constant",
+      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
+      "owner": ".kiro/specs/configuration-policy",
       "conformance_override": "none",
       "evidence": [
         "common/dynamicconfig/constants.go:2294",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/signal-update-limits/bugfix.md"
       ]
     },
     {
       "temporal_key": "history.maxInFlightUpdates",
       "temporal_default": "10",
       "temporal_scope": "Namespace",
-      "classification": "auto-tuned-mechanical-setting",
-      "tokeira_treatment": "No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern.",
-      "owner": "crates/tokeira-runtime",
-      "conformance_override": "none",
+      "classification": "conformance-only-override",
+      "tokeira_treatment": "No production raw-key control; a typed conformance consult site exercises the supported behavior.",
+      "owner": "crates/tokeira-conformance",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:2289",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/signal-update-limits/bugfix.md"
       ]
     },
     {
@@ -3059,7 +3061,8 @@
       "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:2299",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/signal-update-limits/bugfix.md"
       ]
     },
     {
@@ -3106,13 +3109,14 @@
       "temporal_key": "history.maximumSignalsPerExecution",
       "temporal_default": "10000",
       "temporal_scope": "Namespace",
-      "classification": "auto-tuned-mechanical-setting",
-      "tokeira_treatment": "No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern.",
-      "owner": "crates/tokeira-runtime",
-      "conformance_override": "none",
+      "classification": "pinned-behavioral-constant",
+      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
+      "owner": ".kiro/specs/configuration-policy",
+      "conformance_override": "kernel-excluded",
       "evidence": [
         "common/dynamicconfig/constants.go:2351",
-        ".kiro/specs/configuration-policy/requirements.md"
+        ".kiro/specs/configuration-policy/requirements.md",
+        ".kiro/specs/signal-update-limits/bugfix.md"
       ]
     },
     {

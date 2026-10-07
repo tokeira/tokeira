@@ -82,6 +82,18 @@ pub struct WorkflowState {
     /// `service/history/workflow/update/registry.go:92, 220, 382 @ v1.31.0`).
     #[serde(default)]
     pub completed_update_count: u32,
+    /// The WorkflowExecutionSignaled events this run has recorded, a buffered
+    /// signal counted once, when it was admitted (`SignalCount`,
+    /// `ApplyWorkflowExecutionSignaled`, `mutable_state_impl.go:5662-5668 @
+    /// v1.31.0`). The kernel refuses a signal once it reaches
+    /// [`crate::limits::MAXIMUM_SIGNALS_PER_EXECUTION`] (`signal-update-limits`).
+    ///
+    /// Not part of the positional layout: `#[serde(skip)]` leaves every
+    /// postcard encoding of `WorkflowState` unchanged, and the storage codec
+    /// persists the value in the state extension's signal count section. A
+    /// state stored before the count existed reads it as zero.
+    #[serde(skip)]
+    pub signal_count: u64,
     /// Next logical task sequence to assign when scheduling a
     /// workflow task.
     pub next_workflow_task_seq: LogicalTaskSeq,
@@ -1445,6 +1457,7 @@ pub(crate) mod tests {
         WorkflowState {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
+            signal_count: 0,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".into()),

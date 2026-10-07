@@ -54,6 +54,7 @@ pub mod scanner;
 pub mod schedule;
 pub mod shard;
 pub mod shutdown;
+mod signal_limits;
 pub mod speculative_timer;
 pub mod task_ordering;
 pub mod task_queue_config;

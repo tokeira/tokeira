@@ -199,6 +199,9 @@ fn workflow_task_completion_limits() -> WorkflowTaskCompletionLimits {
             "component.nexusoperations.limit.operation.concurrency",
             limits::PENDING_NEXUS_OPERATIONS_LIMIT,
         ),
+        // Checked when the worker accepts, rejects or completes an update the
+        // run doesn't hold (`signal-update-limits` criterion 2.13).
+        total_updates: crate::update::update_limits().total,
     }
 }
 
@@ -3168,6 +3171,7 @@ pub(crate) mod tests {
         WorkflowState {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
+            signal_count: 0,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId(workflow_id),

@@ -224,9 +224,10 @@ the existing arithmetic. Prepare the image and accumulator, encode the resulting
 state once, then run `growth::check_commit` using those exact state bytes. No write
 occurs before readiness, image construction, encoding and growth validation pass.
 
-Write the state and existing effects as today. Pass the already prepared context
-to `insert_projection_log`; it becomes an INSERT-only helper and cannot fetch a
-preceding image. Keep partition assignment for the new row unchanged. Return
+Write the state and existing effects as today. Encode the prepared context before
+the first write and pass those bytes to `insert_projection_log`; it is an
+INSERT-only helper and cannot fetch a preceding image. Keep partition assignment
+for the new row unchanged. Return
 `Applied { new_state: state }` only after the transaction commits. A transaction
 failure discards the prepared local copy; the lane's cached input is unaffected.
 
@@ -276,9 +277,9 @@ LIMIT 1
 
 Use `connection.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")`,
 following the explicit-BEGIN pattern already used in `dsql/control_lease.rs`.
-Aurora DSQL supports that BEGIN form and repeatable-read isolation; explicit
-isolation also makes PostgreSQL-backed integration tests exercise the same snapshot
-property. See [AWS transaction syntax](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-supported-sql-features.html)
+Aurora DSQL supports that BEGIN form and repeatable-read isolation. Integration
+tests execute this exact transaction through SQLx with bound parameters on an
+ephemeral Aurora DSQL cluster. See [AWS transaction syntax](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-supported-sql-features.html)
 and [DSQL client transaction parameters](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/accessing.html)
 (checked 2026-10-07).
 
@@ -475,14 +476,14 @@ production test switches or modified shared configuration are needed.
 
 | Property | Primary implementation/test location |
 |---|---|
-| 1 | `tokeira-storage/src/memory.rs` and `dsql/run_repository/commit.rs`; shared repository contract exercised for both entry points |
-| 2 | `tokeira-storage/src/api.rs` pure preparation tests plus generated repository sequences in `memory.rs` and the DSQL integration contract |
-| 3 | Kernel fresh/replay constructor tests, storage reset tests, runtime successor tests in `runtime/workflow_task.rs` |
-| 4 | Shared seed-helper tests in `api.rs`, in-memory load tests, and DSQL load integration tests |
+| 1 | `tokeira-storage/src/memory.rs` lookup instrumentation and `src/projection_accumulator_tests.rs`; actual SQLx statement capture in `src/dsql/run_repository/projection_accumulator_tests.rs`, both commit entry points |
+| 2 | Pure preparation and shared repository generators in `tokeira-storage/src/projection_accumulator_tests.rs`, reused by the DSQL contract; independent frozen raw-image and merge oracle in `src/projection_accumulator_oracle.rs` |
+| 3 | Kernel `tests/golden_tests.rs`, storage reset contracts on both backends, runtime successor tests in `runtime/workflow_task.rs` and reset bookkeeping in `src/projection_accumulator_tests.rs` |
+| 4 | Seed-helper and memory load contracts in `tokeira-storage/src/projection_accumulator_tests.rs`; DSQL legacy loads and channel-coordinated snapshot schedules in `src/dsql/run_repository/projection_accumulator_tests.rs` |
 | 5 | Existing codec and snapshot test modules in `codec.rs` and `memory.rs` |
-| 6 | Repository survival contracts and runtime lane eviction/reload tests |
-| 7 | Existing repository conflict/dedupe and lane OCC tests; deletion tests for both stores |
-| 8 | Codec size tests, both commit implementations, and runtime growth-response tests |
+| 6 | Shared memory/DSQL survival contracts, frozen reader/writer in `tokeira-storage/src/projection_accumulator_legacy_codec.rs`, and runtime lane eviction/reload tests |
+| 7 | Memory/DSQL repository contracts and runtime lane OCC tests; deletion tests for both stores |
+| 8 | Both repository contracts and `tokeira-runtime/tests/runtime_run_growth.rs` |
 
 The first implementation task is the bug-condition exploration test: observe a
 preceding-image lookup during a baseline ordinary commit and fail the no-read
@@ -494,8 +495,8 @@ oracle must not delegate the accumulator-dependent portion to the production
 preparation function. Generate the same valid commands against both models;
 compare **all** `ProjectionContext` fields, not only this search attribute.
 
-Run the shared generated contract against memory and a selected disposable SQL
-database using the existing `dsql-integration` mechanism. The existing recording
+Run the shared generated contract against memory and an ephemeral Aurora DSQL
+cluster using the existing `dsql-integration` mechanism. The existing recording
 connection acquirer proves acquisition class only; it is not evidence about SQL
 statement counts. Assert statement-level absence of `projection_log` SELECTs
 where the SQL harness exposes executed statements, and explicitly report that
@@ -529,6 +530,6 @@ Named regressions supplement the properties:
 - Growth at exactly the threshold succeeds; one encoded byte above it produces
   the existing breach response. Include the framing overhead of `Some([])`.
 
-The completion bar remains AGENTS.md §10.4 plus relative-link checks. This design
-and the [implementation plan](tasks.md) are approved. Implementation belongs to a
-later task; none of the tests described here has been implemented by this spec work.
+The completion bar remains AGENTS.md §10.4 plus relative-link checks. The approved
+implementation and all eight property contracts are now present; completion and
+execution evidence are recorded in the [implementation plan](tasks.md).

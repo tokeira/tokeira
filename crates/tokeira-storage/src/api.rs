@@ -34,7 +34,10 @@ use tokeira_types::{
 };
 use uuid::Uuid;
 
-use crate::recovery_index::{RecoveryCursor, RecoveryPage};
+use crate::{
+    recovery_index::{RecoveryCursor, RecoveryPage},
+    workflow_dispatch::{WorkflowDiscoveryRange, WorkflowDispatchPage, WorkflowDispatchPosition},
+};
 
 const WORKER_TASK_PROVENANCE_DIGEST_DOMAIN: &[u8] = b"tokeira-worker-task-provenance-v1\0";
 
@@ -1089,6 +1092,26 @@ pub trait RunRepository: Send + Sync {
         successor_run_id: RunId,
     ) -> Result<()>;
 
+    /// Read a bounded normal-queue range across every execution home.
+    ///
+    /// This never claims or deletes rows. The continuation is the last examined
+    /// position, including rows later rejected by raw-coordinate matching.
+    async fn list_workflow_dispatch_page(
+        &self,
+        range: &WorkflowDiscoveryRange,
+        after: Option<WorkflowDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<WorkflowDispatchPage>;
+
+    /// Enumerate every derived key for one execution home, including sticky rows.
+    /// The caller owns this pass-local continuation; no database cursor survives.
+    async fn list_workflow_dispatch_for_home(
+        &self,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<Vec<RunKey>>;
+
     /// Return workflow tasks that are scheduled but not
     /// yet started for the given queue, up to `limit`.
     async fn list_dispatchable_workflow_tasks(
@@ -1289,7 +1312,9 @@ pub(crate) fn dispatchable_workflow_task(
         return None;
     }
     let pending = state.pending_workflow_task.as_ref()?;
-    if pending.started_event_id.is_some() {
+    if pending.started_event_id.is_some()
+        || pending.task_type != tokeira_kernel::WorkflowTaskType::Normal
+    {
         return None;
     }
 
@@ -1300,10 +1325,7 @@ pub(crate) fn dispatchable_workflow_task(
         deployment: state.deployment.clone(),
         build_id: state.build_id.clone(),
     };
-    let real_sticky = state
-        .sticky
-        .as_ref()
-        .filter(|sticky| !sticky.sticky_queue.0.is_empty());
+    let real_sticky = crate::workflow_dispatch::recoverable_sticky(state);
     let (queue, fallback, sticky_preferred, sticky_deadline) = if let Some(sticky) = real_sticky {
         (
             QueueKey {
@@ -1315,7 +1337,7 @@ pub(crate) fn dispatchable_workflow_task(
             pending.schedule_to_start_deadline,
         )
     } else {
-        (normal_queue, None, None, None)
+        (normal_queue, None, None, pending.schedule_to_start_deadline)
     };
 
     Some(DispatchableWorkflowTask {
@@ -2583,6 +2605,28 @@ where
     ) -> Result<Vec<DispatchableWorkflowTask>> {
         (**self)
             .list_dispatchable_workflow_tasks(queue, limit)
+            .await
+    }
+
+    async fn list_workflow_dispatch_page(
+        &self,
+        range: &WorkflowDiscoveryRange,
+        after: Option<WorkflowDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<WorkflowDispatchPage> {
+        (**self)
+            .list_workflow_dispatch_page(range, after, limit)
+            .await
+    }
+
+    async fn list_workflow_dispatch_for_home(
+        &self,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<Vec<RunKey>> {
+        (**self)
+            .list_workflow_dispatch_for_home(home, after, limit)
             .await
     }
 

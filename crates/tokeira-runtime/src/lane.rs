@@ -2526,6 +2526,24 @@ mod tests {
             Ok(())
         }
 
+        async fn list_workflow_dispatch_page(
+            &self,
+            _range: &tokeira_storage::WorkflowDiscoveryRange,
+            _after: Option<tokeira_storage::WorkflowDispatchPosition>,
+            _limit: std::num::NonZeroU32,
+        ) -> Result<tokeira_storage::WorkflowDispatchPage> {
+            anyhow::bail!("workflow discovery is outside this test repository")
+        }
+
+        async fn list_workflow_dispatch_for_home(
+            &self,
+            _home: tokeira_types::ShardId,
+            _after: Option<RunKey>,
+            _limit: std::num::NonZeroU32,
+        ) -> Result<Vec<RunKey>> {
+            anyhow::bail!("workflow acquisition is outside this test repository")
+        }
+
         async fn list_dispatchable_workflow_tasks(
             &self,
             _queue: &QueueKey,
@@ -3307,6 +3325,47 @@ mod tests {
 
         assert!(cache.get(run_key).is_none());
         assert!(!cache.entries.contains_key(&run_key));
+    }
+
+    #[tokio::test]
+    async fn workflow_dispatch_start_submission_preserves_request_across_occ_retries() {
+        let key = RunKey::new();
+        let repo = MockRepo::new(
+            LoadedRun::Existing(sample_state(key)),
+            vec![
+                CommitBehavior::Conflict,
+                CommitBehavior::Conflict,
+                CommitBehavior::Applied,
+            ],
+        );
+        let kernel = MockKernel::new(SmallVec::new());
+        let command = Command::WorkflowTaskStarted(tokeira_kernel::StartWorkflowTaskRequest {
+            logical_seq: LogicalTaskSeq(17),
+            worker_identity: WorkerIdentity("worker".into()),
+            request_id: "one-submission".into(),
+            history_size_bytes: 0,
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+            deployment_transition: None,
+            deployment_transition_revision_number: None,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
+            polled_task_queue: TaskQueueName("queue".into()),
+            now: OffsetDateTime::UNIX_EPOCH,
+        });
+        let result = handle_message(
+            &kernel,
+            &repo,
+            &test_shard_owner(),
+            key,
+            command.clone(),
+            &LaneConfig::default(),
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result.0, CommitResult::Applied { .. }));
+        let (commands, _) = kernel.snapshot();
+        assert_eq!(commands, vec![command.clone(), command.clone(), command]);
     }
 
     proptest! {

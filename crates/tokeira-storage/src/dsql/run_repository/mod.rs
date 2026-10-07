@@ -87,6 +87,9 @@ mod leases;
 mod load;
 mod timers;
 mod visibility;
+mod workflow_dispatch;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod workflow_dispatch_tests;
 mod workflow_rules;
 
 #[cfg(test)]
@@ -572,6 +575,26 @@ impl RunRepository for DsqlRunRepository {
         successor_run_id: RunId,
     ) -> Result<()> {
         self.do_materialize_reset_successor(base_run_key, fork_event_id, successor_run_id)
+            .await
+    }
+
+    async fn list_workflow_dispatch_page(
+        &self,
+        range: &crate::WorkflowDiscoveryRange,
+        after: Option<crate::WorkflowDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::WorkflowDispatchPage> {
+        self.do_list_workflow_dispatch_page(range, after, limit)
+            .await
+    }
+
+    async fn list_workflow_dispatch_for_home(
+        &self,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<Vec<RunKey>> {
+        self.do_list_workflow_dispatch_for_home(home, after, limit)
             .await
     }
 

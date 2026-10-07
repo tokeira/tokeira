@@ -260,25 +260,25 @@ fn chasm_startup_schema_contract_migrates_and_accepts_required_tables() {
                 .any(|migration| { migration.version == version && migration.name == name })
         );
     }
-    for current in [0, 68, 69, 70, 71, 72, 73] {
+    for current in [0, 68, 69, 70, 71, 72, 73, 74, 75, 76] {
         let observed = observation(&recognized, current, (current > 0).then_some(current));
         for policy in [
             SchemaMigrationPolicy::Automatic,
             SchemaMigrationPolicy::ValidateOnly,
         ] {
             let expected = match (current, policy) {
-                (73, _) => SchemaDecision::Compatible {
-                    current: 73,
+                (76, _) => SchemaDecision::Compatible {
+                    current: 76,
                     legacy_backfill: false,
                 },
-                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 73 },
+                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 76 },
                 (_, SchemaMigrationPolicy::Automatic) => SchemaDecision::Migrate {
                     from: current,
-                    to: 73,
+                    to: 76,
                 },
                 (_, SchemaMigrationPolicy::ValidateOnly) => SchemaDecision::MigrationRequired {
                     current,
-                    target: 73,
+                    target: 76,
                 },
             };
             assert_eq!(

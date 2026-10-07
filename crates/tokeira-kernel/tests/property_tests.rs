@@ -2,6 +2,9 @@
 #![allow(clippy::unwrap_used)]
 use std::collections::BTreeMap;
 
+#[path = "support/workflow_dispatch.rs"]
+mod workflow_dispatch;
+
 use proptest::prelude::*;
 use prost::Message;
 use time::{Duration, OffsetDateTime};
@@ -3199,14 +3202,14 @@ proptest! {
     }
 
     #[test]
-    fn property_13_failure_timeout_preserve_pending_wft_identity(req in arb_wft_failed_request(LogicalTaskSeq(60), 30, fixed_now())) {
+    fn property_13_failure_timeout_renew_pending_wft_identity(req in arb_wft_failed_request(LogicalTaskSeq(60), 30, fixed_now())) {
         let now = fixed_now();
         let failed_transition = kernel().apply(
             LoadedRun::Existing(with_pending_wft(make_open_state(now), 60, Some(30), 1)),
             Command::WorkflowTaskFailed(req),
         ).unwrap();
         let failed_pending = failed_transition.next_state.pending_workflow_task.unwrap();
-        prop_assert_eq!(failed_pending.logical_seq, LogicalTaskSeq(60));
+        prop_assert_eq!(failed_pending.logical_seq, LogicalTaskSeq(61));
         // The retry is TRANSIENT (spec transient-wft Req B.1/B.3): its scheduled
         // id is the virtual next-event id (WorkflowTaskFailed landed as event 15
         // -> virtual 16), not the original real Scheduled id
@@ -3257,7 +3260,7 @@ proptest! {
         prop_assert_eq!(failed_transition.history_events.len(), 1);
         prop_assert_eq!(failed_transition.dispatch_ops.len(), 1);
         prop_assert_eq!(matches!(failed_transition.history_events[0].kind, HistoryEventKind::WorkflowTaskFailed { .. }), true);
-        prop_assert_eq!(matches!(failed_transition.dispatch_ops[0], DispatchOp::EnqueueWorkflowTask { logical_seq: LogicalTaskSeq(80), .. }), true);
+        prop_assert_eq!(matches!(failed_transition.dispatch_ops[0], DispatchOp::EnqueueWorkflowTask { logical_seq: LogicalTaskSeq(81), .. }), true);
         prop_assert!(failed_transition.request_dedupe_ops.is_empty());
         prop_assert!(failed_transition.activity_ops.is_empty());
         prop_assert!(failed_transition.timer_ops.is_empty());
@@ -4103,7 +4106,10 @@ proptest! {
             state.activities.len()
         );
         let workflow_task_dispatches = transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. })).count();
-        prop_assert_eq!(workflow_task_dispatches, if has_pending_wft { 0 } else { 1 });
+        prop_assert_eq!(workflow_task_dispatches, 1);
+        if has_pending_wft {
+            prop_assert_eq!(transition.next_state.pending_workflow_task.as_ref().unwrap().logical_seq, LogicalTaskSeq(78));
+        }
     }
 
     #[test]

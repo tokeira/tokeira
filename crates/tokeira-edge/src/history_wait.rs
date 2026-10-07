@@ -270,6 +270,28 @@ where
         Ok(())
     }
 
+    async fn list_workflow_dispatch_page(
+        &self,
+        range: &tokeira_storage::WorkflowDiscoveryRange,
+        after: Option<tokeira_storage::WorkflowDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<tokeira_storage::WorkflowDispatchPage> {
+        self.inner
+            .list_workflow_dispatch_page(range, after, limit)
+            .await
+    }
+
+    async fn list_workflow_dispatch_for_home(
+        &self,
+        home: tokeira_types::ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<Vec<RunKey>> {
+        self.inner
+            .list_workflow_dispatch_for_home(home, after, limit)
+            .await
+    }
+
     async fn list_dispatchable_workflow_tasks(
         &self,
         queue: &QueueKey,

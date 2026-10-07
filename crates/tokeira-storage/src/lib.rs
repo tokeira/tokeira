@@ -37,6 +37,9 @@ mod projection_accumulator_oracle;
 pub mod recovery_index;
 pub mod schema_contract;
 pub mod worker_compute;
+pub mod workflow_dispatch;
+#[cfg(test)]
+mod workflow_dispatch_tests;
 
 pub use api::*;
 pub use chasm::*;
@@ -44,3 +47,4 @@ pub use memory::*;
 pub use metrics::*;
 pub use recovery_index::*;
 pub use worker_compute::*;
+pub use workflow_dispatch::*;

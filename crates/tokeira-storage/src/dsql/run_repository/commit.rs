@@ -351,6 +351,7 @@ async fn write_transition(
         history_size_bytes,
     )
     .await?;
+    super::workflow_dispatch::maintain(tx, state, shard_id).await?;
     if let Some(events_data) = events_data {
         insert_history_batch(
             tx,

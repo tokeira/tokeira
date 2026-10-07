@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS workflow_dispatch (
+    run_key UUID PRIMARY KEY,
+    shard_id UUID NOT NULL,
+    queue_namespace UUID NOT NULL,
+    queue_name TEXT NOT NULL,
+    normal_queue_name TEXT NOT NULL,
+    sticky BOOLEAN NOT NULL,
+    routing_mode SMALLINT NOT NULL,
+    deployment TEXT,
+    build_id TEXT,
+    queue_key TEXT NOT NULL,
+    deployment_key TEXT NOT NULL,
+    build_key TEXT NOT NULL,
+    logical_seq BIGINT NOT NULL,
+    scheduled_at TIMESTAMPTZ NOT NULL,
+    priority_key SMALLINT NOT NULL,
+    priority_data BYTEA,
+    sticky_worker TEXT,
+    schedule_to_start_deadline TIMESTAMPTZ
+);

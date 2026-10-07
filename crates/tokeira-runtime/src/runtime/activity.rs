@@ -2135,6 +2135,7 @@ mod tests {
 
     fn open_state(info: Option<WorkflowVersioningInfo>) -> WorkflowState {
         WorkflowState {
+            used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
@@ -3198,6 +3199,144 @@ mod tests {
         let restarted = &after_start.activities["activity-1"];
         assert!(restarted.started_at.is_some());
         assert_eq!(restarted.last_heartbeat_at, heartbeat_at);
+    }
+
+    // Feature: projection-accumulator, Property 2: complete baseline image equivalence
+    // Feature: projection-accumulator, Property 4: consistent non-durable legacy seeding
+    // Every direct writer reloads legacy state and persists its seeded observations.
+    #[tokio::test]
+    async fn projection_accumulator_all_direct_activity_writers_seed_legacy_state() {
+        for path in 0..5 {
+            let seed_repo = Arc::new(InMemoryStore::default());
+            let seed_runtime = TokeiraRuntime::new(
+                seed_repo.clone(),
+                1,
+                LaneConfig::default(),
+                TimerScannerConfig::default(),
+                WorkflowTimeoutScannerConfig::default(),
+                BacklogConfig::default(),
+            );
+            let (key, token, task) = if path < 2 {
+                let (state, token, _) =
+                    seed_started_activity(&seed_runtime, &seed_repo, None).await;
+                (state.run_key, Some(token), None)
+            } else {
+                let (state, _, task) = seed_scheduled_activity(&seed_runtime, &seed_repo).await;
+                (state.run_key, None, Some(task))
+            };
+            let repo = Arc::new(
+                crate::projection_accumulator_tests::legacy_copy(
+                    &seed_repo,
+                    key,
+                    vec!["legacy".into(), "".into(), "legacy".into()],
+                )
+                .await,
+            );
+            let runtime = TokeiraRuntime::new(
+                repo.clone(),
+                1,
+                LaneConfig::default(),
+                TimerScannerConfig::default(),
+                WorkflowTimeoutScannerConfig::default(),
+                BacklogConfig::default(),
+            );
+            let LoadedRun::Existing(before) = repo.load_run(key).await.unwrap() else {
+                panic!("missing legacy run")
+            };
+            let recovered = repo
+                .list_recovery_candidates_for_shard(tokeira_types::ShardId(0), None, 100)
+                .await
+                .unwrap();
+            assert!(recovered.states.iter().any(
+                |state| state.run_key == key && state.used_worker_deployment_versions.is_none()
+            ));
+            match path {
+                0 => {
+                    runtime
+                        .record_activity_heartbeat(
+                            token.unwrap(),
+                            Some(payloads(b"checkpoint")),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                1 => {
+                    let token = token.unwrap();
+                    commit_activity_retry(
+                        &runtime.activity_retry_deps(),
+                        ActivityRetryTarget {
+                            run_key: key,
+                            activity_id: &token.activity_id,
+                            expected_attempt: token.attempt,
+                            expected_schedule_event_id: token.schedule_event_id,
+                        },
+                        2,
+                        Duration::minutes(1),
+                        Some(payload(b"retryable")),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                2 => {
+                    runtime
+                        .force_start_activity_for_completion(
+                            key,
+                            "activity-1",
+                            WorkerIdentity("by-id".into()),
+                            RequestContext::unattributed(OffsetDateTime::now_utc()),
+                        )
+                        .await
+                        .unwrap();
+                }
+                3 => {
+                    assert!(
+                        runtime
+                            .start_activity_task(
+                                &task.unwrap(),
+                                tokio::time::Instant::now(),
+                                &WorkerIdentity("poller".into())
+                            )
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                _ => {
+                    repo.create_workflow_rule(
+                        before.namespace_id,
+                        pause_rule("pause", "Attempts >= 1"),
+                        10,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(
+                        prepare_activity_dispatch_publish(
+                            &runtime.activity_retry_deps(),
+                            &task.unwrap(),
+                            OffsetDateTime::now_utc()
+                        )
+                        .await
+                        .unwrap(),
+                        ActivityDispatchPreparation::SuppressedByRule
+                    ));
+                }
+            }
+            let restored = InMemoryStore::from_snapshot(&repo.snapshot().await.unwrap()).unwrap();
+            let LoadedRun::Existing(after) = restored.load_run(key).await.unwrap() else {
+                panic!("missing committed run")
+            };
+            assert!(
+                after.transition_seq > before.transition_seq,
+                "path {path} must commit"
+            );
+            assert_eq!(
+                after.used_worker_deployment_versions,
+                Some(vec!["legacy".into(), "".into(), "legacy".into()]),
+                "path {path}"
+            );
+        }
     }
 
     #[tokio::test]

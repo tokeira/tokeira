@@ -1,0 +1,5 @@
+kind: fixed
+body: Workflow commits carry deployment-version projection history in run state, avoiding reads of prior projection images while preserving visibility output.
+time: 2026-10-07T14:30:50.052280+00:00
+custom:
+    Slice: aae88ddd-dbe5-4d93-9d5e-9d79f74e5523

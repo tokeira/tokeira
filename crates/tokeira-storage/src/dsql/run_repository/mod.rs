@@ -31,7 +31,8 @@ use crate::{
     ProjectionRecord, RequestRecord, RunHistoryStats, RunRepository, TransitionAuditRecord,
     WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
     deleted_workflow_projection_context, dispatchable_workflow_task, metrics,
-    workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
+    prepare_workflow_projection, seed_workflow_projection_accumulator,
+    workflow_is_open_and_pinned_to_version,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -87,6 +88,10 @@ mod load;
 mod timers;
 mod visibility;
 mod workflow_rules;
+
+#[cfg(test)]
+#[cfg(feature = "dsql-integration")]
+mod projection_accumulator_tests;
 
 #[cfg(test)]
 use activity::{ActivityDispatchRow, activity_dispatch_from_row};
@@ -1552,6 +1557,7 @@ mod tests {
 
     fn sample_state(run_key: RunKey) -> WorkflowState {
         WorkflowState {
+            used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             run_key,
             namespace_id: NamespaceId::new(),

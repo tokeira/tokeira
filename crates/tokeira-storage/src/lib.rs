@@ -32,6 +32,8 @@ pub mod memory;
 pub mod metrics;
 #[cfg(test)]
 mod preservation_property_tests;
+#[cfg(test)]
+mod projection_accumulator_oracle;
 pub mod recovery_index;
 pub mod schema_contract;
 pub mod worker_compute;

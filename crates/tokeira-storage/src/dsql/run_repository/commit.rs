@@ -1,3 +1,7 @@
+//! Fenced per-run commits: validate, prepare a local state/image pair, then persist it.
+//! Projection preparation precedes growth accounting and every write; only a successful
+//! transaction returns the folded state to the caller's cache.
+
 use super::*;
 
 impl DsqlRunRepository {
@@ -29,7 +33,7 @@ impl DsqlRunRepository {
 
                 let mut permit = self.director.acquire(DbClass::Commit).await?;
                 let mut tx = permit.connection()?.begin().await?;
-                let state = transition.next_state.clone();
+                let mut state = transition.next_state.clone();
                 let shard_id = tokeira_types::execution_home_bundle(
                     state.namespace_id.0.as_bytes(),
                     state.workflow_id.0.as_bytes(),
@@ -188,7 +192,7 @@ impl DsqlRunRepository {
                     shard_id,
                     self.projection_partition_count,
                     &transition,
-                    &state,
+                    &mut state,
                     prior_history_size_bytes,
                 )
                 .await?;
@@ -296,7 +300,7 @@ async fn write_transition(
     shard_id: ShardId,
     projection_partition_count: u32,
     transition: &Transition,
-    state: &WorkflowState,
+    state: &mut WorkflowState,
     prior_history_size_bytes: i64,
 ) -> Result<()> {
     if transition.history_events.len() != transition.event_principals.len() {
@@ -311,6 +315,16 @@ async fn write_transition(
     let events_data = (!transition.history_events.is_empty())
         .then(|| codec::encode_history_events(&transition.history_events))
         .transpose()?;
+    let history_size_bytes = prior_history_size_bytes.saturating_add(
+        events_data
+            .as_ref()
+            .map(|data| i64::try_from(data.len()).unwrap_or(i64::MAX))
+            .unwrap_or(0),
+    );
+    // The input clone, encoded hot state, image and Applied result must agree.
+    // No commit-path seed lookup is permitted, even for an existing reset at seq 0.
+    let context = prepare_workflow_projection(state, history_size_bytes)?;
+    let context_data = codec::encode_projection_context(&context)?;
     // The state is encoded once, to measure and to write.
     let state_data = codec::encode_workflow_state(state)?;
     // The growth checks run before the first write, so a refused commit rolls
@@ -324,12 +338,6 @@ async fn write_transition(
             batch_size: events_data.as_ref().map_or(0, Vec::len),
         },
     )?;
-    let history_size_bytes = prior_history_size_bytes.saturating_add(
-        events_data
-            .as_ref()
-            .map(|data| i64::try_from(data.len()).unwrap_or(i64::MAX))
-            .unwrap_or(0),
-    );
     // The commit path intentionally writes the hot state first, then derives
     // every side table from the same transition/state pair. History remains the
     // authority; side tables are rebuildable projections that make dispatch and
@@ -478,9 +486,9 @@ async fn write_transition(
     insert_projection_log(
         tx,
         run_key,
-        state,
+        state.transition_seq,
         projection_partition_count,
-        history_size_bytes,
+        &context_data,
     )
     .await?;
     Ok(())
@@ -792,29 +800,10 @@ pub(super) async fn upsert_current_execution_start(
 async fn insert_projection_log(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
-    state: &WorkflowState,
+    transition_seq: TransitionSeq,
     projection_partition_count: u32,
-    history_size_bytes: i64,
+    context_data: &[u8],
 ) -> Result<()> {
-    // Projection log rows are grouped per transition. Visibility sinks can
-    // replay the projection stream without rereading workflow state/history.
-    let previous_context = sqlx::query_as::<_, (Vec<u8>,)>(
-        "SELECT context_data
-         FROM projection_log
-         WHERE run_key = $1
-         ORDER BY transition_seq DESC
-         LIMIT 1",
-    )
-    .bind(run_key.0)
-    .fetch_optional(&mut **tx)
-    .await?
-    .map(|(data,)| codec::decode_projection_context(&data))
-    .transpose()?;
-    let context = workflow_projection_context_with_previous(
-        state,
-        previous_context.as_ref(),
-        history_size_bytes,
-    )?;
     sqlx::query(
         "INSERT INTO projection_log
          (partition_id, fanout, run_key, transition_seq, context_data, ops_data, created_at)
@@ -826,11 +815,8 @@ async fn insert_projection_log(
     ))?)
     .bind(PROJECTION_FANOUT)
     .bind(run_key.0)
-    .bind(convert::i64_from_u64(
-        state.transition_seq.0,
-        "transition_seq",
-    )?)
-    .bind(codec::encode_projection_context(&context)?)
+    .bind(convert::i64_from_u64(transition_seq.0, "transition_seq")?)
+    .bind(context_data)
     .bind(codec::LEGACY_EMPTY_PROJECTION_OPS_DATA)
     .execute(&mut **tx)
     .await?;

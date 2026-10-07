@@ -304,6 +304,7 @@ criterion 2.9 preserves the existing missing-image behaviour.
 - Projection pagination, image deletion, dispatch durability, atomic successor
   creation and other parts of the proposed durable-actionable-state architecture.
 
-These requirements, the [design](design.md) and the [implementation plan](tasks.md)
-are approved. Implementation belongs to a later task; no code is implemented by
-these documents.
+These approved requirements are implemented by the run-state accumulator and
+repository contracts described in the [design](design.md). Validation evidence
+and task completion are recorded in the [implementation plan](tasks.md); the four
+deferred Temporal compatibility corrections remain out of scope.

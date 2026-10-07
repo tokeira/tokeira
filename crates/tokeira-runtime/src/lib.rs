@@ -96,3 +96,6 @@ pub use update::*;
 pub use wft_timeout::*;
 pub use worker_compute::*;
 pub use worker_registry::*;
+
+#[cfg(test)]
+mod projection_accumulator_tests;

@@ -49,7 +49,8 @@ use crate::{
         WorkerDeploymentVersionKey, WorkerTaskProvenance, WorkerTaskProvenanceError,
         WorkerTaskProvenanceStore, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
         deleted_workflow_projection_context, dispatchable_workflow_task,
-        workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
+        prepare_workflow_projection, seed_workflow_projection_accumulator,
+        workflow_is_open_and_pinned_to_version,
     },
     codec::{
         ExtensionSection, apply_state_extension, decode_exact, decode_extension, encode_extension,
@@ -60,6 +61,8 @@ use crate::{
         RecoveryCursor, RecoveryPage, RecoveryPhase, read_candidate_page, recovery_needed,
     },
 };
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// In-memory store intended for local development and semantic tests.
 ///
@@ -150,6 +153,9 @@ struct StoreState {
     projection_cursor_offsets: HashMap<(u32, u16, RunKey, TransitionSeq), usize>,
     /// Disposable pointer to the latest projection image for each run.
     latest_projection_offsets: HashMap<RunKey, usize>,
+    /// Counts actual image lookups without changing the production path.
+    #[cfg(test)]
+    projection_image_lookups: AtomicUsize,
     /// Shard lease state keyed by shard id.
     bundle_leases: HashMap<ShardId, BundleLeaseRow>,
     /// Controller routing generation singleton.
@@ -225,6 +231,9 @@ impl StoreState {
     }
 
     fn latest_projection(&self, run_key: RunKey) -> Option<&ProjectionRecord> {
+        #[cfg(test)]
+        self.projection_image_lookups
+            .fetch_add(1, Ordering::Relaxed);
         self.latest_projection_offsets
             .get(&run_key)
             .and_then(|offset| self.projection_log.get(*offset))
@@ -625,6 +634,8 @@ impl SnapshotDoc {
             projection_log,
             projection_cursor_offsets: _,
             latest_projection_offsets: _,
+            #[cfg(test)]
+                projection_image_lookups: _,
             bundle_leases,
             routing_generation,
             budget_version,
@@ -701,6 +712,8 @@ impl SnapshotDoc {
             projection_log: self.projection_log,
             projection_cursor_offsets: HashMap::new(),
             latest_projection_offsets: HashMap::new(),
+            #[cfg(test)]
+            projection_image_lookups: AtomicUsize::new(0),
             bundle_leases: self.bundle_leases.into_iter().collect(),
             routing_generation: self.routing_generation,
             budget_version: self.budget_version,
@@ -783,7 +796,18 @@ impl RunRepository for InMemoryStore {
         let started = Instant::now();
         let store = self.inner.lock().await;
         let loaded = match store.runs.get(&run_key) {
-            Some(state) => LoadedRun::Existing(state.clone()),
+            Some(state) => {
+                let mut state = state.clone();
+                if state.used_worker_deployment_versions.is_none() {
+                    // State, statistics and seed share this lock. Only the returned
+                    // copy is ready: a load alone must not make pruning safe.
+                    seed_workflow_projection_accumulator(
+                        &mut state,
+                        store.latest_projection(run_key),
+                    )?;
+                }
+                LoadedRun::Existing(state)
+            }
             None => LoadedRun::Absent,
         };
         let stats = RunHistoryStats {
@@ -991,7 +1015,7 @@ impl RunRepository for InMemoryStore {
                 transition.event_principals.len()
             );
         }
-        let state = transition.next_state.clone();
+        let mut state = transition.next_state.clone();
         let namespace = Some(state.namespace_id.0.to_string());
         let mut store = self.inner.lock().await;
         if epoch != ShardEpoch::ZERO {
@@ -1136,6 +1160,10 @@ impl RunRepository for InMemoryStore {
         } else {
             crate::codec::history_batch_encoded_len(&transition.history_events)?
         };
+        let history_size_bytes = prior_history_size.saturating_add(appended);
+        // Preparation touches only the local clone. A missing seed, invalid image
+        // or growth refusal must leave every durable map and statistic untouched.
+        let context = prepare_workflow_projection(&mut state, history_size_bytes)?;
         // The growth checks run before the first change, so a refused commit
         // leaves the run as it was. The state is measured as DSQL stores it
         // (`run-growth-limits`).
@@ -1158,11 +1186,7 @@ impl RunRepository for InMemoryStore {
         // same lock acquisition, exactly as the DSQL commit writes the column
         // in the transaction that inserts the batch (Requirement 1.1). A
         // transition without events leaves it unchanged.
-        let history_size_bytes = {
-            let total = prior_history_size.saturating_add(appended);
-            store.history_size.insert(run_key, total);
-            total
-        };
+        store.history_size.insert(run_key, history_size_bytes);
         store
             .history
             .entry(run_key)
@@ -1352,19 +1376,12 @@ impl RunRepository for InMemoryStore {
         // image. Emitting a row for every committed transition keeps the
         // in-memory reference store aligned with DSQL and prevents visibility
         // freshness from depending on whether the kernel emitted a legacy delta.
-        let previous_projection = store
-            .latest_projection(run_key)
-            .map(|record| record.context.clone());
         store.append_projection_record(ProjectionRecord {
             partition_id: partition_for(run_key),
             fanout: 1,
             run_key,
             transition_seq: state.transition_seq,
-            context: workflow_projection_context_with_previous(
-                &state,
-                previous_projection.as_ref(),
-                history_size_bytes,
-            )?,
+            context,
         });
 
         if transition.expected_seq == tokeira_types::TransitionSeq::ZERO {
@@ -2348,6 +2365,10 @@ fn shard_for_run_key(run_key: RunKey, shard_count: u32) -> ShardId {
 }
 
 #[cfg(test)]
+#[path = "projection_accumulator_tests.rs"]
+pub(crate) mod projection_accumulator_tests;
+
+#[cfg(test)]
 mod tests {
     // These tests use `ShardEpoch::ZERO` intentionally: they validate storage
     // mechanics (transition_seq OCC, activity side-tables, timer side-tables,
@@ -2809,8 +2830,9 @@ mod tests {
         );
     }
 
-    fn sample_state(run_key: RunKey) -> WorkflowState {
+    pub(super) fn sample_state(run_key: RunKey) -> WorkflowState {
         WorkflowState {
+            used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             run_key,
             namespace_id: NamespaceId::new(),
@@ -2893,7 +2915,7 @@ mod tests {
         }
     }
 
-    fn start_transition(run_key: RunKey) -> Transition {
+    pub(super) fn start_transition(run_key: RunKey) -> Transition {
         Transition {
             expected_seq: TransitionSeq::ZERO,
             next_state: sample_state(run_key),
@@ -2905,6 +2927,82 @@ mod tests {
             dispatch_ops: Default::default(),
             events_numbered_at_close: 0,
             growth_limits: None,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: projection-accumulator, Property 1: no projection reads in commits
+        // Ordinary commits never fetch an earlier projection image.
+        #[test]
+        fn projection_accumulator_commits_do_not_read_images(
+            versions in prop::collection::vec(prop::option::of("[a-z]{1,4}"), 1..12),
+            seed in prop::collection::vec("[ab]{0,8}", 0..12),
+        ) {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                for bundle in [false, true] {
+                let store = InMemoryStore::default();
+                let run_key = RunKey::new();
+                let mut transition = start_transition(run_key);
+                transition.next_state.used_worker_deployment_versions = Some(seed.clone());
+                for version in &versions {
+                    transition.next_state.versioning_info = version.clone().map(|build_id| WorkflowVersioningInfo {
+                        deployment_version: Some(WorkerDeploymentVersionRef {
+                            deployment_name: "deployment".to_owned(),
+                            build_id,
+                        }),
+                        ..Default::default()
+                    });
+                    let result = super::projection_accumulator_tests::commit(&store, transition.clone(), bundle, ShardEpoch::ZERO).await.unwrap();
+                    let CommitResult::Applied { new_state } = result else {
+                        panic!("valid transition rejected: {result:?}");
+                    };
+                    transition.expected_seq = new_state.transition_seq;
+                    prop_assert_eq!(store.load_run(run_key).await.unwrap(), LoadedRun::Existing(new_state.clone()));
+                    transition.next_state = new_state;
+                    transition.next_state.transition_seq.0 += 1;
+                }
+                prop_assert_eq!(store.inner.lock().await.projection_image_lookups.load(Ordering::Relaxed), 0);
+                }
+                Ok(())
+            })?;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: projection-accumulator, Property 5: extension compatibility
+        // Snapshots retain absent/empty/value states and refuse malformed run payloads.
+        #[test]
+        fn projection_accumulator_snapshot_compatibility(
+            versions in prop::option::of(prop::collection::vec("[ab]{0,6}", 0..16)),
+        ) {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let store = InMemoryStore::default();
+                let run_key = RunKey::new();
+                let mut state = sample_state(run_key);
+                state.used_worker_deployment_versions = versions.clone();
+                store.inner.lock().await.runs.insert(run_key, state.clone());
+                let snapshot = store.snapshot().await.unwrap();
+                let restored = InMemoryStore::from_snapshot(&snapshot).unwrap();
+                assert_eq!(restored.inner.lock().await.runs[&run_key], state);
+
+                let doc = SnapshotDoc::capture(&*store.inner.lock().await);
+                let positional = postcard::to_allocvec(&(SNAPSHOT_FORMAT_VERSION, &doc)).unwrap();
+                assert!(snapshot.starts_with(&positional));
+                let mut broken_payload = postcard::to_allocvec(&versions.unwrap_or_default()).unwrap();
+                broken_payload.push(0);
+                let run_extension = encode_extension(crate::codec::WORKFLOW_STATE_EXTENSION_MAGIC, &[ExtensionSection {
+                    tag: crate::codec::USED_WORKER_DEPLOYMENT_VERSIONS_SECTION,
+                    payload: broken_payload,
+                }]).unwrap();
+                let mut broken = positional;
+                broken.extend(framed_snapshot_extension(SNAPSHOT_EXTENSION_MAGIC, &[run_state_section(&[(run_key, run_extension)])]));
+                assert!(matches!(InMemoryStore::from_snapshot(&broken), Err(SnapshotError::Extension(_))));
+            });
         }
     }
 
@@ -3162,7 +3260,7 @@ mod tests {
             ..WorkflowVersioningInfo::default()
         });
 
-        let projection = workflow_projection_context_with_previous(&state, None, 0).unwrap();
+        let projection = prepare_workflow_projection(&mut state, 0).unwrap();
         assert_eq!(
             projection
                 .search_attributes
@@ -3195,7 +3293,7 @@ mod tests {
                 .search_attributes
                 .0
                 .contains_key("TemporalUsedWorkerDeploymentVersions"),
-            "a pinned override is not a used version until a WFT completes"
+            "a pinned override alone supplies no stored deployment observation"
         );
         assert!(
             !state
@@ -3219,13 +3317,13 @@ mod tests {
             ..WorkflowVersioningInfo::default()
         });
 
-        let first = workflow_projection_context_with_previous(&state, None, 0).unwrap();
+        prepare_workflow_projection(&mut state, 0).unwrap();
         state.versioning_info.as_mut().unwrap().deployment_version =
             Some(WorkerDeploymentVersionRef {
                 deployment_name: "deployment".to_owned(),
                 build_id: "build-2".to_owned(),
             });
-        let second = workflow_projection_context_with_previous(&state, Some(&first), 0).unwrap();
+        let second = prepare_workflow_projection(&mut state, 0).unwrap();
 
         assert_eq!(
             second
@@ -3386,7 +3484,7 @@ mod tests {
         }
     }
 
-    fn activity_state(activity_id: &str) -> tokeira_kernel::ActivityState {
+    pub(super) fn activity_state(activity_id: &str) -> tokeira_kernel::ActivityState {
         tokeira_kernel::ActivityState {
             last_attempt_complete_time: None,
             cancel_requested: false,
@@ -6909,12 +7007,9 @@ mod tests {
                     }
                 }
                 prop_assert_eq!(&restored.snapshot().await.unwrap(), &snapshot);
-                // Without a time anywhere the snapshot is the document alone, as
-                // Tokeira 0.2.0–0.5.1 write it.
-                let any_time = expected
-                    .iter()
-                    .any(|(_, times)| times.values().any(Option::is_some));
-                prop_assert_eq!(snapshot_trailer(&snapshot).is_empty(), !any_time);
+                // Ready runs carry tag 3 even without heartbeat times; an empty
+                // store still needs no snapshot extension.
+                prop_assert_eq!(snapshot_trailer(&snapshot).is_empty(), expected.is_empty());
                 Ok(())
             })?;
         }
@@ -6956,11 +7051,11 @@ mod tests {
                 ));
                 prop_assert!(InMemoryStore::from_snapshot(&tolerant).is_ok());
 
-                let full = framed_snapshot_extension(SNAPSHOT_EXTENSION_MAGIC, &[valid.clone()]);
+                let full = framed_snapshot_extension(SNAPSHOT_EXTENSION_MAGIC, std::slice::from_ref(&valid));
                 let magic_len = postcard::to_allocvec(&SNAPSHOT_EXTENSION_MAGIC).unwrap().len();
                 let suffix = match &malformed {
                     MalformedSnapshotExtension::WrongMagic(magic) => {
-                        framed_snapshot_extension(*magic, &[valid.clone()])
+                        framed_snapshot_extension(*magic, std::slice::from_ref(&valid))
                     }
                     // Cut after the magic, so the bytes still open an extension.
                     MalformedSnapshotExtension::Truncated(cut) => {
@@ -7072,8 +7167,10 @@ mod tests {
                     other => prop_assert!(false, "expected VersionMismatch, got {other:?}"),
                 }
 
-                // (b) Any proper prefix fails to decode.
-                let cut_at = cut.index(snapshot.len());
+                // (b) Any proper prefix of the positional document fails to
+                // decode. Removing the whole optional extension remains valid.
+                let trailer = snapshot_trailer(&snapshot);
+                let cut_at = cut.index(snapshot.len() - trailer.len());
                 prop_assert!(matches!(
                     InMemoryStore::from_snapshot(&snapshot[..cut_at]),
                     Err(SnapshotError::Decode(_))
@@ -7082,10 +7179,14 @@ mod tests {
                 // (c) Trailing bytes after a decodable payload are refused.
                 let mut padded = snapshot.clone();
                 padded.extend_from_slice(&trailing);
-                prop_assert!(matches!(
-                    InMemoryStore::from_snapshot(&padded),
-                    Err(SnapshotError::TrailingBytes(count)) if count == trailing.len()
-                ));
+                if trailer.is_empty() {
+                    prop_assert!(matches!(
+                        InMemoryStore::from_snapshot(&padded),
+                        Err(SnapshotError::TrailingBytes(count)) if count == trailing.len()
+                    ));
+                } else {
+                    prop_assert!(matches!(InMemoryStore::from_snapshot(&padded), Err(SnapshotError::Extension(_))));
+                }
 
                 // (d) Arbitrary bytes never panic (any Result is acceptable).
                 let _ = InMemoryStore::from_snapshot(&garbage);

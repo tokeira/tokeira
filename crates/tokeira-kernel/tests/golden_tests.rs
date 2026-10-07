@@ -217,6 +217,32 @@ fn replay_context_from_start(start: &StartRequest) -> ReplayContext {
     }
 }
 
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(100))]
+
+    // Feature: projection-accumulator, Property 3: new run boundaries
+    // All fresh constructors and replay begin ready empty regardless of raw supplied attributes.
+    #[test]
+    fn projection_accumulator_fresh_constructors_are_ready_empty(
+        values in proptest::collection::vec("[ab]{0,8}", 0..16),
+    ) {
+        let mut start = make_start_request();
+        start.search_attributes.0.insert("TemporalUsedWorkerDeploymentVersions".into(), SearchAttrValue::KeywordList(values.clone()));
+        let mut signal = make_signal_with_start_request();
+        signal.search_attributes.0.insert("TemporalUsedWorkerDeploymentVersions".into(), SearchAttrValue::KeywordList(values));
+        for command in [
+            Command::Start(start.clone()),
+            Command::StartAndUpdate(tokeira_kernel::StartAndUpdateRequest { start: start.clone(), update_id: "update".into() }),
+            Command::SignalWithStart(signal),
+        ] {
+            let transition = kernel().apply(LoadedRun::Absent, command).unwrap();
+            proptest::prop_assert_eq!(transition.next_state.used_worker_deployment_versions, Some(Vec::new()));
+            let replayed = kernel().replay_history_prefix(replay_context_from_start(&start), &transition.history_events).unwrap();
+            proptest::prop_assert_eq!(replayed.used_worker_deployment_versions, Some(Vec::new()));
+        }
+    }
+}
+
 fn history_event(
     event_id: i64,
     happened_at: OffsetDateTime,
@@ -231,6 +257,7 @@ fn history_event(
 
 fn make_open_state() -> WorkflowState {
     WorkflowState {
+        used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),

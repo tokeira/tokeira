@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc b0969ac294bc6cfd37050990dcbd6f6adb60552f95ccd6ff106cc58259eb7387 # shrinks to activity_id = "a"
+cc 1bc25fd24b485c0948181c339113213cd1ab71303c63661c0cfc214f17f78e90 # shrinks to ops = [StartRun { workflow_id: "a", with_history: false, with_timer: false, with_activity: false, with_dedupe: false }], other_version = 0, garbage = [], trailing = [0], cut = Index(0)
+cc 0ef98e017648fa27e03271991fa3eb0c2a12fef933cc450364d06453ccc81c6f # shrinks to runs = [{}]

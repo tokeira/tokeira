@@ -39,6 +39,9 @@
 //!   Requirement 10).
 //!
 //! Section [`ACTIVITY_HEARTBEAT_SECTION`] holds each activity's last heartbeat time.
+//! Section [`USED_WORKER_DEPLOYMENT_VERSIONS_SECTION`] is a frozen postcard
+//! `Vec<String>`: presence (including an empty vector) records accumulator readiness.
+//! Tag 2 belongs to a separate extension; neither existing payload changes here.
 //!
 //! [`history_batch_encoded_len`] is the one definition of a batch's persisted size.
 //! The DSQL repository and the in-memory store both account the per-run History Size
@@ -68,6 +71,10 @@ pub const WORKFLOW_STATE_EXTENSION_MAGIC: u32 = 0x544B_5758;
 
 /// State-extension tag of the section holding each activity's last heartbeat time.
 pub const ACTIVITY_HEARTBEAT_SECTION: u32 = 1;
+
+/// Frozen postcard `Vec<String>` payload for the run's projection accumulator.
+/// Presence distinguishes ready empty from legacy state needing load-time seeding.
+pub const USED_WORKER_DEPLOYMENT_VERSIONS_SECTION: u32 = 3;
 
 /// One tagged section of an extension. The payload layout is fixed per tag.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +223,12 @@ pub(crate) fn encode_state_extension(state: &WorkflowState) -> postcard::Result<
             payload: postcard::to_allocvec(&heartbeats)?,
         });
     }
+    if let Some(versions) = &state.used_worker_deployment_versions {
+        sections.push(ExtensionSection {
+            tag: USED_WORKER_DEPLOYMENT_VERSIONS_SECTION,
+            payload: postcard::to_allocvec(versions)?,
+        });
+    }
     encode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, &sections)
 }
 
@@ -228,6 +241,13 @@ pub(crate) fn apply_state_extension(
     bytes: &[u8],
 ) -> std::result::Result<(), &'static str> {
     for section in decode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, bytes)? {
+        if section.tag == USED_WORKER_DEPLOYMENT_VERSIONS_SECTION {
+            state.used_worker_deployment_versions = Some(
+                decode_exact::<Vec<String>>(&section.payload)
+                    .ok_or("undecodable used-deployment-versions section")?,
+            );
+            continue;
+        }
         if section.tag != ACTIVITY_HEARTBEAT_SECTION {
             // A later release's section: its data is safe to drop by rule.
             continue;
@@ -536,6 +556,7 @@ mod tests {
     /// started workflow task.
     fn layout_state() -> WorkflowState {
         WorkflowState {
+            used_worker_deployment_versions: None,
             completed_update_count: 1,
             run_key: run_key(),
             namespace_id: NamespaceId(Uuid::from_u128(11)),
@@ -798,6 +819,61 @@ mod tests {
         );
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: projection-accumulator, Property 5: extension compatibility
+        // Readiness and verbatim values round-trip independently of positional bytes.
+        #[test]
+        fn projection_accumulator_extension_compatibility(
+            versions in prop::option::of(prop::collection::vec("[ab]{0,6}", 0..16)),
+            heartbeat in any::<bool>(),
+            unknown in prop::collection::vec(any::<u8>(), 0..16),
+        ) {
+            let mut state = layout_state();
+            let positional = released_encoding(&state);
+            prop_assert_eq!(hex(&positional), FROZEN_LAYOUT_HEX);
+            state.used_worker_deployment_versions = versions.clone();
+            if heartbeat {
+                state.activities.get_mut("activity-a").unwrap().last_heartbeat_at = Some(at(7));
+            }
+            let bytes = encode_workflow_state(&state).unwrap();
+            prop_assert!(bytes.starts_with(&positional));
+            prop_assert_eq!(decode_workflow_state(run_key(), &bytes).unwrap(), state.clone());
+            prop_assert_eq!(released_decode(&bytes).used_worker_deployment_versions, None);
+            let extension = encode_state_extension(&state).unwrap();
+            let mut sections = if extension.is_empty() { Vec::new() } else {
+                decode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, &extension).unwrap()
+            };
+            prop_assert!(sections.windows(2).all(|pair| pair[0].tag < pair[1].tag));
+            if let Some(values) = versions {
+                let payload = &sections.iter().find(|section| section.tag == USED_WORKER_DEPLOYMENT_VERSIONS_SECTION).unwrap().payload;
+                prop_assert_eq!(payload, &postcard::to_allocvec(&values).unwrap());
+            }
+            sections.push(ExtensionSection { tag: 99, payload: unknown });
+            let extended = with_extension(&state, &encode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, &sections).unwrap());
+            prop_assert_eq!(decode_workflow_state(run_key(), &extended).unwrap(), state.clone());
+
+            let valid = ExtensionSection {
+                tag: USED_WORKER_DEPLOYMENT_VERSIONS_SECTION,
+                payload: postcard::to_allocvec(&state.used_worker_deployment_versions.clone().unwrap_or_default()).unwrap(),
+            };
+            let mut trailing = valid.clone();
+            trailing.payload.push(0);
+            let mut truncated = valid.clone();
+            truncated.payload.pop();
+            for bad_sections in [vec![trailing], vec![truncated], vec![valid.clone(), valid.clone()]] {
+                let bad = with_extension(&state, &encode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, &bad_sections).unwrap());
+                prop_assert!(decode_workflow_state(run_key(), &bad).unwrap_err().downcast::<StateExtensionError>().is_ok());
+            }
+            let framed = encode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, std::slice::from_ref(&valid)).unwrap();
+            let bad_magic = encode_extension(WORKFLOW_STATE_EXTENSION_MAGIC + 1, &[valid]).unwrap();
+            for bad_frame in [bad_magic, framed[..framed.len()-1].to_vec()] {
+                prop_assert!(decode_workflow_state(run_key(), &with_extension(&state, &bad_frame)).is_err());
+            }
+        }
+    }
+
     #[test]
     fn heartbeat_time_travels_in_the_extension_only() {
         let mut state = layout_state();
@@ -895,7 +971,7 @@ mod tests {
         fn property_unknown_sections_and_activities_are_ignored(
             state in arb_state(),
             unknown in proptest::collection::btree_map(
-                2u32..64,
+                4u32..64,
                 proptest::collection::vec(any::<u8>(), 0..16),
                 0..3,
             ),

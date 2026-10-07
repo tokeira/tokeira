@@ -592,6 +592,7 @@ where
         request: RequestContext,
         timeout: std::time::Duration,
         wait_policy: UpdateWaitPolicy,
+        request_bytes: u64,
     ) -> Result<UpdateLifecycleSnapshot> {
         let timeout: time::Duration =
             time::Duration::try_from(timeout).map_err(|_| anyhow!("invalid timeout"))?;
@@ -604,6 +605,7 @@ where
                 request,
                 timeout,
                 wait_policy,
+                request_bytes,
             )
             .await
     }
@@ -617,6 +619,7 @@ where
         request: RequestContext,
         timeout: std::time::Duration,
         wait_policy: UpdateWaitPolicy,
+        update_request_bytes: u64,
     ) -> Result<MultiOperationResult> {
         let timeout: time::Duration =
             time::Duration::try_from(timeout).map_err(|_| anyhow!("invalid timeout"))?;
@@ -629,6 +632,7 @@ where
                 request,
                 timeout,
                 wait_policy,
+                update_request_bytes,
             )
             .await
     }

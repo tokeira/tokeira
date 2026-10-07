@@ -12,12 +12,40 @@
 //! to all waiting callers so they don't hang indefinitely.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
+use tokeira_kernel::limits::{self, UpdateLimits};
 use tokeira_types::{ExecutionRef, Payload, Payloads, RunKey};
 use tokio::sync::oneshot;
+
+/// An update limit: v1.31.0's value, which only the Temporal functional
+/// harness's build overrides (`signal-update-limits` criterion 2.14;
+/// `conformance-config-override`).
+#[cfg(not(feature = "conformance"))]
+fn update_limit(_key: &str, default: usize) -> usize {
+    default
+}
+
+#[cfg(feature = "conformance")]
+fn update_limit(key: &str, default: usize) -> usize {
+    crate::conformance::reads()
+        .get_i64(key)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(default)
+}
+
+/// The update limits the runtime puts on each update command, and whose total
+/// it puts on a workflow task's completion. The in-flight payload limit has no
+/// override: no corpus test lowers it.
+pub(crate) fn update_limits() -> UpdateLimits {
+    UpdateLimits {
+        in_flight: update_limit("history.maxInFlightUpdates", limits::MAX_IN_FLIGHT_UPDATES),
+        in_flight_payloads: limits::MAX_IN_FLIGHT_UPDATE_PAYLOADS,
+        total: update_limit("history.maxTotalUpdates", limits::MAX_TOTAL_UPDATES),
+    }
+}
 
 /// Lifecycle position reported by the public update APIs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -196,6 +224,10 @@ pub(crate) struct UpdateRegistryEntry {
     /// guard, which is exactly the failure seen running the OpenAI sandbox agent's
     /// blocking `pause` update.
     pub accepted: bool,
+    /// The request's protobuf-encoded size as a `temporal.api.update.v1.Request`,
+    /// which the edge measured. The in-flight payload limit sums it over a
+    /// run's held updates (`signal-update-limits` criterion 2.11).
+    pub request_bytes: u64,
     /// Monotonic admission order within the registry. v1.31.0 sends updates to
     /// the worker sorted by admitted time (`registry.Send` orders by
     /// `admittedTime`, update/registry.go:341-348 @ v1.31.0), which the corpus
@@ -214,6 +246,16 @@ pub struct UpdateRegistry {
     next_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// The admitted updates of one run that the owner's registry holds requests for,
+/// which the update limits count (`signal-update-limits` criteria 2.9, 2.11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeldUpdates {
+    /// How many there are.
+    pub count: usize,
+    /// The sum of their request sizes.
+    pub request_bytes: u64,
+}
+
 impl UpdateRegistry {
     /// Create an empty registry. Entries are added as
     /// [`UpdateWaitPolicy::Completed`] callers begin waiting.
@@ -227,6 +269,7 @@ impl UpdateRegistry {
     /// in-flight update — v1.31.0's `FindOrCreate` dedupe: every caller
     /// sharing an update id shares one update and one outcome
     /// (registry.go:398-452 @ v1.31.0).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register(
         &self,
         run_key: RunKey,
@@ -234,6 +277,7 @@ impl UpdateRegistry {
         update_name: String,
         input: Payloads,
         identity: String,
+        request_bytes: u64,
         wait_policy: UpdateWaitPolicy,
         tx: oneshot::Sender<UpdateResolution>,
     ) -> bool {
@@ -257,11 +301,36 @@ impl UpdateRegistry {
                     waiters: vec![UpdateWaiter { wait_policy, tx }],
                     accepted: false,
                     sent: false,
+                    request_bytes,
                     admitted_seq,
                 });
                 true
             }
         }
+    }
+
+    /// The updates of `admitted`, a run's admitted and unaccepted update ids,
+    /// that this registry holds requests for, `except` aside.
+    ///
+    /// An admitted id with no entry is one whose request a restart lost: it is
+    /// never delivered, so nothing removes it from the run's state, and v1.31.0
+    /// would have forgotten it on reload. It counts toward neither figure
+    /// (`signal-update-limits` criterion 2.9).
+    pub(crate) fn held_updates(
+        &self,
+        run_key: RunKey,
+        admitted: &HashSet<String>,
+        except: Option<&str>,
+    ) -> HeldUpdates {
+        let inner = self.inner.lock().expect("inner lock poisoned");
+        admitted
+            .iter()
+            .filter(|update_id| Some(update_id.as_str()) != except)
+            .filter_map(|update_id| inner.get(&(run_key, update_id.clone())))
+            .fold(HeldUpdates::default(), |held, entry| HeldUpdates {
+                count: held.count + 1,
+                request_bytes: held.request_bytes.saturating_add(entry.request_bytes),
+            })
     }
 
     /// Drop waiters whose callers have gone away (their receiver was
@@ -653,6 +722,7 @@ mod tests {
             "name".into(),
             Payloads::default(),
             "worker".into(),
+            0,
             UpdateWaitPolicy::Completed,
             tx,
         );
@@ -690,6 +760,7 @@ mod tests {
             "pause".into(),
             Payloads::default(),
             "worker".into(),
+            0,
             UpdateWaitPolicy::Completed,
             tx,
         );
@@ -733,6 +804,7 @@ mod tests {
             "name-1".into(),
             Payloads::default(),
             "worker".into(),
+            0,
             UpdateWaitPolicy::Completed,
             tx1,
         );
@@ -742,6 +814,7 @@ mod tests {
             "name-2".into(),
             Payloads::default(),
             "worker".into(),
+            0,
             UpdateWaitPolicy::Completed,
             tx2,
         );
@@ -803,6 +876,7 @@ mod tests {
                         req_ctx(&update_id),
                         Duration::milliseconds(500),
                         UpdateWaitPolicy::Accepted,
+                        0,
                     )
                     .await
                     .unwrap();
@@ -915,6 +989,7 @@ mod tests {
                         req_ctx(&update_id),
                         Duration::milliseconds(200),
                         UpdateWaitPolicy::Completed,
+                        0,
                     )
                     .await;
                 prop_assert!(err.is_err());
@@ -961,6 +1036,7 @@ mod tests {
                         req_ctx(&update_id),
                         Duration::milliseconds(500),
                         UpdateWaitPolicy::Accepted,
+                        0,
                     )
                     .await
                     .unwrap();
@@ -1030,6 +1106,7 @@ mod tests {
                         format!("name-{i}"),
                         Payloads::default(),
                         format!("worker-{i}"),
+                        0,
                         UpdateWaitPolicy::Completed,
                         tx,
                     );
@@ -1174,6 +1251,7 @@ mod tests {
                         req_ctx(&update_id),
                         Duration::milliseconds(20),
                         UpdateWaitPolicy::Completed,
+                        0,
                     )
                     .await
                     .unwrap();
@@ -1242,6 +1320,7 @@ mod tests {
                         format!("name-{i}"),
                         Payloads::default(),
                         format!("worker-{i}"),
+                        0,
                         UpdateWaitPolicy::Completed,
                         tx,
                     );
@@ -1312,6 +1391,7 @@ mod tests {
                         format!("name-{i}"),
                         Payloads::default(),
                         format!("worker-{i}"),
+                        0,
                         UpdateWaitPolicy::Completed,
                         tx,
                     );
@@ -1368,6 +1448,7 @@ mod tests {
                 "name".into(),
                 Payloads::default(),
                 "worker".into(),
+                0,
                 UpdateWaitPolicy::Completed,
                 tx,
             );

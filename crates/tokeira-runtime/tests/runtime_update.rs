@@ -39,6 +39,7 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
                 request_context("update-1"),
                 Duration::milliseconds(200),
                 UpdateWaitPolicy::Completed,
+                0,
             )
             .await
     });
@@ -75,6 +76,7 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -117,6 +119,7 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
                 request_context("update-1"),
                 Duration::milliseconds(200),
                 UpdateWaitPolicy::Completed,
+                0,
             )
             .await
     });
@@ -153,6 +156,7 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -195,6 +199,7 @@ async fn update_accepted_wait_returns_stage_without_outcome() -> Result<()> {
                 request_context("update-1"),
                 Duration::milliseconds(200),
                 UpdateWaitPolicy::Accepted,
+                0,
             )
             .await
     });
@@ -225,6 +230,7 @@ async fn update_accepted_wait_returns_stage_without_outcome() -> Result<()> {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -265,6 +271,7 @@ async fn poll_update_reports_current_stage_and_unknown_not_found() -> Result<()>
             request_context("update-1"),
             Duration::milliseconds(200),
             UpdateWaitPolicy::Admitted,
+            0,
         )
         .await?;
     assert_eq!(admitted.stage, UpdateLifecycleStage::Admitted);
@@ -333,6 +340,7 @@ async fn poll_update_waits_for_history_stage_or_returns_reached_stage() -> Resul
                 request_context("update-1"),
                 Duration::milliseconds(200),
                 UpdateWaitPolicy::Accepted,
+                0,
             )
             .await
     });
@@ -363,6 +371,7 @@ async fn poll_update_waits_for_history_stage_or_returns_reached_stage() -> Resul
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -414,6 +423,7 @@ async fn terminal_update_outcome_survives_runtime_recreation() -> Result<()> {
             request_context("update-1"),
             Duration::milliseconds(200),
             UpdateWaitPolicy::Admitted,
+            0,
         )
         .await?;
     assert_eq!(admitted.stage, UpdateLifecycleStage::Admitted);
@@ -449,6 +459,7 @@ async fn terminal_update_outcome_survives_runtime_recreation() -> Result<()> {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -525,6 +536,7 @@ async fn poll_update_is_read_only_for_known_and_unknown_updates() -> Result<()> 
             request_context("update-1"),
             Duration::milliseconds(200),
             UpdateWaitPolicy::Admitted,
+            0,
         )
         .await?;
     assert_eq!(admitted.stage, UpdateLifecycleStage::Admitted);
@@ -591,6 +603,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
             request_context("update-1"),
             Duration::milliseconds(20),
             UpdateWaitPolicy::Completed,
+            0,
         )
         .await
         .expect("server soft timeout should return the reached stage");
@@ -629,6 +642,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -676,6 +690,7 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
                 request_context("update-1"),
                 Duration::milliseconds(200),
                 UpdateWaitPolicy::Completed,
+                0,
             )
             .await
     });
@@ -700,6 +715,7 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),
@@ -744,6 +760,7 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
             request_context("update-1"),
             Duration::milliseconds(500),
             UpdateWaitPolicy::Completed,
+            0,
         )
         .await
     });
@@ -763,6 +780,7 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
             request_context("update-2"),
             Duration::milliseconds(500),
             UpdateWaitPolicy::Completed,
+            0,
         )
         .await
     });
@@ -818,6 +836,7 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
+            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),

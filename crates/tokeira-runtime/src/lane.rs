@@ -440,6 +440,7 @@ where
             kernel,
             repo,
             shard_owner,
+            update_registry,
             message.run_key,
             message.command,
             config,
@@ -466,6 +467,7 @@ where
                     kernel,
                     repo,
                     shard_owner,
+                    update_registry,
                     message.run_key,
                     terminate.clone(),
                     config,
@@ -1517,6 +1519,7 @@ where
         kernel,
         repo,
         shard_owner,
+        &UpdateRegistry::new(),
         run_key,
         command,
         config,
@@ -1524,6 +1527,45 @@ where
         &mut cache,
     )
     .await
+}
+
+/// Set the held-update figures on an update command or a workflow task's
+/// completion, from the state the lane just loaded and the registry holding the
+/// admitted updates' requests (`signal-update-limits` criteria 2.9, 2.11, 2.13).
+///
+/// The figures are taken here because the lane applies a run's commands one at
+/// a time: no update can be admitted, accepted or completed between this count
+/// and the kernel's check. A count taken before the command reached the lane
+/// could miss an update admitted in between, or count one never admitted.
+fn with_held_updates(
+    mut command: Command,
+    loaded: &LoadedRun,
+    update_registry: &UpdateRegistry,
+    run_key: RunKey,
+) -> Command {
+    let LoadedRun::Existing(state) = loaded else {
+        return command;
+    };
+    match &mut command {
+        Command::Update(request) => {
+            let held = update_registry.held_updates(
+                run_key,
+                &state.admitted_updates,
+                Some(&request.update_id),
+            );
+            request.held_updates = held.count;
+            request.in_flight_request_bytes = held.request_bytes;
+        }
+        Command::WorkflowTaskCompleted(request)
+        | Command::WorkflowTaskCompletedWithRetry { request, .. }
+        | Command::WorkflowTaskCompletedWithCron { request, .. } => {
+            request.held_updates = update_registry
+                .held_updates(run_key, &state.admitted_updates, None)
+                .count;
+        }
+        _ => {}
+    }
+    command
 }
 
 /// Run one command through the kernel and commit it, retrying the
@@ -1534,10 +1576,12 @@ where
 /// won the previous commit race, never replayed blindly. Returns the dispatch
 /// ops and history events from the *committed* transition so the caller can
 /// publish derived effects only after durability is established.
+#[allow(clippy::too_many_arguments)]
 async fn handle_message_with_cache<K, R>(
     kernel: &K,
     repo: &R,
     shard_owner: &Arc<RwLock<ShardOwner>>,
+    update_registry: &UpdateRegistry,
     run_key: RunKey,
     command: Command,
     config: &LaneConfig,
@@ -1571,9 +1615,10 @@ where
                 loaded
             }
         };
+        let attempt_command = with_held_updates(command.clone(), &loaded, update_registry, run_key);
         let mut transition = transition_span.in_scope(|| {
             kernel
-                .apply(loaded, command.clone())
+                .apply(loaded, attempt_command)
                 .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))
         })?;
         // The store checks the commit's growth against these limits and writes
@@ -2856,6 +2901,7 @@ mod tests {
         WorkflowState {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
+            signal_count: 0,
             run_key,
             namespace_id,
             workflow_id: WorkflowId("workflow".to_string()),
@@ -3031,6 +3077,7 @@ mod tests {
             &kernel,
             &repo,
             &shard_owner,
+            &UpdateRegistry::new(),
             run_key,
             sample_command("first"),
             &config,
@@ -3045,6 +3092,7 @@ mod tests {
             &kernel,
             &repo,
             &shard_owner,
+            &UpdateRegistry::new(),
             run_key,
             sample_command("second"),
             &config,
@@ -3097,6 +3145,7 @@ mod tests {
             &kernel,
             &repo,
             &owner,
+            &UpdateRegistry::new(),
             key,
             sample_command("cold"),
             &config,
@@ -3136,6 +3185,7 @@ mod tests {
             &kernel,
             &repo,
             &owner,
+            &UpdateRegistry::new(),
             key,
             sample_command("occ"),
             &config,
@@ -3161,6 +3211,7 @@ mod tests {
             &kernel,
             &repo,
             &owner,
+            &UpdateRegistry::new(),
             key,
             sample_command("evicted"),
             &config,
@@ -3225,6 +3276,7 @@ mod tests {
             &kernel,
             &repo,
             &shard_owner,
+            &UpdateRegistry::new(),
             run_key,
             sample_command("conflict"),
             &config,

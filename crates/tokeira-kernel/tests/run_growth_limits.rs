@@ -54,6 +54,7 @@ fn open_state() -> WorkflowState {
     WorkflowState {
         used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
+        signal_count: 0,
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),
         workflow_id: WorkflowId("workflow".into()),
@@ -211,6 +212,7 @@ fn completion(state: &WorkflowState, commands: Vec<WorkflowCommand>) -> Command 
         force_new_workflow_task: false,
         limits: WorkflowTaskCompletionLimits::default(),
         delivered_update_ids: Vec::new(),
+        held_updates: 0,
         request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         now: now(),
     })

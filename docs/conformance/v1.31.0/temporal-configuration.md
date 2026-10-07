@@ -18,9 +18,9 @@ Counts below include dynamic settings and the separately audited static groups.
 | Tokeira treatment | Count |
 |---|---:|
 | deployment policy | 10 |
-| pinned behavioral constant | 201 |
-| auto-tuned mechanical setting | 358 |
-| conformance-only override | 48 |
+| pinned behavioral constant | 203 |
+| auto-tuned mechanical setting | 355 |
+| conformance-only override | 49 |
 | architecturally irrelevant or excluded | 8 |
 
 ## Static Temporal server configuration
@@ -275,14 +275,14 @@ Counts below include dynamic settings and the separately audited static groups.
 | `history.hostLevelCacheMaxSize` | global / `Int` | `128000` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:1611` |
 | `history.hostLevelCacheMaxSizeBytes` | global / `Int` | `256000 * 4 * 1024` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:1617` |
 | `history.longPollExpirationInterval` | namespace / `Duration` | `time.Second * 20` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:1588` |
-| `history.maxInFlightUpdatePayloads` | namespace / `Int` | `20 * 1024 * 1024` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2294` |
-| `history.maxInFlightUpdates` | namespace / `Int` | `10` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2289` |
+| `history.maxInFlightUpdatePayloads` | namespace / `Int` | `20 * 1024 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:2294` |
+| `history.maxInFlightUpdates` | namespace / `Int` | `10` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:2289` |
 | `history.maxLocalParentWorkflowVerificationDuration` | global / `Duration` | `5 * time.Minute` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2613` |
 | `history.maxTotalUpdates` | namespace / `Int` | `2000` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:2299` |
 | `history.maxTotalUpdates.suggestContinueAsNewThreshold` | namespace / `Float` | `0.9` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:2304` |
 | `history.maximumBufferedEventsBatch` | global / `Int` | `100` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | kernel-excluded | `common/dynamicconfig/constants.go:2340` |
 | `history.maximumBufferedEventsSizeInBytes` | global / `Int` | `2 * 1024 * 1024` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | kernel-excluded | `common/dynamicconfig/constants.go:2345` |
-| `history.maximumSignalsPerExecution` | namespace / `Int` | `10000` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2351` |
+| `history.maximumSignalsPerExecution` | namespace / `Int` | `10000` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | kernel-excluded | `common/dynamicconfig/constants.go:2351` |
 | `history.memoryTimerProcessorSchedulerWorkerCount` | global / `Int` | `64` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:1960` |
 | `history.mutableStateChecksumGenProbability` | namespace / `Int` | `0` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2482` |
 | `history.mutableStateChecksumInvalidateBefore` | global / `Float` | `0` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2492` |

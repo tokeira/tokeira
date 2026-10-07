@@ -1,7 +1,9 @@
 use prost::Message as _;
 use tokeira_proto::{
     conversions::ProtoConversionError,
-    public::temporal::api::errordetails::v1::PermissionDeniedFailure,
+    public::temporal::api::{
+        enums::v1::ResourceExhaustedCause, errordetails::v1::PermissionDeniedFailure,
+    },
 };
 use tonic::{
     Code, Status,
@@ -18,6 +20,9 @@ impl From<EdgeError> for Status {
             EdgeError::NotFound(message) => Status::not_found(message),
             EdgeError::AlreadyExists(message) => Status::already_exists(message),
             EdgeError::ResourceExhausted(message) => Status::resource_exhausted(message),
+            EdgeError::ConcurrentLimitExceeded(message) => {
+                resource_exhausted_status(ResourceExhaustedCause::ConcurrentLimit, message)
+            }
             EdgeError::WorkflowClosing => workflow_closing_status(),
             EdgeError::ConsistentQueryBufferExceeded => busy_workflow_resource_exhausted_status(
                 "consistent query buffer is full, this may be caused by too many queries and \
@@ -247,18 +252,24 @@ fn workflow_closing_status() -> Status {
 /// Build a RESOURCE_EXHAUSTED status carrying a `ResourceExhaustedFailure`
 /// detail with cause BUSY_WORKFLOW and scope NAMESPACE — the shape shared by
 /// v1.31.0's `ErrWorkflowClosing` and `ErrConsistentQueryBufferExceeded`
-/// (consts/const.go:62-77 @ v1.31.0). The Go SDK reconstructs
-/// `serviceerror.ResourceExhausted` — including the Cause the corpus asserts —
-/// from the `google.rpc.Status` detail in the trailer.
+/// (consts/const.go:62-77 @ v1.31.0).
 fn busy_workflow_resource_exhausted_status(message: String) -> Status {
+    resource_exhausted_status(ResourceExhaustedCause::BusyWorkflow, message)
+}
+
+/// Build a RESOURCE_EXHAUSTED status carrying a `ResourceExhaustedFailure`
+/// detail with `cause` and scope NAMESPACE, every scope Tokeira answers. The Go
+/// SDK reconstructs `serviceerror.ResourceExhausted` — including the Cause and
+/// Scope the corpus asserts — from the `google.rpc.Status` detail in the
+/// trailer.
+fn resource_exhausted_status(cause: ResourceExhaustedCause, message: String) -> Status {
     use prost::Message as _;
     use tokeira_proto::public::temporal::api::{
-        enums::v1::{ResourceExhaustedCause, ResourceExhaustedScope},
-        errordetails::v1::ResourceExhaustedFailure,
+        enums::v1::ResourceExhaustedScope, errordetails::v1::ResourceExhaustedFailure,
     };
 
     let failure = ResourceExhaustedFailure {
-        cause: ResourceExhaustedCause::BusyWorkflow as i32,
+        cause: cause as i32,
         scope: ResourceExhaustedScope::Namespace as i32,
     };
     let detail = ProtoAny {
@@ -630,6 +641,34 @@ mod tests {
             .expect("decode failure detail");
         assert_eq!(failure.run_id, "run-123");
         assert_eq!(failure.start_request_id, "req-abc");
+    }
+
+    #[test]
+    fn concurrent_limit_status_carries_its_cause_and_scope() {
+        use tokeira_proto::public::temporal::api::{
+            enums::v1::ResourceExhaustedScope, errordetails::v1::ResourceExhaustedFailure,
+        };
+
+        // `TestReturnUpdateInFlightLimitError` asserts the reconstructed
+        // `serviceerror.ResourceExhausted`'s Cause and Scope
+        // (`tests/update_workflow_test.go:5806-5858 @ v1.31.0`).
+        let message = "limit on number of concurrent in-flight updates has been reached (1)";
+        let status: Status = EdgeError::ConcurrentLimitExceeded(message.to_owned()).into();
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.message(), message);
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        let detail = &rpc_status.details[0];
+        assert_eq!(
+            detail.type_url,
+            "type.googleapis.com/temporal.api.errordetails.v1.ResourceExhaustedFailure"
+        );
+        let failure =
+            ResourceExhaustedFailure::decode(detail.value.as_slice()).expect("decode detail");
+        assert_eq!(
+            failure.cause,
+            ResourceExhaustedCause::ConcurrentLimit as i32
+        );
+        assert_eq!(failure.scope, ResourceExhaustedScope::Namespace as i32);
     }
 
     #[test]

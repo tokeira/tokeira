@@ -38,7 +38,10 @@
 //!   (activity-heartbeat-time, Requirement 1.11; continue-as-new-advice,
 //!   Requirement 10).
 //!
-//! Section [`ACTIVITY_HEARTBEAT_SECTION`] holds each activity's last heartbeat time.
+//! Section [`ACTIVITY_HEARTBEAT_SECTION`] holds each activity's last heartbeat time, and
+//! section [`SIGNAL_COUNT_SECTION`] the run's signal count (signal-update-limits,
+//! criterion 2.8). A reader without the count treats the run as having recorded no
+//! signals, which is how every release before the count behaves.
 //! Section [`USED_WORKER_DEPLOYMENT_VERSIONS_SECTION`] is a frozen postcard
 //! `Vec<String>`: presence (including an empty vector) records accumulator readiness.
 //! Tag 2 belongs to a separate extension; neither existing payload changes here.
@@ -71,6 +74,11 @@ pub const WORKFLOW_STATE_EXTENSION_MAGIC: u32 = 0x544B_5758;
 
 /// State-extension tag of the section holding each activity's last heartbeat time.
 pub const ACTIVITY_HEARTBEAT_SECTION: u32 = 1;
+
+/// State-extension tag of the section holding the run's signal count, a postcard
+/// `u64`. This layout is frozen. Written only when the count isn't zero, so a state
+/// that has recorded no signal encodes as it did before the count existed.
+pub const SIGNAL_COUNT_SECTION: u32 = 2;
 
 /// Frozen postcard `Vec<String>` payload for the run's projection accumulator.
 /// Presence distinguishes ready empty from legacy state needing load-time seeding.
@@ -216,11 +224,18 @@ pub(crate) fn encode_state_extension(state: &WorkflowState) -> postcard::Result<
                 })
         })
         .collect::<Vec<_>>();
+    // Sections go in ascending tag order, each at most once.
     let mut sections = Vec::new();
     if !heartbeats.is_empty() {
         sections.push(ExtensionSection {
             tag: ACTIVITY_HEARTBEAT_SECTION,
             payload: postcard::to_allocvec(&heartbeats)?,
+        });
+    }
+    if state.signal_count != 0 {
+        sections.push(ExtensionSection {
+            tag: SIGNAL_COUNT_SECTION,
+            payload: postcard::to_allocvec(&state.signal_count)?,
         });
     }
     if let Some(versions) = &state.used_worker_deployment_versions {
@@ -248,25 +263,38 @@ pub(crate) fn apply_state_extension(
             );
             continue;
         }
-        if section.tag != ACTIVITY_HEARTBEAT_SECTION {
-            // A later release's section: its data is safe to drop by rule.
-            continue;
-        }
-        let heartbeats = decode_exact::<Vec<ActivityHeartbeat>>(&section.payload)
-            .ok_or("undecodable heartbeat section")?;
-        let mut listed = BTreeSet::new();
-        if !heartbeats
-            .iter()
-            .all(|heartbeat| listed.insert(heartbeat.activity_id.as_str()))
-        {
-            return Err("activity listed twice in the heartbeat section");
-        }
-        for heartbeat in heartbeats {
-            // An activity the state does not hold is skipped; the writer never
-            // lists one, and dropping it is safe.
-            if let Some(activity) = state.activities.get_mut(&heartbeat.activity_id) {
-                activity.last_heartbeat_at = Some(heartbeat.last_heartbeat_at);
+        match section.tag {
+            ACTIVITY_HEARTBEAT_SECTION => apply_heartbeat_section(state, &section.payload)?,
+            SIGNAL_COUNT_SECTION => {
+                state.signal_count = decode_exact::<u64>(&section.payload)
+                    .ok_or("undecodable signal count section")?;
             }
+            // A later release's section: its data is safe to drop by rule.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Apply the [`ACTIVITY_HEARTBEAT_SECTION`] payload to the state it belongs to.
+fn apply_heartbeat_section(
+    state: &mut WorkflowState,
+    payload: &[u8],
+) -> std::result::Result<(), &'static str> {
+    let heartbeats =
+        decode_exact::<Vec<ActivityHeartbeat>>(payload).ok_or("undecodable heartbeat section")?;
+    let mut listed = BTreeSet::new();
+    if !heartbeats
+        .iter()
+        .all(|heartbeat| listed.insert(heartbeat.activity_id.as_str()))
+    {
+        return Err("activity listed twice in the heartbeat section");
+    }
+    for heartbeat in heartbeats {
+        // An activity the state does not hold is skipped; the writer never
+        // lists one, and dropping it is safe.
+        if let Some(activity) = state.activities.get_mut(&heartbeat.activity_id) {
+            activity.last_heartbeat_at = Some(heartbeat.last_heartbeat_at);
         }
     }
     Ok(())
@@ -558,6 +586,7 @@ mod tests {
         WorkflowState {
             used_worker_deployment_versions: None,
             completed_update_count: 1,
+            signal_count: 0,
             run_key: run_key(),
             namespace_id: NamespaceId(Uuid::from_u128(11)),
             workflow_id: WorkflowId("workflow".into()),
@@ -909,6 +938,67 @@ mod tests {
     }
 
     #[test]
+    fn signal_count_follows_the_heartbeat_section() {
+        let mut state = layout_state();
+        let plain = encode_workflow_state(&state).expect("encodes");
+        state
+            .activities
+            .get_mut("activity-a")
+            .expect("activity")
+            .last_heartbeat_at = Some(at(7));
+        state.signal_count = 10_000;
+        let extended = encode_workflow_state(&state).expect("encodes");
+        // The state's bytes are unchanged; the sections follow in ascending tag
+        // order, the count as a postcard u64.
+        assert_eq!(&extended[..plain.len()], plain.as_slice());
+        let extension = encode_extension(
+            WORKFLOW_STATE_EXTENSION_MAGIC,
+            &[
+                heartbeat_section(&[("activity-a", at(7))]),
+                ExtensionSection {
+                    tag: SIGNAL_COUNT_SECTION,
+                    payload: postcard::to_allocvec(&10_000u64).expect("encodes"),
+                },
+            ],
+        )
+        .expect("encodes");
+        assert_eq!(&extended[plain.len()..], extension.as_slice());
+    }
+
+    #[test]
+    fn a_state_stored_without_the_count_counts_from_zero() {
+        let mut state = layout_state();
+        state.signal_count = 9_999;
+        let stored = released_encoding(&state);
+        assert_eq!(
+            decode_workflow_state(run_key(), &stored)
+                .expect("decodes")
+                .signal_count,
+            0
+        );
+    }
+
+    #[test]
+    fn an_undecodable_signal_count_section_is_refused() {
+        for payload in [Vec::new(), vec![0xff; 11], vec![1, 2]] {
+            let extension = encode_extension(
+                WORKFLOW_STATE_EXTENSION_MAGIC,
+                &[ExtensionSection {
+                    tag: SIGNAL_COUNT_SECTION,
+                    payload,
+                }],
+            )
+            .expect("encodes");
+            let error =
+                decode_workflow_state(run_key(), &with_extension(&layout_state(), &extension))
+                    .expect_err("a malformed count is refused")
+                    .downcast::<StateExtensionError>()
+                    .expect("an extension error");
+            assert_eq!(error.defect, "undecodable signal count section");
+        }
+    }
+
+    #[test]
     fn malformed_extension_error_names_the_blob_and_run() {
         let error =
             decode_workflow_state(run_key(), &with_extension(&layout_state(), &[0xff, 0x01]))
@@ -949,6 +1039,19 @@ mod tests {
             prop_assert_eq!(released_decode(&encoded), without_times(state));
         }
 
+        // Feature: signal-update-limits, Property 3: The stored count round-trips
+        #[test]
+        fn property_signal_counts_round_trip(state in arb_state(), count in any::<u64>()) {
+            let mut state = state;
+            state.signal_count = count;
+            let encoded = encode_workflow_state(&state).expect("encodes");
+            prop_assert_eq!(decode_workflow_state(run_key(), &encoded).expect("decodes"), state.clone());
+            // A reader without the count sees the state as having recorded none.
+            let mut without_count = without_times(state);
+            without_count.signal_count = 0;
+            prop_assert_eq!(released_decode(&encoded), without_count);
+        }
+
         // Feature: activity-heartbeat-time, Property 4: Malformed extensions are
         // rejected
         #[test]
@@ -970,6 +1073,7 @@ mod tests {
         #[test]
         fn property_unknown_sections_and_activities_are_ignored(
             state in arb_state(),
+            // Tags 1 to 3 are known; anything above is a later release's.
             unknown in proptest::collection::btree_map(
                 4u32..64,
                 proptest::collection::vec(any::<u8>(), 0..16),

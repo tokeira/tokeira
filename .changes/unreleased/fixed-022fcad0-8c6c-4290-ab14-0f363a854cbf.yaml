@@ -1,0 +1,5 @@
+kind: fixed
+body: A run now refuses signals past 10,000 and updates past Temporal's in-flight, payload and total limits, answering each caller, and a signal's sender, as Temporal does.
+time: 2026-10-07T14:32:40.000000+01:00
+custom:
+    Slice: 022fcad0-8c6c-4290-ab14-0f363a854cbf

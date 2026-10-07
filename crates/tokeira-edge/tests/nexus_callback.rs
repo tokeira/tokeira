@@ -223,6 +223,7 @@ impl WorkflowRuntimeApi for FakeRuntime {
         _request: RequestContext,
         _timeout: std::time::Duration,
         _wait_policy: UpdateWaitPolicy,
+        _request_bytes: u64,
     ) -> Result<UpdateLifecycleSnapshot> {
         unreachable!()
     }

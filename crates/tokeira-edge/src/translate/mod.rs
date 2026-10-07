@@ -971,6 +971,11 @@ pub struct UpdateWorkflowExecutionRequest {
     pub input: Payloads,
     pub wait_policy: UpdateWaitPolicyDto,
     pub timeout: Duration,
+    /// The update's `temporal.api.update.v1.Request` as received, measured by
+    /// its protobuf-encoded size, which is what v1.31.0's `req.Size()` returns.
+    /// The runtime sums it over a run's held updates for the in-flight payload
+    /// limit (`signal-update-limits` criterion 2.11).
+    pub request_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]

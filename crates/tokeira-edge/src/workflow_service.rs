@@ -973,6 +973,9 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         timeout: std::time::Duration,
     ) -> Result<QueryResult>;
 
+    /// `request_bytes` is the update's request, measured as the edge received
+    /// it (`signal-update-limits` criterion 2.11).
+    #[allow(clippy::too_many_arguments)]
     async fn update_workflow(
         &self,
         execution: ExecutionRef,
@@ -982,12 +985,14 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         request: RequestContext,
         timeout: std::time::Duration,
         wait_policy: UpdateWaitPolicy,
+        request_bytes: u64,
     ) -> Result<UpdateLifecycleSnapshot>;
 
     /// Execute the composed Update-with-Start (`ExecuteMultiOperation`,
     /// exactly `[Start, Update]` — `multioperation/api.go @ v1.31.0`).
     /// Defaulted so workflow-task-only test doubles need no change; the
     /// runtime adapter overrides it.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_multi_operation(
         &self,
         start: StartRequest,
@@ -997,6 +1002,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         request: RequestContext,
         timeout: std::time::Duration,
         wait_policy: UpdateWaitPolicy,
+        update_request_bytes: u64,
     ) -> Result<MultiOperationResult> {
         let _ = (
             start,
@@ -1006,6 +1012,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
             request,
             timeout,
             wait_policy,
+            update_request_bytes,
         );
         Err(anyhow!("execute_multi_operation is not implemented"))
     }
@@ -6676,6 +6683,7 @@ impl WorkflowService {
                         update_request,
                         req.update.timeout,
                         wait_policy,
+                        req.update.request_bytes,
                     )
                     .await
                 {
@@ -8160,6 +8168,7 @@ impl WorkflowService {
                         request,
                         req.timeout,
                         wait_policy,
+                        req.request_bytes,
                     )
                     .await
                     .map_err(|error| {
@@ -9032,6 +9041,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::NotFound(_) => "not_found",
         EdgeError::AlreadyExists(_) => "already_exists",
         EdgeError::ResourceExhausted(_) => "resource_exhausted",
+        EdgeError::ConcurrentLimitExceeded(_) => "resource_exhausted",
         EdgeError::WorkflowClosing => "resource_exhausted",
         EdgeError::ConsistentQueryBufferExceeded => "resource_exhausted",
         EdgeError::WorkflowNotReady(_) => "failed_precondition",
@@ -10756,6 +10766,7 @@ mod tests {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
+                held_updates: 0,
                 request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
                 now: OffsetDateTime::now_utc(),
                 command_sizes: Vec::new(),
@@ -10895,6 +10906,7 @@ mod tests {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
+                held_updates: 0,
                 request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
                 now: OffsetDateTime::now_utc(),
                 command_sizes: Vec::new(),
@@ -11311,6 +11323,7 @@ mod tests {
             }]),
             wait_policy,
             timeout: std::time::Duration::from_millis(20),
+            request_bytes: 0,
         }
     }
 
@@ -11662,6 +11675,7 @@ mod tests {
                 },
                 Duration::milliseconds(20),
                 UpdateWaitPolicy::Admitted,
+                0,
             )
             .await?;
         assert_eq!(snapshot.stage, UpdateLifecycleStage::Admitted);

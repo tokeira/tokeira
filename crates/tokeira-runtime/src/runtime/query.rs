@@ -325,6 +325,11 @@ where
     /// `Accepted` wait policy (phase 1) while `Completed` callers block on a
     /// oneshot until the lane notifies the `UpdateRegistry` with the final
     /// resolution.
+    ///
+    /// `request_bytes` is the request's protobuf-encoded size, which the edge
+    /// measured; the in-flight payload limit sums it over a run's held updates
+    /// (`signal-update-limits` criterion 2.11).
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_workflow(
         &self,
         execution: ExecutionRef,
@@ -334,6 +339,7 @@ where
         request: RequestContext,
         timeout_after: Duration,
         wait_policy: UpdateWaitPolicy,
+        request_bytes: u64,
     ) -> Result<UpdateLifecycleSnapshot> {
         let run_key = self
             .repo
@@ -364,6 +370,7 @@ where
             update_name.clone(),
             input.clone(),
             request.caller_identity.clone().unwrap_or_default(),
+            request_bytes,
             wait_policy.clone(),
             wait_tx,
         );
@@ -382,12 +389,18 @@ where
                 .await;
         }
 
+        // The lane sets the held-update figures from the state it loads, just
+        // before the kernel checks the update limits.
         let command = Command::Update(UpdateRequest {
             update_id: update_id.clone(),
             update_name,
             input,
             request,
             now: OffsetDateTime::now_utc(),
+            limits: crate::update::update_limits(),
+            request_bytes,
+            held_updates: 0,
+            in_flight_request_bytes: 0,
         });
 
         let submit_result = self.submit(run_key, command).await;

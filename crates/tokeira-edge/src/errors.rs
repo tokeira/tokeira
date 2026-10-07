@@ -32,6 +32,14 @@ pub enum EdgeError {
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
 
+    /// An update refused for the run's in-flight update count or in-flight
+    /// payload limit. RESOURCE_EXHAUSTED with cause CONCURRENT_LIMIT, scope
+    /// NAMESPACE and v1.31.0's message, which the corpus asserts
+    /// (`update/registry.go:398-436`; `TestReturnUpdateInFlightLimitError`,
+    /// `tests/update_workflow_test.go:5806-5858 @ v1.31.0`).
+    #[error("{0}")]
+    ConcurrentLimitExceeded(String),
+
     /// v1.31.0's `consts.ErrWorkflowClosing`: a signal (or update) arrived
     /// while the workflow has a close attempt bouncing off buffered events
     /// with a started WFT retrying it. RESOURCE_EXHAUSTED with cause
@@ -201,6 +209,7 @@ impl EdgeError {
             EdgeError::NotFound(_) => StatusCode::NOT_FOUND,
             EdgeError::AlreadyExists(_) => StatusCode::CONFLICT,
             EdgeError::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
+            EdgeError::ConcurrentLimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::WorkflowClosing => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::ConsistentQueryBufferExceeded => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::WorkflowNotReady(_) => StatusCode::PRECONDITION_FAILED,
@@ -237,6 +246,7 @@ impl EdgeError {
             EdgeError::NotFound(_) => "not_found",
             EdgeError::AlreadyExists(_) => "already_exists",
             EdgeError::ResourceExhausted(_) => "resource_exhausted",
+            EdgeError::ConcurrentLimitExceeded(_) => "concurrent_limit_exceeded",
             EdgeError::WorkflowClosing => "workflow_closing",
             EdgeError::ConsistentQueryBufferExceeded => "consistent_query_buffer_exceeded",
             EdgeError::WorkflowNotReady(_) => "workflow_not_ready",
@@ -341,6 +351,34 @@ impl From<anyhow::Error> for EdgeError {
         // const.go:81-85`; `service/history/handler.go:2309-2310 @ v1.31.0`).
         if let Some(breach) = value.downcast_ref::<tokeira_kernel::limits::RunLimitExceeded>() {
             return Self::BadRequest(breach.message.clone());
+        }
+        // A signal to a run at the signal limit answers INVALID_ARGUMENT
+        // (`consts.ErrSignalsLimitExceeded`, `service/history/consts/
+        // const.go:60-61 @ v1.31.0`; `signal-update-limits` criterion 2.1).
+        if let Some(tokeira_runtime::KernelRejected(tokeira_kernel::Reject::SignalLimitExceeded)) =
+            value.downcast_ref::<tokeira_runtime::KernelRejected>()
+        {
+            return Self::BadRequest(
+                tokeira_kernel::limits::SIGNAL_LIMIT_EXCEEDED_MESSAGE.to_string(),
+            );
+        }
+        // An update refused for a limit: RESOURCE_EXHAUSTED (CONCURRENT_LIMIT,
+        // NAMESPACE) for the in-flight count and payload, FAILED_PRECONDITION
+        // for the total (`update/registry.go:398-453 @ v1.31.0`;
+        // `signal-update-limits` criteria 2.9-2.11, 2.13).
+        if let Some(tokeira_runtime::KernelRejected(tokeira_kernel::Reject::UpdateLimitExceeded(
+            refusal,
+        ))) = value.downcast_ref::<tokeira_runtime::KernelRejected>()
+        {
+            return match refusal.limit {
+                tokeira_kernel::limits::UpdateLimit::Total => {
+                    Self::FailedPrecondition(refusal.message.clone())
+                }
+                tokeira_kernel::limits::UpdateLimit::InFlight
+                | tokeira_kernel::limits::UpdateLimit::InFlightPayloads => {
+                    Self::ConcurrentLimitExceeded(refusal.message.clone())
+                }
+            };
         }
         // Query pre-dispatch guards surface v1.31.0's WorkflowNotReady
         // (queryworkflow/api.go:116-143).
@@ -496,5 +534,50 @@ mod tests {
             message,
             "transaction size of 5 bytes exceeds limit of 4 bytes"
         );
+    }
+
+    #[test]
+    fn a_signal_at_the_limit_is_an_invalid_argument() {
+        let error = anyhow::Error::new(tokeira_runtime::KernelRejected(
+            tokeira_kernel::Reject::SignalLimitExceeded,
+        ));
+        let EdgeError::BadRequest(message) = EdgeError::from(error) else {
+            panic!("the signal limit must map to a bad request");
+        };
+        assert_eq!(
+            message,
+            "exceeded workflow execution limit for signal events"
+        );
+    }
+
+    #[test]
+    fn update_limits_answer_v1_31_0s_codes() {
+        use tokeira_kernel::limits::UpdateLimitExceeded;
+
+        let refused = |refusal: UpdateLimitExceeded| {
+            EdgeError::from(anyhow::Error::new(tokeira_runtime::KernelRejected(
+                tokeira_kernel::Reject::UpdateLimitExceeded(refusal),
+            )))
+        };
+        let EdgeError::ConcurrentLimitExceeded(message) =
+            refused(UpdateLimitExceeded::in_flight(10))
+        else {
+            panic!("the in-flight limit must map to a concurrent limit");
+        };
+        assert_eq!(
+            message,
+            "limit on number of concurrent in-flight updates has been reached (10)"
+        );
+        assert!(matches!(
+            refused(UpdateLimitExceeded::in_flight_payloads(20)),
+            EdgeError::ConcurrentLimitExceeded(_)
+        ));
+        let EdgeError::FailedPrecondition(message) = refused(UpdateLimitExceeded::total(2_000))
+        else {
+            panic!("the total limit must map to a failed precondition");
+        };
+        assert!(message.starts_with(
+            "The limit on the total number of distinct updates in this workflow has been reached (2000)."
+        ));
     }
 }

@@ -6636,6 +6636,7 @@ pub fn update_request_to_edge(
         ))?;
     let meta = request.meta.as_ref();
     let input_msg = request.input.as_ref();
+    let request_bytes = u64::try_from(prost::Message::encoded_len(request)).unwrap_or(u64::MAX);
 
     let wait_policy = match req.wait_policy {
         Some(wp) => match wp.lifecycle_stage {
@@ -6665,6 +6666,7 @@ pub fn update_request_to_edge(
             .unwrap_or_default(),
         wait_policy,
         timeout: DEFAULT_UPDATE_TIMEOUT,
+        request_bytes,
     })
 }
 
@@ -10327,6 +10329,37 @@ mod tests {
             failure.statuses[1].details[0].type_url,
             "type.googleapis.com/temporal.api.errordetails.v1.ResourceExhaustedFailure"
         );
+    }
+
+    /// An update-with-start refused for the in-flight update limit carries the
+    /// update's `ResourceExhaustedFailure` (CONCURRENT_LIMIT, NAMESPACE) in its
+    /// operation status, the start's being aborted
+    /// (`TestReturnUpdateInFlightLimitError`, `tests/update_workflow_test.go:5806-5858
+    /// @ v1.31.0`).
+    #[test]
+    fn multi_operation_carries_the_update_limits_detail() {
+        use tokeira_proto::public::temporal::api::{
+            enums::v1::ResourceExhaustedCause, errordetails::v1::ResourceExhaustedFailure,
+        };
+
+        let status = multi_operation_failure_to_status(MultiOperationFailure::Update {
+            started: false,
+            error: crate::errors::EdgeError::ConcurrentLimitExceeded(
+                "limit on number of concurrent in-flight updates has been reached (1)".to_owned(),
+            ),
+        });
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        let failure = errordetails_proto::MultiOperationExecutionFailure::decode(
+            rpc_status.details[0].value.as_slice(),
+        )
+        .expect("decode MultiOperationExecutionFailure");
+        assert_eq!(failure.statuses[0].code, Code::Aborted as i32);
+        assert_eq!(failure.statuses[0].message, "Operation was aborted.");
+        assert_eq!(failure.statuses[1].code, Code::ResourceExhausted as i32);
+        let detail =
+            ResourceExhaustedFailure::decode(failure.statuses[1].details[0].value.as_slice())
+                .expect("decode the update's detail");
+        assert_eq!(detail.cause, ResourceExhaustedCause::ConcurrentLimit as i32);
     }
 
     /// Req 3: the success response is exactly `[start, update]` in order,

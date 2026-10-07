@@ -379,6 +379,7 @@ impl BasicKernel {
         let mut state = WorkflowState {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
+            signal_count: 0,
             run_key: ctx.run_key,
             namespace_id: ctx.namespace_id,
             workflow_id: ctx.workflow_id,
@@ -512,6 +513,7 @@ impl BasicKernel {
         let initial = WorkflowState {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
+            signal_count: 0,
             run_key: req.run_key,
             namespace_id: req.namespace_id,
             workflow_id: req.workflow_id,
@@ -678,6 +680,7 @@ impl BasicKernel {
         let initial = WorkflowState {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
+            signal_count: 0,
             run_key: req.run_key,
             namespace_id: req.namespace_id,
             workflow_id: req.workflow_id,
@@ -796,6 +799,11 @@ impl BasicKernel {
             request_id: req.request.request_id.0,
             identity: req.request.caller_identity,
         });
+        // The new run's count starts at its own signal, which v1.31.0 records
+        // before it checks the count, so a signal-with-start that starts a run
+        // is never refused at the fixed limit (`create_workflow_util.go:76-88`;
+        // `signal_with_start_workflow.go:85-94 @ v1.31.0`).
+        builder.state.signal_count = 1;
         if let Some(delay) = positive_start_delay(req.workflow_start_delay) {
             let timer = TimerState {
                 timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
@@ -837,7 +845,21 @@ impl BasicKernel {
     /// "at most one outstanding WFT" invariant comment below.
     fn apply_signal(&self, loaded: LoadedRun, req: SignalRequest) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
+        // v1.31.0 refuses a signal once the run has recorded the limit's worth
+        // (`ValidateSignal`, `signal_workflow_util.go:53-61 @ v1.31.0`). A
+        // duplicate of a request the run already applied is answered before
+        // this by the caller, which looks the request id up after the refusal,
+        // since Tokeira's store checks request ids only at commit
+        // (`signal-update-limits` criterion 2.2).
+        if state.signal_count >= crate::limits::MAXIMUM_SIGNALS_PER_EXECUTION {
+            return Err(Reject::SignalLimitExceeded);
+        }
         let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
+        // Counted on admission, buffered or not: v1.31.0 applies the count when
+        // it adds the event, not when it flushes a buffered one
+        // (`AddWorkflowExecutionSignaledEvent`, `mutable_state_impl.go:5635-5668
+        // @ v1.31.0`).
+        builder.state.signal_count = builder.state.signal_count.saturating_add(1);
         // The dedupe op is emitted at *admission* even when the event is
         // buffered below: idempotency of `SignalWorkflowExecution` is anchored
         // to the request id at durable acceptance, not to the signal's
@@ -904,6 +926,22 @@ impl BasicKernel {
         if state.admitted_updates.contains(&req.update_id) {
             return Err(Reject::DuplicateUpdateId(req.update_id));
         }
+        // A new id meets v1.31.0's update limits, in its order: in flight,
+        // total, then payload (`FindOrCreate` then `Admit`,
+        // `update/registry.go:226-236`, `update/update.go:301-311 @ v1.31.0`).
+        // In flight are the accepted updates and the admitted ones whose
+        // requests the owner holds, which the lane counted from this state: an
+        // admitted id whose request a restart lost is never delivered, so it
+        // must not hold the run's slots, as v1.31.0 forgets it on reload
+        // (`signal-update-limits` criterion 2.9).
+        crate::limits::check_update_admission(
+            &req.limits,
+            req.held_updates.saturating_add(state.pending_updates.len()),
+            state.completed_update_count as usize,
+            req.in_flight_request_bytes,
+            req.request_bytes,
+        )
+        .map_err(Reject::UpdateLimitExceeded)?;
 
         let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
@@ -1963,13 +2001,21 @@ impl BasicKernel {
                 });
                 // The rejections still resolve: each rejected update leaves
                 // the admitted set (no event — rejections are traceless) and
-                // the runtime notifies its waiters post-commit.
+                // the runtime notifies its waiters post-commit. A rejection of
+                // an update the run doesn't hold re-admits it first, at the
+                // total limit's check (criterion 2.13).
+                builder.resurrection = UpdateSlots::at_completion(&builder.state, req.held_updates);
                 for command in req.commands {
                     if let WorkflowCommand::ProtocolMessage {
                         body: UpdateProtocolBody::Rejected { update_id, .. },
                         ..
                     } = command
                     {
+                        if !builder.state.admitted_updates.contains(&update_id)
+                            && !builder.state.pending_updates.contains_key(&update_id)
+                        {
+                            builder.resurrect_update(req.limits.total_updates)?;
+                        }
                         builder.state.admitted_updates.remove(&update_id);
                         builder.state.pending_updates.remove(&update_id);
                     }
@@ -2120,6 +2166,7 @@ impl BasicKernel {
 
         let limits = req.limits;
         let command_sizes = req.command_sizes;
+        builder.resurrection = UpdateSlots::at_completion(&builder.state, req.held_updates);
         let mut closed = false;
         for (index, command) in req.commands.into_iter().enumerate() {
             if closed {
@@ -3383,6 +3430,13 @@ impl BasicKernel {
                     HistoryEventKind::WorkflowExecutionUpdateAdmitted { update_id, .. } => {
                         builder.state.admitted_updates.insert(update_id.clone());
                     }
+                    // A reapplied signal counts, and is never refused for the
+                    // count: v1.31.0's reapply adds it without `ValidateSignal`
+                    // (`reapplyEvents`, `ndc/workflow_resetter.go:865-878 @
+                    // v1.31.0`; `signal-update-limits` criterion 2.7).
+                    HistoryEventKind::WorkflowExecutionSignaled { .. } => {
+                        builder.state.signal_count = builder.state.signal_count.saturating_add(1);
+                    }
                     HistoryEventKind::WorkflowExecutionOptionsUpdated {
                         identity: _,
                         versioning_override,
@@ -4020,7 +4074,12 @@ impl BasicKernel {
         match &event.kind {
             HistoryEventKind::WorkflowExecutionStarted { .. }
             | HistoryEventKind::WorkflowExecutionStartedV2 { .. } => {}
-            HistoryEventKind::WorkflowExecutionSignaled { .. } => {}
+            // A reset run counts the copied history's signals, as v1.31.0's
+            // rebuild applies each one (`mutable_state_rebuilder.go:511-516 @
+            // v1.31.0`; `signal-update-limits` criterion 2.7).
+            HistoryEventKind::WorkflowExecutionSignaled { .. } => {
+                state.signal_count = state.signal_count.saturating_add(1);
+            }
             HistoryEventKind::WorkflowExecutionCancelRequested { .. } => {
                 state.cancel_requested = true;
             }
@@ -4607,9 +4666,18 @@ impl BasicKernel {
             HistoryEventKind::UpsertWorkflowSearchAttributes { patch, .. } => {
                 apply_search_attributes_patch(&mut state.search_attributes, patch);
             }
+            // A completion counts toward the total and the continue-as-new
+            // advice, as v1.31.0's rebuilt registry counts each completed
+            // `UpdateInfo` (`mutable_state_rebuilder.go:654-657`;
+            // `update/registry.go:219-221 @ v1.31.0`; `signal-update-limits`
+            // criterion 2.7). A rejection never does.
             HistoryEventKind::WorkflowExecutionUpdateCompleted { update_id, .. }
-            | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { update_id, .. }
-            | HistoryEventKind::WorkflowExecutionUpdateRejected { update_id, .. } => {
+            | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { update_id, .. } => {
+                state.pending_updates.remove(update_id);
+                state.admitted_updates.remove(update_id);
+                state.completed_update_count = state.completed_update_count.saturating_add(1);
+            }
+            HistoryEventKind::WorkflowExecutionUpdateRejected { update_id, .. } => {
                 state.pending_updates.remove(update_id);
                 state.admitted_updates.remove(update_id);
             }
@@ -6353,10 +6421,12 @@ fn apply_workflow_command(
                         // request (non-empty handler name), RESURRECT it and
                         // proceed as if admitted (`TryResurrect` rebuilds the
                         // update from `Acceptance.accepted_request`,
-                        // update/registry.go:238-281 @ v1.31.0). Without the
-                        // payload the update is unrecoverable — exact wire
+                        // update/registry.go:238-281 @ v1.31.0), once the total
+                        // limit allows it, which v1.31.0 checks first. Without
+                        // the payload the update is unrecoverable — exact wire
                         // message from
                         // workflow_task_completed_handler.go:381 @ v1.31.0.
+                        builder.resurrect_update(limits.total_updates)?;
                         if update_name.is_empty() {
                             return Err(Reject::BadUpdateMessage {
                                 message: format!(
@@ -6482,6 +6552,9 @@ fn apply_workflow_command(
                                 not_found: false,
                             });
                         }
+                        // `TryResurrect` still makes its total check before it
+                        // finds no request in a Response (criterion 2.13).
+                        builder.check_resurrection(limits.total_updates)?;
                         return Err(Reject::BadUpdateMessage {
                             message: format!(
                                 "update {update_id} wasn't found on the server. This is most \
@@ -6533,8 +6606,15 @@ fn apply_workflow_command(
                     // no-op: v1.31.0 resurrects the update from the
                     // rejection's embedded request and resolves it without
                     // error (TryResurrect, registry.go:455-484), which is
-                    // observably identical to ignoring it.
+                    // observably identical to ignoring it, unless the run is at
+                    // the total limit, which v1.31.0 checks first (criterion
+                    // 2.13).
                     let _ = failure;
+                    if !builder.state.admitted_updates.contains(&update_id)
+                        && !builder.state.pending_updates.contains_key(&update_id)
+                    {
+                        builder.resurrect_update(limits.total_updates)?;
+                    }
                     builder.state.admitted_updates.remove(&update_id);
                     builder.state.pending_updates.remove(&update_id);
                 }
@@ -6761,6 +6841,31 @@ struct TransitionBuilder {
     finishing_from: Option<usize>,
     /// Whether a finishing step is writing events.
     finishing_step: bool,
+    /// The run's updates in flight and completed, as a workflow task's
+    /// completion found them, against which a worker's message about an
+    /// update the run holds neither admitted nor accepted is checked
+    /// (`signal-update-limits` criterion 2.13). Zero outside a completion.
+    resurrection: UpdateSlots,
+}
+
+/// A run's updates in flight, accepted or held, and completed, for the total
+/// limit's check when a completion re-admits an update.
+#[derive(Clone, Copy, Debug, Default)]
+struct UpdateSlots {
+    in_flight: usize,
+    completed: usize,
+}
+
+impl UpdateSlots {
+    /// The slots a completion starts from. `held_updates` is the lane's count
+    /// of the admitted updates whose requests the owner holds; unheld ones
+    /// don't count, as v1.31.0 forgets them on reload.
+    fn at_completion(state: &WorkflowState, held_updates: usize) -> Self {
+        Self {
+            in_flight: held_updates.saturating_add(state.pending_updates.len()),
+            completed: state.completed_update_count as usize,
+        }
+    }
 }
 
 impl TransitionBuilder {
@@ -6785,7 +6890,33 @@ impl TransitionBuilder {
             expected_seq,
             finishing_from: None,
             finishing_step: false,
+            resurrection: UpdateSlots::default(),
         }
+    }
+
+    /// The total limit's check for a worker's message about an update the run
+    /// holds neither admitted nor accepted. v1.31.0 makes it first, whatever
+    /// the message, before it looks for a request to re-admit the update from
+    /// (`TryResurrect`, `update/registry.go:238-249`; its error returns from
+    /// the completion without failing the task because it isn't an
+    /// `InvalidArgument`, `workflow_task_completed_handler.go:367-376,
+    /// 1450-1459 @ v1.31.0`).
+    fn check_resurrection(&self, total_limit: usize) -> Result<(), Reject> {
+        crate::limits::check_update_total(
+            total_limit,
+            self.resurrection.in_flight,
+            self.resurrection.completed,
+        )
+        .map_err(Reject::UpdateLimitExceeded)
+    }
+
+    /// [`Self::check_resurrection`], then count the re-admitted update in
+    /// flight for the rest of the completion, as v1.31.0's registry holds it
+    /// until the completion commits.
+    fn resurrect_update(&mut self, total_limit: usize) -> Result<(), Reject> {
+        self.check_resurrection(total_limit)?;
+        self.resurrection.in_flight = self.resurrection.in_flight.saturating_add(1);
+        Ok(())
     }
 
     /// Track where this transition's finishing events begin. v1.31.0 numbers
@@ -8007,6 +8138,19 @@ pub enum Reject {
     /// in the pending set.
     #[error("duplicate update id: {0}")]
     DuplicateUpdateId(String),
+    /// The run has recorded the signal limit's worth of signals
+    /// (`consts.ErrSignalsLimitExceeded`, `signal_workflow_util.go:53-61 @
+    /// v1.31.0`). The edge answers `InvalidArgument` with
+    /// [`crate::limits::SIGNAL_LIMIT_EXCEEDED_MESSAGE`]; a signal from another
+    /// workflow fails on its sender with `SIGNAL_COUNT_LIMIT_EXCEEDED`
+    /// (`signal-update-limits` criteria 2.1, 2.5).
+    #[error("{}", crate::limits::SIGNAL_LIMIT_EXCEEDED_MESSAGE)]
+    SignalLimitExceeded,
+    /// An update reached one of the run's update limits, at admission or when a
+    /// worker's acceptance or rejection would re-admit it
+    /// (`signal-update-limits` criteria 2.9-2.13).
+    #[error("{0}")]
+    UpdateLimitExceeded(crate::limits::UpdateLimitExceeded),
     /// A `ScheduleNexusOperation` command used an operation ID
     /// that is already in the pending set.
     #[error("duplicate nexus operation id: {0}")]

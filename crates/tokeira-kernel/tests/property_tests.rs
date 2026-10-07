@@ -129,6 +129,7 @@ fn stamp_callback_field_change(
 
 fn make_open_state(now: OffsetDateTime) -> WorkflowState {
     WorkflowState {
+        used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),
@@ -7580,6 +7581,10 @@ proptest! {
         }
         let encoded = serde_json::to_vec(&state).unwrap();
         let decoded: WorkflowState = serde_json::from_slice(&encoded).unwrap();
+        // The storage extension, unlike buffered events, is outside JSON's
+        // positional state. Only the storage codec restores its readiness.
+        prop_assert_eq!(&decoded.used_worker_deployment_versions, &None);
+        state.used_worker_deployment_versions = None;
         prop_assert_eq!(decoded, state);
     }
 }

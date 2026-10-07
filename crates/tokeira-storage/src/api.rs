@@ -773,14 +773,21 @@ pub trait RunRepository: Send + Sync {
 
     /// Load the full durable state for a run, or
     /// [`LoadedRun::Absent`] if the key is unknown.
+    ///
+    /// Authoritative stores return an accumulator ready for a later commit. A
+    /// legacy run is seeded from its latest projection in the same snapshot;
+    /// invalid seed data fails the load. Seeding changes only the returned copy,
+    /// so the latest image remains necessary until readiness is persisted and
+    /// writers that discard the extension have been excluded.
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun>;
 
-    /// Load the run and its persisted history statistics in one repository
-    /// round trip.
+    /// Load the run and its persisted history statistics from one snapshot.
     ///
     /// The authoritative stores read the statistic with the state so the value
     /// handed to a workflow-task start is the one the same commit path
-    /// maintains. Wrappers must forward this method explicitly; the default
+    /// maintains. Legacy accumulator seeding can require additional reads in a
+    /// read-only transaction and has the same guarantees as [`Self::load_run`].
+    /// Wrappers must forward this method explicitly; the default
     /// exists for test doubles and reports a zero statistic.
     async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
         Ok((self.load_run(run_key).await?, RunHistoryStats::default()))
@@ -1027,6 +1034,12 @@ pub trait RunRepository: Send + Sync {
     /// A successful implementation must persist the post-transition state
     /// together with history and derived side effects as one semantic unit, or
     /// fail without partially exposing the result.
+    ///
+    /// An otherwise applying transition must carry a ready projection
+    /// accumulator, initialized by a fresh constructor or [`Self::load_run`].
+    /// Commits never read a preceding image to repair unseeded input. The
+    /// [`CommitResult::Applied`] state includes the folded observations and is
+    /// the state callers must retain for subsequent transitions.
     async fn commit_transition(
         &self,
         run_key: RunKey,
@@ -1041,6 +1054,8 @@ pub trait RunRepository: Send + Sync {
     /// [`RunRepository::commit_transition`] entry point remains for tests and
     /// pre-placement callers, but production routing must carry the bundle that
     /// was resolved from `(namespace_id, workflow_id)`.
+    /// Accumulator admission and returned-state guarantees are identical to
+    /// [`Self::commit_transition`].
     async fn commit_transition_for_bundle(
         &self,
         run_key: RunKey,
@@ -1896,21 +1911,34 @@ fn unix_epoch() -> OffsetDateTime {
     OffsetDateTime::UNIX_EPOCH
 }
 
-/// Build a complete workflow visibility image while retaining projection-owned
-/// historical worker-deployment observations from the preceding image.
+/// Invalid projection readiness or inconsistent legacy seed data.
+#[derive(Debug, Error)]
+pub(crate) enum ProjectionAccumulatorError {
+    /// A commit bypassed the load boundary that seeds legacy state.
+    #[error("run {} has an unseeded projection accumulator; load it through the repository before committing", run_key.0)]
+    Unseeded { run_key: RunKey },
+    /// The image cannot belong to the same storage snapshot as this run.
+    #[error("invalid projection accumulator seed for run {}: {defect}", run_key.0)]
+    InvalidSeed {
+        run_key: RunKey,
+        defect: &'static str,
+    },
+}
+
+/// Prepare the complete image and its durable accumulator on a local state copy.
 ///
-/// `TemporalUsedWorkerDeploymentVersions` is a visibility-only accumulator:
-/// v1.31.0 appends a version only after a WFT completes and preserves every
-/// earlier version (`addUsedDeploymentVersionToLoadedSearchAttribute`,
-/// `service/history/workflow/mutable_state_impl.go @ v1.31.0`). Tokeira keeps
-/// that read-model concern outside the kernel. Storage commits merge the prior
-/// atomically-written projection image so every emitted record remains a full
-/// post-transition snapshot and projection replay stays self-contained.
-pub(crate) fn workflow_projection_context_with_previous(
-    state: &WorkflowState,
-    previous: Option<&ProjectionContext>,
+/// This preserves Tokeira's image derivation at `689e89a8622d114de1dd80232a22bb63705d50d1`,
+/// including inherited versions and reset's fresh projection lineage. It deliberately
+/// does not implement Temporal's completion-only bookkeeping or trimming.
+pub(crate) fn prepare_workflow_projection(
+    state: &mut WorkflowState,
     history_size_bytes: i64,
 ) -> Result<ProjectionContext> {
+    let mut used_versions = state.used_worker_deployment_versions.clone().ok_or(
+        ProjectionAccumulatorError::Unseeded {
+            run_key: state.run_key,
+        },
+    )?;
     let mut context = projection_context(
         state,
         if state.status.is_open() {
@@ -1922,19 +1950,6 @@ pub(crate) fn workflow_projection_context_with_previous(
         false,
         history_size_bytes,
     )?;
-
-    let mut used_versions = previous
-        .and_then(|previous| {
-            previous
-                .search_attributes
-                .0
-                .get("TemporalUsedWorkerDeploymentVersions")
-        })
-        .and_then(|value| match value {
-            SearchAttrValue::KeywordList(values) => Some(values.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
     if let Some(SearchAttrValue::KeywordList(current)) = context
         .search_attributes
         .0
@@ -1946,14 +1961,60 @@ pub(crate) fn workflow_projection_context_with_previous(
             }
         }
     }
+    // An empty accumulated list leaves the raw attribute alone: absent, explicitly
+    // empty and differently typed baseline inputs must remain distinguishable.
     if !used_versions.is_empty() {
         context.search_attributes.0.insert(
             "TemporalUsedWorkerDeploymentVersions".to_owned(),
-            SearchAttrValue::KeywordList(used_versions),
+            SearchAttrValue::KeywordList(used_versions.clone()),
         );
     }
-
+    state.used_worker_deployment_versions = Some(used_versions);
     Ok(context)
+}
+
+/// Seed only an unseeded local copy, validating the image before marking it ready.
+///
+/// Callers must read state and image in one snapshot. Older images are legitimate
+/// predecessors; an image ahead of the state indicates corruption, not an empty seed.
+pub(crate) fn seed_workflow_projection_accumulator(
+    state: &mut WorkflowState,
+    previous: Option<&ProjectionRecord>,
+) -> Result<()> {
+    if state.used_worker_deployment_versions.is_some() {
+        return Ok(());
+    }
+    let mut versions = Vec::new();
+    if let Some(record) = previous {
+        let defect = if record.run_key != state.run_key
+            || record.context.namespace_id != state.namespace_id
+            || record.context.workflow_id != state.workflow_id
+            || record.context.run_id != state.run_id
+        {
+            Some("image belongs to another run")
+        } else if record.transition_seq > state.transition_seq {
+            Some("image sequence is newer than the loaded state")
+        } else {
+            None
+        };
+        if let Some(defect) = defect {
+            return Err(ProjectionAccumulatorError::InvalidSeed {
+                run_key: state.run_key,
+                defect,
+            }
+            .into());
+        }
+        if let Some(SearchAttrValue::KeywordList(values)) = record
+            .context
+            .search_attributes
+            .0
+            .get("TemporalUsedWorkerDeploymentVersions")
+        {
+            versions.clone_from(values);
+        }
+    }
+    state.used_worker_deployment_versions = Some(versions);
+    Ok(())
 }
 
 /// Build the non-queryable high-water visibility image for a deleted run.
@@ -2082,11 +2143,10 @@ fn projection_context(
             if let Some(version) = info.deployment_version.as_ref().filter(|version| {
                 !version.deployment_name.is_empty() && !version.build_id.is_empty()
             }) {
-                // Only a successfully completed WFT populates
-                // `deployment_version`; a start-time pinned override therefore
-                // cannot appear in the used-version index prematurely. Storage
-                // folds this observation into the preceding projection image
-                // above, matching v1.31.0's completion-side update.
+                // Preserve Tokeira's stored-version observation at 689e89a8. Starts
+                // can inherit this value, and reset replay retains only its final
+                // version. Temporal compatibility corrections are separate from
+                // moving the accumulator into durable run state.
                 search_attributes.0.insert(
                     "TemporalUsedWorkerDeploymentVersions".to_owned(),
                     SearchAttrValue::KeywordList(vec![format!(

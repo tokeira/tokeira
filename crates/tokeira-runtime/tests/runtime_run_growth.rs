@@ -9,7 +9,10 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     HistoryEvent, HistoryEventKind, LoadedRun, SignalRequest, StartRequest, Transition,
     WorkflowCommand, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
-    limits::{HISTORY_COUNT_LIMIT_ERROR, HISTORY_SIZE_LIMIT_ERROR, RunLimit, RunLimitExceeded},
+    limits::{
+        HISTORY_COUNT_LIMIT_ERROR, HISTORY_SIZE_LIMIT_ERROR, MUTABLE_STATE_SIZE_LIMIT_ERROR,
+        RunLimit, RunLimitExceeded,
+    },
 };
 use tokeira_runtime::{
     BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
@@ -194,6 +197,78 @@ async fn the_history_count_terminates_the_run_one_write_after_the_limit() -> Res
         }
         other => panic!("expected the termination, got {other:?}"),
     }
+    Ok(())
+}
+
+// Feature: projection-accumulator, Property 8: extension growth follows the existing runtime breach policy.
+#[tokio::test]
+async fn projection_accumulator_growth_breach_terminates_through_the_lane() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = runtime(store.clone());
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("accumulator-growth".into());
+    let CommitResult::Applied { new_state: state } = runtime
+        .start_workflow(start_request(namespace_id, workflow_id.clone()))
+        .await?
+    else {
+        panic!("start")
+    };
+    let mut next = state.clone();
+    next.transition_seq = state.transition_seq.next();
+    next.used_worker_deployment_versions =
+        Some(vec!["v".repeat(MUTABLE_STATE_SIZE_LIMIT_ERROR + 1)]);
+    store
+        .commit_transition(
+            state.run_key,
+            Transition {
+                expected_seq: state.transition_seq,
+                next_state: next,
+                history_events: Default::default(),
+                event_principals: Default::default(),
+                request_dedupe_ops: Default::default(),
+                activity_ops: Default::default(),
+                timer_ops: Default::default(),
+                dispatch_ops: Default::default(),
+                events_numbered_at_close: 0,
+                growth_limits: None,
+            },
+            ShardEpoch::ZERO,
+        )
+        .await?;
+    let error = runtime
+        .signal_workflow(
+            ExecutionRef {
+                namespace_id,
+                workflow_id,
+                run_id: None,
+            },
+            signal_request("growth"),
+        )
+        .await
+        .expect_err("state size refused");
+    assert_eq!(
+        error.downcast_ref::<RunLimitExceeded>().unwrap().limit,
+        RunLimit::StateSize
+    );
+    let LoadedRun::Existing(closed) = store.load_run(state.run_key).await? else {
+        panic!("run")
+    };
+    assert_eq!(closed.status, ExecutionStatus::Terminated);
+    assert_eq!(
+        closed.used_worker_deployment_versions.unwrap()[0].len(),
+        MUTABLE_STATE_SIZE_LIMIT_ERROR + 1
+    );
+    let history = store
+        .read_history(state.run_key, state.last_event_id, 10)
+        .await?;
+    assert!(history.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::WorkflowExecutionTerminated { .. }
+    )));
+    assert!(!history.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::WorkflowExecutionSignaled { .. }
+    )));
     Ok(())
 }
 

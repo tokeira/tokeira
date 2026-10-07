@@ -52,6 +52,7 @@ fn request(id: &str) -> RequestContext {
 fn open_state() -> WorkflowState {
     let now = now();
     WorkflowState {
+        used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),

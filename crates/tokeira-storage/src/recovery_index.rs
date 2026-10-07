@@ -274,6 +274,7 @@ mod tests {
 
     fn sample_state(run_key: RunKey) -> WorkflowState {
         WorkflowState {
+            used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             run_key,
             namespace_id: NamespaceId::new(),

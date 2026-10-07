@@ -302,6 +302,8 @@ impl BasicKernel {
     /// This is intentionally narrower than a full replay engine: it rebuilds
     /// durable kernel state from already-recorded history events, plus the
     /// non-historical envelope fields supplied by [`ReplayContext`].
+    /// Reset starts a new projection lineage: replay leaves deployment observations
+    /// ready empty rather than recovering the predecessor's projection history.
     pub fn replay_history_prefix(
         &self,
         ctx: ReplayContext,
@@ -375,6 +377,7 @@ impl BasicKernel {
             .unwrap_or_else(|| ctx.workflow_id.clone());
         let canonical_root_run_id = root_run_id.unwrap_or(ctx.run_id);
         let mut state = WorkflowState {
+            used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             run_key: ctx.run_key,
             namespace_id: ctx.namespace_id,
@@ -507,6 +510,7 @@ impl BasicKernel {
         let mut completion_callbacks = req.completion_callbacks.clone();
         stamp_callback_registration_times(&mut completion_callbacks, req.now);
         let initial = WorkflowState {
+            used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             run_key: req.run_key,
             namespace_id: req.namespace_id,
@@ -672,6 +676,7 @@ impl BasicKernel {
         let initial_worker_deployment_name =
             initial_worker_deployment_name(req.versioning_override.as_ref());
         let initial = WorkflowState {
+            used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             run_key: req.run_key,
             namespace_id: req.namespace_id,

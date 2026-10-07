@@ -1,4 +1,30 @@
+//! Authoritative run and history loads, including consistent legacy accumulator seeding.
+//! Migration loads reread state and statistics with the seed in one DSQL snapshot;
+//! readiness stays local until a later fenced transition persists it.
+
 use super::*;
+
+const READ_HOT_STATE: &str =
+    "SELECT state_data, history_size_bytes FROM workflow_hot WHERE run_key = $1";
+
+const READ_LEGACY_PROJECTION: &str =
+    "SELECT partition_id, fanout, run_key, transition_seq, context_data
+    FROM projection_log WHERE run_key = $1 ORDER BY transition_seq DESC LIMIT 1";
+
+fn decode_hot_state(
+    run_key: RunKey,
+    row: Option<(Vec<u8>, Option<i64>)>,
+) -> Result<(LoadedRun, RunHistoryStats)> {
+    match row {
+        Some((state_data, history_size_bytes)) => Ok((
+            LoadedRun::Existing(codec::decode_workflow_state(run_key, &state_data)?),
+            RunHistoryStats {
+                history_size_bytes: history_size_bytes.unwrap_or(0),
+            },
+        )),
+        None => Ok((LoadedRun::Absent, RunHistoryStats::default())),
+    }
+}
 
 /// History batches after a cursor, in order, a page at a time, so a history
 /// read fetches only the batches it returns (`history-pagination` criterion 2.3).
@@ -108,24 +134,79 @@ impl DsqlRunRepository {
     ) -> Result<(LoadedRun, crate::RunHistoryStats)> {
         record_dsql_operation!(self, "load_run", Some(self.shard_for_run_key(run_key)), {
             let mut permit = self.director.acquire(DbClass::Read).await?;
-            // One read returns the state and the statistic the same commit
-            // maintained (Requirement 1.8). A NULL column is a row from before
-            // V068 and reads as zero.
-            let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>)>(
-                "SELECT state_data, history_size_bytes FROM workflow_hot WHERE run_key = $1",
-            )
-            .bind(run_key.0)
-            .fetch_optional(permit.connection()?)
-            .await?;
-            match row {
-                Some((state_data, history_size_bytes)) => Ok((
-                    LoadedRun::Existing(codec::decode_workflow_state(run_key, &state_data)?),
-                    crate::RunHistoryStats {
-                        history_size_bytes: history_size_bytes.unwrap_or(0),
-                    },
-                )),
-                None => Ok((LoadedRun::Absent, crate::RunHistoryStats::default())),
+            let connection = permit.connection()?;
+            let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>)>(READ_HOT_STATE)
+                .bind(run_key.0)
+                .fetch_optional(&mut *connection)
+                .await?;
+            let (loaded, stats) = decode_hot_state(run_key, row)?;
+            if !matches!(&loaded, LoadedRun::Existing(state) if state.used_worker_deployment_versions.is_none())
+            {
+                return Ok((loaded, stats));
             }
+
+            // Discard the fast read: beginning a transaction only for the image
+            // would combine snapshots if a concurrent writer committed meanwhile.
+            // Reuse the read permit and never persist readiness from this path.
+            #[cfg(all(test, feature = "dsql-integration"))]
+            super::projection_accumulator_tests::pause(
+                run_key,
+                super::projection_accumulator_tests::LoadStage::BeforeSnapshot,
+            )
+            .await;
+            let mut tx = connection
+                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .await?;
+            let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>)>(READ_HOT_STATE)
+                .bind(run_key.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let (mut loaded, stats) = decode_hot_state(run_key, row)?;
+            #[cfg(all(test, feature = "dsql-integration"))]
+            super::projection_accumulator_tests::pause(
+                run_key,
+                super::projection_accumulator_tests::LoadStage::AfterHotRead,
+            )
+            .await;
+            if let LoadedRun::Existing(state) = &mut loaded
+                && state.used_worker_deployment_versions.is_none()
+            {
+                // Historical rows can belong to a different partition count. Do
+                // not hide newer-than-state rows: the seed validator must see them.
+                let row =
+                    sqlx::query_as::<_, (i32, i16, Uuid, i64, Vec<u8>)>(READ_LEGACY_PROJECTION)
+                        .bind(run_key.0)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .with_context(|| {
+                            format!("read projection accumulator seed for run {}", run_key.0)
+                        })?;
+                let previous = row
+                    .map(
+                        |(partition, fanout, key, seq, data)| -> Result<ProjectionRecord> {
+                            Ok(ProjectionRecord {
+                                partition_id: convert::u32_from_i32(
+                                    partition,
+                                    "projection partition_id",
+                                )?,
+                                fanout: u16::try_from(fanout)?,
+                                run_key: RunKey(key),
+                                transition_seq: TransitionSeq(convert::u64_from_i64(
+                                    seq,
+                                    "projection transition_seq",
+                                )?),
+                                context: codec::decode_projection_context(&data)?,
+                            })
+                        },
+                    )
+                    .transpose()
+                    .with_context(|| {
+                        format!("decode projection accumulator seed for run {}", run_key.0)
+                    })?;
+                seed_workflow_projection_accumulator(state, previous.as_ref())?;
+            }
+            tx.commit().await?;
+            Ok((loaded, stats))
         })
     }
 

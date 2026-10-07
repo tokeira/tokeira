@@ -2854,6 +2854,7 @@ mod tests {
     fn sample_state(run_key: RunKey) -> WorkflowState {
         let namespace_id = NamespaceId::new();
         WorkflowState {
+            used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             run_key,
             namespace_id,
@@ -3057,6 +3058,124 @@ mod tests {
         let (load_calls, commit_calls, _) = repo.snapshot().await;
         assert_eq!(load_calls, 1);
         assert_eq!(commit_calls, 2);
+    }
+
+    // Feature: projection-accumulator, Property 2: complete baseline image equivalence
+    // Feature: projection-accumulator, Property 7: failure isolation and existing commit contract
+    // Cache the persisted winner and discard every losing local fold.
+    #[tokio::test]
+    async fn projection_accumulator_lane_seeds_reloads_and_caches_committed_state() {
+        let key = RunKey::new();
+        let repo = tokeira_storage::InMemoryStore::default();
+        let mut state = sample_state(key);
+        state.transition_seq = DurableTransitionSeq(1);
+        crate::projection_accumulator_tests::commit_state(&repo, state, DurableTransitionSeq::ZERO)
+            .await;
+        let repo =
+            crate::projection_accumulator_tests::legacy_copy(&repo, key, vec!["legacy".into()])
+                .await;
+        let before_noop = repo.snapshot().await.unwrap();
+        let config = LaneConfig::default();
+        let owner = test_shard_owner();
+        let noop = MockKernel::new(SmallVec::new()).with_noop();
+        handle_message(
+            &noop,
+            &repo,
+            &owner,
+            key,
+            sample_command("seed-only"),
+            &config,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(repo.snapshot().await.unwrap(), before_noop);
+
+        let kernel = MockKernel::new(SmallVec::new());
+        let mut cache = LaneCache::new(&config);
+        let (result, _, _) = handle_message_with_cache(
+            &kernel,
+            &repo,
+            &owner,
+            key,
+            sample_command("cold"),
+            &config,
+            2,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        let CommitResult::Applied { new_state: first } = result else {
+            panic!("cold commit")
+        };
+        assert_eq!(
+            first.used_worker_deployment_versions,
+            Some(vec!["legacy".into()])
+        );
+        assert_eq!(cache.get(key), Some(LoadedRun::Existing(first.clone())));
+
+        let mut winner = first.clone();
+        winner.transition_seq = first.transition_seq.next();
+        winner
+            .used_worker_deployment_versions
+            .as_mut()
+            .unwrap()
+            .push("winner".into());
+        crate::projection_accumulator_tests::commit_state(&repo, winner, first.transition_seq)
+            .await;
+        let LoadedRun::Existing(mut loser) = cache.get(key).unwrap() else {
+            panic!("cache")
+        };
+        loser
+            .used_worker_deployment_versions
+            .as_mut()
+            .unwrap()
+            .push("loser".into());
+        cache.insert(key, LoadedRun::Existing(loser));
+        let (result, _, _) = handle_message_with_cache(
+            &kernel,
+            &repo,
+            &owner,
+            key,
+            sample_command("occ"),
+            &config,
+            2,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        let CommitResult::Applied { new_state } = result else {
+            panic!("retry commit")
+        };
+        assert_eq!(
+            new_state.used_worker_deployment_versions,
+            Some(vec!["legacy".into(), "winner".into()])
+        );
+        assert_eq!(cache.get(key), Some(LoadedRun::Existing(new_state.clone())));
+        assert_eq!(
+            repo.load_run(key).await.unwrap(),
+            LoadedRun::Existing(new_state)
+        );
+        cache.evict(key);
+        let (result, _, _) = handle_message_with_cache(
+            &kernel,
+            &repo,
+            &owner,
+            key,
+            sample_command("evicted"),
+            &config,
+            2,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        let CommitResult::Applied { new_state } = result else {
+            panic!("evicted commit")
+        };
+        assert_eq!(
+            new_state.used_worker_deployment_versions,
+            Some(vec!["legacy".into(), "winner".into()])
+        );
     }
 
     #[tokio::test]

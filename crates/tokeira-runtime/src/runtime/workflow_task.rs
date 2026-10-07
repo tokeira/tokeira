@@ -2781,6 +2781,37 @@ pub(crate) mod tests {
         ]
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: projection-accumulator, Property 3: new run boundaries
+        // Actual successor routing helpers inherit routing only, never another run's accumulation.
+        #[test]
+        fn projection_accumulator_successor_routing_starts_ready_empty(
+            values in prop::collection::vec("[ab]{0,12}", 0..32),
+            case in arb_continue_as_new_source_case(),
+            initial in arb_continue_as_new_initial_behavior(),
+        ) {
+            let mut parent = open_state("accumulator-parent".into(), continue_as_new_source_info(case, 3, None, None));
+            parent.used_worker_deployment_versions = Some(values.clone());
+            let policy = RetryPolicy { initial_interval: Duration::seconds(1), backoff_coefficient: 1.0, maximum_interval: None, maximum_attempts: 3, non_retryable_error_types: Vec::new() };
+            let retry = build_retry_successor_start(&parent, parent.versioning_info.as_ref(), &policy, Payloads::default(), RunId::new());
+            let cron = build_cron_successor_start(&parent, "* * * * *".into(), Payloads::default(), RunId::new(), now(), now(), None, None).unwrap();
+            let mut continued = retry.clone();
+            continued.inherited_versioning_info = resolve_continue_as_new_versioning(&parent, &parent.task_queue, initial, true, true);
+            let mut child = retry.clone();
+            child.parent_run_key = Some(parent.run_key);
+            child.parent_workflow_id = Some(parent.workflow_id.clone());
+            child.parent_run_id = Some(parent.run_id);
+            child.inherited_versioning_info = resolve_child_versioning(&parent, &parent.task_queue, true, true, true);
+            for start in [retry, cron, continued, child] {
+                let transition = BasicKernel.apply(LoadedRun::Absent, Command::Start(start)).unwrap();
+                prop_assert_eq!(transition.next_state.used_worker_deployment_versions, Some(Vec::new()));
+            }
+            prop_assert_eq!(parent.used_worker_deployment_versions, Some(values));
+        }
+    }
+
     fn arb_versioning_behavior() -> impl Strategy<Value = VersioningBehavior> {
         prop_oneof![
             Just(VersioningBehavior::Unspecified),
@@ -3135,6 +3166,7 @@ pub(crate) mod tests {
         info: Option<WorkflowVersioningInfo>,
     ) -> WorkflowState {
         WorkflowState {
+            used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),

@@ -35,6 +35,7 @@ fn kernel() -> BasicKernel {
 
 fn open_state() -> WorkflowState {
     WorkflowState {
+        used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),

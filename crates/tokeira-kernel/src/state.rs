@@ -54,6 +54,14 @@ pub struct WorkflowState {
     #[serde(default)]
     pub worker_deployment_name: Option<String>,
 
+    /// Previous committed projection's ordered deployment observations.
+    ///
+    /// `None` requires repository seeding; `Some(empty)` is ready and deliberately
+    /// empty. Storage alone folds observations and persists extension tag 3, so
+    /// compaction and routing inheritance cannot discard or copy this run's list.
+    #[serde(skip)]
+    pub used_worker_deployment_versions: Option<Vec<String>>,
+
     /// Current lifecycle status (Running, Paused, or a
     /// terminal state).
     pub status: ExecutionStatus,
@@ -1435,6 +1443,7 @@ pub(crate) mod tests {
 
     pub(crate) fn open_state() -> WorkflowState {
         WorkflowState {
+            used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),

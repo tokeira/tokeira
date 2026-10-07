@@ -30,6 +30,7 @@
 )]
 
 pub mod conversions;
+pub mod failure_limits;
 pub mod internal;
 pub mod public;
 

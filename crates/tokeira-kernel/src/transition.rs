@@ -10,6 +10,7 @@ use tokeira_types::{
 use crate::{
     command::WorkflowIdReusePolicy,
     event::HistoryEvent,
+    limits::RunGrowthLimits,
     state::{ActivityState, CompletionCallback, Priority, TimerState, WorkflowState},
 };
 
@@ -45,6 +46,14 @@ pub struct Transition {
     /// Side-effect dispatch operations (task enqueue, child
     /// start, external signal, etc.).
     pub dispatch_ops: SmallVec<[DispatchOp; 4]>,
+    /// How many of `history_events`, at its end, Temporal v1.31.0 numbers only
+    /// when it finishes the write, after its growth checks. The history count
+    /// check leaves them out (`run-growth-limits` criterion 2.2).
+    pub events_numbered_at_close: u32,
+    /// The limits a store checks this commit's growth against. The kernel
+    /// leaves them empty and the runtime sets them before it commits; a commit
+    /// without them isn't checked (`run-growth-limits`).
+    pub growth_limits: Option<RunGrowthLimits>,
 }
 
 impl Transition {

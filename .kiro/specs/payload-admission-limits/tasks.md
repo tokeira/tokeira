@@ -9,11 +9,11 @@ Check every payload a request carries against v1.31.0's limits at the edge, on t
 - [x] 1. Limits
   - [x] 1.1 Add `crates/tokeira-edge/src/grpc/payload_limits.rs` with v1.31.0's values behind accessors, `blob_exceeds_limit`, `standalone_blob_exceeds_limit`, `memo_exceeds_limit`, `check_search_attribute_count` and `check_search_attribute_sizes`, and `check_blob` and `check_start_payloads` for client calls
     - _Requirements: 2.3, 2.10, 2.11, 2.12_
-  - [x] 1.2 Add `server_failure` and `truncate_failure`, a port of `TruncateWithDepth`, with `oversized_failure`, `oversized_replacement` and `limit_activity_failure` to apply them
+  - [x] 1.2 Add `server_failure` and `truncate_failure`, which cuts a failure down to fit a limit, with `oversized_failure`, `oversized_replacement` and `limit_activity_failure` to apply them
     - _Requirements: 2.6_
   - [x] 1.3 Write property tests for Properties 1 and 2
     - **Property 1: The limits match v1.31.0's**
-    - **Property 2: Truncation matches v1.31.0's**
+    - **Property 2: A truncated failure fits its limit**
     - **Validates: Requirements 2.3, 2.6, 2.10**
 
 - [x] 2. Client calls

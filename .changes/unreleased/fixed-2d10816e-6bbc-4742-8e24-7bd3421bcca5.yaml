@@ -1,0 +1,5 @@
+kind: fixed
+body: A run over Temporal's history, history batch or state limits is now terminated, as Temporal does; buffered events and stored activity failures are bounded too.
+time: 2026-10-06T23:45:51.000000+01:00
+custom:
+    Slice: 2d10816e-6bbc-4742-8e24-7bd3421bcca5

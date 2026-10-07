@@ -21,6 +21,8 @@ use tokeira_kernel::limits::{
 };
 use tokeira_proto::{
     conversions::ProtoConversionError,
+    // v1.31.0's replacement for an oversized failure, shared with the runtime.
+    failure_limits,
     public::temporal::api::{common::v1 as proto_common, failure::v1 as failure_proto},
 };
 use tracing::warn;
@@ -31,16 +33,10 @@ pub(crate) const BLOB_SIZE_EXCEEDS_LIMIT: &str = "Blob data size exceeds limit."
 pub(crate) const MEMO_SIZE_EXCEEDS_LIMIT: &str = "Memo size exceeds limit.";
 /// `common.FailureReasonCompleteResultExceedsLimit` (`common/util.go:97 @ v1.31.0`).
 pub(crate) const COMPLETE_RESULT_EXCEEDS_LIMIT: &str = "Complete result exceeds size limit.";
-/// `common.FailureReasonFailureExceedsLimit` (`common/util.go:99 @ v1.31.0`).
-pub(crate) const FAILURE_EXCEEDS_LIMIT: &str = "Failure exceeds size limit.";
 /// `common.FailureReasonCancelDetailsExceedsLimit` (`common/util.go:101 @ v1.31.0`).
 pub(crate) const CANCEL_DETAILS_EXCEED_LIMIT: &str = "Cancel details exceed size limit.";
 /// `common.FailureReasonHeartbeatExceedsLimit` (`common/util.go:103 @ v1.31.0`).
 pub(crate) const HEARTBEAT_DETAILS_EXCEED_LIMIT: &str = "Heartbeat details exceed size limit.";
-
-/// The depth `failure.Truncate` follows causes to
-/// (`common/failure/failure.go:48-50 @ v1.31.0`).
-const FAILURE_TRUNCATION_DEPTH: u32 = 20;
 
 #[cfg(feature = "conformance")]
 fn harness_override(key: &str, default: usize) -> usize {
@@ -282,108 +278,15 @@ pub(crate) fn oversized_replacement(
 /// A non-retryable server failure (`failure.NewServerFailure`,
 /// `common/failure/failure.go:14-23 @ v1.31.0`).
 pub(crate) fn server_failure(message: &str) -> failure_proto::Failure {
-    failure_proto::Failure {
-        message: message.to_owned(),
-        failure_info: Some(failure_proto::failure::FailureInfo::ServerFailureInfo(
-            failure_proto::ServerFailureInfo {
-                non_retryable: true,
-            },
-        )),
-        ..Default::default()
-    }
+    failure_limits::server_failure(message, true)
 }
 
 /// What v1.31.0 records in place of a failure over the blob size limit: a
-/// server failure whose cause is the original truncated to the warn limit
-/// (`service/frontend/workflow_handler.go:1231-1245, 1824-1838 @ v1.31.0`).
+/// non-retryable server failure whose cause is the original cut down to fit
+/// the warn limit (`service/frontend/workflow_handler.go:1231-1245, 1824-1838
+/// @ v1.31.0`).
 pub(crate) fn oversized_failure(original: &failure_proto::Failure) -> failure_proto::Failure {
-    let mut failure = server_failure(FAILURE_EXCEEDS_LIMIT);
-    let max_size = i64::try_from(blob_size_limit_warn()).unwrap_or(i64::MAX);
-    failure.cause = Some(Box::new(truncate_failure(original, max_size)));
-    failure
-}
-
-/// A port of `failure.TruncateWithDepth` with a depth of 20
-/// (`common/failure/failure.go:48-95 @ v1.31.0`).
-pub(crate) fn truncate_failure(
-    failure: &failure_proto::Failure,
-    max_size: i64,
-) -> failure_proto::Failure {
-    truncate_failure_with_depth(failure, max_size, FAILURE_TRUNCATION_DEPTH)
-}
-
-/// One field's share of the budget: bytes go to earlier calls first, so fields
-/// are cut in order of importance, each charged 4 bytes of proto overhead
-/// when non-empty.
-fn truncate_field(text: &str, max_size: &mut i64) -> String {
-    let kept = truncate_utf8(text, *max_size).to_owned();
-    *max_size -= i64::try_from(kept.len()).unwrap_or(i64::MAX);
-    if !kept.is_empty() {
-        *max_size -= 4;
-    }
-    kept
-}
-
-fn truncate_failure_with_depth(
-    failure: &failure_proto::Failure,
-    mut max_size: i64,
-    max_depth: u32,
-) -> failure_proto::Failure {
-    let mut truncated = failure_proto::Failure::default();
-    // Application and server failure info keep their non-retryable flag.
-    match &failure.failure_info {
-        Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(info)) => {
-            let r#type = truncate_field(&info.r#type, &mut max_size);
-            truncated.failure_info =
-                Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
-                    failure_proto::ApplicationFailureInfo {
-                        non_retryable: info.non_retryable,
-                        r#type,
-                        ..Default::default()
-                    },
-                ));
-            max_size -= 8;
-        }
-        Some(failure_proto::failure::FailureInfo::ServerFailureInfo(info)) => {
-            truncated.failure_info = Some(failure_proto::failure::FailureInfo::ServerFailureInfo(
-                failure_proto::ServerFailureInfo {
-                    non_retryable: info.non_retryable,
-                },
-            ));
-            max_size -= 4;
-        }
-        _ => {}
-    }
-    truncated.source = truncate_field(&failure.source, &mut max_size);
-    truncated.message = truncate_field(&failure.message, &mut max_size);
-    truncated.stack_trace = truncate_field(&failure.stack_trace, &mut max_size);
-    if let Some(cause) = &failure.cause
-        && max_size > 4
-        && max_depth > 0
-    {
-        truncated.cause = Some(Box::new(truncate_failure_with_depth(
-            cause,
-            max_size - 4,
-            max_depth - 1,
-        )));
-    }
-    truncated
-}
-
-/// `util.TruncateUTF8`: at most `max_bytes` bytes, cut back to a character
-/// boundary (`common/util/strings.go:9-19 @ v1.31.0`).
-fn truncate_utf8(text: &str, max_bytes: i64) -> &str {
-    let Ok(max_bytes) = usize::try_from(max_bytes) else {
-        return "";
-    };
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
+    failure_limits::oversized_failure(original, blob_size_limit_warn(), true)
 }
 
 #[cfg(test)]
@@ -393,7 +296,10 @@ mod tests {
 
     use super::*;
     use crate::grpc::translate;
-    use tokeira_proto::workflowservice;
+    use tokeira_proto::{
+        failure_limits::{FAILURE_EXCEEDS_LIMIT, truncate_failure},
+        workflowservice,
+    };
 
     fn payload(data_len: usize) -> proto_common::Payload {
         proto_common::Payload {
@@ -519,75 +425,6 @@ mod tests {
         );
     }
 
-    /// A transcription of `failure.TruncateWithDepth`, written apart from the
-    /// port above so a slip in one shows as a disagreement
-    /// (`common/failure/failure.go:52-95 @ v1.31.0`).
-    fn reference_truncate(
-        f: &failure_proto::Failure,
-        max_size: i64,
-        max_depth: i64,
-    ) -> failure_proto::Failure {
-        fn cut(s: &str, n: i64) -> String {
-            if (s.len() as i64) <= n {
-                return s.to_owned();
-            }
-            if n <= 0 {
-                return String::new();
-            }
-            let mut end = n as usize;
-            while end > 0 && (s.as_bytes()[end] & 0xC0) == 0x80 {
-                end -= 1;
-            }
-            s[..end].to_owned()
-        }
-        let mut budget = max_size;
-        let take = |s: &str, budget: &mut i64| {
-            let kept = cut(s, *budget);
-            *budget -= kept.len() as i64;
-            if !kept.is_empty() {
-                *budget -= 4;
-            }
-            kept
-        };
-        let mut out = failure_proto::Failure::default();
-        if let Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(info)) =
-            &f.failure_info
-        {
-            let kept_type = take(&info.r#type, &mut budget);
-            out.failure_info = Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
-                failure_proto::ApplicationFailureInfo {
-                    non_retryable: info.non_retryable,
-                    r#type: kept_type,
-                    ..Default::default()
-                },
-            ));
-            budget -= 8;
-        } else if let Some(failure_proto::failure::FailureInfo::ServerFailureInfo(info)) =
-            &f.failure_info
-        {
-            out.failure_info = Some(failure_proto::failure::FailureInfo::ServerFailureInfo(
-                failure_proto::ServerFailureInfo {
-                    non_retryable: info.non_retryable,
-                },
-            ));
-            budget -= 4;
-        }
-        out.source = take(&f.source, &mut budget);
-        out.message = take(&f.message, &mut budget);
-        out.stack_trace = take(&f.stack_trace, &mut budget);
-        if let Some(cause) = &f.cause
-            && budget > 4
-            && max_depth > 0
-        {
-            out.cause = Some(Box::new(reference_truncate(
-                cause,
-                budget - 4,
-                max_depth - 1,
-            )));
-        }
-        out
-    }
-
     fn arb_failure() -> impl Strategy<Value = failure_proto::Failure> {
         let text = "[a-zé€😀 ]{0,40}";
         let info = prop_oneof![
@@ -635,16 +472,179 @@ mod tests {
         })
     }
 
-    // Feature: payload-admission-limits, Property 2: Truncation matches v1.31.0's
+    /// A cut-down failure's text fields in the order they are filled: an
+    /// application failure's type, the source, the message and the stack
+    /// trace.
+    fn text_fields(failure: &failure_proto::Failure) -> Vec<&str> {
+        let mut fields = Vec::new();
+        if let Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(info)) =
+            &failure.failure_info
+        {
+            fields.push(info.r#type.as_str());
+        }
+        fields.extend([
+            failure.source.as_str(),
+            failure.message.as_str(),
+            failure.stack_trace.as_str(),
+        ]);
+        fields
+    }
+
+    /// `failure` with its text field at `index`, in [`text_fields`] order, set
+    /// to `text`.
+    fn with_text_field(
+        failure: &failure_proto::Failure,
+        index: usize,
+        text: &str,
+    ) -> failure_proto::Failure {
+        let mut changed = failure.clone();
+        let offset = match &mut changed.failure_info {
+            Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(info)) => {
+                if index == 0 {
+                    info.r#type = text.to_owned();
+                    return changed;
+                }
+                1
+            }
+            _ => 0,
+        };
+        match index - offset {
+            0 => changed.source = text.to_owned(),
+            1 => changed.message = text.to_owned(),
+            _ => changed.stack_trace = text.to_owned(),
+        }
+        changed
+    }
+
+    /// Whether `failure`, and its causes to a depth of twenty, carry nothing a
+    /// cut-down failure drops.
+    fn nothing_to_drop(failure: &failure_proto::Failure, depth: usize) -> bool {
+        matches!(
+            failure.failure_info,
+            None | Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                _
+            )) | Some(failure_proto::failure::FailureInfo::ServerFailureInfo(_))
+        ) && failure
+            .cause
+            .as_deref()
+            .is_none_or(|cause| depth < 20 && nothing_to_drop(cause, depth + 1))
+    }
+
+    /// `failure` with the text field at `index` of its cause `depth` deep set
+    /// to `text`.
+    fn with_nested_text_field(
+        failure: &failure_proto::Failure,
+        depth: usize,
+        index: usize,
+        text: &str,
+    ) -> failure_proto::Failure {
+        if depth == 0 {
+            return with_text_field(failure, index, text);
+        }
+        let mut changed = failure.clone();
+        let cause = failure.cause.as_deref().expect("the cause is kept");
+        changed.cause = Some(Box::new(with_nested_text_field(
+            cause,
+            depth - 1,
+            index,
+            text,
+        )));
+        changed
+    }
+
+    /// Check that `cut` is `original` cut down to `limit`, as the truncation
+    /// promises: it fits, and at each depth an application or server failure
+    /// keeps its kind and flag, each field is a prefix of the original's,
+    /// filled in order, the first cut one holding as much as fits and every
+    /// later one empty, and a cause is kept only when every field is whole.
+    fn check_cut(
+        original: &failure_proto::Failure,
+        cut: &failure_proto::Failure,
+        limit: usize,
+    ) -> Result<(), TestCaseError> {
+        use failure_proto::failure::FailureInfo as Info;
+        prop_assert!(
+            cut.encoded_len() <= limit,
+            "{} > {limit}",
+            cut.encoded_len()
+        );
+        if *cut == failure_proto::Failure::default() {
+            return Ok(());
+        }
+        let (mut was, mut is, mut depth) = (original, cut, 0);
+        loop {
+            match (&was.failure_info, &is.failure_info) {
+                (
+                    Some(Info::ApplicationFailureInfo(was_info)),
+                    Some(Info::ApplicationFailureInfo(is_info)),
+                ) => prop_assert_eq!(was_info.non_retryable, is_info.non_retryable),
+                (
+                    Some(Info::ServerFailureInfo(was_info)),
+                    Some(Info::ServerFailureInfo(is_info)),
+                ) => {
+                    prop_assert_eq!(was_info.non_retryable, is_info.non_retryable);
+                }
+                (Some(Info::ApplicationFailureInfo(_)) | Some(Info::ServerFailureInfo(_)), _)
+                | (_, Some(_)) => prop_assert!(
+                    false,
+                    "kind {:?} kept as {:?}",
+                    was.failure_info,
+                    is.failure_info
+                ),
+                (_, None) => {}
+            }
+            let mut cut_field = false;
+            for (index, (was_text, is_text)) in
+                text_fields(was).iter().zip(text_fields(is)).enumerate()
+            {
+                if cut_field {
+                    prop_assert!(is_text.is_empty(), "field {index} kept after a cut");
+                    continue;
+                }
+                prop_assert!(
+                    was_text.starts_with(is_text),
+                    "field {index} {is_text:?} isn't a prefix of {was_text:?}"
+                );
+                if *was_text != is_text {
+                    cut_field = true;
+                    // One more character anywhere would overflow the limit.
+                    let next = was_text[is_text.len()..]
+                        .chars()
+                        .next()
+                        .expect("a cut field has more");
+                    let longer =
+                        with_nested_text_field(cut, depth, index, &format!("{is_text}{next}"));
+                    prop_assert!(
+                        longer.encoded_len() > limit,
+                        "field {index}, {depth} causes deep, could hold more"
+                    );
+                }
+            }
+            match (&was.cause, &is.cause) {
+                (Some(was_cause), Some(is_cause)) => {
+                    prop_assert!(!cut_field, "a cause kept after a cut");
+                    (was, is, depth) = (was_cause, is_cause, depth + 1);
+                }
+                (None, Some(_)) => prop_assert!(false, "a cause appeared"),
+                (_, None) => return Ok(()),
+            }
+        }
+    }
+
+    // Feature: payload-admission-limits, Property 2: A truncated failure fits its limit
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
         #[test]
-        fn property_truncation_matches_v1_31(failure in arb_failure(), max_size in -8i64..400) {
-            prop_assert_eq!(
-                truncate_failure(&failure, max_size),
-                reference_truncate(&failure, max_size, 20)
-            );
+        fn property_a_truncated_failure_fits_its_limit(
+            failure in arb_failure(),
+            limit in prop_oneof![0usize..400, 0usize..4000],
+        ) {
+            let cut = truncate_failure(&failure, limit);
+            check_cut(&failure, &cut, limit)?;
+            if nothing_to_drop(&failure, 0) && failure.encoded_len() <= limit {
+                prop_assert_eq!(cut, failure);
+            }
         }
     }
 
@@ -654,8 +654,19 @@ mod tests {
             message: "héllo".to_owned(),
             ..Default::default()
         };
-        // Two bytes would split the é, so only the h fits.
-        assert_eq!(truncate_failure(&accented, 2).message, "h");
+        // Four bytes hold the message's tag, its length and two bytes of
+        // text, which would split the é, so only the h fits.
+        assert_eq!(truncate_failure(&accented, 4).message, "h");
+
+        // Cutting a long message shortens its length prefix too, which frees
+        // a byte for one more character.
+        let long = failure_proto::Failure {
+            message: "x".repeat(200),
+            ..Default::default()
+        };
+        let cut = truncate_failure(&long, 103);
+        assert_eq!(cut.message.len(), 101);
+        assert_eq!(cut.encoded_len(), 103);
 
         let mut chain = failure_proto::Failure {
             message: "level-25".to_owned(),
@@ -708,9 +719,12 @@ mod tests {
                 }
             ))
         ));
+        // The replacement fits the warn limit, with as much of the original's
+        // message as fits.
+        assert!(recorded.encoded_len() <= 512 * 1024);
         let cause = recorded.cause.expect("the original is kept as the cause");
-        assert_eq!(*cause, truncate_failure(&original, 512 * 1024));
-        assert!(cause.encoded_len() <= 512 * 1024);
+        assert!(cause.message.len() > 500 * 1024);
+        assert!(original.message.starts_with(&cause.message));
 
         // Within the limits nothing changes.
         let mut small = Some(original.clone());

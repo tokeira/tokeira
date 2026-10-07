@@ -152,6 +152,25 @@ pub fn encode_workflow_state(state: &WorkflowState) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The size [`encode_workflow_state`] writes for `state`, measured without
+/// encoding the state.
+pub fn workflow_state_encoded_len(state: &WorkflowState) -> Result<usize> {
+    let enveloped =
+        postcard::experimental::serialized_size(&(WORKFLOW_STATE_ENVELOPE_VERSION, state))?;
+    Ok(enveloped + encode_state_extension(state)?.len())
+}
+
+/// The measured state of `run-growth-limits` (criterion 2.9): the state's
+/// encoded size less each activity's encoded input, which v1.31.0 keeps only in
+/// history. An input encodes inside the state exactly as it does alone.
+pub fn measured_state_len(encoded_state_len: usize, state: &WorkflowState) -> Result<usize> {
+    let mut inputs = 0usize;
+    for activity in state.activities.values() {
+        inputs = inputs.saturating_add(postcard::experimental::serialized_size(&activity.input)?);
+    }
+    Ok(encoded_state_len.saturating_sub(inputs))
+}
+
 /// Deserialize the authoritative hot-state snapshot for one run.
 ///
 /// Returns [`BlobFormatError`] for a blob without the envelope and

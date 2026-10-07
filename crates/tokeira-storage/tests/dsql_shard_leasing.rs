@@ -313,6 +313,8 @@ fn sample_transition(run_key: RunKey) -> Transition {
         activity_ops: Default::default(),
         timer_ops: Default::default(),
         dispatch_ops: Default::default(),
+        events_numbered_at_close: 0,
+        growth_limits: None,
     }
 }
 

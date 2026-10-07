@@ -311,6 +311,19 @@ async fn write_transition(
     let events_data = (!transition.history_events.is_empty())
         .then(|| codec::encode_history_events(&transition.history_events))
         .transpose()?;
+    // The state is encoded once, to measure and to write.
+    let state_data = codec::encode_workflow_state(state)?;
+    // The growth checks run before the first write, so a refused commit rolls
+    // back with nothing written (`run-growth-limits`).
+    crate::growth::check_commit(
+        run_key,
+        transition,
+        crate::growth::CommitMeasures {
+            prior_history_size: prior_history_size_bytes,
+            measured_state_size: codec::measured_state_len(state_data.len(), state)?,
+            batch_size: events_data.as_ref().map_or(0, Vec::len),
+        },
+    )?;
     let history_size_bytes = prior_history_size_bytes.saturating_add(
         events_data
             .as_ref()
@@ -321,7 +334,15 @@ async fn write_transition(
     // every side table from the same transition/state pair. History remains the
     // authority; side tables are rebuildable projections that make dispatch and
     // sweep queries efficient.
-    insert_workflow_hot(tx, run_key, shard_id, state, history_size_bytes).await?;
+    insert_workflow_hot(
+        tx,
+        run_key,
+        shard_id,
+        state,
+        &state_data,
+        history_size_bytes,
+    )
+    .await?;
     if let Some(events_data) = events_data {
         insert_history_batch(
             tx,
@@ -486,6 +507,7 @@ pub(super) async fn insert_workflow_hot(
     run_key: RunKey,
     shard_id: ShardId,
     state: &WorkflowState,
+    state_data: &[u8],
     history_size_bytes: i64,
 ) -> Result<()> {
     // `workflow_hot` is a materialized snapshot for recovery and read paths.
@@ -500,7 +522,7 @@ pub(super) async fn insert_workflow_hot(
             state.transition_seq.0,
             "transition_seq",
         )?)
-        .bind(codec::encode_workflow_state(state)?)
+        .bind(state_data)
         .bind(history_size_bytes)
         .bind(recovery_needed(state))
         .execute(&mut **tx)

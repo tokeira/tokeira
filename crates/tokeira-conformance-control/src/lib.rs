@@ -151,7 +151,6 @@ mod tests {
         for key in [
             "nope.not.a.key",                         // unknown
             "history.workflowIdReuseMinimalInterval", // kernel-excluded
-            "limit.historySize.error",                // not-enforced
         ] {
             let err = overrides
                 .set(key, OverrideValue::Int(1))

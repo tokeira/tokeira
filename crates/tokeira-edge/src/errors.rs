@@ -336,6 +336,12 @@ impl From<anyhow::Error> for EdgeError {
         if let Some(invalid) = value.downcast_ref::<tokeira_runtime::InvalidWorkflowCommand>() {
             return Self::BadRequest(invalid.message.clone());
         }
+        // A commit refused for one of a run's growth limits answers
+        // INVALID_ARGUMENT with v1.31.0's message (`service/history/consts/
+        // const.go:81-85`; `service/history/handler.go:2309-2310 @ v1.31.0`).
+        if let Some(breach) = value.downcast_ref::<tokeira_kernel::limits::RunLimitExceeded>() {
+            return Self::BadRequest(breach.message.clone());
+        }
         // Query pre-dispatch guards surface v1.31.0's WorkflowNotReady
         // (queryworkflow/api.go:116-143).
         if let Some(not_ready) = value.downcast_ref::<tokeira_runtime::WorkflowNotReady>() {
@@ -469,6 +475,26 @@ mod tests {
         assert_eq!(
             message,
             "cannot attach more than 1 callbacks to a workflow (1 callbacks already attached)"
+        );
+    }
+
+    #[test]
+    fn a_growth_limit_breach_is_an_invalid_argument() {
+        use tokeira_kernel::limits::{RunLimit, RunLimitExceeded};
+
+        let error = anyhow::Error::new(RunLimitExceeded::of(RunLimit::HistorySize));
+        let EdgeError::BadRequest(message) = EdgeError::from(error) else {
+            panic!("a growth limit breach must map to a bad request");
+        };
+        assert_eq!(message, "Workflow history size exceeds limit.");
+
+        let error = anyhow::Error::new(RunLimitExceeded::transaction_size(5, 4));
+        let EdgeError::BadRequest(message) = EdgeError::from(error) else {
+            panic!("a growth limit breach must map to a bad request");
+        };
+        assert_eq!(
+            message,
+            "transaction size of 5 bytes exceeds limit of 4 bytes"
         );
     }
 }

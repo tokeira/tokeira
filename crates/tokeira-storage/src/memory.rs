@@ -1130,18 +1130,36 @@ impl RunRepository for InMemoryStore {
             }
         }
 
+        let prior_history_size = store.history_size.get(&run_key).copied().unwrap_or(0);
+        let appended = if transition.history_events.is_empty() {
+            0
+        } else {
+            crate::codec::history_batch_encoded_len(&transition.history_events)?
+        };
+        // The growth checks run before the first change, so a refused commit
+        // leaves the run as it was. The state is measured as DSQL stores it
+        // (`run-growth-limits`).
+        if transition.growth_limits.is_some() {
+            let measured_state_size = crate::codec::measured_state_len(
+                crate::codec::workflow_state_encoded_len(&state)?,
+                &state,
+            )?;
+            crate::growth::check_commit(
+                run_key,
+                &transition,
+                crate::growth::CommitMeasures {
+                    prior_history_size,
+                    measured_state_size,
+                    batch_size: usize::try_from(appended).unwrap_or(usize::MAX),
+                },
+            )?;
+        }
         // The History Size advances with the batch it accounts for, under the
         // same lock acquisition, exactly as the DSQL commit writes the column
         // in the transaction that inserts the batch (Requirement 1.1). A
         // transition without events leaves it unchanged.
         let history_size_bytes = {
-            let prior = store.history_size.get(&run_key).copied().unwrap_or(0);
-            let appended = if transition.history_events.is_empty() {
-                0
-            } else {
-                crate::codec::history_batch_encoded_len(&transition.history_events)?
-            };
-            let total = prior.saturating_add(appended);
+            let total = prior_history_size.saturating_add(appended);
             store.history_size.insert(run_key, total);
             total
         };
@@ -2885,6 +2903,8 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
+            events_numbered_at_close: 0,
+            growth_limits: None,
         }
     }
 
@@ -2957,6 +2977,8 @@ mod tests {
                                 activity_ops: Default::default(),
                                 timer_ops: Default::default(),
                                 dispatch_ops: Default::default(),
+                                events_numbered_at_close: 0,
+                                growth_limits: None,
                             },
                             ShardEpoch::ZERO,
                         )
@@ -3050,6 +3072,8 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
+                    events_numbered_at_close: 0,
+                    growth_limits: None,
                 },
                 ShardEpoch::ZERO,
             )
@@ -4190,6 +4214,8 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
+                    events_numbered_at_close: 0,
+                    growth_limits: None,
                 };
                 delete_transition.next_state.transition_seq = TransitionSeq(2);
                 delete_transition
@@ -4247,6 +4273,8 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
+                    events_numbered_at_close: 0,
+                    growth_limits: None,
                 };
                 conflict.next_state.namespace_id = queue.namespace_id;
                 conflict.next_state.transition_seq = TransitionSeq(2);
@@ -4518,6 +4546,8 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
+                    events_numbered_at_close: 0,
+                    growth_limits: None,
                 };
                 delete.next_state.transition_seq = TransitionSeq(2);
                 delete.activity_ops.push(ActivityOp::Delete { activity_id });
@@ -4553,6 +4583,8 @@ mod tests {
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
+                    events_numbered_at_close: 0,
+                    growth_limits: None,
                 };
                 close.next_state.namespace_id = namespace_id;
                 close.next_state.workflow_id = workflow_id.clone();
@@ -4830,6 +4862,8 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
+            events_numbered_at_close: 0,
+            growth_limits: None,
         };
         close.next_state.namespace_id = namespace_id;
         close.next_state.workflow_id = workflow_id.clone();
@@ -5106,6 +5140,8 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
+            events_numbered_at_close: 0,
+            growth_limits: None,
         };
         duplicate.next_state.namespace_id = namespace_id;
         duplicate.next_state.workflow_id = workflow_id;
@@ -5658,6 +5694,8 @@ mod tests {
                         activity_ops: Default::default(),
                         timer_ops: Default::default(),
                         dispatch_ops: Default::default(),
+                        events_numbered_at_close: 0,
+                        growth_limits: None,
                     };
                     t2.next_state.transition_seq =
                         TransitionSeq(2);
@@ -5959,6 +5997,8 @@ mod tests {
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
+            events_numbered_at_close: 0,
+            growth_limits: None,
         };
         store
             .commit_transition(run_key, close, ShardEpoch::ZERO)
@@ -7385,6 +7425,370 @@ mod tests {
                 prop_assert_eq!(from_empty.snapshot().await.unwrap(), bytes);
                 Ok(())
             })?;
+        }
+    }
+
+    /// `run-growth-limits`: both stores check each commit against the limits
+    /// the transition carries, in v1.31.0's order, and write nothing of a
+    /// commit they refuse.
+    mod run_growth {
+        use tokeira_kernel::limits::{RunGrowthLimits, RunLimit, RunLimitExceeded};
+
+        use super::*;
+        use crate::growth::{CommitMeasures, check_commit};
+
+        /// Limits small enough for generated values to fall on both sides.
+        const LIMITS: RunGrowthLimits = RunGrowthLimits {
+            history_size_error: 100,
+            history_size_warn: 50,
+            history_count_error: 100,
+            history_count_warn: 50,
+            state_size_error: 100,
+            state_size_warn: 50,
+            transaction_size: 100,
+        };
+
+        /// Limits that never refuse.
+        const UNBOUNDED: RunGrowthLimits = RunGrowthLimits {
+            history_size_error: usize::MAX,
+            history_size_warn: usize::MAX,
+            history_count_error: usize::MAX,
+            history_count_warn: usize::MAX,
+            state_size_error: usize::MAX,
+            state_size_warn: usize::MAX,
+            transaction_size: usize::MAX,
+        };
+
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+        }
+
+        fn checked(
+            existing: bool,
+            open: bool,
+            last_event_id: i64,
+            events_numbered_at_close: u32,
+            growth_limits: Option<RunGrowthLimits>,
+        ) -> Transition {
+            let mut transition = start_transition(RunKey::new());
+            if existing {
+                transition.expected_seq = TransitionSeq(3);
+            }
+            transition.next_state.status = if open {
+                ExecutionStatus::Running
+            } else {
+                ExecutionStatus::Completed
+            };
+            transition.next_state.last_event_id = last_event_id;
+            transition.events_numbered_at_close = events_numbered_at_close;
+            transition.growth_limits = growth_limits;
+            transition
+        }
+
+        /// v1.31.0's outcome for one commit under [`LIMITS`]
+        /// (`context.go:406-463`; `history_manager.go:362-373 @ v1.31.0`).
+        fn v1_31_0_outcome(
+            existing: bool,
+            open: bool,
+            prior: i64,
+            count: i64,
+            state: usize,
+            batch: usize,
+        ) -> Option<RunLimit> {
+            if existing && open {
+                if prior > 100 {
+                    return Some(RunLimit::HistorySize);
+                }
+                if count > 100 {
+                    return Some(RunLimit::HistoryCount);
+                }
+                if state > 100 {
+                    return Some(RunLimit::StateSize);
+                }
+            }
+            (batch > 100).then_some(RunLimit::TransactionSize)
+        }
+
+        /// The next commit of `state` with `count` new events.
+        fn next_commit(
+            state: &WorkflowState,
+            count: usize,
+            growth_limits: RunGrowthLimits,
+        ) -> Transition {
+            let mut next = state.clone();
+            next.transition_seq = state.transition_seq.next();
+            next.last_event_id = state.last_event_id + count as i64;
+            let events = scheduled_events(state.last_event_id + 1, count);
+            Transition {
+                expected_seq: state.transition_seq,
+                next_state: next,
+                event_principals: vec![None; events.len()].into(),
+                history_events: events.into(),
+                request_dedupe_ops: Default::default(),
+                activity_ops: Default::default(),
+                timer_ops: Default::default(),
+                dispatch_ops: Default::default(),
+                events_numbered_at_close: 0,
+                growth_limits: Some(growth_limits),
+            }
+        }
+
+        fn refused(result: Result<CommitResult>) -> Option<RunLimitExceeded> {
+            result.err()?.downcast_ref::<RunLimitExceeded>().cloned()
+        }
+
+        async fn current(store: &InMemoryStore, run_key: RunKey) -> (WorkflowState, i64, usize) {
+            let (loaded, stats) = store.load_run_with_stats(run_key).await.expect("load");
+            let LoadedRun::Existing(state) = loaded else {
+                panic!("run is missing");
+            };
+            let events = store
+                .inner
+                .lock()
+                .await
+                .history
+                .get(&run_key)
+                .map_or(0, Vec::len);
+            (state, stats.history_size_bytes, events)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            // Feature: run-growth-limits, Property 1: Growth checks match v1.31.0's
+            #[test]
+            fn property_1_growth_checks_match_v1_31_0(
+                existing in any::<bool>(),
+                open in any::<bool>(),
+                prior in 0i64..200,
+                last_event_id in 0i64..200,
+                numbered in 0u32..20,
+                state in 0usize..200,
+                batch in 0usize..200,
+            ) {
+                let measures = CommitMeasures {
+                    prior_history_size: prior,
+                    measured_state_size: state,
+                    batch_size: batch,
+                };
+                let unchecked = checked(existing, open, last_event_id, numbered, None);
+                prop_assert_eq!(check_commit(RunKey::new(), &unchecked, measures), Ok(()));
+                let limited = checked(existing, open, last_event_id, numbered, Some(LIMITS));
+                let outcome = check_commit(RunKey::new(), &limited, measures)
+                    .map_err(|breach| breach.limit);
+                let count = last_event_id - i64::from(numbered);
+                let want = v1_31_0_outcome(existing, open, prior, count, state, batch);
+                prop_assert_eq!(outcome, want.map_or(Ok(()), Err));
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            // Feature: run-growth-limits, Property 1: Growth checks match v1.31.0's
+            #[test]
+            fn property_1_a_refused_commit_writes_nothing(
+                batches in prop::collection::vec(0usize..5, 1..10),
+                history_size_error in 0usize..1500,
+                transaction_size in 0usize..400,
+            ) {
+                runtime().block_on(async move {
+                    let store = InMemoryStore::default();
+                    let run_key = RunKey::new();
+                    let mut start = start_transition(run_key);
+                    start.next_state.last_event_id = 1;
+                    start.history_events = scheduled_events(1, 1).into();
+                    start.event_principals = vec![None].into();
+                    store
+                        .commit_transition(run_key, start, ShardEpoch::ZERO)
+                        .await
+                        .expect("start");
+                    let limits = RunGrowthLimits {
+                        history_size_error,
+                        transaction_size,
+                        ..UNBOUNDED
+                    };
+                    for count in batches {
+                        let (state, history_size, events) = current(&store, run_key).await;
+                        let transition = next_commit(&state, count, limits);
+                        let batch = if count == 0 {
+                            0
+                        } else {
+                            usize::try_from(
+                                crate::codec::history_batch_encoded_len(&transition.history_events)
+                                    .expect("batch size"),
+                            )
+                            .expect("size")
+                        };
+                        let want = if usize::try_from(history_size).expect("size") > history_size_error {
+                            Some(RunLimit::HistorySize)
+                        } else if batch > transaction_size {
+                            Some(RunLimit::TransactionSize)
+                        } else {
+                            None
+                        };
+                        let result = store
+                            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                            .await;
+                        match want {
+                            Some(limit) => {
+                                let breach = refused(result);
+                                prop_assert_eq!(breach.map(|breach| breach.limit), Some(limit));
+                                let after = current(&store, run_key).await;
+                                prop_assert_eq!(after.0.transition_seq, state.transition_seq);
+                                prop_assert_eq!(after.1, history_size);
+                                prop_assert_eq!(after.2, events);
+                            }
+                            None => {
+                                let applied = matches!(result, Ok(CommitResult::Applied { .. }));
+                                prop_assert!(applied);
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+
+        #[test]
+        fn each_breach_carries_v1_31_0_s_message() {
+            let measures = |prior, state, batch| CommitMeasures {
+                prior_history_size: prior,
+                measured_state_size: state,
+                batch_size: batch,
+            };
+            let open = checked(true, true, 1, 0, Some(LIMITS));
+            assert_eq!(
+                check_commit(RunKey::new(), &open, measures(101, 0, 0))
+                    .unwrap_err()
+                    .message,
+                "Workflow history size exceeds limit."
+            );
+            assert_eq!(
+                check_commit(
+                    RunKey::new(),
+                    &checked(true, true, 101, 0, Some(LIMITS)),
+                    measures(0, 0, 0)
+                )
+                .unwrap_err()
+                .message,
+                "Workflow history count exceeds limit."
+            );
+            assert_eq!(
+                check_commit(RunKey::new(), &open, measures(0, 101, 0))
+                    .unwrap_err()
+                    .message,
+                "Workflow mutable state size exceeds limit."
+            );
+            assert_eq!(
+                check_commit(RunKey::new(), &open, measures(0, 0, 101))
+                    .unwrap_err()
+                    .message,
+                "transaction size of 101 bytes exceeds limit of 100 bytes"
+            );
+            assert_eq!(
+                RunLimit::TransactionSize.termination_reason(),
+                "Transaction size exceeds limit."
+            );
+        }
+
+        #[test]
+        fn the_measured_state_leaves_out_activity_inputs() {
+            let mut state = sample_state(RunKey::new());
+            for (index, size) in [0usize, 10, 3000].into_iter().enumerate() {
+                let mut activity = activity_state(&format!("activity-{index}"));
+                activity.input =
+                    tokeira_types::Payloads(vec![tokeira_types::Payload::new(vec![1; size])]);
+                state
+                    .activities
+                    .insert(activity.activity_id.clone(), activity);
+            }
+            let encoded = crate::codec::encode_workflow_state(&state).expect("encode");
+            assert_eq!(
+                crate::codec::workflow_state_encoded_len(&state).expect("length"),
+                encoded.len()
+            );
+            let measured =
+                crate::codec::measured_state_len(encoded.len(), &state).expect("measure");
+            let mut emptied = state.clone();
+            for activity in emptied.activities.values_mut() {
+                activity.input = tokeira_types::Payloads::default();
+            }
+            // An empty input still encodes its length, one byte.
+            let emptied_len = crate::codec::encode_workflow_state(&emptied)
+                .expect("encode")
+                .len();
+            assert_eq!(measured, emptied_len - emptied.activities.len());
+        }
+
+        #[tokio::test]
+        async fn a_first_write_over_the_batch_limit_creates_nothing() {
+            let store = InMemoryStore::default();
+            let run_key = RunKey::new();
+            let mut start = start_transition(run_key);
+            start.next_state.last_event_id = 3;
+            start.history_events = scheduled_events(1, 3).into();
+            start.event_principals = vec![None; 3].into();
+            start.growth_limits = Some(RunGrowthLimits {
+                transaction_size: 10,
+                ..UNBOUNDED
+            });
+            let breach = refused(
+                store
+                    .commit_transition(run_key, start, ShardEpoch::ZERO)
+                    .await,
+            )
+            .expect("refused");
+            assert_eq!(breach.limit, RunLimit::TransactionSize);
+            assert!(matches!(
+                store.load_run(run_key).await.expect("load"),
+                LoadedRun::Absent
+            ));
+        }
+
+        #[tokio::test]
+        async fn the_history_count_is_checked_at_the_limit_and_one_over() {
+            let store = InMemoryStore::default();
+            let run_key = RunKey::new();
+            let mut start = start_transition(run_key);
+            start.next_state.last_event_id = 99;
+            store
+                .commit_transition(run_key, start, ShardEpoch::ZERO)
+                .await
+                .expect("start");
+            let limits = RunGrowthLimits {
+                history_count_error: 100,
+                ..UNBOUNDED
+            };
+
+            let (state, _, _) = current(&store, run_key).await;
+            let at_limit = store
+                .commit_transition(run_key, next_commit(&state, 1, limits), ShardEpoch::ZERO)
+                .await
+                .expect("commit");
+            assert!(matches!(at_limit, CommitResult::Applied { .. }));
+
+            let (state, _, _) = current(&store, run_key).await;
+            let breach = refused(
+                store
+                    .commit_transition(run_key, next_commit(&state, 1, limits), ShardEpoch::ZERO)
+                    .await,
+            )
+            .expect("refused");
+            assert_eq!(breach.limit, RunLimit::HistoryCount);
+
+            // The same event, numbered when v1.31.0 finishes the write, isn't
+            // counted until the next one.
+            let mut finishing = next_commit(&state, 1, limits);
+            finishing.events_numbered_at_close = 1;
+            let applied = store
+                .commit_transition(run_key, finishing, ShardEpoch::ZERO)
+                .await
+                .expect("commit");
+            assert!(matches!(applied, CommitResult::Applied { .. }));
         }
     }
 }

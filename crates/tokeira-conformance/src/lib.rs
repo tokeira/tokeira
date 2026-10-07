@@ -370,7 +370,8 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
     },
     // Kernel-consulted constants — never overridable. A runtime-mutable read
     // inside the pure kernel would make the same history replay differently
-    // (`CONTINUE_AS_NEW_MIN_INTERVAL`, `MAX_BUFFERED_EVENTS` @ tokeira-kernel).
+    // (`CONTINUE_AS_NEW_MIN_INTERVAL` @ tokeira-kernel; the buffered event
+    // limits in `tokeira_kernel::limits`, `run-growth-limits`).
     KeySpec {
         key: "history.workflowIdReuseMinimalInterval",
         value_type: ValueType::Duration,
@@ -378,6 +379,11 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
     },
     KeySpec {
         key: "history.maximumBufferedEventsBatch",
+        value_type: ValueType::Int,
+        disposition: Disposition::KernelExcluded,
+    },
+    KeySpec {
+        key: "history.maximumBufferedEventsSizeInBytes",
         value_type: ValueType::Int,
         disposition: Disposition::KernelExcluded,
     },
@@ -421,27 +427,54 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::Wired,
     },
-    // Size limits tokeira does not enforce — there is no consult site to
-    // override, so an override is rejected rather than fabricating a limit.
-    KeySpec {
-        key: "limit.mutableStateSize.error",
-        value_type: ValueType::Int,
-        disposition: Disposition::NotEnforced,
-    },
+    // A run's growth limits (`run-growth-limits`), resolved by the runtime for
+    // each commit it makes, and the stored activity failure limit. Production
+    // builds compile v1.31.0's values; only this harness overrides them. The
+    // warn values are consulted too, for the logs above them.
     KeySpec {
         key: "limit.historySize.error",
         value_type: ValueType::Int,
-        disposition: Disposition::NotEnforced,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.historySize.warn",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
     },
     KeySpec {
         key: "limit.historyCount.error",
         value_type: ValueType::Int,
-        disposition: Disposition::NotEnforced,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.historyCount.warn",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.mutableStateSize.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.mutableStateSize.warn",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "system.transactionSizeLimit",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.mutableStateActivityFailureSize.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
     },
     // Continue-as-new advice thresholds. Pinned v1.31.0 constants in the
     // runtime, consulted once per workflow-task start through
     // `tokeira_runtime::continue_as_new_advice_policy` (continue-as-new-advice,
-    // Requirement 3.3); the hard `limit.*.error` limits above stay unenforced.
+    // Requirement 3.3).
     KeySpec {
         key: "limit.historySize.suggestContinueAsNew",
         value_type: ValueType::Int,
@@ -831,9 +864,19 @@ mod tests {
             ),
             Err(OverrideError::KernelExcluded(_))
         ));
+        // A run's growth limits are wired (`run-growth-limits`), so no key is
+        // `NotEnforced` today.
+        assert!(
+            overrides
+                .set("limit.mutableStateSize.error", OverrideValue::Int(410_000))
+                .is_ok()
+        );
         assert!(matches!(
-            overrides.set("limit.mutableStateSize.error", OverrideValue::Int(410_000)),
-            Err(OverrideError::NotEnforced(_))
+            overrides.set(
+                "history.maximumBufferedEventsSizeInBytes",
+                OverrideValue::Int(10 * 1024 * 1024)
+            ),
+            Err(OverrideError::KernelExcluded(_))
         ));
         assert!(matches!(
             overrides.set("", OverrideValue::Int(1)),

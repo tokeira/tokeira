@@ -42,7 +42,7 @@ This spec covers the limits v1.31.0 applies when a request arrives. The limits o
 
 2.5 WHEN an activity's completion result or cancellation details are over the blob size limit THEN the system SHALL fail the activity instead, with a non-retryable server failure "Complete result exceeds size limit." or "Cancel details exceed size limit.", and SHALL answer the call as succeeded (`service/frontend/workflow_handler.go:1603-1640, 1705-1735, 2012-2040, 2112-2145 @ v1.31.0`)
 
-2.6 WHEN a failure in RespondActivityTaskFailed or RespondWorkflowTaskFailed is over the blob size limit THEN the system SHALL record in its place a non-retryable server failure "Failure exceeds size limit." whose cause is the original failure truncated to the warn limit. For an activity, the response SHALL also list that server failure in its `failures` (`service/frontend/workflow_handler.go:1231-1245, 1824-1838, 1948-1962 @ v1.31.0`; `common/failure/failure.go:48-95 @ v1.31.0`)
+2.6 WHEN a failure in RespondActivityTaskFailed or RespondWorkflowTaskFailed is over the blob size limit THEN the system SHALL record in its place a non-retryable server failure "Failure exceeds size limit." whose cause is the original failure cut down so that the server failure fits the warn limit. For an activity, the response SHALL also list that server failure in its `failures` (`service/frontend/workflow_handler.go:1231-1245, 1824-1838, 1948-1962 @ v1.31.0`)
 
 2.7 WHEN heartbeat details are over the blob size limit THEN the system SHALL fail the activity instead, with a non-retryable server failure "Heartbeat details exceed size limit.", and SHALL answer with `cancel_requested` true (`service/frontend/workflow_handler.go:1406-1435, 1510-1540 @ v1.31.0`)
 

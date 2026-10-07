@@ -415,6 +415,7 @@ impl DsqlRunRepository {
                     successor_run_key,
                     successor_shard,
                     &successor_state,
+                    &codec::encode_workflow_state(&successor_state)?,
                     prefix_size,
                 )
                 .await?;

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Count a run's signals in the kernel and store the count in the state extension. Refuse a signal at the limit, and give each caller v1.31.0's answer. Check an update's in-flight count, total and in-flight payload in the kernel, in v1.31.0's order, with request sizes from the edge and the held updates' count and request bytes from the lane. Count a reset run's copied signals and completed updates.
+Count a run's signals in the kernel and store the count in the state extension. Refuse a signal at the limit, and give each caller v1.31.0's answer, a repeated signal's success included, whether its run is closed, closing or at the limit. Resolve a signal to another workflow that can't be delivered with v1.31.0's cause. Check an update's in-flight count, total and in-flight payload in the kernel, in v1.31.0's order, with request sizes from the edge and the held updates' count and request bytes from the lane. Count a reset run's copied signals and completed updates.
 
 ## Tasks
 
@@ -15,7 +15,7 @@ Count a run's signals in the kernel and store the count in the state extension. 
     - _Requirements: 2.7, 2.9-2.13_
   - [ ] 1.4 Write property tests for Properties 1, 4, 5 and 6, and for the kernel's part of Property 2
     - **Property 1: The signal count is the run's recorded signals**
-    - **Property 2: A signal is refused exactly at the limit**
+    - **Property 2: A client's signal is answered as v1.31.0 answers it**
     - **Property 4: Update admission matches v1.31.0's**
     - **Property 5: Updates are counted as v1.31.0 counts them**
     - **Property 6: Resurrecting an update respects the total limit**
@@ -29,12 +29,13 @@ Count a run's signals in the kernel and store the count in the state extension. 
     - **Validates: Requirements 2.8, 3.5**
 
 - [ ] 3. Signals in the runtime
-  - [ ] 3.1 Answer as a duplicate a SignalWorkflowExecution or batch signal refused at the limit whose request id the run already applied; skip that lookup for SignalWithStart; let the closing check stand aside for a run at the limit
+  - [ ] 3.1 Answer as a duplicate a SignalWorkflowExecution or batch signal refused because the run is closed, closing or at the limit, when the run already applied its request id; skip those lookups for SignalWithStart; let the closing check stand aside for a run at the limit
     - _Requirements: 2.1-2.3_
-  - [ ] 3.2 Resolve a sender whose signal the target refused at the limit: as signaled when the target already applied it, otherwise as failed with `SIGNAL_COUNT_LIMIT_EXCEEDED`
+  - [ ] 3.2 Resolve a sender whose signal can't be delivered with v1.31.0's cause: `EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND` for a self-signal and a missing or closed target, `SIGNAL_COUNT_LIMIT_EXCEEDED` for a target at the limit, and as signaled when the target already applied the signal
     - _Requirements: 2.5_
-  - [ ] 3.3 Write property tests for Property 2's answers through the runtime on the in-memory store
-    - **Property 2: A signal is refused exactly at the limit**
+  - [ ] 3.3 Write property tests for Properties 2 and 7 through the runtime on the in-memory store
+    - **Property 2: A client's signal is answered as v1.31.0 answers it**
+    - **Property 7: A signal to another workflow resolves as v1.31.0 resolves it**
     - **Validates: Requirements 2.1-2.5**
 
 - [ ] 4. Updates in the runtime and the edge

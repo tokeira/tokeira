@@ -220,9 +220,11 @@ A notification-only sticky destination additionally requires a nonempty sticky
 queue and a recoverable pending deadline. A legacy affinity record without that
 deadline uses the normal delivery fallback, without changing durable affinity;
 it must not become an unscannable row with no timeout path.
-The current helper in [api.rs](../../../crates/tokeira-storage/src/api.rs),
-`dispatchable_workflow_task`, must share this classification for durable recovery;
-do not accidentally remove its callers' separate speculative delivery path.
+The legacy delivery helper in [api.rs](../../../crates/tokeira-storage/src/api.rs),
+`dispatchable_workflow_task`, shares Running/unstarted and sticky classification,
+but also delivers stored speculative tasks for recovery and existing listing
+callers. Its eligibility is deliberately broader than durable row derivation;
+speculative tasks must remain deliverable without acquiring a durable row.
 
 Both [memory.rs](../../../crates/tokeira-storage/src/memory.rs) and DSQL commit
 paths apply the same result. For `Some(row)`, upsert the complete row; for `None`,
@@ -230,6 +232,13 @@ delete by run key. Do this within the existing commit/memory critical section,
 after rejection/deduplication gates, including reset materialization. Rollback
 rolls back both state and dispatch. Do not add another projection-log read or move
 accumulator maintenance outside that transaction.
+
+DSQL reset materialization places the successor's `workflow_hot`, `timer_bucket`,
+and eligible `workflow_dispatch` rows at
+`execution_home_bundle(namespace_id, workflow_id)`, matching ordinary commits.
+Do not place hot state or timers by successor run-key hash and rely on a later
+commit to move them. A multi-shard live regression must distinguish those two
+placements and inspect all three immediately after materialization.
 
 The initial implementation deliberately performs one dispatch maintenance
 statement per state-changing commit, including an idempotent delete when no row is

@@ -120,7 +120,7 @@ Named functions are the durable anchors when subsequent edits move line numbers.
 migrations and asynchronous indexes. The
 [AWS limits](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)
 specify at most 3,000 mutated table rows and 10 MiB of modified data per transaction;
-these are not discovery read limits. The approved task supplies prior playground
+these are not discovery read limits. The approved task supplies prior Aurora DSQL
 observations about transaction abortion, `FOR KEY SHARE`, and writable CTEs.
 SQLx checks on real DSQL verified correct affected-row counts for
 `ON CONFLICT DO NOTHING` and a skipping `DO UPDATE ... WHERE`. `RETURNING`

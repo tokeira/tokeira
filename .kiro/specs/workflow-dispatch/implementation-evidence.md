@@ -5,6 +5,7 @@
 Original base: `11ce84109d55167e4b737ac0224dc4004f3dbbbf`.
 Rebased PR base: `8daa6040d3eef518d92d0ba5e03cee6cf7c9a273`.
 Implementation commit: `94272ae1e055b4a122e8e6c19fe9591a1016ff70`.
+Review implementation commit: `27639f90f0c63825417ac7e764445b5fce4a2374`.
 The PR records its final head revision.
 
 This increment adds checked kernel incarnation allocation, shared dispatch
@@ -35,9 +36,16 @@ deferred until the transaction-local lease fence is implemented and verified.
   sticky inclusion, and forced digest collisions. Memory additionally verifies
   multi-home queue scans and snapshot reconstruction. Reset tests seed stale
   successor rows before materialization, including successors with no wanted row.
+  A live eight-shard reset regression selects a successor whose run-hash shard
+  differs from its execution home and checks hot-state, timer, and dispatch
+  placement immediately after materialization. Both stores also check that
+  legacy listings deliver speculative tasks without creating dispatch rows.
 - Runtime regressions check an unchanged start submission across OCC retries and
-  publication/token identity after resuming a retained task. No start-result cache
-  or new retry policy is introduced.
+  publication/token identity after resuming a retained task. Review regressions
+  also check an empty, successful poll while paused and recovery publication of
+  a stored speculative task without a durable dispatch row. Both failed on the
+  original implementation and passed after the delivery fixes. No start-result
+  cache or new retry policy is introduced.
 - Fixed digest vectors, microsecond timestamp normalization, schema/index shape,
   migration-prefix integrity, and existing frozen-state tests complement the
   generated traces. No dependency or state-extension layout changes are made.
@@ -60,14 +68,17 @@ used. Resource identities and credentials are omitted.
 |---|---|---|---|
 | Development contracts | 21:02:49 | 21:11:04 | Ordered pages/reset/collisions passed (41.430 s); 100 atomic traces passed (322.377 s); IAM connector passed (0.473 s). |
 | Expanded final contracts | 21:13:08 | 21:26:29 | Ordered pages/routing/home/reset/collisions passed (45.742 s); 100 atomic traces with generated reset cases and both commit entry points passed (342.968 s); IAM connector passed (0.554 s). |
+| Review regressions | 22:13:48 | 22:22:09 | Eight-shard reset placement passed (38.676 s); ordered pages including speculative legacy delivery passed (11.965 s); 100 atomic traces passed (347.510 s); IAM connector passed (0.833 s). |
 
-The first run preceded the expanded reset/routing regressions. Only the final
-run establishes those additions. A temporary nextest profile extends the live
+The first run preceded the expanded reset/routing regressions. The second run
+establishes those additions; the third adds the review regressions and reruns
+the existing contracts. A temporary nextest profile extends the live
 suite timeout to 20 minutes; repository nextest configuration is unchanged.
 
 ```bash
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --test-threads 1 -E 'test(workflow_dispatch_live_ordered_pages)'
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --test-threads 1 -E 'test(workflow_dispatch_live_atomic_reference_traces)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --test-threads 1 -E 'test(workflow_dispatch_live_reset_uses_execution_home)'
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_connector_iam
 ```
 
@@ -80,17 +91,22 @@ All AGENTS.md §10.4 commands passed on 2026-10-07:
 | `cargo +nightly fmt --all` | Passed |
 | `cargo lint --locked` | Passed |
 | `cargo check --workspace --locked` | Passed |
-| `cargo nextest run --workspace --locked --no-fail-fast` | 3,695 passed; 2 existing ignored SDK integration tests |
+| `cargo nextest run --workspace --locked --no-fail-fast` | 3,697 passed; 2 existing ignored SDK integration tests |
 | `cargo test --workspace --doc --locked` | Passed: 1 executable example; 21 existing ignored examples |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` | Passed |
 
 Affected-crate all-target Clippy also passed with
 `--features tokeira-storage/dsql-integration`. The focused runtime/storage
-workflow-dispatch filter passed 13 tests; kernel/storage suites previously passed
+workflow-dispatch filter passed 16 tests, including three gated tests that return
+without connecting when unset; kernel/storage suites previously passed
 801 tests. The live gates were unset in those local runs; the credentialed results
-above are the live evidence. No completion-bar command was omitted.
+above are the live evidence. No completion-bar command was omitted. The review
+run repeated the entire bar. Two passing tests were marked leaky in the parallel
+workspace run (`lock_diff_classifies_supply_chain_inputs` and
+`embedded_metric_manifest_is_valid`); both passed without leak warnings in a
+serial nextest recheck.
 
-The PR-boundary rebase added only the migration-retry specification and an
+The initial PR-boundary rebase added only the migration-retry specification and an
 internal changelog fragment. Comparing pre/post-rebase trees confirmed identical
 code and build inputs. The full bar was not repeated for this documentation-only
 delta; Markdown and whitespace checks were repeated after rebase.
@@ -104,12 +120,9 @@ Offline Markdown links and `git diff --check` passed. The local link check
 excludes the ignored `.tokeira-build` scratch workspace generated by integration
 tests, whose copied README refers to a document outside that scoped build.
 
-The process environment selects the already-installed ARM `protoc`; the default PATH resolves an Intel
-binary that cannot run on this host. Shared build/cache/toolchain settings remain
-unchanged. Test linking reports existing native-object deployment-target warnings.
 An unset live-test gate is never counted as live DSQL evidence.
 
-The full run exposed a pre-existing timing race in the backlog routing property:
+The initial full run exposed a pre-existing timing race in the backlog routing property:
 50 ms polls could disappear while it synchronized both waiter registrations.
 Its test-only deadlines now outlive nextest's termination deadline, retaining the
 waiters until the test drains them. Delivery logic and operational deadlines are

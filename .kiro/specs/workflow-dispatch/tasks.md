@@ -372,7 +372,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       profile and region. Ensure cleanup runs on success or failure and touches
       only that cluster; keep endpoints/identifiers/credentials out of artifacts.
     - Record test/model revisions, cases, transaction outcomes, query plans,
-      rows/statements read, and pass durations. Separate reported prior playground
+      rows/statements read, and pass durations. Separate reported prior Aurora DSQL
       observations from experiments actually performed by this implementation.
     - If live verification is unavailable, report the unmet checks and leave this
       task incomplete; a local simulation or PostgreSQL result cannot complete it.

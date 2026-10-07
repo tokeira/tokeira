@@ -44,9 +44,9 @@ _For any_ size and limit, a size SHALL exceed the limit exactly when it is great
 
 **Validates: Requirements 2.3, 2.10**
 
-Property 2: Truncation matches v1.31.0's
+Property 2: A truncated failure fits its limit
 
-_For any_ failure and size budget, the truncated failure SHALL keep the failure info's kind and its non-retryable flag (and an application failure's type), and SHALL fill source, message and stack trace in that order, each cut at a UTF-8 boundary, within the budget as `TruncateWithDepth` spends it, following causes to a depth of 20 (`common/failure/failure.go:48-95 @ v1.31.0`).
+_For any_ failure and size limit, the truncated failure SHALL encode in at most the limit, and an application or server failure SHALL keep its kind and non-retryable flag. It SHALL keep an application failure's type, the source, the message and the stack trace in that order, each whole or, for the first that doesn't fit, the longest prefix that fits, cut at a UTF-8 boundary, and nothing after it. Only when every field is whole SHALL it keep the cause, cut down the same way, following causes to a depth of 20. A failure that fits, with nothing to drop, SHALL be kept whole.
 
 **Validates: Requirement 2.6**
 
@@ -65,7 +65,7 @@ _For any_ activity response with a result, cancellation details or heartbeat det
 - `standalone_blob_exceeds_limit(size, operation)`: the same warning, but it compares the error limit on its own, as the standalone activity validator's `validateBlobSize` does (`chasm/lib/activity/validator.go:222-247 @ v1.31.0`). With v1.31.0's values the two agree.
 - `check_blob(size, operation)` and `check_start_payloads(...)` turn these into a client call's `InvalidArgument` errors; the second checks a start's search attributes, input and memo in order.
 - `check_search_attribute_count(&SearchAttributes)` and `check_search_attribute_sizes(&SearchAttributes)`: the key count, then each value's data length and the map's encoded size, with v1.31.0's messages. They are separate so that a standalone activity's registered-key check can sit between them.
-- `server_failure(message)` builds the server failure, and `truncate_failure(&Failure, max_size)` ports `TruncateWithDepth` with a depth of 20. `oversized_failure` builds the replacement for an oversized failure, `oversized_replacement` returns it only over the limit, and `limit_activity_failure` applies RespondActivityTaskFailed's two limits and returns the server failures for its response.
+- `server_failure(message)` builds the server failure and `oversized_failure` the replacement for an oversized failure, from `tokeira_proto::failure_limits`, whose `truncate_failure(&Failure, limit)` cuts a failure down by its encoded size, so a replacement always fits its limit. `oversized_replacement` returns it only over the limit, and `limit_activity_failure` applies RespondActivityTaskFailed's two limits and returns the server failures for its response.
 
 ### Client calls (`crates/tokeira-edge/src/grpc/translate.rs` and `grpc/workflow_service.rs`)
 
@@ -86,7 +86,7 @@ The standalone activity calls are checked in their gRPC handlers:
 - **Failing the activity.** RespondActivityTaskFailed's body, by task token and by id, becomes a helper that the conversions call with a request built from the original's token or ids, its identity, and the server failure. It keeps both paths: workflow activities through translation and `WorkflowService`, standalone activities through the CHASM bridge. The converted call is admitted as RespondActivityTaskFailed. Worker scopes and authorization treat the four activity responses alike (`crates/tokeira-auth/src/worker_scope.rs`), so the outcome doesn't change.
 - **RespondActivityTaskCompleted and RespondActivityTaskCanceled**, by task token and by id: over the limit, fail the activity with "Complete result exceeds size limit." or "Cancel details exceed size limit.", and return the call's usual empty response.
 - **RecordActivityTaskHeartbeat**, by task token and by id: over the limit, fail the activity with "Heartbeat details exceed size limit." and return `cancel_requested: true`.
-- **RespondActivityTaskFailed**, by task token and by id: over the limit, drop the last heartbeat details and add their server failure to the response. Over the limit, replace the failure with "Failure exceeds size limit.", its cause truncated to the warn limit, and add that failure to the response too. Heartbeat details are checked first, as in v1.31.0.
+- **RespondActivityTaskFailed**, by task token and by id: over the limit, drop the last heartbeat details and add their server failure to the response. Over the limit, replace the failure with "Failure exceeds size limit.", its cause cut down so the replacement fits the warn limit, and add that failure to the response too. Heartbeat details are checked first, as in v1.31.0.
 - **RespondWorkflowTaskFailed:** over the limit, replace the failure as above. The response is unchanged.
 - **Retry classification.** A top-level server failure retries unless it is marked non-retryable, as in v1.31.0's `isRetryable` (`service/history/workflow/retry.go:115-150 @ v1.31.0`). `activity_retry_classification` in `grpc/translate.rs` looked only for an application failure in the chain, so it would have retried the conversions' failures; it now reads a top-level server failure's flag. Below the top level it still looks for an application failure, where v1.31.0 reads only the top level; that difference is outside this spec.
 
@@ -109,12 +109,12 @@ The standalone activity calls are checked in their gRPC handlers:
 
 ### Exploratory Bug Condition Checking
 
-- Negative controls: with a check removed or put in the wrong order, or the retry classification change undone, the test that covers it fails. They cover by-id completion and heartbeat, the by-id failure's response, by-id cancellation, RespondWorkflowTaskFailed, the standalone start's order, signal-with-start's order, a wrong truncation overhead and an unconverted completion.
+- Negative controls: with a check removed or put in the wrong order, or the retry classification change undone, the test that covers it fails. They cover by-id completion and heartbeat, the by-id failure's response, by-id cancellation, RespondWorkflowTaskFailed, the standalone start's order, signal-with-start's order, a wrong truncation overhead and an unconverted completion. When the truncation was rewritten to measure the encoded size (`run-growth-limits`), seven more were run: text kept whole over the limit, fields kept after a cut, a cause's budget without its field, no characters taken back, the replacement left out of the count, the kind dropped, and causes followed past twenty.
 
 ### Property-Based Tests
 
 - Property 1 over generated sizes, payloads and search attribute maps, comparing with `prost` encoded lengths.
-- Property 2 over generated failures, with causes and multi-byte text, against a separate transcription of `TruncateWithDepth` in the test.
+- Property 2 over generated failures and limits, with causes and multi-byte text: the result fits; at each depth each field is a prefix of the original's, filled in order, and one more character of the cut field would overflow the limit; and a failure that fits is kept whole.
 - Property 3 through the engine's in-process gRPC endpoint on the in-memory store (`crates/tokeira-engine/tests/payload_admission_limits.rs`), for workflow activities: every response, by task token and by id, just under and just over the limit, at a generated distance from it.
 
 ### Unit Tests

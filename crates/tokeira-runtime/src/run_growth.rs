@@ -15,7 +15,7 @@ use tokeira_kernel::{
 };
 use tokeira_proto::{
     conversions::common::{failure_to_payload, payload_to_failure},
-    failure_limits::{FAILURE_EXCEEDS_LIMIT, server_failure, truncate_failure},
+    failure_limits::oversized_failure,
 };
 use tokeira_types::{Payload, Payloads, RequestContext, RequestId, RunKey};
 
@@ -77,20 +77,19 @@ pub(crate) fn stored_activity_failure_limit() -> usize {
 
 /// The failure a retried activity stores: the worker's, or, when its encoded
 /// size is over `limit`, a server failure `Failure exceeds size limit.` not
-/// marked non-retryable, whose cause is the worker's failure cut to `limit`
-/// (`truncateRetryableActivityFailure`, mutable_state_impl.go:6587-6608 @
-/// v1.31.0). The payload's data is the encoded `Failure`, which is what
-/// v1.31.0 measures.
+/// marked non-retryable, whose cause is the worker's failure cut down so that
+/// the whole fits `limit` (`truncateRetryableActivityFailure`,
+/// mutable_state_impl.go:6587-6608 @ v1.31.0). The payload's data is the
+/// encoded `Failure`, which is what v1.31.0 measures.
 pub(crate) fn stored_activity_failure(failure: Payload, limit: usize) -> Payload {
     if failure.data.len() <= limit {
         return failure;
     }
-    let mut stored = server_failure(FAILURE_EXCEEDS_LIMIT, false);
-    stored.cause = Some(Box::new(truncate_failure(
+    failure_to_payload(&oversized_failure(
         &payload_to_failure(&failure),
-        i64::try_from(limit).unwrap_or(i64::MAX),
-    )));
-    failure_to_payload(&stored)
+        limit,
+        false,
+    ))
 }
 
 /// Whether `command` completes a workflow task, whose refused history batch
@@ -157,7 +156,9 @@ fn json_string_payloads(text: &str) -> Payloads {
 mod tests {
     use proptest::prelude::*;
     use prost::Message as _;
-    use tokeira_proto::public::temporal::api::failure::v1 as failure_proto;
+    use tokeira_proto::{
+        failure_limits::FAILURE_EXCEEDS_LIMIT, public::temporal::api::failure::v1 as failure_proto,
+    };
 
     use super::*;
 
@@ -203,9 +204,9 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
-        // Feature: run-growth-limits, Property 4: Stored activity failures are truncated as v1.31.0 truncates them
+        // Feature: run-growth-limits, Property 4: A stored activity failure fits the limit
         #[test]
-        fn property_4_stored_activity_failures_are_truncated(failure in arb_failure()) {
+        fn property_4_a_stored_activity_failure_fits_the_limit(failure in arb_failure()) {
             let limit = limits::MUTABLE_STATE_ACTIVITY_FAILURE_SIZE_LIMIT_ERROR;
             let payload = failure_to_payload(&failure);
             prop_assert_eq!(payload.data.len(), failure.encoded_len());
@@ -213,8 +214,9 @@ mod tests {
             if failure.encoded_len() <= limit {
                 prop_assert_eq!(stored, payload);
             } else {
-                // The port of `TruncateWithDepth` is the one the edge's tests
-                // compare with a transcription of v1.31.0's.
+                // The edge's tests check how the cause is cut down; here, the
+                // stored failure stands in for it and fits the limit.
+                prop_assert!(stored.data.len() <= limit);
                 let replaced = payload_to_failure(&stored);
                 prop_assert_eq!(replaced.message.as_str(), FAILURE_EXCEEDS_LIMIT);
                 prop_assert_eq!(
@@ -223,10 +225,9 @@ mod tests {
                         failure_proto::ServerFailureInfo { non_retryable: false }
                     ))
                 );
-                prop_assert_eq!(
-                    replaced.cause.map(|cause| *cause),
-                    Some(truncate_failure(&failure, limit as i64))
-                );
+                if let Some(cause) = replaced.cause {
+                    prop_assert!(failure.message.starts_with(&cause.message));
+                }
             }
         }
     }

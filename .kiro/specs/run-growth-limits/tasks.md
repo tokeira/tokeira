@@ -44,12 +44,12 @@ Check each commit's growth in the stores against limits the runtime hands them, 
     - **Validates: Requirement 2.7**
 
 - [x] 5. Stored activity failures
-  - [x] 5.1 Move the `TruncateWithDepth` port and the server failure builder to `tokeira-proto`, with the non-retryable flag
+  - [x] 5.1 Move the truncation and the server failure builder to `tokeira_proto::failure_limits`, with the non-retryable flag, and cut a failure down by its encoded size
     - _Requirements: 2.8_
   - [x] 5.2 Truncate a failure over the stored activity failure limit in `commit_activity_retry`
     - _Requirements: 2.8_
   - [x] 5.3 Write property tests for Property 4
-    - **Property 4: Stored activity failures are truncated as v1.31.0 truncates them**
+    - **Property 4: A stored activity failure fits the limit**
     - **Validates: Requirement 2.8**
 
 - [x] 6. Wire `limit.historySize.error`, `limit.historyCount.error`, `limit.mutableStateSize.error`, their warn keys, `system.transactionSizeLimit` and `limit.mutableStateActivityFailureSize.error` for the Temporal functional harness, and classify `history.maximumBufferedEventsSizeInBytes` as kernel-excluded, as `conformance-config-override`'s key table records: the harness's overrides in the runtime's limits, its key registry, and the compatibility ledger

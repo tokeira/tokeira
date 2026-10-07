@@ -60,9 +60,9 @@ _For any_ sequence of externally originated events while a workflow task is star
 
 **Validates: Requirement 2.7**
 
-Property 4: Stored activity failures are truncated as v1.31.0 truncates them
+Property 4: A stored activity failure fits the limit
 
-_For any_ failure, the activity's stored last failure SHALL be the failure itself when its encoded size is within the limit, and otherwise the server failure whose cause is `TruncateWithDepth` of the failure at the limit.
+_For any_ failure, the activity's stored last failure SHALL be the failure itself when its encoded size is within the limit, and otherwise the server failure `Failure exceeds size limit.`, not marked non-retryable, which fits the limit, with the failure cut down as its cause.
 
 **Validates: Requirement 2.8**
 
@@ -100,8 +100,8 @@ _For any_ failure, the activity's stored last failure SHALL be the failure itsel
 
 ### Stored activity failures (`crates/tokeira-proto`, `crates/tokeira-runtime`)
 
-- The port of `TruncateWithDepth` and the server failure builder move from the edge's `grpc/payload_limits.rs` to `tokeira_proto::failure_limits`, which both the edge and the runtime use. The builder takes v1.31.0's non-retryable flag, which the edge's callers set and the stored activity failure clears.
-- `commit_activity_retry` decodes the failure it is given (`temporal/failure+proto`) and replaces one over the stored activity failure limit before storing it (`run_growth::stored_activity_failure`): a server failure `Failure exceeds size limit.`, not marked non-retryable, whose cause is the original truncated to the limit (criterion 2.8). Workflow rules read the stored failure, as in v1.31.0. The final ActivityTaskFailed event keeps the worker's failure.
+- The server failure builder and the truncation move from the edge's `grpc/payload_limits.rs` to `tokeira_proto::failure_limits`, which both the edge and the runtime use. The truncation is rewritten to cut a failure down by its encoded size, so a replacement always fits its limit (`payload-admission-limits` Property 2). The builder takes v1.31.0's non-retryable flag, which the edge's callers set and the stored activity failure clears.
+- `commit_activity_retry` decodes the failure it is given (`temporal/failure+proto`) and replaces one over the stored activity failure limit before storing it (`run_growth::stored_activity_failure`): a server failure `Failure exceeds size limit.`, not marked non-retryable, whose cause is the original cut down so that the whole fits the limit (criterion 2.8; `failure_limits::oversized_failure`). Workflow rules read the stored failure, as in v1.31.0. The final ActivityTaskFailed event keeps the worker's failure.
 
 ### Functional harness wiring
 
@@ -123,14 +123,14 @@ _For any_ failure, the activity's stored last failure SHALL be the failure itsel
 
 ### Exploratory Bug Condition Checking
 
-- Negative controls: with each check removed or moved, the test that covers it fails. Sixteen were run: no history size check; the count including the finishing events; first writes checked; the state with its activities' inputs; finishing steps unmarked; no buffered size limit; the speculative conversion, and the Nexus operation's task, numbered while handling the request; an activity's start checking the buffered limits; the lane setting no limits; the lane not terminating; the activity writes not terminating; a refused start returning the error; any batch terminating; a failure stored whole; and a breach answered as an internal error.
+- Negative controls: with each check removed or moved, the test that covers it fails. Sixteen were run: no history size check; the count including the finishing events; first writes checked; the state with its activities' inputs; finishing steps unmarked; no buffered size limit; the speculative conversion, and the Nexus operation's task, numbered while handling the request; an activity's start checking the buffered limits; the lane setting no limits; the lane not terminating; the activity writes not terminating; a refused start returning the error; any batch terminating; a failure stored whole; and a breach answered as an internal error. The rewritten truncation has seven more, recorded in `payload-admission-limits`.
 
 ### Property-Based Tests
 
 - Property 1 over the shared check function, with generated History Sizes, event counts, finishing events, state and batch sizes on both sides of each limit, and through the in-memory store, showing a refused commit writes nothing (`memory.rs` tests, `run_growth`).
 - Property 2 through the engine's in-process gRPC endpoint on the in-memory store, at v1.31.0's limits (`crates/tokeira-engine/tests/run_growth_limits.rs`): signals of 2 MiB until Describe's History Size passes 50 MiB, with no task started; heartbeat details of 2 MiB on up to five activities until one would take the state past 8 MiB, with a task started and a signal buffered; and a workflow task completion whose batch passes 4 MiB with the signal it flushes, since gRPC caps a request at 4 MiB. The runtime's tests cover a completion over the limit on its own, and the count (`crates/tokeira-runtime/tests/runtime_run_growth.rs`).
 - Property 3 in the kernel, over generated sequences of signals and activity results of generated sizes (`crates/tokeira-kernel/tests/run_growth_limits.rs`).
-- Property 4 over generated failures (`run_growth.rs` tests), against the port of `TruncateWithDepth` that `payload-admission-limits`' Property 2 compares with a transcription of v1.31.0's.
+- Property 4 over generated failures (`run_growth.rs` tests): a failure within the limit is stored as it is, and one over it is replaced by the server failure, which fits the limit. How the cause is cut down is `payload-admission-limits`' Property 2.
 
 ### Unit Tests
 

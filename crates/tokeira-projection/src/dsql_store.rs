@@ -2068,6 +2068,8 @@ mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_storage::ProjectionContext;
+    #[cfg(feature = "dsql-integration")]
+    use tokeira_storage::dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig};
     use tokeira_types::{
         Payload, RunId, SearchAttrValue, TaskQueueName, VisibilityLifecycleState, WorkflowId,
         WorkflowType,
@@ -2436,5 +2438,86 @@ mod tests {
             Just(ExecutionStatus::ContinuedAsNew),
             Just(ExecutionStatus::TimedOut),
         ]
+    }
+
+    // Feature: on-conflict-row-counts, Property 8: The visibility row follows the newest version
+    // Checked where it is decided: `upsert_execution_row`'s answer gates every
+    // replacement and clear of a run's search-attribute index rows, and the race
+    // that lets a stale record past its caller's version check can't be staged
+    // deterministically through the store's API.
+    #[cfg(feature = "dsql-integration")]
+    #[test]
+    fn dsql_a_visibility_row_applies_only_a_newer_version() -> Result<()> {
+        let Ok(url) = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (pool, store) = runtime.block_on(async {
+            let pool = sqlx::PgPool::connect(&url).await?;
+            let config = DsqlPoolConfig {
+                // nextest starts this test in its crate directory, not the workspace root.
+                migration: MigrationConfig {
+                    migrations_dir: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../tokeira-storage/migrations"),
+                },
+                ..DsqlPoolConfig::default()
+            };
+            let store = DsqlStore::from_database_url_for_tests(url.clone(), config).await?;
+            store.migration_runner().apply(&pool).await?;
+            Ok::<_, anyhow::Error>((pool, store))
+        })?;
+        // Every pair of stored and incoming versions, each an (authority epoch,
+        // transition) pair, over two epochs and two transitions. The pairs include
+        // equal, older and newer versions, and a newer epoch with an earlier
+        // transition.
+        let versions = [(1i64, 1u64), (1, 2), (2, 1), (2, 2)];
+        let pairs = versions
+            .into_iter()
+            .flat_map(|stored| versions.into_iter().map(move |incoming| (stored, incoming)));
+        for (stored, incoming) in pairs {
+            runtime
+                .block_on(async {
+                    let run_key = RunKey(uuid::Uuid::new_v4());
+                    let mut row = resolve_final_vis_state(
+                        &test_projection_context(ExecutionStatus::Running),
+                        run_key,
+                    );
+                    row.authority_epoch = stored.0;
+                    row.source_transition_seq = TransitionSeq(stored.1);
+                    row.task_queue = TaskQueueName("stored".to_owned());
+                    let mut next = row.clone();
+                    next.authority_epoch = incoming.0;
+                    next.source_transition_seq = TransitionSeq(incoming.1);
+                    next.task_queue = TaskQueueName("incoming".to_owned());
+                    let mut connection = pool.acquire().await?;
+                    anyhow::ensure!(
+                        upsert_execution_row(&mut connection, &row, None).await?,
+                        "the fixture row wasn't applied"
+                    );
+                    let applied = upsert_execution_row(&mut connection, &next, None).await?;
+                    let kept = get_execution_row(&mut connection, run_key)
+                        .await?
+                        .ok_or_else(|| anyhow!("the row is stored"))?;
+                    sqlx::query("DELETE FROM execution_visibility_current WHERE run_key = $1")
+                        .bind(run_key.0)
+                        .execute(&mut *connection)
+                        .await?;
+                    let newer = incoming > stored;
+                    let expected = if newer { "incoming" } else { "stored" };
+                    anyhow::ensure!(
+                        applied == newer && kept.task_queue.0 == expected,
+                        "answered applied {applied} and kept {}, expected {expected}",
+                        kept.task_queue.0
+                    );
+                    Ok::<_, anyhow::Error>(())
+                })
+                .map_err(|error| anyhow!("stored {stored:?}, incoming {incoming:?}: {error:#}"))?;
+        }
+        runtime.block_on(async {
+            pool.close().await;
+            store.shutdown().await
+        })
     }
 }

@@ -36,7 +36,9 @@ uuid.workspace = true
 [features]
 default = []
 dsql = ["dep:sqlx", "tokeira-storage/dsql"]
-dsql-integration = ["dsql"]
+# The live suites build the DSQL store from a URL, which only storage's
+# integration feature exposes.
+dsql-integration = ["dsql", "tokeira-storage/dsql-integration"]
 
 [dev-dependencies]
 metrics-util.workspace = true

@@ -44,7 +44,6 @@
 //! signals, which is how every release before the count behaves.
 //! Section [`USED_WORKER_DEPLOYMENT_VERSIONS_SECTION`] is a frozen postcard
 //! `Vec<String>`: presence (including an empty vector) records accumulator readiness.
-//! Tag 2 belongs to a separate extension; neither existing payload changes here.
 //!
 //! [`history_batch_encoded_len`] is the one definition of a batch's persisted size.
 //! The DSQL repository and the in-memory store both account the per-run History Size

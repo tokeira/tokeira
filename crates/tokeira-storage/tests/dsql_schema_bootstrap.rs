@@ -145,9 +145,9 @@ async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
     let mut connection = PgConnection::connect(&database_url).await?;
     let runner = MigrationRunner::embedded();
     let contract = MigrationRunner::compatibility_contract();
-    assert_eq!(contract.target_version, 73);
+    assert_eq!(contract.target_version, 76);
     // Inspect before any mutation: this fixture must exercise the released V068
-    // boundary, not silently pass against a database already upgraded to V073.
+    // boundary, not silently pass against a database already upgraded to V076.
     assert_eq!(
         runner
             .assess_connection(

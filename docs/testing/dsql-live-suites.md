@@ -24,6 +24,9 @@ point them at a database holding application data.
 | Storage `dsql_archetype_scoped_business_ids` | 1 | CHASM Property 8: scoped pointers and backfill; `--features dsql`, URL gate only |
 | Storage `dsql_chasm_node_store_round_trips_and_fences` | 1 | CHASM nodes, atomic pointers and fencing; `--features dsql`, URL gate only |
 | Storage `dsql_concurrent_starts_fence_pointer_and_roll_back_losing_nodes` | 1 | Concurrent CHASM creates and superseding pointers reject stale admission without orphaned nodes; `--features dsql`, URL gate only |
+| Storage `workflow_dispatch_live_atomic_reference_traces` | 1 | 100 generated atomic state/dispatch cases, reset materialization, duplicate/CAS rejection, rollback, and deletion; `dsql-integration`, URL gate only |
+| Storage `workflow_dispatch_live_ordered_pages` | 1 | Normal/Exact paging, home scans including sticky rows, reset boundaries, speculative legacy delivery, and forced digest collisions; `dsql-integration`, URL gate only |
+| Storage `workflow_dispatch_live_reset_uses_execution_home` | 1 | Eight-shard reset placement of hot state, timers and dispatch before any follow-up commit, with execution home distinct from the successor run-hash shard; `dsql-integration`, URL gate only |
 
 Run the suites and their test cases serially against the selected database. The shard
 fixtures reuse a deterministic shard ID across nextest's separate test processes:
@@ -37,6 +40,16 @@ cargo nextest run -p tokeira-storage --features dsql --locked --test-threads 1 -
 
 A green result with the URL gates unset is not live evidence. Record the date, revision,
 suite, and outcome after a credentialed run, without recording the connection URL.
+
+The workflow-dispatch tests use only `TOKEIRA_DSQL_TEST_DATABASE_URL`, apply the
+embedded migrations, and await ASYNC index readiness. Run them serially on an
+ephemeral cluster. The generated transaction suite can exceed nextest's default
+three-minute timeout; use a temporary profile with a longer timeout, as in the
+[managed runbook](managed-embedded-dsql-live-aws.md), without changing the repository profile.
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --test-threads 1 -E 'test(workflow_dispatch_live_)'
+```
 
 ## Endpoint-gated IAM connector
 

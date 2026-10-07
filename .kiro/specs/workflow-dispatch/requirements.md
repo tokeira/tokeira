@@ -120,9 +120,12 @@ Named functions are the durable anchors when subsequent edits move line numbers.
 migrations and asynchronous indexes. The
 [AWS limits](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)
 specify at most 3,000 mutated table rows and 10 MiB of modified data per transaction;
-these are not discovery read limits. The approved task supplies prior playground
-observations about transaction abortion, `ON CONFLICT DO NOTHING` result counts,
-`FOR KEY SHARE`, and writable CTEs. No live DSQL experiment has been run for this spec.
+these are not discovery read limits. The approved task supplies prior Aurora DSQL
+observations about transaction abortion, `FOR KEY SHARE`, and writable CTEs.
+SQLx checks on real DSQL verified correct affected-row counts for
+`ON CONFLICT DO NOTHING` and a skipping `DO UPDATE ... WHERE`. `RETURNING`
+may be selected for its returned data; it is not required to correct row counts.
+Feature-specific execution results belong in the implementation evidence record.
 Statement acceptance alone does not establish the concurrency behavior of a repair.
 
 ## Field and Lifecycle Policy
@@ -262,6 +265,12 @@ normal queue even across a restart, so that affinity cannot strand execution.
 
 ### Requirement 8: Complete fenced acquisition
 
+The initial implementation supports a single execution-home owner. Requirements
+8.4–8.6 remain deferred until the transaction-local lease fence is implemented and
+verified. Single-owner scope includes complete reconciliation, cancellation,
+failure handling, and the non-serving gate; it does not discharge competing-owner
+correctness or the corresponding Property 9 checks.
+
 **User Story:** As a shard owner, I want a complete repaired dispatch view before
 serving, so that old storage, partial repair, and ownership changes cannot hide work.
 
@@ -308,7 +317,7 @@ state, routing, and delivery contracts without expanding into unrelated mechanis
 5. THE implementation SHALL preserve existing workflow priority, fairness metadata, version-routing, query, and eager-delivery contracts at their public boundaries.
 6. THE implementation SHALL leave speculative scheduling and admitted-update recovery mechanisms to their owning specs.
 7. THE discovery interfaces SHALL permit later activity integration without removing today's activity recovery path.
-8. THE design SHALL record any dependency on lease-fencing work separately from the existing `ON CONFLICT` row-count corrections.
+8. THE design SHALL record the transaction-local lease-fencing dependency and retain competing-owner verification as deferred until that fence is implemented and verified.
 
 ### Requirement 11: Recovery latency and progress
 

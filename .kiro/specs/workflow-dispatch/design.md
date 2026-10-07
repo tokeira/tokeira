@@ -54,12 +54,14 @@ in a unique non-partial non-expression index, takeover/release that changes that
 key, compatible renewal, and local expiry self-fencing. A separate successful
 precheck cannot substitute for this contract.
 
-This spec consumes that fence for run commits, deletion, materialization, and
-repair; it does not redesign lease acquisition or renewal. The lease protocol must
-land and pass its concurrency tests before the implementation claims correctness
-under competing owners. The [ON CONFLICT row-count corrections](../on-conflict-row-counts/bugfix.md)
-are a separate dependency and do not establish fencing. Single-owner tests alone
-cannot discharge Requirements 8.4–8.6.
+The complete competing-owner design consumes that fence for run commits,
+deletion, materialization, and repair; it does not redesign lease acquisition or
+renewal. The initial implementation is explicitly single-owner: reconciliation
+and backlog retirement can proceed with cancellation, failure handling, and the
+non-serving gate intact. The lease protocol must land and pass its concurrency
+tests before competing-owner repair is enabled. Requirements 8.4–8.6 and Property
+9 remain deferred; single-owner results cannot discharge them. Verified SQLx
+affected-row behavior is independent of this ownership dependency.
 
 Operation rows, close intents, atomic successor creation, projection discovery,
 admitted-update recovery, and speculative-task redesign are excluded. Preserve
@@ -218,9 +220,11 @@ A notification-only sticky destination additionally requires a nonempty sticky
 queue and a recoverable pending deadline. A legacy affinity record without that
 deadline uses the normal delivery fallback, without changing durable affinity;
 it must not become an unscannable row with no timeout path.
-The current helper in [api.rs](../../../crates/tokeira-storage/src/api.rs),
-`dispatchable_workflow_task`, must share this classification for durable recovery;
-do not accidentally remove its callers' separate speculative delivery path.
+The legacy delivery helper in [api.rs](../../../crates/tokeira-storage/src/api.rs),
+`dispatchable_workflow_task`, shares Running/unstarted and sticky classification,
+but also delivers stored speculative tasks for recovery and existing listing
+callers. Its eligibility is deliberately broader than durable row derivation;
+speculative tasks must remain deliverable without acquiring a durable row.
 
 Both [memory.rs](../../../crates/tokeira-storage/src/memory.rs) and DSQL commit
 paths apply the same result. For `Some(row)`, upsert the complete row; for `None`,
@@ -228,6 +232,13 @@ delete by run key. Do this within the existing commit/memory critical section,
 after rejection/deduplication gates, including reset materialization. Rollback
 rolls back both state and dispatch. Do not add another projection-log read or move
 accumulator maintenance outside that transaction.
+
+DSQL reset materialization places the successor's `workflow_hot`, `timer_bucket`,
+and eligible `workflow_dispatch` rows at
+`execution_home_bundle(namespace_id, workflow_id)`, matching ordinary commits.
+Do not place hot state or timers by successor run-key hash and rely on a later
+commit to move them. A multi-shard live regression must distinguish those two
+placements and inspect all three immediately after materialization.
 
 The initial implementation deliberately performs one dispatch maintenance
 statement per state-changing commit, including an idempotent delete when no row is
@@ -327,6 +338,11 @@ There is no claim, acknowledgement, retry counter, lease, delivery owner, histor
 payload, or workflow input in this table. Application validation enforces enum and
 nullability relationships; DSQL `CHECK` constraints are not used.
 
+Both backends normalize derived timestamps to SQLx's whole-microsecond
+TIMESTAMPTZ representation (truncation toward zero relative to 2000-01-01 UTC).
+This keeps keyset positions and derived row equality identical across backends;
+authoritative pending state retains its original timestamp precision.
+
 `Exact` preserves explicit queue coordinates already stored in state when
 `state.deployment` is present, including its optional build ID. The publisher
 already treats these coordinates as resolved. `Live` covers every other task,
@@ -384,9 +400,10 @@ CREATE INDEX ASYNC idx_workflow_dispatch_home
 ON workflow_dispatch (shard_id, run_key);
 ```
 
-These are separate forward-only migration statements, after the then-current
-migration head; do not reserve numbers that another change may consume. Table
-creation is its own migration. The queue index has eight key columns, with bounded
+The first implementation reserves V074 for the table, V075 for the queue index,
+and V076 for the home index, following the immutable V073 prefix. Each is a
+separate forward-only statement; merged migrations are never renumbered. The
+queue index has eight key columns, with bounded
 digest widths; its partial predicate removes notification-only sticky rows. The
 home index is deliberately complete because reconciliation must find sticky,
 normal, and stale rows. No covering payload columns or time-dependent predicates
@@ -513,6 +530,12 @@ separate lane-local `shard_for(run_key)` mapping. Admission for every run in tha
 home must remain disabled during repair. The implementation must test this mapping
 explicitly: a local lane being Active is insufficient to bypass its execution
 home's acquisition gate.
+
+The following protocol describes the complete competing-owner design. The initial
+single-owner implementation retains acquisition identity, cancellation, local
+expiry checks, transactional authoritative reads, and the non-serving gate.
+Transaction-local takeover/renewal fencing and its concurrency claims remain
+deferred to Tasks 17–18; this does not block single-owner repair or backlog retirement.
 
 1. Acquire ownership and enter `Sweeping`. Capture a fence containing home, owner,
    and epoch; connect cancellation and local expiry to this acquisition attempt.
@@ -779,6 +802,9 @@ non-serving, and a restart from the head converges without a durable checkpoint.
 
 ### Property 9: Ownership loss fences repair
 
+Deferred: requires the separately implemented and verified transaction-local
+lease fence; single-owner implementation and tests do not establish this property.
+
 For any interleaving of repair, ownership change, run commit, and activation, the
 old owner cannot commit repair over the successor's state; losing ownership cannot
 mark the old acquisition serving. The result holds when execution-home and local
@@ -882,12 +908,15 @@ path; passing only an in-memory simulation does not validate database conflicts.
 
 ### DSQL evidence and checks still required
 
-The user brief reports prior Aurora DSQL playground observations of the 3,000-row
-and 10-MiB aggregate write limits, whole-transaction abort on statement refusal,
-`RETURNING` as the reliable evidence for `ON CONFLICT DO NOTHING` insertion,
-`FOR KEY SHARE`, and writable CTE support. Those are reported evidence, not new
-experiments performed for this feature. This design performs no live DSQL
-experiment and uses neither writable CTEs nor affected-row branching as a premise.
+Prior Aurora DSQL observations cover the 3,000-row and 10-MiB aggregate write
+limits, whole-transaction abort on statement refusal, `FOR KEY SHARE`, and writable
+CTE support. SQLx checks on real DSQL verified correct affected-row counts for
+`ON CONFLICT DO NOTHING` and a skipping `DO UPDATE ... WHERE`. A statement may use
+`RETURNING` when its returned values are useful. Feature-specific live evidence
+must record the revision, executed checks, and ephemeral cluster lifecycle times;
+these prior observations do not replace those checks.
+See the [implementation evidence](implementation-evidence.md) for checks actually
+executed by each implementation increment and those still outstanding.
 
 Current AWS documentation supports the
 [key-share conflict rules](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-concurrency-control.html)

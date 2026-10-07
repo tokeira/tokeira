@@ -1,21 +1,22 @@
 # Implementation Plan: Durable Workflow-Task Dispatch
 
 This plan implements the [requirements](requirements.md) and [design](design.md).
-All tasks are unimplemented. The checkpoints below apply to the future code
-change; authoring this specification does not require Rust builds or live DSQL.
+Implementation proceeds in independently verified PRs. The initial scope is
+single-owner; deferred competing-owner work remains separately unchecked below.
+Completed checks and remaining verification are recorded in
+[implementation evidence](implementation-evidence.md).
 
 The external `lease-fence` prerequisite means the passing transaction-local
 ownership protocol described in the design and
 [30_bundle_lease.tla](../../../spec/tla/30_bundle_lease.tla). It must be implemented
 and verified separately before competing-owner acquisition repair is enabled.
-The [ON CONFLICT row-count corrections](../on-conflict-row-counts/bugfix.md) do not
-satisfy that gate.
-Tasks below consume that protocol and do not redesign lease acquisition/renewal.
+Tasks 17–18 consume that protocol and do not redesign lease acquisition/renewal.
+Single-owner reconciliation and backlog retirement do not depend on those tasks.
 
 ## Tasks
 
-- [ ] 1. Add the shared dispatch model and storage schema
-  - [ ] 1.1 Implement pure row derivation and typed coordinates
+- [x] 1. Add the shared dispatch model and storage schema
+  - [x] 1.1 Implement pure row derivation and typed coordinates
     - Add `crates/tokeira-storage/src/workflow_dispatch.rs` with the row,
       incarnation, range, and position types from the design. Derive a row only
       for a running run's unstarted normal task, including transient retries.
@@ -26,8 +27,8 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
       normal fallback for legacy affinity without a recoverable sticky deadline;
       preserve separate speculative delivery callers.
     - _Requirements: 1.1, 1.6, 1.7, 7.5, 7.8, 10.1, 10.4, 10.5, 10.6_
-  - [ ] 1.2 Add forward-only table and index migrations
-    - Allocate contiguous versions after the then-current migration head. Add one
+  - [x] 1.2 Add forward-only table and index migrations
+    - Use V074–V076 after the immutable V073 prefix. Add one
       table statement, the partial normal-queue index, and the complete home
       index as separate migrations; await ASYNC index success before readiness.
     - Implement the design's domain-separated, length-prefixed SHA-256 lookup
@@ -37,7 +38,7 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
       and fixed digest vectors. Preserve all existing migration bytes, frozen
       state extensions, and activity schema.
     - _Requirements: 10.1, 10.2, 10.3, 10.4, 12.8_
-  - [ ] 1.3 Add read-only repository paging on both backends
+  - [x] 1.3 Add read-only repository paging on both backends
     - Extend `RunRepository` with normal-range and execution-home page methods.
       Implement first-page and strict keyset queries ordered by
       `(priority_key, scheduled_at, run_key)` and home walks ordered by run key.
@@ -47,7 +48,7 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
     - Use existing storage-director permits and short page transactions. Do not
       retain a connection, database snapshot, or cursor across an entire pass.
     - _Requirements: 3.1, 3.2, 3.3, 3.5, 3.7, 8.3, 10.2, 10.7_
-  - [ ] 1.4 Add reusable generated-test adapters and controlled failures
+  - [x] 1.4 Add reusable generated-test adapters and controlled failures
     - Use existing storage test infrastructure to run the same reference traces
       on memory and real DSQL. Add narrowly scoped transaction-failure hooks,
       injected lookup collisions, and deterministic synchronization where needed.
@@ -55,8 +56,8 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
       not substitute a mocked database or PostgreSQL for DSQL transaction tests.
     - _Requirements: 12.1, 12.2, 12.8_
 
-- [ ] 2. Make normal workflow-task incarnation allocation complete
-  - [ ] 2.1 Centralize checked normal-task sequence allocation
+- [x] 2. Make normal workflow-task incarnation allocation complete
+  - [x] 2.1 Centralize checked normal-task sequence allocation
     - In `tokeira-kernel`, add the pure allocator and retained-pending renewal
       helper. Renew the sequence in ordinary retained failure retries and when
       resuming a retained unstarted normal task; retain existing fresh-schedule,
@@ -65,7 +66,7 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
       virtual event IDs, advice resets, and the allocator's persisted layout.
       Do not modify the speculative scheduling loop or admitted-update recovery.
     - _Requirements: 1.5, 1.7, 2.1, 2.2, 2.7, 10.4, 10.6_
-  - [ ] 2.2 Apply the authoritative normal-start fence consistently
+  - [x] 2.2 Apply the authoritative normal-start fence consistently
     - Require Running status, matching sequence, and unstarted pending state.
       Preserve completion of already-started tasks under existing pause policy.
     - Carry the renewed sequence through publication, start submission, timeout
@@ -74,7 +75,7 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
     - Retain public error/token behavior and the existing recovery through
       start-to-close timeout after an ambiguous committed start.
     - _Requirements: 2.2, 2.3, 2.4, 2.7, 6.4, 10.5_
-  - [ ] 2.3 Required property test: Property 2 — Incarnation fencing and observable retry preservation
+  - [x] 2.3 Required property test: Property 2 — Incarnation fencing and observable retry preservation
     - Implement `proptest` with at least 100 cases in the kernel tests, with
       runtime submission/token cases where required. Generate retained failures,
       pause/resume, supersession, delayed old offers, repeated submissions,
@@ -84,8 +85,8 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
     - Tag: `// Feature: workflow-dispatch, Property 2: Incarnation fencing and observable retry preservation`
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.7, 12.2_
 
-- [ ] 3. Maintain dispatch in every authoritative storage transaction
-  - [ ] 3.1 Integrate shared derivation into memory and DSQL commits
+- [x] 3. Maintain dispatch in every authoritative storage transaction
+  - [x] 3.1 Integrate shared derivation into memory and DSQL commits
     - Apply the full upsert or run-key delete within the existing transaction or
       memory critical section, after rejection/deduplication gates. Include
       scheduling, start, retry, priority/routing changes, pause/resume, close,
@@ -97,7 +98,7 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
       Document transaction/OCC reasoning rather than optimizing unchanged writes
       before the invariant is established.
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 2.5, 10.4_
-  - [ ] 3.2 Required property test: Property 1 — Atomic derived equality
+  - [x] 3.2 Required property test: Property 1 — Atomic derived equality
     - Implement at least 100 `proptest` cases per backend through the shared
       adapters. Generate transitions and reset materializations, including
       duplicate/rejected commands and failures between state and dispatch writes.
@@ -107,7 +108,7 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
     - Tag: `// Feature: workflow-dispatch, Property 1: Atomic derived equality`
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 2.5, 12.1_
 
-- [ ] 4. Checkpoint: storage and incarnation changes are green
+- [x] 4. Checkpoint: storage and incarnation changes are green
   - Run nightly formatting, locked checks and all-target clippy for the affected
     kernel/storage crates, and their focused nextest suites and doctests. Verify
     migration contracts and frozen-state fixtures without changing dependencies.
@@ -224,18 +225,19 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
     - Tag: `// Feature: workflow-dispatch, Property 7: Sticky recovery and affinity independence`
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 12.2_
 
-- [ ] 9. Add complete execution-home reconciliation under the landed lease fence
+- [ ] 9. Add complete single-owner execution-home reconciliation
   - [ ] 9.1 Implement one-run repair transactions on both stores
-    - Consume the external `lease-fence` contract in
-      `reconcile_workflow_dispatch_run`. Take a home/owner/epoch fence and run key,
-      read authoritative state in that same transaction, derive, and upsert/delete.
+    - Implement `reconcile_workflow_dispatch_run` for single-owner acquisition.
+      Carry execution-home context and the run key; read authoritative state in
+      that same transaction, derive, and upsert/delete. Task 17 supplies the
+      transaction-local competing-owner fence when its prerequisite lands.
     - Validate home agreement and row encoding; account for all transaction writes
       within aggregate limits. Read pages are not write batches. Retry complete
-      transactions after OCC conflict with fresh state and fence validation.
+      transactions after OCC conflict with fresh state and acquisition validation.
     - Make repair idempotent without changing history, hot state, transition
       sequence, projection accumulator, or recovery flag. Fail on corruption,
       ownership loss, decode error, and exhausted retries rather than skipping.
-    - _Requirements: 8.4, 8.5, 8.6, 8.7, 8.8, 8.9, 8.10, 10.8_
+    - _Requirements: 8.7, 8.8, 8.9, 8.10, 10.8_
   - [ ] 9.2 Wire the two walks and execution-home serving gate
     - Keep the acquired home Sweeping. Page recovery candidates through NULL/true
       phases, repair them, and reconstruct timeouts; then sweep every home-index
@@ -243,10 +245,11 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
     - Verify cancellation, owner/epoch, and local expiry before publishing Active
       for that acquisition. Gate every relevant run writer, including retention
       and materialization, on the same execution home; test where lane-local
-      run-key placement differs. No stale local activation permits a fenced write.
+      run-key placement differs. Retain cancellation and local lifecycle checks;
+      competing-owner write fencing remains Task 17.
     - Abandon lost acquisitions and restart both walks from the head after failure;
       never persist a continuation or serve after partial repair.
-    - _Requirements: 8.1, 8.2, 8.3, 8.5, 8.6, 8.7, 8.9, 8.11, 12.5_
+    - _Requirements: 8.1, 8.2, 8.3, 8.7, 8.9, 8.11, 12.5_
   - [ ] 9.3 Required property test: Property 8 — Complete bounded repair
     - Implement at least 100 `proptest` cases per backend over missing, stale,
       and mismatched rows; NULL/false recovery flags consistent with their state;
@@ -256,24 +259,15 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
       decode/write/query failures and prove the home remains non-serving.
     - Tag: `// Feature: workflow-dispatch, Property 8: Complete bounded repair`
     - _Requirements: 8.1, 8.2, 8.3, 8.7, 8.8, 8.9, 8.10, 8.11, 12.2, 12.5_
-  - [ ] 9.4 Required property test: Property 9 — Ownership loss fences repair
-    - Implement at least 100 generated interleaving cases with deterministic
-      barriers in runtime and storage tests, including the real DSQL adapter.
-      Race old-owner repair, takeover, renewal, successor writes, and activation.
-    - Verify stale repair cannot overwrite successor state, no lost acquisition
-      becomes serving, and renewal does not spuriously abort valid owner writes.
-      Include differing execution-home/local-lane mappings and final-gate races.
-    - Tag: `// Feature: workflow-dispatch, Property 9: Ownership loss fences repair`
-    - _Requirements: 8.4, 8.5, 8.6, 10.8, 12.5, 12.8_
 
 - [ ] 10. Checkpoint: runtime discovery and acquisition are green
   - Run affected-crate locked checks, all-target clippy, focused nextest suites,
     and doctests for broker, discovery, registration, sticky timers, and repair.
     Confirm every background task cancels and every new error has the design's
     existing admission/poll behavior and actionable diagnostics.
-  - Confirm the external lease prerequisite is satisfied before proceeding with
-    competing-owner integration. Keep the implementation incomplete if that
-    dependency is unavailable; do not substitute single-owner results.
+  - Leave competing-owner integration and its verification in Tasks 17–18 until
+    the external lease prerequisite is satisfied. Single-owner completion may
+    proceed; do not report its results as competing-owner verification.
   - _Requirements: 4.1, 5.4, 6.5, 7.3, 8.1, 8.9, 10.8, 12.9_
 
 - [ ] 11. Retire workflow backlog use and implement bounded legacy disposal
@@ -370,25 +364,23 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
       widths at valid name limits, deployment/build selection, and ASYNC readiness.
     - Add multi-statement rollback and aggregate row/byte-limit boundary cases for
       commit, reset, repair, and legacy disposal; verify whole-transaction abort.
-      Never infer insertion success from `rows_affected()` after DO NOTHING.
-    - Include deterministic concurrent renewal/takeover/repair cases with the
-      landed fence and generated storage suites for Properties 1, 3, 8, 9, 10,
+    - Include generated single-owner storage suites for Properties 1, 3, 8, 10,
       and the storage portions of Property 11, at least 100 cases per property.
-    - _Requirements: 1.2, 1.3, 8.4, 8.5, 8.8, 9.4, 10.2, 10.4, 12.1, 12.8_
+    - _Requirements: 1.2, 1.3, 8.8, 9.4, 10.2, 10.4, 12.1, 12.8_
   - [ ] 15.2 Checkpoint: run the DSQL suites and preserve accurate evidence
     - Run only on a newly created ephemeral real DSQL cluster under the authorized
       profile and region. Ensure cleanup runs on success or failure and touches
       only that cluster; keep endpoints/identifiers/credentials out of artifacts.
     - Record test/model revisions, cases, transaction outcomes, query plans,
-      rows/statements read, and pass durations. Separate reported prior playground
+      rows/statements read, and pass durations. Separate reported prior Aurora DSQL
       observations from experiments actually performed by this implementation.
     - If live verification is unavailable, report the unmet checks and leave this
       task incomplete; a local simulation or PostgreSQL result cannot complete it.
     - _Requirements: 10.2, 10.8, 12.1, 12.8, 12.9_
 
-- [ ] 16. Final implementation checkpoint
-  - Verify every property below has its required executable test, every acceptance
-    criterion has implementation or verification coverage, and all positive/negative
+- [ ] 16. Single-owner implementation checkpoint
+  - Verify every in-scope property below has its required executable test, every
+    in-scope acceptance criterion has implementation or verification coverage, and all positive/negative
     model checks have their expected outcomes. Add module/public-item and inline
     concurrency reasoning required by AGENTS.md, citing Temporal source where
     observable behavior is non-obvious.
@@ -399,7 +391,33 @@ Tasks below consume that protocol and do not redesign lease acquisition/renewal.
     Run Markdown link and whitespace checks for implementation documentation.
   - Reconcile actual commands/results with the evidence record. Do not mark live
     DSQL, ownership safety, or a property test complete from plan text alone.
+    Keep Tasks 17–18 and Requirements 8.4–8.6 outstanding; this checkpoint does not
+    declare the full competing-owner design implemented.
   - _Requirements: 10.3, 10.4, 10.5, 10.6, 12.4, 12.5, 12.6, 12.7, 12.8, 12.9_
+
+- [ ] 17. Consume the lease fence and verify competing-owner repair
+  - Deferred: requires the separately implemented and verified transaction-local lease fence.
+  - [ ] 17.1 Protect every repair and final activation against ownership loss
+    - Consume the landed home/owner/epoch fence inside every repair transaction.
+      Preserve takeover/release conflict ordering, compatible renewal, and local
+      expiry self-fencing. A lost acquisition cannot publish serving state.
+    - _Requirements: 8.4, 8.5, 8.6, 10.8, 12.5_
+  - [ ] 17.2 Required property test: Property 9 — Ownership loss fences repair
+    - Implement at least 100 generated interleaving cases with deterministic
+      barriers in runtime and storage tests, including the real DSQL adapter.
+      Race old-owner repair, takeover, renewal, successor writes, and activation.
+    - Verify stale repair cannot overwrite successor state, no lost acquisition
+      becomes serving, and renewal does not spuriously abort valid owner writes.
+      Include differing execution-home/local-lane mappings and final-gate races.
+    - Tag: `// Feature: workflow-dispatch, Property 9: Ownership loss fences repair`
+    - _Requirements: 8.4, 8.5, 8.6, 10.8, 12.5, 12.8_
+
+- [ ] 18. Execute competing-owner live DSQL verification
+  - Deferred: requires Task 17's transaction-local fence and concurrency tests.
+  - Run deterministic renewal/takeover/repair and final-activation races on an
+    owned ephemeral real DSQL cluster, including at least 100 Property 9 cases.
+    Record actual outcomes and lifecycle times under Task 15's evidence rules.
+  - _Requirements: 8.4, 8.5, 8.6, 10.8, 12.5, 12.8, 12.9_
 
 ## Task Dependency Graph
 
@@ -421,14 +439,16 @@ unrelated lease work in this feature.
     "6": ["4", "5"],
     "7": ["5", "6"],
     "8": ["3", "5"],
-    "9": ["3", "8", "lease-fence"],
+    "9": ["3", "8"],
     "10": ["5", "6", "7", "8", "9"],
     "11": ["10"],
     "12": ["7", "11"],
     "13": ["2", "6", "9"],
     "14": ["10", "11", "12", "13"],
-    "15": ["14", "lease-fence"],
-    "16": ["12", "13", "14", "15"]
+    "15": ["14"],
+    "16": ["12", "13", "14", "15"],
+    "17": ["9", "lease-fence"],
+    "18": ["15", "17"]
   }
 }
 ```
@@ -441,11 +461,11 @@ unrelated lease work in this feature.
 | 2: Incarnation fencing and observable retry preservation | 2.3 | Storage effects also exercised by 3.2/15 |
 | 3: Ordered read-only traversal | 6.3 | 15 |
 | 4: Bounded slices without prefix starvation | 6.4 | Plan/read-cost evidence in 15 |
-| 5: Demand registration and home independence | 7.2 | Start/ownership fence also exercised by 9.4/15 |
+| 5: Demand registration and home independence | 7.2 | Start checks in 15; competing-owner fence deferred to 17.2/18 |
 | 6: Volatile offer loss and ambiguity | 5.3 | Atomic start/rollback also exercised by 3.2/15 |
 | 7: Sticky recovery and affinity independence | 8.2 | State/reconstruction also exercised by 9.3/15 |
 | 8: Complete bounded repair | 9.3 | 15 |
-| 9: Ownership loss fences repair | 9.4 | 15 |
+| 9: Ownership loss fences repair | 17.2 (deferred) | 18 (deferred) |
 | 10: Workflow-only backlog retirement | 11.3 | 15 |
 | 11: Routing, state, and delivery preservation | 12.2 | Storage portions in 15 |
 | 12: Next-pass recovery and eventual resolution | 14.1 | Query-cost evidence in 15; no wall-clock guarantee |
@@ -463,21 +483,22 @@ unrelated lease work in this feature.
   authorized by this plan.
 - Runtime delivery wiring and workflow backlog retirement form one coherent
   release boundary. Intermediate code may be reviewed in dependency order, but
-  the final release must not disable old workflow delivery before its replacement
-  is complete. Upgrade with every node stopped.
+  intermediate PRs keep existing workflow delivery and recovery operational.
+  Enable bounded, expiring offers and retire workflow backlog paths only when
+  dispatch reconstruction and the serving gate are wired and verified together.
+  Upgrade with every node stopped.
 - Read crate-local instructions before implementing kernel/storage/runtime work.
   Keep API shape and public behavior tied to the vendored protos and Temporal
   v1.31.0 sources cited in requirements/design. Existing request-result gaps are
   not authorization for a new public RPC or persistent delivery ledger.
 - Keep signal/update limits, frozen extension tag 2, external-signal outcome
-  mapping, the existing row-count corrections, and admitted-update/speculative
+  mapping, the verified affected-row behavior, and admitted-update/speculative
   scheduling work in their owning changes. Rebase around those changes. Preserve
   the already-landed projection accumulator and extension tag 3.
 - Activity queue-home discovery and activity backlog retirement are the dependent
   follow-on specification. Keep their present dispatch/pass/backlog paths intact.
   Operations, close intents, successors, and projection discovery remain outside
   this plan.
-- Completing this spec-only change requires the related-spec alignment described
-  in the design, one internal changie fragment, link/whitespace checks, and the
-  authorized commit/rebase/push/PR workflow after document review. Those are spec
-  packaging steps, not unchecked code implementation tasks above.
+- Each implementation PR starts with a code/tests commit and a spec-alignment
+  commit recording completed tasks and actual evidence. Review fixes follow as
+  additional commits. Run the full completion bar for each implementation PR.

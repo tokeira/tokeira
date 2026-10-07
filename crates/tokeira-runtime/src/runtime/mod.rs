@@ -3918,6 +3918,24 @@ mod tests {
             panic!("unused in timer scanner tests")
         }
 
+        async fn list_workflow_dispatch_page(
+            &self,
+            _range: &tokeira_storage::WorkflowDiscoveryRange,
+            _after: Option<tokeira_storage::WorkflowDispatchPosition>,
+            _limit: std::num::NonZeroU32,
+        ) -> Result<tokeira_storage::WorkflowDispatchPage> {
+            anyhow::bail!("workflow discovery is outside this test repository")
+        }
+
+        async fn list_workflow_dispatch_for_home(
+            &self,
+            _home: tokeira_types::ShardId,
+            _after: Option<RunKey>,
+            _limit: std::num::NonZeroU32,
+        ) -> Result<Vec<RunKey>> {
+            anyhow::bail!("workflow acquisition is outside this test repository")
+        }
+
         async fn list_dispatchable_workflow_tasks(
             &self,
             _queue: &QueueKey,

@@ -4144,7 +4144,7 @@ fn wft_failed_with_started_wft() {
             && fork_event_id.is_none()
     ));
     let pending = transition.next_state.pending_workflow_task.unwrap();
-    assert_eq!(pending.logical_seq, LogicalTaskSeq(3));
+    assert_eq!(pending.logical_seq, LogicalTaskSeq(4));
     // The retry is TRANSIENT (spec transient-wft Req B.1/B.3): its scheduled id
     // becomes the virtual next-event id (WorkflowTaskFailed landed as event 10,
     // so virtual = 11) and no WorkflowTaskScheduled event is persisted
@@ -4161,7 +4161,7 @@ fn wft_failed_with_started_wft() {
             logical_seq,
             sticky_preferred,
             ..
-        } if *logical_seq == LogicalTaskSeq(3)
+        } if *logical_seq == LogicalTaskSeq(4)
             && *sticky_preferred == Some(WorkerIdentity("sticky-worker".into()))
     ));
     assert!(transition.request_dedupe_ops.is_empty());

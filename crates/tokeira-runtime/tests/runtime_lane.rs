@@ -6,9 +6,10 @@ use time::{Duration, OffsetDateTime};
 
 use tokeira_kernel::{
     CallbackSpec, CallbackState, Command, CompletionCallback, HistoryEventKind, LoadedRun,
-    SignalWithStartRequest, StartRequest, VersioningBehavior, VersioningOverride,
-    WORKFLOW_START_DELAY_TIMER_ID, WorkerDeploymentVersionRef, WorkflowCommand,
-    WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest,
+    PauseWorkflowRequest, SignalWithStartRequest, StartRequest, UnpauseWorkflowRequest,
+    VersioningBehavior, VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID,
+    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowStartDelayElapsedRequest,
+    WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
     ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusCompletionDeps,
@@ -158,6 +159,116 @@ async fn signal_with_start_existing_run_preserves_signal_metadata() -> Result<()
     assert_eq!(signaled.0, &Some(Headers(header)));
     assert_eq!(signaled.1, &links);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_dispatch_paused_poll_is_empty_then_resume_mints_renewed_sequence() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        1,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("resumed-generation".into());
+    let start = runtime
+        .start_workflow(start_request(namespace_id, workflow_id.clone(), "start"))
+        .await?;
+    let key = applied_state(&start).run_key;
+    let execution = ExecutionRef {
+        namespace_id,
+        workflow_id,
+        run_id: None,
+    };
+    runtime
+        .pause_workflow(
+            execution.clone(),
+            PauseWorkflowRequest {
+                identity: "operator".into(),
+                reason: "pause".into(),
+                request: RequestContext {
+                    request_id: RequestId("pause".into()),
+                    ..RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH)
+                },
+                now: OffsetDateTime::UNIX_EPOCH,
+            },
+        )
+        .await?;
+    assert!(
+        runtime
+            .poll_workflow_activation(
+                queue(namespace_id, "queue-a"),
+                None,
+                WorkerIdentity("worker".into()),
+                tokio::time::Duration::ZERO,
+            )
+            .await?
+            .is_none()
+    );
+    let LoadedRun::Existing(paused) = store.load_run(key).await? else {
+        panic!("paused run missing")
+    };
+    assert!(
+        paused
+            .pending_workflow_task
+            .as_ref()
+            .unwrap()
+            .started_event_id
+            .is_none()
+    );
+    let resumed = runtime
+        .unpause_workflow(
+            execution,
+            UnpauseWorkflowRequest {
+                identity: "operator".into(),
+                reason: "resume".into(),
+                request: RequestContext {
+                    request_id: RequestId("resume".into()),
+                    ..RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH)
+                },
+                now: OffsetDateTime::UNIX_EPOCH,
+            },
+        )
+        .await?;
+    let sequence = applied_state(&resumed)
+        .pending_workflow_task
+        .as_ref()
+        .unwrap()
+        .logical_seq;
+    assert!(sequence > LogicalTaskSeq::ONE);
+    store.inject_conflict(key, 2).await;
+    let Some(tokeira_runtime::WorkflowActivation::WorkflowTask(task)) = runtime
+        .poll_workflow_activation(
+            queue(namespace_id, "queue-a"),
+            None,
+            WorkerIdentity("worker".into()),
+            tokio::time::Duration::from_secs(1),
+        )
+        .await?
+    else {
+        panic!("resumed task must be delivered")
+    };
+    assert_eq!(task.token.logical_seq, sequence);
+    let LoadedRun::Existing(state) = store.load_run(key).await? else {
+        panic!("started run missing")
+    };
+    assert_eq!(
+        state.pending_workflow_task.as_ref().unwrap().logical_seq,
+        sequence
+    );
+    assert_eq!(
+        store
+            .read_history(key, 0, 100)
+            .await?
+            .iter()
+            .filter(|event| matches!(event.kind, HistoryEventKind::WorkflowTaskStarted { .. }))
+            .count(),
+        1
+    );
     Ok(())
 }
 

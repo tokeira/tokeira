@@ -65,6 +65,42 @@ use crate::{
 /// service/history/tasks/workflow_task_timer.go:14-19 @ v1.31.0).
 const SPECULATIVE_WFT_SCHEDULE_TO_START_TIMEOUT: Duration = Duration::seconds(5);
 
+/// SQL stores task identity as a signed BIGINT. Reserve exhaustion before any
+/// mutation, including the counter advance, so no wrapped or truncated offer can
+/// name an earlier generation. The persisted allocator layout stays unchanged.
+fn allocate_workflow_task_seq(state: &mut WorkflowState) -> Result<LogicalTaskSeq, Reject> {
+    let sequence = state.next_workflow_task_seq;
+    if sequence.0 == 0 || sequence.0 > i64::MAX as u64 {
+        return Err(Reject::WorkflowTaskSequenceExhausted);
+    }
+    if state
+        .pending_workflow_task
+        .as_ref()
+        .is_some_and(|pending| pending.logical_seq >= sequence)
+    {
+        return Err(Reject::WorkflowTaskStateInconsistent);
+    }
+    state.next_workflow_task_seq = LogicalTaskSeq(sequence.0 + 1);
+    Ok(sequence)
+}
+
+/// Retained retries keep their observable task metadata; only their internal
+/// delivery generation changes. Old offers must not start the retained retry.
+fn renew_pending_workflow_task_incarnation(
+    state: &mut WorkflowState,
+) -> Result<LogicalTaskSeq, Reject> {
+    if state.pending_workflow_task.is_none() {
+        return Err(Reject::NoPendingWorkflowTask);
+    }
+    let sequence = allocate_workflow_task_seq(state)?;
+    state
+        .pending_workflow_task
+        .as_mut()
+        .expect("pending task checked before allocation")
+        .logical_seq = sequence;
+    Ok(sequence)
+}
+
 /// Derive the completion-callback outcome from a run's terminal event.
 ///
 /// Mirrors v1.31.0's `GetNexusCompletion`, which switches on the workflow
@@ -653,7 +689,7 @@ impl BasicKernel {
                 builder.start_pending_workflow_task(identity, req.advice_policy);
             }
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Atomically create a run and deliver a signal in one transition,
@@ -818,7 +854,7 @@ impl BasicKernel {
         } else {
             builder.schedule_workflow_task();
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Create a workflow with an update admitted in the SAME transition —
@@ -884,7 +920,7 @@ impl BasicKernel {
         if builder.append_external(kind) == BUFFERED_EVENT_ID {
             // A signal flood that pushes the buffer over a limit force-closes
             // the started WFT when the transition finishes.
-            return Ok(builder.finish());
+            return builder.finish();
         }
 
         // Insight: Tokeira keeps the "at most one outstanding workflow task"
@@ -907,7 +943,7 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Admit a workflow update request. Updates go through a two-phase
@@ -970,7 +1006,7 @@ impl BasicKernel {
             builder.schedule_speculative_workflow_task();
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Record a cancellation request. This does not close the workflow —
@@ -988,9 +1024,7 @@ impl BasicKernel {
         // what turns a cancel-external against a finished target into the
         // source's ExternalWorkflowExecutionCancelRequested SUCCESS event.
         if !state.is_open() || state.cancel_requested {
-            return Ok(
-                TransitionBuilder::new(state, req.now, req.request.principal.clone()).finish(),
-            );
+            return TransitionBuilder::new(state, req.now, req.request.principal.clone()).finish();
         }
         let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
@@ -1017,7 +1051,7 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Forcefully close the workflow. Unlike cancel, terminate is
@@ -1039,7 +1073,7 @@ impl BasicKernel {
             request_id: req.request.request_id.clone(),
         });
         builder.terminate_run(req.reason, req.details, req.identity, req.links);
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Force-close-then-terminate driven by `RespondWorkflowTaskFailed` with
@@ -1079,7 +1113,7 @@ impl BasicKernel {
             request_id: req.request.request_id.clone(),
         });
         builder.terminate_run(req.reason, None, req.identity, Vec::new());
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Freeze the workflow so no new WFTs are dispatched. Bumps the
@@ -1096,9 +1130,8 @@ impl BasicKernel {
             if let Some(info) = &state.pause_info
                 && info.request_id == req.request.request_id.0
             {
-                return Ok(
-                    TransitionBuilder::new(state, req.now, req.request.principal.clone()).finish(),
-                );
+                return TransitionBuilder::new(state, req.now, req.request.principal.clone())
+                    .finish();
             }
             return Err(Reject::AlreadyPaused);
         }
@@ -1131,7 +1164,7 @@ impl BasicKernel {
             }
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Resume a paused workflow. Re-enqueues every pending activity
@@ -1187,8 +1220,42 @@ impl BasicKernel {
 
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
+        } else if builder
+            .state
+            .pending_workflow_task
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.started_event_id.is_none() && pending.task_type == WorkflowTaskType::Normal
+            })
+        {
+            let logical_seq = renew_pending_workflow_task_incarnation(&mut builder.state)?;
+            let pending = builder
+                .state
+                .pending_workflow_task
+                .as_ref()
+                .expect("retained task exists");
+            let sticky = builder.state.sticky.as_ref().filter(|affinity| {
+                !affinity.sticky_queue.0.is_empty() && pending.schedule_to_start_deadline.is_some()
+            });
+            builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
+                queue: QueueKey {
+                    namespace_id: builder.state.namespace_id,
+                    task_queue: sticky.map_or_else(
+                        || builder.state.task_queue.clone(),
+                        |affinity| affinity.sticky_queue.clone(),
+                    ),
+                    task_kind: tokeira_types::TaskKind::Workflow,
+                    deployment: builder.state.deployment.clone(),
+                    build_id: builder.state.build_id.clone(),
+                },
+                logical_seq,
+                sticky_preferred: sticky.map(|affinity| affinity.worker_identity.clone()),
+                normal_task_queue: Some(builder.state.task_queue.clone()),
+                speculative: false,
+                priority: builder.state.priority.clone(),
+            });
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Hot-patch activity options (timeouts, task queue) without
@@ -1270,7 +1337,7 @@ impl BasicKernel {
                 enqueue_activity_dispatch(&mut builder, &activity);
             }
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Pause all activities selected from one authoritative state image.
@@ -1331,7 +1398,7 @@ impl BasicKernel {
                 .activity_ops
                 .push(ActivityOp::Upsert(activity.clone()));
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Resume all selected paused activities and re-enqueue scheduled matches.
@@ -1388,7 +1455,7 @@ impl BasicKernel {
             }
             builder.activity_ops.push(ActivityOp::Upsert(snapshot));
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Reset all selected activities while keeping the current running attempt
@@ -1478,7 +1545,7 @@ impl BasicKernel {
             }
             builder.activity_ops.push(ActivityOp::Upsert(snapshot));
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Fork the workflow history at a prior event, closing this run
@@ -1559,7 +1626,7 @@ impl BasicKernel {
             builder.close(ExecutionStatus::Terminated);
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Mutate versioning override and completion callbacks on a live run.
@@ -1675,7 +1742,7 @@ impl BasicKernel {
             .extend(attached_completion_callbacks);
         builder.state.links.extend(req.attached_links);
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Close the workflow because a server-enforced timeout fired.
@@ -1701,7 +1768,7 @@ impl BasicKernel {
         builder.close(ExecutionStatus::TimedOut);
         builder.apply_parent_close_policy();
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Mark a pending WFT as started. Validates the logical sequence
@@ -1712,6 +1779,9 @@ impl BasicKernel {
         req: StartWorkflowTaskRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
+        if state.status != ExecutionStatus::Running {
+            return Err(Reject::WorkflowPaused);
+        }
         let pending = state
             .pending_workflow_task
             .clone()
@@ -1858,7 +1928,7 @@ impl BasicKernel {
                 })?;
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Start a Worker Deployment transition and ensure a WFT exists to observe it.
@@ -1891,7 +1961,7 @@ impl BasicKernel {
         } else {
             builder.redispatch_pending_workflow_task_for_transition(&req.target);
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Complete a workflow task and apply the worker's command batch.
@@ -2044,7 +2114,7 @@ impl BasicKernel {
                 if !builder.state.admitted_updates.is_empty() {
                     builder.schedule_speculative_workflow_task();
                 }
-                return Ok(builder.finish());
+                return builder.finish();
             }
         }
 
@@ -2269,7 +2339,7 @@ impl BasicKernel {
                 });
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Record that an activity started — the transition the runtime commits
@@ -2444,7 +2514,7 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Record whether a child workflow started or failed to start.
@@ -2509,7 +2579,7 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Record the terminal outcome of a child workflow and remove it
@@ -2599,7 +2669,7 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Record the outcome of a cross-workflow signal request.
@@ -2648,7 +2718,7 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Record the outcome of a cross-workflow cancel request.
@@ -2701,7 +2771,7 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Record a Nexus operation lifecycle event (started, completed,
@@ -2952,7 +3022,7 @@ impl BasicKernel {
             }
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Re-dispatch a backing-off Nexus operation whose `next_attempt_at` has
@@ -3014,7 +3084,7 @@ impl BasicKernel {
                 scheduled_event_id: pending.scheduled_event_id,
                 scheduled_at: pending.scheduled_at,
             });
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Advance the durable cancellation child after one runtime-owned delivery
@@ -3098,7 +3168,7 @@ impl BasicKernel {
                 builder.schedule_workflow_task_on_close();
             }
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Re-dispatch a cancellation whose retry deadline was selected by the runtime.
@@ -3153,7 +3223,7 @@ impl BasicKernel {
             endpoint: pending.endpoint,
             service: pending.service,
         });
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Record a WFT failure. The pending WFT stays alive (with
@@ -3557,7 +3627,7 @@ impl BasicKernel {
         if let Some(reason) = req.terminate_reason {
             builder.state.pending_workflow_task = None;
             builder.terminate_run(reason, None, "history-service".to_string(), Vec::new());
-            return Ok(builder.finish());
+            return builder.finish();
         }
         let paused = builder.state.status == ExecutionStatus::Paused;
         // A reset re-drives from the fork point on a FRESH normal attempt-1 task
@@ -3581,9 +3651,11 @@ impl BasicKernel {
             builder.state.pending_workflow_task = None;
             builder.schedule_workflow_task();
         } else {
-            // No new events (or paused): keep the failed task alive for a retry with
-            // the same `logical_seq` and no new WorkflowTaskScheduled event. Phase B
-            // refines this attempt>1 branch to virtual ids + event suppression.
+            // No new events (or paused): preserve transient event suppression
+            // and virtual IDs, but fence delayed offers from the failed attempt.
+            // The new internal generation does not change Temporal's attempts
+            // (service/history/workflow/workflow_task_state_machine.go @ v1.31.0).
+            let logical_seq = renew_pending_workflow_task_incarnation(&mut builder.state)?;
             let sticky_preferred = builder
                 .state
                 .sticky
@@ -3629,14 +3701,14 @@ impl BasicKernel {
                         deployment: builder.state.deployment.clone(),
                         build_id: builder.state.build_id.clone(),
                     },
-                    logical_seq: pending.logical_seq,
+                    logical_seq,
                     sticky_preferred,
                     normal_task_queue: Some(builder.state.task_queue.clone()),
                     priority: builder.state.priority.clone(),
                 });
             }
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Record a WFT timeout. Clears sticky affinity so the retry
@@ -3654,7 +3726,7 @@ impl BasicKernel {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now, None);
         builder.state.sticky = None;
-        Ok(builder.finish())
+        builder.finish()
     }
 
     fn apply_workflow_task_timed_out(
@@ -3745,7 +3817,7 @@ impl BasicKernel {
                         start_to_close: false,
                     });
             }
-            return Ok(builder.finish());
+            return builder.finish();
         }
 
         let started_event_id = pending
@@ -3915,7 +3987,7 @@ impl BasicKernel {
                     start_to_close: true,
                 });
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Fire a timer and wake the workflow. The timer is removed from
@@ -3951,7 +4023,7 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     fn apply_workflow_start_delay_elapsed(
@@ -3967,7 +4039,7 @@ impl BasicKernel {
             .remove(WORKFLOW_START_DELAY_TIMER_ID)
             .is_none()
         {
-            return Ok(builder.finish());
+            return builder.finish();
         }
         builder.timer_ops.push(TimerOp::Delete {
             timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
@@ -3977,7 +4049,7 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Ensure a WFT is pending so that an incoming query has a task
@@ -3994,12 +4066,12 @@ impl BasicKernel {
         // piggybacked on the existing WFT when the worker polls.
         if state.pending_workflow_task.is_some() {
             let builder = TransitionBuilder::new(state, req.now, None);
-            return Ok(builder.finish());
+            return builder.finish();
         }
 
         let mut builder = TransitionBuilder::new(state, req.now, None);
         builder.schedule_workflow_task();
-        Ok(builder.finish())
+        builder.finish()
     }
 
     /// Record the outcome of a completion-callback delivery attempt, advancing the
@@ -4067,7 +4139,7 @@ impl BasicKernel {
                 callback.next_attempt_at = None;
             }
         }
-        Ok(builder.finish())
+        builder.finish()
     }
 
     fn apply_replayed_event(&self, state: &mut WorkflowState, event: &HistoryEvent) {
@@ -6846,6 +6918,9 @@ struct TransitionBuilder {
     /// update the run holds neither admitted nor accepted is checked
     /// (`signal-update-limits` criterion 2.13). Zero outside a completion.
     resurrection: UpdateSlots,
+    /// Scheduling also occurs in infallible finishing callbacks. Preserve the
+    /// allocation failure until finish, which must never expose a partial copy.
+    allocation_error: Option<Reject>,
 }
 
 /// A run's updates in flight, accepted or held, and completed, for the total
@@ -6891,6 +6966,7 @@ impl TransitionBuilder {
             finishing_from: None,
             finishing_step: false,
             resurrection: UpdateSlots::default(),
+            allocation_error: None,
         }
     }
 
@@ -7448,6 +7524,19 @@ impl TransitionBuilder {
         self.apply_parent_close_policy();
     }
 
+    fn allocate_workflow_task_seq(&mut self) -> Option<LogicalTaskSeq> {
+        if self.allocation_error.is_some() {
+            return None;
+        }
+        match allocate_workflow_task_seq(&mut self.state) {
+            Ok(sequence) => Some(sequence),
+            Err(error) => {
+                self.allocation_error = Some(error);
+                None
+            }
+        }
+    }
+
     /// Schedule a workflow task: emit the scheduled event,
     /// set the pending WFT on state, and push a dispatch op.
     /// No-ops if the workflow is paused.
@@ -7484,8 +7573,9 @@ impl TransitionBuilder {
             return;
         }
 
-        let logical_seq = self.state.next_workflow_task_seq;
-        self.state.next_workflow_task_seq = logical_seq.next();
+        let Some(logical_seq) = self.allocate_workflow_task_seq() else {
+            return;
+        };
         self.state.wft_stamp = self.state.wft_stamp.saturating_add(1);
         pending.logical_seq = logical_seq;
         pending.target_worker_deployment_version_changed = false;
@@ -7525,8 +7615,9 @@ impl TransitionBuilder {
             return;
         }
 
-        let logical_seq = self.state.next_workflow_task_seq;
-        self.state.next_workflow_task_seq = logical_seq.next();
+        let Some(logical_seq) = self.allocate_workflow_task_seq() else {
+            return;
+        };
         self.state.wft_stamp = self.state.wft_stamp.saturating_add(1);
         pending.logical_seq = logical_seq;
         self.state.pending_workflow_task = Some(pending);
@@ -7567,8 +7658,9 @@ impl TransitionBuilder {
         if self.state.status == ExecutionStatus::Paused {
             return;
         }
-        let logical_seq = self.state.next_workflow_task_seq;
-        self.state.next_workflow_task_seq = logical_seq.next();
+        let Some(logical_seq) = self.allocate_workflow_task_seq() else {
+            return;
+        };
         // A continuously-failing workflow task (attempt > 1) is *transient*: v1.31.0
         // does not persist its WorkflowTaskScheduled event. The scheduled id is the
         // virtual next-event id (last_event_id + 1) and `last_event_id` is NOT
@@ -7841,9 +7933,12 @@ impl TransitionBuilder {
     /// Consume the builder and produce the final
     /// [`Transition`]. Increments `transition_seq` exactly
     /// once.
-    fn finish(mut self) -> Transition {
+    fn finish(mut self) -> Result<Transition, Reject> {
         self.finishing(Self::enforce_buffered_event_limit);
-        self.finish_without_buffered_limits()
+        if let Some(error) = self.allocation_error.take() {
+            return Err(error);
+        }
+        Ok(self.finish_without_buffered_limits())
     }
 
     /// [`Self::finish`] for a transition the runtime commits outside the
@@ -7851,6 +7946,7 @@ impl TransitionBuilder {
     /// a force-close would schedule. The run's next transition checks the
     /// buffered event limits instead.
     fn finish_without_buffered_limits(mut self) -> Transition {
+        debug_assert!(self.allocation_error.is_none());
         self.state.transition_seq = self.state.transition_seq.next();
         debug_assert_eq!(self.history_events.len(), self.event_principals.len());
         let events_numbered_at_close = self
@@ -8237,6 +8333,10 @@ pub enum Reject {
     /// speculative-wft owner amendment F3).
     #[error("Workflow task state is inconsistent.")]
     WorkflowTaskStateInconsistent,
+
+    /// The persisted task allocator cannot issue another SQL-representable identity.
+    #[error("workflow task sequence exhausted")]
+    WorkflowTaskSequenceExhausted,
     /// A worker update protocol message on `RespondWorkflowTaskCompleted`
     /// failed validation (spec speculative-wft K5, Req 6.1/6.2 + owner
     /// amendment F5). Like [`Reject::InvalidCommandAttributes`], this aborts

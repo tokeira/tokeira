@@ -11,13 +11,14 @@ use super::*;
 
 const CURRENT_EXECUTION_DELETE_STATEMENT: &str =
     "DELETE FROM current_execution WHERE key = $1 AND run_key = $2";
-const RUN_OWNED_DELETE_STATEMENTS: [&str; 7] = [
+const RUN_OWNED_DELETE_STATEMENTS: [&str; 8] = [
     "DELETE FROM request_dedupe WHERE run_key = $1",
     // Nothing writes `activity_state` any more; this clears the rows that
     // earlier releases wrote (`activity-state-writes` criterion 3.2).
     "DELETE FROM activity_state WHERE run_key = $1",
     "DELETE FROM timer_bucket WHERE run_key = $1",
     "DELETE FROM activity_dispatch WHERE run_key = $1",
+    "DELETE FROM workflow_dispatch WHERE run_key = $1",
     "DELETE FROM dispatch_backlog WHERE run_key = $1",
     "DELETE FROM workflow_hot WHERE run_key = $1",
     // History is last so a future non-transactional backend never exposes
@@ -223,6 +224,7 @@ mod tests {
                 "activity_state",
                 "timer_bucket",
                 "activity_dispatch",
+                "workflow_dispatch",
                 "dispatch_backlog",
                 "workflow_hot",
                 "history_batch",

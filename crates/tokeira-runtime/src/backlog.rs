@@ -457,6 +457,24 @@ mod tests {
         ) -> Result<()> {
             Err(anyhow!("unused"))
         }
+        async fn list_workflow_dispatch_page(
+            &self,
+            _range: &tokeira_storage::WorkflowDiscoveryRange,
+            _after: Option<tokeira_storage::WorkflowDispatchPosition>,
+            _limit: std::num::NonZeroU32,
+        ) -> Result<tokeira_storage::WorkflowDispatchPage> {
+            anyhow::bail!("workflow discovery is outside this test repository")
+        }
+
+        async fn list_workflow_dispatch_for_home(
+            &self,
+            _home: tokeira_types::ShardId,
+            _after: Option<RunKey>,
+            _limit: std::num::NonZeroU32,
+        ) -> Result<Vec<RunKey>> {
+            anyhow::bail!("workflow acquisition is outside this test repository")
+        }
+
         async fn list_dispatchable_workflow_tasks(
             &self,
             _queue: &QueueKey,
@@ -844,6 +862,10 @@ mod tests {
         fn property_drain_routes_entries_to_the_correct_broker(logical_seq in 1u64..8u64, attempt in 1u32..4u32) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
+                // Registration synchronization must not lose a waiter to a
+                // short wall-clock deadline under workspace-test contention.
+                // Nextest terminates this test before these polls can expire.
+                let poll_timeout = std::time::Duration::from_secs(300);
                 let repo = MockBacklogRepo::default();
                 let broker = InMemoryBroker::default();
                 let activity_broker = InMemoryActivityBroker::default();
@@ -896,7 +918,7 @@ mod tests {
                             .poll_workflow_task(
                                 &queue,
                                 &tokeira_types::WorkerIdentity("worker".into()),
-                                std::time::Duration::from_millis(50),
+                                poll_timeout,
                             )
                             .await
                             .unwrap()
@@ -908,7 +930,7 @@ mod tests {
                     let queue = activity_queue.clone();
                     tokio::spawn(async move {
                         activity_broker
-                            .poll_activity_task(&queue, std::time::Duration::from_millis(50))
+                            .poll_activity_task(&queue, poll_timeout)
                             .await
                             .unwrap()
                     })

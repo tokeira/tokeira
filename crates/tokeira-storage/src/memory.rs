@@ -60,6 +60,10 @@ use crate::{
     recovery_index::{
         RecoveryCursor, RecoveryPage, RecoveryPhase, read_candidate_page, recovery_needed,
     },
+    workflow_dispatch::{
+        WorkflowDiscoveryRange, WorkflowDispatchPage, WorkflowDispatchPosition,
+        WorkflowDispatchRow, derive_workflow_dispatch,
+    },
 };
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -111,6 +115,8 @@ struct StoreState {
     execution_index: HashMap<(NamespaceId, String, RunId), RunKey>,
     /// Materialized hot state by run key.
     runs: HashMap<RunKey, WorkflowState>,
+    /// Updated under the run-write lock; snapshots rebuild this derived view.
+    workflow_dispatch: HashMap<RunKey, WorkflowDispatchRow>,
     /// Persisted History Size by run key: the sum of
     /// [`crate::codec::history_batch_encoded_len`] over every committed batch,
     /// maintained in the same lock acquisition as the batch so it mirrors the
@@ -443,6 +449,20 @@ impl InMemoryStore {
             }
             apply_snapshot_extension(&mut state, trailing).map_err(SnapshotError::Extension)?;
         }
+        // Reconstruct after applying every extension; the frozen snapshot layout
+        // contains all authoritative inputs and needs no redundant row payload.
+        state.workflow_dispatch = state
+            .runs
+            .values()
+            .filter_map(|run| {
+                let home = tokeira_types::execution_home_bundle(
+                    run.namespace_id.0.as_bytes(),
+                    run.workflow_id.0.as_bytes(),
+                    Self::effective_shard_count(&state),
+                );
+                derive_workflow_dispatch(run, home).map(|row| (run.run_key, row))
+            })
+            .collect();
         Ok(Self {
             inner: Arc::new(Mutex::new(state)),
         })
@@ -621,6 +641,7 @@ impl SnapshotDoc {
             current_execution,
             execution_index,
             runs,
+            workflow_dispatch: _,
             history_size,
             worker_deployments,
             workflow_rules,
@@ -695,6 +716,7 @@ impl SnapshotDoc {
             current_execution: self.current_execution.into_iter().collect(),
             execution_index: self.execution_index.into_iter().collect(),
             runs: self.runs.into_iter().collect(),
+            workflow_dispatch: HashMap::new(),
             history_size: self.history_size.into_iter().collect(),
             worker_deployments: self.worker_deployments.into_iter().collect(),
             workflow_rules: self
@@ -1164,6 +1186,15 @@ impl RunRepository for InMemoryStore {
         // Preparation touches only the local clone. A missing seed, invalid image
         // or growth refusal must leave every durable map and statistic untouched.
         let context = prepare_workflow_projection(&mut state, history_size_bytes)?;
+        let execution_home = tokeira_types::execution_home_bundle(
+            state.namespace_id.0.as_bytes(),
+            state.workflow_id.0.as_bytes(),
+            Self::effective_shard_count(&store),
+        );
+        let workflow_dispatch = derive_workflow_dispatch(&state, execution_home);
+        if let Some(row) = &workflow_dispatch {
+            row.validate()?;
+        }
         // The growth checks run before the first change, so a refused commit
         // leaves the run as it was. The state is measured as DSQL stores it
         // (`run-growth-limits`).
@@ -1350,6 +1381,16 @@ impl RunRepository for InMemoryStore {
                 .retain(|(entry_run_key, _), _| entry_run_key != &run_key);
         }
 
+        // Every fallible preparation completed before either map changes. The
+        // same lock protects state and derived intent from partial observation.
+        match workflow_dispatch {
+            Some(row) => {
+                store.workflow_dispatch.insert(run_key, row);
+            }
+            None => {
+                store.workflow_dispatch.remove(&run_key);
+            }
+        }
         store.runs.insert(run_key, state.clone());
         store.execution_index.insert(
             (
@@ -1518,6 +1559,7 @@ impl RunRepository for InMemoryStore {
         store.transition_audit.remove(&run_key);
         store.run_shard_map.remove(&run_key);
         store.conflict_injections.remove(&run_key);
+        store.workflow_dispatch.remove(&run_key);
         store
             .request_dedupe
             .retain(|_, record| record.run_key != run_key);
@@ -1624,6 +1666,20 @@ impl RunRepository for InMemoryStore {
         // as one batch, which is how the DSQL materialization persists it
         // (Requirement 1.6).
         let prefix_size = crate::codec::history_batch_encoded_len(&copied_history)?;
+        let home = tokeira_types::execution_home_bundle(
+            successor_state.namespace_id.0.as_bytes(),
+            successor_state.workflow_id.0.as_bytes(),
+            Self::effective_shard_count(&store),
+        );
+        let dispatch = derive_workflow_dispatch(&successor_state, home);
+        if let Some(row) = &dispatch {
+            row.validate()?;
+        }
+        if let Some(row) = dispatch {
+            store.workflow_dispatch.insert(successor_run_key, row);
+        } else {
+            store.workflow_dispatch.remove(&successor_run_key);
+        }
         store.history_size.insert(successor_run_key, prefix_size);
         store.history.insert(successor_run_key, copied_history);
         store
@@ -1669,6 +1725,41 @@ impl RunRepository for InMemoryStore {
         store.run_shard_map.insert(successor_run_key, shard_id);
 
         Ok(())
+    }
+
+    async fn list_workflow_dispatch_page(
+        &self,
+        range: &WorkflowDiscoveryRange,
+        after: Option<WorkflowDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<WorkflowDispatchPage> {
+        let store = self.inner.lock().await;
+        Ok(workflow_dispatch_page_with_keys(
+            &store,
+            range,
+            after,
+            limit,
+            WorkflowDispatchRow::lookup_keys,
+        ))
+    }
+
+    async fn list_workflow_dispatch_for_home(
+        &self,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<Vec<RunKey>> {
+        let store = self.inner.lock().await;
+        let mut keys: Vec<_> = store
+            .workflow_dispatch
+            .values()
+            .filter(|row| row.execution_home == home)
+            .map(|row| row.incarnation.run_key)
+            .filter(|key| after.is_none_or(|position| *key > position))
+            .collect();
+        keys.sort_unstable();
+        keys.truncate(limit.get() as usize);
+        Ok(keys)
     }
 
     async fn list_dispatchable_workflow_tasks(
@@ -2360,6 +2451,36 @@ fn partition_for(run_key: RunKey) -> u32 {
     (raw as u32) % 16
 }
 
+fn workflow_dispatch_page_with_keys(
+    store: &StoreState,
+    range: &WorkflowDiscoveryRange,
+    after: Option<WorkflowDispatchPosition>,
+    limit: std::num::NonZeroU32,
+    row_keys: impl Fn(&WorkflowDispatchRow) -> [String; 3],
+) -> WorkflowDispatchPage {
+    let keys = range.lookup_keys();
+    let (mode, _, _) = range.routing.coordinates();
+    let mut rows: Vec<_> = store
+        .workflow_dispatch
+        .values()
+        .filter(|row| {
+            !row.sticky
+                && row.namespace_id == range.namespace_id
+                && row.routing.coordinates().0 == mode
+                && row_keys(row) == keys
+                && after.is_none_or(|position| row.position() > position)
+        })
+        .cloned()
+        .collect();
+    rows.sort_by_key(WorkflowDispatchRow::position);
+    rows.truncate(limit.get() as usize);
+    WorkflowDispatchPage {
+        last_examined: rows.last().map(WorkflowDispatchRow::position),
+        exhausted: rows.len() < limit.get() as usize,
+        candidates: rows,
+    }
+}
+
 fn shard_for_run_key(run_key: RunKey, shard_count: u32) -> ShardId {
     ShardId((run_key.0.as_u128() as u32) % shard_count.max(1))
 }
@@ -2367,6 +2488,10 @@ fn shard_for_run_key(run_key: RunKey, shard_count: u32) -> ShardId {
 #[cfg(test)]
 #[path = "projection_accumulator_tests.rs"]
 pub(crate) mod projection_accumulator_tests;
+
+#[cfg(test)]
+#[path = "workflow_dispatch_memory_tests.rs"]
+mod workflow_dispatch_tests;
 
 #[cfg(test)]
 mod tests {

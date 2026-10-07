@@ -2,7 +2,7 @@
 
 ## Overview
 
-Count a run's signals in the kernel and store the count in the state extension. Refuse a signal at the limit, and give each caller v1.31.0's answer. Check an update's in-flight count, total and in-flight payload in the kernel, in v1.31.0's order, with request sizes from the edge and in-flight request bytes from the lane. Count a reset run's copied signals and completed updates.
+Count a run's signals in the kernel and store the count in the state extension. Refuse a signal at the limit, and give each caller v1.31.0's answer. Check an update's in-flight count, total and in-flight payload in the kernel, in v1.31.0's order, with request sizes from the edge and the held updates' count and request bytes from the lane. Count a reset run's copied signals and completed updates.
 
 ## Tasks
 
@@ -40,11 +40,11 @@ Count a run's signals in the kernel and store the count in the state extension. 
 - [ ] 4. Updates in the runtime and the edge
   - [ ] 4.1 Measure each update request's encoded size at the edge, and keep it in the update registry
     - _Requirements: 2.11_
-  - [ ] 4.2 Resolve `UpdateLimits` in the runtime and put them on each update command and on a completion's limits; set `in_flight_request_bytes` in the lane from the registry, for the admitted updates of the state it loaded
+  - [ ] 4.2 Resolve `UpdateLimits` in the runtime and put them on each update command and on a completion's limits; set `held_updates` and `in_flight_request_bytes` in the lane from the registry, for the admitted updates of the state it loaded, on an update command and `held_updates` on a completion
     - _Requirements: 2.9-2.14_
   - [ ] 4.3 Map the rejects to `InvalidArgument`, to `ResourceExhausted` with cause `CONCURRENT_LIMIT` and scope `NAMESPACE`, and to `FailedPrecondition`, in ExecuteMultiOperation too
     - _Requirements: 2.1, 2.9-2.13_
-  - [ ] 4.4 Write the engine's tests of each answer through the in-process gRPC endpoint, and the runtime's tests of the total limit and a resurrection on a seeded run
+  - [ ] 4.4 Write the engine's tests of each answer through the in-process gRPC endpoint, and the runtime's tests of the total limit and a resurrection on a seeded run, and of a run whose ten admitted updates lost their requests in a restart still admitting a new update
     - _Requirements: 2.1-2.5, 2.9-2.13_
 
 - [ ] 5. Wire `history.maxInFlightUpdates` for the Temporal functional harness, and classify `history.maximumSignalsPerExecution` as kernel-excluded, as `conformance-config-override`'s key table records: the harness's overrides in the runtime's update limits, its key registry, and the compatibility ledger with the configuration doc generated from it
@@ -55,5 +55,5 @@ Count a run's signals in the kernel and store the count in the state extension. 
 ## Notes
 
 - Property tests use `proptest`, tagged `// Feature: signal-update-limits, Property N: <title>`.
-- The kernel holds the counts and makes every decision. The lane supplies the one fact that only it can see at the moment of the check: the in-flight request bytes.
+- The kernel holds the counts and makes every decision. The lane supplies the facts that only it can see at the moment of the check: how many of the run's admitted updates it holds, and their request bytes.
 - `history.maxTotalUpdates` was wired for the continue-as-new advice; the same override now sets the total limit too.

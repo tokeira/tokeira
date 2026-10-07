@@ -2,17 +2,18 @@
 
 ## Overview
 
-The kernel counts a run's signals and refuses a signal at the limit. It refuses an update for the in-flight count, the total and the in-flight payload, in v1.31.0's order, from counts it already keeps and request sizes the runtime hands it. The stores keep the signal count in the state extension of the run's stored state. The runtime and the publisher turn a refused signal into what each caller gets from v1.31.0, and the edge answers with v1.31.0's codes.
+The kernel counts a run's signals and refuses a signal at the limit. It refuses an update for the in-flight count, the total and the in-flight payload, in v1.31.0's order, from the accepted and completed counts it already keeps and from the count and request sizes of the held updates, which the lane hands it. The stores keep the signal count in the state extension of the run's stored state. The runtime and the publisher turn a refused signal into what each caller gets from v1.31.0, and the edge answers with v1.31.0's codes.
 
 ## Glossary
 
 - **Signal limit:** `history.maximumSignalsPerExecution`, 10,000 (`common/dynamicconfig/constants.go:2351-2355 @ v1.31.0`).
 - **Signal count:** the number of WorkflowExecutionSignaled events a run has recorded (criterion 2.6).
 - **Update limits:** 10 updates in flight (`history.maxInFlightUpdates`), 20 MiB of in-flight update requests (`history.maxInFlightUpdatePayloads`) and 2,000 updates in all (`history.maxTotalUpdates`) (`constants.go:2289-2303 @ v1.31.0`).
-- **In-flight update:** an update admitted and neither completed nor rejected, whether or not the workflow has accepted it. In the kernel, the run's `admitted_updates` and `pending_updates`.
+- **In-flight update:** an update admitted and neither completed nor rejected, whether or not the workflow has accepted it, an unaccepted one counting only while Tokeira holds its request (criterion 2.9). In the kernel, the run's `pending_updates` and the admitted updates the lane reports held.
+- **Held update:** an admitted, unaccepted update whose request the run's owner holds in its `UpdateRegistry`.
 - **Completed update count:** `completed_update_count`, the updates the workflow completed after accepting them.
 - **Request size:** an update request's protobuf-encoded size as a `temporal.api.update.v1.Request`.
-- **In-flight request bytes:** the request sizes of a run's admitted updates that the workflow hasn't accepted or rejected.
+- **In-flight request bytes:** the request sizes of a run's held updates.
 
 ## How this maps onto Tokeira's architecture
 
@@ -21,7 +22,7 @@ v1.31.0 checks these limits in its history service, under the run's lock, agains
 1. **Request ids are deduplicated at commit.** v1.31.0 keeps a run's signal request ids in its mutable state and checks them before the count. Tokeira's stores check request ids when they commit, after the kernel has applied the command. So when the kernel refuses a signal for the count, the caller asks the store whether the run already applied the request id, and answers a duplicate if it did. SignalWithStart's signal to a running run skips this, since v1.31.0 checks its count first.
 2. **The closing check runs in the runtime.** Tokeira refuses a signal to a closing run in the runtime, before the kernel sees it (`signal_workflow`). v1.31.0 checks the count first. So the runtime's check stands aside when the run it has loaded is at the signal limit, and the kernel's refusal answers.
 3. **The publisher delivers a signal from another workflow.** After the sender commits, the publisher submits the signal to the target's lane and resolves the sender with `ExternalSignalResolved`. The target's refusal reaches the publisher as an error, which it turns into the failure's cause.
-4. **Admitted updates are part of the run's state.** v1.31.0 keeps admitted updates in its in-memory registry, and rebuilds accepted and completed updates from mutable state when it loads a run. Tokeira keeps admitted and accepted update ids and the completed count in the run's state, and the requests of admitted updates in the owner's in-memory `UpdateRegistry`. The in-flight and total checks count from the state, as the continue-as-new advice does. The in-flight request bytes come from the registry, for the admitted updates of the state the kernel is about to check.
+4. **Admitted updates are part of the run's state.** v1.31.0 keeps admitted updates in its in-memory registry, and rebuilds accepted and completed updates from mutable state when it loads a run. Tokeira keeps admitted and accepted update ids and the completed count in the run's state, and the requests of admitted updates in the owner's in-memory `UpdateRegistry`. A restart therefore leaves admitted ids in the state whose requests are gone. Nothing delivers those updates, so nothing removes their ids, and counting them would leave a run with ten of them refusing every update until it closed. So the checks count accepted updates from the state and admitted updates only while the registry holds their requests, which is what v1.31.0's reloaded registry holds. The lane reports both figures for the admitted updates of the state the kernel is about to check.
 5. **A reset run is built in two steps.** The store builds the new run by replaying the copied history through the kernel (`replay_history_prefix`), and the kernel applies the reapplied events when it fails the fork's workflow task. v1.31.0 rebuilds the new run's mutable state from the copied events, then reapplies. Each step adds to the new run's counts.
 
 ## Bug Details
@@ -80,19 +81,19 @@ _For any_ state, decoding its encoding SHALL give back its signal count and ever
 
 Property 4: Update admission matches v1.31.0's
 
-_For any_ running run, in-flight and completed counts, in-flight request bytes, request size and limits, the kernel SHALL refuse an update with a new id exactly when one of these holds, checked in this order: its in-flight updates number the in-flight limit or more; its updates in flight and completed number the total limit or more; its in-flight request bytes and the request's size reach the payload limit. A limit of 0 disables its check. The answer SHALL be the first that holds. Otherwise the kernel SHALL admit the update, and the run's in-flight count SHALL grow by one.
+_For any_ running run, accepted, held and completed counts, in-flight request bytes, request size and limits, the kernel SHALL refuse an update with a new id exactly when one of these holds, checked in this order: its in-flight updates, accepted and held, number the in-flight limit or more; its updates in flight and completed number the total limit or more; its in-flight request bytes and the request's size reach the payload limit. A limit of 0 disables its check. The answer SHALL be the first that holds. Otherwise the kernel SHALL admit the update, and the run's in-flight count SHALL grow by one. Admitted updates that aren't held SHALL count toward none of the limits.
 
 **Validates: Requirements 2.9-2.12**
 
 Property 5: Updates are counted as v1.31.0 counts them
 
-_For any_ sequence of admissions, acceptances, completions with a result or a failure, rejections and resets, an update SHALL be in flight from its admission until it is completed or rejected; the completed count SHALL grow by one for each completion after an acceptance, and never for a rejection; and a reset run's completed count SHALL be the number of completions in its copied history.
+_For any_ sequence of admissions, acceptances, completions with a result or a failure, rejections and resets, an update SHALL be in flight from its admission until it is completed or rejected, an unaccepted one only while it is held; the completed count SHALL grow by one for each completion after an acceptance, and never for a rejection; and a reset run's completed count SHALL be the number of completions in its copied history.
 
 **Validates: Requirements 2.7, 2.9, 2.10**
 
 Property 6: Resurrecting an update respects the total limit
 
-_For any_ run and any completion that accepts or rejects an update the run has neither admitted nor accepted, the completion SHALL fail with 2.10's error, recording nothing, exactly when the run's updates in flight and completed number the total limit or more, whatever its in-flight count and request bytes.
+_For any_ run and any completion that accepts or rejects an update the run has neither admitted nor accepted, the completion SHALL fail with 2.10's error, recording nothing, exactly when the run's updates in flight, accepted and held, and completed number the total limit or more, whatever its in-flight request bytes.
 
 **Validates: Requirement 2.13**
 
@@ -125,12 +126,12 @@ _For any_ run and any completion that accepts or rejects an update the run has n
 ### Update limits (`crates/tokeira-kernel`, `crates/tokeira-runtime`, `crates/tokeira-edge`)
 
 - **The request's size.** The edge measures each update request's encoded size, `prost::Message::encoded_len` of the `Request` it received, which is the size v1.31.0's `req.Size()` returns, and passes it to the runtime with the update. This covers UpdateWorkflowExecution and the update in ExecuteMultiOperation.
-- **The registry.** `UpdateRegistryEntry` keeps the request's size. A new registry method sums the sizes of a run's entries whose ids are in a given admitted set, other than one given id.
-- **The command.** `UpdateRequest` gains `limits: UpdateLimits`, `request_bytes` and `in_flight_request_bytes`. The runtime resolves the limits as it resolves a workflow task's limits: the Temporal functional harness's build reads its overrides of `history.maxInFlightUpdates` and `history.maxTotalUpdates`, and production builds use the constants.
-- **The lane sets the in-flight request bytes.** Immediately before the kernel applies an update command, the lane, which has just loaded the run and holds the runtime's `UpdateRegistry`, sets `in_flight_request_bytes` to the sizes of the registry's entries for the admitted updates of that state, other than the command's own. A figure computed before the command reached the lane could miss an update admitted in between, or count one never admitted. An admitted update whose entry a restart lost counts zero bytes, as v1.31.0 counts an update it has forgotten.
-- **The checks** (`apply_update`): once the run is open and not paused and the id is new, in v1.31.0's order (criterion 2.12): the in-flight count, `admitted_updates.len() + pending_updates.len()`, against the in-flight limit; that count plus `completed_update_count` against the total limit; then `in_flight_request_bytes + request_bytes` against the payload limit. Each refuses with `Reject::UpdateLimitExceeded`. On that error the runtime removes the update's registry entry and answers the caller, as it does for any refused update. The runtime's dedupe of an update id the run already knows comes first and is unchanged. `apply_start_and_update` starts a run with no updates, which no limit refuses at any value the harness sets.
-- **Resurrection** (`apply_workflow_task_completed`): the arms that accept or reject an update the run has neither admitted nor accepted check the total first, against the total limit, which `WorkflowTaskCompletionLimits` now carries, and refuse the completion with `Reject::UpdateLimitExceeded` (criterion 2.13). The completion records nothing, like any completion the kernel refuses, and the runtime returns the error to the worker.
-- **Counting after a reset** (`apply_replayed_event`): each WorkflowExecutionUpdateCompleted event of the copied history counts as a completed update (criterion 2.7). The in-flight sets are rebuilt as today. The continue-as-new advice reads the same count (criterion 3.2).
+- **The registry.** `UpdateRegistryEntry` keeps the request's size. A new registry method counts a run's entries whose ids are in a given admitted set, other than one given id, and sums their sizes.
+- **The command.** `UpdateRequest` gains `limits: UpdateLimits`, `request_bytes`, `held_updates` and `in_flight_request_bytes`. A workflow task's completion request gains `held_updates` too. The runtime resolves the limits as it resolves a workflow task's limits: the Temporal functional harness's build reads its overrides of `history.maxInFlightUpdates` and `history.maxTotalUpdates`, and production builds use the constants.
+- **The lane reports the held updates.** Immediately before the kernel applies an update command, the lane, which has just loaded the run and holds the runtime's `UpdateRegistry`, sets `held_updates` to the number of the state's admitted updates that the registry holds, other than the command's own, and `in_flight_request_bytes` to their request sizes. It sets `held_updates` on a workflow task's completion the same way. A figure computed before the command reached the lane could miss an update admitted in between, or count one never admitted. An admitted update whose entry a restart lost is neither counted nor sized, as v1.31.0 forgets it (criterion 2.9).
+- **The checks** (`apply_update`): once the run is open and not paused and the id is new, in v1.31.0's order (criterion 2.12): the in-flight count, `held_updates + pending_updates.len()`, against the in-flight limit; that count plus `completed_update_count` against the total limit; then `in_flight_request_bytes + request_bytes` against the payload limit. Each refuses with `Reject::UpdateLimitExceeded`. On that error the runtime removes the update's registry entry and answers the caller, as it does for any refused update. The runtime's dedupe of an update id the run already knows comes first and is unchanged. `apply_start_and_update` starts a run with no updates, which no limit refuses at any value the harness sets.
+- **Resurrection** (`apply_workflow_task_completed`): the arms that accept or reject an update the run has neither admitted nor accepted check the total first, `held_updates + pending_updates.len() + completed_update_count` against the total limit, which `WorkflowTaskCompletionLimits` now carries, and refuse the completion with `Reject::UpdateLimitExceeded` (criterion 2.13). The completion records nothing, like any completion the kernel refuses, and the runtime returns the error to the worker.
+- **Counting after a reset** (`apply_replayed_event`): each WorkflowExecutionUpdateCompleted event of the copied history counts as a completed update (criterion 2.7). The in-flight sets are rebuilt as today. The continue-as-new advice reads the same completed count (criterion 3.2); it still counts every admitted update, held or not (bugfix Out of Scope).
 
 ### Answers (`crates/tokeira-edge`)
 
@@ -156,7 +157,7 @@ _For any_ run and any completion that accepts or rejects an update the run has n
 
 ### Exploratory Bug Condition Checking
 
-- Negative controls: with each check removed, moved or miscounted, the test that covers it fails. They cover: no signal check; a flushed signal counted again; a reset's copied or reapplied signals left uncounted; the request id lookup missing, or applied to SignalWithStart; the closing check before the count; the publisher's refusal left unmapped; the count's section unwritten, or written for a zero count; accepted updates left out of the in-flight count; a rejection counted as a completion; the checks out of order; the requests of accepted updates counted in the in-flight bytes; the bytes summed over registry entries the state hasn't admitted; the resurrection unchecked; the replay counting no completions; and the edge's answers without their detail.
+- Negative controls: with each check removed, moved or miscounted, the test that covers it fails. They cover: no signal check; a flushed signal counted again; a reset's copied or reapplied signals left uncounted; the request id lookup missing, or applied to SignalWithStart; the closing check before the count; the publisher's refusal left unmapped; the count's section unwritten, or written for a zero count; accepted updates left out of the in-flight count; admitted updates counted whether or not they are held; a rejection counted as a completion; the checks out of order; the requests of accepted updates counted in the in-flight bytes; the bytes summed over registry entries the state hasn't admitted; the resurrection unchecked; the replay counting no completions; and the edge's answers without their detail.
 
 ### Property-Based Tests
 
@@ -168,6 +169,7 @@ _For any_ run and any completion that accepts or rejects an update the run has n
 
 - Each answer's code, message and detail, through the engine's in-process gRPC endpoint on the in-memory store (`crates/tokeira-engine/tests/signal_update_limits.rs`): a run that has recorded 10,000 signals refuses the next client signal, SignalWithStart and signal from another workflow; a run whose worker is idle refuses the eleventh of eleven updates; six updates of nearly 4 MiB each, the sixth refused, since gRPC caps a request at 4 MiB; and an update-with-start to a running run at the in-flight limit, refused with the update's detail.
 - The total limit and a resurrection through the runtime, on a run seeded with 1,999 completed updates.
+- A run whose ten admitted updates lost their requests in a restart still admits a new update. A new runtime over the same in-memory store stands in for the restart.
 - A run that signal-with-start starts counts one signal, and a continue-as-new successor counts none.
 - A reset run's counts, from its copied history and its reapplied signals.
 - A run stored without the section counts from zero.

@@ -62,3 +62,4 @@ That is v1.31.0's `len(r.updates)` after a reload (`registry.go:189-204, 367-369
 - A speculative workflow task that a worker had started when the node restarted. v1.31.0 loses it with the node; Tokeira keeps it, and its empty completion is dropped without a follow-up (2.4).
 - The schedule-to-start timer of a speculative workflow task that recovery republishes after a restart, which recovery doesn't re-arm.
 - The admitted updates a run keeps when its copied history is replayed and the replay closes it.
+- Updates a reset reapplied in a run stored before this change. Such a run holds no history-admitted updates (2.6), so after a restart those updates look lost and are forgotten, though their WorkflowExecutionUpdateAdmitted events would have delivered them through history. Only reset runs stored before the change, with reapplied updates still pending, are affected.

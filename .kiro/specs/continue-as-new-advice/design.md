@@ -58,7 +58,8 @@ adopts the observable contract, not Temporal's structures.
 
 - Hard limits (`limit.historySize.error`, `limit.historyCount.error`,
   `history.maxTotalUpdates` enforcement) and warning thresholds.
-  [run-growth-limits](../run-growth-limits/bugfix.md) enforces the first two.
+  [run-growth-limits](../run-growth-limits/bugfix.md) enforces the first two, and
+  [signal-update-limits](../signal-update-limits/bugfix.md) the third.
 - Forcing continuation or any lifecycle change driven by the Advice.
 - Envelopes for activity, timer, dispatch, or side-table blobs.
 - Public-proto byte accounting; the statistic is the store's own encoding.
@@ -252,7 +253,9 @@ Sites:
   ([kernel.rs:6080-6160](../../../crates/tokeira-kernel/src/kernel.rs)).
 - **Rebuild**: the `WorkflowTaskStarted` arm of `replay_history_prefix`
   ([kernel.rs:3976-4000](../../../crates/tokeira-kernel/src/kernel.rs)) copies the three
-  fields into the pending record.
+  fields into the pending record. The replay also counts the copied history's completed
+  updates ([signal-update-limits](../signal-update-limits/bugfix.md)), so a reset run's Advice
+  counts them, as v1.31.0's rebuilt update registry does.
 
 ### 3. Runtime (`crates/tokeira-runtime`)
 

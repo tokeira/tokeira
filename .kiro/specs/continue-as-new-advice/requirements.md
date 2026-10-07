@@ -84,8 +84,9 @@ second transport for the transport-independence evidence.
 
 Out of scope: enforcing `limit.historySize.error`, `limit.historyCount.error`, or
 `history.maxTotalUpdates` as hard limits ([run-growth-limits](../run-growth-limits/bugfix.md)
-enforces the first two); forcing continuation; changing SDK behaviour;
-warning-level thresholds; envelopes for activity, timer, and other side-table blobs.
+enforces the first two, and [signal-update-limits](../signal-update-limits/bugfix.md)
+the third); forcing continuation; changing SDK behaviour; warning-level thresholds;
+envelopes for activity, timer, and other side-table blobs.
 
 ## Evidence From Current Code
 

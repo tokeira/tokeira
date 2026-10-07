@@ -1,5 +1,19 @@
 # Requirements Document: Broker Fairness and Delivery Metrics
 
+## Workflow dispatch alignment
+
+For workflow tasks, [workflow-dispatch](../workflow-dispatch/requirements.md)
+Requirements 3–6 and 10.5 replace backlog-drain source budgeting with bounded
+queue-home discovery and volatile admission. Workflow backlog statistics count
+durable dispatch intent once, without adding its ready copy. This supersedes the
+workflow-specific three-tier/source-order claims below, including bypass of shared
+retention bounds; public priority/fairness behavior remains intact. Activity
+backlog source budgeting and delivery remain governed by this specification.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Introduction
 
 This document captures the requirements for broker fairness, delivery-source budgeting, and the supporting delivery metrics infrastructure in the Tokeira runtime (`tokeira-runtime`).

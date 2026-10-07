@@ -1,5 +1,20 @@
 # Design Document: Task Queue Priority and Fairness
 
+## Workflow dispatch alignment
+
+[Workflow-dispatch](../workflow-dispatch/requirements.md) Requirement 10.5 preserves
+this specification's public priority/fairness behavior and raw metadata while
+replacing workflow backlog persistence. For workflow tasks, stored DeliveryOrder
+and three-tier claims below give way to derived priority metadata plus volatile
+broker ordering; SQL discovery order does not replace weighted delivery policy.
+Workflow statistics count dispatch intent without double counting ready copies.
+Activity ordering, persisted backlog order, and configuration contracts remain
+unchanged.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Overview
 
 This design adds Temporal v1.31.0 task-queue priority and weighted fairness to

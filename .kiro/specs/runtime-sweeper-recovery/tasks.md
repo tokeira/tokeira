@@ -1,5 +1,20 @@
 # Implementation Plan: Sweeper and Recovery
 
+## Workflow dispatch alignment
+
+[Workflow-dispatch](../workflow-dispatch/requirements.md) Requirements 7–8 supersede
+the workflow-only republish/read-only recovery assumptions and expired-affinity
+cleanup described below. Its acquisition protocol repairs missing and stale rows
+under the execution-home transaction fence, restores pending absolute sticky
+deadlines even after affinity reset, and serves only after both walks and timeout
+reconstruction succeed. The lease-fence prerequisite is explicit in its
+[design](../workflow-dispatch/design.md); a separate epoch precheck is insufficient.
+Activity and unrelated timeout recovery retain their existing contracts.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Overview
 
 Implement shard-scoped ownership, post-failover sweep reconstruction, epoch-fenced task tokens, and shard-scoped scanning for the Tokeira runtime. This adds `ShardOwner` state tracking, a `shard_for()` deterministic mapping, six new shard-filtered `RunRepository` query methods, a one-time `sweep_shard()` function, a `LeaseRenewer` background task, shard-scoped timeout tracking with `shard_id` on all tracking entries, shard-scoped timer scanning, `InMemoryStore` shard-to-run mapping, `TokeiraRuntime` shard lifecycle methods, command admission gating, and epoch fencing on task tokens.

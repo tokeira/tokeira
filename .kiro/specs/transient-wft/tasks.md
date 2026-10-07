@@ -1,5 +1,19 @@
 # Tasks: Transient Workflow-Task Model (Kernel + Runtime + Edge)
 
+## Workflow dispatch alignment
+
+[Workflow-dispatch](../workflow-dispatch/requirements.md) Requirement 2 changes the
+internal identity of retained normal-task retries: each new startable generation
+allocates a fresh logical sequence, including retries that suppress schedule/start
+events. It supersedes any retained-sequence assumption in the retry mechanism
+below. Worker-visible attempts, virtual event IDs, history suppression and late
+materialization remain governed by this specification; changing internal identity
+must not manufacture a new Scheduled event.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 Requirements: [requirements.md](./requirements.md). Design: [design.md](./design.md).
 
 > **Requirement 0 accepted (2026-07-03, owner)** — adopt the transient-WFT model, amending the Feature-2

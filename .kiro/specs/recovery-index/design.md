@@ -1,5 +1,19 @@
 # Design Document: Recovery Index
 
+## Workflow dispatch alignment
+
+[Workflow-dispatch](../workflow-dispatch/requirements.md) Requirements 7–8 extend
+RecoveryEntries with pending normal-task schedule-to-start deadlines and require
+coverage by the recovery predicate. Candidate pagination remains, but a second
+walk of every execution-home dispatch row finds stale rows excluded by the flag.
+Repair re-reads authoritative state in its fenced transaction; the single-decode,
+unchanged-entry, memory-first statements below do not constrain that new write
+path. Sampler and activity-entry contracts remain unchanged.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Overview
 
 Each `workflow_hot` row gains a nullable boolean, `recovery_needed`, written by the same statement that writes the row's state and set to a pure predicate of that state. An asynchronous index on `(shard_id, recovery_needed, run_key)` lets the repository list a shard's Candidates in run-key order with a cursor. The Sweep and the Sampler replace their full-shard reads with that paged listing, decode each Candidate's state once, and derive every entry from it through one shared function.

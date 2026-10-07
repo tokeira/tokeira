@@ -1,5 +1,19 @@
 # Implementation Plan: Recovery Index
 
+## Workflow dispatch alignment
+
+[Workflow-dispatch](../workflow-dispatch/requirements.md) Requirements 7–8 extend
+RecoveryEntries with pending normal-task schedule-to-start deadlines and require
+coverage by the recovery predicate. Candidate pagination remains, but a second
+walk of every execution-home dispatch row finds stale rows excluded by the flag.
+Repair re-reads authoritative state in its fenced transaction; the single-decode,
+unchanged-entry, memory-first statements below do not constrain that new write
+path. Sampler and activity-entry contracts remain unchanged.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Overview
 
 Index the runs that hold Recovery_Work, then move the Sweep and the Sampler onto a paged Candidate listing. Order: shared derivation, schema, storage, runtime. Each step leaves the workspace green; the bar of root `AGENTS.md` §10.4 runs at each checkpoint.

@@ -1,5 +1,19 @@
 # Implementation Plan: Broker Fairness and Delivery Metrics
 
+## Workflow dispatch alignment
+
+For workflow tasks, [workflow-dispatch](../workflow-dispatch/requirements.md)
+Requirements 3–6 and 10.5 replace backlog-drain source budgeting with bounded
+queue-home discovery and volatile admission. Workflow backlog statistics count
+durable dispatch intent once, without adding its ready copy. This supersedes the
+workflow-specific three-tier/source-order claims below, including bypass of shared
+retention bounds; public priority/fairness behavior remains intact. Activity
+backlog source budgeting and delivery remain governed by this specification.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Overview
 
 Add a closed-loop fairness system to the backlog drain path in `tokeira-runtime`. The implementation introduces delivery metrics collection (sync match rate, poll success rate, schedule-to-start latency, backlog age), a per-QueueKey drain share budget maintained by a background control loop, and a budget gate in the drain loop. The fast path (sticky → live-ready → backlog) is unchanged. All fairness parameters are internal constants — no `FairnessConfig`, no operator knobs. The existing `BacklogConfig` is unchanged.

@@ -1,5 +1,19 @@
 # Design Document: Broker Fairness and Delivery Metrics
 
+## Workflow dispatch alignment
+
+For workflow tasks, [workflow-dispatch](../workflow-dispatch/requirements.md)
+Requirements 3–6 and 10.5 replace backlog-drain source budgeting with bounded
+queue-home discovery and volatile admission. Workflow backlog statistics count
+durable dispatch intent once, without adding its ready copy. This supersedes the
+workflow-specific three-tier/source-order claims below, including bypass of shared
+retention bounds; public priority/fairness behavior remains intact. Activity
+backlog source budgeting and delivery remain governed by this specification.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Overview
 
 The broker fairness feature adds a closed-loop feedback system to the backlog drain path. Today the `InMemoryBroker` delivers tasks on a first-come-first-served basis with no weighting between delivery sources and no feedback from delivery health metrics. The `poll_workflow_task` path contains explicit TODO markers for fairness budgets.

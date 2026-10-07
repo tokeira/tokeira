@@ -1,5 +1,19 @@
 # Design Document: Speculative Workflow-Task Model (Kernel + Runtime + Edge)
 
+## Workflow dispatch alignment
+
+[Workflow-dispatch](../workflow-dispatch/requirements.md) Requirements 1 and 10.6
+explicitly exclude speculative tasks from durable dispatch derivation. An unstarted
+normal task, including a transient retry or a task converted to normal by this
+specification, follows that derived-row contract in its committing transaction.
+Speculative scheduling, drop/materialization, follow-up tasks, and admitted-update
+recovery remain owned here; workflow-dispatch does not redesign those mechanisms
+or add a durable row for a speculative offer.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Overview
 
 This feature adopts Temporal's **speculative workflow-task model** into `tokeira-kernel` and the

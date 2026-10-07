@@ -74,8 +74,10 @@ observable effect is inside a conformance build.
   Since [run-growth-limits](../run-growth-limits/bugfix.md), `HistorySizeLimitError`,
   `HistoryCountLimitError` and `MutableStateSizeLimitError` have consult sites in the runtime's limits
   for each commit, as do `TransactionSizeLimit` and the stored activity failure limit.
-  `HistorySizeSuggestContinueAsNew` has had one since
-  [continue-as-new-advice](../continue-as-new-advice/requirements.md).
+  `HistorySizeSuggestContinueAsNew` and `WorkflowExecutionMaxTotalUpdates` have had one since
+  [continue-as-new-advice](../continue-as-new-advice/requirements.md). Since
+  [signal-update-limits](../signal-update-limits/bugfix.md), `WorkflowExecutionMaxTotalUpdates` and
+  `WorkflowExecutionMaxInFlightUpdates` have consult sites in the runtime's update limits.
 - **The harness seam:** `FunctionalTestBase.OverrideDynamicConfig(setting dynamicconfig.GenericSetting,
   value any) (cleanup func())` (`tests/testcore/functional_test_base.go:645`),
   `TestCluster.OverrideDynamicConfig` (`tests/testcore/test_cluster.go:636`), and the tokeira onebox
@@ -183,6 +185,9 @@ so an override is Unsupported until enforcement lands under another spec.
 | `limit.historySize.error`, `limit.historySize.warn`, `limit.historyCount.error`, `limit.historyCount.warn`, `limit.mutableStateSize.error`, `limit.mutableStateSize.warn`, `system.transactionSizeLimit`, `limit.mutableStateActivityFailureSize.error` | the growth and stored activity failure limits (runtime) | **Overridable** | the run growth checks from [run-growth-limits](../run-growth-limits/bugfix.md); production builds compile v1.31.0's values |
 | `history.maximumBufferedEventsSizeInBytes` (2 MiB) | the buffered event size limit (kernel) | **Kernel-excluded** | from [run-growth-limits](../run-growth-limits/bugfix.md); consulted in the pure kernel, like the count |
 | `limit.historySize.suggestContinueAsNew`, `limit.historyCount.suggestContinueAsNew` | `continue_as_new_advice_policy` (runtime) | **Overridable** | the advice thresholds from [continue-as-new-advice](../continue-as-new-advice/requirements.md) |
+| `history.maxTotalUpdates.suggestContinueAsNewThreshold` | `continue_as_new_advice_policy` (runtime) | **Overridable** | the update advice threshold from [continue-as-new-advice](../continue-as-new-advice/requirements.md), with `history.maxTotalUpdates` |
+| `history.maxInFlightUpdates`, `history.maxTotalUpdates` | the update limits (runtime); `continue_as_new_advice_policy` (runtime) for `history.maxTotalUpdates` | **Overridable** | the update limits from [signal-update-limits](../signal-update-limits/bugfix.md), and the update advice threshold from [continue-as-new-advice](../continue-as-new-advice/requirements.md); production builds compile v1.31.0's values |
+| `history.maximumSignalsPerExecution` (10,000) | the signal limit (kernel) | **Kernel-excluded** | from [signal-update-limits](../signal-update-limits/bugfix.md); no corpus leaf overrides it |
 
 ---
 

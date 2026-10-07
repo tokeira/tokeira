@@ -6,7 +6,7 @@ Temporal v1.31.0 bounds how much a run may accumulate. Before each write to a ru
 
 Tokeira enforces none of these except the buffered event count, and that only when a signal is buffered. A run's history and state grow without bound until a write fails at DSQL's limits with a storage error, or, in memory, without ever failing. An activity's stored failure keeps whatever size the worker sent.
 
-This spec covers these limits on a run's growth. The limits on what a request or a workflow task's completion carries are in [payload-admission-limits](../payload-admission-limits/bugfix.md) and [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md); the limits on a run's signals and updates are a separate change.
+This spec covers these limits on a run's growth. The limits on what a request or a workflow task's completion carries are in [payload-admission-limits](../payload-admission-limits/bugfix.md) and [workflow-task-command-limits](../workflow-task-command-limits/bugfix.md); the limits on a run's signals and updates are in [signal-update-limits](../signal-update-limits/bugfix.md).
 
 ## Bug Analysis
 
@@ -59,5 +59,5 @@ This spec covers these limits on a run's growth. The limits on what a request or
 - v1.31.0's state check on a write that closes the run. v1.31.0 still persists the closing write and then answers `InvalidArgument` (`context.go:423-460, 1093-1122 @ v1.31.0`); Tokeira checks only writes that leave the run open.
 - DSQL's 1 MiB column and 2 MiB row limits, which a state or batch below these limits can still exceed, and a reset's copied history, which is written as one batch. Separate changes bound both.
 - What a timer or scanner does with a refused write. v1.31.0's task executors retry the error and eventually move the task to a dead-letter queue.
-- The limits on a run's signals and updates.
+- The limits on a run's signals and updates, which [signal-update-limits](../signal-update-limits/bugfix.md) covers.
 - Standalone activities and other CHASM executions, which v1.31.0 checks the same way and terminates through their component tree (`context.go:1138-1145 @ v1.31.0`). Tokeira stores them apart from runs.

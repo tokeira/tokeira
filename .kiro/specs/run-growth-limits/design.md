@@ -117,7 +117,7 @@ _For any_ failure, the activity's stored last failure SHALL be the failure itsel
 ### Out of scope
 
 - The state check on a write that closes the run, DSQL's column and row limits, a reset's copied history, and what timers and scanners do with a refused write (bugfix Out of Scope).
-- The limits on a run's signals and updates.
+- The limits on a run's signals and updates, which [signal-update-limits](../signal-update-limits/bugfix.md) covers.
 
 ## Testing Strategy
 

@@ -270,7 +270,7 @@ fn dynamic_sql_attestations_are_counted_and_explained() {
         }
     }
     assert_eq!(
-        attestations, 11,
+        attestations, 9,
         "new dynamic SQL requires an explicit audit"
     );
 }

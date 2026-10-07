@@ -82,6 +82,24 @@ cargo nextest run -p tokeira-storage --features dsql-integration --locked \
   --test dsql_schema_bootstrap --run-ignored only
 ```
 
+## Plain migration runner paths
+
+The ignored `dsql_migration_runner` test requires
+`TOKEIRA_DSQL_MIGRATION_RUNNER_TEST_DATABASE_URL` and
+`TOKEIRA_DSQL_MIGRATION_RUNNER_TEST_ACK=MIGRATE_DISPOSABLE_EMPTY_DATABASE`, and refuses a
+database whose current schema already contains relations. It migrates the full embedded
+corpus through `MigrationRunner::apply_connection`, which `tkr schema setup` uses, then
+checks that `MigrationRunner::apply` finds nothing to apply. Set
+`TOKEIRA_DSQL_MIGRATION_RUNNER_TEST_FIRST=pool` to run the two paths the other way round.
+Use a new empty database for each run. A full migration with its index builds takes
+several minutes, longer than nextest's default three-minute ceiling, so run it with
+`cargo test`:
+
+```bash
+cargo test -p tokeira-storage --features dsql-integration --locked \
+  --test dsql_migration_runner -- --ignored
+```
+
 ## Managed lifecycle
 
 The [managed embedded DSQL live-AWS runbook](managed-embedded-dsql-live-aws.md) covers the

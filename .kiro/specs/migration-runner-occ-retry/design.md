@@ -17,24 +17,29 @@ crash-recovery semantics. So the plain paths can't simply call it.
 
 ## Fix Implementation
 
-- **Shared step.** Extract the loop from `execute_migration_step` into one function that takes a connection
-  and a migration and returns the job id of any `ASYNC` index build:
-  - begin, execute, and commit;
+- **Shared step.** Extract the loop from `execute_migration_step` into one function,
+  `attempt_migration_with_retries`, that takes a session and a migration and returns the job id of any
+  `ASYNC` index build:
+  - begin, execute, and commit (`MigrationSession::attempt`, a trait private to the module that
+    `PgConnection` implements);
   - on a `40001` (`is_occ_error`) from the statement or the commit, start again in a new transaction on the
     same connection, up to `DEFAULT_MIGRATION_OCC_RETRIES`;
-  - on any other error, return it.
+  - on any other error, or a failure to begin, return it, saying where it happened.
 
-  A second shared function waits for the build when `parse_async_index_spec` recognises the statement.
-  `execute_migration_step` becomes the idempotency check, then the shared step, then the wait, with the same
-  behaviour as today.
-- **`apply_connection`.** For each unapplied migration, run the shared step and the wait on the given
-  connection, then record the migration as today. Retrying on the same connection is what refreshes its
-  catalog cache.
-- **`apply` (pool).** Acquire one connection per migration, then do the same as `apply_connection` on it, so
-  every retry of a migration uses one session.
+  The existing `wait_for_async_index` waits for the build when `parse_async_index_spec` recognises the
+  statement. `execute_migration_step` becomes the idempotency check, then the shared step, then the wait,
+  with the same behaviour as today.
+- **`apply_connection`.** For each unapplied migration, run `apply_plain_migration` (the shared step and the
+  wait, with today's error context) on the given connection, then record the migration as today. Retrying
+  on the same connection is what refreshes its catalog cache.
+- **`apply` (pool).** Acquire one connection per migration and run `apply_plain_migration` on it, so every
+  retry of a migration uses one session. Return the connection to the pool before recording the migration,
+  so the path still holds one connection at a time.
 - **Errors.** When the retries run out, or a non-`40001` error occurs, return today's context: "failed to
   apply migration V…" for a statement and "failed to commit migration V…" for a commit. Record the failure
-  metric as today.
+  metric for these as today. A failed wait for an index build stops the run with "failed waiting for the
+  index build of migration V…" and records nothing, as on the guarded path. A rerun repeats the migration,
+  which every `ASYNC` index migration in the corpus allows with `IF NOT EXISTS`.
 - **No idempotency gate on the plain paths.** A `40001` failure aborts the transaction, so the retried
   migration applied nothing, whatever its form (criterion 2.1). The gate stays where it serves its purpose,
   on the guarded path.
@@ -43,10 +48,10 @@ crash-recovery semantics. So the plain paths can't simply call it.
 
 Property 1: A conflict is retried and the migration is recorded once
 
-_For any_ sequence of `40001` failures on a migration's statement or commit, shorter than the retry limit,
-followed by success, the plain paths SHALL commit the migration once, record it once in `schema_version`, and
-go on to the next migration. With the limit's worth of failures, they SHALL stop with today's error, having
-recorded nothing for that migration.
+_For any_ sequence of at most `DEFAULT_MIGRATION_OCC_RETRIES` `40001` failures on a migration's statement or
+commit, followed by success, the plain paths SHALL commit the migration once, record it once in
+`schema_version`, and go on to the next migration. With one failure more, they SHALL stop with today's error,
+having recorded nothing for that migration.
 
 **Validates: Requirements 2.1, 2.3**
 
@@ -62,7 +67,8 @@ retry nothing.
 - **Unit tests** of the shared step over an executor double that fails the statement or the commit with
   `40001` a set number of times, then succeeds. Cover Properties 1 and 2, and check that the guarded path
   still refuses a non-idempotent migration. If the step needs a small internal trait or closure to accept
-  the double, keep it private to the module.
+  the double, keep it private to the module. The double, `ScriptedSession`, scripts the attempts at a
+  migration that the guarded step would refuse as not idempotent.
 - **Live tests** on an ephemeral Aurora DSQL cluster, never a PostgreSQL stand-in. On a newly created
   cluster:
   - `apply_connection` and `apply` each migrate the full embedded corpus to the target in one run;
@@ -70,6 +76,6 @@ retry nothing.
 
   OC001 can't be provoked on demand, so the unit tests carry the retry, and the live tests prove the
   rewired paths end to end, including the waits for index builds.
-- **Exploration first.** Before the fix, the unit test for Property 1 fails against today's
-  `apply_connection`.
+- **Exploration.** Run as a negative control once the step was shared: with the shared loop cut to a single
+  attempt, which is all the plain paths made, the unit test for Property 1 fails.
 - **Preservation.** The existing migration tests stay green, the guarded path's tests included.

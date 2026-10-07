@@ -1,5 +1,19 @@
 # Requirements Document: Recovery Index
 
+## Workflow dispatch alignment
+
+[Workflow-dispatch](../workflow-dispatch/requirements.md) Requirements 7–8 extend
+RecoveryEntries with pending normal-task schedule-to-start deadlines and require
+coverage by the recovery predicate. Candidate pagination remains, but a second
+walk of every execution-home dispatch row finds stale rows excluded by the flag.
+Repair re-reads authoritative state in its fenced transaction; the single-decode,
+unchanged-entry, memory-first statements below do not constrain that new write
+path. Sampler and activity-entry contracts remain unchanged.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Introduction
 
 When a node takes a shard, the recovery sweep (`sweep_shard`, [runtime-sweeper-recovery](../runtime-sweeper-recovery/requirements.md)) rebuilds the shard's volatile delivery and timeout state from durable state. Today it reads every `workflow_hot` row of the shard five times, once per kind of work, decoding each state each time, and it reads every `activity_state` row of the shard. Its cost and memory therefore grow with every run the shard holds, open or closed, rather than with the work that is pending. Worker-compute sampling reads every `workflow_hot` row of every active shard the same way on each sampling tick to find reconstructible Nexus deliveries.

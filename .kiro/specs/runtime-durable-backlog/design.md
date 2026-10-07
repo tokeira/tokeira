@@ -1,5 +1,18 @@
 # Design Document: Durable Backlog Integration
 
+## Workflow dispatch alignment
+
+For workflow tasks, [workflow-dispatch](../workflow-dispatch/requirements.md)
+Requirements 1–6 and 9 supersede this specification's Tier C persistence,
+grace demotion, regular draining, and ready-only deduplication contract. The target
+commits dispatch intent with run state, discovers it through queue-home head
+passes, and keeps ready/in-flight offers volatile. Activity backlog storage,
+grace/drain handling, and shared activity loops retain their existing contracts.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Overview
 
 This design adds Tier C (durable backlog) to the three-tier delivery model described in [040-delivery-broker](../../../docs/architecture/040-delivery-broker.md). Today, `InMemoryBroker` and `InMemoryActivityBroker` implement only Tier A (sync match) and Tier B (live-ready). Tasks that are not matched by a poller sit in memory indefinitely — a liability if the process restarts or a shard is relinquished.

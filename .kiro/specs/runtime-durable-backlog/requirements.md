@@ -1,5 +1,18 @@
 # Requirements Document: Durable Backlog Integration
 
+## Workflow dispatch alignment
+
+For workflow tasks, [workflow-dispatch](../workflow-dispatch/requirements.md)
+Requirements 1–6 and 9 supersede this specification's Tier C persistence,
+grace demotion, regular draining, and ready-only deduplication contract. The target
+commits dispatch intent with run state, discovers it through queue-home head
+passes, and keeps ready/in-flight offers volatile. Activity backlog storage,
+grace/drain handling, and shared activity loops retain their existing contracts.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Introduction
 
 This document captures the requirements for Feature 12 (Durable Backlog Integration) of the Tokeira runtime. The durable backlog is Tier C of the three-tier delivery model described in [040-delivery-broker](../../../docs/architecture/040-delivery-broker.md). It provides persistent task storage for unmatched tasks that survive past the live-ready grace window, ensuring they are eventually delivered to workers without relying on in-memory state alone.

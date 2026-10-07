@@ -1,5 +1,20 @@
 # Design Document: Sweeper and Recovery
 
+## Workflow dispatch alignment
+
+[Workflow-dispatch](../workflow-dispatch/requirements.md) Requirements 7–8 supersede
+the workflow-only republish/read-only recovery assumptions and expired-affinity
+cleanup described below. Its acquisition protocol repairs missing and stale rows
+under the execution-home transaction fence, restores pending absolute sticky
+deadlines even after affinity reset, and serves only after both walks and timeout
+reconstruction succeed. The lease-fence prerequisite is explicit in its
+[design](../workflow-dispatch/design.md); a separate epoch precheck is insufficient.
+Activity and unrelated timeout recovery retain their existing contracts.
+
+This is a planned replacement, not an implementation claim. The
+[workflow-dispatch task plan](../workflow-dispatch/tasks.md) tracks its code and
+verification; existing completion marks below retain their historical meaning.
+
 ## Overview
 
 This design covers the sweeper and recovery subsystem for the Tokeira runtime. The sweeper is a one-time scan executed after shard acquisition that reconstructs volatile delivery state (broker queues, timeout tracking maps) from authoritative durable storage. Combined with epoch-fenced shard leases, it ensures no dispatchable work is lost across failovers while preventing stale owners from committing.

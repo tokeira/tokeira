@@ -343,30 +343,13 @@ impl MigrationRunner {
                 ensure_no_pre_envelope_hot_state(&mut guard_connection).await?;
             }
             let started_at = Instant::now();
-            let mut tx = pool.begin().await?;
-            // SQL safety: migration text comes from the embedded corpus or the trusted
-            // operator-selected migration directory; applied checksums are verified
-            // against the ledger. Request values are never interpolated into these bytes.
-            if let Err(error) = sqlx::query(AssertSqlSafe(migration.sql.as_str()))
-                .execute(&mut *tx)
-                .await
             {
-                record_migration_failure(&migration, started_at.elapsed(), &error);
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to apply migration V{:03}__{}",
-                        migration.version, migration.name
-                    )
-                });
-            }
-            if let Err(error) = tx.commit().await {
-                record_migration_failure(&migration, started_at.elapsed(), &error);
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to commit migration V{:03}__{}",
-                        migration.version, migration.name
-                    )
-                });
+                // One session per migration, so a retry after a schema conflict
+                // refreshes that session's cached catalog. It goes back to the
+                // pool before the migration is recorded, so this path still
+                // holds one connection at a time.
+                let mut connection = pool.acquire().await?;
+                apply_plain_migration(&mut connection, &migration, started_at).await?;
             }
 
             if let Err(error) = sqlx::query(
@@ -405,31 +388,7 @@ impl MigrationRunner {
                 ensure_no_pre_envelope_hot_state(connection).await?;
             }
             let started_at = Instant::now();
-            let mut tx = connection.begin().await?;
-            // SQL safety: migration text comes from the embedded corpus or the trusted
-            // operator-selected migration directory; applied checksums are verified
-            // against the ledger. Request values are never interpolated into these bytes.
-            if let Err(error) = sqlx::query(AssertSqlSafe(migration.sql.as_str()))
-                .execute(&mut *tx)
-                .await
-            {
-                record_migration_failure(&migration, started_at.elapsed(), &error);
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to apply migration V{:03}__{}",
-                        migration.version, migration.name
-                    )
-                });
-            }
-            if let Err(error) = tx.commit().await {
-                record_migration_failure(&migration, started_at.elapsed(), &error);
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to commit migration V{:03}__{}",
-                        migration.version, migration.name
-                    )
-                });
-            }
+            apply_plain_migration(connection, &migration, started_at).await?;
 
             if let Err(error) = sqlx::query(
                 "INSERT INTO schema_version (version, name, checksum, applied_at) VALUES ($1, $2, $3, now())",
@@ -1041,46 +1000,167 @@ async fn execute_migration_step(
         });
     }
     let index_spec = parse_async_index_spec(&migration.sql);
-    let mut conflicts = 0_u32;
-    let job_id = loop {
-        let mut transaction = connection.begin().await?;
-        let result = match &index_spec {
-            Some(_) => {
-                // SQL safety: migration text comes from the embedded corpus or the trusted
-                // operator-selected migration directory; applied checksums are verified
-                // against the ledger. Request values are never interpolated into these bytes.
-                sqlx::query_scalar::<_, String>(AssertSqlSafe(migration.sql.as_str()))
-                    .fetch_optional(&mut *transaction)
-                    .await
-            }
-            // SQL safety: migration text comes from the embedded corpus or the trusted
-            // operator-selected migration directory; applied checksums are verified
-            // against the ledger. Request values are never interpolated into these bytes.
-            None => sqlx::query(AssertSqlSafe(migration.sql.as_str()))
-                .execute(&mut *transaction)
-                .await
-                .map(|_| None),
-        };
-        let job_id = match result {
-            Ok(job_id) => job_id,
-            Err(error) if is_occ_error(&error) && conflicts < DEFAULT_MIGRATION_OCC_RETRIES => {
-                conflicts += 1;
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        match transaction.commit().await {
-            Ok(()) => break job_id,
-            Err(error) if is_occ_error(&error) && conflicts < DEFAULT_MIGRATION_OCC_RETRIES => {
-                conflicts += 1;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    };
+    let job_id = attempt_migration_with_retries(connection, migration, index_spec.is_some())
+        .await
+        .map_err(|error| error.into_inner())?;
     if let Some(spec) = index_spec {
         wait_for_async_index(connection, &spec, job_id.as_deref()).await?;
     }
     Ok(())
+}
+
+/// Apply one migration for the plain runner paths ([`MigrationRunner::apply`]
+/// and [`MigrationRunner::apply_connection`]): the guarded step's retry of SQLSTATE
+/// `40001` and its wait for an `ASYNC` index build, without its idempotency check
+/// (`migration-runner-occ-retry` criteria 2.1, 2.2).
+///
+/// A `40001` failure aborts the transaction, so a retried migration applied
+/// nothing whatever its form. The guarded path needs idempotency for a different
+/// reason: replay after a crash or a takeover.
+async fn apply_plain_migration(
+    connection: &mut PgConnection,
+    migration: &MigrationFile,
+    started_at: Instant,
+) -> Result<()> {
+    let index_spec = parse_async_index_spec(&migration.sql);
+    let job_id =
+        match attempt_migration_with_retries(connection, migration, index_spec.is_some()).await {
+            Ok(job_id) => job_id,
+            // Opening the transaction failed; as before, no migration failure is
+            // recorded and no context is added.
+            Err(MigrationAttemptError::Begin(error)) => return Err(error.into()),
+            Err(MigrationAttemptError::Statement(error)) => {
+                record_migration_failure(migration, started_at.elapsed(), &error);
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to apply migration V{:03}__{}",
+                        migration.version, migration.name
+                    )
+                });
+            }
+            Err(MigrationAttemptError::Commit(error)) => {
+                record_migration_failure(migration, started_at.elapsed(), &error);
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to commit migration V{:03}__{}",
+                        migration.version, migration.name
+                    )
+                });
+            }
+        };
+    if let Some(spec) = index_spec {
+        wait_for_async_index(connection, &spec, job_id.as_deref())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed waiting for the index build of migration V{:03}__{}",
+                    migration.version, migration.name
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Where one transactional attempt at a migration failed, so each caller keeps
+/// its own error context.
+#[derive(Debug)]
+enum MigrationAttemptError<E> {
+    /// Opening the transaction failed. Never retried.
+    Begin(E),
+    /// The migration's statement failed.
+    Statement(E),
+    /// The commit failed.
+    Commit(E),
+}
+
+impl<E> MigrationAttemptError<E> {
+    fn into_inner(self) -> E {
+        match self {
+            Self::Begin(error) | Self::Statement(error) | Self::Commit(error) => error,
+        }
+    }
+}
+
+/// One transactional attempt at a migration: begin, run its statement, commit.
+#[async_trait::async_trait]
+trait MigrationSession: Send {
+    type Error: Send;
+
+    /// Run `migration` in a new transaction and commit it. With `captures_job`,
+    /// the statement's single text result, an `ASYNC` index build's job id, is
+    /// returned.
+    async fn attempt(
+        &mut self,
+        migration: &MigrationFile,
+        captures_job: bool,
+    ) -> Result<Option<String>, MigrationAttemptError<Self::Error>>;
+
+    /// Whether a failed attempt may be retried in a new transaction.
+    fn is_retryable(error: &Self::Error) -> bool;
+}
+
+#[async_trait::async_trait]
+impl MigrationSession for PgConnection {
+    type Error = sqlx::Error;
+
+    async fn attempt(
+        &mut self,
+        migration: &MigrationFile,
+        captures_job: bool,
+    ) -> Result<Option<String>, MigrationAttemptError<sqlx::Error>> {
+        let mut transaction = self.begin().await.map_err(MigrationAttemptError::Begin)?;
+        let job_id = if captures_job {
+            // SQL safety: migration text comes from the embedded corpus or the trusted
+            // operator-selected migration directory; applied checksums are verified
+            // against the ledger. Request values are never interpolated into these bytes.
+            sqlx::query_scalar::<_, String>(AssertSqlSafe(migration.sql.as_str()))
+                .fetch_optional(&mut *transaction)
+                .await
+        } else {
+            // SQL safety: as above.
+            sqlx::query(AssertSqlSafe(migration.sql.as_str()))
+                .execute(&mut *transaction)
+                .await
+                .map(|_| None)
+        }
+        .map_err(MigrationAttemptError::Statement)?;
+        transaction
+            .commit()
+            .await
+            .map_err(MigrationAttemptError::Commit)?;
+        Ok(job_id)
+    }
+
+    fn is_retryable(error: &sqlx::Error) -> bool {
+        is_occ_error(error)
+    }
+}
+
+/// Attempt `migration`, retrying a statement or commit that fails with a
+/// retryable error (SQLSTATE `40001`: Aurora DSQL's OC000 and OC001) up to
+/// [`DEFAULT_MIGRATION_OCC_RETRIES`] times. Retrying from the same session
+/// refreshes its cached catalog after an OC001
+/// (<https://docs.aws.amazon.com/aurora-dsql/latest/userguide/troubleshooting.html#troubleshooting-occ>).
+async fn attempt_migration_with_retries<S>(
+    session: &mut S,
+    migration: &MigrationFile,
+    captures_job: bool,
+) -> Result<Option<String>, MigrationAttemptError<S::Error>>
+where
+    S: MigrationSession + ?Sized,
+{
+    let mut conflicts = 0_u32;
+    loop {
+        match session.attempt(migration, captures_job).await {
+            Ok(job_id) => return Ok(job_id),
+            Err(MigrationAttemptError::Statement(error) | MigrationAttemptError::Commit(error))
+                if S::is_retryable(&error) && conflicts < DEFAULT_MIGRATION_OCC_RETRIES =>
+            {
+                conflicts += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 const DEFAULT_MIGRATION_OCC_RETRIES: u32 = 5;
@@ -1868,5 +1948,162 @@ mod tests {
         assert!(entries.iter().any(|(name, labels)| {
             name == metric && labels.get("status").is_some_and(|value| value == status)
         }));
+    }
+
+    // Feature: migration-runner-occ-retry. The retry loop the guarded step and
+    // the plain runner paths share, over a scripted session.
+
+    /// A [`super::MigrationSession`] that answers each attempt from a script.
+    struct ScriptedSession {
+        outcomes: std::collections::VecDeque<
+            Result<Option<String>, super::MigrationAttemptError<ScriptedError>>,
+        >,
+        attempts: usize,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ScriptedError {
+        retryable: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::MigrationSession for ScriptedSession {
+        type Error = ScriptedError;
+
+        async fn attempt(
+            &mut self,
+            _migration: &MigrationFile,
+            _captures_job: bool,
+        ) -> Result<Option<String>, super::MigrationAttemptError<ScriptedError>> {
+            self.attempts += 1;
+            self.outcomes
+                .pop_front()
+                .expect("the session was attempted more often than the script allows")
+        }
+
+        fn is_retryable(error: &ScriptedError) -> bool {
+            error.retryable
+        }
+    }
+
+    /// A migration the guarded step would refuse as not idempotent, so the
+    /// tests below show that the retry doesn't depend on idempotency.
+    fn scripted_migration() -> MigrationFile {
+        MigrationFile {
+            version: 47,
+            name: "scripted".to_string(),
+            path: PathBuf::from("V047__scripted.sql"),
+            sql: "CREATE TABLE scripted (id UUID PRIMARY KEY);".to_string(),
+            checksum: "checksum".to_string(),
+        }
+    }
+
+    /// A failed attempt: on the statement when `on_statement`, else on the commit.
+    fn failure(
+        on_statement: bool,
+        retryable: bool,
+    ) -> Result<Option<String>, super::MigrationAttemptError<ScriptedError>> {
+        let error = ScriptedError { retryable };
+        Err(if on_statement {
+            super::MigrationAttemptError::Statement(error)
+        } else {
+            super::MigrationAttemptError::Commit(error)
+        })
+    }
+
+    fn run_script(
+        outcomes: Vec<Result<Option<String>, super::MigrationAttemptError<ScriptedError>>>,
+    ) -> (
+        Result<Option<String>, super::MigrationAttemptError<ScriptedError>>,
+        usize,
+    ) {
+        let mut session = ScriptedSession {
+            outcomes: outcomes.into(),
+            attempts: 0,
+        };
+        let migration = scripted_migration();
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(super::attempt_migration_with_retries(
+                &mut session,
+                &migration,
+                false,
+            ));
+        (result, session.attempts)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Property 1: a conflict is retried and the migration is recorded once.
+        // Below the limit, every conflict on the statement or the commit is
+        // retried, and the migration succeeds on the attempt after the last one.
+        #[test]
+        fn conflicts_below_the_limit_are_retried(
+            conflicts in prop::collection::vec(any::<bool>(), 0..=super::DEFAULT_MIGRATION_OCC_RETRIES as usize),
+        ) {
+            let mut outcomes = conflicts
+                .iter()
+                .map(|on_statement| failure(*on_statement, true))
+                .collect::<Vec<_>>();
+            outcomes.push(Ok(Some("job".to_string())));
+            let (result, attempts) = run_script(outcomes);
+            prop_assert_eq!(result.ok(), Some(Some("job".to_string())));
+            prop_assert_eq!(attempts, conflicts.len() + 1);
+        }
+
+        // Property 1, at the limit: one conflict more than the retries allow
+        // ends the migration with the last conflict, where it happened.
+        #[test]
+        fn conflicts_past_the_limit_stop_with_the_last(
+            conflicts in prop::collection::vec(
+                any::<bool>(),
+                super::DEFAULT_MIGRATION_OCC_RETRIES as usize + 1..=super::DEFAULT_MIGRATION_OCC_RETRIES as usize + 1,
+            ),
+        ) {
+            let outcomes = conflicts
+                .iter()
+                .map(|on_statement| failure(*on_statement, true))
+                .collect::<Vec<_>>();
+            let (result, attempts) = run_script(outcomes);
+            let last_on_statement = *conflicts.last().expect("at least one conflict");
+            match result {
+                Err(super::MigrationAttemptError::Statement(_)) => prop_assert!(last_on_statement),
+                Err(super::MigrationAttemptError::Commit(_)) => prop_assert!(!last_on_statement),
+                other => prop_assert!(false, "unexpected result {other:?}"),
+            }
+            prop_assert_eq!(attempts, super::DEFAULT_MIGRATION_OCC_RETRIES as usize + 1);
+        }
+    }
+
+    // Property 2: other failures stop the run, on the statement or the commit.
+    #[test]
+    fn a_failure_that_is_not_a_conflict_is_not_retried() {
+        for on_statement in [true, false] {
+            let (result, attempts) = run_script(vec![failure(on_statement, false)]);
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    // A failure to open the transaction is never retried, as before.
+    #[test]
+    fn a_failure_to_begin_is_not_retried() {
+        let (result, attempts) = run_script(vec![Err(super::MigrationAttemptError::Begin(
+            ScriptedError { retryable: true },
+        ))]);
+        assert!(matches!(
+            result,
+            Err(super::MigrationAttemptError::Begin(_))
+        ));
+        assert_eq!(attempts, 1);
+    }
+
+    // The retry tests run a migration that the guarded step's idempotency
+    // check refuses; the shared loop retries it all the same.
+    #[test]
+    fn the_retried_migration_is_one_the_guarded_step_refuses() {
+        assert!(!super::migration_is_idempotent(&scripted_migration().sql));
     }
 }

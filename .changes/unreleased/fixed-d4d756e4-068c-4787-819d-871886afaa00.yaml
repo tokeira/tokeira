@@ -1,0 +1,5 @@
+kind: fixed
+body: The migration runner and `tkr schema setup` now retry a schema conflict and wait for index builds, as engine startup does.
+time: 2026-10-07T22:13:34.000000+01:00
+custom:
+    Slice: d4d756e4-068c-4787-819d-871886afaa00

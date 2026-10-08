@@ -192,6 +192,25 @@ where
             .await
     }
 
+    async fn poll_workflow_activation_with_kind(
+        &self,
+        queue: tokeira_types::QueueKey,
+        normal_queue: Option<tokeira_types::QueueKey>,
+        is_sticky: bool,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<Option<tokeira_runtime::WorkflowActivation>> {
+        self.runtime
+            .poll_workflow_activation_with_kind(
+                queue,
+                normal_queue,
+                is_sticky,
+                worker_identity,
+                timeout,
+            )
+            .await
+    }
+
     async fn workflow_poller_scaling_decision(
         &self,
         queue: &tokeira_types::QueueKey,

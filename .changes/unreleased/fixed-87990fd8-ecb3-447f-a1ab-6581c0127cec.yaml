@@ -1,0 +1,5 @@
+kind: fixed
+body: Sticky workflow-task schedule-to-start deadlines now survive shard recovery, including after sticky affinity is cleared. Acquisition cancellation and concurrent task starts preserve the current timeout entry.
+time: 2026-10-08T18:59:21.000000+00:00
+custom:
+    Slice: 87990fd8-ecb3-447f-a1ab-6581c0127cec

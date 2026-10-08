@@ -2188,7 +2188,7 @@ where
                     logical_seq,
                     sticky_preferred,
                     normal_task_queue,
-                    speculative: _,
+                    speculative,
                     priority,
                 } => {
                     let workflow_queue = queue.clone();
@@ -2239,21 +2239,25 @@ where
                                 None,
                             )
                         };
-                    self.broker
-                        .publish_workflow_task(
-                            DispatchableWorkflowTask {
-                                run_key,
-                                queue: final_queue,
-                                logical_seq: *logical_seq,
-                                sticky_preferred: final_sticky,
-                                normal_queue,
-                                sticky_deadline,
-                                priority: priority.clone(),
-                                order: None,
-                            },
-                            Some(&self.delivery_metrics),
-                        )
-                        .await;
+                    let task = DispatchableWorkflowTask {
+                        run_key,
+                        queue: final_queue,
+                        logical_seq: *logical_seq,
+                        sticky_preferred: final_sticky,
+                        normal_queue,
+                        sticky_deadline,
+                        priority: priority.clone(),
+                        order: None,
+                    };
+                    if *speculative {
+                        self.broker
+                            .publish_speculative_workflow_task(task, Some(&self.delivery_metrics))
+                            .await;
+                    } else {
+                        self.broker
+                            .publish_workflow_task(task, Some(&self.delivery_metrics))
+                            .await;
+                    }
                 }
                 DispatchOp::RecordSpeculativeOutcome {
                     namespace_id,

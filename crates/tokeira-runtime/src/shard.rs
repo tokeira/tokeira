@@ -42,6 +42,7 @@ pub enum ShardState {
 /// Per-shard ownership record held by the runtime node.
 #[derive(Debug)]
 pub struct OwnedShard {
+    generation: u64,
     /// Epoch obtained when the lease was acquired.
     pub epoch: ShardEpoch,
     /// Current lifecycle state.
@@ -60,6 +61,17 @@ pub struct OwnedShard {
 pub struct ShardOwner {
     shards: HashMap<ShardId, OwnedShard>,
     shard_count: u32,
+    next_generation: u64,
+}
+
+/// Identity of one local acquisition attempt, including repeated sweeps at the
+/// same durable epoch. The token is cancelled before a replacement is installed.
+#[derive(Clone, Debug)]
+pub(crate) struct ShardAcquisition {
+    pub(crate) shard_id: ShardId,
+    pub(crate) epoch: ShardEpoch,
+    pub(crate) generation: u64,
+    pub(crate) cancel: CancellationToken,
 }
 
 impl ShardOwner {
@@ -71,6 +83,7 @@ impl ShardOwner {
         Self {
             shards: HashMap::new(),
             shard_count,
+            next_generation: 0,
         }
     }
 
@@ -86,16 +99,53 @@ impl ShardOwner {
     /// cancel shard-scoped background tasks when the shard
     /// is relinquished.
     pub fn record_acquired(&mut self, shard_id: ShardId, epoch: ShardEpoch) -> CancellationToken {
+        if let Some(previous) = self.shards.get(&shard_id) {
+            previous.cancel.cancel();
+        }
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("local acquisition generation exhausted");
         let cancel = CancellationToken::new();
         self.shards.insert(
             shard_id,
             OwnedShard {
+                generation: self.next_generation,
                 epoch,
                 state: ShardState::Sweeping,
                 cancel: cancel.clone(),
             },
         );
         cancel
+    }
+
+    pub(crate) fn acquisition(&self, shard_id: ShardId) -> Option<ShardAcquisition> {
+        self.shards.get(&shard_id).map(|owned| ShardAcquisition {
+            shard_id,
+            epoch: owned.epoch,
+            generation: owned.generation,
+            cancel: owned.cancel.clone(),
+        })
+    }
+
+    pub(crate) fn matches_acquisition(&self, acquisition: &ShardAcquisition) -> bool {
+        self.shards.get(&acquisition.shard_id).is_some_and(|owned| {
+            owned.epoch == acquisition.epoch && owned.generation == acquisition.generation
+        })
+    }
+
+    pub(crate) fn acquisition_active(&self, acquisition: &ShardAcquisition) -> bool {
+        self.matches_acquisition(acquisition)
+            && !acquisition.cancel.is_cancelled()
+            && self.owns(acquisition.shard_id) == Some(acquisition.epoch)
+    }
+
+    pub(crate) fn activate_acquisition(&mut self, acquisition: &ShardAcquisition) -> bool {
+        if !self.matches_acquisition(acquisition) || acquisition.cancel.is_cancelled() {
+            return false;
+        }
+        self.mark_active(acquisition.shard_id);
+        true
     }
 
     /// Transition a shard from `Sweeping` to `Active`.
@@ -135,7 +185,7 @@ impl ShardOwner {
     /// or not owned at all.
     pub fn owns(&self, shard_id: ShardId) -> Option<ShardEpoch> {
         self.shards.get(&shard_id).and_then(|owned| {
-            if owned.state == ShardState::Active {
+            if owned.state == ShardState::Active && !owned.cancel.is_cancelled() {
                 Some(owned.epoch)
             } else {
                 None
@@ -147,7 +197,7 @@ impl ShardOwner {
     pub fn is_active(&self, shard_id: ShardId) -> bool {
         self.shards
             .get(&shard_id)
-            .is_some_and(|o| o.state == ShardState::Active)
+            .is_some_and(|o| o.state == ShardState::Active && !o.cancel.is_cancelled())
     }
 
     /// Returns the epoch for a shard regardless of state.
@@ -167,7 +217,7 @@ impl ShardOwner {
     /// Iterator over active shard IDs only.
     pub fn active_shards(&self) -> impl Iterator<Item = ShardId> + '_ {
         self.shards.iter().filter_map(|(id, o)| {
-            if o.state == ShardState::Active {
+            if o.state == ShardState::Active && !o.cancel.is_cancelled() {
                 Some(*id)
             } else {
                 None

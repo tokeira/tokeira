@@ -16,7 +16,7 @@
 
 use std::future::Future;
 
-use tokeira_kernel::{CallbackState, WorkflowState};
+use tokeira_kernel::{CallbackState, WorkflowState, WorkflowTaskType};
 use tokeira_types::RunKey;
 
 use crate::api::{
@@ -57,6 +57,17 @@ fn callback_awaits_delivery(state: &CallbackState) -> bool {
     matches!(state, CallbackState::Scheduled | CallbackState::BackingOff)
 }
 
+/// An unstarted normal workflow task whose durable sticky deadline must survive recovery.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StickyDeadlineSweepEntry {
+    /// Durable run identity.
+    pub run_key: RunKey,
+    /// Pending normal-task incarnation fenced by the kernel.
+    pub logical_seq: tokeira_types::LogicalTaskSeq,
+    /// Original absolute deadline; affinity reset never extends it.
+    pub deadline: time::OffsetDateTime,
+}
+
 /// Everything the recovery sweep rebuilds from one run's state.
 #[derive(Clone, Debug, Default)]
 pub struct RecoveryEntries {
@@ -66,6 +77,8 @@ pub struct RecoveryEntries {
     pub workflow_timeout: Option<WorkflowTimeoutSweepEntry>,
     /// A started workflow task, whose start-to-close timeout to track.
     pub started_workflow_task: Option<WftTimeoutSweepEntry>,
+    /// An unstarted normal task's deadline, independent of sticky affinity.
+    pub sticky_deadline: Option<StickyDeadlineSweepEntry>,
     /// An open run's activities, whose timeouts to track.
     pub activities: Vec<ActivitySweepEntry>,
     /// An open run's Nexus operations that have a timeout, to track.
@@ -81,6 +94,7 @@ impl RecoveryEntries {
         self.dispatchable_workflow_task.is_none()
             && self.workflow_timeout.is_none()
             && self.started_workflow_task.is_none()
+            && self.sticky_deadline.is_none()
             && self.activities.is_empty()
             && self.nexus_timeouts.is_empty()
             && self.completion_callbacks.is_empty()
@@ -112,6 +126,9 @@ pub fn recovery_entries(state: &WorkflowState) -> RecoveryEntries {
             has_retry_policy: state.retry_policy.is_some(),
         }),
         started_workflow_task: state.pending_workflow_task.as_ref().and_then(|task| {
+            if !open {
+                return None;
+            }
             let (Some(started_event_id), Some(started_at)) =
                 (task.started_event_id, task.started_at)
             else {
@@ -124,6 +141,20 @@ pub fn recovery_entries(state: &WorkflowState) -> RecoveryEntries {
                 started_at,
                 workflow_task_timeout: state.workflow_task_timeout,
             })
+        }),
+        sticky_deadline: state.pending_workflow_task.as_ref().and_then(|task| {
+            if !open
+                || task.task_type != WorkflowTaskType::Normal
+                || task.started_event_id.is_some()
+            {
+                return None;
+            }
+            task.schedule_to_start_deadline
+                .map(|deadline| StickyDeadlineSweepEntry {
+                    run_key,
+                    logical_seq: task.logical_seq,
+                    deadline,
+                })
         }),
         activities: if open {
             state

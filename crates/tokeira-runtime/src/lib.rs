@@ -32,6 +32,7 @@ mod child_start;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod deployment_registry;
+mod discovery;
 pub mod dispatch_rate_limit;
 pub mod drain;
 pub mod errors;
@@ -63,6 +64,7 @@ pub mod update;
 pub mod wft_timeout;
 pub mod worker_compute;
 pub mod worker_registry;
+mod workflow_offers;
 mod workflow_rules;
 
 pub use activity_timeout::*;

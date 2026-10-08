@@ -1,5 +1,66 @@
 # Workflow dispatch implementation evidence
 
+## Second implementation PR: delivery components and deadline recovery
+
+Base: `eb80ab4aa839010c26708d75d4f1a62492bb92ac`. The PR records its final head.
+
+Tasks 5–7 are constructed only through the temporary internal delivery choice;
+ordinary runtime constructors still use notification, backlog and recovery
+delivery. Tests enable the new path explicitly, including a poll that discovers
+and starts a task with no publication and a different execution home. The cutover
+must remove this choice together with complete reconciliation and the serving
+gate. No migration, dependency or lockfile change is introduced.
+
+The offer pool shares incarnation deduplication and capacity across notifications
+and discovery. Takes retain identity until a definitive result or the five-second
+lease ends; ready retention is also five seconds. Reservations account for pages
+in flight, are bounded by the home cap, and release unused capacity on cancellation.
+Discovery preserves continuation across one-page slices, advances across rejected
+coordinates and incompatible/held rows, and discards continuation on a capacity
+stop. Poll guards reference-count demand, coalesce Live ranges, retain idle passes
+for renewal and retire only idle registrations under pressure. The wire sticky
+queue kind reaches registration independently of the optional normal queue name.
+
+Task 8 is active with existing delivery. Recovery derives the pending normal
+task's absolute deadline even after affinity reset. Installation, activation and
+cleanup check an acquisition's epoch and local generation; failed, cancelled and
+superseded sweeps cannot affect a successor's workflow-task tracking. Timeout
+results retire the submitted revision, preserving a concurrent start or retry.
+Post-commit tracking installs start-to-close before returning the committed start,
+including when its reply is lost. Temporal's durable sticky timer behavior is
+verified in `service/history/workflow/task_generator.go:419–444 @ v1.31.0`;
+matching's discarded NotFound results are verified in
+`service/matching/matching_engine.go:767–778 @ v1.31.0`.
+
+The generated contracts configure at least 100 cases per test:
+
+- Property 3: shared memory/DSQL ordered traversal, tuple ties, varied page sizes,
+  read-only state/row checks, multiple execution homes and moved-behind-cursor
+  rediscovery. Existing forced-collision contracts complement generated runtime
+  filtering of held and incompatible candidates.
+- Property 4: 129–269-row prefixes across multiple slices, per-slice examination
+  and admission bounds, and generated capacity-stop/release turns among competing
+  ranges. Direct checks cover all scheduler defaults and full home/queue capacity.
+- Property 5: poll/renewal/cancellation counts, coalesced ranges, home generation
+  replacement, overlapping homes, retirement and registry restart. Fixed runtime
+  tests prove duplicate offers cannot commit two starts and idle pressure preserves
+  active registrations. Eviction cancels an in-flight page and invalidates its
+  completion identity, so a late result cannot overwrite a recreated registration.
+- Property 6: notification/page duplicates, takes, cancellation, ambiguous results,
+  expiry and retirement against an independent lease model; runtime restart with
+  an unstarted offer or a lost committed-start reply. Repository transition counts
+  and dispatch pages distinguish volatile delivery from the single durable start.
+- Property 7: shared memory/DSQL deadline derivation for affinity present/reset,
+  paused, started, closed, speculative and legacy states; valid timeout creates
+  normal discoverable replacement work. Channel-controlled success and stale
+  rejection preserve a replacement installed during submission. Fixed tests use
+  injected time to verify exact-deadline firing only after Active, and pause actual
+  sweeps in both acquisition paths across failure, abort, relinquish and replacement.
+
+Tasks 9, 15, 17 and 18 remain incomplete. Query-plan observations below are evidence
+for Task 15, not completion of its transaction-boundary and read-cost verification.
+Requirements 8.4–8.6 still require the transaction-local competing-owner lease fence.
+
 ## First implementation PR
 
 Original base: `11ce84109d55167e4b737ac0224dc4004f3dbbbf`.

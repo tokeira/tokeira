@@ -19,15 +19,16 @@ Show the four defects first, on both stores, with tests that fail on the current
   - [ ] 1.2 Write the contract tests, each run on both stores:
     - a pass of 3,001 small expired tasks, and one of eleven tasks whose payloads are about 1 MB each;
     - the deletion of a closed run owning more than 3,000 rows;
-    - a materialization whose copied history encodes to more than 1 MiB, one to more than 10 MiB, and one whose successor holds 3,500 timers.
-    - _Requirements: 1.1-1.5_
-  - [ ] 1.3 Run them on the current code, on the in-memory store and on an ephemeral DSQL cluster, and confirm each fails as 1.1 to 1.4 predict
-    - _Requirements: 1.1-1.5_
+    - a materialization whose copied history encodes to more than 1 MiB, one to more than 10 MiB, and one whose successor holds 3,500 timers;
+    - a start of the same workflow id between a reset's commit on its base and its successor's materialization.
+    - _Requirements: 1.1-1.6_
+  - [ ] 1.3 Run them on the current code, on the in-memory store and on an ephemeral DSQL cluster, and confirm each fails as 1.1 to 1.4 and 1.6 predict
+    - _Requirements: 1.1-1.6_
 
 - [ ] 2. Budgets and the bulk-write record
   - [ ] 2.1 Add `write_budget`: the budgets, DSQL's limits and the paging helper
     - _Requirements: 2.1_
-  - [ ] 2.2 Add migrations V077 to V080, with the schema contracts, baseline lock, build information, migration tests and the migration paragraph of `crates/tokeira-storage/AGENTS.md`, as V074 to V076 did
+  - [ ] 2.2 Add the four migrations at the next free numbers (V077 to V080 at the time of writing), with the schema contracts, baseline lock, build information, migration tests and the migration paragraph of `crates/tokeira-storage/AGENTS.md`, as V074 to V076 did
     - _Requirements: 2.3, 2.4, 2.8_
   - [ ] 2.3 Add `RunBulkWrite`, `BulkWritePhase` and `list_run_bulk_writes` to both stores, and records to the in-memory store's snapshot
     - _Requirements: 2.3, 2.5, 2.8_
@@ -44,7 +45,7 @@ Show the four defects first, on both stores, with tests that fail on the current
 - [ ] 4. Deletion and the purge
   - [ ] 4.1 Make `delete_run_for_bundle` the first transaction, in both stores, and restate the trait's contract
     - _Requirements: 2.3, 3.3, 3.4_
-  - [ ] 4.2 Add `purge_run` to both stores: the switch of a `materializing` record, the tables in order, history last, and the record with the last rows
+  - [ ] 4.2 Add `abandon_materialization` and `purge_run` to both stores: the switch of a `materializing` record, the tables in order, history last, and the record with the last rows
     - _Requirements: 2.4, 2.5, 2.9_
   - [ ] 4.3 Write property tests for Properties 3 and 4
     - **Property 3: A run has mutable state or a bulk-write record, never both**
@@ -54,26 +55,29 @@ Show the four defects first, on both stores, with tests that fail on the current
 - [ ] 5. Materialization and the timer scanner
   - [ ] 5.1 Materialize a reset successor in steps, in both stores: the read, the batches, the record, the copy and the final transaction, with History Size as the sum of the batches
     - _Requirements: 2.7, 2.8, 2.11, 3.5_
-  - [ ] 5.2 Pass `StaleTimer` to `delete_due_timer_if_matches`, and keep a due timer whose run is missing while that run has mutable state or a `materializing` record
+  - [ ] 5.2 Check the current pointer in the final transaction against `expected_current`, which `reset_workflow` resolves and the Reset command carries to the lane in `ResetRequest::expected_current_run_key`
+    - _Requirements: 1.6, 2.13, 3.5_
+  - [ ] 5.3 Pass `StaleTimer` to `delete_due_timer_if_matches`, and keep a due timer whose run is missing while that run has mutable state or a `materializing` record
     - _Requirements: 2.10, 3.6_
-  - [ ] 5.3 Write property tests for Properties 5, 6, 7 and 8
+  - [ ] 5.4 Write property tests for Properties 5, 6, 7, 8 and 10
     - **Property 5: A materialized successor is complete, or invisible**
     - **Property 6: An abandoned materialization leaves nothing behind**
     - **Property 7: The copied history is split at event boundaries within the batch budget**
     - **Property 8: The timer scanner keeps a materializing run's timers**
-    - **Validates: Requirements 2.1, 2.7, 2.8, 2.9, 2.10, 2.11, 3.5, 3.6**
+    - **Property 10: A successor replaces only the run the reset found current**
+    - **Validates: Requirements 1.6, 2.1, 2.7, 2.8, 2.9, 2.10, 2.11, 2.13, 3.5, 3.6**
 
 - [ ] 6. Runtime
   - [ ] 6.1 Add the purger, started with the runtime's other loops
     - _Requirements: 2.5, 2.9_
-  - [ ] 6.2 Make `delete_workflow` purge in a task the caller's cancellation doesn't stop, and hand a failed purge to the purger
+  - [ ] 6.2 Make `delete_workflow` return after the first transaction, which it runs with the handoff to the purger in a task the caller's cancellation doesn't stop. Add `DeleteWorkflowRequest::purge_inline`, set by the batch delete and the namespace's reclaim, which purges before returning and hands a failed purge to the purger
     - _Requirements: 2.5, 2.6_
   - [ ] 6.3 Hand a failed materialization's successor to the purger from the lane
     - _Requirements: 2.9_
-  - [ ] 6.4 Hand a shard's records to the purger from `sweep_shard`
+  - [ ] 6.4 Make `sweep_shard` switch the shard's `materializing` records before activation, and hand all its records to the purger without waiting
     - _Requirements: 2.5, 2.9_
-  - [ ] 6.5 Write the runtime's unit tests: a deletion whose purge fails, the sweep's handoff, and a failed reset's purge
-    - _Requirements: 2.5, 2.6, 2.9_
+  - [ ] 6.5 Write the runtime's unit tests: a deletion's return and its purge, an inline purge and one that fails, the sweep's switch and handoff, and a failed reset's purge
+    - _Requirements: 2.5, 2.6, 2.9, 2.13_
 
 - [ ] 7. Write property tests for Property 1 across the four writes, asserting the budgets
   - **Property 1: Every transaction stays within the budgets**
@@ -83,7 +87,7 @@ Show the four defects first, on both stores, with tests that fail on the current
   - _Requirements: 2.1-2.9_
 
 - [ ] 9. Align the specs this changes: runtime-durable-backlog criterion 3.7 and its design, temporal-ui-support's deletion design, continue-as-new-advice Requirement 1.6 and Property 1, and run-growth-limits criterion 3.4 and Out of Scope
-  - _Requirements: 2.2, 2.3, 2.4, 2.11_
+  - _Requirements: 2.2, 2.3, 2.4, 2.6, 2.11_
 
 - [ ] 10. Checkpoint: the exploration tests pass on both stores, each negative control fails its test, the live suite passes on an ephemeral cluster, and the full bar of root `AGENTS.md` §10.4 passes
 

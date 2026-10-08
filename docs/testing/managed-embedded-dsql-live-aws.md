@@ -130,18 +130,15 @@ directory as well.
 
 ## Run
 
-From the repository root, create a temporary nextest profile, set the Region and a fresh
-descriptor path, then run only the ignored live test. The default nextest timeout is three
-minutes; remote lifecycle operations need the longer, narrowly scoped override below.
+From the repository root, create a temporary nextest configuration, set the Region and a
+fresh descriptor path, then run only the ignored live test. The repository's `dsql-live`
+profile allows each test twenty minutes; remote lifecycle operations need the longer,
+narrowly scoped override below, added to that profile.
 
 ```bash
 DSQL_NEXTEST_CONFIG="$(mktemp)"
 cp .config/nextest.toml "$DSQL_NEXTEST_CONFIG"
 cat >> "$DSQL_NEXTEST_CONFIG" <<'TOML'
-
-[profile.dsql-live]
-retries = 0
-test-threads = 1
 
 [[profile.dsql-live.overrides]]
 filter = 'test(=managed_embedded_dsql_live_lifecycle)'

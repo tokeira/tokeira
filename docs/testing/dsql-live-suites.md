@@ -7,6 +7,12 @@ execution is outside the default validation and CI. Run from the repository
 root with `--locked`; keep endpoints, URLs, credentials, and resource identities in the
 operator environment rather than in committed files or shared output.
 
+Run every live suite with the repository's `dsql-live` nextest profile
+(`.config/nextest.toml`): it runs one test at a time, never retries, and allows each
+test twenty minutes. On a new cluster the first test that migrates applies the whole
+embedded corpus and waits for every asynchronous index build, which takes about ten
+minutes, longer than the default profile's three-minute ceiling.
+
 ## URL-gated storage and projection
 
 Set `TOKEIRA_DSQL_TEST_DATABASE_URL` to a connection URL for a disposable test database.
@@ -40,12 +46,12 @@ Run the suites and their test cases serially against the selected database. The 
 fixtures reuse a deterministic shard ID across nextest's separate test processes:
 
 ```bash
-cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_shard_leasing --test-threads 1
-cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_on_conflict_counts --test-threads 1
-cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_embedded_ownership --test-threads 1
-cargo nextest run -p tokeira-projection --features dsql-integration --locked --test dsql_projection_persistence --test-threads 1
-cargo nextest run -p tokeira-projection --features dsql-integration --locked --test-threads 1 -E 'test(=dsql_store::tests::dsql_a_visibility_row_applies_only_a_newer_version)'
-cargo nextest run -p tokeira-storage --features dsql --locked --test-threads 1 -E 'test(=dsql::chasm_node::tests::dsql_archetype_scoped_business_ids) | test(=dsql::chasm_node::tests::dsql_chasm_node_store_round_trips_and_fences) | test(=dsql::chasm_node::tests::dsql_concurrent_starts_fence_pointer_and_roll_back_losing_nodes) | test(=dsql::chasm_node::tests::dsql_a_chasm_execution_commits_only_with_its_pointer) | test(=dsql::chasm_node::tests::dsql_a_backfill_returns_what_it_copied)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_shard_leasing --test-threads 1
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_on_conflict_counts --test-threads 1
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_embedded_ownership --test-threads 1
+cargo nextest run -p tokeira-projection --features dsql-integration --locked --profile dsql-live --test dsql_projection_persistence --test-threads 1
+cargo nextest run -p tokeira-projection --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(=dsql_store::tests::dsql_a_visibility_row_applies_only_a_newer_version)'
+cargo nextest run -p tokeira-storage --features dsql --locked --profile dsql-live --test-threads 1 -E 'test(=dsql::chasm_node::tests::dsql_archetype_scoped_business_ids) | test(=dsql::chasm_node::tests::dsql_chasm_node_store_round_trips_and_fences) | test(=dsql::chasm_node::tests::dsql_concurrent_starts_fence_pointer_and_roll_back_losing_nodes) | test(=dsql::chasm_node::tests::dsql_a_chasm_execution_commits_only_with_its_pointer) | test(=dsql::chasm_node::tests::dsql_a_backfill_returns_what_it_copied)'
 ```
 
 A green result with the URL gates unset is not live evidence. Record the date, revision,
@@ -53,12 +59,10 @@ suite, and outcome after a credentialed run, without recording the connection UR
 
 The workflow-dispatch tests use only `TOKEIRA_DSQL_TEST_DATABASE_URL`, apply the
 embedded migrations, and await ASYNC index readiness. Run them serially on an
-ephemeral cluster. The generated transaction suite can exceed nextest's default
-three-minute timeout; use a temporary profile with a longer timeout, as in the
-[managed runbook](managed-embedded-dsql-live-aws.md), without changing the repository profile.
+ephemeral cluster. The generated transaction suite also runs for several minutes.
 
 ```bash
-cargo nextest run -p tokeira-storage --features dsql-integration --locked --test-threads 1 -E 'test(workflow_dispatch_live_)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_)'
 ```
 
 ## Endpoint-gated IAM connector
@@ -69,7 +73,7 @@ AWS credential chain must supply an identity authorized for the connector's `adm
 connection, as described in the [managed lifecycle prerequisites](managed-embedded-dsql-live-aws.md#prerequisites).
 
 ```bash
-cargo nextest run -p tokeira-storage --features dsql-integration --locked --test dsql_connector_iam
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_connector_iam
 ```
 
 This test builds the production `ConnectionFactory`, creates an IAM-authenticated TLS
@@ -88,7 +92,7 @@ target. It never resets or cleans the database; use a new disposable empty datab
 each run, including after an interruption.
 
 ```bash
-cargo nextest run -p tokeira-storage --features dsql-integration --locked \
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live \
   --test dsql_schema_bootstrap --run-ignored only
 ```
 
@@ -102,12 +106,11 @@ corpus through `MigrationRunner::apply_connection`, which `tkr schema setup` use
 checks that `MigrationRunner::apply` finds nothing to apply. Set
 `TOKEIRA_DSQL_MIGRATION_RUNNER_TEST_FIRST=pool` to run the two paths the other way round.
 Use a new empty database for each run. A full migration with its index builds takes
-several minutes, longer than nextest's default three-minute ceiling, so run it with
-`cargo test`:
+several minutes.
 
 ```bash
-cargo test -p tokeira-storage --features dsql-integration --locked \
-  --test dsql_migration_runner -- --ignored
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live \
+  --test dsql_migration_runner --run-ignored only
 ```
 
 ## Managed lifecycle
@@ -116,6 +119,6 @@ The [managed embedded DSQL live-AWS runbook](managed-embedded-dsql-live-aws.md) 
 separate ignored test that creates and destroys a billable cluster and starts the full
 embedded engine. Follow its acknowledgement, credential, descriptor, and recovery rules.
 The connector migration needs this lifecycle run as well as the endpoint test and every
-URL-gated test. They run on a credentialed operator host; the managed runbook supplies a
-temporary nextest profile because the default three-minute timeout is too short for
-cluster lifecycle operations.
+URL-gated test. They run on a credentialed operator host; the managed runbook adds a
+longer override for its lifecycle test to the `dsql-live` profile, because cluster
+lifecycle operations take longer still.

@@ -28,3 +28,13 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# The live DSQL suites (docs/testing/dsql-live-suites.md). On a new cluster the
+# first test that migrates applies the whole corpus and waits for every ASYNC
+# index build, about ten minutes, and the generated suites run hundreds of
+# transactions. The work is real, not a hang, so each test gets twenty minutes.
+# Live tests share one database, so they run one at a time and never retry.
+[profile.dsql-live]
+retries = 0
+test-threads = 1
+slow-timeout = { period = "120s", terminate-after = 10 }

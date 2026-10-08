@@ -10,7 +10,12 @@ use std::{
     },
 };
 
-use anyhow::Result;
+use anyhow::{Context as _, Result, anyhow, ensure};
+use proptest::{
+    prelude::*,
+    strategy::ValueTree,
+    test_runner::{Config as ProptestConfig, TestRunner},
+};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{PendingWorkflowTask, Transition, WorkflowState};
@@ -198,6 +203,138 @@ async fn active_same_owner_reacquire_is_idempotent() -> Result<()> {
             epoch: ShardEpoch(1)
         }
     );
+    Ok(())
+}
+
+/// Who holds a lease row a case starts with.
+#[derive(Clone, Copy, Debug)]
+enum Holder {
+    Caller,
+    Other,
+    Nobody,
+}
+
+/// `cases` values of `strategy`, unshrunk: each case costs DSQL round trips, and
+/// a failure names its case.
+fn live_cases<S: Strategy>(strategy: S, cases: usize) -> Result<Vec<S::Value>> {
+    let mut runner = TestRunner::new(ProptestConfig {
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    (0..cases)
+        .map(|_| {
+            strategy
+                .new_tree(&mut runner)
+                .map(|tree| tree.current())
+                .map_err(|reason| anyhow!("{reason}"))
+        })
+        .collect()
+}
+
+// Feature: on-conflict-row-counts, Property 1: A shard lease is decided from what was written
+#[test]
+fn a_shard_lease_is_decided_from_what_was_written() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let Some(context) = runtime.block_on(TestContext::connect())? else {
+        return Ok(());
+    };
+    // Every lease row a case can start with: none, or a holder, live or expired,
+    // at a generated epoch.
+    let kinds = [
+        None,
+        Some((Holder::Caller, true)),
+        Some((Holder::Caller, false)),
+        Some((Holder::Other, true)),
+        Some((Holder::Other, false)),
+        Some((Holder::Nobody, true)),
+        Some((Holder::Nobody, false)),
+    ];
+    let epochs = live_cases(1i64..4, kinds.len())?;
+    for (kind, epoch) in kinds.into_iter().zip(epochs) {
+        let row = kind.map(|(holder, live)| (holder, live, epoch));
+        runtime
+            .block_on(lease_case(&context, row))
+            .with_context(|| format!("lease row {row:?}"))?;
+    }
+    Ok(())
+}
+
+async fn lease_case(context: &TestContext, row: Option<(Holder, bool, i64)>) -> Result<()> {
+    let shard_id = next_shard();
+    context.clear_lease(shard_id).await?;
+    // Whole seconds, so a row the acquire didn't rewrite keeps exactly this expiry.
+    let now = OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp())?;
+    let fixture_expiry = row.map(|(_, live, _)| {
+        if live {
+            now + Duration::minutes(5)
+        } else {
+            now - Duration::minutes(5)
+        }
+    });
+    if let Some((holder, _, epoch)) = row {
+        let owner = match holder {
+            Holder::Caller => Some("caller"),
+            Holder::Other => Some("other"),
+            Holder::Nobody => None,
+        };
+        sqlx::query(
+            "INSERT INTO shard_lease (shard_id, owner, epoch, lease_expiry, node_endpoint)
+             VALUES ($1, $2, $3, $4, 'fixture')",
+        )
+        .bind(shard_id_to_uuid(shard_id))
+        .bind(owner)
+        .bind(epoch)
+        .bind(fixture_expiry)
+        .execute(&context.pool)
+        .await?;
+    }
+    let outcome = context
+        .store
+        .run_repository()
+        .try_acquire_bundle(shard_id, "caller".to_owned(), "127.0.0.1:7233".to_owned())
+        .await?;
+    let (owner, epoch, expiry) = sqlx::query_as::<_, (Option<String>, i64, OffsetDateTime)>(
+        "SELECT owner, epoch, lease_expiry FROM shard_lease WHERE shard_id = $1",
+    )
+    .bind(shard_id_to_uuid(shard_id))
+    .fetch_one(&context.pool)
+    .await?;
+    context.clear_lease(shard_id).await?;
+    let epoch_of = |value: i64| u64::try_from(value).map(ShardEpoch);
+    let expected = match row {
+        None => LeaseOutcome::Acquired {
+            epoch: ShardEpoch(1),
+        },
+        Some((Holder::Caller, true, held)) => LeaseOutcome::Acquired {
+            epoch: epoch_of(held)?,
+        },
+        Some((Holder::Other, true, held)) => LeaseOutcome::Rejected {
+            current_owner: "other".to_owned(),
+            current_epoch: epoch_of(held)?,
+        },
+        // Expired, or held by no one: taken over at the next epoch.
+        Some((_, _, held)) => LeaseOutcome::Acquired {
+            epoch: epoch_of(held + 1)?,
+        },
+    };
+    ensure!(
+        outcome == expected,
+        "answered {outcome:?}, expected {expected:?}"
+    );
+    match expected {
+        LeaseOutcome::Acquired { epoch: acquired } => ensure!(
+            owner.as_deref() == Some("caller")
+                && epoch_of(epoch)? == acquired
+                && Some(expiry) != fixture_expiry,
+            "the stored lease is {owner:?} at {epoch}, expiring {expiry}, not the acquired one"
+        ),
+        _ => ensure!(
+            owner.as_deref() == Some("other") && Some(expiry) == fixture_expiry,
+            "a rejected acquire changed the lease: {owner:?} at {epoch}, expiring {expiry}"
+        ),
+    }
     Ok(())
 }
 

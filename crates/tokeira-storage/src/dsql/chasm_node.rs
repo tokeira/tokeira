@@ -1047,4 +1047,251 @@ mod tests {
         })?;
         result.map_err(|error| anyhow::anyhow!("{error}"))
     }
+
+    /// `cases` values of `strategy`, unshrunk: each case costs DSQL round trips,
+    /// and a failure names its case.
+    fn live_cases<S: Strategy>(strategy: S, cases: usize) -> anyhow::Result<Vec<S::Value>> {
+        use proptest::strategy::ValueTree;
+
+        let mut runner = TestRunner::new(ProptestConfig {
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        });
+        (0..cases)
+            .map(|_| {
+                strategy
+                    .new_tree(&mut runner)
+                    .map(|tree| tree.current())
+                    .map_err(|reason| anyhow::anyhow!("{reason}"))
+            })
+            .collect()
+    }
+
+    // Feature: on-conflict-row-counts, Property 7: A CHASM execution commits only with its pointer
+    #[test]
+    fn dsql_a_chasm_execution_commits_only_with_its_pointer() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let Some(store) = runtime.block_on(dsql_store_from_env())? else {
+            return Ok(());
+        };
+        let repo = store.chasm_node_repository();
+        // What the persist expects of the pointer: 0, none, with none stored;
+        // 1, none, with one stored; 2, the stored pointer; 3, the stored run at
+        // another version; 4, another run; 5, a run, with none stored.
+        for case in 0u8..6 {
+            runtime
+                .block_on(pointer_case(&repo, case))
+                .map_err(|error| anyhow::anyhow!("case {case}: {error:#}"))?;
+        }
+        runtime.block_on(store.shutdown())
+    }
+
+    async fn pointer_case(repo: &super::DsqlChasmNodeRepository, case: u8) -> anyhow::Result<()> {
+        let namespace = uuid::Uuid::new_v4().to_string();
+        let pointer = |key: &ExecutionKey| {
+            pointer_tests::current(key.run_id.clone(), "request", LifecycleState::Running)
+        };
+        let first = ExecutionKey::new(&namespace, "pointer", uuid::Uuid::new_v4().to_string());
+        let stored = (!matches!(case, 0 | 5)).then(|| pointer(&first));
+        if let Some(stored) = &stored {
+            let created = repo
+                .persist_new_execution(
+                    &first,
+                    7,
+                    vec![pointer_tests::root(7, LifecycleState::Running, 1)],
+                    stored.clone(),
+                    None,
+                )
+                .await?;
+            anyhow::ensure!(
+                created == NodePersistOutcome::Applied,
+                "fixture: {created:?}"
+            );
+        }
+        let second = ExecutionKey::new(&namespace, "pointer", uuid::Uuid::new_v4().to_string());
+        let expected_current = match case {
+            0 | 1 => None,
+            2 => stored.clone(),
+            3 => stored.clone().map(|mut stale| {
+                stale.vt_epoch.transition_count += 1;
+                stale
+            }),
+            _ => Some(pointer(&ExecutionKey::new(
+                &namespace,
+                "pointer",
+                uuid::Uuid::new_v4().to_string(),
+            ))),
+        };
+        let outcome = repo
+            .persist_new_execution(
+                &second,
+                7,
+                vec![pointer_tests::root(7, LifecycleState::Running, 1)],
+                pointer(&second),
+                expected_current,
+            )
+            .await?;
+        let current = repo.current_run(&namespace, 7, "pointer").await?;
+        let nodes = repo.load_execution(&second).await?.len();
+        for key in [&second, &first] {
+            repo.delete_execution(key).await?;
+        }
+        if matches!(case, 0 | 2) {
+            anyhow::ensure!(
+                outcome == NodePersistOutcome::Applied
+                    && current == Some(pointer(&second))
+                    && nodes == 1,
+                "answered {outcome:?}, pointer {current:?}, {nodes} nodes; expected the commit"
+            );
+        } else {
+            anyhow::ensure!(
+                matches!(outcome, NodePersistOutcome::Conflict { .. })
+                    && current == stored
+                    && nodes == 0,
+                "answered {outcome:?}, pointer {current:?}, {nodes} nodes; expected a conflict"
+            );
+        }
+        Ok(())
+    }
+
+    // Feature: on-conflict-row-counts, Property 6: A backfill returns what it copied
+    #[test]
+    fn dsql_a_backfill_returns_what_it_copied() -> anyhow::Result<()> {
+        let Ok(database_url) = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let Some(store) = runtime.block_on(dsql_store_from_env())? else {
+            return Ok(());
+        };
+        let pool = runtime.block_on(sqlx::PgPool::connect(&database_url))?;
+        let repo = store.chasm_node_repository();
+        // The legacy pointers and the batch size are generated. In turn, none,
+        // one or two of the pointers are already scoped, so every run has the
+        // backfill meet pointers it must leave as they are.
+        let sizes = live_cases((1usize..6, 1usize..4), 6)?;
+        for (index, (legacy, batch)) in sizes.into_iter().enumerate() {
+            let scoped = (index % 3).min(legacy);
+            runtime
+                .block_on(backfill_case(&repo, &pool, legacy, scoped, batch))
+                .map_err(|error| {
+                    anyhow::anyhow!("{legacy} legacy, {scoped} scoped, batch {batch}: {error:#}")
+                })?;
+        }
+        runtime.block_on(async {
+            pool.close().await;
+            store.shutdown().await
+        })
+    }
+
+    async fn backfill_case(
+        repo: &super::DsqlChasmNodeRepository,
+        pool: &sqlx::PgPool,
+        legacy: usize,
+        scoped: usize,
+        batch: usize,
+    ) -> anyhow::Result<()> {
+        // An archetype and namespace no other case or test uses, so the backfill,
+        // which scans every legacy pointer of its archetype, sees only these.
+        let archetype = u32::try_from(uuid::Uuid::new_v4().as_u128() % u128::from(u32::MAX))?;
+        let namespace = uuid::Uuid::new_v4();
+        let mut keys = Vec::new();
+        for index in 0..legacy {
+            let key = ExecutionKey::new(
+                namespace.to_string(),
+                format!("legacy-{index}"),
+                uuid::Uuid::new_v4().to_string(),
+            );
+            repo.persist_dirty(
+                &key,
+                vec![pointer_tests::root(archetype, LifecycleState::Running, 1)],
+            )
+            .await?;
+            let pointer =
+                pointer_tests::current(key.run_id.clone(), "request", LifecycleState::Running);
+            sqlx::query(
+                "INSERT INTO chasm_current_run
+                 (namespace_id, business_id, run_id, request_id, status, failover_version, transition_count)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(namespace)
+            .bind(&key.business_id)
+            .bind(uuid::Uuid::parse_str(&key.run_id)?)
+            .bind(&pointer.request_id)
+            .bind(super::DsqlChasmNodeRepository::encode_status(pointer.status))
+            .bind(pointer.vt_epoch.namespace_failover_version)
+            .bind(pointer.vt_epoch.transition_count)
+            .execute(pool)
+            .await?;
+            if index < scoped {
+                sqlx::query(
+                    "INSERT INTO chasm_current_execution
+                     (namespace_id, archetype_id, business_id, run_id, request_id, status,
+                      failover_version, transition_count, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())",
+                )
+                .bind(namespace)
+                .bind(i64::from(archetype))
+                .bind(&key.business_id)
+                .bind(uuid::Uuid::parse_str(&key.run_id)?)
+                .bind(&pointer.request_id)
+                .bind(super::DsqlChasmNodeRepository::encode_status(
+                    pointer.status,
+                ))
+                .bind(pointer.vt_epoch.namespace_failover_version)
+                .bind(pointer.vt_epoch.transition_count)
+                .execute(pool)
+                .await?;
+            }
+            keys.push(key);
+        }
+        let mut copied = 0;
+        let mut calls = 0;
+        loop {
+            let before: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM chasm_current_execution WHERE namespace_id = $1",
+            )
+            .bind(namespace)
+            .fetch_one(pool)
+            .await?;
+            let count = repo.backfill_current_executions(archetype, batch).await?;
+            let after: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM chasm_current_execution WHERE namespace_id = $1",
+            )
+            .bind(namespace)
+            .fetch_one(pool)
+            .await?;
+            anyhow::ensure!(
+                i64::try_from(count)? == after - before,
+                "a call returned {count} but wrote {}",
+                after - before
+            );
+            if count == 0 {
+                break;
+            }
+            copied += count;
+            calls += 1;
+            anyhow::ensure!(calls <= legacy, "the backfill never ran out");
+        }
+        for table in ["chasm_current_execution", "chasm_current_run", "chasm_node"] {
+            // SQL safety: allowlisted table literal.
+            QueryBuilder::<Postgres>::new("DELETE FROM ")
+                .push(table)
+                .push(" WHERE namespace_id = ")
+                .push_bind(namespace)
+                .build()
+                .execute(pool)
+                .await?;
+        }
+        anyhow::ensure!(
+            copied == legacy - scoped,
+            "copied {copied} of {} unscoped pointers",
+            legacy - scoped
+        );
+        Ok(())
+    }
 }

@@ -441,7 +441,6 @@ pub fn workflow_task_completed_request(
         // (server-side RejectUnprocessed, Req 9); the edge cannot see the
         // Sent set.
         delivered_update_ids: Vec::new(),
-        held_updates: 0,
         request: RequestContext {
             request_id: CoreRequestId(context.request_id.as_str().to_string()),
             caller_identity,

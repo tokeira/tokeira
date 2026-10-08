@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -207,6 +207,21 @@ pub struct WorkflowState {
     /// but not yet accepted by the worker. Tracked to reject
     /// duplicate update IDs.
     pub admitted_updates: std::collections::HashSet<String>,
+    /// The admitted updates a WorkflowExecutionUpdateAdmitted event records:
+    /// those a reset reapplied, or that the replay of a copied history
+    /// admitted. Each reaches the worker in history rather than as a protocol
+    /// message, and stays in flight across a reload, as v1.31.0 rebuilds it
+    /// from mutable state without its request (`NewRegistry`,
+    /// `service/history/workflow/update/registry.go:189-204 @ v1.31.0`). Always
+    /// a subset of [`Self::admitted_updates`]: every transition ends by
+    /// keeping only the ids still admitted.
+    ///
+    /// Not part of the positional layout: `#[serde(skip)]` leaves every
+    /// postcard encoding of `WorkflowState` unchanged, and the storage codec
+    /// persists the set in the state extension's history-admitted updates
+    /// section. A state stored before the set existed reads it as empty.
+    #[serde(skip)]
+    pub history_admitted_updates: BTreeSet<String>,
     /// Pending Nexus operations keyed by operation ID.
     pub pending_nexus_operations: BTreeMap<String, PendingNexusOperation>,
     /// Completion callbacks attached to this execution.
@@ -351,6 +366,19 @@ impl WorkflowState {
     /// (`Running` or `Paused`).
     pub fn is_open(&self) -> bool {
         self.status.is_open()
+    }
+
+    /// Whether an admitted update remains that a workflow task must carry as a
+    /// protocol message: one outside [`Self::history_admitted_updates`], whose
+    /// updates reach the worker in history. v1.31.0 sends a message only for an
+    /// update with a request (`needToSend`, `Send`,
+    /// `service/history/workflow/update/update.go:404-437 @ v1.31.0`), and once
+    /// the runtime has forgotten the run's lost updates
+    /// ([`crate::forget_lost_updates`]), every other admitted update has one.
+    pub fn has_admitted_update_to_send(&self) -> bool {
+        self.admitted_updates
+            .iter()
+            .any(|update_id| !self.history_admitted_updates.contains(update_id))
     }
 
     /// Return the execution-scoped versioning override, if one is set.
@@ -1509,6 +1537,7 @@ pub(crate) mod tests {
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
             admitted_updates: HashSet::new(),
+            history_admitted_updates: BTreeSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: Vec::new(),
             user_metadata: None,

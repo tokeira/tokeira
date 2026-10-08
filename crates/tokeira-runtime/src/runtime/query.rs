@@ -352,16 +352,26 @@ where
         // to the in-flight update or replays its outcome — repeated requests
         // sharing an id get one update and one result, and never a second
         // WFT (`FindOrCreate` attach + `GetUpdateOutcome` replay,
-        // registry.go:398-484 @ v1.31.0).
-        if self
-            .update_lifecycle_snapshot(run_key, execution.clone(), &update_id)
+        // registry.go:398-484 @ v1.31.0). A lost update's retry is admitted
+        // anew, taking over the id the run still holds.
+        let readmit = match self
+            .look_up_update(run_key, execution.clone(), &update_id)
             .await?
-            .is_some()
         {
-            return self
-                .wait_for_update_stage(run_key, execution, update_id, wait_policy, timeout_after)
-                .await;
-        }
+            UpdateLookup::Found(_) => {
+                return self
+                    .wait_for_update_stage(
+                        run_key,
+                        execution,
+                        update_id,
+                        wait_policy,
+                        timeout_after,
+                    )
+                    .await;
+            }
+            UpdateLookup::Lost => true,
+            UpdateLookup::Unknown => false,
+        };
 
         let (wait_tx, wait_rx) = oneshot::channel::<UpdateResolution>();
         let created = self.update_registry.register(
@@ -389,7 +399,7 @@ where
                 .await;
         }
 
-        // The lane sets the held-update figures from the state it loads, just
+        // The lane sets the held requests' sizes from the state it loads, just
         // before the kernel checks the update limits.
         let command = Command::Update(UpdateRequest {
             update_id: update_id.clone(),
@@ -399,8 +409,8 @@ where
             now: OffsetDateTime::now_utc(),
             limits: crate::update::update_limits(),
             request_bytes,
-            held_updates: 0,
             in_flight_request_bytes: 0,
+            readmit,
         });
 
         let submit_result = self.submit(run_key, command).await;
@@ -690,9 +700,25 @@ where
         execution: ExecutionRef,
         update_id: &str,
     ) -> Result<Option<UpdateLifecycleSnapshot>> {
+        Ok(
+            match self.look_up_update(run_key, execution, update_id).await? {
+                UpdateLookup::Found(snapshot) => Some(snapshot),
+                UpdateLookup::Lost | UpdateLookup::Unknown => None,
+            },
+        )
+    }
+
+    /// Find the update `update_id` of `run_key` as a client sees it: in history,
+    /// as an update the run holds admitted, or nowhere.
+    async fn look_up_update(
+        &self,
+        run_key: RunKey,
+        execution: ExecutionRef,
+        update_id: &str,
+    ) -> Result<UpdateLookup> {
         let state = match self.repo.load_run(run_key).await? {
             LoadedRun::Existing(state) => state,
-            LoadedRun::Absent => return Ok(None),
+            LoadedRun::Absent => return Ok(UpdateLookup::Unknown),
         };
         let workflow_execution = ExecutionRef {
             run_id: Some(state.run_id),
@@ -715,7 +741,7 @@ where
                     accepted_event_id,
                     result,
                 } if event_update_id == update_id => {
-                    return Ok(Some(UpdateLifecycleSnapshot {
+                    return Ok(UpdateLookup::Found(UpdateLifecycleSnapshot {
                         workflow_execution: workflow_execution.clone(),
                         update_id: update_id.to_string(),
                         update_name: accepted
@@ -763,7 +789,7 @@ where
                             }
                         }
                     };
-                    return Ok(Some(UpdateLifecycleSnapshot {
+                    return Ok(UpdateLookup::Found(UpdateLifecycleSnapshot {
                         workflow_execution: workflow_execution.clone(),
                         update_id: update_id.to_string(),
                         update_name: resolved_name,
@@ -777,7 +803,7 @@ where
                     rejected_request_sequencing_event_id,
                     ..
                 } if event_update_id == update_id => {
-                    return Ok(Some(UpdateLifecycleSnapshot {
+                    return Ok(UpdateLookup::Found(UpdateLifecycleSnapshot {
                         workflow_execution: workflow_execution.clone(),
                         update_id: update_id.to_string(),
                         update_name: accepted
@@ -802,7 +828,7 @@ where
             // with `acceptedUpdateCompletedWorkflowFailure` when the workflow
             // is no longer running (registry.go:455-484 @ v1.31.0).
             if !state.is_open() {
-                return Ok(Some(UpdateLifecycleSnapshot {
+                return Ok(UpdateLookup::Found(UpdateLifecycleSnapshot {
                     workflow_execution: workflow_execution.clone(),
                     update_id: update_id.to_string(),
                     update_name,
@@ -810,7 +836,7 @@ where
                     outcome: Some(UpdateOutcome::AcceptedRunClosed),
                 }));
             }
-            return Ok(Some(UpdateLifecycleSnapshot {
+            return Ok(UpdateLookup::Found(UpdateLifecycleSnapshot {
                 workflow_execution: workflow_execution.clone(),
                 update_id: update_id.to_string(),
                 update_name,
@@ -819,16 +845,21 @@ where
             }));
         }
 
-        if state.admitted_updates.contains(update_id)
-            || self
-                .update_registry
-                .contains_registered_update(run_key, update_id)
+        // An admitted update is one whose request this node holds, or one its
+        // WorkflowExecutionUpdateAdmitted event delivers. Any other admitted id
+        // is lost: a restart took its request, and v1.31.0, having forgotten it
+        // on reload, finds no update (`update/registry.go:168-236, 461-480 @
+        // v1.31.0`). The id leaves the run's state with the next command.
+        if self
+            .update_registry
+            .contains_registered_update(run_key, update_id)
+            || state.history_admitted_updates.contains(update_id)
         {
             let (update_name, _) = self
                 .update_registry
                 .peek_update_info(run_key, update_id)
                 .unwrap_or_default();
-            return Ok(Some(UpdateLifecycleSnapshot {
+            return Ok(UpdateLookup::Found(UpdateLifecycleSnapshot {
                 workflow_execution: workflow_execution.clone(),
                 update_id: update_id.to_string(),
                 update_name,
@@ -836,8 +867,11 @@ where
                 outcome: None,
             }));
         }
+        if state.admitted_updates.contains(update_id) {
+            return Ok(UpdateLookup::Lost);
+        }
 
-        Ok(None)
+        Ok(UpdateLookup::Unknown)
     }
 
     async fn wait_for_history_stage(
@@ -870,6 +904,18 @@ where
 
         Ok(latest)
     }
+}
+
+/// What a client finds for an update id (`look_up_update`).
+enum UpdateLookup {
+    /// An update in history, or one the run holds admitted.
+    Found(UpdateLifecycleSnapshot),
+    /// An id the run holds admitted whose request a restart lost and that no
+    /// history event delivers: v1.31.0 has forgotten it, so a retry is a new
+    /// update.
+    Lost,
+    /// No update with this id.
+    Unknown,
 }
 
 fn requested_stage(wait_policy: UpdateWaitPolicy) -> UpdateLifecycleStage {

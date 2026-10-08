@@ -1,0 +1,5 @@
+kind: fixed
+body: After a restart, a client's retry of an update the run admitted is delivered and answered, no empty workflow tasks repeat, and updates a reset reapplied count as in flight.
+time: 2026-10-08T20:11:53.000000+01:00
+custom:
+    Slice: 884ac979-92ff-4e12-b250-5e74b753d463

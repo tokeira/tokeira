@@ -311,6 +311,7 @@ fn make_open_state() -> WorkflowState {
         pending_external_cancels: BTreeMap::new(),
         pending_updates: BTreeMap::new(),
         admitted_updates: std::collections::HashSet::new(),
+        history_admitted_updates: Default::default(),
         pending_nexus_operations: BTreeMap::new(),
         completion_callbacks: Vec::new(),
         user_metadata: None,
@@ -1050,7 +1051,6 @@ fn complete_wft_with_nexus_cancel(state: WorkflowState) -> Transition {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
                 now: now(),
                 command_sizes: Vec::new(),
@@ -1501,7 +1501,6 @@ fn sticky_completion_dispatches_next_wft_sticky_then_s2s_times_out() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -2571,8 +2570,8 @@ fn update_rejects_paused_workflow() {
                 now: now(),
                 limits: Default::default(),
                 request_bytes: 0,
-                held_updates: 0,
                 in_flight_request_bytes: 0,
+                readmit: false,
             }),
         )
         .unwrap_err();
@@ -2753,7 +2752,6 @@ fn wft_completed_paused_workflow_no_force_wft() {
                 force_new_workflow_task: true,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -2795,7 +2793,6 @@ fn wft_completion_tracks_previous_started_event_id() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -3422,7 +3419,6 @@ fn workflow_task_completed_with_activity_and_timer() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -3500,7 +3496,6 @@ fn workflow_task_completed_with_complete_workflow() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -3549,7 +3544,6 @@ fn workflow_task_completed_with_fail_workflow() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -3637,7 +3631,6 @@ fn continue_as_new_closes_run() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -3713,7 +3706,6 @@ fn continue_as_new_then_another_command() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -3890,7 +3882,6 @@ fn fail_workflow_with_retry_policy() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -3940,7 +3931,6 @@ fn fail_workflow_without_retry_policy() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -4514,7 +4504,6 @@ fn reject_wft_completed_no_pending() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -4552,7 +4541,6 @@ fn reject_wft_completed_not_started() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -4591,7 +4579,6 @@ fn reject_wft_completed_seq_mismatch() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -4633,7 +4620,6 @@ fn reject_wft_completed_token_mismatch() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -4723,7 +4709,6 @@ fn reject_duplicate_activity_id() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -4774,7 +4759,6 @@ fn reject_duplicate_timer_id() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -5105,7 +5089,6 @@ fn reject_commands_after_close() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -5144,7 +5127,6 @@ fn cancel_workflow_command() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -5201,7 +5183,6 @@ fn cancel_workflow_then_another_command() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -5242,7 +5223,6 @@ fn request_cancel_activity() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -5303,7 +5283,6 @@ fn request_cancel_activity_started_sets_durable_cancel_requested() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -5360,7 +5339,6 @@ fn request_cancel_activity_unknown() {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
-            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
             command_sizes: Vec::new(),
@@ -5429,7 +5407,6 @@ fn close_command_with_buffered_events_is_unhandled_command() {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
-            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
             command_sizes: Vec::new(),
@@ -5473,7 +5450,6 @@ fn cancel_timer() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -5522,7 +5498,6 @@ fn cancel_timer_unknown() {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
-            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
             command_sizes: Vec::new(),
@@ -5581,7 +5556,6 @@ fn record_marker_missing_name_fails_wft() {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
-            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
             command_sizes: Vec::new(),
@@ -5667,7 +5641,6 @@ fn workflow_property_and_search_attribute_patches_record_merge_and_replay() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -5751,7 +5724,6 @@ fn invalid_search_attribute_uses_bad_search_attributes_failure_cause() {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
-            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
             command_sizes: Vec::new(),
@@ -5825,7 +5797,6 @@ fn transient_completion_materializes_scheduled_started_with_task_times() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -5933,7 +5904,6 @@ fn cancel_timer_fired_and_buffered_deletes_buffered_fired_event() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -5986,7 +5956,6 @@ fn request_cancel_activity_then_resolved_canceled() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -6098,7 +6067,6 @@ fn cancel_then_cancel_workflow_e2e() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -6299,7 +6267,6 @@ fn start_child_workflow_happy_path() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -6472,7 +6439,6 @@ fn signal_external_workflow_happy_path() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -6552,7 +6518,6 @@ fn request_cancel_external_workflow_happy_path() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -6643,8 +6608,8 @@ fn update_with_no_pending_wft() {
                 now: now(),
                 limits: Default::default(),
                 request_bytes: 0,
-                held_updates: 0,
                 in_flight_request_bytes: 0,
+                readmit: false,
             }),
         )
         .unwrap();
@@ -6688,8 +6653,8 @@ fn update_with_pending_wft() {
                 now: now(),
                 limits: Default::default(),
                 request_bytes: 0,
-                held_updates: 0,
                 in_flight_request_bytes: 0,
+                readmit: false,
             }),
         )
         .unwrap();
@@ -6714,8 +6679,8 @@ fn update_rejected_missing_run() {
                 now: now(),
                 limits: Default::default(),
                 request_bytes: 0,
-                held_updates: 0,
                 in_flight_request_bytes: 0,
+                readmit: false,
             }),
         )
         .unwrap_err();
@@ -6735,8 +6700,8 @@ fn update_rejected_closed_run() {
                 now: now(),
                 limits: Default::default(),
                 request_bytes: 0,
-                held_updates: 0,
                 in_flight_request_bytes: 0,
+                readmit: false,
             }),
         )
         .unwrap_err();
@@ -6757,8 +6722,8 @@ fn update_duplicate_update_id() {
                 now: now(),
                 limits: Default::default(),
                 request_bytes: 0,
-                held_updates: 0,
                 in_flight_request_bytes: 0,
+                readmit: false,
             }),
         )
         .unwrap_err();
@@ -6796,7 +6761,6 @@ fn update_completed_happy_path() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -6854,7 +6818,6 @@ fn update_rejected_happy_path() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -6910,7 +6873,6 @@ fn update_completed_unknown_update() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -6953,7 +6915,6 @@ fn update_rejected_unknown_update_is_tolerated() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -7009,7 +6970,6 @@ fn protocol_message_accepted_body() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -7066,7 +7026,6 @@ fn protocol_message_completed_body() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -7126,7 +7085,6 @@ fn protocol_message_rejected_body() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -7194,7 +7152,6 @@ fn complete_workflow_clears_pending_updates() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -7241,7 +7198,6 @@ fn record_marker_happy_path() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -7305,7 +7261,6 @@ fn record_marker_after_close_rejected() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -7637,7 +7592,6 @@ fn close_via_wft(state: WorkflowState, commands: Vec<WorkflowCommand>) -> Transi
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -7938,7 +7892,6 @@ fn schedule_nexus_operation_happy_path() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -8003,7 +7956,6 @@ fn schedule_nexus_operation_duplicate_rejected() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -8046,7 +7998,6 @@ fn cancel_nexus_operation_happy_path() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -8322,7 +8273,6 @@ fn cancel_nexus_operation_unknown() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -8880,7 +8830,6 @@ fn close_via_complete_clears_pending_nexus_operations() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
@@ -9087,8 +9036,8 @@ fn admit_update(state: WorkflowState, update_id: &str) -> WorkflowState {
                 now: now(),
                 limits: Default::default(),
                 request_bytes: 0,
-                held_updates: 0,
                 in_flight_request_bytes: 0,
+                readmit: false,
             }),
         )
         .unwrap()
@@ -9144,7 +9093,6 @@ fn speculative_completion_request(
         force_new_workflow_task: false,
         limits: Default::default(),
         delivered_update_ids: Vec::new(),
-        held_updates: 0,
         request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
         now: now(),
         command_sizes: Vec::new(),

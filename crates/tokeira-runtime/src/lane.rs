@@ -1562,43 +1562,42 @@ where
     .await
 }
 
-/// Set the held-update figures on an update command or a workflow task's
-/// completion, from the state the lane just loaded and the registry holding the
-/// admitted updates' requests (`signal-update-limits` criteria 2.9, 2.11, 2.13).
+/// Bring the loaded state and the command up to date with the update requests
+/// this node holds, immediately before the kernel applies the command: forget
+/// the run's lost updates ([`tokeira_kernel::forget_lost_updates`]), and give an
+/// update command the held requests' sizes, the in-flight payload limit's
+/// operand.
 ///
-/// The figures are taken here because the lane applies a run's commands one at
-/// a time: no update can be admitted, accepted or completed between this count
-/// and the kernel's check. A count taken before the command reached the lane
-/// could miss an update admitted in between, or count one never admitted.
-fn with_held_updates(
+/// This happens here because the lane applies a run's commands one at a time:
+/// no update can be admitted, accepted or completed between this look at the
+/// registry and the kernel's transition. A look taken before the command
+/// reached the lane could miss an update admitted in between.
+///
+/// A completion claims each update its worker rejected before it commits, so
+/// the forget finds that update without a request and drops it; the kernel then
+/// takes the rejection as one of an update the run doesn't hold, which the
+/// update's own admission keeps within the total limit, and the outcome is the
+/// same.
+fn reconcile_held_updates(
+    mut loaded: LoadedRun,
     mut command: Command,
-    loaded: &LoadedRun,
     update_registry: &UpdateRegistry,
     run_key: RunKey,
-) -> Command {
-    let LoadedRun::Existing(state) = loaded else {
-        return command;
+) -> (LoadedRun, Command) {
+    let LoadedRun::Existing(state) = &mut loaded else {
+        return (loaded, command);
     };
-    match &mut command {
-        Command::Update(request) => {
-            let held = update_registry.held_updates(
-                run_key,
-                &state.admitted_updates,
-                Some(&request.update_id),
-            );
-            request.held_updates = held.count;
-            request.in_flight_request_bytes = held.request_bytes;
-        }
-        Command::WorkflowTaskCompleted(request)
-        | Command::WorkflowTaskCompletedWithRetry { request, .. }
-        | Command::WorkflowTaskCompletedWithCron { request, .. } => {
-            request.held_updates = update_registry
-                .held_updates(run_key, &state.admitted_updates, None)
-                .count;
-        }
-        _ => {}
+    tokeira_kernel::forget_lost_updates(state, |update_id| {
+        update_registry.contains_registered_update(run_key, update_id)
+    });
+    if let Command::Update(request) = &mut command {
+        request.in_flight_request_bytes = update_registry.held_request_bytes(
+            run_key,
+            &state.admitted_updates,
+            &request.update_id,
+        );
     }
-    command
+    (loaded, command)
 }
 
 /// Run one command through the kernel and commit it, retrying the
@@ -1648,7 +1647,8 @@ where
                 loaded
             }
         };
-        let attempt_command = with_held_updates(command.clone(), &loaded, update_registry, run_key);
+        let (loaded, attempt_command) =
+            reconcile_held_updates(loaded, command.clone(), update_registry, run_key);
         let mut transition = transition_span.in_scope(|| {
             kernel
                 .apply(loaded, attempt_command)
@@ -3015,6 +3015,7 @@ mod tests {
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
+            history_admitted_updates: Default::default(),
             pending_nexus_operations: BTreeMap::new(),
             versioning_info: None,
             worker_deployment_name: None,

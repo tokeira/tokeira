@@ -246,16 +246,6 @@ pub struct UpdateRegistry {
     next_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// The admitted updates of one run that the owner's registry holds requests for,
-/// which the update limits count (`signal-update-limits` criteria 2.9, 2.11).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct HeldUpdates {
-    /// How many there are.
-    pub count: usize,
-    /// The sum of their request sizes.
-    pub request_bytes: u64,
-}
-
 impl UpdateRegistry {
     /// Create an empty registry. Entries are added as
     /// [`UpdateWaitPolicy::Completed`] callers begin waiting.
@@ -309,27 +299,24 @@ impl UpdateRegistry {
         }
     }
 
-    /// The updates of `admitted`, a run's admitted and unaccepted update ids,
-    /// that this registry holds requests for, `except` aside.
-    ///
-    /// An admitted id with no entry is one whose request a restart lost: it is
-    /// never delivered, so nothing removes it from the run's state, and v1.31.0
-    /// would have forgotten it on reload. It counts toward neither figure
-    /// (`signal-update-limits` criterion 2.9).
-    pub(crate) fn held_updates(
+    /// The request sizes of the updates of `admitted`, a run's admitted and
+    /// unaccepted update ids, that this registry holds requests for, `except`
+    /// aside: the in-flight payload limit's operand. An update its history
+    /// event delivers has no request here and adds nothing, as v1.31.0 rebuilds
+    /// it without one (`update/registry.go:189-204 @ v1.31.0`).
+    pub(crate) fn held_request_bytes(
         &self,
         run_key: RunKey,
         admitted: &HashSet<String>,
-        except: Option<&str>,
-    ) -> HeldUpdates {
+        except: &str,
+    ) -> u64 {
         let inner = self.inner.lock().expect("inner lock poisoned");
         admitted
             .iter()
-            .filter(|update_id| Some(update_id.as_str()) != except)
+            .filter(|update_id| update_id.as_str() != except)
             .filter_map(|update_id| inner.get(&(run_key, update_id.clone())))
-            .fold(HeldUpdates::default(), |held, entry| HeldUpdates {
-                count: held.count + 1,
-                request_bytes: held.request_bytes.saturating_add(entry.request_bytes),
+            .fold(0, |bytes: u64, entry| {
+                bytes.saturating_add(entry.request_bytes)
             })
     }
 

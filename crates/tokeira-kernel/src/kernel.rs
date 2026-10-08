@@ -467,6 +467,7 @@ impl BasicKernel {
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
+            history_admitted_updates: std::collections::BTreeSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: completion_callbacks.clone(),
             user_metadata: user_metadata.clone(),
@@ -509,6 +510,9 @@ impl BasicKernel {
             state.external_payload_size_bytes += size;
             self.apply_replayed_event(&mut state, event);
         }
+        // A later event in the prefix may have accepted, rejected or
+        // completed a history-admitted update.
+        keep_history_admitted_within_admitted(&mut state);
 
         Ok(state)
     }
@@ -601,6 +605,7 @@ impl BasicKernel {
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
+            history_admitted_updates: std::collections::BTreeSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: completion_callbacks.clone(),
             user_metadata: req.user_metadata.clone(),
@@ -768,6 +773,7 @@ impl BasicKernel {
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
+            history_admitted_updates: std::collections::BTreeSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: Vec::new(),
             user_metadata: req.user_metadata.clone(),
@@ -959,20 +965,32 @@ impl BasicKernel {
         if state.pending_updates.contains_key(&req.update_id) {
             return Err(Reject::DuplicateUpdateId(req.update_id));
         }
-        if state.admitted_updates.contains(&req.update_id) {
+        // A client's retry of an update whose request a restart lost is a new
+        // update: v1.31.0 finds no update for the id after its reload and
+        // creates one (`FindOrCreate`, `update/registry.go:226-236, 461-480 @
+        // v1.31.0`). Only the runtime knows the request was lost, so it says
+        // so with `readmit`; by now the retry's own request is held, and the
+        // id is still admitted. An update its event delivers is never lost.
+        let readmitted = req.readmit
+            && state.admitted_updates.contains(&req.update_id)
+            && !state.history_admitted_updates.contains(&req.update_id);
+        if state.admitted_updates.contains(&req.update_id) && !readmitted {
             return Err(Reject::DuplicateUpdateId(req.update_id));
         }
         // A new id meets v1.31.0's update limits, in its order: in flight,
         // total, then payload (`FindOrCreate` then `Admit`,
         // `update/registry.go:226-236`, `update/update.go:301-311 @ v1.31.0`).
-        // In flight are the accepted updates and the admitted ones whose
-        // requests the owner holds, which the lane counted from this state: an
-        // admitted id whose request a restart lost is never delivered, so it
-        // must not hold the run's slots, as v1.31.0 forgets it on reload
-        // (`signal-update-limits` criterion 2.9).
+        // In flight are the run's accepted and admitted updates. The runtime
+        // forgot its lost updates before this command, so the admitted ones are
+        // those whose requests the owner holds and those an event delivers:
+        // v1.31.0's `len(r.updates)` after a reload (`update/registry.go:189-204,
+        // 367-369 @ v1.31.0`). A re-admitted update is the one being admitted,
+        // so it is left out.
+        let in_flight =
+            state.admitted_updates.len() - usize::from(readmitted) + state.pending_updates.len();
         crate::limits::check_update_admission(
             &req.limits,
-            req.held_updates.saturating_add(state.pending_updates.len()),
+            in_flight,
             state.completed_update_count as usize,
             req.in_flight_request_bytes,
             req.request_bytes,
@@ -2074,7 +2092,7 @@ impl BasicKernel {
                 // the runtime notifies its waiters post-commit. A rejection of
                 // an update the run doesn't hold re-admits it first, at the
                 // total limit's check (criterion 2.13).
-                builder.resurrection = UpdateSlots::at_completion(&builder.state, req.held_updates);
+                builder.resurrection = UpdateSlots::at_completion(&builder.state);
                 for command in req.commands {
                     if let WorkflowCommand::ProtocolMessage {
                         body: UpdateProtocolBody::Rejected { update_id, .. },
@@ -2110,8 +2128,11 @@ impl BasicKernel {
                         committed: false,
                     });
                 // K7: updates admitted while this task ran still need a
-                // delivery vehicle — schedule a fresh speculative task.
-                if !builder.state.admitted_updates.is_empty() {
+                // delivery vehicle — schedule a fresh speculative task. An
+                // update its event delivers needs none: it reaches the worker
+                // in history (`needToSend`, `update/update.go:404-437 @
+                // v1.31.0`).
+                if builder.state.has_admitted_update_to_send() {
                     builder.schedule_speculative_workflow_task();
                 }
                 return builder.finish();
@@ -2236,7 +2257,7 @@ impl BasicKernel {
 
         let limits = req.limits;
         let command_sizes = req.command_sizes;
-        builder.resurrection = UpdateSlots::at_completion(&builder.state, req.held_updates);
+        builder.resurrection = UpdateSlots::at_completion(&builder.state);
         let mut closed = false;
         for (index, command) in req.commands.into_iter().enumerate() {
             if closed {
@@ -2317,10 +2338,12 @@ impl BasicKernel {
         // once the running task completes when admitted updates remain
         // unsent; buffered-event/heartbeat triggers above already produced a
         // NORMAL task instead (respondworkflowtaskcompleted/api.go:512-541
-        // @ v1.31.0).
+        // @ v1.31.0). An update its event delivers is never sent as a message
+        // (`needToSend`, `update/update.go:404-437 @ v1.31.0`), so it causes
+        // none.
         if builder.state.is_open()
             && builder.state.pending_workflow_task.is_none()
-            && !builder.state.admitted_updates.is_empty()
+            && builder.state.has_admitted_update_to_send()
         {
             builder.schedule_speculative_workflow_task();
         }
@@ -3499,6 +3522,10 @@ impl BasicKernel {
                     }
                     HistoryEventKind::WorkflowExecutionUpdateAdmitted { update_id, .. } => {
                         builder.state.admitted_updates.insert(update_id.clone());
+                        builder
+                            .state
+                            .history_admitted_updates
+                            .insert(update_id.clone());
                     }
                     // A reapplied signal counts, and is never refused for the
                     // count: v1.31.0's reapply adds it without `ValidateSignal`
@@ -4730,7 +4757,11 @@ impl BasicKernel {
                 // (awaiting re-acceptance by the successor's worker), not accepted
                 // — reconstruct that registry entry on cold replay so recovery
                 // re-delivers it (mirrors the accepted arm above for pending).
+                // Its event delivers it, so it stays in flight with no request
+                // held for it, as v1.31.0's rebuilt registry keeps it
+                // (`update/registry.go:189-204 @ v1.31.0`).
                 state.admitted_updates.insert(update_id.clone());
+                state.history_admitted_updates.insert(update_id.clone());
             }
             HistoryEventKind::WorkflowPropertiesModified { patch, .. } => {
                 apply_memo_patch(&mut state.memo, patch);
@@ -6923,8 +6954,49 @@ struct TransitionBuilder {
     allocation_error: Option<Reject>,
 }
 
-/// A run's updates in flight, accepted or held, and completed, for the total
-/// limit's check when a completion re-admits an update.
+/// Forget the run's lost updates before the kernel applies its next command:
+/// the admitted, unaccepted updates whose requests `held` says the owner no
+/// longer holds, and that no WorkflowExecutionUpdateAdmitted event records.
+///
+/// A restart, or a move of the run to another node, loses the requests of the
+/// updates the run admitted, while their ids stay in this state. v1.31.0 keeps
+/// such an update only in memory and forgets it when it reloads the run
+/// (`NewRegistry`, `service/history/workflow/update/registry.go:168-224 @
+/// v1.31.0`), so a client's retry is admitted as a new update. The runtime
+/// calls this on the state it loaded, with its view of the requests it holds,
+/// immediately before the kernel applies a command, so the change lands in
+/// that command's transition and records no event. A request is held from
+/// before its update's admission until the update leaves the admitted set, so
+/// a node that hasn't restarted forgets nothing it could still deliver.
+///
+/// A speculative workflow task that no worker has started and that has no
+/// update left to carry goes too: v1.31.0 keeps speculative tasks only in
+/// memory, so a reload drops it (`updateworkflow/api.go:216-251 @ v1.31.0`).
+/// A started one stays for its worker's completion.
+pub fn forget_lost_updates(state: &mut WorkflowState, held: impl Fn(&str) -> bool) {
+    let history_admitted = &state.history_admitted_updates;
+    state
+        .admitted_updates
+        .retain(|update_id| history_admitted.contains(update_id) || held(update_id));
+    let idle_speculative = state.pending_workflow_task.as_ref().is_some_and(|task| {
+        task.task_type == WorkflowTaskType::Speculative && task.started_event_id.is_none()
+    });
+    if idle_speculative && !state.has_admitted_update_to_send() {
+        state.pending_workflow_task = None;
+    }
+}
+
+/// Keep the history-admitted set within the admitted ids, which an update
+/// leaves when the worker accepts or rejects it or the run closes.
+fn keep_history_admitted_within_admitted(state: &mut WorkflowState) {
+    let admitted = &state.admitted_updates;
+    state
+        .history_admitted_updates
+        .retain(|update_id| admitted.contains(update_id));
+}
+
+/// A run's updates in flight, admitted or accepted, and completed, for the
+/// total limit's check when a completion re-admits an update.
 #[derive(Clone, Copy, Debug, Default)]
 struct UpdateSlots {
     in_flight: usize,
@@ -6932,12 +7004,13 @@ struct UpdateSlots {
 }
 
 impl UpdateSlots {
-    /// The slots a completion starts from. `held_updates` is the lane's count
-    /// of the admitted updates whose requests the owner holds; unheld ones
-    /// don't count, as v1.31.0 forgets them on reload.
-    fn at_completion(state: &WorkflowState, held_updates: usize) -> Self {
+    /// The slots a completion starts from. The runtime forgot the run's lost
+    /// updates before the completion, so its admitted updates are the ones
+    /// v1.31.0 still holds after a reload (`update/registry.go:189-204 @
+    /// v1.31.0`).
+    fn at_completion(state: &WorkflowState) -> Self {
         Self {
-            in_flight: held_updates.saturating_add(state.pending_updates.len()),
+            in_flight: state.admitted_updates.len() + state.pending_updates.len(),
             completed: state.completed_update_count as usize,
         }
     }
@@ -7947,6 +8020,9 @@ impl TransitionBuilder {
     /// buffered event limits instead.
     fn finish_without_buffered_limits(mut self) -> Transition {
         debug_assert!(self.allocation_error.is_none());
+        // Accepting, rejecting or closing removes an id from the admitted set
+        // at many sites; this one step keeps the history-admitted set with it.
+        keep_history_admitted_within_admitted(&mut self.state);
         self.state.transition_seq = self.state.transition_seq.next();
         debug_assert_eq!(self.history_events.len(), self.event_principals.len());
         let events_numbered_at_close = self

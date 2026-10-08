@@ -729,16 +729,19 @@ pub struct UpdateRequest {
     /// which the edge measured (criterion 2.11).
     #[serde(default)]
     pub request_bytes: u64,
-    /// How many of the run's admitted, unaccepted updates the owner's update
-    /// registry holds requests for, this update aside. Set by the lane from
-    /// the state it loaded, immediately before the kernel applies the command;
-    /// a value set by the caller is overwritten (criterion 2.9).
-    #[serde(default)]
-    pub held_updates: usize,
-    /// The request sizes of those held updates. Set by the lane with
-    /// [`Self::held_updates`] (criterion 2.11).
+    /// The request sizes of the run's admitted, unaccepted updates whose
+    /// requests the owner's update registry holds, this update aside. Set by
+    /// the lane from the state it loaded, immediately before the kernel
+    /// applies the command; a value set by the caller is overwritten.
     #[serde(default)]
     pub in_flight_request_bytes: u64,
+    /// Whether the runtime found the id admitted with no request held for it,
+    /// a restart having lost the request: the kernel then admits this update
+    /// as a new one, as v1.31.0 admits a retry after a reload
+    /// ([`crate::forget_lost_updates`]). Without it, an admitted id is a
+    /// duplicate.
+    #[serde(default)]
+    pub readmit: bool,
 }
 
 /// Identity of an external workflow that initiated a
@@ -1587,14 +1590,6 @@ pub struct WorkflowTaskCompletedRequest {
     /// @ v1.31.0; spec speculative-wft Req 9).
     #[serde(default)]
     pub delivered_update_ids: Vec<String>,
-    /// How many of the run's admitted, unaccepted updates the owner's update
-    /// registry holds requests for. Set by the lane from the state it loaded,
-    /// immediately before the kernel applies the completion; a value set by
-    /// the caller is overwritten. The total limit's check when the worker
-    /// accepts or rejects an update the run doesn't hold reads it
-    /// (`signal-update-limits` criteria 2.9, 2.13).
-    #[serde(default)]
-    pub held_updates: usize,
     /// Authenticated request context for worker-authored event attribution.
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.

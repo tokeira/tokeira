@@ -4,8 +4,8 @@
 //! request the run already applied succeeds, whether the run is closed,
 //! closing or at the signal limit, except SignalWithStart's, whose count and
 //! closing come first. A signal to another workflow resolves its sender with
-//! v1.31.0's cause. Updates count in flight only while the runtime holds their
-//! requests, and the total limit also refuses a worker's re-admission of an
+//! v1.31.0's cause. The updates whose requests a restart lost stop counting in
+//! flight, and the total limit also refuses a worker's re-admission of an
 //! update the run doesn't hold.
 // Integration test: unwrap is idiomatic in test code (root AGENTS.md §1).
 #![allow(clippy::unwrap_used)]
@@ -256,7 +256,6 @@ fn completion(
         force_new_workflow_task: false,
         limits: Default::default(),
         delivered_update_ids: Vec::new(),
-        held_updates: 0,
         request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         now: OffsetDateTime::now_utc(),
         command_sizes: Vec::new(),

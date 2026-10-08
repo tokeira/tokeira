@@ -102,6 +102,7 @@ fn open_state(signal_count: u64) -> WorkflowState {
         pending_external_cancels: BTreeMap::new(),
         pending_updates: BTreeMap::new(),
         admitted_updates: HashSet::new(),
+        history_admitted_updates: Default::default(),
         pending_nexus_operations: BTreeMap::new(),
         completion_callbacks: Vec::new(),
         user_metadata: None,
@@ -231,12 +232,10 @@ fn start_task(state: &WorkflowState, index: usize) -> Transition {
         .unwrap()
 }
 
-/// A completion of the run's started workflow task, with `held_updates` as the
-/// lane would report them.
+/// A completion of the run's started workflow task.
 fn completion(
     state: &WorkflowState,
     commands: Vec<WorkflowCommand>,
-    held_updates: usize,
     total_updates: usize,
 ) -> Command {
     let pending = state.pending_workflow_task.as_ref().unwrap();
@@ -265,7 +264,6 @@ fn completion(
             ..WorkflowTaskCompletionLimits::default()
         },
         delivered_update_ids: Vec::new(),
-        held_updates,
         request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         now: now(),
     })
@@ -274,7 +272,6 @@ fn completion(
 fn update_command(
     update_id: &str,
     limits: UpdateLimits,
-    held_updates: usize,
     in_flight_request_bytes: u64,
     request_bytes: u64,
 ) -> Command {
@@ -286,8 +283,8 @@ fn update_command(
         now: now(),
         limits,
         request_bytes,
-        held_updates,
         in_flight_request_bytes,
+        readmit: false,
     })
 }
 
@@ -375,7 +372,7 @@ proptest! {
                 (2, Some(task)) if task.started_event_id.is_some() => BasicKernel
                     .apply(
                         LoadedRun::Existing(state.clone()),
-                        completion(&state, Vec::new(), 0, 0),
+                        completion(&state, Vec::new(), 0),
                     )
                     .unwrap(),
                 _ => continue,
@@ -426,8 +423,8 @@ proptest! {
     #[test]
     fn update_admission_matches_v1_31_0(
         accepted_updates in 0usize..14,
-        held_updates in 0usize..14,
-        unheld_updates in 0usize..14,
+        admitted_updates in 0usize..14,
+        history_admitted in 0usize..14,
         completed in 0u32..2_100,
         in_flight_request_bytes in 0u64..(24 << 20),
         request_bytes in 0u64..(5 << 20),
@@ -445,24 +442,29 @@ proptest! {
                 PendingUpdate { update_id, accepted_event_id: 3, name: "handler".into() },
             );
         }
-        // Admitted ids the lane reports held, and ones whose requests a restart
-        // lost; only the held count reaches the kernel.
-        for index in 0..held_updates + unheld_updates {
-            state.admitted_updates.insert(format!("admitted-{index}"));
+        // The run's admitted updates, as the runtime leaves them before the
+        // command: those whose requests it holds, and those an event delivers,
+        // which count alike (`admitted-updates-after-restart`).
+        for index in 0..admitted_updates {
+            let update_id = format!("admitted-{index}");
+            if index < history_admitted {
+                state.history_admitted_updates.insert(update_id.clone());
+            }
+            state.admitted_updates.insert(update_id);
         }
         // Each limit is disabled, or near the figure it bounds, so that each
         // check is tried on both sides of its boundary.
-        let in_flight = held_updates + accepted_updates;
+        let in_flight = admitted_updates + accepted_updates;
         let limits = UpdateLimits {
             in_flight: limit_near(in_flight as u64, in_flight_offset),
             in_flight_payloads: limit_near(in_flight_request_bytes + request_bytes, payload_offset),
             total: limit_near(in_flight as u64 + u64::from(completed), total_offset),
         };
         let update_id = if duplicate { "admitted-0" } else { "new" };
-        let duplicate = duplicate && held_updates + unheld_updates > 0;
+        let duplicate = duplicate && admitted_updates > 0;
         let result = BasicKernel.apply(
             LoadedRun::Existing(state),
-            update_command(update_id, limits, held_updates, in_flight_request_bytes, request_bytes),
+            update_command(update_id, limits, in_flight_request_bytes, request_bytes),
         );
         let expected = if duplicate {
             None
@@ -507,7 +509,7 @@ proptest! {
         history.extend(started.history_events.iter().cloned());
         state = started.next_state;
         let completed_task = BasicKernel
-            .apply(LoadedRun::Existing(state.clone()), completion(&state, Vec::new(), 0, 0))
+            .apply(LoadedRun::Existing(state.clone()), completion(&state, Vec::new(), 0))
             .unwrap();
         history.extend(completed_task.history_events.iter().cloned());
         state = completed_task.next_state;
@@ -516,7 +518,7 @@ proptest! {
         for (index, outcome) in rounds.into_iter().enumerate() {
             let update_id = format!("update-{index}");
             let admitted = BasicKernel
-                .apply(LoadedRun::Existing(state.clone()), update_command(&update_id, disabled, 0, 0, 0))
+                .apply(LoadedRun::Existing(state.clone()), update_command(&update_id, disabled, 0, 0))
                 .unwrap();
             history.extend(admitted.history_events.iter().cloned());
             state = admitted.next_state;
@@ -541,7 +543,7 @@ proptest! {
                 })],
             };
             let finished = BasicKernel
-                .apply(LoadedRun::Existing(state.clone()), completion(&state, commands, 0, 0))
+                .apply(LoadedRun::Existing(state.clone()), completion(&state, commands, 0))
                 .unwrap();
             history.extend(finished.history_events.iter().cloned());
             state = finished.next_state;
@@ -559,7 +561,7 @@ proptest! {
     #[test]
     fn resurrection_respects_the_total_limit(
         accepted_updates in 0usize..6,
-        held_updates in 0usize..6,
+        admitted_updates in 0usize..6,
         completed in 0u32..8,
         total_limit in prop_oneof![Just(0usize), 1usize..20],
         kind in 0u8..4,
@@ -586,10 +588,13 @@ proptest! {
                 failure: None,
             },
         };
-        let command = completion(&state, vec![message(0, body)], held_updates, total_limit);
+        for index in 0..admitted_updates {
+            state.admitted_updates.insert(format!("admitted-{index}"));
+        }
+        let command = completion(&state, vec![message(0, body)], total_limit);
         let result = BasicKernel.apply(LoadedRun::Existing(state), command);
         let at_total = total_limit > 0
-            && held_updates + accepted_updates + completed as usize >= total_limit;
+            && admitted_updates + accepted_updates + completed as usize >= total_limit;
         if at_total {
             prop_assert_eq!(update_refusal(result), Some(UpdateLimit::Total));
         } else {
@@ -616,13 +621,13 @@ fn each_resurrection_counts_toward_the_next() {
     ];
     let refused = BasicKernel.apply(
         LoadedRun::Existing(state.clone()),
-        completion(&state, commands.clone(), 0, 1),
+        completion(&state, commands.clone(), 1),
     );
     assert_eq!(update_refusal(refused), Some(UpdateLimit::Total));
     let admitted = BasicKernel
         .apply(
             LoadedRun::Existing(state.clone()),
-            completion(&state, commands, 0, 2),
+            completion(&state, commands, 2),
         )
         .unwrap();
     assert_eq!(admitted.next_state.pending_updates.len(), 2);

@@ -106,6 +106,7 @@ fn open_state() -> WorkflowState {
         pending_external_cancels: BTreeMap::new(),
         pending_updates: BTreeMap::new(),
         admitted_updates: HashSet::new(),
+        history_admitted_updates: Default::default(),
         pending_nexus_operations: BTreeMap::new(),
         completion_callbacks: Vec::new(),
         user_metadata: None,
@@ -212,7 +213,6 @@ fn completion(state: &WorkflowState, commands: Vec<WorkflowCommand>) -> Command 
         force_new_workflow_task: false,
         limits: WorkflowTaskCompletionLimits::default(),
         delivered_update_ids: Vec::new(),
-        held_updates: 0,
         request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         now: now(),
     })

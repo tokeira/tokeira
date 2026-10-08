@@ -561,6 +561,7 @@ mod tests {
             pending_external_cancels: Default::default(),
             pending_updates: Default::default(),
             admitted_updates: Default::default(),
+            history_admitted_updates: Default::default(),
             pending_nexus_operations: Default::default(),
             versioning_info: None,
             worker_deployment_name: None,

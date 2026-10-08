@@ -524,6 +524,7 @@ fn sample_state(run_key: RunKey) -> WorkflowState {
         pending_external_cancels: Default::default(),
         pending_updates: Default::default(),
         admitted_updates: Default::default(),
+        history_admitted_updates: Default::default(),
         pending_nexus_operations: Default::default(),
         completion_callbacks: Vec::new(),
         user_metadata: None,

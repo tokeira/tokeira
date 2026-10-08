@@ -44,6 +44,9 @@
 //! signals, which is how every release before the count behaves.
 //! Section [`USED_WORKER_DEPLOYMENT_VERSIONS_SECTION`] is a frozen postcard
 //! `Vec<String>`: presence (including an empty vector) records accumulator readiness.
+//! Section [`HISTORY_ADMITTED_UPDATES_SECTION`] holds the admitted updates a
+//! WorkflowExecutionUpdateAdmitted event records. A reader without it treats the run
+//! as holding none, which is how every release before the set behaves.
 //!
 //! [`history_batch_encoded_len`] is the one definition of a batch's persisted size.
 //! The DSQL repository and the in-memory store both account the per-run History Size
@@ -82,6 +85,12 @@ pub const SIGNAL_COUNT_SECTION: u32 = 2;
 /// Frozen postcard `Vec<String>` payload for the run's projection accumulator.
 /// Presence distinguishes ready empty from legacy state needing load-time seeding.
 pub const USED_WORKER_DEPLOYMENT_VERSIONS_SECTION: u32 = 3;
+
+/// State-extension tag of the section holding the run's history-admitted updates,
+/// a postcard `Vec<String>` of update ids in ascending order. This layout is frozen.
+/// Written only when the run holds such an update, so any other state encodes as it
+/// did before the set existed.
+pub const HISTORY_ADMITTED_UPDATES_SECTION: u32 = 4;
 
 /// One tagged section of an extension. The payload layout is fixed per tag.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +252,14 @@ pub(crate) fn encode_state_extension(state: &WorkflowState) -> postcard::Result<
             payload: postcard::to_allocvec(versions)?,
         });
     }
+    if !state.history_admitted_updates.is_empty() {
+        // A `BTreeSet` iterates in ascending order, the payload's frozen order.
+        let update_ids = state.history_admitted_updates.iter().collect::<Vec<_>>();
+        sections.push(ExtensionSection {
+            tag: HISTORY_ADMITTED_UPDATES_SECTION,
+            payload: postcard::to_allocvec(&update_ids)?,
+        });
+    }
     encode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, &sections)
 }
 
@@ -268,10 +285,32 @@ pub(crate) fn apply_state_extension(
                 state.signal_count = decode_exact::<u64>(&section.payload)
                     .ok_or("undecodable signal count section")?;
             }
+            HISTORY_ADMITTED_UPDATES_SECTION => {
+                apply_history_admitted_updates_section(state, &section.payload)?;
+            }
             // A later release's section: its data is safe to drop by rule.
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// Apply the [`HISTORY_ADMITTED_UPDATES_SECTION`] payload to the state it belongs to.
+fn apply_history_admitted_updates_section(
+    state: &mut WorkflowState,
+    payload: &[u8],
+) -> std::result::Result<(), &'static str> {
+    let update_ids = decode_exact::<Vec<String>>(payload)
+        .ok_or("undecodable history-admitted updates section")?;
+    if !update_ids.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err("history-admitted updates out of order or listed twice");
+    }
+    // An id the state doesn't hold as admitted is skipped; the writer never
+    // lists one, since every transition keeps the set within the admitted ids.
+    state.history_admitted_updates = update_ids
+        .into_iter()
+        .filter(|update_id| state.admitted_updates.contains(update_id))
+        .collect();
     Ok(())
 }
 
@@ -655,6 +694,7 @@ mod tests {
             pending_external_cancels: Default::default(),
             pending_updates: Default::default(),
             admitted_updates: Default::default(),
+            history_admitted_updates: Default::default(),
             pending_nexus_operations: Default::default(),
             versioning_info: None,
             worker_deployment_name: None,
@@ -997,6 +1037,107 @@ mod tests {
         }
     }
 
+    fn update_ids(ids: &[&str]) -> Vec<u8> {
+        postcard::to_allocvec(&ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>())
+            .expect("encodes")
+    }
+
+    #[test]
+    fn history_admitted_updates_follow_the_signal_count() {
+        let mut state = layout_state();
+        state.signal_count = 3;
+        state.admitted_updates = ["update-b", "update-a", "held"].map(String::from).into();
+        state.history_admitted_updates = ["update-b", "update-a"].map(String::from).into();
+        let encoded = encode_workflow_state(&state).expect("encodes");
+        // The state's own bytes are unchanged; the ids follow the count in
+        // ascending order, as a postcard Vec<String>.
+        let positional = released_encoding(&state);
+        assert_eq!(&encoded[..positional.len()], positional.as_slice());
+        let extension = encode_extension(
+            WORKFLOW_STATE_EXTENSION_MAGIC,
+            &[
+                ExtensionSection {
+                    tag: SIGNAL_COUNT_SECTION,
+                    payload: postcard::to_allocvec(&3u64).expect("encodes"),
+                },
+                ExtensionSection {
+                    tag: HISTORY_ADMITTED_UPDATES_SECTION,
+                    payload: update_ids(&["update-a", "update-b"]),
+                },
+            ],
+        )
+        .expect("encodes");
+        assert_eq!(&encoded[positional.len()..], extension.as_slice());
+        assert_eq!(
+            decode_workflow_state(run_key(), &encoded).expect("decodes"),
+            state
+        );
+    }
+
+    #[test]
+    fn a_state_stored_without_history_admitted_updates_holds_none() {
+        let mut state = layout_state();
+        state.admitted_updates = ["reapplied"].map(String::from).into();
+        state.history_admitted_updates = ["reapplied"].map(String::from).into();
+        let decoded =
+            decode_workflow_state(run_key(), &released_encoding(&state)).expect("decodes");
+        assert!(decoded.history_admitted_updates.is_empty());
+        assert_eq!(decoded.admitted_updates, state.admitted_updates);
+    }
+
+    #[test]
+    fn a_history_admitted_update_the_state_does_not_hold_is_skipped() {
+        let mut state = layout_state();
+        state.admitted_updates = ["held"].map(String::from).into();
+        let extension = encode_extension(
+            WORKFLOW_STATE_EXTENSION_MAGIC,
+            &[ExtensionSection {
+                tag: HISTORY_ADMITTED_UPDATES_SECTION,
+                payload: update_ids(&["ghost", "held"]),
+            }],
+        )
+        .expect("encodes");
+        let decoded =
+            decode_workflow_state(run_key(), &with_extension(&state, &extension)).expect("decodes");
+        assert_eq!(
+            decoded.history_admitted_updates,
+            ["held"].map(String::from).into()
+        );
+    }
+
+    #[test]
+    fn malformed_history_admitted_updates_are_refused() {
+        for (payload, defect) in [
+            (
+                vec![0xff; 3],
+                "undecodable history-admitted updates section",
+            ),
+            (
+                update_ids(&["update-b", "update-a"]),
+                "history-admitted updates out of order or listed twice",
+            ),
+            (
+                update_ids(&["update-a", "update-a"]),
+                "history-admitted updates out of order or listed twice",
+            ),
+        ] {
+            let extension = encode_extension(
+                WORKFLOW_STATE_EXTENSION_MAGIC,
+                &[ExtensionSection {
+                    tag: HISTORY_ADMITTED_UPDATES_SECTION,
+                    payload,
+                }],
+            )
+            .expect("encodes");
+            let error =
+                decode_workflow_state(run_key(), &with_extension(&layout_state(), &extension))
+                    .expect_err("a malformed section is refused")
+                    .downcast::<StateExtensionError>()
+                    .expect("an extension error");
+            assert_eq!(error.defect, defect);
+        }
+    }
+
     #[test]
     fn malformed_extension_error_names_the_blob_and_run() {
         let error =
@@ -1051,6 +1192,36 @@ mod tests {
             prop_assert_eq!(released_decode(&encoded), without_count);
         }
 
+        // Feature: admitted-updates-after-restart, Property 5: History admission is stored
+        #[test]
+        fn property_history_admission_is_stored(
+            state in arb_state(),
+            held in proptest::collection::btree_set("[a-z]{1,6}", 0..4),
+            history in proptest::collection::btree_set("[A-Z]{1,6}", 0..4),
+        ) {
+            let mut state = state;
+            state.admitted_updates = held.iter().chain(&history).cloned().collect();
+            state.history_admitted_updates = history.clone();
+            let encoded = encode_workflow_state(&state).expect("encodes");
+            prop_assert_eq!(
+                decode_workflow_state(run_key(), &encoded).expect("decodes"),
+                state.clone()
+            );
+            // The section is written exactly when the run holds such an update,
+            // so any other state encodes as before the set existed.
+            let extension = &encoded[released_encoding(&state).len()..];
+            let written = !extension.is_empty()
+                && decode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, extension)
+                    .expect("frames")
+                    .iter()
+                    .any(|section| section.tag == HISTORY_ADMITTED_UPDATES_SECTION);
+            prop_assert_eq!(written, !history.is_empty());
+            // A reader without the section sees the run holding none.
+            let mut without = without_times(state);
+            without.history_admitted_updates.clear();
+            prop_assert_eq!(released_decode(&encoded), without);
+        }
+
         // Feature: activity-heartbeat-time, Property 4: Malformed extensions are
         // rejected
         #[test]
@@ -1072,9 +1243,9 @@ mod tests {
         #[test]
         fn property_unknown_sections_and_activities_are_ignored(
             state in arb_state(),
-            // Tags 1 to 3 are known; anything above is a later release's.
+            // Tags 1 to 4 are known; anything above is a later release's.
             unknown in proptest::collection::btree_map(
-                4u32..64,
+                5u32..64,
                 proptest::collection::vec(any::<u8>(), 0..16),
                 0..3,
             ),

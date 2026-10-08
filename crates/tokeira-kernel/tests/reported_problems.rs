@@ -89,6 +89,7 @@ fn open_state() -> WorkflowState {
         pending_external_cancels: BTreeMap::new(),
         pending_updates: BTreeMap::new(),
         admitted_updates: std::collections::HashSet::new(),
+        history_admitted_updates: Default::default(),
         pending_nexus_operations: BTreeMap::new(),
         completion_callbacks: Vec::new(),
         user_metadata: None,
@@ -453,7 +454,6 @@ fn completion_clears_count_and_recorded_problem() {
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
-                held_updates: 0,
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),

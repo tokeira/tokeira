@@ -103,14 +103,16 @@ _For any_ reset and the commands after it, a run's history-admitted updates SHAL
 ### Forgetting lost updates (`crates/tokeira-kernel`, `crates/tokeira-runtime/src/lane.rs`)
 
 - The kernel exposes `forget_lost_updates(state: &mut WorkflowState, held: impl Fn(&str) -> bool)`. It removes from `admitted_updates` each id that isn't history-admitted and for which `held` is false. If the pending workflow task is speculative, unstarted, and no admitted id outside the history-admitted set remains, it removes the task too. It records no event; the change reaches storage in the transition of the command applied next.
-- Immediately before `kernel.apply`, the lane calls it on the state it loaded, with `held` asking the `UpdateRegistry` for an entry. This replaces the held-update count `with_held_updates` sets today. The lane still sets `in_flight_request_bytes`, the held requests' sizes, on an update command.
+- Immediately before `kernel.apply`, the lane (`reconcile_held_updates`) calls it on the state it loaded, with `held` asking the `UpdateRegistry` for an entry, and sets `in_flight_request_bytes`, the held requests' sizes, on an update command.
 - An admitted id with an entry is never lost: a request's entry is created before its admission, and is removed only once the update leaves `admitted_updates`. So in a process that hasn't restarted, nothing is forgotten (3.1).
+- The one exception is an update the worker rejects in a completion. The completion claims its entry before it commits, so the forget drops it first, and the kernel then takes the rejection as one of an update the run doesn't hold, at the total limit's check, which the update's own admission already met. The outcome is the same.
 
 ### Re-admitting a retry (`crates/tokeira-runtime/src/runtime/query.rs`, `crates/tokeira-kernel`)
 
 - `update_workflow`'s dedupe treats an id that the state holds as admitted, not history-admitted, with no entry in the registry, as lost. It registers the retry's request and submits the update command with `readmit: true`.
 - `apply_update` admits an update with `readmit` whose id is admitted and not history-admitted as a new one. It checks the limits with the update itself left out, and schedules a workflow task when none is pending. Any other update for an admitted id is still `DuplicateUpdateId`.
 - By the time the command reaches the lane, its own entry exists, so the forget keeps the id, and the re-admission takes it over.
+- A lookup of a lost id finds no update, so PollWorkflowExecutionUpdate answers NotFound for it, as v1.31.0's lookup does after a reload (`registry.go:461-480 @ v1.31.0`).
 
 ### Follow-up tasks and counting (`crates/tokeira-kernel/src/kernel.rs`)
 
@@ -136,7 +138,7 @@ _For any_ reset and the commands after it, a run's history-admitted updates SHAL
   - no forget;
   - the forget dropping history-admitted updates;
   - a started speculative task dropped;
-  - a retry without `readmit`;
+  - a retry without `readmit`, in the kernel; sent so by the runtime, it changes nothing a client sees, since the run answers a duplicate and the task already pending delivers the retry's own request;
   - a follow-up scheduled for history-admitted updates;
   - the count leaving out history-admitted updates;
   - the section unwritten, or written for an empty set.
@@ -154,6 +156,7 @@ _For any_ reset and the commands after it, a run's history-admitted updates SHAL
 - The four exploratory cases, kept as regression tests.
 - A reset run's history-admitted updates after a reload.
 - `forget_lost_updates` on a run with a started speculative task, which it keeps.
+- A worker polling the speculative task that recovery republished for a lost update: the forget drops it, and the public poll path discards the start the run refuses.
 
 ### Preservation Checking
 

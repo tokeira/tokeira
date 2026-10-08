@@ -2565,7 +2565,6 @@ pub(crate) mod tests {
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
-            held_updates: 0,
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
             command_sizes: Vec::new(),

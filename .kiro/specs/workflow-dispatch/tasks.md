@@ -274,6 +274,14 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
   - [ ] 11.1 Remove workflow writes, grace demotion, and regular draining together
     - In `backlog.rs`, broker, publisher, and runtime wiring, remove only workflow
       backlog paths after the replacement discovery/recovery paths are connected.
+    - Before enabling repair by default, handle legacy reset successors whose hot
+      row and timers remain on the run-key shard after a stop before their first
+      commit. Preserve eventual execution-home recovery; skipping such a row alone
+      is insufficient. This placement issue blocks cutover until covered by a
+      stopped-upgrade regression on both stores (see the design).
+    - Align outer runtime admission and task-token epoch lookup with execution
+      home, then verify a public start and delivery when only that home is held
+      and its run-key hash selects another shard.
     - Preserve activity backlog, its shared loops, `activity_dispatch`, and
       `reconcile_due_activity_dispatches_once`. Add no mixed-release branch or
       durable workflow delivery checkpoint.

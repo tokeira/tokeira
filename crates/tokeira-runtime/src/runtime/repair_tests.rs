@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Point {
+    Load,
     Candidates,
     Repair,
     Home,
@@ -32,6 +33,7 @@ struct Repo {
     fail: Mutex<Option<Point>>,
     conflicts: AtomicUsize,
     repair_attempts: AtomicUsize,
+    loads: AtomicUsize,
     pause: Mutex<Option<Pause>>,
 }
 
@@ -336,6 +338,8 @@ impl RunRepository for Repo {
     }
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        self.hit(Point::Load).await?;
         self.inner.load_run(run_key).await
     }
 
@@ -601,5 +605,329 @@ impl RunRepository for Repo {
 
     async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
         self.inner.delete_due_timer_if_matches(timer).await
+    }
+}
+
+fn timeout_runtime(repo: Arc<Repo>, home: ShardId) -> Arc<TokeiraRuntime<Repo>> {
+    let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
+        repo,
+        1,
+        LaneConfig::default(),
+        TimerScannerConfig {
+            scan_interval: std::time::Duration::from_secs(86400),
+            ..Default::default()
+        },
+        WorkflowTimeoutScannerConfig {
+            scan_interval: std::time::Duration::from_secs(86400),
+            ..Default::default()
+        },
+        BacklogConfig::default(),
+        ActivityTimeoutScannerConfig::default(),
+        NexusTimeoutScannerConfig::default(),
+        NexusEndpointRegistry::default(),
+        Arc::new(NoopNexusHttpClient),
+        NexusCompletionDeps::default(),
+        8,
+        "timeout-home-test".into(),
+        "127.0.0.1:0".into(),
+        false,
+        None,
+    ));
+    {
+        let mut owner = runtime.shard_owner.write().unwrap();
+        owner.enable_reconciliation();
+        owner.record_acquired(home, ShardEpoch::ZERO);
+        owner.mark_active(home);
+    }
+    runtime
+}
+
+fn timeout_start() -> (StartRequest, ShardId) {
+    let mut request =
+        super::tests::sample_start_request(Some(Duration::hours(1)), Some(Duration::seconds(2)));
+    request.namespace_id = NamespaceId(uuid::Uuid::from_u128(1));
+    let home = execution_home_bundle(
+        request.namespace_id.0.as_bytes(),
+        request.workflow_id.0.as_bytes(),
+        8,
+    );
+    request.run_key = (1..100)
+        .map(|i| RunKey(uuid::Uuid::from_u128(i)))
+        .find(|key| crate::shard::shard_for(*key, 8) != home)
+        .unwrap();
+    (request, home)
+}
+
+async fn expire_tracked_run(runtime: &TokeiraRuntime<Repo>, run_key: RunKey, home: ShardId) {
+    let entry = runtime
+        .workflow_timeout_tracking
+        .snapshot_for_shard(home)
+        .into_iter()
+        .find(|entry| entry.run_key == run_key)
+        .expect("every committed successor must have its own timeout");
+    let now = entry.started_at
+        + entry.workflow_start_delay.unwrap_or(Duration::ZERO)
+        + entry.workflow_run_timeout.unwrap()
+        + Duration::milliseconds(1);
+    crate::timeout::scan_workflow_timeouts_once(
+        &runtime.workflow_timeout_tracking,
+        Some(home),
+        &WorkflowTimeoutScannerConfig::default(),
+        now,
+        |entry, violation, now| {
+            crate::timeout::submit_workflow_timeout(
+                runtime.repo.clone(),
+                runtime.lanes.clone(),
+                runtime.lanes.len(),
+                entry,
+                violation,
+                now,
+            )
+        },
+    )
+    .await;
+    let LoadedRun::Existing(state) = runtime.repo.load_run(run_key).await.unwrap() else {
+        panic!("expired run disappeared")
+    };
+    assert_eq!(state.status, ExecutionStatus::TimedOut);
+    assert!(
+        runtime
+            .repo
+            .read_history(run_key, 0, 128)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| {
+                matches!(
+                    event.kind,
+                    HistoryEventKind::WorkflowExecutionTimedOut {
+                        timeout_type: WorkflowTimeoutType::RunTimeout,
+                        ..
+                    }
+                )
+            })
+    );
+}
+
+#[tokio::test]
+async fn timeout_retry_and_cron_successors_time_out_without_reacquisition() {
+    for cron in [false, true] {
+        let repo = Arc::new(Repo {
+            inner: InMemoryStore::with_shard_count(8),
+            ..Default::default()
+        });
+        let (mut request, home) = timeout_start();
+        if cron {
+            request.cron_schedule = Some("* * * * *".into());
+        } else {
+            request.retry_policy = Some(RetryPolicy {
+                initial_interval: Duration::seconds(1),
+                backoff_coefficient: 2.0,
+                maximum_interval: None,
+                maximum_attempts: 2,
+                non_retryable_error_types: Vec::new(),
+            });
+        }
+        let execution = ExecutionRef {
+            namespace_id: request.namespace_id,
+            workflow_id: request.workflow_id.clone(),
+            run_id: None,
+        };
+        let first = request.run_key;
+        let runtime = timeout_runtime(repo.clone(), home);
+        assert!(matches!(
+            runtime.lanes[0]
+                .submit(first, Command::Start(request))
+                .await
+                .unwrap(),
+            CommitResult::Applied { .. }
+        ));
+        expire_tracked_run(&runtime, first, home).await;
+        let successor = repo.resolve_execution(&execution).await.unwrap().unwrap();
+        assert_ne!(successor, first);
+        let LoadedRun::Existing(state) = repo.load_run(successor).await.unwrap() else {
+            panic!("successor missing")
+        };
+        assert_eq!(state.status, ExecutionStatus::Running);
+        assert_eq!(state.attempt, if cron { 1 } else { 2 });
+        assert_eq!(runtime.active_shards(), vec![home]);
+        expire_tracked_run(&runtime, successor, home).await;
+        stop(&runtime).await;
+    }
+}
+
+#[tokio::test]
+async fn start_deadlines_survive_lost_reply_and_unrelated_home_reacquisition() {
+    for variant in 0..3 {
+        let repo = Arc::new(Repo {
+            inner: InMemoryStore::with_shard_count(8),
+            ..Default::default()
+        });
+        let (request, home) = timeout_start();
+        let key = request.run_key;
+        let run_hash_home = crate::shard::shard_for(key, 8);
+        assert_ne!(home, run_hash_home);
+        let runtime = timeout_runtime(repo.clone(), home);
+        let (committing, resume) = repo.pause(Point::Commit);
+        let lane = runtime.lanes[0].clone();
+        let command = match variant {
+            0 => Command::Start(request.clone()),
+            1 => Command::StartAndUpdate(StartAndUpdateRequest {
+                start: request.clone(),
+                update_id: "folded".into(),
+            }),
+            _ => Command::SignalWithStart(signal_start(request.clone())),
+        };
+        let caller = tokio::spawn(async move { lane.submit(key, command).await });
+        committing.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        resume.send(()).unwrap();
+        runtime.lanes[0]
+            .submit(
+                key,
+                Command::Signal(SignalRequest {
+                    signal_name: "after-start".into(),
+                    input: Payloads::default(),
+                    header: None,
+                    links: Vec::new(),
+                    request: RequestContext {
+                        request_id: RequestId("after-start".into()),
+                        ..request.request.clone()
+                    },
+                    now: request.now,
+                }),
+            )
+            .await
+            .unwrap();
+        let before = runtime.workflow_timeout_tracking.snapshot();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].run_key, key);
+        assert_eq!(before[0].shard_id, home);
+        assert_eq!(before[0].started_at, request.now);
+        for _ in 0..2 {
+            runtime
+                .recover_self_assigned_shard(run_hash_home, ShardEpoch::ZERO)
+                .await
+                .unwrap();
+            assert_eq!(runtime.workflow_timeout_tracking.snapshot(), before);
+        }
+        stop(&runtime).await;
+    }
+}
+
+#[tokio::test]
+async fn dispatch_batch_uses_committed_home_without_loading_run() {
+    let repo = Arc::new(Repo::default());
+    *repo.fail.lock().unwrap() = Some(Point::Load);
+    let (request, home) = timeout_start();
+    let runtime = timeout_runtime(repo.clone(), home);
+    let publisher = RuntimeDispatchPublisher::new(
+        runtime.broker.clone(),
+        runtime.activity_broker.clone(),
+        repo.clone(),
+        Arc::new(Mutex::new(runtime.lanes.clone())),
+        runtime.lanes.len(),
+        Arc::new(NoopNexusHttpClient),
+        Arc::new(crate::nexus::NoopNexusCompletionClient),
+        crate::nexus::NexusCompletionRuntimeConfig::default(),
+        NexusEndpointRegistry::default(),
+        crate::nexus::NexusTaskBroker::default(),
+        runtime.nexus_timeout_tracking.clone(),
+        runtime.completion_callback_tracking.clone(),
+        runtime.activity_tracking.clone(),
+        DeliveryMetrics::new(),
+    );
+    let queue = QueueKey {
+        namespace_id: request.namespace_id,
+        task_queue: request.task_queue,
+        task_kind: TaskKind::Activity,
+        deployment: None,
+        build_id: None,
+    };
+    let ops: Vec<_> = (0..32)
+        .map(|n| DispatchOp::EnqueueActivityTask {
+            queue: queue.clone(),
+            activity_id: format!("activity-{n}"),
+            input: Payloads::default(),
+            schedule_event_id: n + 1,
+            attempt: 1,
+            dispatch_revision: 0,
+            stamp: 0,
+            dispatch_at: OffsetDateTime::UNIX_EPOCH,
+            schedule_to_close_timeout: None,
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+            priority: None,
+        })
+        .collect();
+    crate::lane::DispatchPublisher::publish(&publisher, request.run_key, home, &ops)
+        .await
+        .unwrap();
+    assert_eq!(repo.loads.load(Ordering::SeqCst), 0);
+    let entries = runtime.activity_tracking.snapshot();
+    assert_eq!(entries.len(), 32);
+    assert!(entries.iter().all(|entry| entry.shard_id == home));
+    for _ in 0..32 {
+        let task = runtime
+            .activity_broker
+            .poll_activity_task(&queue, std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .expect("one failed tracker read must not truncate the batch");
+        assert_eq!(task.0.run_key, request.run_key);
+    }
+    stop(&runtime).await;
+}
+
+fn signal_start(start: StartRequest) -> SignalWithStartRequest {
+    SignalWithStartRequest {
+        run_key: start.run_key,
+        advice_policy: start.advice_policy,
+        namespace_id: start.namespace_id,
+        workflow_id: start.workflow_id,
+        run_id: start.run_id,
+        workflow_type: start.workflow_type,
+        task_queue: start.task_queue,
+        input: start.input,
+        memo: start.memo,
+        search_attributes: start.search_attributes,
+        workflow_execution_timeout: start.workflow_execution_timeout,
+        workflow_run_timeout: start.workflow_run_timeout,
+        workflow_task_timeout: start.workflow_task_timeout,
+        retry_policy: start.retry_policy,
+        conflict_policy: start.conflict_policy,
+        reuse_policy: start.reuse_policy,
+        header: start.header,
+        deployment: start.deployment,
+        build_id: start.build_id,
+        versioning_override: start.versioning_override,
+        workflow_start_delay: start.workflow_start_delay,
+        user_metadata: start.user_metadata,
+        links: start.links,
+        priority: start.priority,
+        initiator: start.initiator,
+        cron_schedule: start.cron_schedule,
+        attempt: start.attempt,
+        continued_execution_run_id: start.continued_execution_run_id,
+        first_execution_run_id: start.first_execution_run_id,
+        parent_run_key: start.parent_run_key,
+        parent_workflow_id: start.parent_workflow_id,
+        parent_run_id: start.parent_run_id,
+        parent_namespace_id: start.parent_namespace_id,
+        parent_namespace_name: start.parent_namespace_name,
+        parent_initiated_event_id: start.parent_initiated_event_id,
+        root_workflow_id: start.root_workflow_id,
+        root_run_id: start.root_run_id,
+        original_execution_run_id: start.original_execution_run_id,
+        continued_failure: start.continued_failure,
+        last_completion_result: start.last_completion_result,
+        first_run_started_at: start.first_run_started_at,
+        request: start.request,
+        now: start.now,
+        client_cron_schedule: start.client_cron_schedule,
+        signal_name: "signal-at-start".into(),
+        signal_input: Payloads::default(),
     }
 }

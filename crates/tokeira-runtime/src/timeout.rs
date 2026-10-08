@@ -179,12 +179,12 @@ pub(crate) async fn scan_workflow_timeouts_once<F, Fut>(
     tracking: &WorkflowTimeoutTrackingState,
     shard_id: Option<ShardId>,
     config: &WorkflowTimeoutScannerConfig,
+    now: OffsetDateTime,
     mut submit_timeout: F,
 ) where
     F: FnMut(WorkflowTimeoutEntry, WorkflowTimeoutViolation, OffsetDateTime) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let now = OffsetDateTime::now_utc();
     let entries = tracking.inner.snapshot(shard_id);
     let mut submitted = 0usize;
 
@@ -263,147 +263,154 @@ pub(crate) async fn run_workflow_timeout_scanner<R: tokeira_storage::RunReposito
                 &tracking,
                 Some(shard_id),
                 &config,
+                OffsetDateTime::now_utc(),
                 |entry, violation, now| {
                     runtime_metrics::record_scanner_dispatched("workflow_timeout", shard_id.0);
-                    let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
-                    let repo = repo.clone();
-                    let lanes = lanes.clone();
-                    async move {
-                        // A RUN timeout with retry attempts remaining continues
-                        // the retry chain: the close carries the successor run
-                        // id and the successor starts as a derived effect of
-                        // the committed close (retryWorkflow on run-timeout,
-                        // timer_queue_active_task_executor.go:713-796 @
-                        // v1.31.0). Execution timeouts never retry — the
-                        // chain's own deadline has passed.
-                        let mut retry_successor = None;
-                        if matches!(violation, WorkflowTimeoutViolation::RunTimeout)
-                            && entry.has_retry_policy
-                            && let Ok(tokeira_kernel::LoadedRun::Existing(state)) =
-                                repo.load_run(entry.run_key).await
-                            && let Some(policy) = state.retry_policy.clone()
-                        {
-                            // `maximum_attempts == 0` means unlimited.
-                            let attempts_ok = policy.maximum_attempts == 0
-                                || state.attempt < policy.maximum_attempts;
-                            let backoff = crate::runtime::workflow_task::retry_backoff(
-                                &policy,
-                                state.attempt,
-                            );
-                            // Next attempt must fit before the execution-level
-                            // deadline, anchored on the chain's first run.
-                            let within_deadline = match state.workflow_execution_timeout {
-                                Some(execution_timeout) => {
-                                    let anchor =
-                                        state.first_run_started_at.unwrap_or(state.started_at);
-                                    now + backoff < anchor + execution_timeout
-                                }
-                                None => true,
-                            };
-                            if attempts_ok && within_deadline {
-                                retry_successor =
-                                    Some((state, policy, tokeira_types::RunId::new()));
-                            }
-                        }
-                        // A RUN timeout on a cron workflow with no retry
-                        // continuation restarts the cron schedule: the next cron
-                        // run carries the timeout as its LastError, the same way
-                        // the failure path continues cron. The cron schedule and
-                        // input live on the run's start event.
-                        let mut cron_successor = None;
-                        if retry_successor.is_none()
-                            && matches!(violation, WorkflowTimeoutViolation::RunTimeout)
-                            && let Ok(events) = repo.read_history(entry.run_key, 0, 1).await
-                            && let Some(
-                                tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted {
-                                    cron_schedule: Some(cron),
-                                    input,
-                                    ..
-                                }
-                                | tokeira_kernel::HistoryEventKind::WorkflowExecutionStartedV2 {
-                                    cron_schedule: Some(cron),
-                                    input,
-                                    ..
-                                },
-                            ) = events.first().map(|event| &event.kind)
-                            && !cron.is_empty()
-                            && let Ok(tokeira_kernel::LoadedRun::Existing(state)) =
-                                repo.load_run(entry.run_key).await
-                        {
-                            cron_successor = Some((
-                                state,
-                                cron.clone(),
-                                input.clone(),
-                                tokeira_types::RunId::new(),
-                            ));
-                        }
-                        let new_execution_run_id = retry_successor
-                            .as_ref()
-                            .map(|(_, _, run_id)| *run_id)
-                            .or_else(|| cron_successor.as_ref().map(|(_, _, _, run_id)| *run_id));
-                        lane.submit(
-                            entry.run_key,
-                            Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
-                                timeout_type: match violation {
-                                    WorkflowTimeoutViolation::ExecutionTimeout => {
-                                        WorkflowTimeoutType::ExecutionTimeout
-                                    }
-                                    WorkflowTimeoutViolation::RunTimeout => {
-                                        WorkflowTimeoutType::RunTimeout
-                                    }
-                                },
-                                // `RetryState` reflects the RETRY policy, not the
-                                // cron continuation: a retry successor surfaces
-                                // `InProgress`, while a cron successor (or terminal)
-                                // reports the policy-derived state — `RetryPolicyNotSet`
-                                // when the cron workflow has no retry policy.
-                                retry_state: if retry_successor.is_some() {
-                                    RetryState::InProgress
-                                } else {
-                                    workflow_timeout_retry_state(&entry)
-                                },
-                                new_execution_run_id,
-                                now,
-                            }),
-                        )
-                        .await?;
-                        if let Some((state, policy, new_run_id)) = retry_successor {
-                            start_timeout_retry_successor(
-                                repo,
-                                &lanes,
-                                lane_count,
-                                entry.run_key,
-                                state,
-                                policy,
-                                new_run_id,
-                            )
-                            .await;
-                        } else if let Some((state, cron, input, new_run_id)) = cron_successor {
-                            // Anchor the cron continuation on the precise run-timeout
-                            // deadline (execution start + run timeout) rather than the
-                            // periodic scan instant, so the next fire lands on the
-                            // schedule's phase free of up-to-`scan_interval` jitter.
-                            let run_timeout_deadline = entry.started_at
-                                + entry.workflow_start_delay.unwrap_or(Duration::ZERO)
-                                + entry.workflow_run_timeout.unwrap_or(Duration::ZERO);
-                            start_timeout_cron_successor(
-                                &lanes,
-                                lane_count,
-                                state,
-                                cron,
-                                input,
-                                new_run_id,
-                                run_timeout_deadline,
-                            )
-                            .await;
-                        }
-                        Ok(())
-                    }
+                    submit_workflow_timeout(
+                        repo.clone(),
+                        lanes.clone(),
+                        lane_count,
+                        entry,
+                        violation,
+                        now,
+                    )
                 },
             )
             .await;
         }
     }
+}
+
+/// Commit an expired run and start its retry or cron successor, if any.
+///
+/// The scan supplies one clock instant for the timeout decision and close; the
+/// successor's applied Start installs its own tracking before this returns.
+pub(crate) async fn submit_workflow_timeout<R: tokeira_storage::RunRepository + 'static>(
+    repo: Arc<R>,
+    lanes: Vec<LaneHandle>,
+    lane_count: usize,
+    entry: WorkflowTimeoutEntry,
+    violation: WorkflowTimeoutViolation,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
+    // A RUN timeout with retry attempts remaining continues
+    // the retry chain: the close carries the successor run
+    // id and the successor starts as a derived effect of
+    // the committed close (retryWorkflow on run-timeout,
+    // timer_queue_active_task_executor.go:713-796 @
+    // v1.31.0). Execution timeouts never retry — the
+    // chain's own deadline has passed.
+    let mut retry_successor = None;
+    if matches!(violation, WorkflowTimeoutViolation::RunTimeout)
+        && entry.has_retry_policy
+        && let Ok(tokeira_kernel::LoadedRun::Existing(state)) = repo.load_run(entry.run_key).await
+        && let Some(policy) = state.retry_policy.clone()
+    {
+        // `maximum_attempts == 0` means unlimited.
+        let attempts_ok = policy.maximum_attempts == 0 || state.attempt < policy.maximum_attempts;
+        let backoff = crate::runtime::workflow_task::retry_backoff(&policy, state.attempt);
+        // Next attempt must fit before the execution-level
+        // deadline, anchored on the chain's first run.
+        let within_deadline = match state.workflow_execution_timeout {
+            Some(execution_timeout) => {
+                let anchor = state.first_run_started_at.unwrap_or(state.started_at);
+                now + backoff < anchor + execution_timeout
+            }
+            None => true,
+        };
+        if attempts_ok && within_deadline {
+            retry_successor = Some((state, policy, tokeira_types::RunId::new()));
+        }
+    }
+    // A RUN timeout on a cron workflow with no retry
+    // continuation restarts the cron schedule: the next cron
+    // run carries the timeout as its LastError, the same way
+    // the failure path continues cron. The cron schedule and
+    // input live on the run's start event.
+    let mut cron_successor = None;
+    if retry_successor.is_none()
+        && matches!(violation, WorkflowTimeoutViolation::RunTimeout)
+        && let Ok(events) = repo.read_history(entry.run_key, 0, 1).await
+        && let Some(
+            tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted {
+                cron_schedule: Some(cron),
+                input,
+                ..
+            }
+            | tokeira_kernel::HistoryEventKind::WorkflowExecutionStartedV2 {
+                cron_schedule: Some(cron),
+                input,
+                ..
+            },
+        ) = events.first().map(|event| &event.kind)
+        && !cron.is_empty()
+        && let Ok(tokeira_kernel::LoadedRun::Existing(state)) = repo.load_run(entry.run_key).await
+    {
+        cron_successor = Some((
+            state,
+            cron.clone(),
+            input.clone(),
+            tokeira_types::RunId::new(),
+        ));
+    }
+    let new_execution_run_id = retry_successor
+        .as_ref()
+        .map(|(_, _, run_id)| *run_id)
+        .or_else(|| cron_successor.as_ref().map(|(_, _, _, run_id)| *run_id));
+    lane.submit(
+        entry.run_key,
+        Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
+            timeout_type: match violation {
+                WorkflowTimeoutViolation::ExecutionTimeout => WorkflowTimeoutType::ExecutionTimeout,
+                WorkflowTimeoutViolation::RunTimeout => WorkflowTimeoutType::RunTimeout,
+            },
+            // `RetryState` reflects the RETRY policy, not the
+            // cron continuation: a retry successor surfaces
+            // `InProgress`, while a cron successor (or terminal)
+            // reports the policy-derived state — `RetryPolicyNotSet`
+            // when the cron workflow has no retry policy.
+            retry_state: if retry_successor.is_some() {
+                RetryState::InProgress
+            } else {
+                workflow_timeout_retry_state(&entry)
+            },
+            new_execution_run_id,
+            now,
+        }),
+    )
+    .await?;
+    if let Some((state, policy, new_run_id)) = retry_successor {
+        start_timeout_retry_successor(
+            repo,
+            &lanes,
+            lane_count,
+            entry.run_key,
+            state,
+            policy,
+            new_run_id,
+        )
+        .await;
+    } else if let Some((state, cron, input, new_run_id)) = cron_successor {
+        // Anchor the cron continuation on the precise run-timeout
+        // deadline (execution start + run timeout) rather than the
+        // periodic scan instant, so the next fire lands on the
+        // schedule's phase free of up-to-`scan_interval` jitter.
+        let run_timeout_deadline = entry.started_at
+            + entry.workflow_start_delay.unwrap_or(Duration::ZERO)
+            + entry.workflow_run_timeout.unwrap_or(Duration::ZERO);
+        start_timeout_cron_successor(
+            &lanes,
+            lane_count,
+            state,
+            cron,
+            input,
+            new_run_id,
+            run_timeout_deadline,
+        )
+        .await;
+    }
+    Ok(())
 }
 
 /// Start the retry successor after a run-timeout close committed — the same

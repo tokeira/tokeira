@@ -554,6 +554,28 @@ deferred to Tasks 17–18; this does not block single-owner repair or backlog re
 The current repair and admission barrier are enabled by the temporary private
 queue-home construction choice. Default acquisition retains its previous delivery
 and due-work behavior until cutover. Tracker scoping is active in both modes.
+
+Cutover remains blocked on legacy reset placement: before the execution-home fix,
+`crates/tokeira-storage/src/dsql/run_repository/load.rs @ a0addfa2^1` materialized
+both the successor hot row and timers under `shard_for_run_key(successor_run_key)`
+and committed before the successor's first lane command. A stop in that interval
+can leave persisted placement different from the namespace/workflow execution
+home. Current acquisition repair intentionally rejects that mismatch instead of
+changing authoritative placement in a derived-row-only transaction. Before default
+enablement, an explicit placement recovery path must preserve eventual recovery
+of the affected workflow without blocking unrelated runs. Simply skipping the row
+cannot establish that guarantee. The cutover implementation must cover this exact
+stopped-upgrade fixture on both stores, including timer and dispatch placement.
+
+The cutover must also align outer runtime admission and task-token epoch lookup
+with execution-home ownership.
+`crates/tokeira-runtime/src/runtime/commit.rs` currently uses the run-key hash
+in `shard_id_for`, before the lane's execution-home gate. A node holding only the
+execution home can therefore reject a valid start. The tracker regressions submit
+through the real lane to isolate tracking from that pre-existing outer gate; they
+do not establish public multi-home admission. Add an end-to-end regression with
+only the execution home held before enabling the new delivery path by default.
+
 When enabled, acquisition first publishes Sweeping and drains a per-home writer
 barrier before either walk. Lane commits retain admission through post-commit
 tracking and reset materialization; direct activity commits and retention use the
@@ -565,6 +587,12 @@ All recovery trackers carry the acquisition generation and a mutation revision.
 Installation checks the current generation under the ownership lock, processing
 requires Active, and completion retires only the submitted revision. Beginning a
 replacement acquisition cancels and clears the old home entries under that lock.
+Run and execution deadlines are installed in the lane after an applied start,
+using committed state and execution home before the reply and while retaining
+write admission. Retry, cron, continue-as-new and folded starts share that path;
+reset materialization seeds its successor explicitly. Callers do not reinstall
+deadlines after awaiting the reply. Dispatch publication receives the same
+execution home directly, so tracker installation adds no fallible state reloads.
 A callback HTTP result cannot retire or reinstall another acquisition's entry;
 its scanner retires only after observing committed terminal state. Managed
 acquisitions bound their local deadline conservatively from each successful lease

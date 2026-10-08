@@ -268,7 +268,6 @@ pub struct RuntimeDispatchPublisher<R> {
     repo: Arc<R>,
     lanes: Arc<Mutex<Vec<LaneHandle>>>,
     lane_count: usize,
-    shard_count: u32,
     nexus_client: Arc<dyn NexusHttpClient>,
     nexus_completion_client: Arc<dyn NexusCompletionClient>,
     nexus_completion_config: NexusCompletionRuntimeConfig,
@@ -291,7 +290,6 @@ impl<R> std::fmt::Debug for RuntimeDispatchPublisher<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeDispatchPublisher")
             .field("lane_count", &self.lane_count)
-            .field("shard_count", &self.shard_count)
             .finish_non_exhaustive()
     }
 }
@@ -304,7 +302,6 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             repo: self.repo.clone(),
             lanes: self.lanes.clone(),
             lane_count: self.lane_count,
-            shard_count: self.shard_count,
             nexus_client: self.nexus_client.clone(),
             nexus_completion_client: self.nexus_completion_client.clone(),
             nexus_completion_config: self.nexus_completion_config.clone(),
@@ -331,7 +328,6 @@ where
         repo: Arc<R>,
         lanes: Arc<Mutex<Vec<LaneHandle>>>,
         lane_count: usize,
-        shard_count: u32,
         nexus_client: Arc<dyn NexusHttpClient>,
         nexus_completion_client: Arc<dyn NexusCompletionClient>,
         nexus_completion_config: NexusCompletionRuntimeConfig,
@@ -348,7 +344,6 @@ where
             repo,
             lanes,
             lane_count,
-            shard_count,
             nexus_client,
             nexus_completion_client,
             nexus_completion_config,
@@ -1699,17 +1694,6 @@ where
         }
     }
 
-    async fn execution_home(&self, run_key: RunKey) -> Result<ShardId> {
-        match self.repo.load_run(run_key).await? {
-            LoadedRun::Existing(state) => Ok(tokeira_types::execution_home_bundle(
-                state.namespace_id.0.as_bytes(),
-                state.workflow_id.0.as_bytes(),
-                self.shard_count,
-            )),
-            LoadedRun::Absent => anyhow::bail!("dispatch run is absent"),
-        }
-    }
-
     async fn nexus_delivery_version(
         &self,
         run_key: RunKey,
@@ -2162,7 +2146,12 @@ impl<R> DispatchPublisher for RuntimeDispatchPublisher<R>
 where
     R: RunRepository + 'static,
 {
-    async fn publish(&self, run_key: RunKey, ops: &[DispatchOp]) -> Result<()> {
+    async fn publish(
+        &self,
+        run_key: RunKey,
+        execution_home: ShardId,
+        ops: &[DispatchOp],
+    ) -> Result<()> {
         for op in ops {
             match op {
                 DispatchOp::EnqueueWorkflowTask {
@@ -2310,7 +2299,7 @@ where
                         };
                         self.activity_tracking.record_scheduled(
                             run_key,
-                            self.execution_home(run_key).await?,
+                            execution_home,
                             activity_id.clone(),
                             effective,
                         );
@@ -2540,7 +2529,7 @@ where
                     {
                         self.nexus_timeout_tracking.insert(NexusTimeoutEntry {
                             run_key: *originator_run_key,
-                            shard_id: self.execution_home(*originator_run_key).await?,
+                            shard_id: execution_home,
                             operation_id: operation_id.clone(),
                             scheduled_event_id: *scheduled_event_id,
                             scheduled_at: *scheduled_at,
@@ -2621,7 +2610,7 @@ where
                     self.completion_callback_tracking
                         .insert(CompletionCallbackTrackingEntry {
                             run_key,
-                            shard_id: self.execution_home(run_key).await?,
+                            shard_id: execution_home,
                             callback_index,
                         });
                     let callback = callback.clone();

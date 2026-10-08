@@ -114,6 +114,50 @@ cargo nextest run -p tokeira-storage --features dsql-integration --locked --prof
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_query_plans)'
 ```
 
+### Review regressions
+
+Workflow execution/run deadlines now install in the lane's post-commit path for
+all committed start events, including plain, update-with-start, signal-with-start,
+retry, cron and continue-as-new starts. The install uses committed state and its
+execution home, while write admission is held and before the reply. Reset's
+separately materialized successor retains its explicit install. All caller-side
+installs after an awaited start have been removed. The publisher receives the
+committed execution home for the whole batch; tracker home lookup performs no
+state read and cannot truncate dispatch on a read failure.
+
+Deterministic runtime tests exercise real lane commits and the production timeout
+submission path with an explicit scan instant. A timed-out run's retry successor
+and cron successor both time out without reacquisition. A lost reply after each
+of the three start forms retains its deadline when only the execution home is
+held, even after another shard is acquired twice. A 32-activity batch installs on
+that home and delivers every offer while a repository fixture rejects state reads;
+the fixture records zero reads. The focused suite passes all 11 tests, including
+the existing scanner properties. No new tests sleep.
+
+The restart-slices negative configuration now lists only `EventuallyResolved`.
+TLC 1.7.4 reports its expected temporal violation (exit 13), and tla-rs 0.21.2 names
+`EventuallyResolved` (exit 1). Both were rerun on 2026-10-09; the other unchanged
+model configurations retain the full results above.
+
+Two cutover gaps are recorded explicitly in the design and remain unchecked in
+task 11.1. Legacy reset materialization can leave hot state and timers on the
+run-key shard until the first successor commit; current repair rejects that
+placement mismatch. Separately, the outer runtime admission/token helper still
+uses run-key placement. The multi-home tracker tests submit directly to the lane,
+so they do not claim public admission works when only the execution home is held.
+Default enablement requires placement handling and public admission regressions.
+
+No live cluster was created for these runtime and test changes. The storage SQL,
+migrations and repository transactions are unchanged; prior real DSQL results
+remain the evidence for them.
+
+The full AGENTS.md §10.4 bar passed after these fixes on 2026-10-09: nightly
+formatting, locked workspace lint and check, all 3,757 nextest tests (2 existing
+ignored SDK integration tests), doctests (1 passed, 21 existing ignored examples),
+and documentation with warnings denied. DSQL-feature all-target Clippy also
+passed with warnings denied. No bar command was omitted. Changed Markdown links, including fragments, and whitespace checks passed. The runtime
+changes introduced no dependency, lockfile, migration or shared-config changes.
+
 ### Workspace validation before rebase
 
 The complete bar passed: nightly formatting, `cargo lint --locked`, workspace

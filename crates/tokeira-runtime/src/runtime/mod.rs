@@ -75,8 +75,7 @@ use crate::{
     shard::{ShardOwner, shard_for},
     shutdown::RuntimeShutdownHandle,
     timeout::{
-        WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
-        run_workflow_timeout_scanner,
+        WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState, run_workflow_timeout_scanner,
     },
     update::{
         PendingUpdateTransport, UpdateLifecycleSnapshot, UpdateLifecycleStage, UpdateOutcome,
@@ -809,7 +808,6 @@ where
                     repo.clone(),
                     shared_lanes.clone(),
                     lane_count,
-                    shard_count,
                     nexus_client.clone(),
                     nexus_completion_client.clone(),
                     nexus_completion_config.clone(),
@@ -957,7 +955,6 @@ where
             repo.clone(),
             shared_lanes.clone(),
             lane_count,
-            shard_count,
             nexus_client.clone(),
             nexus_completion_client.clone(),
             nexus_completion_config.clone(),
@@ -2715,7 +2712,6 @@ pub(crate) mod tests {
             repo.clone(),
             Arc::new(Mutex::new(Vec::new())),
             1,
-            1,
             Arc::new(NoopNexusHttpClient),
             Arc::new(NoopNexusCompletionClient),
             NexusCompletionRuntimeConfig::default(),
@@ -2742,6 +2738,7 @@ pub(crate) mod tests {
         publisher
             .publish(
                 run_key,
+                ShardId(0),
                 &[DispatchOp::EnqueueActivityTask {
                     queue: queue.clone(),
                     activity_id: "activity-1".to_string(),
@@ -2854,7 +2851,6 @@ pub(crate) mod tests {
             repo,
             Arc::new(Mutex::new(Vec::new())),
             1,
-            1,
             Arc::new(NoopNexusHttpClient),
             Arc::new(NoopNexusCompletionClient),
             NexusCompletionRuntimeConfig::default(),
@@ -2892,6 +2888,7 @@ pub(crate) mod tests {
         publisher
             .publish(
                 run_key,
+                ShardId(0),
                 &[DispatchOp::EnqueueWorkflowTask {
                     queue: sticky_queue.clone(),
                     logical_seq: LogicalTaskSeq::ONE,
@@ -2933,6 +2930,7 @@ pub(crate) mod tests {
         publisher
             .publish(
                 run_key,
+                ShardId(0),
                 &[DispatchOp::EnqueueWorkflowTask {
                     queue: sticky_queue.clone(),
                     logical_seq: LogicalTaskSeq(2),
@@ -3735,6 +3733,7 @@ pub(crate) mod tests {
                         scan_interval: tokio::time::Duration::from_secs(1),
                         max_timeouts_per_scan: max_batch,
                     },
+                    OffsetDateTime::now_utc(),
                     move |entry, violation, now| {
                         let seen = seen_clone.clone();
                         async move {
@@ -3785,6 +3784,7 @@ pub(crate) mod tests {
                     &tracking,
                     None,
                     &WorkflowTimeoutScannerConfig::default(),
+                    OffsetDateTime::now_utc(),
                     move |entry, _violation, _now| {
                         let entries_for_submit = entries_for_submit.clone();
                         async move {

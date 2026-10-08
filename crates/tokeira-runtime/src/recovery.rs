@@ -650,7 +650,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DispatchPublisher for NoopPublisher {
-        async fn publish(&self, _run_key: RunKey, _ops: &[DispatchOp]) -> anyhow::Result<()> {
+        async fn publish(
+            &self,
+            _run_key: RunKey,
+            _execution_home: ShardId,
+            _ops: &[DispatchOp],
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn submit_to_run(

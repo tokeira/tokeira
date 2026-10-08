@@ -24,7 +24,7 @@ Temporal v1.31.0 splits the same work:
 - Its SQL store appends a run's history before the transaction that writes the run's mutable state (`common/persistence/sql/execution.go:334-358 @ v1.31.0`).
 - It holds a write to persistence to 4 MiB (`DefaultTransactionSizeLimit`, `common/primitives/constants.go:10-11 @ v1.31.0`).
 
-This spec splits each of the four writes into transactions within fixed budgets, each safe to retry, and makes an interrupted write finish or undo itself later. A reset's successor becomes current only while the pointer still names the run the reset found current. The spec also makes the in-memory store refuse what DSQL refuses for these writes, so a test on either store shows the defects.
+This spec splits each of the four writes into transactions within fixed budgets, each safe to retry, and makes an interrupted write finish or undo itself later. A reset's successor becomes current only while the current pointer still names the run it named when the reset was admitted. The spec also makes the in-memory store refuse what DSQL refuses for these writes, so a test on either store shows the defects.
 
 ## Bug Analysis
 
@@ -103,7 +103,7 @@ v1.31.0 likewise appends a new run's history before the transaction that writes 
 
 The store SHALL count a run's history as DSQL stores it, one row per batch.
 
-2.13 WHEN a materialization's final transaction runs THEN it SHALL make the successor current only if the current pointer still names the run that was current when the runtime admitted the reset, or is still absent if there was none. IF the pointer has changed THEN the materialization SHALL fail, its rows SHALL be purged as 2.9 says, and the run the pointer names SHALL stay current. v1.31.0 moves the pointer to a reset's run only while the pointer names the run its reset updates (`persistToDB`, `service/history/ndc/workflow_resetter.go:358-430`; `assertRunIDAndUpdateCurrentExecution`, `common/persistence/sql/execution_util.go:966-1009 @ v1.31.0`).
+2.13 WHEN a materialization's final transaction runs THEN it SHALL make the successor current only if the current pointer still names the run it named when the runtime admitted the reset, whether that run was open or closed, or is still absent if there was no pointer then. IF the pointer has changed THEN the materialization SHALL fail, its rows SHALL be purged as 2.9 says, and the run the pointer names SHALL stay current. v1.31.0 moves the pointer to a reset's run only while the pointer names the run its reset updates (`persistToDB`, `service/history/ndc/workflow_resetter.go:358-430`; `assertRunIDAndUpdateCurrentExecution`, `common/persistence/sql/execution_util.go:966-1009 @ v1.31.0`).
 
 ### Unchanged Behavior (Regression Prevention)
 
@@ -115,7 +115,7 @@ The store SHALL count a run's history as DSQL stores it, one row per batch.
 
 3.4 For a deleted run, visibility SHALL CONTINUE TO receive the tombstone, and DescribeWorkflowExecution, GetWorkflowExecutionHistory and the List APIs SHALL CONTINUE TO answer as [temporal-ui-support](../temporal-ui-support/requirements.md) Requirement 9 requires.
 
-3.5 WHEN the current pointer still names the run that was current when the reset was admitted THEN a reset's successor SHALL CONTINUE TO have the mutable state, history events, timers, workflow dispatch row and current pointer it has today, and the reset RPC SHALL CONTINUE TO answer as today.
+3.5 WHEN the current pointer still names the run it named when the reset was admitted, open or closed, THEN a reset's successor SHALL CONTINUE TO have the mutable state, history events, timers, workflow dispatch row and current pointer it has today, and the reset RPC SHALL CONTINUE TO answer as today.
 
 3.6 The timer scanner SHALL CONTINUE TO delete the row of a due timer whose run has closed, or whose run doesn't exist and isn't being materialized.
 

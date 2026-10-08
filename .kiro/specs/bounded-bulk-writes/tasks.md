@@ -20,9 +20,10 @@ Show the four defects first, on both stores, with tests that fail on the current
     - a pass of 3,001 small expired tasks, and one of eleven tasks whose payloads are about 1 MB each;
     - the deletion of a closed run owning more than 3,000 rows;
     - a materialization whose copied history encodes to more than 1 MiB, one to more than 10 MiB, and one whose successor holds 3,500 timers;
-    - a start of the same workflow id between a reset's commit on its base and its successor's materialization.
-    - _Requirements: 1.1-1.6_
-  - [ ] 1.3 Run them on the current code, on the in-memory store and on an ephemeral DSQL cluster, and confirm each fails as 1.1 to 1.4 and 1.6 predict
+    - a start of the same workflow id between a reset's commit on its base and its successor's materialization;
+    - a plain reset of a closed workflow, with no start in between, which must pass before and after the fix.
+    - _Requirements: 1.1-1.6, 3.5_
+  - [ ] 1.3 Run them on the current code, on the in-memory store and on an ephemeral DSQL cluster, and confirm each defect case fails as 1.1 to 1.4 and 1.6 predict, and the plain reset passes
     - _Requirements: 1.1-1.6_
 
 - [ ] 2. Budgets and the bulk-write record
@@ -55,7 +56,7 @@ Show the four defects first, on both stores, with tests that fail on the current
 - [ ] 5. Materialization and the timer scanner
   - [ ] 5.1 Materialize a reset successor in steps, in both stores: the read, the batches, the record, the copy and the final transaction, with History Size as the sum of the batches
     - _Requirements: 2.7, 2.8, 2.11, 3.5_
-  - [ ] 5.2 Check the current pointer in the final transaction against `expected_current`, which `reset_workflow` resolves and the Reset command carries to the lane in `ResetRequest::expected_current_run_key`
+  - [ ] 5.2 Check the current pointer in the final transaction against `expected_current`: the run the pointer names when `reset_workflow` admits the reset, open or closed, read with `find_latest_run` and carried to the lane in `ResetRequest::expected_current_run_key`. Correct `reset_workflow`'s out-of-date comment on `find_latest_run`
     - _Requirements: 1.6, 2.13, 3.5_
   - [ ] 5.3 Pass `StaleTimer` to `delete_due_timer_if_matches`, and keep a due timer whose run is missing while that run has mutable state or a `materializing` record
     - _Requirements: 2.10, 3.6_
@@ -64,7 +65,7 @@ Show the four defects first, on both stores, with tests that fail on the current
     - **Property 6: An abandoned materialization leaves nothing behind**
     - **Property 7: The copied history is split at event boundaries within the batch budget**
     - **Property 8: The timer scanner keeps a materializing run's timers**
-    - **Property 10: A successor replaces only the run the reset found current**
+    - **Property 10: A successor replaces only the run the pointer named at admission**
     - **Validates: Requirements 1.6, 2.1, 2.7, 2.8, 2.9, 2.10, 2.11, 2.13, 3.5, 3.6**
 
 - [ ] 6. Runtime

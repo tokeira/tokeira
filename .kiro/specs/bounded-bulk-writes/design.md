@@ -5,7 +5,7 @@
 Each of the four writes becomes a series of transactions within fixed budgets:
 - **The spill** keeps its one call per pass. Storage splits the call into transactions and reports how far it got, so the scanner re-publishes only what wasn't persisted.
 - **A deletion** makes the run unreachable in one fenced transaction, which also records the run for purging, and DeleteWorkflowExecution returns once it commits. A purge then removes the run's other rows in pages, history last, and removes the record with the last of them.
-- **A reset** records the successor as being materialized, writes the copied history and the timer rows in pages, and then writes the successor's mutable state, dispatch row and current pointer in a final transaction that removes the record. That transaction makes the successor current only if the pointer still names the run the reset found current.
+- **A reset** records the successor as being materialized, writes the copied history and the timer rows in pages, and then writes the successor's mutable state, dispatch row and current pointer in a final transaction that removes the record. That transaction makes the successor current only if the pointer still names the run it named when the reset was admitted, open or closed.
 - **An interrupted write is finished by a purge.** A purge recorded by a deletion runs to completion. A materialization that never reached its final transaction is purged like a deleted run.
 
 One new table, `run_bulk_write`, holds the records. A run has mutable state or a record, never both, and that is what keeps every existing reader correct at every step without a change to any of them.
@@ -30,7 +30,7 @@ v1.31.0 splits these writes too, but around structures Tokeira doesn't have. The
 2. **A copy, not a fork.** v1.31.0 forks the base's history branch, sharing its nodes, and writes only the new run's own events. Tokeira copies the prefix into the successor's own rows and replays it ([workflow-reset](../workflow-reset/design.md)), so the copy is a write v1.31.0 doesn't make. The copy follows v1.31.0's order for a new run: history rows first, then the transaction that writes mutable state and makes the run current (`common/persistence/sql/execution.go:334-358, 446-474 @ v1.31.0`). An abandoned copy is purged where v1.31.0 leaves an orphan branch to its scavenger.
 3. **Timer rows before the run.** v1.31.0 writes a new run's timer tasks in the transaction that writes its mutable state. Tokeira's timer rows are its timer tasks, and a successor's may not fit in one transaction. So they are written with the history, before the successor is visible, and the timer scanner keeps a due timer whose run is still being materialized.
 4. **One fence for both.** The same record type fences a purge and a materialization. Every reader looks a run up by its mutable state or current pointer, and a recorded run has neither, so no reader changes.
-5. **A checked move of the current pointer.** v1.31.0 creates a reset's run and moves the current pointer to it in one transaction, and moves the pointer only while it names the run the reset updates (`workflow_resetter.go:358-430`; `common/persistence/sql/execution_util.go:966-1009 @ v1.31.0`). Tokeira commits the reset on its base first and creates the successor later, so a start can land in between. The final transaction therefore checks the pointer against the run the runtime found current when it admitted the reset. It fails rather than move the pointer off a run that started since.
+5. **A checked move of the current pointer.** v1.31.0 creates a reset's run and moves the current pointer to it in one transaction, and moves the pointer only while it names the run the reset updates (`workflow_resetter.go:358-430`; `common/persistence/sql/execution_util.go:966-1009 @ v1.31.0`). Tokeira commits the reset on its base first and creates the successor later, so a start can land in between. The final transaction therefore checks the pointer against the run it named when the runtime admitted the reset, open or closed. It fails rather than move the pointer off a run that started since.
 
 The backlog is a delivery optimisation ([`crates/tokeira-runtime/AGENTS.md`](../../../crates/tokeira-runtime/AGENTS.md)): losing an entry loses no work. A spill that persists part of a pass is therefore safe as long as no task is dropped.
 
@@ -134,10 +134,10 @@ _For any_ transaction of the covered writes, the in-memory store SHALL refuse it
 
 **Validates: Requirements 1.5, 2.12**
 
-Property 10: A successor replaces only the run the reset found current
+Property 10: A successor replaces only the run the pointer named at admission
 
-_For any_ reset, and any start, close or deletion of a run of the same workflow id that lands between the reset's commit on its base and its successor's final transaction:
-- the final transaction SHALL make the successor current exactly when the current pointer still names the run that was current when the reset was admitted, or is still absent if there was none;
+_For any_ reset of an open or a closed workflow, and any start, close or deletion of a run of the same workflow id that lands between the reset's commit on its base and its successor's final transaction:
+- the final transaction SHALL make the successor current exactly when the current pointer still names the run it named when the reset was admitted, open or closed, or is still absent if there was no pointer then;
 - otherwise the successor SHALL never become visible, its rows SHALL be purged, and the pointer SHALL keep naming the run it names.
 
 **Validates: Requirements 1.6, 2.13, 3.5**
@@ -220,14 +220,18 @@ The memory store mirrors this under its lock: it removes the run, its pointers a
 
 ### Materialization (`materialize_reset_successor`)
 
-The call gains the run the reset expects to replace as current: `materialize_reset_successor(base_run_key, fork_event_id, successor_run_id, expected_current)`, where `expected_current` is an `Option<RunKey>`. `reset_workflow` already resolves the current run before it submits the reset. The Reset command carries it to the lane in `ResetRequest::expected_current_run_key`, a field the kernel ignores, as the command already carries the reapply exclusions and post-reset options the lane reads after the commit.
+The call gains the run the successor replaces as current: `materialize_reset_successor(base_run_key, fork_event_id, successor_run_id, expected_current)`, where `expected_current` is an `Option<RunKey>`.
+- `reset_workflow` reads it when it admits the reset, with `find_latest_run`. That returns the run the current pointer names, whether the run is open or closed, or none when there is no pointer.
+- The open-only run that `reset_workflow` resolves today, through `resolve_execution` without a run id, can't serve. It reads a closed current run as none, so every reset of a closed workflow would fail the check. It stays for the step that terminates a distinct open current run.
+- `reset_workflow`'s comment says `find_latest_run` orders runs by start time. That is out of date, since both stores read the pointer, and the code PR corrects it. The edge already picks a reset's base with `find_latest_run` when the request names no run.
+- The Reset command carries the value to the lane in `ResetRequest::expected_current_run_key`. The kernel ignores that field, and the command already carries the reapply exclusions and post-reset options the lane reads after the commit.
 
 Today the materialization is one transaction. It becomes:
 1. **Read the base.** Read the base's state and its history in one read transaction, which is today's reads moved out of the write transaction, and replay the prefix into the successor's state, as today. The copied events must run from event 1 without a gap. A purge of the base removes its history in pages, first events first, so a read that overlaps one would otherwise copy a prefix with its start missing.
 2. **Cut the batches.** Split the copied events, with their principals, into batches in event order. A batch closes when the next event would take its encoded events, or its encoded principals, over 512 KiB, and an event that alone exceeds that forms a batch of its own (Property 7). A history DSQL accepted holds no event over 1 MiB, since each of its batches fit a value. Every batch carries the transition sequence today's single batch carries.
 3. **Record.** In one transaction, check that the successor has no hot row and insert its record with phase `materializing` and the successor's execution home.
 4. **Copy.** Write the batches and then the successor's timer rows, paged within the budgets. Each transaction first reads the record `FOR UPDATE` and stops unless it says `materializing`. Batches are inserted with `ON CONFLICT (run_key, first_event_id) DO NOTHING`, and timers upserted as today, so a retried transaction writes nothing twice.
-5. **Final transaction.** Read the record `FOR UPDATE` and require `materializing`. Read the current pointer `FOR UPDATE` and require that it names `expected_current`, or is absent if that is `None` (2.13). Then:
+5. **Final transaction.** Read the record `FOR UPDATE` and require `materializing`. Read the current pointer `FOR UPDATE` and require that it names `expected_current`, the run it named at admission, open or closed, or is absent if that is `None` (2.13). Then:
    - insert the successor's hot row with History Size equal to the sum of the batches' encoded sizes (2.11);
    - maintain its `workflow_dispatch` row at the execution home, as today;
    - point the current pointer at the successor;
@@ -263,7 +267,7 @@ A due timer row can exist without its run's hot row only while the run is being 
 - **Recovery.** `sweep_shard` pages through the shard's records.
   - Before the shard admits commands, the sweep switches each `materializing` record to `purging` with `abandon_materialization`, one small transaction per record (2.9). A materialization still running from an earlier ownership of the shard then fails at its next transaction, so none can complete once the shard is active. Otherwise one could make its successor visible after the sweep's walks had passed it, so no tracker would be installed for the successor until the next acquisition, and its follow-up command would be refused by a node that no longer owns the shard.
   - Every record found here is abandoned: the sweep finishes before the shard admits commands, so no materialization started under this ownership is running. Such records are rare, so the switches don't hold activation up in practice. A switch that fails fails the sweep, and the shard isn't activated until a sweep succeeds.
-  - The sweep then hands every record's run to the purger and doesn't wait for the purges. The switch is the only write the sweep makes.
+  - The sweep then hands every record's run to the purger and doesn't wait for the purges. The switch is the only write this spec adds to the sweep.
 
 ### The in-memory store's model of DSQL (`crates/tokeira-storage/src/memory.rs`)
 
@@ -295,7 +299,8 @@ The code PR aligns these specs with the fix:
   - the deletion of a closed run owning more than 3,000 rows;
   - a reset whose copied history encodes to more than 1 MiB, and one to more than 10 MiB;
   - a reset whose successor holds 3,500 timers;
-  - a start of the same workflow id between a reset's commit on its base and its successor's materialization.
+  - a start of the same workflow id between a reset's commit on its base and its successor's materialization;
+  - a plain reset of a closed workflow, with no start in between, which passes before the fix and must still pass after it (3.5).
 - On the code before the fix, each must fail on both stores:
   - the spill persists nothing and re-publishes every task;
   - the deletion fails and the run stays;
@@ -310,6 +315,7 @@ The code PR aligns these specs with the fix:
   - a copy transaction that skips the record's check;
   - a final transaction that keeps the record;
   - a final transaction that moves the pointer without its check;
+  - `expected_current` taken from the open-only lookup, which the plain reset of a closed workflow fails;
   - a sweep that hands a `materializing` record to the purger without switching it first;
   - the scanner deleting a materializing run's timer;
   - batches cut without the principals budget;

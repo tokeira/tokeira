@@ -535,23 +535,56 @@ where
                                 );
                             }
                         }
-                        Some(pending) if pending.started_event_id.is_none() => {
+                        Some(pending) => {
                             wft_timeout_tracking.disarm_speculative(message.run_key);
-                            if let Some(deadline) = pending.schedule_to_start_deadline {
-                                tracing::debug!(
-                                    run_key = ?message.run_key,
-                                    logical_seq = pending.logical_seq.0,
-                                    ?deadline,
-                                    "tracking sticky wft schedule-to-start deadline"
-                                );
+                            // Timeout ownership follows the execution home used by
+                            // storage and acquisition, not the lane's run-key hash.
+                            let home = {
+                                let owner = shard_owner.read().expect("shard_owner lock poisoned");
+                                tokeira_types::execution_home_bundle(
+                                    new_state.namespace_id.0.as_bytes(),
+                                    new_state.workflow_id.0.as_bytes(),
+                                    owner.shard_count(),
+                                )
+                            };
+                            let deadline = if let (Some(started_event_id), Some(started_at)) =
+                                (pending.started_event_id, pending.started_at)
+                            {
+                                Some((
+                                    crate::wft_timeout::WftTimeoutKind::StartToClose,
+                                    started_event_id,
+                                    started_at,
+                                    new_state.workflow_task_timeout,
+                                ))
+                            } else {
+                                pending.schedule_to_start_deadline.map(|deadline| {
+                                    (
+                                        crate::wft_timeout::WftTimeoutKind::ScheduleToStart,
+                                        0,
+                                        deadline,
+                                        time::Duration::ZERO,
+                                    )
+                                })
+                            };
+                            if let Some((
+                                kind,
+                                started_event_id,
+                                started_at,
+                                workflow_task_timeout,
+                            )) = deadline
+                            {
+                                // Install before returning the commit result: loss
+                                // of a successful start reply must still leave its
+                                // start-to-close recovery path. Response assembly
+                                // must never reinstall an older state afterwards.
                                 wft_timeout_tracking.insert(crate::wft_timeout::WftTimeoutEntry {
                                     run_key: message.run_key,
-                                    shard_id,
+                                    shard_id: home,
                                     logical_seq: pending.logical_seq,
-                                    started_event_id: 0,
-                                    started_at: pending.scheduled_at,
-                                    workflow_task_timeout: deadline - pending.scheduled_at,
-                                    kind: crate::wft_timeout::WftTimeoutKind::ScheduleToStart,
+                                    started_event_id,
+                                    started_at,
+                                    workflow_task_timeout,
+                                    kind,
                                 });
                             }
                         }

@@ -231,15 +231,18 @@ fn generate(workspace_root: &Path, outputs: &Outputs) -> Result<()> {
     // emit sibling-relative `include!` paths suited to checked-in code.
     let controller_protos = discover_protos(&controller_dir)?;
     if !controller_protos.is_empty() {
+        let files = controller_protos
+            .iter()
+            .map(|path| path.strip_prefix(&proto_root))
+            .collect::<Result<Vec<_>, _>>()?;
         connectrpc_build::Config::new()
             .out_dir(&tokeira_out)
-            .files(
-                &controller_protos
-                    .iter()
-                    .map(|p| p.to_str().expect("proto path is valid UTF-8"))
-                    .collect::<Vec<_>>(),
-            )
-            .includes(&[proto_root.to_str().expect("proto root is valid UTF-8")])
+            // Controller files belong to the internal pass above. Reuse its
+            // protox descriptors, selecting their proto-relative names, so
+            // Connect generation cannot silently fall back to protoc.
+            .descriptor_set(tokeira_out.join("tokeira_internal_descriptor.bin"))
+            .files(&files)
+            .emit_rerun_directives(false)
             .include_file("_connectrpc_controller.rs")
             .compile()
             .context("compile Tokeira controller connect-rust bindings")?;

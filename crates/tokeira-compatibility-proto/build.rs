@@ -1,3 +1,7 @@
+//! Compile compatibility protos with protox and generate Buffa/Connect bindings.
+//! Descriptor bytes preserve imported types, options and source comments without
+//! requiring an external protobuf compiler on the build host.
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -10,23 +14,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = workspace_root.join("proto");
     let compatibility_dir = proto_root.join("tokeira/compatibility");
 
-    println!("cargo:rerun-if-changed={}", compatibility_dir.display());
+    // Imports can live outside this package's own proto directory.
+    println!("cargo:rerun-if-changed={}", proto_root.display());
 
     let protos = discover_protos(&compatibility_dir)?;
     if !protos.is_empty() {
+        let mut compiler = protox::Compiler::new([&proto_root])?;
+        compiler
+            .include_imports(true)
+            .include_source_info(true)
+            .open_files(&protos)?;
+        let descriptor = PathBuf::from(env::var("OUT_DIR")?).join("compatibility-descriptors.bin");
+        fs::write(&descriptor, compiler.encode_file_descriptor_set())?;
+        // Precompiled descriptor mode selects proto-relative names, unlike
+        // connectrpc-build's protoc mode, which accepts filesystem paths.
+        let files = protos
+            .iter()
+            .map(|path| path.strip_prefix(&proto_root))
+            .collect::<Result<Vec<_>, _>>()?;
         connectrpc_build::Config::new()
-            .files(
-                &protos
-                    .iter()
-                    .map(|path| {
-                        path.to_str()
-                            .ok_or_else(|| format!("non-UTF8 proto path: {}", path.display()))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-            .includes(&[proto_root
-                .to_str()
-                .ok_or("workspace proto root path is not UTF-8")?])
+            .descriptor_set(descriptor)
+            .files(&files)
+            .emit_rerun_directives(false)
             .include_file("_connectrpc_compatibility.rs")
             .compile()?;
     }

@@ -11,7 +11,8 @@ use proptest::{
 };
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    LoadedRun, Priority, RequestDedupeOp, Transition, WorkflowState, WorkflowTaskType,
+    BasicKernel, Command, Kernel, LoadedRun, Priority, RequestDedupeOp, Transition, WorkflowState,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTaskType,
 };
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, RequestId, RunId, RunKey, ShardEpoch,
@@ -135,6 +136,284 @@ pub(crate) fn run_atomic_cases(backend: &impl Backend, runtime: &tokio::runtime:
     runner
         .run(&strategy, |(reset, steps)| {
             runtime.block_on(atomic_case(backend, reset, steps))
+        })
+        .unwrap();
+}
+
+pub(crate) fn run_page_cases(backend: &impl Backend, runtime: &tokio::runtime::Runtime) {
+    let strategy = (prop::collection::vec((1i32..6, 0i64..4), 2..24), 1u32..9);
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: 100,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    runner
+        .run(&strategy, |(coordinates, page_size)| {
+            runtime.block_on(async {
+                // Feature: workflow-dispatch, Property 3: Ordered read-only traversal
+                // Every page advances in tuple order; a new head sees work moved behind its cursor.
+                let mut template = fresh_transition(RunKey::new());
+                template.next_state.namespace_id = tokeira_types::NamespaceId::new();
+                let range = WorkflowDiscoveryRange {
+                    namespace_id: template.next_state.namespace_id,
+                    queue_name: template.next_state.task_queue.clone(),
+                    routing: WorkflowDispatchRouting::Live,
+                };
+                let mut states = Vec::new();
+                let mut homes = std::collections::BTreeSet::new();
+                for (index, (priority, scheduled)) in coordinates.iter().enumerate() {
+                    let mut transition = template.clone();
+                    transition.next_state.run_key = RunKey::new();
+                    transition.next_state.workflow_id.0 = format!("traversal-{index}");
+                    let mut home = tokeira_types::execution_home_bundle(
+                        range.namespace_id.0.as_bytes(),
+                        transition.next_state.workflow_id.0.as_bytes(),
+                        8,
+                    );
+                    if index == 1 {
+                        for suffix in 0..100 {
+                            if !homes.contains(&home) {
+                                break;
+                            }
+                            transition.next_state.workflow_id.0 =
+                                format!("traversal-{index}-{suffix}");
+                            home = tokeira_types::execution_home_bundle(
+                                range.namespace_id.0.as_bytes(),
+                                transition.next_state.workflow_id.0.as_bytes(),
+                                8,
+                            );
+                        }
+                    }
+                    homes.insert(home);
+                    transition.next_state.priority = Some(Priority {
+                        priority_key: *priority,
+                        fairness_key: String::new(),
+                        fairness_weight: 1.0,
+                    });
+                    transition
+                        .next_state
+                        .pending_workflow_task
+                        .as_mut()
+                        .unwrap()
+                        .scheduled_at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(*scheduled);
+                    states.push(applied(commit(backend, transition).await.unwrap()));
+                    prop_assert_eq!(
+                        backend
+                            .row(states.last().unwrap().run_key)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .execution_home,
+                        home
+                    );
+                }
+                prop_assert!(homes.len() > 1);
+                let mut expected: Vec<_> = states
+                    .iter()
+                    .map(|state| {
+                        (
+                            state.priority.as_ref().unwrap().priority_key as i16,
+                            state.pending_workflow_task.as_ref().unwrap().scheduled_at,
+                            state.run_key,
+                        )
+                    })
+                    .collect();
+                expected.sort();
+                let mut before = Vec::new();
+                for state in &states {
+                    before.push(backend.row(state.run_key).await.unwrap());
+                }
+                let mut seen = Vec::new();
+                let mut after = None;
+                loop {
+                    let page = backend
+                        .repo()
+                        .list_workflow_dispatch_page(
+                            &range,
+                            after,
+                            NonZeroU32::new(page_size).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    prop_assert!(page.candidates.len() <= page_size as usize);
+                    for row in &page.candidates {
+                        prop_assert!(after.is_none_or(|position| row.position() > position));
+                        seen.push((row.priority_key, row.scheduled_at, row.incarnation.run_key));
+                    }
+                    prop_assert_eq!(
+                        page.last_examined,
+                        page.candidates.last().map(WorkflowDispatchRow::position)
+                    );
+                    after = page.last_examined;
+                    if page.exhausted {
+                        break;
+                    }
+                }
+                prop_assert_eq!(&seen, &expected);
+                for (state, row) in states.iter().zip(before) {
+                    prop_assert_eq!(backend.row(state.run_key).await.unwrap(), row);
+                    let LoadedRun::Existing(loaded) =
+                        backend.repo().load_run(state.run_key).await.unwrap()
+                    else {
+                        panic!("run missing")
+                    };
+                    prop_assert_eq!(loaded.transition_seq, state.transition_seq);
+                }
+                let first = backend
+                    .repo()
+                    .list_workflow_dispatch_page(&range, None, NonZeroU32::new(1).unwrap())
+                    .await
+                    .unwrap();
+                let last_key = expected.last().unwrap().2;
+                let state = states
+                    .iter()
+                    .find(|state| state.run_key == last_key)
+                    .unwrap();
+                let mut moved = following(state);
+                moved.next_state.priority.as_mut().unwrap().priority_key = 1;
+                moved
+                    .next_state
+                    .pending_workflow_task
+                    .as_mut()
+                    .unwrap()
+                    .scheduled_at = OffsetDateTime::UNIX_EPOCH - Duration::seconds(1);
+                applied(
+                    backend
+                        .repo()
+                        .commit_transition(last_key, moved, ShardEpoch::ZERO)
+                        .await
+                        .unwrap(),
+                );
+                let continuation = backend
+                    .repo()
+                    .list_workflow_dispatch_page(
+                        &range,
+                        first.last_examined,
+                        NonZeroU32::new(64).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                prop_assert!(
+                    continuation
+                        .candidates
+                        .iter()
+                        .all(|row| row.incarnation.run_key != last_key)
+                );
+                let head = backend
+                    .repo()
+                    .list_workflow_dispatch_page(&range, None, NonZeroU32::new(1).unwrap())
+                    .await
+                    .unwrap();
+                prop_assert_eq!(head.candidates[0].incarnation.run_key, last_key);
+                Ok(())
+            })
+        })
+        .unwrap();
+}
+
+pub(crate) fn run_sticky_recovery_cases(backend: &impl Backend, runtime: &tokio::runtime::Runtime) {
+    let strategy = (any::<bool>(), 0u8..5, -100i64..100, any::<bool>());
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: 100,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    runner
+        .run(&strategy, |(affinity, shape, seconds, legacy)| {
+            runtime.block_on(async {
+                // Feature: workflow-dispatch, Property 7: Sticky recovery and affinity independence
+                // Reloaded pending deadlines depend on task state, never the affinity hint or recovery clock.
+                let mut transition = fresh_transition(RunKey::new());
+                let state = &mut transition.next_state;
+                state.namespace_id = tokeira_types::NamespaceId::new();
+                let deadline = OffsetDateTime::UNIX_EPOCH + Duration::seconds(seconds);
+                let pending = state.pending_workflow_task.as_mut().unwrap();
+                pending.schedule_to_start_deadline = (!legacy).then_some(deadline);
+                if shape == 1 {
+                    pending.task_type = WorkflowTaskType::Speculative;
+                }
+                if shape == 2 {
+                    pending.started_event_id = Some(3);
+                    pending.started_at = Some(deadline);
+                }
+                if shape == 3 {
+                    state.status = ExecutionStatus::Paused;
+                }
+                if shape == 4 {
+                    state.status = ExecutionStatus::Completed;
+                }
+                state.sticky = affinity.then(|| StickyAffinity {
+                    worker_identity: WorkerIdentity("sticky-worker".into()),
+                    sticky_queue: TaskQueueName("sticky-q".into()),
+                    schedule_to_start_timeout: Duration::seconds(5),
+                });
+                let expected_sequence = pending.logical_seq;
+                state.next_workflow_task_seq = LogicalTaskSeq(expected_sequence.0 + 1);
+                let state = applied(commit(backend, transition).await.unwrap());
+                let LoadedRun::Existing(loaded) =
+                    backend.repo().load_run(state.run_key).await.unwrap()
+                else {
+                    panic!("run missing")
+                };
+                let entries = crate::recovery_entries(&loaded);
+                let expected = !legacy && matches!(shape, 0 | 3);
+                prop_assert_eq!(entries.sticky_deadline.is_some(), expected);
+                if let Some(entry) = entries.sticky_deadline {
+                    prop_assert_eq!(entry.deadline, deadline);
+                    prop_assert_eq!(entry.logical_seq, expected_sequence);
+                    prop_assert!(crate::recovery_needed(&loaded));
+                }
+                prop_assert_eq!(&loaded.sticky, &state.sticky);
+                if shape == 0 && legacy {
+                    prop_assert!(!backend.row(state.run_key).await.unwrap().unwrap().sticky);
+                }
+                if expected {
+                    let timed_out = BasicKernel
+                        .apply(
+                            LoadedRun::Existing(loaded),
+                            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                                logical_seq: expected_sequence,
+                                started_event_id: 0,
+                                timeout_type: WorkflowTaskTimeoutType::ScheduleToStart,
+                                now: deadline,
+                            }),
+                        )
+                        .unwrap();
+                    let replacement = applied(commit(backend, timed_out).await.unwrap());
+                    prop_assert!(replacement.sticky.is_none());
+                    prop_assert!(
+                        crate::recovery_entries(&replacement)
+                            .sticky_deadline
+                            .is_none()
+                    );
+                    if shape == 0 {
+                        let row = backend.row(state.run_key).await.unwrap().unwrap();
+                        prop_assert!(!row.sticky);
+                        prop_assert!(row.incarnation.logical_seq > expected_sequence);
+                        let page = backend
+                            .repo()
+                            .list_workflow_dispatch_page(
+                                &WorkflowDiscoveryRange {
+                                    namespace_id: replacement.namespace_id,
+                                    queue_name: replacement.task_queue.clone(),
+                                    routing: row.routing,
+                                },
+                                None,
+                                NonZeroU32::new(64).unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        prop_assert!(
+                            page.candidates
+                                .iter()
+                                .any(|row| row.incarnation.run_key == state.run_key)
+                        );
+                    } else {
+                        prop_assert!(backend.row(state.run_key).await.unwrap().is_none());
+                    }
+                }
+                Ok(())
+            })
         })
         .unwrap();
 }
@@ -482,22 +761,32 @@ pub(crate) async fn routing_and_home_pages(backend: &impl Backend) {
             break;
         }
     }
-    for row in expected {
+    for row in &expected {
         assert!(
             keys.contains(&row.incarnation.run_key),
             "home walk must include sticky intent"
         );
         assert_eq!(
             backend.row(row.incarnation.run_key).await.unwrap(),
-            Some(row)
+            Some(row.clone())
         );
     }
-    assert!(
-        backend
+    // Other fixtures may populate this home; only this fixture's run keys
+    // must be excluded. Walk every page so a leaked key cannot hide later.
+    let mut after = None;
+    loop {
+        let page = backend
             .repo()
-            .list_workflow_dispatch_for_home(ShardId(1), None, NonZeroU32::new(7).unwrap())
+            .list_workflow_dispatch_for_home(ShardId(1), after, NonZeroU32::new(64).unwrap())
             .await
-            .unwrap()
-            .is_empty()
-    );
+            .unwrap();
+        assert!(
+            page.iter()
+                .all(|key| { expected.iter().all(|row| row.incarnation.run_key != *key) })
+        );
+        if page.len() < 64 {
+            break;
+        }
+        after = page.last().copied();
+    }
 }

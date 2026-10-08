@@ -11,11 +11,10 @@ publish = false
 anyhow = "1"
 futures = "0.3"
 tokeira-engine = "0.5.1"
-temporalio-client = "1.0"
+temporalio-client = { version = "1.0", features = ["vendored-protox"] }
 temporalio-common = "1.0"
 temporalio-macros = "1.0"
 temporalio-sdk = "1.0"
 temporalio-workflow = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 url = "2"
-

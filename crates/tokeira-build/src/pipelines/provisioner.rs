@@ -33,10 +33,9 @@ use crate::{
     rust_toolchain_version,
 };
 
-/// System packages the build container needs on top of the pinned rust image
-/// (identical to the tokeirad image build — the provisioner links the same
-/// TLS/proto stack).
-const APT_LINE: &str = "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler libprotobuf-dev ca-certificates && rm -rf /var/lib/apt/lists/*";
+/// System packages needed for the provisioner's TLS dependencies on top of
+/// the pinned Rust image. Protobuf compilation is provided by protox.
+const APT_LINE: &str = "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*";
 
 /// Everything [`build_provisioner`] consumes. The snapshot and closure come
 /// from the freeze/resolve steps; the request only carries decisions, never

@@ -143,3 +143,19 @@ async fn workflow_dispatch_digest_collision_advances_past_rejected_coordinates()
     );
     assert!(range.matches(&next.candidates[0]));
 }
+
+#[test]
+fn workflow_dispatch_generated_ordered_traversal() {
+    crate::workflow_dispatch_tests::run_page_cases(
+        &InMemoryStore::with_shard_count(8),
+        &tokio::runtime::Runtime::new().unwrap(),
+    );
+}
+
+#[test]
+fn workflow_dispatch_generated_sticky_recovery() {
+    crate::workflow_dispatch_tests::run_sticky_recovery_cases(
+        &InMemoryStore::with_shard_count(8),
+        &tokio::runtime::Runtime::new().unwrap(),
+    );
+}

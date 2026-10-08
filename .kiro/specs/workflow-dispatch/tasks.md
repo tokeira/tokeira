@@ -116,8 +116,8 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     are mandatory in Task 15. No competing-owner claim is made at this checkpoint.
   - _Requirements: 1.2, 2.1, 10.3, 10.4, 12.1, 12.9_
 
-- [ ] 5. Add bounded memory-only workflow offers
-  - [ ] 5.1 Retain incarnation identity across ready and in-flight delivery
+- [x] 5. Add bounded memory-only workflow offers
+  - [x] 5.1 Retain incarnation identity across ready and in-flight delivery
     - In `broker.rs`, move `(run_key, logical_seq)` from ready to in flight on
       take. Deduplicate notification and discovered copies against both sets.
     - Implement the 5-second offer lease, 5-second ready retention interval,
@@ -126,7 +126,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       outcome, expiry, cancellation, or eviction; make no durable claim writes.
     - Preserve query/speculative and already-started eager response lifecycles.
     - _Requirements: 2.6, 3.6, 3.8, 4.1, 4.5, 4.6, 6.1, 6.2, 6.5, 10.5, 10.6_
-  - [ ] 5.2 Wire start outcomes and cancellation to the offer lease
+  - [x] 5.2 Wire start outcomes and cancellation to the offer lease
     - Integrate `start_polled_workflow_task_inner` outcomes without treating
       lease expiry as permission to undo a committed start. Stale/closed/paused
       work releases the entry and follows existing poll handling.
@@ -134,7 +134,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       the existing retry policy. Broker restart and home retirement discard
       volatile entries without deleting durable intent.
     - _Requirements: 5.6, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6_
-  - [ ] 5.3 Required property test: Property 6 — Volatile offer loss and ambiguity
+  - [x] 5.3 Required property test: Property 6 — Volatile offer loss and ambiguity
     - Implement at least 100 `proptest` cases in broker/runtime tests over
       notifications, duplicate pages, takes, cancellation, expiry, and ambiguous
       starts. Inspect repository writes to prove consumers author no delivery
@@ -142,8 +142,8 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Tag: `// Feature: workflow-dispatch, Property 6: Volatile offer loss and ambiguity`
     - _Requirements: 2.6, 3.8, 6.1, 6.2, 6.4, 6.5, 6.6, 12.2_
 
-- [ ] 6. Implement queue-home passes with bounded scheduler slices
-  - [ ] 6.1 Add the reusable discovery source and pass scheduler
+- [x] 6. Implement queue-home passes with bounded scheduler slices
+  - [x] 6.1 Add the reusable discovery source and pass scheduler
     - Add `runtime/discovery.rs` at `crates/tokeira-runtime/src/discovery.rs`,
       with the design's typed range/page/position interfaces and workflow source.
       Keep activity integration possible without adding an activity source yet.
@@ -155,7 +155,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       pass when capacity returns. Never add a hard scan cap that restarts a long
       blocked prefix on every slice.
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 4.1, 4.3, 4.4, 4.5, 4.6, 4.7, 10.7_
-  - [ ] 6.2 Resolve routing and filter candidates before admission
+  - [x] 6.2 Resolve routing and filter candidates before admission
     - Select Exact ranges and a coalesced Live range per queue family. Compare
       raw coordinates after digest lookup, advance past collisions/known/stale
       rows, and hydrate Live candidates serially for existing registry resolution.
@@ -165,14 +165,14 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Pass priority/fairness metadata to existing broker policy. Treat a failed
       post-commit notification as acceleration loss, not loss of durable intent.
     - _Requirements: 3.6, 3.7, 3.8, 4.2, 4.3, 10.2, 10.5_
-  - [ ] 6.3 Required property test: Property 3 — Ordered read-only traversal
+  - [x] 6.3 Required property test: Property 3 — Ordered read-only traversal
     - Implement at least 100 `proptest` cases across storage page adapters and
       runtime filtering. Generate ties, page sizes, collisions, mutations between
       pages, held rows, and multiple execution homes. Verify read-only traversal,
       strictly advancing positions, and later head discovery of moved/new rows.
     - Tag: `// Feature: workflow-dispatch, Property 3: Ordered read-only traversal`
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 10.2_
-  - [ ] 6.4 Required property test: Property 4 — Bounded slices without prefix starvation
+  - [x] 6.4 Required property test: Property 4 — Bounded slices without prefix starvation
     - Implement at least 100 `proptest` cases in discovery tests, generating
       finite held/incompatible prefixes, capacity changes, and fair competing
       ranges. Include a fixed prefix longer than both 64-row budgets, and track
@@ -183,8 +183,8 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Tag: `// Feature: workflow-dispatch, Property 4: Bounded slices without prefix starvation`
     - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 12.3_
 
-- [ ] 7. Register discovery from polling and runtime ownership
-  - [ ] 7.1 Add poll-demand guards and bounded retirement
+- [x] 7. Register discovery from polling and runtime ownership
+  - [x] 7.1 Add poll-demand guards and bounded retirement
     - Register normal poll demand before immediate take in the existing workflow
       poll path, independently of publication. Reference-count active demand,
       coalesce family Live ranges, and keep active demand scheduled.
@@ -195,7 +195,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       New polls recreate registration after restart; overlapping homes require
       no new durable queue-home fence. Sticky polls do not start periodic scans.
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 6.3, 7.1_
-  - [ ] 7.2 Required property test: Property 5 — Demand registration and home independence
+  - [x] 7.2 Required property test: Property 5 — Demand registration and home independence
     - Implement at least 100 `proptest` cases in runtime/broker tests over polls,
       renewals, cancellation, idle eviction, broker restart, and overlapping or
       retiring homes. Drop all publications and verify registration still works.
@@ -204,8 +204,8 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Tag: `// Feature: workflow-dispatch, Property 5: Demand registration and home independence`
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 6.3_
 
-- [ ] 8. Reconstruct sticky schedule-to-start deadlines
-  - [ ] 8.1 Add deadline recovery entries and epoch-scoped tracking
+- [x] 8. Reconstruct sticky schedule-to-start deadlines
+  - [x] 8.1 Add deadline recovery entries and epoch-scoped tracking
     - Extend `RecoveryEntries` and `is_empty()` with unstarted normal-task
       deadline entries, preserving the recovery flag's coverage of pending tasks.
       Derive from pending state even after ResetStickyTaskQueue clears affinity.
@@ -215,7 +215,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Preserve paused-task timeout policy, stale-sequence rejection, normal
       fallback, and speculative timers owned by their existing mechanism.
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 8.1, 10.6_
-  - [ ] 8.2 Required property test: Property 7 — Sticky recovery and affinity independence
+  - [x] 8.2 Required property test: Property 7 — Sticky recovery and affinity independence
     - Implement at least 100 `proptest` cases across recovery/timeout and storage
       entry tests. Generate restart before/after deadline, affinity reset,
       supersession, pause/resume, and start/timeout races using injected clocks.
@@ -487,6 +487,11 @@ unrelated lease work in this feature.
   Enable bounded, expiring offers and retire workflow backlog paths only when
   dispatch reconstruction and the serving gate are wired and verified together.
   Upgrade with every node stopped.
+  Tasks 5–7 are implemented behind a temporary internal construction choice,
+  disabled by ordinary runtime constructors. Tests enable it explicitly; the
+  cutover removes it. Task 8's deadline reconstruction and local acquisition
+  lifecycle checks are active with existing delivery. Task 9 still supplies the
+  complete reconciliation and writer serving gate.
 - Read crate-local instructions before implementing kernel/storage/runtime work.
   Keep API shape and public behavior tied to the vendored protos and Temporal
   v1.31.0 sources cited in requirements/design. Existing request-result gaps are

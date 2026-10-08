@@ -110,34 +110,7 @@ impl DsqlRunRepository {
         after: Option<WorkflowDispatchPosition>,
         limit: std::num::NonZeroU32,
     ) -> Result<WorkflowDispatchPage> {
-        let [queue_key, deployment_key, build_key] = range.lookup_keys();
-        let (mode, _, _) = range.routing.coordinates();
-        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(SELECT_ROW);
-        query
-            .push(" WHERE queue_namespace=")
-            .push_bind(range.namespace_id.0)
-            .push(" AND queue_key=")
-            .push_bind(queue_key)
-            .push(" AND routing_mode=")
-            .push_bind(mode)
-            .push(" AND deployment_key=")
-            .push_bind(deployment_key)
-            .push(" AND build_key=")
-            .push_bind(build_key)
-            .push(" AND sticky=false");
-        if let Some(position) = after {
-            query
-                .push(" AND (priority_key, scheduled_at, run_key) > (")
-                .push_bind(position.priority_key)
-                .push(",")
-                .push_bind(position.scheduled_at)
-                .push(",")
-                .push_bind(position.run_key.0)
-                .push(")");
-        }
-        query
-            .push(" ORDER BY priority_key, scheduled_at, run_key LIMIT ")
-            .push_bind(i64::from(limit.get()));
+        let mut query = queue_page_query(range, after, limit);
         let mut permit = self.director.acquire(DbClass::Read).await?;
         let mut tx = permit.connection()?.begin().await?;
         let candidates = query
@@ -161,11 +134,7 @@ impl DsqlRunRepository {
         after: Option<RunKey>,
         limit: std::num::NonZeroU32,
     ) -> Result<Vec<RunKey>> {
-        let sql = if after.is_some() {
-            "SELECT run_key FROM workflow_dispatch WHERE shard_id=$1 AND run_key > $3 ORDER BY run_key LIMIT $2"
-        } else {
-            "SELECT run_key FROM workflow_dispatch WHERE shard_id=$1 ORDER BY run_key LIMIT $2"
-        };
+        let sql = home_page_sql(after.is_some());
         let mut query = sqlx::query_scalar::<_, Uuid>(sql)
             .bind(Self::shard_id_to_uuid(home))
             .bind(i64::from(limit.get()));
@@ -177,5 +146,51 @@ impl DsqlRunRepository {
         let keys = query.fetch_all(&mut *tx).await?;
         tx.commit().await?;
         Ok(keys.into_iter().map(RunKey).collect())
+    }
+}
+
+// Shared with live EXPLAIN checks so measurement cannot silently drift from the
+// actual first-page or continuation SQL executed through the storage director.
+pub(super) fn queue_page_query(
+    range: &WorkflowDiscoveryRange,
+    after: Option<WorkflowDispatchPosition>,
+    limit: std::num::NonZeroU32,
+) -> sqlx::QueryBuilder<sqlx::Postgres> {
+    let [queue_key, deployment_key, build_key] = range.lookup_keys();
+    let (mode, _, _) = range.routing.coordinates();
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(SELECT_ROW);
+    query
+        .push(" WHERE queue_namespace=")
+        .push_bind(range.namespace_id.0)
+        .push(" AND queue_key=")
+        .push_bind(queue_key)
+        .push(" AND routing_mode=")
+        .push_bind(mode)
+        .push(" AND deployment_key=")
+        .push_bind(deployment_key)
+        .push(" AND build_key=")
+        .push_bind(build_key)
+        .push(" AND sticky=false");
+    if let Some(position) = after {
+        query
+            .push(" AND (priority_key, scheduled_at, run_key) > (")
+            .push_bind(position.priority_key)
+            .push(",")
+            .push_bind(position.scheduled_at)
+            .push(",")
+            .push_bind(position.run_key.0)
+            .push(")");
+    }
+    query
+        .push(" ORDER BY priority_key, scheduled_at, run_key LIMIT ")
+        .push_bind(i64::from(limit.get()));
+    query
+}
+
+pub(super) fn home_page_sql(continued: bool) -> &'static str {
+    if continued {
+        "SELECT run_key FROM workflow_dispatch WHERE shard_id=$1 AND run_key > $3 ORDER BY run_key LIMIT $2"
+    } else {
+        "SELECT run_key FROM workflow_dispatch WHERE shard_id=$1 ORDER BY run_key LIMIT $2"
     }
 }

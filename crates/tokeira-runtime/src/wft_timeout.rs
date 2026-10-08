@@ -1,17 +1,10 @@
-//! Workflow-task start-to-close timeout tracking and scanning.
+//! Workflow-task deadline tracking reconstructed from authoritative state.
 //!
-//! Owns the in-memory set of workflow tasks that have *started* on a worker and
-//! are waiting for completion, and the background scanner that fails any whose
-//! start-to-close deadline passes — the mechanism that reclaims a workflow task
-//! when a worker accepts it and then dies or stalls.
-//!
-//! This state is volatile and derived. The durable transition log is
-//! authoritative for which tasks are started and when; this map is a scan-time
-//! cache rebuilt from durable history by `crate::recovery::sweep_shard` on
-//! shard takeover, so a crash or failover costs only a rebuild. Entries carry
-//! their `ShardId` so a handoff evicts exactly the runs this node no longer owns.
-//! Keyed by `RunKey` (one started workflow task per run at a time), so completing
-//! a task simply removes its entry and the scanner never fires against it.
+//! Both unstarted normal schedule-to-start deadlines and started start-to-close
+//! deadlines are volatile caches. Recovery retains their absolute deadlines even
+//! when sticky affinity has been cleared. Acquisition identities prevent a stale
+//! sweep from reinstalling authority, and revision-checked retirement prevents an
+//! awaited timeout result from removing a worker start's replacement entry.
 
 use std::{
     collections::HashMap,
@@ -26,7 +19,10 @@ use tokeira_types::{LogicalTaskSeq, RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
+    lane::LaneHandle,
+    metrics as runtime_metrics,
+    scanner::pick_lane_for_run_key,
+    shard::{ShardAcquisition, ShardOwner},
 };
 
 /// Which workflow-task deadline an entry watches.
@@ -35,7 +31,7 @@ pub enum WftTimeoutKind {
     /// A STARTED task's start-to-close window (anchor = `started_at`).
     StartToClose,
     /// A sticky-dispatched UNSTARTED task's schedule-to-start window
-    /// (anchor = the schedule time; sticky raise S2/S3). Fires
+    /// (anchor plus duration = the durable absolute deadline). Fires
     /// `WorkflowTaskTimedOut(SCHEDULE_TO_START)`, which clears sticky and
     /// reschedules on the normal queue.
     ScheduleToStart,
@@ -46,7 +42,8 @@ pub enum WftTimeoutKind {
 /// `logical_seq` (and, for start-to-close, `started_event_id`) identify the
 /// exact attempt so the kernel can fence a timeout submitted against a task
 /// that has since been superseded. For `ScheduleToStart` entries
-/// `started_event_id` is 0 and `started_at` holds the SCHEDULE time; the map
+/// `started_event_id` is 0; recovery stores the absolute deadline in `started_at`
+/// with a zero duration, avoiding deadline extension after restart. The map
 /// stays keyed by run, so the start-to-close entry inserted when a worker
 /// picks the task up simply replaces the schedule-to-start one.
 #[derive(Clone, Debug, PartialEq)]
@@ -71,24 +68,142 @@ pub struct WftTimeoutEntry {
 /// same handle it already holds for the coarse sweep.
 #[derive(Clone, Default, Debug)]
 pub struct WftTimeoutTrackingState {
-    inner: Arc<Mutex<HashMap<RunKey, WftTimeoutEntry>>>,
+    inner: Arc<Mutex<TimeoutEntries>>,
+    owner: Arc<std::sync::OnceLock<Arc<RwLock<ShardOwner>>>>,
+    acquisition: Option<ShardAcquisition>,
+    #[cfg(test)]
+    recovery_pause: Arc<Mutex<Option<RecoveryPause>>>,
     speculative: Arc<std::sync::OnceLock<crate::speculative_timer::SpeculativeTimerSet>>,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct RecoveryPause {
+    installed: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[derive(Clone, Debug)]
+struct TrackedTimeout {
+    entry: WftTimeoutEntry,
+    revision: u64,
+    acquisition: Option<ShardAcquisition>,
+}
+
+#[derive(Debug, Default)]
+struct TimeoutEntries {
+    entries: HashMap<RunKey, TrackedTimeout>,
+    revision: u64,
+}
+
 impl WftTimeoutTrackingState {
-    /// Begin tracking a started workflow task, replacing any prior entry for the
-    /// run.
+    #[cfg(test)]
+    pub(crate) fn pause_next_recovery(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (installed_tx, installed_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *self.recovery_pause.lock().unwrap() = Some(RecoveryPause {
+            installed: installed_tx,
+            resume: resume_rx,
+        });
+        (installed_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_recovery(&self) -> Result<()> {
+        let pause = self.recovery_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            let _ = pause.installed.send(());
+            pause
+                .resume
+                .await
+                .map_err(|_| anyhow::anyhow!("candidate listing failed"))?;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_owner(&self, owner: Arc<RwLock<ShardOwner>>) {
+        let _ = self.owner.set(owner);
+    }
+
+    pub(crate) fn for_acquisition(&self, acquisition: ShardAcquisition) -> Self {
+        Self {
+            acquisition: Some(acquisition),
+            ..self.clone()
+        }
+    }
+
+    /// Track this task only under the current local acquisition. Recovery uses
+    /// a captured acquisition; committed transitions use the current one.
     pub fn insert(&self, entry: WftTimeoutEntry) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .insert(entry.run_key, entry);
+        let owner = self
+            .owner
+            .get()
+            .map(|owner| owner.read().expect("shard owner lock poisoned"));
+        let acquisition = self.acquisition.clone().or_else(|| {
+            owner
+                .as_ref()
+                .and_then(|owner| owner.acquisition(entry.shard_id))
+        });
+        if let Some(owner) = &owner {
+            let Some(acquisition) = &acquisition else {
+                return;
+            };
+            if acquisition.cancel.is_cancelled() || !owner.matches_acquisition(acquisition) {
+                return;
+            }
+        }
+        // Ownership read lock precedes the tracking lock everywhere, including
+        // cleanup. Replacement cannot interleave validation with installation.
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
+        inner.revision = inner
+            .revision
+            .checked_add(1)
+            .expect("timeout revision exhausted");
+        let revision = inner.revision;
+        inner.entries.insert(
+            entry.run_key,
+            TrackedTimeout {
+                entry,
+                revision,
+                acquisition,
+            },
+        );
+    }
+
+    fn remove_submitted(&self, submitted: &TrackedTimeout) {
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
+        if inner
+            .entries
+            .get(&submitted.entry.run_key)
+            .is_some_and(|current| current.revision == submitted.revision)
+        {
+            inner.entries.remove(&submitted.entry.run_key);
+        }
+    }
+
+    fn active(&self, entry: &TrackedTimeout) -> bool {
+        match (self.owner.get(), &entry.acquisition) {
+            (Some(owner), Some(acquisition)) => owner
+                .read()
+                .expect("shard owner lock poisoned")
+                .acquisition_active(acquisition),
+            (None, _) => true,
+            _ => false,
+        }
     }
 
     /// Number of started workflow tasks still awaiting a worker's reply.
     /// Drain reports it as `pending_wft_replies` (Req 8.2.8).
     pub fn tracked_count(&self) -> usize {
-        self.inner.lock().expect("inner lock poisoned").len()
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .entries
+            .len()
     }
 
     /// Stop tracking a run's workflow task, called when it completes or times out
@@ -97,6 +212,7 @@ impl WftTimeoutTrackingState {
         self.inner
             .lock()
             .expect("inner lock poisoned")
+            .entries
             .remove(&run_key);
     }
 
@@ -144,7 +260,8 @@ impl WftTimeoutTrackingState {
         self.inner
             .lock()
             .expect("inner lock poisoned")
-            .retain(|_, entry| entry.shard_id != shard_id);
+            .entries
+            .retain(|_, entry| entry.entry.shard_id != shard_id);
         if let Some(timers) = self.speculative.get() {
             timers.remove_all_for_shard(shard_id);
         }
@@ -156,8 +273,9 @@ impl WftTimeoutTrackingState {
         self.inner
             .lock()
             .expect("inner lock poisoned")
+            .entries
             .values()
-            .cloned()
+            .map(|tracked| tracked.entry.clone())
             .collect()
     }
 
@@ -166,9 +284,10 @@ impl WftTimeoutTrackingState {
         self.inner
             .lock()
             .expect("inner lock poisoned")
+            .entries
             .values()
-            .filter(|entry| entry.shard_id == shard_id)
-            .cloned()
+            .filter(|tracked| tracked.entry.shard_id == shard_id)
+            .map(|tracked| tracked.entry.clone())
             .collect()
     }
 }
@@ -199,7 +318,9 @@ impl Default for WftTimeoutScannerConfig {
 /// than as "no timeout", matching the durable encoding of an instantly-expiring
 /// deadline.
 pub fn evaluate_wft_timeout(entry: &WftTimeoutEntry, now: OffsetDateTime) -> bool {
-    now - entry.started_at > entry.workflow_task_timeout
+    (entry.kind == WftTimeoutKind::ScheduleToStart
+        && now >= entry.started_at + entry.workflow_task_timeout)
+        || now - entry.started_at > entry.workflow_task_timeout
         || entry.workflow_task_timeout.is_zero() && now >= entry.started_at
 }
 
@@ -212,30 +333,59 @@ pub(crate) async fn scan_wft_timeouts_once<F, Fut>(
     tracking: &WftTimeoutTrackingState,
     shard_id: Option<ShardId>,
     config: &WftTimeoutScannerConfig,
+    submit_timeout: F,
+) where
+    F: FnMut(WftTimeoutEntry, OffsetDateTime) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    scan_wft_timeouts_at(
+        tracking,
+        shard_id,
+        config,
+        OffsetDateTime::now_utc(),
+        submit_timeout,
+    )
+    .await;
+}
+
+async fn scan_wft_timeouts_at<F, Fut>(
+    tracking: &WftTimeoutTrackingState,
+    shard_id: Option<ShardId>,
+    config: &WftTimeoutScannerConfig,
+    now: OffsetDateTime,
     mut submit_timeout: F,
 ) where
     F: FnMut(WftTimeoutEntry, OffsetDateTime) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let now = OffsetDateTime::now_utc();
-    let entries = match shard_id {
-        Some(shard_id) => tracking.snapshot_for_shard(shard_id),
-        None => tracking.snapshot(),
-    };
+    let mut entries: Vec<_> = tracking
+        .inner
+        .lock()
+        .expect("inner lock poisoned")
+        .entries
+        .values()
+        .filter(|tracked| shard_id.is_none_or(|id| tracked.entry.shard_id == id))
+        .cloned()
+        .collect();
+    entries.sort_by_key(|tracked| tracked.entry.run_key);
     let mut submitted = 0usize;
 
-    for entry in entries {
+    for tracked in entries {
+        if !tracking.active(&tracked) {
+            continue;
+        }
+        let entry = &tracked.entry;
         if submitted >= config.max_timeouts_per_scan {
             break;
         }
-        if !evaluate_wft_timeout(&entry, now) {
+        if !evaluate_wft_timeout(entry, now) {
             continue;
         }
 
         match submit_timeout(entry.clone(), now).await {
             Ok(()) => {
                 runtime_metrics::record_workflow_task_timed_out(OutcomeLabel::Success);
-                tracking.remove(entry.run_key);
+                tracking.remove_submitted(&tracked);
             }
             Err(error) => {
                 let message = error.to_string();
@@ -251,7 +401,7 @@ pub(crate) async fn scan_wft_timeouts_once<F, Fut>(
                         run_key = ?entry.run_key,
                         "wft timeout scanner timeout rejected by kernel"
                     );
-                    tracking.remove(entry.run_key);
+                    tracking.remove_submitted(&tracked);
                 } else {
                     runtime_metrics::record_workflow_task_timed_out(OutcomeLabel::Failure);
                     tracing::warn!(
@@ -324,6 +474,103 @@ pub(crate) async fn run_wft_timeout_scanner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        // Feature: workflow-dispatch, Property 7: Sticky recovery and affinity independence
+        // A pending result can retire only its own entry, never a concurrent start or retry.
+        #[test]
+        fn timeout_result_preserves_replacement(rejected in any::<bool>(), newer_sequence in any::<bool>(), delay in 0i64..1000) {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let tracking = WftTimeoutTrackingState::default();
+                let now = fixed_now();
+                let mut original = sample_entry(RunKey::new(), now - Duration::seconds(delay));
+                original.kind = WftTimeoutKind::ScheduleToStart;
+                original.started_event_id = 0;
+                original.workflow_task_timeout = Duration::ZERO;
+                tracking.insert(original.clone());
+                let mut replacement = original.clone();
+                replacement.kind = WftTimeoutKind::StartToClose;
+                replacement.started_event_id = 9;
+                replacement.started_at = now;
+                replacement.workflow_task_timeout = Duration::seconds(30);
+                if newer_sequence { replacement.logical_seq.0 += 1; }
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let mut started_tx = Some(started_tx);
+                let mut release_rx = Some(release_rx);
+                let config = WftTimeoutScannerConfig::default();
+                let scan = scan_wft_timeouts_at(&tracking, Some(ShardId(0)), &config, now, |_, _| {
+                    let started_tx = started_tx.take().unwrap();
+                    let release_rx = release_rx.take().unwrap();
+                    async move {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        if rejected { Err(anyhow::anyhow!("kernel rejected stale timeout")) } else { Ok(()) }
+                    }
+                });
+                let replace = async {
+                    started_rx.await.unwrap();
+                    tracking.insert(replacement.clone());
+                    release_tx.send(()).unwrap();
+                };
+                tokio::join!(scan, replace);
+                assert_eq!(tracking.snapshot(), vec![replacement]);
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_waits_for_its_acquisition_and_old_sweep_cannot_reinstall_it() {
+        let owner = Arc::new(RwLock::new(ShardOwner::new(8)));
+        let tracking = WftTimeoutTrackingState::default();
+        tracking.set_owner(owner.clone());
+        let first = {
+            let mut owner = owner.write().unwrap();
+            owner.record_acquired(ShardId(3), tokeira_types::ShardEpoch(7));
+            owner.acquisition(ShardId(3)).unwrap()
+        };
+        let first_tracking = tracking.for_acquisition(first.clone());
+        let mut entry = sample_entry(RunKey::new(), fixed_now());
+        entry.shard_id = ShardId(3);
+        entry.kind = WftTimeoutKind::ScheduleToStart;
+        entry.workflow_task_timeout = Duration::ZERO;
+        first_tracking.insert(entry.clone());
+        scan_wft_timeouts_at(
+            &tracking,
+            Some(ShardId(3)),
+            &WftTimeoutScannerConfig::default(),
+            fixed_now(),
+            |_, _| async { panic!("sweeping acquisition cannot fire") },
+        )
+        .await;
+        let second = {
+            let mut owner = owner.write().unwrap();
+            owner.record_acquired(ShardId(3), tokeira_types::ShardEpoch(7));
+            owner.acquisition(ShardId(3)).unwrap()
+        };
+        let mut replacement = entry.clone();
+        replacement.logical_seq.0 += 1;
+        tracking
+            .for_acquisition(second.clone())
+            .insert(replacement.clone());
+        first_tracking.insert(entry);
+        assert!(first.cancel.is_cancelled());
+        assert!(!owner.write().unwrap().activate_acquisition(&first));
+        assert_eq!(tracking.snapshot(), vec![replacement]);
+        assert!(owner.write().unwrap().activate_acquisition(&second));
+        scan_wft_timeouts_at(
+            &tracking,
+            Some(ShardId(3)),
+            &WftTimeoutScannerConfig::default(),
+            fixed_now(),
+            |_, _| async { Ok(()) },
+        )
+        .await;
+        assert!(tracking.snapshot().is_empty());
+    }
 
     fn fixed_now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()

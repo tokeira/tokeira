@@ -637,6 +637,22 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
             .map(|task| task.map(WorkflowActivation::WorkflowTask))
     }
 
+    /// Preserve sticky queue kind independently of the optional normal-name
+    /// alias (`temporal/api/taskqueue/v1/message.proto`). The runtime uses this
+    /// distinction when registering periodic normal-queue discovery.
+    async fn poll_workflow_activation_with_kind(
+        &self,
+        queue: tokeira_types::QueueKey,
+        normal_queue: Option<tokeira_types::QueueKey>,
+        is_sticky: bool,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<Option<WorkflowActivation>> {
+        let _ = is_sticky;
+        self.poll_workflow_activation(queue, normal_queue, worker_identity, timeout)
+            .await
+    }
+
     /// Return a poller-count delta after a successful workflow poll, if the
     /// matching plane currently observes pressure on that physical queue.
     async fn workflow_poller_scaling_decision(
@@ -4793,6 +4809,7 @@ impl WorkflowService {
                         })
                         .await?;
                 }
+                let is_sticky = req.is_sticky;
                 let internal = to_internal::poll_request(req);
                 let scaling_queue = internal.queue.clone();
                 if internal.queue.deployment.is_some() {
@@ -4808,9 +4825,10 @@ impl WorkflowService {
                 }
                 let activation = self
                     .runtime
-                    .poll_workflow_activation(
+                    .poll_workflow_activation_with_kind(
                         internal.queue,
                         internal.normal_queue,
+                        is_sticky,
                         internal.worker_identity.clone(),
                         internal.timeout,
                     )

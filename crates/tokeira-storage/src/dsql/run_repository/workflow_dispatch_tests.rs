@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{Execute, PgPool, postgres::PgPoolOptions};
 use tokeira_kernel::HistoryEventKind;
 use tokeira_types::{LogicalTaskSeq, WorkerIdentity};
 
@@ -20,6 +20,127 @@ use crate::{
 struct Fixture {
     pool: PgPool,
     store: DsqlStore,
+}
+
+#[tokio::test]
+async fn workflow_dispatch_live_query_plans() -> Result<()> {
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return Ok(());
+    }
+    let fixture = Fixture::connect(8).await?;
+    let mut template =
+        crate::memory::projection_accumulator_tests::fresh_transition(RunKey::new()).next_state;
+    template.namespace_id = tokeira_types::NamespaceId::new();
+    let namespace_id = template.namespace_id;
+    let mut positions = Vec::new();
+    for batch in 0..32 {
+        let mut tx = fixture.pool.begin().await?;
+        for offset in 0..256 {
+            let index = batch * 256 + offset;
+            template.run_key = RunKey::new();
+            template.task_queue.0 = format!("explain-queue-{}", (index / 2) % 128);
+            template.deployment =
+                (index % 2 == 1).then(|| tokeira_types::DeploymentId("explain-deployment".into()));
+            template.build_id = template
+                .deployment
+                .as_ref()
+                .map(|_| tokeira_types::BuildId("explain-build".into()));
+            let home = ShardId(batch);
+            super::workflow_dispatch::maintain(&mut tx, &template, home).await?;
+            if index < 2 {
+                positions.push(
+                    crate::derive_workflow_dispatch(&template, home)
+                        .unwrap()
+                        .position(),
+                );
+            }
+        }
+        tx.commit().await?;
+    }
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM workflow_dispatch")
+        .fetch_one(&fixture.pool)
+        .await?;
+    let mut report = format!(
+        "Seeded rows: 8192; table rows after seeding: {total}.\n128 queue families; Live and Exact each contain 32 rows per seeded family.\n32 execution homes contain 256 seeded rows each.\nASYNC indexes were awaited by the migration runner before seeding.\n"
+    );
+    for (index, routing) in [
+        crate::WorkflowDispatchRouting::Live,
+        crate::WorkflowDispatchRouting::Exact {
+            deployment: tokeira_types::DeploymentId("explain-deployment".into()),
+            build_id: Some(tokeira_types::BuildId("explain-build".into())),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let range = crate::WorkflowDiscoveryRange {
+            namespace_id,
+            queue_name: tokeira_types::TaskQueueName("explain-queue-0".into()),
+            routing,
+        };
+        for continued in [false, true] {
+            let mut builder = super::workflow_dispatch::queue_page_query(
+                &range,
+                continued.then_some(positions[index]),
+                std::num::NonZeroU32::new(64).unwrap(),
+            );
+            let mut query = builder.build();
+            let arguments = query
+                .take_arguments()
+                .map_err(anyhow::Error::from_boxed)?
+                .expect("page query has bound arguments");
+            // Only the fixed EXPLAIN prefix is added; every candidate value
+            // remains a bound argument in the actual page query.
+            let mut explain =
+                sqlx::QueryBuilder::<sqlx::Postgres>::with_arguments("EXPLAIN ", arguments);
+            explain.push(query.sql().as_str());
+            let plan = explain
+                .build_query_as::<(String,)>()
+                .fetch_all(&fixture.pool)
+                .await?;
+            report.push_str(&format!(
+                "\nQueue mode {index}, continuation={continued}, range selectivity={:.6}:\n",
+                32.0 / total as f64
+            ));
+            for (line,) in plan {
+                report.push_str(&line);
+                report.push('\n');
+            }
+        }
+    }
+    let home = ShardId(0);
+    let home_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM workflow_dispatch WHERE shard_id=$1")
+            .bind(DsqlRunRepository::shard_id_to_uuid(home))
+            .fetch_one(&fixture.pool)
+            .await?;
+    for continued in [false, true] {
+        // Both SQL fragments are static; fixture coordinates stay bound.
+        let mut explain = sqlx::QueryBuilder::<sqlx::Postgres>::new("EXPLAIN ");
+        explain.push(super::workflow_dispatch::home_page_sql(continued));
+        let mut query = explain
+            .build_query_as::<(String,)>()
+            .bind(DsqlRunRepository::shard_id_to_uuid(home))
+            .bind(64i64);
+        if continued {
+            query = query.bind(positions[0].run_key.0);
+        }
+        let plan = query.fetch_all(&fixture.pool).await?;
+        report.push_str(&format!(
+            "\nHome continuation={continued}, matching rows={home_count}, selectivity={:.6}:\n",
+            home_count as f64 / total as f64
+        ));
+        for (line,) in plan {
+            report.push_str(&line);
+            report.push('\n');
+        }
+    }
+    if let Some(path) = std::env::var_os("TOKEIRA_WORKFLOW_DISPATCH_PLAN_OUTPUT") {
+        std::fs::write(path, report)?;
+    }
+    fixture.store.shutdown().await?;
+    fixture.pool.close().await;
+    Ok(())
 }
 
 impl Fixture {
@@ -48,22 +169,7 @@ impl Fixture {
             },
         )
         .await?;
-        // A fresh cluster can change its catalog while ASYNC indexes finish.
-        // Retry only the existing migration conflict outcome, leaving the runner
-        // and its separately owned retry policy unchanged.
-        for attempt in 0..20 {
-            match store.migration_runner().apply(&pool).await {
-                Ok(_) => break,
-                Err(error)
-                    if attempt < 19
-                        && error
-                            .downcast_ref::<sqlx::Error>()
-                            .and_then(|error| error.as_database_error())
-                            .and_then(|error| error.code())
-                            .is_some_and(|code| matches!(code.as_ref(), "OC001" | "40001")) => {}
-                Err(error) => return Err(error),
-            }
-        }
+        store.migration_runner().apply(&pool).await?;
         let jobs = sqlx::query_as::<_, (String, String)>(
             "SELECT job_id, status FROM sys.jobs WHERE job_type = 'INDEX_BUILD'",
         )
@@ -301,4 +407,28 @@ async fn digest_collision(fixture: &Fixture) -> Result<()> {
         .await?;
     assert!(range.matches(&next.candidates[0]));
     Ok(())
+}
+
+#[test]
+fn workflow_dispatch_live_generated_ordered_traversal() {
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return;
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let fixture = runtime.block_on(Fixture::connect(8)).unwrap();
+    crate::workflow_dispatch_tests::run_page_cases(&fixture, &runtime);
+    runtime.block_on(fixture.store.shutdown()).unwrap();
+    runtime.block_on(fixture.pool.close());
+}
+
+#[test]
+fn workflow_dispatch_live_generated_sticky_recovery() {
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return;
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let fixture = runtime.block_on(Fixture::connect(8)).unwrap();
+    crate::workflow_dispatch_tests::run_sticky_recovery_cases(&fixture, &runtime);
+    runtime.block_on(fixture.store.shutdown()).unwrap();
+    runtime.block_on(fixture.pool.close());
 }

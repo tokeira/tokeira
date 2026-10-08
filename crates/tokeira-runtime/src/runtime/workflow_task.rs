@@ -829,6 +829,42 @@ where
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<WorkflowActivation>> {
+        let is_sticky = normal_queue.is_some();
+        self.poll_workflow_activation_with_kind(
+            queue,
+            normal_queue,
+            is_sticky,
+            worker_identity,
+            timeout_after,
+        )
+        .await
+    }
+
+    /// Preserve the wire queue kind even when a sticky poll omits its normal
+    /// queue name. Only normal polling registers periodic durable discovery;
+    /// sticky delivery continues through notifications and recovered deadlines.
+    pub async fn poll_workflow_activation_with_kind(
+        &self,
+        queue: QueueKey,
+        normal_queue: Option<QueueKey>,
+        is_sticky: bool,
+        worker_identity: WorkerIdentity,
+        timeout_after: tokio::time::Duration,
+    ) -> Result<Option<WorkflowActivation>> {
+        // Polls create demand before the first take, even if no publication ever
+        // reached matching. Sticky polls retain their notification/timer path.
+        let _demand = if !is_sticky {
+            self.discovery.as_ref().and_then(|(registry, homes)| {
+                homes
+                    .local_home(&queue)
+                    .filter(|home| !home.cancel.is_cancelled())
+                    .map(|home| {
+                        registry.register_poll(queue.clone(), home, tokio::time::Instant::now())
+                    })
+            })
+        } else {
+            None
+        };
         let deadline = tokio::time::Instant::now() + timeout_after;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -870,7 +906,11 @@ where
                         // This is the poll-side of Invariant I.1's "clear broker
                         // in-flight" for a superseded speculative task (spec
                         // speculative-wft R.2). A non-stale error propagates.
-                        Err(error) if is_stale_workflow_task_start(&error) => {
+                        Err(error)
+                            if is_stale_workflow_task_start(&error)
+                                || (self.discovery.is_some()
+                                    && is_withdrawn_workflow_task_start(&error)) =>
+                        {
                             tracing::debug!(
                                 ?error,
                                 "discarded superseded workflow task from broker; re-polling"
@@ -1795,10 +1835,20 @@ where
             tokeira.workflow_task_sequence = offered.logical_seq.0,
             tokeira.attempt = tracing::field::Empty,
         );
+        let offer_key = (offered.run_key, offered.logical_seq);
         let result = self
             .start_polled_workflow_task_inner(offered, entered_at, worker_identity)
             .instrument(span.clone())
             .await;
+        // Ambiguous failures and cancelled futures keep only the bounded lease.
+        // A late outcome cannot remove a replacement admitted after that lease.
+        if result.is_ok()
+            || result.as_ref().is_err_and(|error| {
+                is_stale_workflow_task_start(error) || is_withdrawn_workflow_task_start(error)
+            })
+        {
+            self.broker.finish_offer(offer_key, entered_at).await;
+        }
         if let Ok(started) = &result {
             span.record("tokeira.workflow_id", started.workflow_id.0.as_str());
             span.record("tokeira.run_id", started.run_id.0.to_string());
@@ -1911,21 +1961,6 @@ where
             attempt: pending.attempt,
             shard_epoch: self.current_shard_epoch(new_state.run_key).await?,
         };
-        let shard_id = self.shard_id_for(new_state.run_key).await;
-        // A SPECULATIVE task's start-to-close is enforced by the precise
-        // in-memory timer the lane armed on this same WorkflowTaskStarted commit
-        // (spec speculative-wft R.2), so it is kept out of the coarse sweep.
-        if pending.task_type != tokeira_kernel::WorkflowTaskType::Speculative {
-            self.wft_timeout_tracking.insert(WftTimeoutEntry {
-                kind: WftTimeoutKind::StartToClose,
-                run_key: new_state.run_key,
-                shard_id,
-                logical_seq: pending.logical_seq,
-                started_event_id,
-                started_at: pending.started_at.unwrap_or(now),
-                workflow_task_timeout: new_state.workflow_task_timeout,
-            });
-        }
         self.delivery_metrics
             .record_latency(&offered.queue, entered_at.elapsed());
 
@@ -1990,20 +2025,6 @@ where
             attempt: pending.attempt,
             shard_epoch: self.current_shard_epoch(state.run_key).await?,
         };
-        let shard_id = self.shard_id_for(state.run_key).await;
-        // Speculative tasks use the precise in-memory timer (armed by the lane
-        // on the start commit), not the coarse sweep (spec speculative-wft R.2).
-        if pending.task_type != tokeira_kernel::WorkflowTaskType::Speculative {
-            self.wft_timeout_tracking.insert(WftTimeoutEntry {
-                kind: WftTimeoutKind::StartToClose,
-                run_key: state.run_key,
-                shard_id,
-                logical_seq: pending.logical_seq,
-                started_event_id,
-                started_at,
-                workflow_task_timeout: state.workflow_task_timeout,
-            });
-        }
         let queue = QueueKey {
             namespace_id: state.namespace_id,
             task_queue: state.task_queue.clone(),
@@ -2134,6 +2155,19 @@ fn is_stale_workflow_task_start(error: &anyhow::Error) -> bool {
                     | tokeira_kernel::Reject::WorkflowTaskAlreadyStarted { .. }
                     | tokeira_kernel::Reject::NoPendingWorkflowTask
                     | tokeira_kernel::Reject::WorkflowPaused
+            )
+        })
+}
+
+fn is_withdrawn_workflow_task_start(error: &anyhow::Error) -> bool {
+    // Read-only discovery can race closure or retention. Matching discards
+    // NotFound and keeps polling (matching_engine.go:767-778 @ v1.31.0).
+    error
+        .downcast_ref::<crate::lane::KernelRejected>()
+        .is_some_and(|rejected| {
+            matches!(
+                rejected.0,
+                tokeira_kernel::Reject::MissingRun | tokeira_kernel::Reject::RunClosed(_)
             )
         })
 }

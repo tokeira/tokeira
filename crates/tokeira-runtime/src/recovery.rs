@@ -22,13 +22,11 @@
 //! its `on_lost` channel, so a shard whose lease is fenced mid-sweep can be torn
 //! down rather than activated.
 //!
-//! Epoch / lease interaction. Lease acquisition yields a `ShardEpoch` that every
-//! subsequent commit for the shard carries; an older epoch is rejected at commit
-//! time. The renewer does not touch the epoch — it only refreshes the lease's
-//! expiry — so a `Rejected` outcome means another node fenced this one and the
-//! local shard must be relinquished. The sweep deliberately does not consult the
-//! epoch: it reconstructs derived state regardless, because correctness rests on
-//! commit-time fencing, not on the sweep.
+//! Acquisition lifetime. Membership cancels a superseded or failed sweep and
+//! only activates the same local acquisition that began it. Workflow-task
+//! deadline installation also checks that acquisition under the owner lock, so
+//! an old sweep cannot overwrite a successor's tracking. These local checks do
+//! not establish a transaction-local fence against competing durable owners.
 
 use std::sync::Arc;
 
@@ -135,7 +133,13 @@ where
                 // path. The fresh broker has no poller observations, so it
                 // safely selects the supplied normal fallback without mutating
                 // durable affinity.
-                broker.publish_workflow_task(task, None).await;
+                if state.pending_workflow_task.as_ref().is_some_and(|pending| {
+                    pending.task_type == tokeira_kernel::WorkflowTaskType::Speculative
+                }) {
+                    broker.publish_speculative_workflow_task(task, None).await;
+                } else {
+                    broker.publish_workflow_task(task, None).await;
+                }
                 result.workflow_tasks_republished += 1;
             }
             if let Some(entry) = entries.workflow_timeout {
@@ -163,6 +167,24 @@ where
                 });
                 result.wft_timeout_entries_reconstructed += 1;
             }
+            if let Some(entry) = entries.sticky_deadline {
+                // Durable sticky timers survive affinity reset and restart
+                // (workflow/task_generator.go:GenerateScheduleWorkflowTaskTasks
+                // @ v1.31.0). Anchor directly at the stored deadline, including
+                // overdue entries; reconstruction never grants another window.
+                wft_timeout_tracking.insert(WftTimeoutEntry {
+                    kind: WftTimeoutKind::ScheduleToStart,
+                    run_key: entry.run_key,
+                    shard_id,
+                    logical_seq: entry.logical_seq,
+                    started_event_id: 0,
+                    started_at: entry.deadline,
+                    workflow_task_timeout: time::Duration::ZERO,
+                });
+                result.wft_timeout_entries_reconstructed += 1;
+            }
+            #[cfg(test)]
+            wft_timeout_tracking.pause_recovery().await?;
             for entry in entries.activities {
                 // The last heartbeat time comes from the run's state, so the
                 // heartbeat deadline is the one the previous owner would have
@@ -370,6 +392,7 @@ pub async fn run_lease_renewer<R>(
                 failures = 0;
             }
             Ok(LeaseOutcome::Rejected { .. }) => {
+                cancel.cancel();
                 if let Some(tx) = on_lost.take() {
                     let _ = tx.send(());
                 }
@@ -387,6 +410,7 @@ pub async fn run_lease_renewer<R>(
                     "lease renewer failed to renew shard lease"
                 );
                 if failures > max_retries {
+                    cancel.cancel();
                     if let Some(tx) = on_lost.take() {
                         let _ = tx.send(());
                     }

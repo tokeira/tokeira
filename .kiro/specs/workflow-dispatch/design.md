@@ -368,8 +368,9 @@ the same Live range; no policy-selected version has been hidden in an Exact rang
 Implementation tests must cover classification and range selection in both modes.
 
 Each admitted versioned normal poll selects its Exact coordinates and its family's
-Live range. Unversioned polls select the corresponding unversioned Exact range
-and the same Live range. Routing configuration can change without rewriting every
+Live range. Unversioned polls select only the Live range: the committed classifier
+places tasks without explicit deployment coordinates there, so no separate
+unversioned Exact range exists. Routing configuration can change without rewriting every
 run or requiring a notification. Sticky delivery uses the same resolver, including
 the existing compatible normal fallback; registry reads never clear sticky state.
 
@@ -608,8 +609,21 @@ policy and resumes without inventing a fresh deadline.
 After a commit, lane tracking arms that same deadline. During acquisition, install
 it before Active but do not submit a timeout command until Active. An overdue
 deadline is due immediately at the first processing opportunity; never replace it
-with `now + sticky_timeout`. Timeout tracking is scoped to the acquisition epoch
-so cancellation cannot leave an old owner's timer authority alive.
+with `now + sticky_timeout`. Timeout tracking carries the acquisition epoch and a
+local generation, including a new generation for reacquisition at the same epoch.
+Installation checks that identity under the ownership lock. Activation and cleanup
+use the same identity, so a cancelled, failed or superseded sweep cannot activate
+or overwrite/remove its successor's deadline entries. Both acquisition paths cancel
+partial sweeps, and the managed lease-loss watcher retains the acquisition's cleanup
+guard after activation. These local lifecycle checks do not replace the deferred
+transaction-local competing-owner fence.
+
+Each installed timeout also has a monotonically increasing local revision. After
+awaiting submission, success and stale rejection retire only the submitted
+revision. A concurrent start replaces schedule-to-start with start-to-close while
+retaining the incarnation, so logical sequence alone cannot identify the entry.
+The post-commit hook installs the started deadline before returning its result;
+response assembly cannot reinstall an older timeout after a lost or delayed reply.
 
 `ResetStickyTaskQueue` can change row destination to normal because affinity is
 gone, but keeps the pending deadline. A task that starts first invalidates the

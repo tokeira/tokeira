@@ -38,49 +38,53 @@ where
         shard_id: ShardId,
         epoch: ShardEpoch,
     ) -> Result<SweepResult> {
-        {
-            let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
-            let _ = owner.record_acquired(shard_id, epoch);
-        }
-        let swept = sweep_shard(
-            shard_id,
-            self.repo.as_ref(),
-            &self.broker,
-            &self.lanes,
-            self.lanes.len(),
-            &self.workflow_timeout_tracking,
-            &self.wft_timeout_tracking,
-            &self.activity_tracking,
-            &self.nexus_timeout_tracking,
-            &self.completion_callback_tracking,
-            &self.activity_retry_deps(),
-        )
-        .await;
-        self.settle_self_assigned_recovery(shard_id, swept).await
+        let mut recovery = self.begin_acquisition(shard_id, epoch);
+        let tracking = self
+            .wft_timeout_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let retry = self.activity_retry_deps();
+        let shutdown = self.runtime_shutdown.cancellation_token();
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped during shard recovery")),
+            _ = recovery.acquisition.cancel.cancelled() => return Err(anyhow!("shard recovery acquisition cancelled")),
+            result = sweep_shard(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
+                &self.workflow_timeout_tracking, &tracking, &self.activity_tracking,
+                &self.nexus_timeout_tracking, &self.completion_callback_tracking, &retry) => result?,
+        };
+        Self::settle_self_assigned_recovery(&mut recovery, Ok(result))
     }
 
-    /// Finish a self-assigned shard's recovery: activate it after a successful
-    /// sweep; after a failed one, relinquish it so it admits nothing and keeps
-    /// no partly rebuilt tracking.
-    async fn settle_self_assigned_recovery(
-        &self,
-        shard_id: ShardId,
+    fn settle_self_assigned_recovery(
+        recovery: &mut AcquisitionCleanup,
         swept: Result<SweepResult>,
     ) -> Result<SweepResult> {
-        match swept {
-            Ok(result) => {
-                self.shard_owner
-                    .write()
-                    .expect("shard_owner lock poisoned")
-                    .mark_active(shard_id);
-                Ok(result)
-            }
-            Err(error) => {
-                self.relinquish_shard(shard_id).await;
-                Err(error)
-            }
+        let result = swept?;
+        recovery.activate()?;
+        recovery.disarm();
+        Ok(result)
+    }
+
+    fn begin_acquisition(&self, shard_id: ShardId, epoch: ShardEpoch) -> AcquisitionCleanup {
+        let acquisition = {
+            let mut owner = self.shard_owner.write().expect("shard owner lock poisoned");
+            owner.record_acquired(shard_id, epoch);
+            owner
+                .acquisition(shard_id)
+                .expect("just recorded acquisition")
+        };
+        AcquisitionCleanup {
+            acquisition,
+            owner: self.shard_owner.clone(),
+            workflow: self.workflow_timeout_tracking.clone(),
+            wft: self.wft_timeout_tracking.clone(),
+            activity: self.activity_tracking.clone(),
+            nexus: self.nexus_timeout_tracking.clone(),
+            callbacks: self.completion_callback_tracking.clone(),
+            armed: true,
         }
     }
+
     /// Acquire a durable lease on `shard_id`, reconstruct its volatile state,
     /// and bring it into service.
     ///
@@ -132,13 +136,10 @@ where
             return Ok(epoch);
         }
 
-        let cancel = {
-            let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
-            owner.record_acquired(shard_id, epoch)
-        };
-
-        let (lost_tx, lost_rx) = oneshot::channel();
-        tokio::spawn(run_lease_renewer(
+        let recovery = self.begin_acquisition(shard_id, epoch);
+        let cancel = recovery.acquisition.cancel.clone();
+        let (lost_tx, mut lost_rx) = oneshot::channel();
+        let _renewer = self.runtime_shutdown.spawn(run_lease_renewer(
             self.repo.clone(),
             shard_id,
             self.owner_identity.clone(),
@@ -149,52 +150,37 @@ where
             cancel.clone(),
             lost_tx,
         ));
-
-        sweep_shard(
-            shard_id,
-            self.repo.as_ref(),
-            &self.broker,
-            &self.lanes,
-            self.lanes.len(),
-            &self.workflow_timeout_tracking,
-            &self.wft_timeout_tracking,
-            &self.activity_tracking,
-            &self.nexus_timeout_tracking,
-            &self.completion_callback_tracking,
-            // Activity republication runs through the shared preparation gate
-            // with the runtime's broker and deployment registry.
-            &self.activity_retry_deps(),
-        )
-        .await?;
-
-        // Sweep must complete before the shard goes Active: only now is the
-        // in-memory delivery/timeout state a faithful rebuild of durable
-        // history, so it is safe to start admitting commands against it.
-        self.shard_owner
-            .write()
-            .expect("shard_owner lock poisoned")
-            .mark_active(shard_id);
-
-        let shard_owner = self.shard_owner.clone();
-        let workflow_timeout_tracking = self.workflow_timeout_tracking.clone();
-        let wft_timeout_tracking = self.wft_timeout_tracking.clone();
-        let activity_tracking = self.activity_tracking.clone();
-        let nexus_timeout_tracking = self.nexus_timeout_tracking.clone();
-        let completion_callback_tracking = self.completion_callback_tracking.clone();
-        // The renewer fires lost_rx when the lease is fenced. Move the shard to
-        // Draining and drop all per-shard tracking so this node stops scanning
-        // timeouts for runs whose ownership has moved elsewhere.
-        tokio::spawn(async move {
-            if lost_rx.await.is_ok() {
-                let mut owner = shard_owner.write().expect("shard_owner lock poisoned");
-                owner.mark_draining(shard_id);
-                drop(owner);
-                workflow_timeout_tracking.remove_all_for_shard(shard_id);
-                wft_timeout_tracking.remove_all_for_shard(shard_id);
-                activity_tracking.remove_all_for_shard(shard_id);
-                nexus_timeout_tracking.remove_all_for_shard(shard_id);
-                completion_callback_tracking.remove_all_for_shard(shard_id);
+        let tracking = self
+            .wft_timeout_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let retry = self.activity_retry_deps();
+        let shutdown = self.runtime_shutdown.cancellation_token();
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped during shard recovery")),
+            _ = cancel.cancelled() => return Err(anyhow!("shard acquisition cancelled during recovery")),
+            _ = &mut lost_rx => return Err(anyhow!("shard lease lost during recovery")),
+            result = sweep_shard(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
+                &self.workflow_timeout_tracking, &tracking, &self.activity_tracking,
+                &self.nexus_timeout_tracking, &self.completion_callback_tracking, &retry) => { result?; }
+        }
+        // No await between final loss inspection and activation. Generation and
+        // cancellation are checked under the same owner lock as replacement.
+        if !matches!(
+            lost_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ) {
+            return Err(anyhow!("shard lease lost before activation"));
+        }
+        recovery.activate()?;
+        let _watcher = self.runtime_shutdown.spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => {},
+                _ = cancel.cancelled() => {},
+                _ = lost_rx => {},
             }
+            // Cleanup owns this acquisition, not the shard's future occupant.
+            drop(recovery);
         });
 
         Ok(epoch)
@@ -209,10 +195,10 @@ where
     /// lease-loss handling in [`acquire_shard`](Self::acquire_shard); the
     /// durable lease is expected to be released by the caller / controller flow.
     pub async fn relinquish_shard(&self, shard_id: ShardId) {
-        self.shard_owner
-            .write()
-            .expect("shard_owner lock poisoned")
-            .mark_draining(shard_id);
+        // Hold ownership through cleanup: a replacement acquisition cannot
+        // install entries between draining and removal of the old tracking.
+        let mut owner = self.shard_owner.write().expect("shard owner lock poisoned");
+        owner.mark_draining(shard_id);
         self.workflow_timeout_tracking
             .remove_all_for_shard(shard_id);
         self.wft_timeout_tracking.remove_all_for_shard(shard_id);
@@ -220,10 +206,7 @@ where
         self.nexus_timeout_tracking.remove_all_for_shard(shard_id);
         self.completion_callback_tracking
             .remove_all_for_shard(shard_id);
-        self.shard_owner
-            .write()
-            .expect("shard_owner lock poisoned")
-            .remove(shard_id);
+        owner.remove(shard_id);
     }
 }
 
@@ -293,6 +276,58 @@ where
             budget_applier,
         );
         tokio::spawn(client.run(shutdown))
+    }
+}
+
+/// Synchronous cancellation cleanup also covers a caller dropping acquisition
+/// mid-sweep. The owner lock serializes cleanup with replacement installation.
+struct AcquisitionCleanup {
+    acquisition: crate::shard::ShardAcquisition,
+    owner: Arc<RwLock<ShardOwner>>,
+    workflow: WorkflowTimeoutTrackingState,
+    wft: WftTimeoutTrackingState,
+    activity: ActivityTrackingState,
+    nexus: NexusTimeoutTrackingState,
+    callbacks: CompletionCallbackTrackingState,
+    armed: bool,
+}
+
+impl AcquisitionCleanup {
+    fn activate(&self) -> Result<()> {
+        if !self
+            .owner
+            .write()
+            .expect("shard owner lock poisoned")
+            .activate_acquisition(&self.acquisition)
+        {
+            return Err(anyhow!("shard acquisition superseded before activation"));
+        }
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AcquisitionCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.acquisition.cancel.cancel();
+        let mut owner = self.owner.write().expect("shard owner lock poisoned");
+        if !owner.matches_acquisition(&self.acquisition) {
+            return;
+        }
+        let shard_id = self.acquisition.shard_id;
+        owner.mark_draining(shard_id);
+        self.workflow.remove_all_for_shard(shard_id);
+        self.wft.remove_all_for_shard(shard_id);
+        self.activity.remove_all_for_shard(shard_id);
+        self.nexus.remove_all_for_shard(shard_id);
+        self.callbacks.remove_all_for_shard(shard_id);
+        owner.remove(shard_id);
     }
 }
 
@@ -510,13 +545,7 @@ mod tests {
         use crate::activity_timeout::ActivityTrackingEntry;
 
         let (runtime, _) = runtime_with_membership_client(Arc::new(InMemoryStore::default()));
-        {
-            let mut owner = runtime
-                .shard_owner
-                .write()
-                .expect("shard_owner lock poisoned");
-            let _ = owner.record_acquired(ShardId(0), ShardEpoch(3));
-        }
+        let mut recovery = runtime.begin_acquisition(ShardId(0), ShardEpoch(3));
         // Tracking the failed sweep had already rebuilt.
         let now = OffsetDateTime::now_utc();
         runtime.activity_tracking.insert(ActivityTrackingEntry {
@@ -530,10 +559,12 @@ mod tests {
             cancel_requested: false,
         });
 
-        let error = runtime
-            .settle_self_assigned_recovery(ShardId(0), Err(anyhow!("candidate listing failed")))
-            .await
-            .expect_err("the sweep's error is returned");
+        let error = TokeiraRuntime::<InMemoryStore>::settle_self_assigned_recovery(
+            &mut recovery,
+            Err(anyhow!("candidate listing failed")),
+        )
+        .expect_err("the sweep's error is returned");
+        drop(recovery);
 
         assert!(error.to_string().contains("candidate listing failed"));
         assert!(runtime.active_shards().is_empty());
@@ -547,6 +578,103 @@ mod tests {
         );
         assert!(runtime.activity_tracking.snapshot().is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupted_recovery_cannot_activate_or_clear_a_replacement_acquisition() {
+        for managed in [false, true] {
+            for interruption in 0..4 {
+                let store = Arc::new(InMemoryStore::default());
+                let mut item = tokeira_kernel::Kernel::apply(
+                    &BasicKernel,
+                    LoadedRun::Absent,
+                    Command::Start(start_request()),
+                )
+                .unwrap();
+                let run_key = item.next_state.run_key;
+                let deadline = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+                item.next_state
+                    .pending_workflow_task
+                    .as_mut()
+                    .unwrap()
+                    .schedule_to_start_deadline = Some(deadline);
+                store
+                    .commit_transition(run_key, item, ShardEpoch::ZERO)
+                    .await
+                    .unwrap();
+                let (runtime, _) = runtime_with_membership_client(store);
+                let (installed, resume) = runtime.wft_timeout_tracking.pause_next_recovery();
+                let acquiring = runtime.clone();
+                let task = tokio::spawn(async move {
+                    if managed {
+                        acquiring.acquire_shard(ShardId(0)).await.map(|_| ())
+                    } else {
+                        acquiring
+                            .recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO)
+                            .await
+                            .map(|_| ())
+                    }
+                });
+                installed.await.unwrap();
+                assert!(runtime.active_shards().is_empty());
+                let entries = runtime.wft_timeout_tracking.snapshot();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(
+                    entries[0].started_at + entries[0].workflow_task_timeout,
+                    deadline
+                );
+                match interruption {
+                    0 => {
+                        drop(resume);
+                        assert!(task.await.unwrap().is_err());
+                    }
+                    1 => {
+                        task.abort();
+                        assert!(task.await.unwrap_err().is_cancelled());
+                        drop(resume);
+                    }
+                    2 => {
+                        runtime.relinquish_shard(ShardId(0)).await;
+                        assert!(task.await.unwrap().is_err());
+                        drop(resume);
+                    }
+                    _ => {
+                        let epoch = runtime
+                            .shard_owner
+                            .read()
+                            .unwrap()
+                            .epoch_of(ShardId(0))
+                            .unwrap();
+                        runtime
+                            .recover_self_assigned_shard(ShardId(0), epoch)
+                            .await
+                            .unwrap();
+                        let _ = resume.send(());
+                        assert!(task.await.unwrap().is_err());
+                        assert_eq!(runtime.active_shards(), vec![ShardId(0)]);
+                        assert_eq!(runtime.wft_timeout_tracking.snapshot(), entries);
+                    }
+                }
+                if interruption < 3 {
+                    assert!(runtime.active_shards().is_empty());
+                    assert!(runtime.wft_timeout_tracking.snapshot().is_empty());
+                    assert!(
+                        runtime
+                            .shard_owner
+                            .read()
+                            .unwrap()
+                            .epoch_of(ShardId(0))
+                            .is_none()
+                    );
+                }
+                runtime.runtime_shutdown.begin_shutdown();
+                runtime
+                    .runtime_shutdown
+                    .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+                    .await
+                    .unwrap();
+            }
+        }
     }
 
     fn start_request() -> StartRequest {

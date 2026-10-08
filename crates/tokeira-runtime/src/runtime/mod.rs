@@ -82,16 +82,15 @@ use crate::{
         PendingUpdateTransport, UpdateLifecycleSnapshot, UpdateLifecycleStage, UpdateOutcome,
         UpdateRegistry, UpdateResolution, UpdateTransportResolution, UpdateWaitPolicy,
     },
-    wft_timeout::{
-        WftTimeoutEntry, WftTimeoutKind, WftTimeoutScannerConfig, WftTimeoutTrackingState,
-        run_wft_timeout_scanner,
-    },
+    wft_timeout::{WftTimeoutScannerConfig, WftTimeoutTrackingState, run_wft_timeout_scanner},
     worker_registry::{WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata},
     workflow_rules::{matching_pause_rule, pause_info_for_rule},
 };
 
 mod activity;
 mod commit;
+#[cfg(test)]
+mod discovery_tests;
 mod lifecycle;
 mod membership;
 mod query;
@@ -207,6 +206,10 @@ pub struct TokeiraRuntime<R> {
     repo: Arc<R>,
     /// In-memory workflow-task broker.
     broker: InMemoryBroker,
+    discovery: Option<(
+        crate::discovery::DiscoveryRegistry,
+        Arc<dyn crate::discovery::QueueHomeProvider>,
+    )>,
     /// In-memory activity-task broker.
     activity_broker: InMemoryActivityBroker,
     /// Lane executor handles (one per lane).
@@ -693,7 +696,55 @@ where
         // wired by the server bootstrap, `None` for the simpler constructors and tests.
         namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
     ) -> Self {
-        let broker = InMemoryBroker::default();
+        Self::new_with_delivery(
+            repo,
+            lane_count,
+            config,
+            timer_config,
+            workflow_timeout_config,
+            backlog_config,
+            activity_timeout_config,
+            nexus_timeout_config,
+            nexus_registry,
+            nexus_client,
+            nexus_completion,
+            shard_count,
+            owner_identity,
+            node_endpoint,
+            seed_default_shard,
+            namespace_resolver,
+            None,
+        )
+    }
+
+    fn new_with_delivery(
+        repo: Arc<R>,
+        lane_count: usize,
+        config: LaneConfig,
+        timer_config: TimerScannerConfig,
+        workflow_timeout_config: WorkflowTimeoutScannerConfig,
+        backlog_config: BacklogConfig,
+        activity_timeout_config: ActivityTimeoutScannerConfig,
+        nexus_timeout_config: NexusTimeoutScannerConfig,
+        nexus_registry: NexusEndpointRegistry,
+        nexus_client: Arc<dyn NexusHttpClient>,
+        nexus_completion: NexusCompletionDeps,
+        shard_count: u32,
+        owner_identity: String,
+        node_endpoint: String,
+        seed_default_shard: bool,
+        // Resolves originator namespace names for the External-endpoint outbound metric;
+        // wired by the server bootstrap, `None` for the simpler constructors and tests.
+        namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
+        queue_homes: Option<Arc<dyn crate::discovery::QueueHomeProvider>>,
+    ) -> Self {
+        // Temporary construction-only choice: bounded offers become the default
+        // only with dispatch reconstruction and backlog retirement at cutover.
+        let broker = queue_homes
+            .clone()
+            .map_or_else(InMemoryBroker::default, InMemoryBroker::with_discovery);
+        let discovery =
+            queue_homes.map(|homes| (crate::discovery::DiscoveryRegistry::default(), homes));
         let activity_broker = InMemoryActivityBroker::default();
         let workflow_timeout_tracking = WorkflowTimeoutTrackingState::default();
         let wft_timeout_tracking = WftTimeoutTrackingState::default();
@@ -720,6 +771,7 @@ where
         let runtime_drain = Arc::new(RuntimeDrain::default());
         let shard_count = shard_count.max(1);
         let shard_owner = Arc::new(RwLock::new(ShardOwner::new(shard_count)));
+        wft_timeout_tracking.set_owner(shard_owner.clone());
         let lane_count = lane_count.max(1);
         // The publisher needs lane handles to route follow-up work (child
         // resolutions, continue-as-new starts), but the lanes don't exist yet.
@@ -915,10 +967,24 @@ where
                 completion_callback_scanner_config,
                 completion_callback_scanner_cancel.clone(),
             )));
+        if let Some((registry, _)) = &discovery {
+            let cancel = CancellationToken::new();
+            runtime_shutdown.register_cancellation(cancel.clone());
+            let _discovery_handle = runtime_shutdown.spawn(crate::discovery::run_discovery(
+                crate::discovery::WorkflowSource {
+                    repo: repo.clone(),
+                    registry: worker_deployment_registry.clone(),
+                },
+                registry.clone(),
+                broker.clone(),
+                cancel,
+            ));
+        }
         runtime_shutdown.close_registration();
         Self {
             repo,
             broker,
+            discovery,
             activity_broker,
             lanes,
             config,
@@ -1775,7 +1841,7 @@ pub struct ResetActivitiesRequest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
@@ -3732,7 +3798,7 @@ mod tests {
         }
     }
 
-    fn sample_start_request(
+    pub(crate) fn sample_start_request(
         workflow_execution_timeout: Option<Duration>,
         workflow_run_timeout: Option<Duration>,
     ) -> StartRequest {

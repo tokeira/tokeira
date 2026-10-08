@@ -62,7 +62,8 @@ tokeira-config = { path = "../tokeira-config", version = "0.5.1" }
 tokeira-storage = { path = "../tokeira-storage", version = "0.5.1", features = ["dsql"] }
 tokeira-types = { path = "../tokeira-types", version = "0.5.1" }
 http = "1"
-temporalio-client = { version = "1.0.0", default-features = false, optional = true }
+# Keep SDK code generation self-contained for embedders without a system protoc.
+temporalio-client = { version = "1.0.0", default-features = false, features = ["vendored-protox"], optional = true }
 
 [features]
 # Unstable embedder surface; no semver compatibility promise.

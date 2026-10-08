@@ -1,0 +1,5 @@
+kind: fixed
+body: Building the Rust workspace no longer requires a system protoc installation. Temporal SDK and Tokeira API bindings use protox, matching the repository's protobuf generator.
+time: 2026-10-08T19:44:37.000000+00:00
+custom:
+    Slice: 4d8a3dd1-58e2-4db5-b94d-772eef277f17

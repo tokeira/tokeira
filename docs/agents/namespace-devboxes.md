@@ -182,7 +182,7 @@ ssh <box>.devbox.namespace 'bash -s' <<'EOF'
 set -e
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    protobuf-compiler cmake clang pkg-config git
+    cmake clang pkg-config git
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --quiet --default-toolchain 1.97.1 \
     --component rustfmt --component clippy
@@ -197,8 +197,8 @@ EOF
 - The base image ships rustup system-wide: `RUSTUP_HOME=/usr/local/rustup`, env file
   at `/usr/local/cargo/env` (not `~/.cargo/env`). Non-interactive SSH does not source
   login profiles; `tkw devbox` sources the cargo env itself.
-- `protoc` is a hard build requirement (prost-build and connectrpc-build shell out to
-  it; nothing vendors it). cmake + clang cover aws-lc-sys, ring, zstd-sys, mimalloc.
+- Protobuf compilation uses `protox`, including the Temporal SDK's build scripts;
+  no system `protoc` is needed. cmake + clang cover aws-lc-sys, ring, zstd-sys, mimalloc.
 - The fmt nightly must match CI's `NIGHTLY_FMT_TOOLCHAIN` pin exactly; `tkw devbox
   bar` uses whichever dated nightly is installed on the box, keeping the pin's home
   in CI config.

@@ -3,7 +3,7 @@
 From a clean checkout to a running Temporal-compatible server:
 
 ```bash
-# Install the operator CLI (building requires protoc — see the development guide)
+# Install the operator CLI (no system protoc required)
 cargo install --locked --path apps/tkr
 
 # Create and start a local deployment

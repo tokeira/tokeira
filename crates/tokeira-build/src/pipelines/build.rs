@@ -1,10 +1,13 @@
+//! Shared Rust builder setup and its cache identity. System packages participate
+//! in that identity so a dependency change cannot reuse an incompatible builder.
+
 use std::{fs, path::PathBuf, process::Command};
 
 use dagger_sdk::{Client, Container, HostDirectoryOpts, Query};
 
 use crate::{Arch, BuildError, CI_FMT_NIGHTLY, rust_toolchain_version};
 
-pub(crate) const BUILDER_APT_LINE: &str = "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler libprotobuf-dev ca-certificates cmake clang git curl jq && rm -rf /var/lib/apt/lists/*";
+pub(crate) const BUILDER_APT_LINE: &str = "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates cmake clang git curl jq && rm -rf /var/lib/apt/lists/*";
 
 /// Construct the shared image/CI builder toolchain before source or caches are attached.
 ///

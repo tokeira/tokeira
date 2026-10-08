@@ -18,6 +18,7 @@ thiserror.workspace = true
 
 [build-dependencies]
 connectrpc-build = "0.9"
+protox = "0.9"
 walkdir = "2"
 
 [lints]

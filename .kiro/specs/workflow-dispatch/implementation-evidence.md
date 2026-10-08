@@ -12,7 +12,8 @@ ordinary runtime constructors still use notification, backlog and recovery
 delivery. Tests enable the new path explicitly, including a poll that discovers
 and starts a task with no publication and a different execution home. The cutover
 must remove this choice together with complete reconciliation and the serving
-gate. No migration, dependency or lockfile change is introduced.
+gate. No migration or state-format change is introduced. The same PR's protobuf
+build changes are recorded below.
 
 The offer pool shares incarnation deduplication and capacity across notifications
 and discovery. Takes retain identity until a definitive result or the five-second
@@ -68,7 +69,8 @@ Requirements 8.4–8.6 still require the transaction-local competing-owner lease
 
 The branch was rebased once onto the base above, with no conflicts. The full
 `AGENTS.md` §10.4 bar was rerun after rebasing and correcting the shared home-page
-test. Nothing in the bar was omitted:
+test, and again after completing the protox build changes. Final Rust validation
+uses `PROTOC=/nonexistent/protoc`. Nothing in the bar was omitted:
 
 | Command | Result |
 | --- | --- |
@@ -81,8 +83,8 @@ test. Nothing in the bar was omitted:
 
 The DSQL integration feature also passed all-target Clippy with `-D warnings`.
 Focused discovery tests, the paused-acquisition recovery checks, Markdown relative
-link checks and `git diff --check` passed. No dependency, lockfile, migration or
-proptest seed changes were introduced.
+link checks and `git diff --check` passed. No migration or proptest seed changes
+were introduced.
 
 One earlier workspace run hit the attempt assertion in the unchanged
 `backoff_interval_rule_between_publication_and_start_pauses_durably` test: the
@@ -90,6 +92,26 @@ offer-only poll returned a stale attempt-one candidate. That API leaves durable
 revalidation to start. Its test and activity paths remain unchanged; 30 isolated
 repetitions and the final full workspace run passed. Earlier runs also reported
 isolated leaked-test warnings; the final full run had none.
+
+### Protobuf build change
+
+The engine, bench and standalone README example enable the Temporal SDK's
+`vendored-protox` feature. Compatibility and conformance build scripts compile
+descriptors with protox and feed them to Connect generation, retaining imports
+and source information. The controller generation step in `proto-sync` reuses
+the already-compiled internal descriptor. `proto-sync check` passes with the
+invalid `PROTOC`, proving checked-in bindings remain byte-for-byte identical.
+
+The workspace lockfile adds four dependency edges to the existing protox package;
+it adds no package versions. The example's independent lockfile adds protox and
+its compiler dependencies without changing existing package versions. Its locked
+standalone build passes with the same invalid `PROTOC`, retaining the existing
+`Runtime::new_assume_tokio` deprecation warning.
+
+CI and builder recipes no longer install system protobuf packages. README,
+quick-start and agent build prerequisites match the new build paths. CI retains
+the invalid `PROTOC` guard. Container image builds were not run; they are outside
+the requested §10.4 bar.
 
 ### Live validation and query plans
 

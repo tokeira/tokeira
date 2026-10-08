@@ -387,9 +387,9 @@ edges trimmed; it prints `kache stats` and a `df` so the reclaim is visible. Del
 
 - **Environment prerequisites:** toolchain via `rust-toolchain.toml` (stable 1.97.1); fmt
   needs the dated nightly (`NIGHTLY_FMT_TOOLCHAIN` in ci.yml, currently
-  `nightly-2026-06-16` — advance with local dev); `protoc` on PATH (prost-build compiles
-  `proto/upstream/`; CI installs protobuf-compiler for exactly this); `gh` only at the
-  §10.6 PR boundary (never Codex).
+  `nightly-2026-06-16` — advance with local dev); `gh` only at the §10.6 PR boundary
+  (never Codex). Protobuf generation uses `protox`, including SDK build scripts;
+  no system `protoc` is required.
 - **Linker:** the tracked `.cargo/config.toml` links with lld (`-fuse-ld=lld` via clang)
   on aarch64 and sets `debug = "line-tables-only"` — deliberate link-time tuning that
   every worktree inherits. kache skips linked outputs, so link time is unaffected by the

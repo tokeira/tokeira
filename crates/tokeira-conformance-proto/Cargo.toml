@@ -20,6 +20,7 @@ thiserror.workspace = true
 # Same 0.9 minor line as the connectrpc runtime crate above: the codegen and the
 # runtime version in lockstep, and buffa 0.9 output only compiles against a 0.9 runtime.
 connectrpc-build = "0.9"
+protox = "0.9"
 walkdir = "2"
 
 [lints]

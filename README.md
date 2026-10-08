@@ -20,8 +20,8 @@ Rust application when a separate service is unnecessary.
 
 ## Quickstart
 
-Prerequisites: Rust ≥ 1.97 and `protoc` (`brew install protobuf` /
-`apt install protobuf-compiler`); Docker for the service path.
+Prerequisites: Rust ≥ 1.97; Docker for the service path. Protobuf compilation uses
+the pure-Rust `protox` compiler, so no system `protoc` installation is needed.
 
 ### A durable workflow in one file
 

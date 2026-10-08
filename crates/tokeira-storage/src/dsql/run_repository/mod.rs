@@ -578,6 +578,21 @@ impl RunRepository for DsqlRunRepository {
             .await
     }
 
+    async fn reconcile_workflow_dispatch_run(&self, home: ShardId, run_key: RunKey) -> Result<()> {
+        self.do_reconcile_workflow_dispatch_run(home, run_key)
+            .await
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<sqlx::Error>()
+                    .is_some_and(Self::is_serialization_failure)
+                {
+                    crate::WorkflowDispatchRepairConflict.into()
+                } else {
+                    error
+                }
+            })
+    }
+
     async fn list_workflow_dispatch_page(
         &self,
         range: &crate::WorkflowDiscoveryRange,

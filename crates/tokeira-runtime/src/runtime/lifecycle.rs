@@ -1042,6 +1042,7 @@ where
                 (bundle, commit_epoch)
             };
 
+            let _write = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
             match self
                 .repo
                 .delete_run_for_bundle(

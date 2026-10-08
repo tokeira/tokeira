@@ -159,3 +159,89 @@ fn workflow_dispatch_generated_sticky_recovery() {
         &tokio::runtime::Runtime::new().unwrap(),
     );
 }
+
+#[async_trait]
+impl crate::workflow_dispatch_tests::RepairBackend for InMemoryStore {
+    async fn remove_row(&self, key: RunKey) -> Result<()> {
+        self.inner.lock().await.workflow_dispatch.remove(&key);
+        Ok(())
+    }
+    async fn legacy_recovery_flag(&self, _key: RunKey) -> Result<()> {
+        // Memory derives recovery eligibility; it has no nullable persisted flag.
+        Ok(())
+    }
+    async fn authority(&self, _keys: &[RunKey]) -> Result<Vec<u8>> {
+        // The snapshot contains authority and every other store collection;
+        // dispatch is deliberately reconstructed, not serialized.
+        Ok(self.snapshot().await?)
+    }
+    async fn finish_repair_case(&self, keys: &[RunKey]) -> Result<()> {
+        let mut store = self.inner.lock().await;
+        for key in keys {
+            store.runs.remove(key);
+            store.workflow_dispatch.remove(key);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn workflow_dispatch_generated_complete_repair() {
+    crate::workflow_dispatch_tests::run_repair_cases(
+        &InMemoryStore::default(),
+        &tokio::runtime::Runtime::new().unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn repair_rejects_wrong_home_and_invalid_encoding_without_partial_changes() {
+    let store = InMemoryStore::default();
+    let transition = super::projection_accumulator_tests::fresh_transition(RunKey::new());
+    let key = transition.next_state.run_key;
+    store
+        .commit_transition(key, transition, ShardEpoch::ZERO)
+        .await
+        .unwrap();
+    let row = store.row(key).await.unwrap();
+    assert!(
+        store
+            .reconcile_workflow_dispatch_run(ShardId(1), key)
+            .await
+            .is_err()
+    );
+    store
+        .inner
+        .lock()
+        .await
+        .runs
+        .get_mut(&key)
+        .unwrap()
+        .pending_workflow_task
+        .as_mut()
+        .unwrap()
+        .logical_seq = tokeira_types::LogicalTaskSeq(u64::MAX);
+    let before = store.snapshot().await.unwrap();
+    assert!(
+        store
+            .reconcile_workflow_dispatch_run(ShardId(0), key)
+            .await
+            .is_err()
+    );
+    assert_eq!(store.snapshot().await.unwrap(), before);
+    assert_eq!(store.row(key).await.unwrap(), row);
+}
+
+#[test]
+fn dispatch_encoding_budget_rejects_column_and_row_overflow() {
+    let state = super::projection_accumulator_tests::fresh_transition(RunKey::new()).next_state;
+    let mut row = derive_workflow_dispatch(&state, ShardId(0)).unwrap();
+    row.queue_name.0 = "q".repeat(1024 * 1024);
+    assert!(row.validate().is_ok());
+    row.queue_name.0.push('q');
+    assert!(row.validate().is_err());
+    row.queue_name.0.pop();
+    row.normal_queue_name.0 = "n".repeat(1024 * 1024 - 4096);
+    assert!(row.validate().is_ok());
+    row.normal_queue_name.0.push('n');
+    assert!(row.validate().is_err());
+}

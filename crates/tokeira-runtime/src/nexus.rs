@@ -2001,55 +2001,54 @@ pub struct NexusTimeoutEntry {
 
 #[derive(Clone, Default, Debug)]
 pub struct NexusTimeoutTrackingState {
-    inner: Arc<Mutex<HashMap<(RunKey, String), NexusTimeoutEntry>>>,
+    pub(crate) inner:
+        crate::acquisition_tracking::AcquisitionEntries<(RunKey, String), NexusTimeoutEntry>,
 }
 
 impl NexusTimeoutTrackingState {
+    pub(crate) fn set_owner(&self, owner: Arc<RwLock<ShardOwner>>) {
+        self.inner.set_owner(owner);
+    }
+    pub(crate) fn for_acquisition(&self, acquisition: crate::shard::ShardAcquisition) -> Self {
+        Self {
+            inner: self.inner.for_acquisition(acquisition),
+        }
+    }
+    /// Install only for the current acquisition; recovery may install before activation.
     pub fn insert(&self, entry: NexusTimeoutEntry) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .insert((entry.run_key, entry.operation_id.clone()), entry);
+        self.inner.insert(
+            (entry.run_key, entry.operation_id.clone()),
+            entry.shard_id,
+            entry,
+        );
     }
-
+    /// Stop tracking after the authoritative transition has resolved this key.
     pub fn remove(&self, run_key: RunKey, operation_id: &str) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .remove(&(run_key, operation_id.to_string()));
+        self.inner.remove(&(run_key, operation_id.to_string()));
     }
-
-    pub fn remove_all_for_run(&self, run_key: RunKey) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .retain(|(candidate, _), _| *candidate != run_key);
-    }
-
+    /// Purge the departing home under the ownership lock, before a replacement can install.
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .retain(|_, entry| entry.shard_id != shard_id);
+        self.inner.retain(|_, entry| entry.shard_id != shard_id);
     }
-
+    /// Snapshot values for inspection; scanners additionally validate acquisition and revision.
     pub fn snapshot(&self) -> Vec<NexusTimeoutEntry> {
         self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .values()
-            .cloned()
+            .snapshot(None)
+            .into_iter()
+            .map(|entry| entry.value)
             .collect()
     }
-
+    /// Snapshot only this execution home's values.
     pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<NexusTimeoutEntry> {
         self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .values()
-            .filter(|entry| entry.shard_id == shard_id)
-            .cloned()
+            .snapshot(Some(shard_id))
+            .into_iter()
+            .map(|entry| entry.value)
             .collect()
+    }
+    /// Forget all entries after the run's physical deletion.
+    pub fn remove_all_for_run(&self, run_key: RunKey) {
+        self.inner.retain(|(key, _), _| *key != run_key);
     }
 }
 
@@ -2071,55 +2070,53 @@ pub struct CompletionCallbackTrackingEntry {
 
 #[derive(Clone, Default, Debug)]
 pub struct CompletionCallbackTrackingState {
-    inner: Arc<Mutex<HashMap<(RunKey, usize), CompletionCallbackTrackingEntry>>>,
+    pub(crate) inner: crate::acquisition_tracking::AcquisitionEntries<
+        (RunKey, usize),
+        CompletionCallbackTrackingEntry,
+    >,
 }
 
 impl CompletionCallbackTrackingState {
+    pub(crate) fn set_owner(&self, owner: Arc<RwLock<ShardOwner>>) {
+        self.inner.set_owner(owner);
+    }
+    pub(crate) fn for_acquisition(&self, acquisition: crate::shard::ShardAcquisition) -> Self {
+        Self {
+            inner: self.inner.for_acquisition(acquisition),
+        }
+    }
+    /// Install only for the current acquisition; recovery may install before activation.
     pub fn insert(&self, entry: CompletionCallbackTrackingEntry) {
         self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .insert((entry.run_key, entry.callback_index), entry);
+            .insert((entry.run_key, entry.callback_index), entry.shard_id, entry);
     }
-
+    /// Stop tracking after the authoritative transition has resolved this key.
     pub fn remove(&self, run_key: RunKey, callback_index: usize) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .remove(&(run_key, callback_index));
+        self.inner.remove(&(run_key, callback_index));
     }
-
-    pub fn remove_all_for_run(&self, run_key: RunKey) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .retain(|(candidate, _), _| *candidate != run_key);
-    }
-
+    /// Purge the departing home under the ownership lock, before a replacement can install.
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .retain(|_, entry| entry.shard_id != shard_id);
+        self.inner.retain(|_, entry| entry.shard_id != shard_id);
     }
-
+    /// Snapshot values for inspection; scanners additionally validate acquisition and revision.
     pub fn snapshot(&self) -> Vec<CompletionCallbackTrackingEntry> {
         self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .values()
-            .cloned()
+            .snapshot(None)
+            .into_iter()
+            .map(|entry| entry.value)
             .collect()
     }
-
+    /// Snapshot only this execution home's values.
     pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<CompletionCallbackTrackingEntry> {
         self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .values()
-            .filter(|entry| entry.shard_id == shard_id)
-            .cloned()
+            .snapshot(Some(shard_id))
+            .into_iter()
+            .map(|entry| entry.value)
             .collect()
+    }
+    /// Forget all entries after the run's physical deletion.
+    pub fn remove_all_for_run(&self, run_key: RunKey) {
+        self.inner.retain(|(key, _), _| *key != run_key);
     }
 }
 
@@ -2333,13 +2330,14 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
     R: RunRepository + 'static,
 {
     let now = OffsetDateTime::now_utc();
-    let entries = match shard_id {
-        Some(shard_id) => tracking.snapshot_for_shard(shard_id),
-        None => tracking.snapshot(),
-    };
+    let entries = tracking.inner.snapshot(shard_id);
     let mut submitted = 0usize;
 
-    for entry in entries {
+    for tracked in entries {
+        if !tracking.inner.active(&tracked) {
+            continue;
+        }
+        let entry = tracked.value.clone();
         if submitted >= config.max_timeouts_per_scan {
             break;
         }
@@ -2347,7 +2345,9 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
         let state = match repo.load_run(entry.run_key).await {
             Ok(LoadedRun::Existing(state)) => state,
             Ok(LoadedRun::Absent) => {
-                tracking.remove(entry.run_key, &entry.operation_id);
+                tracking
+                    .inner
+                    .remove_submitted(&(entry.run_key, entry.operation_id.clone()), &tracked);
                 continue;
             }
             Err(error) => {
@@ -2361,8 +2361,13 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
             }
         };
 
+        if !tracking.inner.active(&tracked) {
+            continue;
+        }
         let Some(operation) = state.pending_nexus_operations.get(&entry.operation_id) else {
-            tracking.remove(entry.run_key, &entry.operation_id);
+            tracking
+                .inner
+                .remove_submitted(&(entry.run_key, entry.operation_id.clone()), &tracked);
             continue;
         };
 
@@ -2446,7 +2451,9 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
             .map(|_| ());
 
         match result {
-            Ok(()) => tracking.remove(entry.run_key, &entry.operation_id),
+            Ok(()) => tracking
+                .inner
+                .remove_submitted(&(entry.run_key, entry.operation_id.clone()), &tracked),
             Err(error) => {
                 let message = error.to_string();
                 // Kernel rejection means the operation already resolved or advanced
@@ -2459,7 +2466,9 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
                         operation_id = entry.operation_id,
                         "nexus timeout scanner timeout rejected by kernel"
                     );
-                    tracking.remove(entry.run_key, &entry.operation_id);
+                    tracking
+                        .inner
+                        .remove_submitted(&(entry.run_key, entry.operation_id.clone()), &tracked);
                 } else {
                     tracing::warn!(
                         ?error,

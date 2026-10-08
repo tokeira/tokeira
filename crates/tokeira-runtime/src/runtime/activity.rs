@@ -645,11 +645,19 @@ where
                 (bundle_id, epoch)
             };
 
+            let mut write_admission = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
             let committed = self
                 .repo
                 .commit_transition_for_bundle(token.run_key, bundle, transition, commit_epoch)
                 .await;
-            match terminate_on_growth_breach(&self.lanes, token.run_key, committed).await? {
+            match terminate_on_growth_breach(
+                &self.lanes,
+                token.run_key,
+                committed,
+                &mut write_admission,
+            )
+            .await?
+            {
                 CommitResult::Applied { .. } | CommitResult::Duplicate => {
                     // Reset the volatile heartbeat clock; the CANCEL signal
                     // itself comes from the durable state loaded above — the
@@ -824,11 +832,14 @@ where
                 (bundle_id, epoch)
             };
 
+            let mut write_admission = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
             let committed = self
                 .repo
                 .commit_transition_for_bundle(run_key, bundle, transition, commit_epoch)
                 .await;
-            match terminate_on_growth_breach(&self.lanes, run_key, committed).await? {
+            match terminate_on_growth_breach(&self.lanes, run_key, committed, &mut write_admission)
+                .await?
+            {
                 CommitResult::Applied { .. } => {
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
                     self.activity_tracking.record_started(
@@ -1141,11 +1152,18 @@ where
                 (bundle_id, epoch)
             };
 
+            let mut write_admission = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
             let committed = self
                 .repo
                 .commit_transition_for_bundle(task.run_key, bundle, transition, commit_epoch)
                 .await;
-            let committed = terminate_on_growth_breach(&self.lanes, task.run_key, committed).await;
+            let committed = terminate_on_growth_breach(
+                &self.lanes,
+                task.run_key,
+                committed,
+                &mut write_admission,
+            )
+            .await;
             // A start refused for a growth limit terminated the run, so the poll
             // goes on, as for a task whose run has closed (`run-growth-limits`
             // criterion 2.4).
@@ -1378,6 +1396,7 @@ pub(crate) async fn terminate_on_growth_breach(
     lanes: &[LaneHandle],
     run_key: RunKey,
     committed: Result<CommitResult>,
+    write_admission: &mut Option<crate::serving_gate::WritePermit>,
 ) -> Result<CommitResult> {
     let breach = match &committed {
         Err(error) => crate::run_growth::terminating_breach(error, false),
@@ -1386,6 +1405,10 @@ pub(crate) async fn terminate_on_growth_breach(
     let Some(breach) = breach else {
         return committed;
     };
+    // The refused transition wrote nothing. Release its permit before asking
+    // the lane for another write; a queued exclusive recovery must not deadlock
+    // behind a writer waiting for its own second read permit.
+    write_admission.take();
     if lanes.is_empty() {
         tracing::error!(
             ?run_key,
@@ -1617,11 +1640,14 @@ where
             (bundle_id, epoch)
         };
 
+        let mut write_admission = crate::serving_gate::admit(&deps.shard_owner, bundle).await?;
         let committed = deps
             .repo
             .commit_transition_for_bundle(run_key, bundle, transition, commit_epoch)
             .await;
-        match terminate_on_growth_breach(&deps.lanes, run_key, committed).await? {
+        match terminate_on_growth_breach(&deps.lanes, run_key, committed, &mut write_admission)
+            .await?
+        {
             CommitResult::Applied { .. } => {
                 if paused {
                     deps.tracking.remove(run_key, activity_id);
@@ -2029,11 +2055,14 @@ where
             (bundle_id, epoch)
         };
 
+        let mut write_admission = crate::serving_gate::admit(&deps.shard_owner, bundle).await?;
         let committed = deps
             .repo
             .commit_transition_for_bundle(task.run_key, bundle, transition, commit_epoch)
             .await;
-        match terminate_on_growth_breach(&deps.lanes, task.run_key, committed).await? {
+        match terminate_on_growth_breach(&deps.lanes, task.run_key, committed, &mut write_admission)
+            .await?
+        {
             CommitResult::Applied { .. } => {
                 deps.tracking.remove(task.run_key, &task.activity_id);
                 return Ok(Preparation::SuppressedByRule);
@@ -2693,6 +2722,137 @@ mod tests {
                 .started_event_id
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn repair_defers_overdue_timers_and_activity_pause_rules_until_active() {
+        for interrupted in [false, true] {
+            let repo = Arc::new(InMemoryStore::default());
+            let runtime = Arc::new(TokeiraRuntime::new(
+                repo.clone(),
+                1,
+                LaneConfig::default(),
+                TimerScannerConfig {
+                    scan_interval: std::time::Duration::from_secs(86400),
+                    ..Default::default()
+                },
+                WorkflowTimeoutScannerConfig::default(),
+                BacklogConfig::default(),
+            ));
+            runtime.shard_owner.write().unwrap().enable_reconciliation();
+            let (state, _, task) = seed_scheduled_activity(&runtime, &repo).await;
+            runtime.activity_broker.remove_run(state.run_key).await;
+            repo.create_workflow_rule(
+                state.namespace_id,
+                pause_rule("repair-pause", "ActivityType = 'activity-type'"),
+                10,
+            )
+            .await
+            .unwrap();
+            let mut transition = tokeira_kernel::Kernel::apply(
+                &BasicKernel,
+                LoadedRun::Existing(state.clone()),
+                Command::Signal(tokeira_kernel::SignalRequest {
+                    signal_name: "timer-fixture".into(),
+                    input: Payloads::default(),
+                    header: None,
+                    links: vec![],
+                    request: tokeira_types::RequestContext {
+                        request_id: RequestId("repair-test-request".into()),
+                        caller_identity: None,
+                        principal: None,
+                        received_at: OffsetDateTime::now_utc(),
+                    },
+                    now: OffsetDateTime::now_utc(),
+                }),
+            )
+            .unwrap();
+            let timer = tokeira_kernel::TimerState {
+                timer_id: "overdue-repair".into(),
+                started_event_id: 1,
+                fire_at: OffsetDateTime::now_utc() - Duration::seconds(1),
+            };
+            transition
+                .next_state
+                .timers
+                .insert(timer.timer_id.clone(), timer.clone());
+            transition
+                .timer_ops
+                .push(tokeira_kernel::TimerOp::Upsert(timer.clone()));
+            repo.commit_transition(state.run_key, transition, ShardEpoch::ZERO)
+                .await
+                .unwrap();
+            let before = repo.snapshot().await.unwrap();
+            let (entered, resume) = runtime.wft_timeout_tracking.pause_next_recovery();
+            let acquiring = runtime.clone();
+            let recovery = tokio::spawn(async move {
+                acquiring
+                    .recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO)
+                    .await
+            });
+            entered.await.unwrap();
+            assert!(runtime.active_shards().is_empty());
+            assert_eq!(
+                reconcile_due_activity_dispatches_once(
+                    &runtime.activity_retry_deps(),
+                    ShardId(0),
+                    OffsetDateTime::now_utc(),
+                    64
+                )
+                .await,
+                0
+            );
+            assert_eq!(repo.snapshot().await.unwrap(), before);
+            if interrupted {
+                drop(resume);
+                assert!(recovery.await.unwrap().is_err());
+                assert!(runtime.active_shards().is_empty());
+                assert_eq!(repo.snapshot().await.unwrap(), before);
+                runtime
+                    .recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO)
+                    .await
+                    .unwrap();
+            } else {
+                resume.send(()).unwrap();
+                let result = recovery.await.unwrap().unwrap();
+                assert_eq!(result.due_timers_injected, 0);
+                assert_eq!(result.activity_tasks_republished, 0);
+            }
+            assert_eq!(repo.snapshot().await.unwrap(), before);
+            let due = repo
+                .list_due_timers_for_shard(ShardId(0), OffsetDateTime::now_utc(), None, 64)
+                .await
+                .unwrap();
+            assert_eq!(due.len(), 1);
+            runtime.lanes[0]
+                .submit(
+                    state.run_key,
+                    crate::scanner::command_for_due_timer(
+                        due[0].clone(),
+                        OffsetDateTime::now_utc(),
+                    ),
+                )
+                .await
+                .unwrap();
+            reconcile_due_activity_dispatches_once(
+                &runtime.activity_retry_deps(),
+                ShardId(0),
+                OffsetDateTime::now_utc(),
+                64,
+            )
+            .await;
+            let LoadedRun::Existing(after) = repo.load_run(state.run_key).await.unwrap() else {
+                panic!("run missing")
+            };
+            assert!(!after.timers.contains_key(&timer.timer_id));
+            assert!(after.activities[&task.activity_id].pause_info.is_some());
+            runtime.runtime_shutdown.begin_shutdown();
+            runtime
+                .runtime_shutdown
+                .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

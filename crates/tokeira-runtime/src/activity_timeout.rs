@@ -21,10 +21,9 @@
 //! the tracking entry only supplies the timing anchors the durable state does not
 //! retain.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, RwLock};
+
+use crate::shard::ShardOwner;
 
 use time::OffsetDateTime;
 use tokeira_kernel::{
@@ -81,17 +80,28 @@ pub struct ActivityTrackingEntry {
 /// activities open at once.
 #[derive(Clone, Default, Debug)]
 pub struct ActivityTrackingState {
-    inner: Arc<Mutex<HashMap<(RunKey, String), ActivityTrackingEntry>>>,
+    pub(crate) inner:
+        crate::acquisition_tracking::AcquisitionEntries<(RunKey, String), ActivityTrackingEntry>,
 }
 
 impl ActivityTrackingState {
+    pub(crate) fn set_owner(&self, owner: Arc<RwLock<ShardOwner>>) {
+        self.inner.set_owner(owner);
+    }
+    pub(crate) fn for_acquisition(&self, acquisition: crate::shard::ShardAcquisition) -> Self {
+        Self {
+            inner: self.inner.for_acquisition(acquisition),
+        }
+    }
+
     /// Insert a fully-formed entry, replacing any existing one for the same key.
     /// Used by shard recovery to rebuild tracking from durable state.
     pub fn insert(&self, entry: ActivityTrackingEntry) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .insert((entry.run_key, entry.activity_id.clone()), entry);
+        self.inner.insert(
+            (entry.run_key, entry.activity_id.clone()),
+            entry.shard_id,
+            entry,
+        );
     }
 
     /// Begin tracking a freshly scheduled activity, anchoring both the
@@ -112,29 +122,23 @@ impl ActivityTrackingState {
         now: OffsetDateTime,
     ) {
         let activity_id = activity_id.into();
-        let mut guard = self.inner.lock().expect("inner lock poisoned");
-        match guard.get_mut(&(run_key, activity_id.clone())) {
-            Some(entry) => {
+        self.inner
+            .upsert((run_key, activity_id.clone()), shard_id, |previous| {
+                let mut entry = previous.unwrap_or(ActivityTrackingEntry {
+                    run_key,
+                    shard_id,
+                    activity_id,
+                    original_scheduled_at: now,
+                    last_dispatched_at: now,
+                    started_at: None,
+                    last_heartbeat_at: None,
+                    cancel_requested: false,
+                });
                 entry.last_dispatched_at = now;
                 entry.started_at = None;
                 entry.last_heartbeat_at = None;
-            }
-            None => {
-                guard.insert(
-                    (run_key, activity_id.clone()),
-                    ActivityTrackingEntry {
-                        run_key,
-                        shard_id,
-                        activity_id,
-                        original_scheduled_at: now,
-                        last_dispatched_at: now,
-                        started_at: None,
-                        last_heartbeat_at: None,
-                        cancel_requested: false,
-                    },
-                );
-            }
-        }
+                entry
+            });
     }
 
     /// Record a redispatch on retry: advance the schedule-to-start anchor and
@@ -142,31 +146,23 @@ impl ActivityTrackingState {
     /// `original_scheduled_at` (the schedule-to-close anchor) untouched so the
     /// overall deadline still spans all attempts.
     pub fn record_retry(&self, run_key: RunKey, activity_id: &str, now: OffsetDateTime) {
-        if let Some(entry) = self
-            .inner
-            .lock()
-            .expect("inner lock poisoned")
-            .get_mut(&(run_key, activity_id.to_string()))
-        {
-            entry.last_dispatched_at = now;
-            entry.started_at = None;
-            entry.last_heartbeat_at = None;
-        }
+        self.inner
+            .update(&(run_key, activity_id.to_string()), |entry| {
+                entry.last_dispatched_at = now;
+                entry.started_at = None;
+                entry.last_heartbeat_at = None;
+            });
     }
 
     /// Record that a worker started the activity, anchoring the start-to-close and
     /// heartbeat clocks. Heartbeat is reset to `None` so the first interval is
     /// measured from start.
     pub fn record_started(&self, run_key: RunKey, activity_id: &str, now: OffsetDateTime) {
-        if let Some(entry) = self
-            .inner
-            .lock()
-            .expect("inner lock poisoned")
-            .get_mut(&(run_key, activity_id.to_string()))
-        {
-            entry.started_at = Some(now);
-            entry.last_heartbeat_at = None;
-        }
+        self.inner
+            .update(&(run_key, activity_id.to_string()), |entry| {
+                entry.started_at = Some(now);
+                entry.last_heartbeat_at = None;
+            });
     }
 
     /// Record a heartbeat, resetting the heartbeat clock. Returns whether a cancel
@@ -178,30 +174,25 @@ impl ActivityTrackingState {
         activity_id: &str,
         now: OffsetDateTime,
     ) -> Option<bool> {
-        let mut guard = self.inner.lock().expect("inner lock poisoned");
-        let entry = guard.get_mut(&(run_key, activity_id.to_string()))?;
-        entry.last_heartbeat_at = Some(now);
-        Some(entry.cancel_requested)
+        self.inner
+            .update(&(run_key, activity_id.to_string()), |entry| {
+                entry.last_heartbeat_at = Some(now);
+                entry.cancel_requested
+            })
     }
 
     /// Mark that a cancel has been requested for the activity; relayed to the
     /// worker on its next heartbeat.
     pub fn mark_cancel_requested(&self, run_key: RunKey, activity_id: &str) {
-        if let Some(entry) = self
-            .inner
-            .lock()
-            .expect("inner lock poisoned")
-            .get_mut(&(run_key, activity_id.to_string()))
-        {
-            entry.cancel_requested = true;
-        }
+        self.inner
+            .update(&(run_key, activity_id.to_string()), |entry| {
+                entry.cancel_requested = true;
+            });
     }
 
     /// Whether a cancel has been requested, or `None` if the activity is untracked.
     pub fn is_cancel_requested(&self, run_key: RunKey, activity_id: &str) -> Option<bool> {
         self.inner
-            .lock()
-            .expect("inner lock poisoned")
             .get(&(run_key, activity_id.to_string()))
             .map(|entry| entry.cancel_requested)
     }
@@ -209,48 +200,36 @@ impl ActivityTrackingState {
     /// Stop tracking an activity, called when it resolves so it is never scanned
     /// again.
     pub fn remove(&self, run_key: RunKey, activity_id: &str) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .remove(&(run_key, activity_id.to_string()));
+        self.inner.remove(&(run_key, activity_id.to_string()));
     }
 
     /// Stop tracking every activity owned by a deleted workflow run.
     pub fn remove_all_for_run(&self, run_key: RunKey) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .retain(|(candidate, _), _| *candidate != run_key);
+        self.inner.retain(|(key, _), _| *key != run_key);
     }
 
     /// Drop every entry for a shard on handoff; the new owner rebuilds them from
     /// durable state during its sweep.
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
-        self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .retain(|_, entry| entry.shard_id != shard_id);
+        self.inner.retain(|_, entry| entry.shard_id != shard_id);
     }
 
     /// Snapshot all tracked entries; the scanner evaluates the copy without
     /// holding the lock.
     pub fn snapshot(&self) -> Vec<ActivityTrackingEntry> {
         self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .values()
-            .cloned()
+            .snapshot(None)
+            .into_iter()
+            .map(|entry| entry.value)
             .collect()
     }
 
     /// Snapshot only the entries owned by `shard_id`, used by the per-shard scan.
     pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<ActivityTrackingEntry> {
         self.inner
-            .lock()
-            .expect("inner lock poisoned")
-            .values()
-            .filter(|entry| entry.shard_id == shard_id)
-            .cloned()
+            .snapshot(Some(shard_id))
+            .into_iter()
+            .map(|entry| entry.value)
             .collect()
     }
 }
@@ -370,12 +349,13 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
     let now = OffsetDateTime::now_utc();
     let mut submitted = 0usize;
 
-    let entries = match shard_id {
-        Some(shard_id) => tracking.snapshot_for_shard(shard_id),
-        None => tracking.snapshot(),
-    };
+    let entries = tracking.inner.snapshot(shard_id);
 
-    for entry in entries {
+    for tracked in entries {
+        if !tracking.inner.active(&tracked) {
+            continue;
+        }
+        let entry = tracked.value.clone();
         if submitted >= config.max_timeouts_per_scan {
             break;
         }
@@ -383,7 +363,9 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
         let state = match deps.repo.load_run(entry.run_key).await {
             Ok(LoadedRun::Existing(state)) => state,
             Ok(LoadedRun::Absent) => {
-                tracking.remove(entry.run_key, &entry.activity_id);
+                tracking
+                    .inner
+                    .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);
                 continue;
             }
             Err(error) => {
@@ -397,6 +379,9 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             }
         };
 
+        if !tracking.inner.active(&tracked) {
+            continue;
+        }
         // A closed run keeps its activities in state, but none of their
         // timeouts can fire: v1.31.0's activity-timeout task returns
         // `ErrWorkflowCompleted` for a closed run
@@ -404,12 +389,16 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
         // the queue completes rather than retries (queues/executable.go:401).
         // Untrack instead of retrying or resolving an activity of a closed run.
         if !state.is_open() {
-            tracking.remove(entry.run_key, &entry.activity_id);
+            tracking
+                .inner
+                .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);
             continue;
         }
 
         let Some(activity) = state.activities.get(&entry.activity_id).cloned() else {
-            tracking.remove(entry.run_key, &entry.activity_id);
+            tracking
+                .inner
+                .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);
             continue;
         };
 
@@ -471,8 +460,15 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                     next_attempt,
                     backoff,
                 } => {
+                    // A retry's post-commit tracking belongs to the scan's
+                    // acquisition and submitted revision, even if its repository
+                    // reply arrives after another operation replaced the key.
+                    let mut retry_deps = deps.clone();
+                    retry_deps.tracking = ActivityTrackingState {
+                        inner: tracking.inner.for_entry(&tracked),
+                    };
                     let result = commit_activity_retry(
-                        deps,
+                        &retry_deps,
                         ActivityRetryTarget {
                             run_key: entry.run_key,
                             activity_id: &entry.activity_id,
@@ -584,7 +580,9 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
         match result {
             Ok(()) => {
                 runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Success);
-                tracking.remove(entry.run_key, &entry.activity_id);
+                tracking
+                    .inner
+                    .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);
             }
             Err(error) => {
                 let message = error.to_string();
@@ -600,7 +598,9 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                         activity_id = entry.activity_id,
                         "activity timeout scanner timeout rejected by kernel"
                     );
-                    tracking.remove(entry.run_key, &entry.activity_id);
+                    tracking
+                        .inner
+                        .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);
                 } else {
                     runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Failure);
                     tracing::warn!(

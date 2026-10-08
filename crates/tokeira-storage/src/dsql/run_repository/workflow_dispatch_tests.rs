@@ -32,13 +32,31 @@ async fn workflow_dispatch_live_query_plans() -> Result<()> {
         crate::memory::projection_accumulator_tests::fresh_transition(RunKey::new()).next_state;
     template.namespace_id = tokeira_types::NamespaceId::new();
     let namespace_id = template.namespace_id;
-    let mut positions = Vec::new();
-    for batch in 0..32 {
+    let mut positions = [Vec::new(), Vec::new()];
+    let scheduled_at = template
+        .pending_workflow_task
+        .as_ref()
+        .unwrap()
+        .scheduled_at;
+    for batch in 0..64 {
         let mut tx = fixture.pool.begin().await?;
         for offset in 0..256 {
             let index = batch * 256 + offset;
             template.run_key = RunKey::new();
-            template.task_queue.0 = format!("explain-queue-{}", (index / 2) % 128);
+            template.task_queue.0 = format!(
+                "explain-queue-{}",
+                if index < 8192 {
+                    0
+                } else {
+                    1 + (index / 2) % 128
+                }
+            );
+            template
+                .pending_workflow_task
+                .as_mut()
+                .unwrap()
+                .scheduled_at =
+                scheduled_at + Duration::seconds(((index / 2) % 4096 / 1024) as i64);
             template.deployment =
                 (index % 2 == 1).then(|| tokeira_types::DeploymentId("explain-deployment".into()));
             template.build_id = template
@@ -47,8 +65,8 @@ async fn workflow_dispatch_live_query_plans() -> Result<()> {
                 .map(|_| tokeira_types::BuildId("explain-build".into()));
             let home = ShardId(batch);
             super::workflow_dispatch::maintain(&mut tx, &template, home).await?;
-            if index < 2 {
-                positions.push(
+            if index < 8192 {
+                positions[(index % 2) as usize].push(
                     crate::derive_workflow_dispatch(&template, home)
                         .unwrap()
                         .position(),
@@ -57,11 +75,14 @@ async fn workflow_dispatch_live_query_plans() -> Result<()> {
         }
         tx.commit().await?;
     }
+    for mode in &mut positions {
+        mode.sort();
+    }
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM workflow_dispatch")
         .fetch_one(&fixture.pool)
         .await?;
     let mut report = format!(
-        "Seeded rows: 8192; table rows after seeding: {total}.\n128 queue families; Live and Exact each contain 32 rows per seeded family.\n32 execution homes contain 256 seeded rows each.\nASYNC indexes were awaited by the migration runner before seeding.\n"
+        "Seeded rows: 16384; table rows after seeding: {total}.\nLive and Exact each contain 4096 rows in queue 0, all priority 3, with 1024 equal timestamps per group. Another 8192 rows span 128 unrelated queue families.\n64 execution homes contain 256 seeded rows each.\nASYNC indexes were awaited by the migration runner before seeding.\n"
     );
     for (index, routing) in [
         crate::WorkflowDispatchRouting::Live,
@@ -78,35 +99,93 @@ async fn workflow_dispatch_live_query_plans() -> Result<()> {
             queue_name: tokeira_types::TaskQueueName("explain-queue-0".into()),
             routing,
         };
-        for continued in [false, true] {
-            let mut builder = super::workflow_dispatch::queue_page_query(
-                &range,
-                continued.then_some(positions[index]),
-                std::num::NonZeroU32::new(64).unwrap(),
-            );
-            let mut query = builder.build();
-            let arguments = query
-                .take_arguments()
-                .map_err(anyhow::Error::from_boxed)?
-                .expect("page query has bound arguments");
-            // Only the fixed EXPLAIN prefix is added; every candidate value
-            // remains a bound argument in the actual page query.
-            let mut explain =
-                sqlx::QueryBuilder::<sqlx::Postgres>::with_arguments("EXPLAIN ", arguments);
-            explain.push(query.sql().as_str());
-            let plan = explain
-                .build_query_as::<(String,)>()
-                .fetch_all(&fixture.pool)
+        for offset in [0, 768, 2048, 3840] {
+            let cursor = (offset > 0).then(|| positions[index][offset - 1]);
+            let actual = fixture
+                .repo()
+                .list_workflow_dispatch_page(&range, cursor, std::num::NonZeroU32::new(64).unwrap())
                 .await?;
-            report.push_str(&format!(
-                "\nQueue mode {index}, continuation={continued}, range selectivity={:.6}:\n",
-                32.0 / total as f64
-            ));
-            for (line,) in plan {
-                report.push_str(&line);
-                report.push('\n');
+            assert_eq!(
+                actual
+                    .candidates
+                    .iter()
+                    .map(WorkflowDispatchRow::position)
+                    .collect::<Vec<_>>(),
+                positions[index][offset..offset + 64]
+            );
+            for before in [true, false] {
+                let mut builder = if before {
+                    legacy_queue_page_query(&range, cursor)
+                } else {
+                    super::workflow_dispatch::queue_page_query(
+                        &range,
+                        cursor,
+                        std::num::NonZeroU32::new(64).unwrap(),
+                    )
+                };
+                let mut query = builder.build();
+                let arguments = query
+                    .take_arguments()
+                    .map_err(anyhow::Error::from_boxed)?
+                    .expect("page query has bound arguments");
+                let mut explain =
+                    sqlx::QueryBuilder::<sqlx::Postgres>::with_arguments("EXPLAIN ", arguments);
+                explain.push(query.sql().as_str());
+                let plan = explain
+                    .build_query_as::<(String,)>()
+                    .fetch_all(&fixture.pool)
+                    .await?;
+                if !before {
+                    assert!(
+                        plan.iter()
+                            .any(|(line,)| line.contains("Index Cond:")
+                                && line.contains("run_key =")),
+                        "bounded payload page requires primary-key equality lookups: {plan:#?}"
+                    );
+                }
+                if !before && cursor.is_some() {
+                    let conditions: Vec<_> = plan
+                        .iter()
+                        .map(|(line,)| line.as_str())
+                        .filter(|line| line.contains("Index Cond:"))
+                        .collect();
+                    for required in [
+                        &["priority_key =", "scheduled_at =", "run_key >"][..],
+                        &["priority_key =", "scheduled_at >"][..],
+                        &["priority_key >"][..],
+                    ] {
+                        assert!(
+                            conditions
+                                .iter()
+                                .any(|line| required.iter().all(|part| line.contains(part))),
+                            "continuation lacks complete scalar seek {required:?}: {plan:#?}"
+                        );
+                    }
+                }
+                report.push_str(&format!("\nQueue mode {index}, offset={offset}, before={before}, range selectivity={:.6}:\n", 4096.0 / total as f64));
+                for (line,) in plan {
+                    report.push_str(&line);
+                    report.push('\n');
+                }
             }
         }
+        let mut cursor = None;
+        let mut traversed = Vec::new();
+        loop {
+            let page = fixture
+                .repo()
+                .list_workflow_dispatch_page(&range, cursor, std::num::NonZeroU32::new(64).unwrap())
+                .await?;
+            traversed.extend(page.candidates.iter().map(WorkflowDispatchRow::position));
+            cursor = page.last_examined;
+            if page.exhausted {
+                break;
+            }
+        }
+        assert_eq!(
+            traversed, positions[index],
+            "all ties survive complete traversal"
+        );
     }
     let home = ShardId(0);
     let home_count: i64 =
@@ -123,7 +202,7 @@ async fn workflow_dispatch_live_query_plans() -> Result<()> {
             .bind(DsqlRunRepository::shard_id_to_uuid(home))
             .bind(64i64);
         if continued {
-            query = query.bind(positions[0].run_key.0);
+            query = query.bind(positions[0][0].run_key.0);
         }
         let plan = query.fetch_all(&fixture.pool).await?;
         report.push_str(&format!(
@@ -141,6 +220,40 @@ async fn workflow_dispatch_live_query_plans() -> Result<()> {
     fixture.store.shutdown().await?;
     fixture.pool.close().await;
     Ok(())
+}
+
+// The pre-change tuple predicate is retained only as a live plan negative control.
+fn legacy_queue_page_query(
+    range: &crate::WorkflowDiscoveryRange,
+    after: Option<crate::WorkflowDispatchPosition>,
+) -> sqlx::QueryBuilder<sqlx::Postgres> {
+    let mut query = sqlx::QueryBuilder::new(super::workflow_dispatch::SELECT_ROW);
+    let [queue, deployment, build] = range.lookup_keys();
+    let (mode, _, _) = range.routing.coordinates();
+    query
+        .push(" WHERE queue_namespace=")
+        .push_bind(range.namespace_id.0)
+        .push(" AND queue_key=")
+        .push_bind(queue)
+        .push(" AND routing_mode=")
+        .push_bind(mode)
+        .push(" AND deployment_key=")
+        .push_bind(deployment)
+        .push(" AND build_key=")
+        .push_bind(build)
+        .push(" AND sticky=false");
+    if let Some(after) = after {
+        query
+            .push(" AND (priority_key, scheduled_at, run_key) > (")
+            .push_bind(after.priority_key)
+            .push(",")
+            .push_bind(after.scheduled_at)
+            .push(",")
+            .push_bind(after.run_key.0)
+            .push(")");
+    }
+    query.push(" ORDER BY priority_key, scheduled_at, run_key LIMIT 64");
+    query
 }
 
 impl Fixture {
@@ -431,4 +544,120 @@ fn workflow_dispatch_live_generated_sticky_recovery() {
     crate::workflow_dispatch_tests::run_sticky_recovery_cases(&fixture, &runtime);
     runtime.block_on(fixture.store.shutdown()).unwrap();
     runtime.block_on(fixture.pool.close());
+}
+
+#[async_trait]
+impl crate::workflow_dispatch_tests::RepairBackend for Fixture {
+    async fn remove_row(&self, key: RunKey) -> Result<()> {
+        sqlx::query("DELETE FROM workflow_dispatch WHERE run_key=$1")
+            .bind(key.0)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn legacy_recovery_flag(&self, key: RunKey) -> Result<()> {
+        sqlx::query("UPDATE workflow_hot SET recovery_needed=NULL WHERE run_key=$1")
+            .bind(key.0)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn authority(&self, keys: &[RunKey]) -> Result<Vec<u8>> {
+        let keys: Vec<_> = keys.iter().map(|key| key.0).collect();
+        let hot = sqlx::query_as::<_, (Uuid, i64, Vec<u8>, Option<bool>, OffsetDateTime)>(
+            "SELECT run_key, transition_seq, state_data, recovery_needed, updated_at FROM workflow_hot WHERE run_key=ANY($1) ORDER BY run_key")
+            .bind(&keys).fetch_all(&self.pool).await?;
+        let projection = sqlx::query_as::<_, (Uuid, i64, Vec<u8>, Vec<u8>)>(
+            "SELECT run_key, transition_seq, context_data, ops_data FROM projection_log WHERE run_key=ANY($1) ORDER BY run_key, transition_seq")
+            .bind(&keys).fetch_all(&self.pool).await?;
+        let mut history = Vec::new();
+        for key in &keys {
+            history.push(self.repo().read_history(RunKey(*key), 0, 100).await?);
+        }
+        Ok(format!("{hot:?}{projection:?}{history:?}").into_bytes())
+    }
+    async fn finish_repair_case(&self, keys: &[RunKey]) -> Result<()> {
+        let keys: Vec<_> = keys.iter().map(|key| key.0).collect();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM workflow_dispatch WHERE run_key=ANY($1)")
+            .bind(&keys)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM workflow_hot WHERE run_key=ANY($1)")
+            .bind(&keys)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+#[test]
+fn workflow_dispatch_live_generated_complete_repair() {
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return;
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let fixture = runtime.block_on(Fixture::connect(1)).unwrap();
+    crate::workflow_dispatch_tests::run_repair_cases(&fixture, &runtime);
+    runtime.block_on(fixture.store.shutdown()).unwrap();
+    runtime.block_on(fixture.pool.close());
+}
+
+#[tokio::test]
+async fn workflow_dispatch_live_repair_decode_and_encoding_failures_preserve_authority()
+-> Result<()> {
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return Ok(());
+    }
+    let fixture = Fixture::connect(1).await?;
+    let transition = crate::memory::projection_accumulator_tests::fresh_transition(RunKey::new());
+    let key = transition.next_state.run_key;
+    let mut state = crate::memory::projection_accumulator_tests::applied(
+        crate::workflow_dispatch_tests::commit(&fixture, transition).await?,
+    );
+    let expected_row = fixture.row(key).await?;
+    assert!(
+        fixture
+            .repo()
+            .reconcile_workflow_dispatch_run(ShardId(1), key)
+            .await
+            .is_err()
+    );
+    let original =
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT state_data FROM workflow_hot WHERE run_key=$1")
+            .bind(key.0)
+            .fetch_one(&fixture.pool)
+            .await?;
+    state.pending_workflow_task.as_mut().unwrap().logical_seq = LogicalTaskSeq(u64::MAX);
+    for corrupt in [vec![1, 2, 3], codec::encode_workflow_state(&state)?] {
+        sqlx::query("UPDATE workflow_hot SET state_data=$2 WHERE run_key=$1")
+            .bind(key.0)
+            .bind(corrupt)
+            .execute(&fixture.pool)
+            .await?;
+        let before =
+            crate::workflow_dispatch_tests::RepairBackend::authority(&fixture, &[key]).await?;
+        assert!(
+            fixture
+                .repo()
+                .reconcile_workflow_dispatch_run(ShardId(0), key)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::workflow_dispatch_tests::RepairBackend::authority(&fixture, &[key]).await?,
+            before
+        );
+        assert_eq!(fixture.row(key).await?, expected_row);
+    }
+    sqlx::query("UPDATE workflow_hot SET state_data=$2 WHERE run_key=$1")
+        .bind(key.0)
+        .bind(original)
+        .execute(&fixture.pool)
+        .await?;
+    crate::workflow_dispatch_tests::RepairBackend::finish_repair_case(&fixture, &[key]).await?;
+    fixture.store.shutdown().await?;
+    fixture.pool.close().await;
+    Ok(())
 }

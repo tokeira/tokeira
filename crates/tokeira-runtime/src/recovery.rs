@@ -7,13 +7,13 @@
 //! `sweep_shard` performs that rebuild; [`run_lease_renewer`] keeps the shard's
 //! durable lease alive for as long as this node owns it.
 //!
-//! Crash-safety and idempotency. The sweep reads durable state and reconstructs
-//! in-memory derived state; it commits nothing new. Re-running it (after a crash,
-//! a failover, or a re-acquire) therefore reproduces the same in-memory state and
-//! cannot corrupt anything — republishing a task the previous owner already
-//! delivered is harmless because delivery is at-least-once and the kernel fences
-//! duplicates by sequence. This is why the sweep is allowed to run unconditionally
-//! on every takeover.
+//! Crash-safety and idempotency. Recovery reconstructs volatile indexes from
+//! authoritative state. With dispatch reconciliation enabled, one-run repair
+//! transactions also replace derived rows; both walks finish behind the local
+//! writer barrier before activation. Due timer firing and activity preparation
+//! then belong to Active-only scanners. Legacy construction retains its sweep
+//! effects until the coordinated cutover. Duplicate delivery remains harmless
+//! because the start transition checks the task incarnation.
 //!
 //! Ordering. The sweep must complete before the shard is marked `Active` and
 //! starts admitting commands (see the `runtime::membership` client); admitting work
@@ -24,13 +24,13 @@
 //!
 //! Acquisition lifetime. Membership cancels a superseded or failed sweep and
 //! only activates the same local acquisition that began it. Workflow-task
-//! deadline installation also checks that acquisition under the owner lock, so
-//! an old sweep cannot overwrite a successor's tracking. These local checks do
+//! deadline installation and every other recovery tracker check that acquisition
+//! under the owner lock, so an old sweep cannot overwrite successor tracking. These local checks do
 //! not establish a transaction-local fence against competing durable owners.
 
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use time::OffsetDateTime;
 use tokeira_storage::{
     DueActivityDispatch, DueTimer, LeaseOutcome, LeaseRepository, RecoveryCursor, RunRepository,
@@ -92,10 +92,11 @@ const DUE_ACTIVITY_DISPATCH_PAGE: usize = 100;
 /// repopulates the workflow/WFT/activity/Nexus timeout tracking sets. Returns a
 /// [`SweepResult`] tallying the work.
 ///
-/// Idempotent and crash-safe: it commits nothing and only mirrors durable state
-/// into memory, so it is safe to run on every shard takeover and to re-run after
-/// a crash (see module docs). Must finish before the shard is marked `Active`, so
-/// no command is admitted against a partially-rebuilt view.
+/// Legacy sweep entry point retained for tests of existing construction. Its
+/// derived publications are repeatable; due timer and activity preparation may
+/// submit authoritative transitions. Enabled reconciliation uses the two-walk
+/// entry point below and defers those effects until activation.
+#[cfg(test)]
 pub(crate) async fn sweep_shard<R, S>(
     shard_id: ShardId,
     repo: &R,
@@ -113,6 +114,81 @@ where
     R: RunRepository + ?Sized,
     S: RunRepository + 'static,
 {
+    sweep_shard_inner(
+        shard_id,
+        repo,
+        broker,
+        lanes,
+        lane_count,
+        workflow_timeout_tracking,
+        wft_timeout_tracking,
+        activity_tracking,
+        nexus_timeout_tracking,
+        completion_callback_tracking,
+        retry_deps,
+        None,
+    )
+    .await
+}
+
+/// Local acquisition identity carried through every repair attempt and page.
+#[derive(Debug)]
+pub(crate) struct RepairAcquisition {
+    pub(crate) owner: Arc<std::sync::RwLock<crate::shard::ShardOwner>>,
+    pub(crate) acquisition: crate::shard::ShardAcquisition,
+    pub(crate) max_retries: u32,
+}
+
+impl RepairAcquisition {
+    fn validate(&self) -> Result<()> {
+        crate::serving_gate::validate(&self.owner, &self.acquisition)
+    }
+
+    async fn repair<R: RunRepository + ?Sized>(
+        &self,
+        repo: &R,
+        run_key: tokeira_types::RunKey,
+    ) -> Result<()> {
+        for attempt in 0..=self.max_retries {
+            self.validate()?;
+            match repo
+                .reconcile_workflow_dispatch_run(self.acquisition.shard_id, run_key)
+                .await
+            {
+                Err(error)
+                    if error.is::<tokeira_storage::WorkflowDispatchRepairConflict>()
+                        && attempt < self.max_retries =>
+                {
+                    continue;
+                }
+                result => {
+                    result.with_context(|| format!("repair workflow dispatch for {run_key:?}"))?
+                }
+            }
+            return self.validate();
+        }
+        unreachable!("last repair attempt returns")
+    }
+}
+
+pub(crate) async fn sweep_shard_inner<R, S>(
+    shard_id: ShardId,
+    repo: &R,
+    broker: &InMemoryBroker,
+    lanes: &[LaneHandle],
+    lane_count: usize,
+    workflow_timeout_tracking: &WorkflowTimeoutTrackingState,
+    wft_timeout_tracking: &WftTimeoutTrackingState,
+    activity_tracking: &ActivityTrackingState,
+    nexus_timeout_tracking: &NexusTimeoutTrackingState,
+    completion_callback_tracking: &CompletionCallbackTrackingState,
+    retry_deps: &ActivityRetryDeps<S>,
+    repair: Option<&RepairAcquisition>,
+) -> Result<SweepResult>
+where
+    R: RunRepository + ?Sized,
+    S: RunRepository + 'static,
+{
     let mut result = SweepResult::default();
     let now = OffsetDateTime::now_utc();
 
@@ -123,10 +199,16 @@ where
     // read.
     let mut cursor: Option<RecoveryCursor> = None;
     loop {
+        if let Some(repair) = repair {
+            repair.validate()?;
+        }
         let page = repo
             .list_recovery_candidates_for_shard(shard_id, cursor.as_ref(), RECOVERY_PAGE)
             .await?;
         for state in &page.states {
+            if let Some(repair) = repair {
+                repair.repair(repo, state.run_key).await?;
+            }
             let entries = recovery_entries(state);
             if let Some(task) = entries.dispatchable_workflow_task {
                 // Recovery republishes the same derived envelope as the hot
@@ -231,6 +313,33 @@ where
             Some(next) => cursor = Some(next),
             None => break,
         }
+    }
+
+    if let Some(repair) = repair {
+        // Recovery flags establish missing wanted rows. The complete home index
+        // supplies the complementary walk: closed/excluded runs and orphans can
+        // still own stale rows, including sticky rows outside the queue index.
+        let limit = std::num::NonZeroU32::new(64).expect("nonzero repair page");
+        let mut after = None;
+        loop {
+            repair.validate()?;
+            let keys = repo
+                .list_workflow_dispatch_for_home(shard_id, after, limit)
+                .await?;
+            let exhausted = keys.len() < limit.get() as usize;
+            after = keys.last().copied();
+            for key in keys {
+                repair.repair(repo, key).await?;
+            }
+            if exhausted {
+                break;
+            }
+        }
+        repair.validate()?;
+        // Active-only scanners already own timer firing and activity preparation.
+        // They resume at the first processing opportunity after activation. The
+        // legacy sweep below remains unchanged while discovery is disabled.
+        return Ok(result);
     }
 
     // Only rows due at the sweep's `now` republish — a retry inside its
@@ -375,6 +484,35 @@ pub async fn run_lease_renewer<R>(
 ) where
     R: LeaseRepository + 'static,
 {
+    run_lease_renewer_scoped(
+        repo,
+        shard_id,
+        owner,
+        node_endpoint,
+        epoch,
+        interval,
+        max_retries,
+        cancel,
+        on_lost,
+        None,
+    )
+    .await;
+}
+
+pub(crate) async fn run_lease_renewer_scoped<R>(
+    repo: Arc<R>,
+    shard_id: ShardId,
+    owner: String,
+    node_endpoint: String,
+    epoch: ShardEpoch,
+    interval: tokio::time::Duration,
+    max_retries: u32,
+    cancel: CancellationToken,
+    on_lost: oneshot::Sender<()>,
+    acquisition: Option<crate::shard::ShardAcquisition>,
+) where
+    R: LeaseRepository + 'static,
+{
     let mut failures = 0u32;
     let mut on_lost = Some(on_lost);
 
@@ -384,10 +522,46 @@ pub async fn run_lease_renewer<R>(
             _ = tokio::time::sleep(interval) => {}
         }
 
-        match repo
-            .renew_bundle(shard_id, owner.clone(), epoch, node_endpoint.clone())
-            .await
+        let started = tokio::time::Instant::now();
+        let deadline = acquisition.as_ref().and_then(|acquisition| {
+            *acquisition
+                .deadline
+                .lock()
+                .expect("acquisition deadline lock poisoned")
+        });
+        let renewal = repo.renew_bundle(shard_id, owner.clone(), epoch, node_endpoint.clone());
+        let outcome = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, renewal).await {
+                Ok(outcome) if started < deadline && tokio::time::Instant::now() < deadline => {
+                    outcome
+                }
+                _ => {
+                    cancel.cancel();
+                    if let Some(tx) = on_lost.take() {
+                        let _ = tx.send(());
+                    }
+                    break;
+                }
+            }
+        } else {
+            renewal.await
+        };
+        if matches!(
+            outcome,
+            Ok(LeaseOutcome::Renewed { .. } | LeaseOutcome::Acquired { .. })
+        ) && let Some(acquisition) = &acquisition
+            && let Some(duration) = repo.bundle_lease_duration()
         {
+            let duration = std::time::Duration::try_from(duration)
+                .expect("repository grants positive lease duration");
+            // Request start is no later than the repository's timestamp, so this
+            // deadline never extends admission beyond the granted durable lease.
+            *acquisition
+                .deadline
+                .lock()
+                .expect("acquisition deadline lock poisoned") = Some(started + duration);
+        }
+        match outcome {
             Ok(LeaseOutcome::Renewed { .. }) => {
                 failures = 0;
             }
@@ -775,14 +949,12 @@ mod tests {
 
                 for idx in 0..run_count {
                     let run_key = RunKey::new();
-                    let computed_shard = ShardId(
-                        (run_key.0.as_u128() as u32)
-                            % shard_count,
-                    );
                     let mut t = start_transition(run_key);
                     t.next_state.namespace_id = ns;
                     t.next_state.workflow_id =
                         WorkflowId(format!("wf-{idx}"));
+                    let computed_shard = tokeira_types::execution_home_bundle(
+                        t.next_state.namespace_id.0.as_bytes(), t.next_state.workflow_id.0.as_bytes(), shard_count);
                     let result = store
                         .commit_transition(
                             run_key,
@@ -885,14 +1057,12 @@ mod tests {
 
                 for idx in 0..run_count {
                     let run_key = RunKey::new();
-                    let computed_shard = ShardId(
-                        (run_key.0.as_u128() as u32)
-                            % shard_count,
-                    );
                     let mut t = start_transition(run_key);
                     t.next_state.namespace_id = ns;
                     t.next_state.workflow_id =
                         WorkflowId(format!("wf-{idx}"));
+                    let computed_shard = tokeira_types::execution_home_bundle(
+                        t.next_state.namespace_id.0.as_bytes(), t.next_state.workflow_id.0.as_bytes(), shard_count);
                     let act_id = format!("act-{idx}");
                     let queue = QueueKey {
                         namespace_id: ns,
@@ -1238,13 +1408,11 @@ mod tests {
 
                 for idx in 0..run_count {
                     let run_key = RunKey::new();
-                    let computed_shard = ShardId(
-                        (run_key.0.as_u128() as u32)
-                            % shard_count,
-                    );
                     let mut t = start_transition(run_key);
                     t.next_state.workflow_id =
                         WorkflowId(format!("wf-{idx}"));
+                    let computed_shard = tokeira_types::execution_home_bundle(
+                        t.next_state.namespace_id.0.as_bytes(), t.next_state.workflow_id.0.as_bytes(), shard_count);
                     let timer_id = format!("tmr-{idx}");
                     let tmr = TimerState {
                         timer_id: timer_id.clone(),
@@ -2008,13 +2176,11 @@ mod tests {
 
                 for idx in 0..run_count {
                     let run_key = RunKey::new();
-                    let computed_shard = ShardId(
-                        (run_key.0.as_u128() as u32)
-                            % shard_count,
-                    );
                     let mut t = start_transition(run_key);
                     t.next_state.workflow_id =
                         WorkflowId(format!("wf-{idx}"));
+                    let computed_shard = tokeira_types::execution_home_bundle(
+                        t.next_state.namespace_id.0.as_bytes(), t.next_state.workflow_id.0.as_bytes(), shard_count);
                     let timer_id =
                         format!("tmr-{idx}");
                     let tmr = TimerState {

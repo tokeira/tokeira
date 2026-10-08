@@ -152,7 +152,7 @@ impl WftTimeoutTrackingState {
             let Some(acquisition) = &acquisition else {
                 return;
             };
-            if acquisition.cancel.is_cancelled() || !owner.matches_acquisition(acquisition) {
+            if !acquisition.valid() || !owner.matches_acquisition(acquisition) {
                 return;
             }
         }

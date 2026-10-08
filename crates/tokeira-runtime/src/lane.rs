@@ -436,6 +436,7 @@ where
             shard_for(message.run_key, owner.shard_count())
         };
         let processing_span = lane_processing_span(&message, command_type, shard_id);
+        let mut write_admission = None;
         let result = handle_message_with_cache(
             kernel,
             repo,
@@ -446,6 +447,7 @@ where
             config,
             config.max_occ_retries,
             cache,
+            &mut write_admission,
         )
         .instrument(processing_span.clone())
         .await;
@@ -473,6 +475,7 @@ where
                     config,
                     config.max_occ_retries,
                     cache,
+                    &mut write_admission,
                 )
                 .instrument(processing_span.clone())
                 .await;
@@ -492,6 +495,19 @@ where
         let stop_draining = result.is_err() || breach.is_some();
         let reply = match result {
             Ok((commit_result, mut dispatch_ops, history_events)) => {
+                // Every post-commit index uses stable execution ownership; the
+                // run hash above only identifies the processing span.
+                let shard_id = match &commit_result {
+                    CommitResult::Applied { new_state } => tokeira_types::execution_home_bundle(
+                        new_state.namespace_id.0.as_bytes(),
+                        new_state.workflow_id.0.as_bytes(),
+                        shard_owner
+                            .read()
+                            .expect("shard_owner lock poisoned")
+                            .shard_count(),
+                    ),
+                    _ => shard_id,
+                };
                 let mut reset_materialization_error = None;
                 if let CommitResult::Applied { new_state } = &commit_result {
                     // Workflow-task timeout tracking, split by task type:
@@ -809,7 +825,11 @@ where
                         {
                             let shard_id = {
                                 let owner = shard_owner.read().expect("shard_owner lock poisoned");
-                                shard_for(successor_run_key, owner.shard_count())
+                                tokeira_types::execution_home_bundle(
+                                    successor_state.namespace_id.0.as_bytes(),
+                                    successor_state.workflow_id.0.as_bytes(),
+                                    owner.shard_count(),
+                                )
                             };
                             if successor_state.workflow_execution_timeout.is_some()
                                 || successor_state.workflow_run_timeout.is_some()
@@ -1558,6 +1578,7 @@ where
         config,
         max_retries,
         &mut cache,
+        &mut None,
     )
     .await
 }
@@ -1619,6 +1640,7 @@ async fn handle_message_with_cache<K, R>(
     config: &LaneConfig,
     max_retries: u32,
     cache: &mut LaneCache,
+    write_admission: &mut Option<crate::serving_gate::WritePermit>,
 ) -> Result<(
     CommitResult,
     SmallVec<[DispatchOp; 4]>,
@@ -1715,6 +1737,10 @@ where
                 SmallVec::new(),
                 SmallVec::new(),
             ));
+        }
+        if write_admission.is_none() {
+            *write_admission =
+                crate::serving_gate::admit(shard_owner, execution_home_bundle).await?;
         }
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
@@ -3135,6 +3161,7 @@ mod tests {
             &config,
             config.max_occ_retries,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -3150,6 +3177,7 @@ mod tests {
             &config,
             config.max_occ_retries,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -3203,6 +3231,7 @@ mod tests {
             &config,
             2,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -3243,6 +3272,7 @@ mod tests {
             &config,
             2,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -3269,6 +3299,7 @@ mod tests {
             &config,
             2,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -3334,6 +3365,7 @@ mod tests {
             &config,
             config.max_occ_retries,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();

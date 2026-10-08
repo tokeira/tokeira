@@ -42,15 +42,46 @@ where
         let tracking = self
             .wft_timeout_tracking
             .for_acquisition(recovery.acquisition.clone());
-        let retry = self.activity_retry_deps();
+        let workflow_tracking = self
+            .workflow_timeout_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let activity_tracking = self
+            .activity_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let nexus_tracking = self
+            .nexus_timeout_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let callback_tracking = self
+            .completion_callback_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let repair = crate::recovery::RepairAcquisition {
+            owner: self.shard_owner.clone(),
+            acquisition: recovery.acquisition.clone(),
+            max_retries: self.config.max_occ_retries,
+        };
+        let reconciliation = self
+            .shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .reconciliation_enabled();
+        let shutdown = self.runtime_shutdown.cancellation_token();
+        let _exclusive = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped while draining recovery writers")),
+            result = crate::serving_gate::quiesce(&self.shard_owner, &recovery.acquisition) => result?,
+        };
+        let mut retry = self.activity_retry_deps();
+        retry.tracking = activity_tracking.clone();
         let shutdown = self.runtime_shutdown.cancellation_token();
         let result = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped during shard recovery")),
             _ = recovery.acquisition.cancel.cancelled() => return Err(anyhow!("shard recovery acquisition cancelled")),
-            result = sweep_shard(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
-                &self.workflow_timeout_tracking, &tracking, &self.activity_tracking,
-                &self.nexus_timeout_tracking, &self.completion_callback_tracking, &retry) => result?,
+            result = crate::recovery::sweep_shard_inner(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
+                &workflow_tracking, &tracking,
+                &activity_tracking,
+                &nexus_tracking,
+                &callback_tracking, &retry, reconciliation.then_some(&repair)) => result?,
         };
         Self::settle_self_assigned_recovery(&mut recovery, Ok(result))
     }
@@ -69,6 +100,16 @@ where
         let acquisition = {
             let mut owner = self.shard_owner.write().expect("shard owner lock poisoned");
             owner.record_acquired(shard_id, epoch);
+            // Cancellation and clearing share the owner lock with scoped installs.
+            // A superseded sweep cannot repopulate these entries after this clear,
+            // and runs no longer eligible for recovery cannot leak old generations.
+            self.workflow_timeout_tracking
+                .remove_all_for_shard(shard_id);
+            self.wft_timeout_tracking.remove_all_for_shard(shard_id);
+            self.activity_tracking.remove_all_for_shard(shard_id);
+            self.nexus_timeout_tracking.remove_all_for_shard(shard_id);
+            self.completion_callback_tracking
+                .remove_all_for_shard(shard_id);
             owner
                 .acquisition(shard_id)
                 .expect("just recorded acquisition")
@@ -105,6 +146,7 @@ where
     where
         R: LeaseRepository,
     {
+        let lease_request_started = tokio::time::Instant::now();
         let outcome = self
             .repo
             .try_acquire_bundle(
@@ -137,32 +179,79 @@ where
         }
 
         let recovery = self.begin_acquisition(shard_id, epoch);
+        let reconciliation = self
+            .shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .reconciliation_enabled();
+        if reconciliation && let Some(duration) = self.repo.bundle_lease_duration() {
+            *recovery
+                .acquisition
+                .deadline
+                .lock()
+                .expect("acquisition deadline lock poisoned") =
+                Some(lease_request_started + std::time::Duration::try_from(duration)?);
+        }
         let cancel = recovery.acquisition.cancel.clone();
         let (lost_tx, mut lost_rx) = oneshot::channel();
-        let _renewer = self.runtime_shutdown.spawn(run_lease_renewer(
-            self.repo.clone(),
-            shard_id,
-            self.owner_identity.clone(),
-            self.node_endpoint.clone(),
-            epoch,
-            tokio::time::Duration::from_secs(1),
-            3,
-            cancel.clone(),
-            lost_tx,
-        ));
+        let _renewer = self
+            .runtime_shutdown
+            .spawn(crate::recovery::run_lease_renewer_scoped(
+                self.repo.clone(),
+                shard_id,
+                self.owner_identity.clone(),
+                self.node_endpoint.clone(),
+                epoch,
+                tokio::time::Duration::from_secs(1),
+                3,
+                cancel.clone(),
+                lost_tx,
+                reconciliation.then(|| recovery.acquisition.clone()),
+            ));
         let tracking = self
             .wft_timeout_tracking
             .for_acquisition(recovery.acquisition.clone());
-        let retry = self.activity_retry_deps();
+        let workflow_tracking = self
+            .workflow_timeout_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let activity_tracking = self
+            .activity_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let nexus_tracking = self
+            .nexus_timeout_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let callback_tracking = self
+            .completion_callback_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let repair = crate::recovery::RepairAcquisition {
+            owner: self.shard_owner.clone(),
+            acquisition: recovery.acquisition.clone(),
+            max_retries: self.config.max_occ_retries,
+        };
+        let reconciliation = self
+            .shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .reconciliation_enabled();
+        let shutdown = self.runtime_shutdown.cancellation_token();
+        let _exclusive = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped while draining recovery writers")),
+            result = crate::serving_gate::quiesce(&self.shard_owner, &recovery.acquisition) => result?,
+        };
+        let mut retry = self.activity_retry_deps();
+        retry.tracking = activity_tracking.clone();
         let shutdown = self.runtime_shutdown.cancellation_token();
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped during shard recovery")),
             _ = cancel.cancelled() => return Err(anyhow!("shard acquisition cancelled during recovery")),
             _ = &mut lost_rx => return Err(anyhow!("shard lease lost during recovery")),
-            result = sweep_shard(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
-                &self.workflow_timeout_tracking, &tracking, &self.activity_tracking,
-                &self.nexus_timeout_tracking, &self.completion_callback_tracking, &retry) => { result?; }
+            result = crate::recovery::sweep_shard_inner(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
+                &workflow_tracking, &tracking,
+                &activity_tracking,
+                &nexus_tracking,
+                &callback_tracking, &retry, reconciliation.then_some(&repair)) => { result?; }
         }
         // No await between final loss inspection and activation. Generation and
         // cancellation are checked under the same owner lock as replacement.

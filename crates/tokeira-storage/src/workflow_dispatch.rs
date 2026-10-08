@@ -15,6 +15,11 @@ use tokeira_types::{
     StickyAffinity, TaskQueueName, WorkerIdentity,
 };
 
+/// A repair transaction lost OCC; retry from a fresh state read and acquisition check.
+#[derive(Debug, thiserror::Error)]
+#[error("workflow dispatch repair serialization conflict")]
+pub struct WorkflowDispatchRepairConflict;
+
 /// Identity of a single startable generation within a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowTaskIncarnation {
@@ -164,6 +169,39 @@ impl WorkflowDispatchRow {
         ensure!(
             !self.sticky || self.schedule_to_start_deadline.is_some(),
             "sticky dispatch requires a recoverable deadline"
+        );
+        self.validate_size()?;
+        Ok(())
+    }
+
+    fn validate_size(&self) -> Result<()> {
+        let (_, deployment, build) = self.routing.coordinates();
+        let priority = self
+            .priority
+            .as_ref()
+            .map(postcard::to_allocvec)
+            .transpose()?;
+        let columns = [
+            self.queue_name.0.len(),
+            self.normal_queue_name.0.len(),
+            deployment.map_or(0, str::len),
+            build.map_or(0, str::len),
+            self.sticky_worker
+                .as_ref()
+                .map_or(0, |worker| worker.0.len()),
+            priority.as_ref().map_or(0, Vec::len),
+        ];
+        ensure!(
+            columns.iter().all(|bytes| *bytes <= 1024 * 1024),
+            "workflow dispatch column exceeds DSQL's 1 MiB limit"
+        );
+        // Conservative room for scalar columns, digests and row/index overhead.
+        // One-run repair modifies just this row. Even charging old + new images
+        // stays below the separate 10 MiB / 3,000-row transaction service limits,
+        // including an orphan deletion (at most one existing 2 MiB row).
+        ensure!(
+            columns.iter().sum::<usize>() + 4096 <= 2 * 1024 * 1024,
+            "workflow dispatch row exceeds the conservative 2 MiB encoding budget"
         );
         Ok(())
     }

@@ -761,22 +761,32 @@ pub(crate) async fn routing_and_home_pages(backend: &impl Backend) {
             break;
         }
     }
-    for row in expected {
+    for row in &expected {
         assert!(
             keys.contains(&row.incarnation.run_key),
             "home walk must include sticky intent"
         );
         assert_eq!(
             backend.row(row.incarnation.run_key).await.unwrap(),
-            Some(row)
+            Some(row.clone())
         );
     }
-    assert!(
-        backend
+    // Other fixtures may populate this home; only this fixture's run keys
+    // must be excluded. Walk every page so a leaked key cannot hide later.
+    let mut after = None;
+    loop {
+        let page = backend
             .repo()
-            .list_workflow_dispatch_for_home(ShardId(1), None, NonZeroU32::new(7).unwrap())
+            .list_workflow_dispatch_for_home(ShardId(1), after, NonZeroU32::new(64).unwrap())
             .await
-            .unwrap()
-            .is_empty()
-    );
+            .unwrap();
+        assert!(
+            page.iter()
+                .all(|key| { expected.iter().all(|row| row.incarnation.run_key != *key) })
+        );
+        if page.len() < 64 {
+            break;
+        }
+        after = page.last().copied();
+    }
 }

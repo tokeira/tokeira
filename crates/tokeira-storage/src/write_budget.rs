@@ -20,7 +20,7 @@
 //! enough under DSQL's limits that the keys, fixed-width columns and per-row
 //! overhead it doesn't count never matter.
 //!
-//! [`TransactionModel`] is the in-memory store's account of one of those
+//! `TransactionModel` is the in-memory store's account of one of those
 //! transactions. It refuses what DSQL refuses, so a test on either store sees
 //! the same refusals.
 

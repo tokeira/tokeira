@@ -62,8 +62,10 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::OffsetDateTime;
-use tokeira_kernel::{HistoryEvent, WorkflowState};
-use tokeira_types::RunKey;
+use tokeira_kernel::{HistoryEvent, TimerState, WorkflowState, state::Priority};
+use tokeira_types::{EventPrincipal, RunKey};
+
+use crate::{BacklogPayload, ProjectionContext};
 
 /// Magic prefix of an enveloped `workflow_hot.state_data` blob (`"TKWS"`).
 pub const WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5753;
@@ -122,6 +124,73 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 /// the repository cannot safely infer derived state from that row.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     postcard::from_bytes(bytes).map_err(Into::into)
+}
+
+/// Marker that opens a backlog row's payload envelope (`"TKBQ"`).
+const BACKLOG_ENVELOPE_VERSION: u32 = 0x544B_4251;
+
+#[derive(Serialize, Deserialize)]
+struct BacklogEnvelope {
+    version: u32,
+    payload: BacklogPayload,
+    priority: Option<Priority>,
+}
+
+/// Serialize the batch-aligned history-principal sidecar.
+pub fn encode_history_principals(principals: &[Option<EventPrincipal>]) -> Result<Vec<u8>> {
+    encode(&principals)
+}
+
+/// Deserialize the batch-aligned history-principal sidecar.
+pub fn decode_history_principals(bytes: &[u8]) -> Result<Vec<Option<EventPrincipal>>> {
+    decode(bytes)
+}
+
+/// Serialize timer metadata that is not already indexed in `timer_bucket`.
+pub fn encode_timer_state(state: &TimerState) -> Result<Vec<u8>> {
+    encode(state)
+}
+
+/// Deserialize one timer side-table row.
+pub fn decode_timer_state(bytes: &[u8]) -> Result<TimerState> {
+    decode(bytes)
+}
+
+/// Serialize backlog payload and public delivery metadata for the generic backlog table.
+pub fn encode_backlog_payload(
+    payload: &BacklogPayload,
+    priority: Option<&Priority>,
+) -> Result<Vec<u8>> {
+    encode(&BacklogEnvelope {
+        version: BACKLOG_ENVELOPE_VERSION,
+        payload: payload.clone(),
+        priority: priority.cloned(),
+    })
+}
+
+/// Deserialize backlog payload and delivery metadata after a queue drain.
+///
+/// Before the schema baseline, rows contained a bare [`BacklogPayload`]. The
+/// explicit envelope marker prevents an old enum discriminant from being
+/// mistaken for the new shape, while the fallback keeps a real old byte fixture
+/// readable with default Priority.
+pub fn decode_backlog_payload(bytes: &[u8]) -> Result<(BacklogPayload, Option<Priority>)> {
+    if let Ok(envelope) = decode::<BacklogEnvelope>(bytes)
+        && envelope.version == BACKLOG_ENVELOPE_VERSION
+    {
+        return Ok((envelope.payload, envelope.priority));
+    }
+    decode(bytes).map(|payload| (payload, None))
+}
+
+/// Serialize projection delivery context for replayable projection records.
+pub fn encode_projection_context(ctx: &ProjectionContext) -> Result<Vec<u8>> {
+    encode(ctx)
+}
+
+/// Deserialize projection delivery context.
+pub fn decode_projection_context(bytes: &[u8]) -> Result<ProjectionContext> {
+    decode(bytes)
 }
 
 /// A hot-state or history blob whose leading version is not the one this build writes.
@@ -398,6 +467,73 @@ pub fn decode_history_events(run_key: RunKey, bytes: &[u8]) -> Result<Vec<Histor
         run_key,
         bytes,
     )
+}
+
+/// Cut a reset's copied history into batches: consecutive ranges of `events`
+/// whose encoded events, and encoded principals, each stay within `max_bytes`,
+/// unless a range holds a single event (`bounded-bulk-writes`).
+///
+/// Both stores cut with this function, so they write the same batches and seed
+/// the same History Size. Sizes are exact without encoding each candidate batch:
+/// postcard writes a sequence as its length followed by its items, so a batch's
+/// size is its envelope and length prefix plus the sizes of its events.
+pub fn reset_history_batches(
+    events: &[HistoryEvent],
+    principals: &[Option<EventPrincipal>],
+    max_bytes: usize,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    anyhow::ensure!(
+        events.len() == principals.len(),
+        "history/principal sidecar length mismatch: {} events, {} principals",
+        events.len(),
+        principals.len()
+    );
+    let envelope = varint_len(u64::from(HISTORY_BATCH_ENVELOPE_VERSION));
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut event_bytes = 0usize;
+    let mut principal_bytes = 0usize;
+    for (index, (event, principal)) in events.iter().zip(principals).enumerate() {
+        let event_len = encode(event)?.len();
+        let principal_len = encode(principal)?.len();
+        let count = varint_len((index - start + 1) as u64);
+        let over = envelope + count + event_bytes + event_len > max_bytes
+            || count + principal_bytes + principal_len > max_bytes;
+        if over && index > start {
+            batches.push(start..index);
+            start = index;
+            event_bytes = 0;
+            principal_bytes = 0;
+        }
+        event_bytes += event_len;
+        principal_bytes += principal_len;
+    }
+    if start < events.len() {
+        batches.push(start..events.len());
+    }
+    Ok(batches)
+}
+
+/// Fail unless a reset's copied history runs from event 1 without a gap.
+///
+/// A purge of the base removes its history in pages, first events first, so a
+/// read that overlaps one could otherwise copy a prefix with its start missing
+/// (`bounded-bulk-writes`).
+pub fn ensure_contiguous_prefix(base_run_key: RunKey, events: &[HistoryEvent]) -> Result<()> {
+    for (index, event) in events.iter().enumerate() {
+        let expected = i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1);
+        anyhow::ensure!(
+            event.event_id == expected,
+            "history of {base_run_key:?} is not contiguous: event {} where {expected} was expected",
+            event.event_id
+        );
+    }
+    Ok(())
+}
+
+/// Bytes postcard's varint takes for `value`: seven bits a byte, at least one.
+fn varint_len(value: u64) -> usize {
+    (u64::BITS - value.leading_zeros()).max(1).div_ceil(7) as usize
 }
 
 /// Encoded size of one history batch as the stores persist it, envelope included.

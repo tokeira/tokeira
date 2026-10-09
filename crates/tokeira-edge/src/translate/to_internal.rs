@@ -585,6 +585,8 @@ pub fn reset_request(req: ResetWorkflowExecutionRequest, context: &EdgeContext) 
                 }
             })
             .collect(),
+        // The runtime reads the current pointer when it admits the reset.
+        expected_current_run_key: None,
         reason: req.reason,
         request: RequestContext {
             request_id: CoreRequestId(

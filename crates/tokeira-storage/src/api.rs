@@ -195,6 +195,83 @@ pub enum DeleteRunResult {
     },
 }
 
+/// What a run's bulk-write record says is happening to the run's rows.
+///
+/// A record names a run whose rows are written or removed across several
+/// transactions (`bounded-bulk-writes`). A run has mutable state or a record,
+/// never both, so no lookup finds a run while it has a record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum BulkWritePhase {
+    /// A reset's successor is being written. Every transaction of the
+    /// materialization checks that the record still says this, and its final
+    /// transaction removes the record as it makes the successor visible.
+    Materializing,
+    /// The run's remaining rows are being removed, after a deletion's first
+    /// transaction or an abandoned materialization. The transaction that
+    /// removes the run's last history rows removes the record.
+    Purging,
+}
+
+impl BulkWritePhase {
+    /// The `run_bulk_write.phase` value DSQL stores.
+    #[must_use]
+    pub const fn to_db_smallint(self) -> i16 {
+        match self {
+            Self::Materializing => 1,
+            Self::Purging => 2,
+        }
+    }
+
+    /// Decode a stored phase. DSQL has no `CHECK` constraint, so the
+    /// application rejects any other value.
+    pub fn from_db_smallint(value: i16) -> Result<Self> {
+        match value {
+            1 => Ok(Self::Materializing),
+            2 => Ok(Self::Purging),
+            other => Err(anyhow!("unknown run_bulk_write phase {other}")),
+        }
+    }
+}
+
+/// One run's bulk-write record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunBulkWrite {
+    /// The run whose rows are being written or removed.
+    pub run_key: RunKey,
+    /// The run's execution home, whose owner runs the write and finds the
+    /// record again after a takeover.
+    pub shard_id: ShardId,
+    /// What is happening to the run's rows.
+    pub phase: BulkWritePhase,
+}
+
+/// A backlog spill that stopped at a transaction that failed.
+///
+/// A spill writes its entries in order, in transactions within the budgets of
+/// [`crate::write_budget`]. The entries of the transactions before the failed
+/// one are stored and the rest aren't, so the caller keeps only the rest
+/// (`runtime-durable-backlog` criterion 3.7).
+#[derive(Debug, Error)]
+#[error("stored {persisted} backlog entries, then a transaction failed")]
+pub struct BacklogPersistError {
+    /// How many of the entries, counted from the first, are stored.
+    pub persisted: usize,
+    /// Why the next transaction failed.
+    #[source]
+    pub source: anyhow::Error,
+}
+
+/// Why the kernel rejected a due timer, which decides whether its row may go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleTimer {
+    /// The run has closed, so the timer can never fire.
+    RunClosed,
+    /// The run doesn't exist. Its row is kept while the run is being
+    /// materialized, or once it exists, since a reset's successor holds timer
+    /// rows before its final transaction makes it visible (`bounded-bulk-writes`).
+    RunMissing,
+}
+
 /// Encoded byte length for Worker Deployment conflict tokens.
 pub const CONFLICT_TOKEN_BYTES: usize = 8;
 
@@ -1067,13 +1144,17 @@ pub trait RunRepository: Send + Sync {
         epoch: ShardEpoch,
     ) -> Result<CommitResult>;
 
-    /// Atomically purge one run under OCC and execution-home shard fencing.
+    /// Make one closed run unreachable, under OCC and execution-home shard
+    /// fencing, and record it for purging.
     ///
-    /// A successful implementation must append the returned deletion
-    /// tombstone and remove the run's mutable state, history, current pointer
-    /// (only when it still names this run), and run-owned dispatch/sweep rows as
-    /// one semantic write. A mismatch returns [`DeleteRunResult::Conflict`]
-    /// without exposing a partial purge.
+    /// In one transaction, a successful implementation appends the returned
+    /// deletion tombstone, removes the current pointer (only when it still names
+    /// this run), the run's mutable state and its workflow dispatch row, and
+    /// records the run with phase [`BulkWritePhase::Purging`]. From that commit
+    /// on no lookup finds the run. [`Self::purge_run`] removes its remaining
+    /// rows, which can outnumber what one transaction may change
+    /// (`bounded-bulk-writes`). A mismatch returns [`DeleteRunResult::Conflict`]
+    /// and changes nothing.
     async fn delete_run_for_bundle(
         &self,
         run_key: RunKey,
@@ -1083,14 +1164,54 @@ pub trait RunRepository: Send + Sync {
     ) -> Result<DeleteRunResult>;
 
     /// Materialize a reset successor by copying the base run's committed
-    /// history prefix through `fork_event_id` and deriving the successor state
-    /// by replaying that prefix.
+    /// history before `fork_event_id` and deriving the successor state by
+    /// replaying it.
+    ///
+    /// The copy is written in transactions within the budgets of
+    /// [`crate::write_budget`], behind a [`BulkWritePhase::Materializing`]
+    /// record, before a final transaction makes the successor visible and
+    /// current and removes the record (`bounded-bulk-writes`). That transaction
+    /// moves the current pointer only while it names `expected_current`, the
+    /// run it named when the reset was admitted, open or closed, or is absent
+    /// when that is `None`; otherwise the call fails. A failed call can leave
+    /// the record and the rows written so far: the caller hands the successor
+    /// to [`Self::purge_run`].
     async fn materialize_reset_successor(
         &self,
         base_run_key: RunKey,
         fork_event_id: i64,
         successor_run_id: RunId,
+        expected_current: Option<RunKey>,
     ) -> Result<()>;
+
+    /// Switch a run's [`BulkWritePhase::Materializing`] record to
+    /// [`BulkWritePhase::Purging`], which every later transaction of the
+    /// materialization sees, so none of them changes anything.
+    ///
+    /// A record that is already purging, or none, is left as it is. Callers
+    /// pass only a materialization that will never finish: one whose attempt
+    /// failed, or one found when a shard is taken over.
+    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()>;
+
+    /// Remove the remaining rows of a run that has a bulk-write record.
+    ///
+    /// A `Materializing` record is first abandoned, as
+    /// [`Self::abandon_materialization`] does. The rows go table by table, in
+    /// transactions within the budgets of [`crate::write_budget`], history last,
+    /// and the record goes with the last history rows. A run without a record
+    /// is left untouched. Every transaction is safe to repeat and to run beside
+    /// another purge of the same run, so a purge that stops early is finished by
+    /// any later one.
+    async fn purge_run(&self, run_key: RunKey) -> Result<()>;
+
+    /// List up to `limit` bulk-write records of one execution home, in run-key
+    /// order, after `after`.
+    async fn list_run_bulk_writes(
+        &self,
+        shard_id: ShardId,
+        after: Option<RunKey>,
+        limit: usize,
+    ) -> Result<Vec<RunBulkWrite>>;
 
     /// Read a bounded normal-queue range across every execution home.
     ///
@@ -1164,9 +1285,16 @@ pub trait RunRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>>;
 
-    /// Durably persist unmatched tasks to the dispatch
-    /// backlog for later retry.
-    async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()>;
+    /// Durably persist unmatched tasks to the dispatch backlog for later retry.
+    ///
+    /// The entries are written in order, in transactions within the budgets of
+    /// [`crate::write_budget`]. An entry whose backlog identity is stored keeps
+    /// the stored row. The call stops at the first transaction that fails and
+    /// reports how many entries the transactions before it stored.
+    async fn persist_to_backlog(
+        &self,
+        entries: Vec<BacklogEntry>,
+    ) -> std::result::Result<(), BacklogPersistError>;
 
     /// Remove and return up to `limit` backlog entries for the given queue in
     /// ascending [`DeliveryOrder`].
@@ -1264,11 +1392,18 @@ pub trait RunRepository: Send + Sync {
     /// `timer` was read as: the same run, timer id and fire time.
     ///
     /// This is the timer scanner's cleanup for a row the kernel rejected
-    /// because its run has closed or no longer exists, so it can never fire.
+    /// because its run has closed or doesn't exist, so it can never fire.
     /// Matching the fire time makes the delete a no-op when the row has been
-    /// replaced by a later timer that reuses the id. Returns whether a row was
+    /// replaced by a later timer that reuses the id. For
+    /// [`StaleTimer::RunMissing`] the row is kept when, in the delete's own
+    /// transaction, the run has mutable state or a
+    /// [`BulkWritePhase::Materializing`] record. Returns whether a row was
     /// removed.
-    async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool>;
+    async fn delete_due_timer_if_matches(
+        &self,
+        timer: &DueTimer,
+        reason: StaleTimer,
+    ) -> Result<bool>;
 
     // TODO(storage): add sweep methods for activity tasks, archival eligibility,
     // namespace-scoped pagination, and explicit current-execution conflict
@@ -2616,10 +2751,33 @@ where
         base_run_key: RunKey,
         fork_event_id: i64,
         successor_run_id: RunId,
+        expected_current: Option<RunKey>,
     ) -> Result<()> {
         (**self)
-            .materialize_reset_successor(base_run_key, fork_event_id, successor_run_id)
+            .materialize_reset_successor(
+                base_run_key,
+                fork_event_id,
+                successor_run_id,
+                expected_current,
+            )
             .await
+    }
+
+    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()> {
+        (**self).abandon_materialization(run_key).await
+    }
+
+    async fn purge_run(&self, run_key: RunKey) -> Result<()> {
+        (**self).purge_run(run_key).await
+    }
+
+    async fn list_run_bulk_writes(
+        &self,
+        shard_id: ShardId,
+        after: Option<RunKey>,
+        limit: usize,
+    ) -> Result<Vec<RunBulkWrite>> {
+        (**self).list_run_bulk_writes(shard_id, after, limit).await
     }
 
     async fn list_dispatchable_workflow_tasks(
@@ -2690,7 +2848,10 @@ where
             .await
     }
 
-    async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
+    async fn persist_to_backlog(
+        &self,
+        entries: Vec<BacklogEntry>,
+    ) -> std::result::Result<(), BacklogPersistError> {
         (**self).persist_to_backlog(entries).await
     }
 
@@ -2748,8 +2909,12 @@ where
             .await
     }
 
-    async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
-        (**self).delete_due_timer_if_matches(timer).await
+    async fn delete_due_timer_if_matches(
+        &self,
+        timer: &DueTimer,
+        reason: StaleTimer,
+    ) -> Result<bool> {
+        (**self).delete_due_timer_if_matches(timer, reason).await
     }
 }
 

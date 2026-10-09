@@ -37,20 +37,20 @@ use tokio::sync::Mutex;
 use crate::DeliveryOrder;
 use crate::{
     api::{
-        ActivityDispatchIdentity, AttributedHistoryEvent, BacklogEntry, BudgetAllocationResult,
-        BundleLease, CommitResult, ConflictToken, ConnectionDirector, ControlRepository,
-        CurrentExecutionConflictPolicy, DbClass, DbPermit, DeleteRunRequest, DeleteRunResult,
-        DeploymentCasResult, DeploymentKey, DeploymentName, DispatchableActivityTask,
-        DispatchableWorkflowTask, DueActivityDispatch, DueTimer, GenerationAdvanceResult,
-        LeaseOutcome, LeaseRepository, ProjectionBatch, ProjectionLog, ProjectionRecord,
-        ProvenancePut, RequestRecord, RunHistoryStats, RunRepository, StoredTaskQueueConfig,
-        StoredTaskQueueConfigKey, StoredWorkerDeployment, TaskQueueConfigCasResult,
-        TaskQueueConfigRepository, TransitionAuditRecord, WorkerDeploymentRepository,
-        WorkerDeploymentVersionKey, WorkerTaskProvenance, WorkerTaskProvenanceError,
-        WorkerTaskProvenanceStore, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
-        deleted_workflow_projection_context, dispatchable_workflow_task,
-        prepare_workflow_projection, seed_workflow_projection_accumulator,
-        workflow_is_open_and_pinned_to_version,
+        ActivityDispatchIdentity, AttributedHistoryEvent, BacklogEntry, BacklogPersistError,
+        BudgetAllocationResult, BulkWritePhase, BundleLease, CommitResult, ConflictToken,
+        ConnectionDirector, ControlRepository, CurrentExecutionConflictPolicy, DbClass, DbPermit,
+        DeleteRunRequest, DeleteRunResult, DeploymentCasResult, DeploymentKey, DeploymentName,
+        DispatchableActivityTask, DispatchableWorkflowTask, DueActivityDispatch, DueTimer,
+        GenerationAdvanceResult, LeaseOutcome, LeaseRepository, ProjectionBatch, ProjectionLog,
+        ProjectionRecord, ProvenancePut, RequestRecord, RunBulkWrite, RunHistoryStats,
+        RunRepository, StaleTimer, StoredTaskQueueConfig, StoredTaskQueueConfigKey,
+        StoredWorkerDeployment, TaskQueueConfigCasResult, TaskQueueConfigRepository,
+        TransitionAuditRecord, WorkerDeploymentRepository, WorkerDeploymentVersionKey,
+        WorkerTaskProvenance, WorkerTaskProvenanceError, WorkerTaskProvenanceStore,
+        WorkflowRuleCreateResult, WorkflowRuleDeleteResult, deleted_workflow_projection_context,
+        dispatchable_workflow_task, prepare_workflow_projection,
+        seed_workflow_projection_accumulator, workflow_is_open_and_pinned_to_version,
     },
     codec::{
         ExtensionSection, apply_state_extension, decode_exact, decode_extension, encode_extension,
@@ -64,6 +64,7 @@ use crate::{
         WorkflowDiscoveryRange, WorkflowDispatchPage, WorkflowDispatchPosition,
         WorkflowDispatchRow, derive_workflow_dispatch,
     },
+    write_budget::{MAX_RESET_BATCH_BYTES, TransactionModel, WriteBudget, WriteCost, pages},
 };
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -187,9 +188,88 @@ struct StoreState {
     run_shard_map: HashMap<RunKey, ShardId>,
     /// Total shard count for deterministic assignment.
     shard_count: u32,
+    /// Bulk-write records by run (`bounded-bulk-writes`): the runs whose rows
+    /// are being written or removed across transactions. A run is in `runs` or
+    /// here, never both, as on DSQL.
+    bulk_writes: BTreeMap<RunKey, RunBulkWrite>,
+    /// Test hook: how many more transactions of covered writes succeed before
+    /// the next one fails without changing anything.
+    bulk_write_failure: Option<usize>,
+    /// Every covered write transaction's total, for the budget properties.
+    #[cfg(test)]
+    modeled_transactions: Vec<WriteCost>,
 }
 
 impl StoreState {
+    /// Open one transaction of a covered write (`bounded-bulk-writes`). A
+    /// failure injected for tests stops the write here, before the transaction
+    /// changes anything, as a refused DSQL transaction does.
+    fn begin_bulk_transaction(&mut self) -> Result<TransactionModel> {
+        match self.bulk_write_failure {
+            Some(0) => {
+                self.bulk_write_failure = None;
+                Err(anyhow::anyhow!("injected bulk-write transaction failure"))
+            }
+            Some(remaining) => {
+                self.bulk_write_failure = Some(remaining - 1);
+                Ok(TransactionModel::default())
+            }
+            None => Ok(TransactionModel::default()),
+        }
+    }
+
+    /// Close a covered write's transaction once all its writes are declared and
+    /// accepted, just before they are applied.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn commit_bulk_transaction(&mut self, model: &TransactionModel) {
+        #[cfg(test)]
+        self.modeled_transactions.push(model.total());
+        #[cfg(not(test))]
+        let _ = model;
+    }
+
+    /// Fail unless `run_key`'s record still says it is being materialized: the
+    /// check every transaction of a materialization makes, as DSQL's read of the
+    /// record `FOR UPDATE` does.
+    fn ensure_materializing(&self, run_key: RunKey) -> Result<()> {
+        match self.bulk_writes.get(&run_key) {
+            Some(record) if record.phase == BulkWritePhase::Materializing => Ok(()),
+            _ => Err(anyhow::anyhow!(
+                "the materialization of {run_key:?} was abandoned"
+            )),
+        }
+    }
+
+    /// Remove a run's first `batches` history batches, as DSQL stores them: the
+    /// first `batches` transition-audit records with events, the records
+    /// without events among them, and their events from the run's history.
+    fn purge_history_batches(&mut self, run_key: RunKey, batches: usize) {
+        let mut removed_events = 0usize;
+        if let Some(records) = self.transition_audit.get_mut(&run_key) {
+            let mut taken = 0usize;
+            let cut = records
+                .iter()
+                .position(|record| {
+                    if !record.history_events.is_empty() {
+                        if taken == batches {
+                            return true;
+                        }
+                        taken += 1;
+                        removed_events += record.history_events.len();
+                    }
+                    false
+                })
+                .unwrap_or(records.len());
+            records.drain(..cut);
+        }
+        if let Some(history) = self.history.get_mut(&run_key) {
+            history.drain(..removed_events.min(history.len()));
+        }
+        if let Some(principals) = self.history_principals.get_mut(&run_key) {
+            principals.drain(..removed_events.min(principals.len()));
+        }
+    }
+
     fn append_projection_record(&mut self, record: ProjectionRecord) {
         let offset = self.projection_log.len();
         self.projection_cursor_offsets.insert(
@@ -356,6 +436,14 @@ impl InMemoryStore {
         store.conflict_injections.insert(run_key, count);
     }
 
+    /// Make the covered bulk writes (`bounded-bulk-writes`) fail after
+    /// `succeed` more of their transactions: the next one fails before it
+    /// changes anything. Tests use it to stop a spill, a deletion, a purge or a
+    /// materialization at any transaction.
+    pub async fn fail_bulk_write_after(&self, succeed: usize) {
+        self.inner.lock().await.bulk_write_failure = Some(succeed);
+    }
+
     /// Override the current-execution conflict policy
     /// used by `commit_transition` when a new workflow
     /// start collides with an existing open execution.
@@ -516,6 +604,14 @@ pub const SNAPSHOT_EXTENSION_MAGIC: u32 = 0x544B_5358;
 /// the bytes the hot-state codec appends after that run's state.
 pub const RUN_STATE_EXTENSION_SECTION: u32 = 1;
 
+/// Snapshot-extension tag of the section listing the bulk-write records.
+///
+/// The payload is a postcard `Vec<RunBulkWrite>` in run-key order, a layout
+/// frozen from its first release. A release without the section drops the
+/// records, and with them its knowledge of the unfinished writes; their rows
+/// stay unreachable, since a recorded run has no mutable state.
+pub const BULK_WRITE_SECTION: u32 = 2;
+
 /// Errors from the [`InMemoryStore`] snapshot persist/restore surface.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -607,12 +703,32 @@ fn snapshot_extension(state: &StoreState) -> Result<Vec<u8>, SnapshotError> {
             payload: postcard::to_allocvec(&runs).map_err(SnapshotError::Encode)?,
         });
     }
+    if !state.bulk_writes.is_empty() {
+        let records = state.bulk_writes.values().copied().collect::<Vec<_>>();
+        sections.push(ExtensionSection {
+            tag: BULK_WRITE_SECTION,
+            payload: postcard::to_allocvec(&records).map_err(SnapshotError::Encode)?,
+        });
+    }
     encode_extension(SNAPSHOT_EXTENSION_MAGIC, &sections).map_err(SnapshotError::Encode)
 }
 
 /// Apply a snapshot extension to the store restored from the same snapshot.
 fn apply_snapshot_extension(state: &mut StoreState, bytes: &[u8]) -> Result<(), &'static str> {
     for section in decode_extension(SNAPSHOT_EXTENSION_MAGIC, bytes)? {
+        if section.tag == BULK_WRITE_SECTION {
+            let records = decode_exact::<Vec<RunBulkWrite>>(&section.payload)
+                .ok_or("undecodable bulk-write section")?;
+            for record in records {
+                if state.runs.contains_key(&record.run_key) {
+                    return Err("snapshot extension records a bulk write for a run with state");
+                }
+                if state.bulk_writes.insert(record.run_key, record).is_some() {
+                    return Err("bulk write recorded twice in the snapshot extension");
+                }
+            }
+            continue;
+        }
         if section.tag != RUN_STATE_EXTENSION_SECTION {
             // A later release's section: its data is safe to drop by rule.
             continue;
@@ -683,6 +799,11 @@ impl SnapshotDoc {
             timer_bucket,
             run_shard_map,
             shard_count,
+            // Carried by the snapshot extension, after the document.
+            bulk_writes: _,
+            bulk_write_failure: _,
+            #[cfg(test)]
+                modeled_transactions: _,
         } = state;
         Self {
             current_open: sorted_pairs(current_open),
@@ -766,6 +887,11 @@ impl SnapshotDoc {
             timer_bucket: self.timer_bucket.into_iter().collect(),
             run_shard_map: self.run_shard_map.into_iter().collect(),
             shard_count: self.shard_count,
+            // Restored from the snapshot extension when the snapshot has one.
+            bulk_writes: BTreeMap::new(),
+            bulk_write_failure: None,
+            #[cfg(test)]
+            modeled_transactions: Vec::new(),
         };
         // These maps only accelerate reads over the durable-equivalent log;
         // rebuilding them at boot preserves snapshot bytes and makes them
@@ -1556,15 +1682,30 @@ impl RunRepository for InMemoryStore {
                 history_size_bytes,
             )?,
         };
-        // The tombstone and purge share this lock acquisition. No reader can
-        // observe the run removed without its anti-resurrection record present.
-        store.append_projection_record(tombstone.clone());
-
         let workflow_key = (state.namespace_id, state.workflow_id.0.clone());
+        let names_run = store.current_execution.get(&workflow_key) == Some(&run_key);
+        // The first transaction of a deletion (`bounded-bulk-writes`): the
+        // tombstone, the pointer when it names the run, the run's state and
+        // dispatch row, and the record that the purge finishes from.
+        let mut model = store.begin_bulk_transaction()?;
+        model.write(&[crate::codec::encode_projection_context(&tombstone.context)?.len()])?;
+        model.delete(
+            usize::from(names_run)
+                + 1
+                + usize::from(store.workflow_dispatch.contains_key(&run_key)),
+        )?;
+        model.write(&[])?;
+        store.commit_bulk_transaction(&model);
+
+        // The tombstone, the run's removal and its purge record share this lock
+        // acquisition, as they share DSQL's transaction: no reader can observe
+        // the run removed without its anti-resurrection record, and the rows the
+        // purge removes later are already unreachable.
+        store.append_projection_record(tombstone.clone());
         if store.current_open.get(&workflow_key) == Some(&run_key) {
             store.current_open.remove(&workflow_key);
         }
-        if store.current_execution.get(&workflow_key) == Some(&run_key) {
+        if names_run {
             store.current_execution.remove(&workflow_key);
         }
         store.execution_index.remove(&(
@@ -1574,24 +1715,17 @@ impl RunRepository for InMemoryStore {
         ));
         store.runs.remove(&run_key);
         store.history_size.remove(&run_key);
-        store.history.remove(&run_key);
-        store.history_principals.remove(&run_key);
-        store.transition_audit.remove(&run_key);
         store.run_shard_map.remove(&run_key);
         store.conflict_injections.remove(&run_key);
         store.workflow_dispatch.remove(&run_key);
-        store
-            .request_dedupe
-            .retain(|_, record| record.run_key != run_key);
-        store
-            .timer_bucket
-            .retain(|(candidate, _), _| *candidate != run_key);
-        store
-            .activity_dispatch
-            .retain(|(candidate, _), _| *candidate != run_key);
-        store
-            .dispatch_backlog
-            .retain(|entry| entry.run_key != run_key);
+        store.bulk_writes.insert(
+            run_key,
+            RunBulkWrite {
+                run_key,
+                shard_id: execution_home_bundle,
+                phase: BulkWritePhase::Purging,
+            },
+        );
 
         Ok(DeleteRunResult::Deleted { tombstone })
     }
@@ -1601,55 +1735,57 @@ impl RunRepository for InMemoryStore {
         base_run_key: RunKey,
         fork_event_id: i64,
         successor_run_id: RunId,
+        expected_current: Option<RunKey>,
     ) -> Result<()> {
-        let mut store = self.inner.lock().await;
-
-        let base_state = store
-            .runs
-            .get(&base_run_key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("base run not found: {:?}", base_run_key))?;
+        // The steps of DSQL's materialization (`bounded-bulk-writes`), each a
+        // transaction of its own under the lock and the model, so a test can stop
+        // the materialization between any two.
+        let (base_state, copied_history, copied_principals, shard_count) = {
+            let store = self.inner.lock().await;
+            let base_state = store
+                .runs
+                .get(&base_run_key)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("base run not found: {:?}", base_run_key))?;
+            let base_history = store
+                .history
+                .get(&base_run_key)
+                .ok_or_else(|| anyhow::anyhow!("base history not found: {:?}", base_run_key))?;
+            // The fork event is the WFT-FINISH event being reset; the successor
+            // branch keeps only the events BEFORE it — v1.31.0 rebuilds mutable
+            // state to `WorkflowTaskFinishEventId - 1`
+            // (`baseRebuildLastEventID`, resetworkflow/api.go:119 @ v1.31.0). The
+            // replayed successor thus ends with that WFT still started; the reset
+            // flow then fails it with cause ResetWorkflow and re-dispatches.
+            let prefix_len = base_history
+                .iter()
+                .position(|event| event.event_id == fork_event_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "fork_event_id {} outside committed history for {:?}",
+                        fork_event_id,
+                        base_run_key
+                    )
+                })?;
+            let copied_history: Vec<_> = base_history[..prefix_len].to_vec();
+            let copied_principals = store
+                .history_principals
+                .get(&base_run_key)
+                .map(|principals| principals[..prefix_len].to_vec())
+                .unwrap_or_else(|| vec![None; prefix_len]);
+            (
+                base_state,
+                copied_history,
+                copied_principals,
+                Self::effective_shard_count(&store),
+            )
+        };
+        crate::codec::ensure_contiguous_prefix(base_run_key, &copied_history)?;
         let successor_run_key = RunKey::derive(
             base_state.namespace_id,
             &base_state.workflow_id,
             successor_run_id,
         );
-
-        if store.runs.contains_key(&successor_run_key) {
-            anyhow::bail!(
-                "successor run already exists for {:?}: {:?}",
-                successor_run_id,
-                successor_run_key
-            );
-        }
-
-        let base_history = store
-            .history
-            .get(&base_run_key)
-            .ok_or_else(|| anyhow::anyhow!("base history not found: {:?}", base_run_key))?;
-
-        // The fork event is the WFT-FINISH event being reset; the successor
-        // branch keeps only the events BEFORE it — v1.31.0 rebuilds mutable
-        // state to `WorkflowTaskFinishEventId - 1`
-        // (`baseRebuildLastEventID`, resetworkflow/api.go:119 @ v1.31.0). The
-        // replayed successor thus ends with that WFT still started; the reset
-        // flow then fails it with cause ResetWorkflow and re-dispatches.
-        let prefix_len = base_history
-            .iter()
-            .position(|event| event.event_id == fork_event_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "fork_event_id {} outside committed history for {:?}",
-                    fork_event_id,
-                    base_run_key
-                )
-            })?;
-        let copied_history: Vec<_> = base_history[..prefix_len].to_vec();
-        let copied_principals = store
-            .history_principals
-            .get(&base_run_key)
-            .map(|principals| principals[..prefix_len].to_vec())
-            .unwrap_or_else(|| vec![None; prefix_len]);
 
         let kernel = BasicKernel;
         let replay_ctx = ReplayContext {
@@ -1681,30 +1817,153 @@ impl RunRepository for InMemoryStore {
         let materialized_at = time::OffsetDateTime::now_utc();
         successor_state.started_at = materialized_at;
         successor_state.first_run_started_at = Some(materialized_at);
-
-        // The successor's History Size is the encoded size of the copied prefix
-        // as one batch, which is how the DSQL materialization persists it
-        // (Requirement 1.6).
-        let prefix_size = crate::codec::history_batch_encoded_len(&copied_history)?;
         let home = tokeira_types::execution_home_bundle(
             successor_state.namespace_id.0.as_bytes(),
             successor_state.workflow_id.0.as_bytes(),
-            Self::effective_shard_count(&store),
+            shard_count,
         );
         let dispatch = derive_workflow_dispatch(&successor_state, home);
         if let Some(row) = &dispatch {
             row.validate()?;
         }
+
+        // The copied history in batches DSQL can store; its History Size is the
+        // sum of their encoded sizes, as for any run (`continue-as-new-advice`
+        // Requirement 1.6).
+        let batches = crate::codec::reset_history_batches(
+            &copied_history,
+            &copied_principals,
+            MAX_RESET_BATCH_BYTES,
+        )?;
+        let mut costs = Vec::with_capacity(batches.len() + successor_state.timers.len());
+        let mut history_size = 0i64;
+        for batch in &batches {
+            let events = crate::codec::encode_history_events(&copied_history[batch.clone()])?.len();
+            history_size = history_size.saturating_add(i64::try_from(events).unwrap_or(i64::MAX));
+            costs.push((
+                WriteCost::write(events),
+                principals_len(&copied_principals[batch.clone()])?,
+            ));
+        }
+        let timers = successor_state.timers.values().cloned().collect::<Vec<_>>();
+        for timer in &timers {
+            costs.push((
+                WriteCost::write(crate::codec::encode_timer_state(timer)?.len()),
+                0,
+            ));
+        }
+
+        {
+            let mut store = self.inner.lock().await;
+            anyhow::ensure!(
+                !store.runs.contains_key(&successor_run_key),
+                "successor run already exists for {:?}: {:?}",
+                successor_run_id,
+                successor_run_key
+            );
+            anyhow::ensure!(
+                !store.bulk_writes.contains_key(&successor_run_key),
+                "successor run {successor_run_key:?} already has a bulk-write record"
+            );
+            let mut model = store.begin_bulk_transaction()?;
+            model.write(&[])?;
+            store.commit_bulk_transaction(&model);
+            store.bulk_writes.insert(
+                successor_run_key,
+                RunBulkWrite {
+                    run_key: successor_run_key,
+                    shard_id: home,
+                    phase: BulkWritePhase::Materializing,
+                },
+            );
+        }
+
+        // The batches, then the timer rows, in pages within the budget. The
+        // pages count each batch's principals with its events.
+        let page_costs = costs
+            .iter()
+            .map(|(cost, principals)| WriteCost {
+                rows: cost.rows,
+                bytes: cost.bytes + principals,
+            })
+            .collect::<Vec<_>>();
+        for page in pages(&page_costs, WriteBudget::TRANSACTION) {
+            // Let other operations run between transactions, as they can on DSQL.
+            tokio::task::yield_now().await;
+            let mut store = self.inner.lock().await;
+            store.ensure_materializing(successor_run_key)?;
+            let mut model = store.begin_bulk_transaction()?;
+            for (cost, principals) in &costs[page.clone()] {
+                model.write(&[cost.bytes, *principals])?;
+            }
+            store.commit_bulk_transaction(&model);
+            for index in page {
+                if let Some(batch) = batches.get(index) {
+                    store
+                        .history
+                        .entry(successor_run_key)
+                        .or_default()
+                        .extend(copied_history[batch.clone()].iter().cloned());
+                    store
+                        .history_principals
+                        .entry(successor_run_key)
+                        .or_default()
+                        .extend(copied_principals[batch.clone()].iter().cloned());
+                    store
+                        .transition_audit
+                        .entry(successor_run_key)
+                        .or_default()
+                        .push(TransitionAuditRecord {
+                            run_key: successor_run_key,
+                            transition_seq: successor_state.transition_seq,
+                            history_events: copied_history[batch.clone()].to_vec(),
+                            activity_ops: Vec::new(),
+                            timer_ops: Vec::new(),
+                            dispatch_ops: Vec::new(),
+                        });
+                } else {
+                    let timer = &timers[index - batches.len()];
+                    store
+                        .timer_bucket
+                        .insert((successor_run_key, timer.timer_id.clone()), timer.clone());
+                }
+            }
+        }
+
+        // The final transaction makes the successor visible and current, only
+        // while the pointer names the run it named when the reset was admitted
+        // (v1.31.0 asserts the same, `assertRunIDAndUpdateCurrentExecution`,
+        // common/persistence/sql/execution_util.go:966-1009 @ v1.31.0).
+        tokio::task::yield_now().await;
+        let mut store = self.inner.lock().await;
+        store.ensure_materializing(successor_run_key)?;
+        let workflow_key = (
+            successor_state.namespace_id,
+            successor_state.workflow_id.0.clone(),
+        );
+        let current = store.current_execution.get(&workflow_key).copied();
+        anyhow::ensure!(
+            current == expected_current,
+            "the current run of workflow {:?} changed while its reset was materialized: \
+             expected {:?}, found {:?}",
+            successor_state.workflow_id,
+            expected_current,
+            current
+        );
+        let mut model = store.begin_bulk_transaction()?;
+        model.write(&[crate::codec::encode_workflow_state(&successor_state)?.len()])?;
+        if dispatch.is_some() {
+            model.write(&[])?;
+        }
+        model.write(&[])?;
+        model.delete(1)?;
+        store.commit_bulk_transaction(&model);
         if let Some(row) = dispatch {
             store.workflow_dispatch.insert(successor_run_key, row);
         } else {
             store.workflow_dispatch.remove(&successor_run_key);
         }
-        store.history_size.insert(successor_run_key, prefix_size);
-        store.history.insert(successor_run_key, copied_history);
-        store
-            .history_principals
-            .insert(successor_run_key, copied_principals);
+        store.history_size.insert(successor_run_key, history_size);
         store
             .runs
             .insert(successor_run_key, successor_state.clone());
@@ -1716,37 +1975,14 @@ impl RunRepository for InMemoryStore {
             ),
             successor_run_key,
         );
-        store.current_execution.insert(
-            (
-                successor_state.namespace_id,
-                successor_state.workflow_id.0.clone(),
-            ),
-            successor_run_key,
-        );
+        store
+            .current_execution
+            .insert(workflow_key.clone(), successor_run_key);
         if successor_state.status.is_open() {
-            store.current_open.insert(
-                (
-                    successor_state.namespace_id,
-                    successor_state.workflow_id.0.clone(),
-                ),
-                successor_run_key,
-            );
+            store.current_open.insert(workflow_key, successor_run_key);
         }
-
-        // The successor's activities live only in its state
-        // (`activity-state-writes` criterion 2.2).
-        for timer in successor_state.timers.values() {
-            store
-                .timer_bucket
-                .insert((successor_run_key, timer.timer_id.clone()), timer.clone());
-        }
-
-        let shard_id = tokeira_types::execution_home_bundle(
-            successor_state.namespace_id.0.as_bytes(),
-            successor_state.workflow_id.0.as_bytes(),
-            Self::effective_shard_count(&store),
-        );
-        store.run_shard_map.insert(successor_run_key, shard_id);
+        store.run_shard_map.insert(successor_run_key, home);
+        store.bulk_writes.remove(&successor_run_key);
 
         Ok(())
     }
@@ -1783,6 +2019,141 @@ impl RunRepository for InMemoryStore {
             store.workflow_dispatch.remove(&run_key);
         }
         Ok(())
+    }
+
+    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()> {
+        let mut store = self.inner.lock().await;
+        if !store
+            .bulk_writes
+            .get(&run_key)
+            .is_some_and(|record| record.phase == BulkWritePhase::Materializing)
+        {
+            return Ok(());
+        }
+        let mut model = store.begin_bulk_transaction()?;
+        model.write(&[])?;
+        store.commit_bulk_transaction(&model);
+        if let Some(record) = store.bulk_writes.get_mut(&run_key) {
+            record.phase = BulkWritePhase::Purging;
+        }
+        Ok(())
+    }
+
+    async fn purge_run(&self, run_key: RunKey) -> Result<()> {
+        self.abandon_materialization(run_key).await?;
+        let budget = WriteBudget::TRANSACTION.rows;
+        loop {
+            // Let other operations run between transactions, as they can on DSQL.
+            tokio::task::yield_now().await;
+            let mut store = self.inner.lock().await;
+            if !store.bulk_writes.contains_key(&run_key) {
+                return Ok(());
+            }
+            // One table per transaction, in DSQL's order, history last. Nothing
+            // recreates a row of a recorded run, so a table once empty stays
+            // empty, and the record goes only with the last history rows.
+            let dedupe = store
+                .request_dedupe
+                .iter()
+                .filter(|(_, record)| record.run_key == run_key)
+                .map(|(key, _)| key.clone())
+                .take(budget)
+                .collect::<Vec<_>>();
+            if !dedupe.is_empty() {
+                let mut model = store.begin_bulk_transaction()?;
+                model.delete(dedupe.len())?;
+                store.commit_bulk_transaction(&model);
+                for key in dedupe {
+                    store.request_dedupe.remove(&key);
+                }
+                continue;
+            }
+            let timers = store
+                .timer_bucket
+                .keys()
+                .filter(|(candidate, _)| *candidate == run_key)
+                .take(budget)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !timers.is_empty() {
+                let mut model = store.begin_bulk_transaction()?;
+                model.delete(timers.len())?;
+                store.commit_bulk_transaction(&model);
+                for key in timers {
+                    store.timer_bucket.remove(&key);
+                }
+                continue;
+            }
+            let dispatch = store
+                .activity_dispatch
+                .keys()
+                .filter(|(candidate, _)| *candidate == run_key)
+                .take(budget)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !dispatch.is_empty() {
+                let mut model = store.begin_bulk_transaction()?;
+                model.delete(dispatch.len())?;
+                store.commit_bulk_transaction(&model);
+                for key in dispatch {
+                    store.activity_dispatch.remove(&key);
+                }
+                continue;
+            }
+            let backlog = store
+                .dispatch_backlog
+                .iter()
+                .filter(|entry| entry.run_key == run_key)
+                .take(budget)
+                .count();
+            if backlog > 0 {
+                let mut model = store.begin_bulk_transaction()?;
+                model.delete(backlog)?;
+                store.commit_bulk_transaction(&model);
+                let mut left = backlog;
+                store.dispatch_backlog.retain(|entry| {
+                    if entry.run_key == run_key && left > 0 {
+                        left -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                continue;
+            }
+            let rows = history_rows(&store, run_key);
+            let last = rows < budget;
+            let page = if last { rows } else { budget };
+            let mut model = store.begin_bulk_transaction()?;
+            model.delete(page + usize::from(last))?;
+            store.commit_bulk_transaction(&model);
+            store.purge_history_batches(run_key, page);
+            if last {
+                store.transition_audit.remove(&run_key);
+                store.history.remove(&run_key);
+                store.history_principals.remove(&run_key);
+                store.bulk_writes.remove(&run_key);
+                return Ok(());
+            }
+        }
+    }
+
+    async fn list_run_bulk_writes(
+        &self,
+        shard_id: ShardId,
+        after: Option<RunKey>,
+        limit: usize,
+    ) -> Result<Vec<RunBulkWrite>> {
+        let store = self.inner.lock().await;
+        Ok(store
+            .bulk_writes
+            .values()
+            .filter(|record| {
+                record.shard_id == shard_id && after.is_none_or(|after| record.run_key > after)
+            })
+            .take(limit)
+            .copied()
+            .collect())
     }
 
     async fn list_workflow_dispatch_page(
@@ -1914,18 +2285,51 @@ impl RunRepository for InMemoryStore {
         Ok(matches)
     }
 
-    async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
-        let mut store = self.inner.lock().await;
-        // An entry whose backlog identity is already held keeps the held entry, as
-        // DSQL's `ON CONFLICT (key) DO NOTHING` does (runtime-durable-backlog 3.8).
-        let mut held = store
-            .dispatch_backlog
+    async fn persist_to_backlog(
+        &self,
+        entries: Vec<BacklogEntry>,
+    ) -> std::result::Result<(), BacklogPersistError> {
+        let costs = entries
             .iter()
-            .map(BacklogEntry::identity)
-            .collect::<std::collections::HashSet<_>>();
-        for entry in entries {
-            if held.insert(entry.identity()) {
-                store.dispatch_backlog.push_back(entry);
+            .map(|entry| {
+                crate::codec::encode_backlog_payload(&entry.payload, entry.priority.as_ref())
+                    .map(|payload| WriteCost::write(payload.len()))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(|source| BacklogPersistError {
+                persisted: 0,
+                source,
+            })?;
+        // The pages commit one by one, as DSQL's transactions do, so a failed
+        // page leaves the pages before it stored.
+        let mut entries = entries.into_iter();
+        for page in pages(&costs, WriteBudget::TRANSACTION) {
+            // Let other operations run between transactions, as they can on DSQL.
+            tokio::task::yield_now().await;
+            let mut store = self.inner.lock().await;
+            let declared = store.begin_bulk_transaction().and_then(|mut model| {
+                for cost in &costs[page.clone()] {
+                    model.write(&[cost.bytes])?;
+                }
+                Ok(model)
+            });
+            let model = declared.map_err(|source| BacklogPersistError {
+                persisted: page.start,
+                source,
+            })?;
+            store.commit_bulk_transaction(&model);
+            // An entry whose backlog identity is already held keeps the held
+            // entry, as DSQL's `ON CONFLICT (key) DO NOTHING` does
+            // (`runtime-durable-backlog` criterion 3.8).
+            let mut held = store
+                .dispatch_backlog
+                .iter()
+                .map(BacklogEntry::identity)
+                .collect::<std::collections::HashSet<_>>();
+            for entry in entries.by_ref().take(page.len()) {
+                if held.insert(entry.identity()) {
+                    store.dispatch_backlog.push_back(entry);
+                }
             }
         }
         Ok(())
@@ -2147,8 +2551,24 @@ impl RunRepository for InMemoryStore {
         Ok(due)
     }
 
-    async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
+    async fn delete_due_timer_if_matches(
+        &self,
+        timer: &DueTimer,
+        reason: StaleTimer,
+    ) -> Result<bool> {
         let mut store = self.inner.lock().await;
+        // A reset's successor holds its timer rows before its final transaction
+        // makes it visible, so a timer whose run is missing keeps its row while
+        // the run is being materialized, or once it exists.
+        if reason == StaleTimer::RunMissing
+            && (store.runs.contains_key(&timer.run_key)
+                || store
+                    .bulk_writes
+                    .get(&timer.run_key)
+                    .is_some_and(|record| record.phase == BulkWritePhase::Materializing))
+        {
+            return Ok(false);
+        }
         let key = (timer.run_key, timer.timer_id.clone());
         let matches = store
             .timer_bucket
@@ -2543,6 +2963,27 @@ fn workflow_dispatch_page_with_keys(
     }
 }
 
+/// The run's history rows as DSQL stores them: one per commit that recorded
+/// events, which is one transition-audit record with events.
+fn history_rows(store: &StoreState, run_key: RunKey) -> usize {
+    store.transition_audit.get(&run_key).map_or(0, |records| {
+        records
+            .iter()
+            .filter(|record| !record.history_events.is_empty())
+            .count()
+    })
+}
+
+/// The size of a history batch's principals as DSQL stores them: none when no
+/// event has a principal (`insert_history_batch` writes NULL).
+fn principals_len(principals: &[Option<tokeira_types::EventPrincipal>]) -> Result<usize> {
+    if principals.iter().any(Option::is_some) {
+        Ok(crate::codec::encode_history_principals(principals)?.len())
+    } else {
+        Ok(0)
+    }
+}
+
 #[cfg(test)]
 #[path = "projection_accumulator_tests.rs"]
 pub(crate) mod projection_accumulator_tests;
@@ -2550,6 +2991,14 @@ pub(crate) mod projection_accumulator_tests;
 #[cfg(test)]
 #[path = "workflow_dispatch_memory_tests.rs"]
 mod workflow_dispatch_tests;
+
+#[cfg(test)]
+#[path = "bulk_write_memory_tests.rs"]
+mod bulk_write_tests;
+
+#[cfg(test)]
+#[path = "bulk_write_memory_properties.rs"]
+mod bulk_write_properties;
 
 #[cfg(test)]
 mod tests {
@@ -3809,7 +4258,12 @@ mod tests {
         }
         assert_eq!(paged, all);
 
-        assert!(store.delete_due_timer_if_matches(&all[0]).await.unwrap());
+        assert!(
+            store
+                .delete_due_timer_if_matches(&all[0], StaleTimer::RunClosed)
+                .await
+                .unwrap()
+        );
         let rest = store
             .list_due_timers_for_shard(ShardId(0), due_at, Some(&all[0]), 10)
             .await
@@ -5220,10 +5674,15 @@ mod tests {
             timer_state("timer-1", replacement.fire_at),
         );
 
-        assert!(!store.delete_due_timer_if_matches(&read).await.unwrap());
+        assert!(
+            !store
+                .delete_due_timer_if_matches(&read, StaleTimer::RunClosed)
+                .await
+                .unwrap()
+        );
         assert!(
             store
-                .delete_due_timer_if_matches(&replacement)
+                .delete_due_timer_if_matches(&replacement, StaleTimer::RunClosed)
                 .await
                 .unwrap()
         );
@@ -5589,9 +6048,22 @@ mod tests {
         // resetworkflow/api.go:119) — the reset WFT is still STARTED and the
         // activity/timer it commanded (events 5/6) never happened on this
         // branch.
-        RunRepository::materialize_reset_successor(&store, base_run_key, 4, successor_run_id)
-            .await
-            .unwrap();
+        let expected = RunRepository::find_latest_run(
+            &store,
+            base_state.namespace_id,
+            &base_state.workflow_id,
+        )
+        .await
+        .unwrap();
+        RunRepository::materialize_reset_successor(
+            &store,
+            base_run_key,
+            4,
+            successor_run_id,
+            expected,
+        )
+        .await
+        .unwrap();
 
         let LoadedRun::Existing(successor) = RunRepository::load_run(&store, successor_run_key)
             .await
@@ -5680,10 +6152,15 @@ mod tests {
         )
         .await;
 
-        let err =
-            RunRepository::materialize_reset_successor(&store, base_run_key, 99, RunId::new())
-                .await
-                .unwrap_err();
+        let err = RunRepository::materialize_reset_successor(
+            &store,
+            base_run_key,
+            99,
+            RunId::new(),
+            Some(base_run_key),
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.to_string().contains("outside committed history"));
     }
@@ -5763,9 +6240,22 @@ mod tests {
         )
         .await;
 
-        RunRepository::materialize_reset_successor(&store, base_run_key, 2, successor_run_id)
-            .await
-            .unwrap();
+        let expected = RunRepository::find_latest_run(
+            &store,
+            base_state.namespace_id,
+            &base_state.workflow_id,
+        )
+        .await
+        .unwrap();
+        RunRepository::materialize_reset_successor(
+            &store,
+            base_run_key,
+            2,
+            successor_run_id,
+            expected,
+        )
+        .await
+        .unwrap();
 
         let resolved = RunRepository::resolve_execution(
             &store,
@@ -5870,11 +6360,19 @@ mod tests {
                 .await;
 
                 // Exclusive cut: forking at event 2 keeps only the start event.
+                let expected = RunRepository::find_latest_run(
+                    &store,
+                    base_state.namespace_id,
+                    &base_state.workflow_id,
+                )
+                .await
+                .unwrap();
                 RunRepository::materialize_reset_successor(
                     &store,
                     base_run_key,
                     2,
                     successor_run_id,
+                    expected,
                 )
                 .await
                 .unwrap();
@@ -6467,10 +6965,13 @@ mod tests {
                 prop_assert!(tombstone.context.memo.0.is_empty());
                 prop_assert!(tombstone.context.search_attributes.0.is_empty());
 
+                // The first transaction leaves the run unreachable and recorded;
+                // its purge removes the rest (`bounded-bulk-writes`).
                 prop_assert!(matches!(
                     store.load_run(run_key).await.unwrap(),
                     LoadedRun::Absent
                 ));
+                store.purge_run(run_key).await.unwrap();
                 prop_assert!(store.read_history_to_end(run_key, 0).await.unwrap().is_empty());
                 prop_assert_eq!(
                     store
@@ -6494,6 +6995,7 @@ mod tests {
                 prop_assert!(inner.timer_bucket.keys().all(|(candidate, _)| *candidate != run_key));
                 prop_assert!(inner.activity_dispatch.keys().all(|(candidate, _)| *candidate != run_key));
                 prop_assert!(inner.dispatch_backlog.iter().all(|entry| entry.run_key != run_key));
+                prop_assert!(!inner.bulk_writes.contains_key(&run_key));
                 prop_assert_eq!(inner.projection_log.last(), Some(&tombstone));
                 Ok(())
             })?;
@@ -7207,7 +7709,8 @@ mod tests {
         #[test]
         fn property_malformed_snapshot_extensions_are_rejected(
             malformed in arb_malformed_snapshot_extension(),
-            unknown_tag in 2u32..64,
+            // Tags 1 and 2 are the run-state and bulk-write sections.
+            unknown_tag in 3u32..64,
         ) {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

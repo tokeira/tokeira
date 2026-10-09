@@ -823,6 +823,15 @@ pub struct ResetRequest {
     /// Ordered versioning changes applied to the successor before its fresh WFT.
     #[serde(default)]
     pub post_reset_versioning_overrides: Vec<VersioningOverrideChange>,
+    /// The run the workflow's current pointer named when the runtime admitted
+    /// the reset, open or closed, or `None` when there was no pointer.
+    ///
+    /// The kernel ignores it. The lane hands it to the successor's
+    /// materialization, which makes the successor current only while the
+    /// pointer still names this run, so a start that lands after the reset's
+    /// commit on its base keeps the pointer (`bounded-bulk-writes` criterion 2.13).
+    #[serde(default)]
+    pub expected_current_run_key: Option<RunKey>,
     /// Human-readable reason for the reset.
     pub reason: String,
     /// Caller-supplied request context for dedupe and tracing.

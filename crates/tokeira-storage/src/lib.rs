@@ -23,6 +23,8 @@
 pub mod api;
 #[cfg(test)]
 mod bug_condition_exploration_tests;
+#[cfg(test)]
+mod bulk_write_tests;
 pub mod chasm;
 pub mod codec;
 #[cfg(feature = "dsql")]
@@ -40,6 +42,7 @@ pub mod worker_compute;
 pub mod workflow_dispatch;
 #[cfg(test)]
 mod workflow_dispatch_tests;
+pub mod write_budget;
 
 pub use api::*;
 pub use chasm::*;

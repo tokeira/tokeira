@@ -1,4 +1,5 @@
 use super::*;
+use crate::write_budget::{WriteBudget, WriteCost, pages};
 
 const BACKLOG_STATS_BY_PRIORITY_SQL: &str = "
     SELECT priority_key, COUNT(*), MIN(scheduled_at)
@@ -120,17 +121,49 @@ impl DsqlRunRepository {
         })
     }
 
-    pub(super) async fn do_persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
+    pub(super) async fn do_persist_to_backlog(
+        &self,
+        entries: Vec<BacklogEntry>,
+    ) -> std::result::Result<(), crate::BacklogPersistError> {
+        let mut persisted = 0;
         record_dsql_operation!(self, "persist_to_backlog", None, {
-            if entries.is_empty() {
-                metrics::record_dsql_rows_written("persist_to_backlog", 0);
-                return Ok(());
-            }
+            self.persist_backlog_pages(entries, &mut persisted).await
+        })
+        .map_err(|source| crate::BacklogPersistError { persisted, source })
+    }
 
-            let mut rows_written = 0;
+    /// Write the entries in order, in transactions within the budgets of
+    /// `write_budget` (`bounded-bulk-writes`), counting into `persisted` the
+    /// entries of each committed page. A page that fails stops the call, so the
+    /// count is always a prefix of the entries.
+    async fn persist_backlog_pages(
+        &self,
+        entries: Vec<BacklogEntry>,
+        persisted: &mut usize,
+    ) -> Result<()> {
+        // Encode once: the encoded payload is both the stored value and its
+        // cost against the budget.
+        let rows = entries
+            .into_iter()
+            .map(|entry| {
+                let payload =
+                    codec::encode_backlog_payload(&entry.payload, entry.priority.as_ref())?;
+                Ok((entry, payload))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            metrics::record_dsql_rows_written("persist_to_backlog", 0);
+            return Ok(());
+        }
+        let costs = rows
+            .iter()
+            .map(|(_, payload)| WriteCost::write(payload.len()))
+            .collect::<Vec<_>>();
+        for page in pages(&costs, WriteBudget::TRANSACTION) {
             let mut permit = self.director.acquire(DbClass::Commit).await?;
             let mut tx = permit.connection()?.begin().await?;
-            for entry in entries {
+            let mut page_rows = 0;
+            for (entry, payload) in &rows[page.clone()] {
                 let partition_id = partition_for(entry.run_key, self.projection_partition_count);
                 let deployment = entry
                     .queue
@@ -163,19 +196,17 @@ impl DsqlRunRepository {
                         "dispatch_backlog.insertion_tie",
                     )?)
                     .bind(entry.run_key.0)
-                    .bind(codec::encode_backlog_payload(
-                        &entry.payload,
-                        entry.priority.as_ref(),
-                    )?)
+                    .bind(payload)
                     .bind(entry.scheduled_at)
                     .execute(&mut *tx)
                     .await?;
-                rows_written += inserted.rows_affected();
+                page_rows += inserted.rows_affected();
             }
             tx.commit().await?;
-            metrics::record_dsql_rows_written("persist_to_backlog", rows_written);
-            Ok(())
-        })
+            *persisted = page.end;
+            metrics::record_dsql_rows_written("persist_to_backlog", page_rows);
+        }
+        Ok(())
     }
 
     pub(super) async fn do_drain_backlog(

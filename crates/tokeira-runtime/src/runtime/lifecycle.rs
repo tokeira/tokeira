@@ -1023,20 +1023,50 @@ where
                 (bundle, commit_epoch)
             };
 
-            let _write = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
-            match self
-                .repo
-                .delete_run_for_bundle(
-                    run_key,
-                    bundle,
-                    DeleteRunRequest {
-                        expected_seq: state.transition_seq,
-                        deleted_at: request.now,
-                    },
-                    epoch,
-                )
-                .await?
-            {
+            // The first transaction removes the run's workflow dispatch row,
+            // which a recovery's repair reconciles, so it holds the execution
+            // home's write permit, as a lane's commit does. Waiting for the
+            // permit is still cancellable.
+            let write = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
+            // The first transaction and the purge's handoff run in a task the
+            // caller's cancellation doesn't stop: a caller whose deadline
+            // expires while the first transaction commits can't leave a
+            // committed deletion without its purge (`bounded-bulk-writes`).
+            // DeleteWorkflowExecution returns once the run is unreachable, as
+            // v1.31.0 returns once it has added its delete task
+            // (`service/history/api/deleteworkflow/api.go:86-98 @ v1.31.0`).
+            let repo = self.repo.clone();
+            let purger = self.purger.clone();
+            let purge_inline = request.purge_inline;
+            let deletion = DeleteRunRequest {
+                expected_seq: state.transition_seq,
+                deleted_at: request.now,
+            };
+            let outcome = tokio::spawn(async move {
+                let outcome = repo
+                    .delete_run_for_bundle(run_key, bundle, deletion, epoch)
+                    .await;
+                // The purge writes none of the rows a repair reconciles, so it
+                // doesn't hold a recovery of the home up.
+                drop(write);
+                let outcome = outcome?;
+                if matches!(outcome, DeleteRunResult::Deleted { .. }) {
+                    if !purge_inline {
+                        purger.enqueue(run_key);
+                    } else if let Err(error) = repo.purge_run(run_key).await {
+                        tracing::warn!(
+                            ?error,
+                            run_key = ?run_key,
+                            "a deleted run's purge failed; the purger will finish it"
+                        );
+                        purger.enqueue(run_key);
+                    }
+                }
+                anyhow::Ok(outcome)
+            })
+            .await
+            .map_err(|error| anyhow!("workflow deletion task failed: {error}"))??;
+            match outcome {
                 DeleteRunResult::Deleted { tombstone } => {
                     self.cleanup_deleted_run(run_key).await;
                     return Ok(WorkflowDeletion { tombstone });
@@ -1427,7 +1457,7 @@ where
     pub async fn reset_workflow(
         &self,
         execution: ExecutionRef,
-        request: tokeira_kernel::ResetRequest,
+        mut request: tokeira_kernel::ResetRequest,
     ) -> Result<ResetWorkflowResult> {
         let run_key = self
             .repo
@@ -1438,11 +1468,9 @@ where
         // CURRENT run when it is a DIFFERENT, still-running run
         // (`workflow_resetter.go` terminateWorkflow, identity=IdentityResetter). The
         // base==current-running case is already handled by `apply_reset` terminating
-        // the base. The running current is the OPEN-execution pointer — NOT
-        // `find_latest_run`, whose `started_at` ordering is unreliable for a reset
-        // successor (its start time is replayed from the base's prefix, so it looks
-        // older than the original run it superseded). Resolve it BEFORE the fork so
-        // the freshly materialized successor does not become the pointer first.
+        // the base. The running current is the pointer resolved without a run id,
+        // which names a run only while it is open. Resolve it BEFORE the fork so the
+        // freshly materialized successor does not become the pointer first.
         let current_run_key = self
             .repo
             .resolve_execution(&ExecutionRef {
@@ -1450,6 +1478,16 @@ where
                 workflow_id: execution.workflow_id.clone(),
                 run_id: None,
             })
+            .await?;
+        // The run the pointer names, open or closed: the successor replaces it
+        // as current only while the pointer still names it, so a start that
+        // lands after the reset's commit on its base keeps the pointer
+        // (`bounded-bulk-writes` criterion 2.13). `find_latest_run` reads the
+        // pointer itself; the open-only run above reads a closed current run as
+        // none, which would fail every reset of a closed workflow.
+        request.expected_current_run_key = self
+            .repo
+            .find_latest_run(execution.namespace_id, &execution.workflow_id)
             .await?;
         let successor_run_key = RunKey::derive(
             execution.namespace_id,
@@ -1461,7 +1499,15 @@ where
         let reset_principal = request.request.principal.clone();
         let successor_run_id = request.new_run_id;
         let fork_event_id = request.fork_event_id;
-        match self.submit(run_key, Command::Reset(request)).await? {
+        let committed = self.submit(run_key, Command::Reset(request)).await;
+        if committed.is_err() {
+            // A failed materialization can leave its record and the rows it
+            // wrote. The lane purges them at once; queueing the successor
+            // retries that purge if it failed. A successor without a record is
+            // a no-op purge.
+            self.purger.enqueue(successor_run_key);
+        }
+        match committed? {
             CommitResult::Applied { .. } => {}
             CommitResult::Duplicate => {
                 return Err(anyhow!(
@@ -1941,6 +1987,8 @@ mod tests {
                 received_at: OffsetDateTime::UNIX_EPOCH,
             },
             now: OffsetDateTime::UNIX_EPOCH + Duration::seconds(5),
+            // These tests read the run's rows right after the call.
+            purge_inline: true,
         }
     }
 
@@ -2048,6 +2096,223 @@ mod tests {
             deletion.tombstone.transition_seq,
             before.transition_seq.next(),
             "closed deletion adds only its tombstone version"
+        );
+    }
+
+    // A deletion returns once its first transaction makes the run unreachable,
+    // and the purger removes the rest (`bounded-bulk-writes` criterion 2.6).
+    #[tokio::test]
+    async fn deletion_returns_once_the_run_is_unreachable_and_the_purger_finishes_it() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = deletion_runtime(repo.clone());
+        let start = deletion_start_request();
+        let run_key = start.run_key;
+        runtime.start_workflow(start).await.unwrap();
+
+        let mut request = deletion_request("delete-in-background");
+        request.purge_inline = false;
+        runtime.delete_workflow(run_key, request).await.unwrap();
+        assert!(matches!(
+            repo.load_run(run_key).await.unwrap(),
+            LoadedRun::Absent
+        ));
+
+        runtime.purger.idle().await;
+        assert!(
+            repo.read_history_to_end(run_key, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_run_bulk_writes(ShardId(0), None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A closed run whose first deletion transaction committed and whose purge
+    /// hasn't run, as a node that stopped after the first transaction leaves it.
+    async fn recorded_for_purging(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        repo: &InMemoryStore,
+    ) -> RunKey {
+        let start = deletion_start_request();
+        let run_key = start.run_key;
+        let execution = ExecutionRef {
+            namespace_id: start.namespace_id,
+            workflow_id: start.workflow_id.clone(),
+            run_id: Some(start.run_id),
+        };
+        runtime.start_workflow(start).await.unwrap();
+        runtime
+            .terminate_workflow(
+                execution,
+                TerminateRequest {
+                    reason: "closed for deletion".to_string(),
+                    details: None,
+                    identity: "operator".to_string(),
+                    links: Vec::new(),
+                    request: RequestContext {
+                        request_id: RequestId(format!("terminate-{}", run_key.0)),
+                        caller_identity: None,
+                        principal: None,
+                        received_at: OffsetDateTime::UNIX_EPOCH,
+                    },
+                    now: OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
+                },
+            )
+            .await
+            .unwrap();
+        let LoadedRun::Existing(state) = repo.load_run(run_key).await.unwrap() else {
+            panic!("terminated run should remain until deletion");
+        };
+        let deleted = repo
+            .delete_run_for_bundle(
+                run_key,
+                ShardId(0),
+                tokeira_storage::DeleteRunRequest {
+                    expected_seq: state.transition_seq,
+                    deleted_at: OffsetDateTime::UNIX_EPOCH + Duration::seconds(2),
+                },
+                ShardEpoch::ZERO,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(deleted, DeleteRunResult::Deleted { .. }));
+        run_key
+    }
+
+    // A shard's recovery abandons the materializations recorded on it and
+    // hands every record to the purger, which removes the runs' rows
+    // (`bounded-bulk-writes` criterion 2.9).
+    #[tokio::test]
+    async fn recovery_abandons_materializations_and_hands_records_to_the_purger() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = deletion_runtime(repo.clone());
+        let deleted = recorded_for_purging(&runtime, &repo).await;
+
+        let start = deletion_start_request();
+        let base = start.run_key;
+        let (namespace_id, workflow_id) = (start.namespace_id, start.workflow_id.clone());
+        runtime.start_workflow(start).await.unwrap();
+        let successor_run_id = RunId::new();
+        let successor = RunKey::derive(namespace_id, &workflow_id, successor_run_id);
+        // The record commits; the copy's first transaction fails, as a node
+        // stopping there leaves it.
+        repo.fail_bulk_write_after(1).await;
+        repo.materialize_reset_successor(base, 2, successor_run_id, Some(base))
+            .await
+            .unwrap_err();
+        let records = repo
+            .list_run_bulk_writes(ShardId(0), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| record.run_key == successor
+            && record.phase == tokeira_storage::BulkWritePhase::Materializing));
+
+        // A purger whose queue nothing drains shows what recovery does itself:
+        // it switches the materialization before the shard could admit a
+        // command, whether or not a purge has run.
+        let (recovered, _queue) = crate::purge::RunPurger::new();
+        let found = crate::purge::recover_bulk_writes(ShardId(0), repo.as_ref(), &recovered, None)
+            .await
+            .unwrap();
+        assert_eq!(found, 2);
+        assert!(
+            repo.list_run_bulk_writes(ShardId(0), None, 10)
+                .await
+                .unwrap()
+                .iter()
+                .all(|record| record.phase == tokeira_storage::BulkWritePhase::Purging)
+        );
+        let mut both = vec![deleted, successor];
+        both.sort();
+        assert_eq!(recovered.queued(), both);
+
+        for run_key in recovered.queued() {
+            runtime.purger.enqueue(run_key);
+        }
+        runtime.purger.idle().await;
+        assert!(
+            repo.list_run_bulk_writes(ShardId(0), None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for run_key in [deleted, successor] {
+            assert!(
+                repo.read_history_to_end(run_key, 0)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(matches!(
+            repo.load_run(successor).await.unwrap(),
+            LoadedRun::Absent
+        ));
+    }
+
+    // The purger retries a purge that failed, until it succeeds.
+    #[tokio::test]
+    async fn the_purger_retries_a_failed_purge() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = deletion_runtime(repo.clone());
+        let run_key = recorded_for_purging(&runtime, &repo).await;
+        repo.fail_bulk_write_after(0).await;
+        runtime.purger.enqueue(run_key);
+        runtime.purger.idle().await;
+        assert!(
+            repo.list_run_bulk_writes(ShardId(0), None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.read_history_to_end(run_key, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // An inline purge that fails still returns the deletion, and the purger
+    // finishes the purge.
+    #[tokio::test]
+    async fn a_failed_inline_purge_is_finished_by_the_purger() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = deletion_runtime(repo.clone());
+        let start = deletion_start_request();
+        let run_key = start.run_key;
+        runtime.start_workflow(start).await.unwrap();
+        // The termination commits outside the covered writes; the first
+        // transaction then commits, and the purge's first transaction fails.
+        repo.fail_bulk_write_after(1).await;
+
+        let deletion = runtime
+            .delete_workflow(run_key, deletion_request("delete-inline"))
+            .await
+            .unwrap();
+        assert_eq!(
+            deletion.tombstone.context.lifecycle_state,
+            tokeira_types::VisibilityLifecycleState::Deleted
+        );
+
+        runtime.purger.idle().await;
+        assert!(
+            repo.read_history_to_end(run_key, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_run_bulk_writes(ShardId(0), None, 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

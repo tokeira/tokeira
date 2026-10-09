@@ -317,6 +317,8 @@ pub struct TokeiraRuntime<R> {
     node_endpoint: String,
     /// Cancellation and join boundary shared by every runtime scanner.
     runtime_shutdown: RuntimeShutdownHandle,
+    /// Finishes the purges of deleted runs and abandoned materializations.
+    purger: crate::purge::RunPurger,
 }
 
 // Manual impl: the runtime root aggregates trait-object stores and the
@@ -346,6 +348,14 @@ pub struct DeleteWorkflowRequest {
     pub request: RequestContext,
     /// Stable admission time used by both termination and the deletion tombstone.
     pub now: OffsetDateTime,
+    /// Purge the run's remaining rows before returning, instead of leaving them
+    /// to the background purger (`bounded-bulk-writes` criterion 2.6).
+    ///
+    /// DeleteWorkflowExecution leaves it unset and returns once the run is
+    /// unreachable. A batch delete and a namespace's reclaim set it, so each
+    /// moves to its next run only once a run's rows are gone, and a large
+    /// reclaim doesn't fill the purger's queue.
+    pub purge_inline: bool,
 }
 
 /// Result of an authoritative workflow deletion.
@@ -899,6 +909,12 @@ where
                 activity_timeout_config,
                 activity_timeout_scanner_cancel.clone(),
             )));
+        let (purger, purger_queue) = crate::purge::RunPurger::new();
+        let _purger_task = runtime_shutdown.spawn(crate::purge::run_purger(
+            repo.clone(),
+            purger_queue,
+            runtime_shutdown.cancellation_token(),
+        ));
         let grace_scanner_cancel = CancellationToken::new();
         runtime_shutdown.register_cancellation(grace_scanner_cancel.clone());
         let grace_scanner_handle = Some(runtime_shutdown.spawn(run_grace_scanner(
@@ -1043,6 +1059,7 @@ where
             runtime_shutdown,
             worker_deployment_repository: None,
             worker_deployment_registry,
+            purger,
         }
     }
 
@@ -3997,8 +4014,26 @@ pub(crate) mod tests {
             _base_run_key: RunKey,
             _fork_event_id: i64,
             _successor_run_id: RunId,
+            _expected_current: Option<RunKey>,
         ) -> Result<()> {
             panic!("unused in timer scanner tests")
+        }
+
+        async fn abandon_materialization(&self, _run_key: RunKey) -> Result<()> {
+            panic!("unused in timer scanner tests")
+        }
+
+        async fn purge_run(&self, _run_key: RunKey) -> Result<()> {
+            panic!("unused in timer scanner tests")
+        }
+
+        async fn list_run_bulk_writes(
+            &self,
+            _shard_id: ShardId,
+            _after: Option<RunKey>,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::RunBulkWrite>> {
+            Ok(Vec::new())
         }
 
         async fn list_workflow_dispatch_page(
@@ -4051,7 +4086,10 @@ pub(crate) mod tests {
             panic!("unused in timer scanner tests")
         }
 
-        async fn persist_to_backlog(&self, _entries: Vec<BacklogEntry>) -> Result<()> {
+        async fn persist_to_backlog(
+            &self,
+            _entries: Vec<BacklogEntry>,
+        ) -> std::result::Result<(), tokeira_storage::BacklogPersistError> {
             panic!("unused in timer scanner tests")
         }
 
@@ -4116,7 +4154,11 @@ pub(crate) mod tests {
             self.list_due_timers(_now, limit).await
         }
 
-        async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
+        async fn delete_due_timer_if_matches(
+            &self,
+            timer: &DueTimer,
+            _reason: tokeira_storage::StaleTimer,
+        ) -> Result<bool> {
             self.deletes
                 .lock()
                 .expect("deletes lock poisoned")

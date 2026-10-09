@@ -756,12 +756,14 @@ where
                             exclude_update,
                             reset_request_context,
                             post_reset_versioning_overrides,
+                            expected_current,
                         ) = match &committed_command {
                             Command::Reset(reset_request) => (
                                 reset_request.reapply_exclude_signal,
                                 reset_request.reapply_exclude_update,
                                 reset_request.request.clone(),
                                 reset_request.post_reset_versioning_overrides.clone(),
+                                reset_request.expected_current_run_key,
                             ),
                             _ => (
                                 false,
@@ -770,6 +772,7 @@ where
                                     time::OffsetDateTime::now_utc(),
                                 ),
                                 Vec::new(),
+                                None,
                             ),
                         };
                         // A reset closes the predecessor and forks a successor
@@ -843,6 +846,7 @@ where
                                 message.run_key,
                                 fork_event_id,
                                 successor_run_id,
+                                expected_current,
                             )
                             .await
                         {
@@ -852,6 +856,17 @@ where
                                 successor_run_key = ?successor_run_key,
                                 "failed to materialize reset successor"
                             );
+                            // The attempt has stopped, so its record and the
+                            // rows it wrote can go now (`bounded-bulk-writes`).
+                            // A purge that fails here is retried by the
+                            // runtime's purger, or by the shard's next owner.
+                            if let Err(purge_error) = repo.purge_run(successor_run_key).await {
+                                tracing::warn!(
+                                    error = ?purge_error,
+                                    successor_run_key = ?successor_run_key,
+                                    "failed to purge an abandoned reset successor"
+                                );
+                            }
                             reset_materialization_error = Some(error);
                         } else if let Ok((LoadedRun::Existing(successor_state), successor_stats)) =
                             repo.load_run_with_stats(successor_run_key).await
@@ -2566,11 +2581,29 @@ mod tests {
             Err(anyhow!("unused"))
         }
 
+        async fn abandon_materialization(&self, _run_key: RunKey) -> Result<()> {
+            Ok(())
+        }
+
+        async fn purge_run(&self, _run_key: RunKey) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list_run_bulk_writes(
+            &self,
+            _shard_id: tokeira_types::ShardId,
+            _after: Option<RunKey>,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::RunBulkWrite>> {
+            Ok(Vec::new())
+        }
+
         async fn materialize_reset_successor(
             &self,
             _base_run_key: RunKey,
             _fork_event_id: i64,
             successor_run_id: RunId,
+            _expected_current: Option<RunKey>,
         ) -> Result<()> {
             let mut state = self.state.lock().await;
             let successor_run_key = RunKey::derive(
@@ -2635,7 +2668,10 @@ mod tests {
             Ok(false)
         }
 
-        async fn persist_to_backlog(&self, _entries: Vec<BacklogEntry>) -> Result<()> {
+        async fn persist_to_backlog(
+            &self,
+            _entries: Vec<BacklogEntry>,
+        ) -> std::result::Result<(), tokeira_storage::BacklogPersistError> {
             Ok(())
         }
 
@@ -2687,7 +2723,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn delete_due_timer_if_matches(&self, _timer: &DueTimer) -> Result<bool> {
+        async fn delete_due_timer_if_matches(
+            &self,
+            _timer: &DueTimer,
+            _reason: tokeira_storage::StaleTimer,
+        ) -> Result<bool> {
             Ok(false)
         }
     }

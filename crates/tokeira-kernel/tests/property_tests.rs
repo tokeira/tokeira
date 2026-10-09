@@ -600,6 +600,7 @@ fn arb_reset_request(
             reapply_exclude_signal: false,
             reapply_exclude_update: false,
             post_reset_versioning_overrides: Vec::new(),
+            expected_current_run_key: None,
             reason,
             request: request_context(&request_id, now),
             now,

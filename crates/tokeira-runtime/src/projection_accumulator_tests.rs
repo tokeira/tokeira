@@ -227,6 +227,7 @@ async fn projection_accumulator_runtime_reset_commits_from_materialized_state() 
                 reapply_exclude_signal: false,
                 reapply_exclude_update: false,
                 post_reset_versioning_overrides: Vec::new(),
+                expected_current_run_key: None,
                 reason: "test reset".into(),
                 request: RequestContext::unattributed(at),
                 now: at,

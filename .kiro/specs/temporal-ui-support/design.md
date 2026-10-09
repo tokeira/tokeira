@@ -2,13 +2,13 @@
 
 ## Overview
 
-This design enables the Temporal UI to connect to tokeirad by implementing the missing gRPC endpoints the UI depends on, adding gRPC-Web transport for direct browser connections, and wiring the visibility projection pipeline so workflow lists show real data. For workflow deletion, it replaces the original visibility-only implementation with an OCC- and shard-fenced authoritative purge plus a versioned visibility tombstone.
+This design enables the Temporal UI to connect to tokeirad by implementing the missing gRPC endpoints the UI depends on, adding gRPC-Web transport for direct browser connections, and wiring the visibility projection pipeline so workflow lists show real data. For workflow deletion, it replaces the original visibility-only implementation with an OCC- and shard-fenced authoritative deletion plus a versioned visibility tombstone; a purge then removes the deleted run's remaining rows in pages.
 
 The work spans four crates and the server binary:
 
 - `tokeira-edge` — new gRPC handlers and edge-layer logic for discovery, namespace management, reverse history, delete, reset, describe-task-queue, and signal-with-start
 - `tokeira-runtime` — coordinate terminate-before-delete, fenced purge, and runtime-local cleanup
-- `tokeira-storage` — atomically remove authoritative run data and append a deletion projection record
+- `tokeira-storage` — make the run unreachable and append a deletion projection record in one transaction, then purge the run's remaining rows in pages
 - `tokeira-projection` — wire the visibility sink into the server startup and retain non-queryable deletion tombstones so stale projection records cannot resurrect deleted executions
 - `tokeirad` (app binary) — add `tonic-web` + CORS middleware, wire new dependencies
 
@@ -23,9 +23,10 @@ derived from `service/frontend/workflow_handler.go`, `service/frontend/validator
 identity is verified in `service/history/consts/const.go` at the same tag. In particular, an
 open execution is terminated with reason `Delete workflow execution` and identity
 `history-service`, while deletion removes visibility, the current pointer, mutable
-state, and history in an idempotent staged operation. Tokeira provides the same
-observable result synchronously once admitted; it does not reproduce Temporal's
-internal transfer-task staging.
+state, and history in an idempotent staged operation. Tokeira stages it too: one
+transaction appends the visibility tombstone, removes the current pointer and mutable
+state, and records the run for a purge that removes its other rows, history last
+([bounded-bulk-writes](../bounded-bulk-writes/design.md)).
 
 ## Dependencies and Non-Goals
 
@@ -36,9 +37,10 @@ internal transfer-task staging.
   command, delete history event, I/O, or storage concern is added to the kernel.
 - Retention-driven deletion, namespace deletion, archival, and multi-cluster deletion
   replication are outside Requirement 9.
-- Tokeira does not emulate Temporal's asynchronous delete-task latency. Returning only
-  after the local authoritative purge and visibility tombstone have applied is an
-  intentionally stronger completion point with the same successful response shape.
+- DeleteWorkflowExecution returns once the run is unreachable and its visibility
+  tombstone has applied, as v1.31.0 returns once it has added its delete task
+  (`service/history/api/deleteworkflow/api.go:86-98 @ v1.31.0`). The purge of the
+  run's remaining rows continues in the background.
 
 ## Architecture
 
@@ -132,8 +134,10 @@ For `GetClusterInfo`, the `WorkflowService` needs access to the `OperatorApi` (o
    transition sequence, execution-home bundle, and current shard epoch. Storage checks
    both fences in the same critical section or transaction, appends a `Deleted`
    projection record at the next sequence, conditionally removes the current pointer
-   only if it still names the target, and purges the target's authoritative and dispatch
-   rows atomically.
+   only if it still names the target, removes the target's mutable state and workflow
+   dispatch row, and records the run for purging, in one transaction. The runtime's
+   purger then removes the run's other rows in pages, history last
+   ([bounded-bulk-writes](../bounded-bulk-writes/design.md)).
 4. The runtime removes disposable broker entries, timeout tracking, update/query
    waiters, and callback tracking for the run. Work already delivered to a worker is
    harmless: any later completion reloads an absent run and cannot recreate it.
@@ -292,6 +296,9 @@ leave runtime-local work live after the authoritative rows disappear.
 pub struct DeleteWorkflowRequest {
     pub request: RequestContext,
     pub now: OffsetDateTime,
+    /// Purge the run's remaining rows before returning. A batch delete and a
+    /// namespace's reclaim set it; DeleteWorkflowExecution doesn't.
+    pub purge_inline: bool,
 }
 
 pub struct WorkflowDeletion {
@@ -319,9 +326,13 @@ lookup from changing targets between edge resolution and runtime admission.
   reason `Delete workflow execution`, no details, and identity `history-service`
   (`service/history/api/deleteworkflow/api.go @ v1.31.0`);
 - reload the post-termination state, derive the execution-home bundle and active commit
-  epoch exactly as the normal lane commit path does, and call the repository deletion;
+  epoch exactly as the normal lane commit path does, and call the repository deletion
+  in a task the caller's cancellation doesn't stop;
+- once that deletion commits, hand the run to the purger in the same task, or, with
+  `purge_inline`, purge it before returning and hand it to the purger only if that
+  purge fails;
 - retry an OCC conflict from a fresh load, but never retarget a different run;
-- after a successful purge, remove the run from workflow/activity broker queues,
+- after a successful deletion, remove the run from workflow/activity broker queues,
   workflow/WFT/activity/Nexus timeout trackers, completion-callback tracking,
   close-attempt tracking, buffered queries, and the update registry.
 
@@ -359,19 +370,24 @@ pub trait RunRepository: Send + Sync {
 ```
 
 The implementation checks the shard epoch and `expected_seq` under the same in-memory
-mutex or DSQL transaction that performs the purge. A successful operation:
+mutex or DSQL transaction that performs the deletion. A successful operation:
 
 1. constructs a full projection record from the durable state with
    `lifecycle_state = Deleted`, empty memo/search attributes, and
    `transition_seq = expected_seq.next()`;
 2. appends that record to the projection log;
 3. deletes the current-execution pointer only when it still names `run_key`;
-4. removes `workflow_hot`, `history_batch`, `request_dedupe`, `activity_state`,
-   `timer_bucket`, `activity_dispatch`, and `dispatch_backlog` rows owned by the run;
-5. removes the equivalent `runs`, `history`, explicit execution index, transition
-   audit, timeout/dispatch side tables, and run-to-shard entry in the in-memory store.
+4. removes the run's `workflow_hot` and `workflow_dispatch` rows, and inserts its
+   `run_bulk_write` record with phase `purging`;
+5. removes the equivalent `runs` entry, pointers, explicit execution index, dispatch
+   row, History Size and run-to-shard entry, and inserts the record, in the
+   in-memory store.
 
-The DSQL implementation performs all five steps in one transaction. The in-memory store
+The DSQL implementation performs all five steps in one transaction. `purge_run` then
+removes the run's `request_dedupe`, `activity_state`, `timer_bucket`,
+`activity_dispatch`, `dispatch_backlog` and `history_batch` rows in pages, history
+last, and the record with the last of them
+([bounded-bulk-writes](../bounded-bulk-writes/design.md)). The in-memory store
 also gains an explicit current-execution map: `find_latest_run` reads that pointer rather
 than scanning surviving runs, matching DSQL and preventing deletion of the current run
 from exposing an older run through a run-id-omitted request.
@@ -569,8 +585,9 @@ This avoids ambiguity with the forward cursor format.
 
 *For any* existing workflow execution and any generated set of run-owned history,
 dedupe, activity, timer, dispatch, and backlog rows, successful deletion SHALL leave the
-exact run absent from explicit resolution, mutable-state load, and history reads and
-SHALL remove every generated run-owned side row. If the generated run is open, the
+exact run absent from explicit resolution and mutable-state load, and, once its purge
+has finished, from history reads, with every generated run-owned side row removed. If
+the generated run is open, the
 deletion coordinator SHALL first commit termination with reason
 `Delete workflow execution` and identity `history-service`; if it is closed, it SHALL
 not author another termination. In both cases, storage SHALL persist and return one
@@ -606,7 +623,7 @@ sequence.
 ### Property 10: Current-execution pointer safety
 
 *For any* workflow lineage containing one target run and zero or more older runs, and
-for any optional newer run installed as current before the target purge commits,
+for any optional newer run installed as current before the target's deletion commits,
 deleting the target SHALL remove the current-execution pointer if and only if that
 pointer still names the target. A subsequent run-id-omitted resolution SHALL therefore
 return the newer current run when one exists and SHALL never fall back to an older run
@@ -706,7 +723,7 @@ Tests to implement:
 - `DeleteWorkflowExecution` rejects missing execution, empty workflow id, and malformed run id with INVALID_ARGUMENT
 - Running deletion uses reason `Delete workflow execution` and identity `history-service`
 - Closed deletion does not append a termination transition
-- DSQL deletion SQL guards `current_execution` by both pointer key and target run key and removes every run-owned table in one transaction
+- DSQL deletion SQL guards `current_execution` by both pointer key and target run key; the first transaction removes the run's mutable state and dispatch row and records it, and the purge covers every other run-owned table, history last
 - Visibility list, filtered count, grouped count, and rollup count all exclude a retained `Deleted` row
 - `ResetWorkflowExecution` with non-WFT-completed event returns INVALID_ARGUMENT
 - `RegisterNamespace` with empty name returns INVALID_ARGUMENT

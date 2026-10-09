@@ -34,7 +34,7 @@ A write that finds or leaves a run over a growth limit (1.1-1.3); events that ta
 - A run within every limit behaves as today (3.1).
 - The continue-as-new advice keeps its thresholds (3.2).
 - The force-close records what it records today (3.3).
-- A reset writes its successor as today (3.4).
+- A reset writes its successor without these limits' checks (3.4), in the batches of [bounded-bulk-writes](../bounded-bulk-writes/design.md).
 
 ## Root Cause
 

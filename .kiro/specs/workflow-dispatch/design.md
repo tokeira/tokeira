@@ -207,10 +207,15 @@ async fn list_workflow_dispatch_for_home(
 
 async fn reconcile_workflow_dispatch_run(
     &self,
-    fence: &ExecutionHomeFence,
+    home: ShardId,
     run_key: RunKey,
-) -> Result<DispatchRepairOutcome>;
+) -> Result<()>;
 ```
+
+The implemented repair interface carries a single-owner execution home. The caller
+holds its local writer barrier throughout acquisition. Tasks 17–18 will add the
+transaction-local `ExecutionHomeFence`; this interface makes no competing-owner
+claim. A typed `WorkflowDispatchRepairConflict` requests a whole-call retry.
 
 `Derive` returns a row exactly when status is `Running`, the pending task is
 unstarted, and its type is normal. A transient retry is normal for this purpose.
@@ -411,20 +416,28 @@ normal, and stale rows. No covering payload columns or time-dependent predicates
 are needed. Await successful asynchronous index construction before readiness.
 AWS documents the [index syntax and partial-predicate rules](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/create-index-syntax-support.html).
 
-First page omits the continuation predicate; subsequent pages use:
+The first page reads the equality-prefixed range in tuple order. Continuation is
+logically `(priority_key, scheduled_at, run_key) > (p, t, k)`, but a tuple comparison
+was a residual filter in DSQL. The implementation uses three disjoint seeks:
 
 ```sql
-SELECT run_key, queue_name, deployment, build_id, logical_seq,
-       priority_key, scheduled_at, priority_data, normal_queue_name,
-       schedule_to_start_deadline
-FROM workflow_dispatch
-WHERE queue_namespace = $1 AND queue_key = $2
-  AND routing_mode = $3 AND deployment_key = $4 AND build_key = $5
-  AND sticky = false
-  AND (priority_key, scheduled_at, run_key) > ($6, $7, $8)
-ORDER BY priority_key, scheduled_at, run_key
-LIMIT $9;
+-- Each branch also has the same namespace/queue/routing equality prefix.
+priority_key = $p AND scheduled_at = $t AND run_key > $k
+priority_key = $p AND scheduled_at > $t
+priority_key > $p
 ```
+
+Each branch selects only index-covered ordering keys, orders by the complete
+position and takes at most one page. A single `UNION ALL` statement orders their
+bounded results, materializes at most one page, then joins those keys to fetch
+payloads in the same read snapshot. Selecting payloads in each branch lets DSQL
+prefer a primary-key tail scan with residual queue/time filtering; the key-only
+stage keeps the queue seek covered.
+This preserves one query per scheduler slice and the existing concurrency budget;
+internal branch results are at most three pages. The timestamp/run-key branch
+advances within equal-time groups, and the other branches are disjoint from every
+consumed position. The live plan fixture checks first and deep continuation pages
+for both Live and Exact routing, with full traversal across timestamp ties.
 
 The unique run-key tie-breaker gives a total order within a range. Advance from
 the last SQL row, including a digest collision or locally skipped row. Each page
@@ -538,6 +551,53 @@ expiry checks, transactional authoritative reads, and the non-serving gate.
 Transaction-local takeover/renewal fencing and its concurrency claims remain
 deferred to Tasks 17–18; this does not block single-owner repair or backlog retirement.
 
+The current repair and admission barrier are enabled by the temporary private
+queue-home construction choice. Default acquisition retains its previous delivery
+and due-work behavior until cutover. Tracker scoping is active in both modes.
+
+Cutover remains blocked on legacy reset placement: before the execution-home fix,
+`crates/tokeira-storage/src/dsql/run_repository/load.rs @ a0addfa2^1` materialized
+both the successor hot row and timers under `shard_for_run_key(successor_run_key)`
+and committed before the successor's first lane command. A stop in that interval
+can leave persisted placement different from the namespace/workflow execution
+home. Current acquisition repair intentionally rejects that mismatch instead of
+changing authoritative placement in a derived-row-only transaction. Before default
+enablement, an explicit placement recovery path must preserve eventual recovery
+of the affected workflow without blocking unrelated runs. Simply skipping the row
+cannot establish that guarantee. The cutover implementation must cover this exact
+stopped-upgrade fixture on both stores, including timer and dispatch placement.
+
+The cutover must also align outer runtime admission and task-token epoch lookup
+with execution-home ownership.
+`crates/tokeira-runtime/src/runtime/commit.rs` currently uses the run-key hash
+in `shard_id_for`, before the lane's execution-home gate. A node holding only the
+execution home can therefore reject a valid start. The tracker regressions submit
+through the real lane to isolate tracking from that pre-existing outer gate; they
+do not establish public multi-home admission. Add an end-to-end regression with
+only the execution home held before enabling the new delivery path by default.
+
+When enabled, acquisition first publishes Sweeping and drains a per-home writer
+barrier before either walk. Lane commits retain admission through post-commit
+tracking and reset materialization; direct activity commits and retention use the
+same home barrier. Only reconstruction and derived-row repair happen while
+Sweeping. Active scanners subsequently fire overdue timers and prepare activities,
+including workflow-rule pause writes.
+
+All recovery trackers carry the acquisition generation and a mutation revision.
+Installation checks the current generation under the ownership lock, processing
+requires Active, and completion retires only the submitted revision. Beginning a
+replacement acquisition cancels and clears the old home entries under that lock.
+Run and execution deadlines are installed in the lane after an applied start,
+using committed state and execution home before the reply and while retaining
+write admission. Retry, cron, continue-as-new and folded starts share that path;
+reset materialization seeds its successor explicitly. Callers do not reinstall
+deadlines after awaiting the reply. Dispatch publication receives the same
+execution home directly, so tracker installation adds no fallible state reloads.
+A callback HTTP result cannot retire or reinstall another acquisition's entry;
+its scanner retires only after observing committed terminal state. Managed
+acquisitions bound their local deadline conservatively from each successful lease
+request's start time; a renewal returned after that deadline cannot revive them.
+
 1. Acquire ownership and enter `Sweeping`. Capture a fence containing home, owner,
    and epoch; connect cancellation and local expiry to this acquisition attempt.
 2. Walk the existing `recovery_needed IS NULL` then `true` candidate phases by run
@@ -578,7 +638,13 @@ the encoded row against DSQL's row/column limits before executing; account for
 the entire transaction, including any fence implementation writes, against row
 and byte limits. A fence using only key-share does not author another lease
 update. Leave headroom rather than constructing transactions at 10 MiB. Read
-page size is not a write budget. Decode/limit violations fail acquisition with
+page size is not a write budget. The implementation validates each non-indexed
+variable column at 1 MiB and reserves 4 KiB of overhead within a conservative
+2 MiB row budget. One-run repair mutates at most one derived row; even charging
+both old and new row images stays below the separate 10 MiB transaction limit.
+It never enlarges a repair to probe the 3,000-row service limit. Those service
+boundary/abort probes are separate from the smaller application budgets.
+Decode/limit violations fail acquisition with
 the offending run identified in logs; they are not silently skipped.
 
 OCC conflicts retry the **whole** repair transaction with a fresh fence check and
@@ -712,13 +778,14 @@ the model's derived row set. The final Active publication corresponds to atomic
 depends on execution-home admission and the lease fence, not on a global database
 snapshot spanning all repair pages.
 
-The current model abstracts a pass as one atomic set admission, has very few runs,
-uses a fixed serviceable set, and does not model SQL pages, routing changes, digest
-collisions, capacity sharing, paused retries, or batched repair. Add a bounded
-refinement model/check for page continuation across slices, an incompatible prefix,
-retained failure retry, and interrupted two-walk repair. Include negative controls
-that restart at every slice and omit the stale-row walk. Use generated runtime
-tests for prefix sizes larger than the finite model can economically explore.
+The abstract model has few runs and atomic pass admission. Its concrete companion,
+[41_dispatch_repair.tla](../../../spec/tla/41_dispatch_repair.tla), adds a multi-page
+blocked prefix, continuation across slices, a retained failure retry, and
+interrupted NULL/true/home walks. `abstractRow` stays fixed while non-serving;
+intermediate repairs stutter and final activation maps to Reconcile. Negative
+controls restart each slice, retain retry identity, or omit stale-row deletion.
+SQL plans, routing changes, digest collisions and capacity sharing remain code
+and generated-test obligations beyond this finite companion.
 
 Keep weak fairness on enabled discovery/start/timeout/reconcile processing and
 eventual fault cessation. Extend serviceability assumptions to stable compatible
@@ -727,7 +794,9 @@ from fairness of notifications. The `_stale_rows.cfg` scenario deliberately omit
 `RowsAreWanted` and disables reconciliation deletion: its successful check is
 evidence that stale dispatch can be harmless to safety, not proof of Requirement
 8.11. The complete repair configuration and additional tests must assert both row
-invariants. No new model run is claimed by this design document.
+invariants. Both model checkers passed every positive and failed every targeted
+negative configuration on 2026-10-08; commands and mappings are recorded in
+[the model documentation](../../../spec/README.md#tla41_dispatch_repairtla).
 
 ## Correctness Properties
 
@@ -865,17 +934,18 @@ source boundaries or a model-refinement argument.
 
 ## Error Handling
 
-Proposed `DispatchRepairError` and `DiscoveryError` variants below wrap the existing
-storage/runtime errors; they do not create new public RPC error semantics.
+Repair uses contextual storage errors plus `WorkflowDispatchRepairConflict` for
+whole-transaction OCC retries. Discovery uses its existing typed errors. Neither
+path introduces public RPC error semantics.
 
 | Condition | Internal treatment | External effect |
 |---|---|---|
 | Missing, closed, paused, stale, or already-started offer | Existing kernel rejection; release volatile identity. | Poll path discards stale work and continues; preserve existing task-token NotFound mapping where returned by an RPC. |
 | Repeated submission for a committed private start | Existing already-started rejection, or reuse of a confirmed result still held by its caller; never fabricate a result after ambiguity. | Existing public poll/token behavior; no second start/event and no new public internal-history RPC. |
 | Hot-state CAS or DSQL OCC conflict | Existing commit conflict / repair retry with fresh transaction. | Existing retry behavior; never a partially committed row/state pair. |
-| Lease missing, epoch/owner mismatch, expiry, or acquisition cancellation | `DispatchRepairError::OwnershipLost`; cancel acquisition and timers. | Home unavailable through existing routing/admission handling; no Active publication. |
-| Recovery decode failure or home mismatch | `DispatchRepairError::InvalidState`; identify run and cause in logs. | Home remains non-serving; no silently skipped row. |
-| Row encoding, sequence exhaustion, or aggregate write limit | Checked conversion/allocation error or `DispatchRepairError::LimitExceeded`; abort whole operation. | Existing internal/storage error mapping, no truncated identity or partial mutation. |
+| Lease missing, epoch/owner mismatch, expiry, or acquisition cancellation | Existing local acquisition error / `NotShardOwner`; cancel acquisition and trackers. | Home unavailable through existing routing/admission handling; no Active publication. |
+| Recovery decode failure or home mismatch | Contextual storage validation error; identify run and cause in logs. | Home remains non-serving; no silently skipped row. |
+| Row encoding, sequence exhaustion, or aggregate write limit | Checked conversion/encoding-budget error; abort the whole operation. | Existing internal/storage error mapping, no truncated identity or partial mutation. |
 | Page/registry read failure | `DiscoveryError::Storage` / `Routing`; discard pass, back off via existing retry policy. | Poll remains bounded by its existing timeout/cancellation behavior; durable intent remains. |
 | Capacity unavailable | Normal `SliceOutcome::CapacityBlocked`, not a storage failure. | Later capacity resumes discovery from head. |
 | Digest collision or now-incompatible candidate | Skip after exact comparison/resolution; advance key. | No cross-queue/version delivery and no public error. |

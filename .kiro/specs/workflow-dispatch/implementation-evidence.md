@@ -1,5 +1,179 @@
 # Workflow dispatch implementation evidence
 
+## Third implementation PR: reconciliation and serving admission
+
+Original base: `059f2c1b1291bc176c5005617df6328925e56845`.
+The PR records the rebased base, implementation commit and final head.
+
+This change implements complete single-owner acquisition repair behind the same
+private queue-home construction choice as discovery. Ordinary constructors retain
+the existing delivery and recovery effects. The subsequent cutover removes that
+choice together with the workflow backlog paths; activity backlog remains separate.
+No migration, state-format, dependency-version or lockfile change is introduced.
+The runtime's new opt-in `dsql-integration` feature forwards the existing storage
+feature solely for the live acquisition test.
+
+One-run repair reads authoritative state and replaces or deletes only its derived
+dispatch row in the same transaction. Recovery walks NULL/true candidates and then
+the complete home index, including sticky, excluded and orphan rows. Acquisition
+publishes Sweeping and drains already-admitted writers before reading either walk.
+Lane commits retain the permit through post-commit tracking and reset materialization;
+direct activity and retention writers use the same execution home. Due timers and
+activity preparation, including rule-pause transitions, wait for Active. An aborted
+or failed acquisition never serves and its replacement starts both walks at the head.
+
+All five timeout/callback trackers are acquisition-scoped in both construction modes.
+Installs check current generation under the owner lock; scans require Active;
+retirement compares the submitted revision. Activity retry completions also carry
+that revision, so a delayed reply cannot update or remove a replacement key.
+Callback HTTP completions retain their
+entry until a scanner observes committed terminal state, preventing a late result
+from erasing replacement tracking. Callback lifecycle grounding is
+`components/callbacks/statemachine.go @ v1.31.0` and
+`components/callbacks/executors.go @ v1.31.0`. Lane and publisher tracking now use
+stable execution-home placement, and the memory repository's recovery/timer placement
+matches that same rule. Local lease deadlines bound activation and admission;
+these are not a transaction-local competing-owner fence. Requirements 8.4–8.6 and
+tasks 17–18 remain deferred for that prerequisite.
+
+### Contracts and model checks
+
+Property 8 runs 100 generated cases on each backend, with missing, stale and
+mismatched rows; sticky, closed, speculative and absent runs; legacy recovery flags;
+interruption and head-restart convergence. An independent expected-row model checks
+complete repair. Raw authoritative state, history and projection snapshots remain
+unchanged after partial and complete repair. Runtime fault fixtures cover either
+walk's query failure, repair failure, whole-transaction OCC retry/exhaustion,
+interruption, an already-admitted lane commit whose run hash differs from its
+execution home, and overdue timer/activity-pause work deferred until Active.
+Encoding checks exercise the 1 MiB column and conservative 2 MiB row budgets.
+The single-row repair budget is distinct from DSQL's 3,000-row/10 MiB service limits;
+the service-boundary abort suites remain part of task 15.
+
+The companion `41_dispatch_repair` model covers three blocked positions ahead of
+a serviceable task, page continuation, retained failure retry and interrupted
+NULL/true/home walks. Intermediate repair steps are non-serving stutters; activation
+maps to Reconcile. TLC 1.7.4 and tla-rs 0.21.2 agree on all six positive and nine
+negative configurations across models 40 and 41. Every negative fails its intended
+property; temporal negatives were also checked with only that target property.
+Commands, state counts and code/test mappings are in
+[the model README](../../../spec/README.md#tla41_dispatch_repairtla).
+No state/depth limit truncated a run. The stale-rows configuration retains its
+explicitly weaker claim; it does not prove complete repair.
+
+### Live DSQL validation
+
+Runs use temporary Aurora DSQL clusters in `eu-west-1`, AWS profile `default`,
+without deletion protection and with `purpose=tokeira-test` and
+`task=workflow-dispatch-3`. Each runner deletes its own cluster in cleanup.
+
+The first cluster was created **2026-10-08 21:33:20 UTC**; deletion was accepted
+**2026-10-08 21:54:22 UTC** and subsequent lookup confirmed absence. The generated
+100-case repair contract passed, including schema bootstrap. The continuation-plan
+run then exposed a nested-ordering SQL syntax error. The corrected query gives the
+outer ordering its own subquery boundary; its rerun is recorded below.
+
+The second cluster was created **2026-10-08 22:02:08 UTC**; deletion was accepted
+**2026-10-08 22:15:55 UTC**. Its bootstrap run returned DSQL schema-change conflict
+`OC001`; the corruption contract passed on the migrated database (7.235 s).
+The real acquisition check passed (2.825 s), as did the ordered-page contract
+(15.637 s) and complete 16,384-row plan/traversal fixture (287.795 s). The two
+ad-hoc follow-up checks overlapped the plan fixture, so the final run repeats
+these suites serially as required by the live-test runbook.
+
+Inspection of that plan found a selective primary-key tail scan at the timestamp
+boundary despite correct returned ordering. The final SQL first materializes a
+bounded page of index-covered keys, then looks up its payloads. The live test now
+asserts complete scalar index bounds for every disjoint continuation interval;
+returned rows alone cannot satisfy the seek check.
+
+The final cluster was created **2026-10-08 22:18:54 UTC**; deletion was accepted
+**2026-10-08 22:33:32 UTC**. All four suites ran serially with the `dsql-live`
+profile and passed:
+
+| Contract | Result |
+|---|---|
+| Repair home/decode/encoding failures | Passed, 418.815 s including schema bootstrap |
+| Real acquisition and superseded tracker installs | Passed, 2.819 s |
+| Ordered pages, routing, reset and speculative legacy delivery | Passed, 12.332 s |
+| First/deep continuation plans and full traversal | Passed, 293.465 s |
+
+[The final before/after plans](query-plans-reconciliation-20261008.md) record the
+16,384 seeded rows, 16,413 total rows, 24.9558% target-range selectivity and deep
+positions inside one priority band, including equal-time ties. Every continuation
+uses all three scalar ordering bounds as index conditions. The bounded key page
+feeds primary-key equality payload lookups in the same read snapshot. Both Live
+and Exact full traversals preserved all 4,096 positions. Home continuations also
+seek by run key. No migration or query-concurrency increase was needed.
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_generated_complete_repair)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_repair_decode_and_encoding_failures_preserve_authority)'
+cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_ordered_pages)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_query_plans)'
+```
+
+### Review regressions
+
+Workflow execution/run deadlines now install in the lane's post-commit path for
+all committed start events, including plain, update-with-start, signal-with-start,
+retry, cron and continue-as-new starts. The install uses committed state and its
+execution home, while write admission is held and before the reply. Reset's
+separately materialized successor retains its explicit install. All caller-side
+installs after an awaited start have been removed. The publisher receives the
+committed execution home for the whole batch; tracker home lookup performs no
+state read and cannot truncate dispatch on a read failure.
+
+Deterministic runtime tests exercise real lane commits and the production timeout
+submission path with an explicit scan instant. A timed-out run's retry successor
+and cron successor both time out without reacquisition. A lost reply after each
+of the three start forms retains its deadline when only the execution home is
+held, even after another shard is acquired twice. A 32-activity batch installs on
+that home and delivers every offer while a repository fixture rejects state reads;
+the fixture records zero reads. The focused suite passes all 11 tests, including
+the existing scanner properties. No new tests sleep.
+
+The restart-slices negative configuration now lists only `EventuallyResolved`.
+TLC 1.7.4 reports its expected temporal violation (exit 13), and tla-rs 0.21.2 names
+`EventuallyResolved` (exit 1). Both were rerun on 2026-10-09; the other unchanged
+model configurations retain the full results above.
+
+Two cutover gaps are recorded explicitly in the design and remain unchecked in
+task 11.1. Legacy reset materialization can leave hot state and timers on the
+run-key shard until the first successor commit; current repair rejects that
+placement mismatch. Separately, the outer runtime admission/token helper still
+uses run-key placement. The multi-home tracker tests submit directly to the lane,
+so they do not claim public admission works when only the execution home is held.
+Default enablement requires placement handling and public admission regressions.
+
+No live cluster was created for these runtime and test changes. The storage SQL,
+migrations and repository transactions are unchanged; prior real DSQL results
+remain the evidence for them.
+
+The full AGENTS.md §10.4 bar passed after these fixes on 2026-10-09: nightly
+formatting, locked workspace lint and check, all 3,757 nextest tests (2 existing
+ignored SDK integration tests), doctests (1 passed, 21 existing ignored examples),
+and documentation with warnings denied. DSQL-feature all-target Clippy also
+passed with warnings denied. No bar command was omitted. Changed Markdown links, including fragments, and whitespace checks passed. The runtime
+changes introduced no dependency, lockfile, migration or shared-config changes.
+
+### Workspace validation before rebase
+
+The complete bar passed: nightly formatting, `cargo lint --locked`, workspace
+check, 3,736 nextest tests (2 existing ignored), workspace doctests (1 passed,
+21 existing ignored), and documentation with warnings denied. DSQL integration
+all-target Clippy also passed with warnings denied. An earlier unchanged projection
+checkpoint test hit its 500 ms cancellation; its isolated rerun and the full rerun
+passed. Nextest reported one leaked process handle in an unchanged proto field-number
+test during the green run. Native cached archives emitted linker deployment-target
+warnings; the compiler/Clippy lint gates passed. No bar command was skipped.
+A subsequent complete bar also passed with the bounded-key query (3,736 tests,
+2 ignored; no leak warnings in that run). The final activity-retry revision guard
+passed its generated replacement test, 72 focused activity/acquisition/repair
+tests, and feature-enabled all-target Clippy with warnings denied. The PR records
+the final full bar after rebasing onto the newer main revision.
+
 ## Second implementation PR: delivery components and deadline recovery
 
 Original base: `eb80ab4aa839010c26708d75d4f1a62492bb92ac`.

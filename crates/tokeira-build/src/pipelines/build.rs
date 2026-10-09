@@ -1,5 +1,5 @@
-//! Shared Rust builder setup and its cache identity. System packages participate
-//! in that identity so a dependency change cannot reuse an incompatible builder.
+//! Shared Rust builder setup and its cache identity. The package-install command
+//! participates in that identity; resolved system package versions do not.
 
 use std::{fs, path::PathBuf, process::Command};
 

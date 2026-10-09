@@ -54,6 +54,8 @@ tokeira-chasm = { path = "../tokeira-chasm", version = "0.5.1" }
 prost = "0.14"
 
 [features]
+# Opt-in acquisition checks on an operator-provided ephemeral DSQL cluster.
+dsql-integration = ["tokeira-storage/dsql-integration"]
 # Compiles the dynamic-override read seam (`conformance`) into the wired
 # admission sites. The override registry itself is test-harness machinery this
 # crate never links; the serving application installs read functions at boot.

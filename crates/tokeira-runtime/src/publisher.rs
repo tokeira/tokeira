@@ -61,7 +61,7 @@ use crate::{
         nexus_completion_backoff, nexus_operation_next_attempt_at,
     },
     scanner::pick_lane_for_run_key,
-    shard::{ShardOwner, shard_for},
+    shard::ShardOwner,
     workflow_task::{
         resolve_child_versioning, resolve_workflow_task_target_version, route_activity_task_queue,
     },
@@ -268,7 +268,6 @@ pub struct RuntimeDispatchPublisher<R> {
     repo: Arc<R>,
     lanes: Arc<Mutex<Vec<LaneHandle>>>,
     lane_count: usize,
-    shard_count: u32,
     nexus_client: Arc<dyn NexusHttpClient>,
     nexus_completion_client: Arc<dyn NexusCompletionClient>,
     nexus_completion_config: NexusCompletionRuntimeConfig,
@@ -291,7 +290,6 @@ impl<R> std::fmt::Debug for RuntimeDispatchPublisher<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeDispatchPublisher")
             .field("lane_count", &self.lane_count)
-            .field("shard_count", &self.shard_count)
             .finish_non_exhaustive()
     }
 }
@@ -304,7 +302,6 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             repo: self.repo.clone(),
             lanes: self.lanes.clone(),
             lane_count: self.lane_count,
-            shard_count: self.shard_count,
             nexus_client: self.nexus_client.clone(),
             nexus_completion_client: self.nexus_completion_client.clone(),
             nexus_completion_config: self.nexus_completion_config.clone(),
@@ -331,7 +328,6 @@ where
         repo: Arc<R>,
         lanes: Arc<Mutex<Vec<LaneHandle>>>,
         lane_count: usize,
-        shard_count: u32,
         nexus_client: Arc<dyn NexusHttpClient>,
         nexus_completion_client: Arc<dyn NexusCompletionClient>,
         nexus_completion_config: NexusCompletionRuntimeConfig,
@@ -348,7 +344,6 @@ where
             repo,
             lanes,
             lane_count,
-            shard_count,
             nexus_client,
             nexus_completion_client,
             nexus_completion_config,
@@ -1794,14 +1789,8 @@ where
 
         let now = OffsetDateTime::now_utc();
         let attempt_outcome = match delivery {
-            Ok(CompletionDeliveryOutcome::Delivered) => {
-                self.completion_callback_tracking
-                    .remove(run_key, callback_index);
-                CallbackAttemptOutcome::Succeeded
-            }
+            Ok(CompletionDeliveryOutcome::Delivered) => CallbackAttemptOutcome::Succeeded,
             Ok(CompletionDeliveryOutcome::NonRetryableError { detail }) => {
-                self.completion_callback_tracking
-                    .remove(run_key, callback_index);
                 CallbackAttemptOutcome::NonRetryableFailure {
                     failure: attempt_failure_payload(&detail),
                 }
@@ -1819,8 +1808,6 @@ where
                 let max = self.nexus_completion_config.retry_max_attempts;
                 if max != 0 && next_attempt >= max {
                     // Attempts exhausted → terminal Failed (design Error Handling).
-                    self.completion_callback_tracking
-                        .remove(run_key, callback_index);
                     CallbackAttemptOutcome::NonRetryableFailure {
                         failure: attempt_failure_payload(&detail),
                     }
@@ -1835,12 +1822,6 @@ where
                             next_attempt,
                             jitter_seed,
                         );
-                    self.completion_callback_tracking
-                        .insert(CompletionCallbackTrackingEntry {
-                            run_key,
-                            shard_id: shard_for(run_key, self.shard_count),
-                            callback_index,
-                        });
                     CallbackAttemptOutcome::RetryableFailure {
                         failure: attempt_failure_payload(&detail),
                         next_attempt_at,
@@ -1855,30 +1836,15 @@ where
             now,
         });
         if let Err(error) = self.submit_to_run(run_key, command).await {
-            // A kernel rejection means the callback already advanced to a terminal state
-            // (another attempt won, or the callback index is gone): the index entry is
-            // stale, drop it. Any other error is transient and the attempt outcome was
-            // NOT recorded — re-seed the tracking index so the scanner re-drives this
-            // callback (it is still `Scheduled`/`BackingOff` on the closed run). Without
-            // this, a transient submit failure would strand the callback until a shard
-            // takeover rebuild.
-            if error.to_string().contains("kernel rejected") {
-                self.completion_callback_tracking
-                    .remove(run_key, callback_index);
-            } else {
-                self.completion_callback_tracking
-                    .insert(CompletionCallbackTrackingEntry {
-                        run_key,
-                        shard_id: shard_for(run_key, self.shard_count),
-                        callback_index,
-                    });
-                tracing::warn!(
-                    ?error,
-                    run_key = ?run_key,
-                    callback_index,
-                    "failed to submit completion callback attempt; re-queued for the scanner"
-                );
-            }
+            // Keep the entry until a scanner observes the committed terminal
+            // state. A lost attempt reply must remain retryable, and an old HTTP
+            // completion must never retire a replacement acquisition's entry.
+            tracing::warn!(
+                ?error,
+                ?run_key,
+                callback_index,
+                "completion callback attempt was not recorded; scanner will reload state"
+            );
         }
     }
 }
@@ -2180,7 +2146,12 @@ impl<R> DispatchPublisher for RuntimeDispatchPublisher<R>
 where
     R: RunRepository + 'static,
 {
-    async fn publish(&self, run_key: RunKey, ops: &[DispatchOp]) -> Result<()> {
+    async fn publish(
+        &self,
+        run_key: RunKey,
+        execution_home: ShardId,
+        ops: &[DispatchOp],
+    ) -> Result<()> {
         for op in ops {
             match op {
                 DispatchOp::EnqueueWorkflowTask {
@@ -2328,7 +2299,7 @@ where
                         };
                         self.activity_tracking.record_scheduled(
                             run_key,
-                            shard_for(run_key, self.shard_count),
+                            execution_home,
                             activity_id.clone(),
                             effective,
                         );
@@ -2558,7 +2529,7 @@ where
                     {
                         self.nexus_timeout_tracking.insert(NexusTimeoutEntry {
                             run_key: *originator_run_key,
-                            shard_id: shard_for(*originator_run_key, self.shard_count),
+                            shard_id: execution_home,
                             operation_id: operation_id.clone(),
                             scheduled_event_id: *scheduled_event_id,
                             scheduled_at: *scheduled_at,
@@ -2636,6 +2607,12 @@ where
                     // the cancel-nexus arm above.
                     let publisher = RuntimeDispatchPublisher::clone(self);
                     let callback_index = *callback_index;
+                    self.completion_callback_tracking
+                        .insert(CompletionCallbackTrackingEntry {
+                            run_key,
+                            shard_id: execution_home,
+                            callback_index,
+                        });
                     let callback = callback.clone();
                     let outcome = outcome.clone();
                     spawn_dispatch("completion_callback", run_key, async move {
@@ -2664,7 +2641,7 @@ where
 /// the authority for the current lifecycle state and deadline, so each entry's run is
 /// reloaded; a stale entry (run absent, callback gone, or no longer backing off) is
 /// dropped. Delivery reuses [`RuntimeDispatchPublisher::deliver_completion_callback`],
-/// which re-seeds or clears the tracking index based on the new attempt outcome.
+/// while entries remain until a scan observes a committed terminal state.
 pub(crate) async fn scan_completion_callbacks_once<R>(
     repo: &R,
     tracking: &CompletionCallbackTrackingState,
@@ -2675,20 +2652,23 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
     R: RunRepository + 'static,
 {
     let now = OffsetDateTime::now_utc();
-    let entries = match shard_id {
-        Some(shard_id) => tracking.snapshot_for_shard(shard_id),
-        None => tracking.snapshot(),
-    };
+    let entries = tracking.inner.snapshot(shard_id);
     let mut fired = 0usize;
 
-    for entry in entries {
+    for tracked in entries {
+        if !tracking.inner.active(&tracked) {
+            continue;
+        }
+        let entry = tracked.value.clone();
         if fired >= config.max_per_scan {
             break;
         }
         let state = match repo.load_run(entry.run_key).await {
             Ok(LoadedRun::Existing(state)) => state,
             Ok(LoadedRun::Absent) => {
-                tracking.remove(entry.run_key, entry.callback_index);
+                tracking
+                    .inner
+                    .remove_submitted(&(entry.run_key, entry.callback_index), &tracked);
                 continue;
             }
             Err(error) => {
@@ -2702,7 +2682,9 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
             }
         };
         let Some(callback) = state.completion_callbacks.get(entry.callback_index) else {
-            tracking.remove(entry.run_key, entry.callback_index);
+            tracking
+                .inner
+                .remove_submitted(&(entry.run_key, entry.callback_index), &tracked);
             continue;
         };
         match callback.state {
@@ -2719,7 +2701,9 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
             },
             CallbackState::Succeeded | CallbackState::Failed => {
                 // Terminal: another attempt won or it failed out — drop the entry.
-                tracking.remove(entry.run_key, entry.callback_index);
+                tracking
+                    .inner
+                    .remove_submitted(&(entry.run_key, entry.callback_index), &tracked);
                 continue;
             }
             // Standby (open run) / Blocked are not the scanner's to fire.
@@ -2758,6 +2742,9 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
             // closed run, so this is defensive) — skip without dropping the entry.
             continue;
         };
+        if !tracking.inner.active(&tracked) {
+            continue;
+        }
         runtime_metrics::record_scanner_dispatched(
             "completion_callback",
             shard_id.map(|s| s.0).unwrap_or(0),
@@ -2774,7 +2761,11 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
         let publisher = RuntimeDispatchPublisher::clone(publisher);
         let run_key = entry.run_key;
         let callback_index = entry.callback_index;
+        let tracking = tracking.clone();
         spawn_dispatch("completion_callback_retry", run_key, async move {
+            if !tracking.inner.active(&tracked) {
+                return;
+            }
             publisher
                 .deliver_completion_callback(run_key, callback_index, &callback, &outcome)
                 .await;

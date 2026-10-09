@@ -28,8 +28,6 @@ use tokeira_storage::{
 use tokeira_types::{WorkerTaskClass, WorkerTaskOrigin, WorkflowId};
 use tracing::Instrument as _;
 
-use crate::timeout::WorkflowTimeoutEntry;
-
 /// Workflow-task routing target computed from durable run state plus registry config.
 ///
 /// The value is shared with activity-start transition checks because Temporal
@@ -1715,29 +1713,11 @@ where
             new_run_id,
         );
         let successor_run_key = start_request.run_key;
-        let shard_id = self.shard_id_for(successor_run_key).await;
         match self
             .submit(successor_run_key, Command::Start(start_request))
             .await?
         {
-            CommitResult::Applied { new_state } => {
-                if new_state.workflow_execution_timeout.is_some()
-                    || new_state.workflow_run_timeout.is_some()
-                {
-                    self.workflow_timeout_tracking.insert(WorkflowTimeoutEntry {
-                        run_key: new_state.run_key,
-                        shard_id,
-                        workflow_execution_timeout: new_state.workflow_execution_timeout,
-                        workflow_run_timeout: new_state.workflow_run_timeout,
-                        started_at: new_state.started_at,
-                        workflow_start_delay: new_state.workflow_start_delay,
-                        first_run_started_at: new_state.first_run_started_at,
-                        has_retry_policy: new_state.retry_policy.is_some(),
-                    });
-                }
-                Ok(())
-            }
-            CommitResult::Duplicate => Ok(()),
+            CommitResult::Applied { .. } | CommitResult::Duplicate => Ok(()),
             CommitResult::Conflict { reason } => {
                 Err(anyhow!("retry successor start conflicted: {reason}"))
             }
@@ -1785,29 +1765,11 @@ where
         )
         .map_err(|error| anyhow!("invalid cron schedule on continuation: {error:?}"))?;
         let successor_run_key = start_request.run_key;
-        let shard_id = self.shard_id_for(successor_run_key).await;
         match self
             .submit(successor_run_key, Command::Start(start_request))
             .await?
         {
-            CommitResult::Applied { new_state } => {
-                if new_state.workflow_execution_timeout.is_some()
-                    || new_state.workflow_run_timeout.is_some()
-                {
-                    self.workflow_timeout_tracking.insert(WorkflowTimeoutEntry {
-                        run_key: new_state.run_key,
-                        shard_id,
-                        workflow_execution_timeout: new_state.workflow_execution_timeout,
-                        workflow_run_timeout: new_state.workflow_run_timeout,
-                        started_at: new_state.started_at,
-                        workflow_start_delay: new_state.workflow_start_delay,
-                        first_run_started_at: new_state.first_run_started_at,
-                        has_retry_policy: new_state.retry_policy.is_some(),
-                    });
-                }
-                Ok(())
-            }
-            CommitResult::Duplicate => Ok(()),
+            CommitResult::Applied { .. } | CommitResult::Duplicate => Ok(()),
             CommitResult::Conflict { reason } => {
                 Err(anyhow!("cron successor start conflicted: {reason}"))
             }

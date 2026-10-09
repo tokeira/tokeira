@@ -1,0 +1,5 @@
+kind: fixed
+body: Recovery now scopes timeout and callback tracking to the current shard acquisition and preserves replacement entries during concurrent scans.
+time: 2026-10-08T21:51:05.840182+00:00
+custom:
+    Slice: 25481e09-90d0-4831-9f28-ee5201978ab9

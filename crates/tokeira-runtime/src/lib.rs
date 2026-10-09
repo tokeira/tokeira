@@ -20,6 +20,7 @@
     clippy::enum_variant_names
 )]
 
+mod acquisition_tracking;
 pub mod activity_timeout;
 pub mod backlog;
 pub mod batch;
@@ -53,6 +54,7 @@ pub mod runtime;
 pub use runtime::continue_as_new_advice_policy;
 pub mod scanner;
 pub mod schedule;
+mod serving_gate;
 pub mod shard;
 pub mod shutdown;
 mod signal_limits;

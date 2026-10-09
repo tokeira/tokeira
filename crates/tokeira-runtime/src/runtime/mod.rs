@@ -66,7 +66,7 @@ use crate::{
     },
     publisher::{RuntimeDispatchPublisher, run_completion_callback_scanner},
     query::{QueryResult, QueryTask},
-    recovery::{SweepResult, lease_rejected_error, run_lease_renewer, sweep_shard},
+    recovery::{SweepResult, lease_rejected_error},
     retry::{RetryDecision, RetryExhaustedReason, evaluate_activity_retry},
     scanner::{
         TimerScannerConfig, lane_index_for_run_key, pick_lane_for_run_key, run_timer_scanner,
@@ -75,8 +75,7 @@ use crate::{
     shard::{ShardOwner, shard_for},
     shutdown::RuntimeShutdownHandle,
     timeout::{
-        WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
-        run_workflow_timeout_scanner,
+        WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState, run_workflow_timeout_scanner,
     },
     update::{
         PendingUpdateTransport, UpdateLifecycleSnapshot, UpdateLifecycleStage, UpdateOutcome,
@@ -91,9 +90,13 @@ mod activity;
 mod commit;
 #[cfg(test)]
 mod discovery_tests;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod dsql_tests;
 mod lifecycle;
 mod membership;
 mod query;
+#[cfg(test)]
+mod repair_tests;
 pub(crate) mod workflow_task;
 
 pub use workflow_task::continue_as_new_advice_policy;
@@ -771,7 +774,17 @@ where
         let runtime_drain = Arc::new(RuntimeDrain::default());
         let shard_count = shard_count.max(1);
         let shard_owner = Arc::new(RwLock::new(ShardOwner::new(shard_count)));
+        if discovery.is_some() {
+            shard_owner
+                .write()
+                .expect("shard owner lock poisoned")
+                .enable_reconciliation();
+        }
         wft_timeout_tracking.set_owner(shard_owner.clone());
+        workflow_timeout_tracking.set_owner(shard_owner.clone());
+        activity_tracking.set_owner(shard_owner.clone());
+        nexus_timeout_tracking.set_owner(shard_owner.clone());
+        completion_callback_tracking.set_owner(shard_owner.clone());
         let lane_count = lane_count.max(1);
         // The publisher needs lane handles to route follow-up work (child
         // resolutions, continue-as-new starts), but the lanes don't exist yet.
@@ -795,7 +808,6 @@ where
                     repo.clone(),
                     shared_lanes.clone(),
                     lane_count,
-                    shard_count,
                     nexus_client.clone(),
                     nexus_completion_client.clone(),
                     nexus_completion_config.clone(),
@@ -943,7 +955,6 @@ where
             repo.clone(),
             shared_lanes.clone(),
             lane_count,
-            shard_count,
             nexus_client.clone(),
             nexus_completion_client.clone(),
             nexus_completion_config.clone(),
@@ -2694,13 +2705,12 @@ pub(crate) mod tests {
     async fn runtime_dispatch_publisher_wires_activity_dispatch_to_broker() {
         let workflow_broker = InMemoryBroker::default();
         let activity_broker = InMemoryActivityBroker::default();
-        let repo = Arc::new(MockTimerRepo::from_responses(Vec::new()));
+        let repo = Arc::new(InMemoryStore::default());
         let publisher = RuntimeDispatchPublisher::new(
             workflow_broker,
             activity_broker.clone(),
-            repo,
+            repo.clone(),
             Arc::new(Mutex::new(Vec::new())),
-            1,
             1,
             Arc::new(NoopNexusHttpClient),
             Arc::new(NoopNexusCompletionClient),
@@ -2719,11 +2729,16 @@ pub(crate) mod tests {
             deployment: None,
             build_id: None,
         };
-        let run_key = RunKey::new();
+        let item = crate::discovery::tests::transition(&queue, 0);
+        let run_key = item.next_state.run_key;
+        repo.commit_transition(run_key, item, ShardEpoch::ZERO)
+            .await
+            .unwrap();
 
         publisher
             .publish(
                 run_key,
+                ShardId(0),
                 &[DispatchOp::EnqueueActivityTask {
                     queue: queue.clone(),
                     activity_id: "activity-1".to_string(),
@@ -2836,7 +2851,6 @@ pub(crate) mod tests {
             repo,
             Arc::new(Mutex::new(Vec::new())),
             1,
-            1,
             Arc::new(NoopNexusHttpClient),
             Arc::new(NoopNexusCompletionClient),
             NexusCompletionRuntimeConfig::default(),
@@ -2874,6 +2888,7 @@ pub(crate) mod tests {
         publisher
             .publish(
                 run_key,
+                ShardId(0),
                 &[DispatchOp::EnqueueWorkflowTask {
                     queue: sticky_queue.clone(),
                     logical_seq: LogicalTaskSeq::ONE,
@@ -2915,6 +2930,7 @@ pub(crate) mod tests {
         publisher
             .publish(
                 run_key,
+                ShardId(0),
                 &[DispatchOp::EnqueueWorkflowTask {
                     queue: sticky_queue.clone(),
                     logical_seq: LogicalTaskSeq(2),
@@ -3717,6 +3733,7 @@ pub(crate) mod tests {
                         scan_interval: tokio::time::Duration::from_secs(1),
                         max_timeouts_per_scan: max_batch,
                     },
+                    OffsetDateTime::now_utc(),
                     move |entry, violation, now| {
                         let seen = seen_clone.clone();
                         async move {
@@ -3767,6 +3784,7 @@ pub(crate) mod tests {
                     &tracking,
                     None,
                     &WorkflowTimeoutScannerConfig::default(),
+                    OffsetDateTime::now_utc(),
                     move |entry, _violation, _now| {
                         let entries_for_submit = entries_for_submit.clone();
                         async move {

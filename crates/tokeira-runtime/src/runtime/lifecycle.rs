@@ -130,25 +130,6 @@ where
                 return Err(error);
             }
         };
-        // Register run-level deadlines before response materialization: task
-        // token construction is fallible after the authoritative commit.
-        if matches!(result, CommitResult::Applied { .. })
-            && (request.workflow_execution_timeout.is_some()
-                || request.workflow_run_timeout.is_some())
-        {
-            let shard_id = self.shard_id_for(request.run_key).await;
-            self.workflow_timeout_tracking.insert(WorkflowTimeoutEntry {
-                run_key: request.run_key,
-                shard_id,
-                workflow_execution_timeout: request.workflow_execution_timeout,
-                workflow_run_timeout: request.workflow_run_timeout,
-                started_at: request.now,
-                workflow_start_delay: request.workflow_start_delay,
-                first_run_started_at: request.first_run_started_at,
-                has_retry_policy: request.retry_policy.is_some(),
-            });
-        }
-
         let eager_workflow_task = match (&result, eager_worker_identity, reserved_poller) {
             (CommitResult::Applied { new_state }, Some(worker_identity), None) => Some(
                 self.started_workflow_task_from_state(new_state, false, worker_identity)
@@ -1042,6 +1023,7 @@ where
                 (bundle, commit_epoch)
             };
 
+            let _write = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
             match self
                 .repo
                 .delete_run_for_bundle(

@@ -34,7 +34,7 @@ use tokeira_proto::{
     conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
 };
 use tokeira_storage::{CommitResult, RunRepository, metrics as storage_metrics};
-use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch, execution_home_bundle};
+use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch, ShardId, execution_home_bundle};
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -84,13 +84,22 @@ impl Default for LaneConfig {
 /// Publishes dispatch operations produced by a committed
 /// transition (workflow tasks, activity tasks, etc.).
 ///
-/// Implementations are expected to be cheap and
-/// non-blocking; the lane holds no locks while calling
-/// [`publish`](DispatchPublisher::publish).
+/// The lane retains write admission through [`publish`](DispatchPublisher::publish).
+/// Implementations must keep the batch cheap and spawn any follow-up submission:
+/// awaiting a command on the same lane would deadlock.
 #[async_trait]
 pub trait DispatchPublisher: Send + Sync {
-    /// Publish a batch of [`DispatchOp`]s for `run_key`.
-    async fn publish(&self, run_key: RunKey, ops: &[DispatchOp]) -> Result<()>;
+    /// Publish a committed run's dispatch batch under its execution home.
+    ///
+    /// The caller derives `execution_home` from the committed state while holding
+    /// write admission. Every originator in `ops` belongs to this run; tracker
+    /// installation must not reload state or fall back to the run-key hash.
+    async fn publish(
+        &self,
+        run_key: RunKey,
+        execution_home: ShardId,
+        ops: &[DispatchOp],
+    ) -> Result<()>;
 
     /// Submit a command to a specific run, used by
     /// orchestration follow-up paths such as child
@@ -436,6 +445,7 @@ where
             shard_for(message.run_key, owner.shard_count())
         };
         let processing_span = lane_processing_span(&message, command_type, shard_id);
+        let mut write_admission = None;
         let result = handle_message_with_cache(
             kernel,
             repo,
@@ -446,6 +456,7 @@ where
             config,
             config.max_occ_retries,
             cache,
+            &mut write_admission,
         )
         .instrument(processing_span.clone())
         .await;
@@ -473,6 +484,7 @@ where
                     config,
                     config.max_occ_retries,
                     cache,
+                    &mut write_admission,
                 )
                 .instrument(processing_span.clone())
                 .await;
@@ -492,8 +504,45 @@ where
         let stop_draining = result.is_err() || breach.is_some();
         let reply = match result {
             Ok((commit_result, mut dispatch_ops, history_events)) => {
+                // Every post-commit index uses stable execution ownership; the
+                // run hash above only identifies the processing span.
+                let shard_id = match &commit_result {
+                    CommitResult::Applied { new_state } => tokeira_types::execution_home_bundle(
+                        new_state.namespace_id.0.as_bytes(),
+                        new_state.workflow_id.0.as_bytes(),
+                        shard_owner
+                            .read()
+                            .expect("shard_owner lock poisoned")
+                            .shard_count(),
+                    ),
+                    _ => shard_id,
+                };
                 let mut reset_materialization_error = None;
                 if let CommitResult::Applied { new_state } = &commit_result {
+                    if history_events.iter().any(|event| {
+                        matches!(
+                            event.kind,
+                            HistoryEventKind::WorkflowExecutionStarted { .. }
+                                | HistoryEventKind::WorkflowExecutionStartedV2 { .. }
+                        )
+                    }) && (new_state.workflow_execution_timeout.is_some()
+                        || new_state.workflow_run_timeout.is_some())
+                    {
+                        // All starts, including folded starts and successors, install
+                        // before replying and while holding write admission. A lost
+                        // reply must not lose the deadline, and a caller resuming
+                        // after reacquisition must not replace recovered tracking.
+                        workflow_timeout_tracking.insert(crate::timeout::WorkflowTimeoutEntry {
+                            run_key: new_state.run_key,
+                            shard_id,
+                            workflow_execution_timeout: new_state.workflow_execution_timeout,
+                            workflow_run_timeout: new_state.workflow_run_timeout,
+                            started_at: new_state.started_at,
+                            workflow_start_delay: new_state.workflow_start_delay,
+                            first_run_started_at: new_state.first_run_started_at,
+                            has_retry_policy: new_state.retry_policy.is_some(),
+                        });
+                    }
                     // Workflow-task timeout tracking, split by task type:
                     //
                     // A SPECULATIVE task's deadlines are enforced by PRECISE
@@ -809,7 +858,11 @@ where
                         {
                             let shard_id = {
                                 let owner = shard_owner.read().expect("shard_owner lock poisoned");
-                                shard_for(successor_run_key, owner.shard_count())
+                                tokeira_types::execution_home_bundle(
+                                    successor_state.namespace_id.0.as_bytes(),
+                                    successor_state.workflow_id.0.as_bytes(),
+                                    owner.shard_count(),
+                                )
                             };
                             if successor_state.workflow_execution_timeout.is_some()
                                 || successor_state.workflow_run_timeout.is_some()
@@ -970,7 +1023,7 @@ where
                 }
                 if !dispatch_ops.is_empty()
                     && let Err(error) = publisher
-                        .publish(message.run_key, &dispatch_ops)
+                        .publish(message.run_key, shard_id, &dispatch_ops)
                         .instrument(processing_span.clone())
                         .await
                 {
@@ -1360,19 +1413,12 @@ where
                                         inherited_versioning_info: successor_versioning_info,
                                     };
                                     let publisher = publisher.clone();
-                                    let workflow_timeout_tracking =
-                                        workflow_timeout_tracking.clone();
                                     let predecessor_run_key = message.run_key;
-                                    let shard_count = shard_owner
-                                        .read()
-                                        .expect("shard_owner lock poisoned")
-                                        .shard_count();
                                     // Start the successor off-lane for the same
                                     // reason as child delivery: it may route to
                                     // this lane, and an inline submit would
-                                    // self-deadlock. The successor's run timeout
-                                    // tracking is registered from the spawned
-                                    // task once its start commits.
+                                    // self-deadlock. The successor lane installs
+                                    // its deadlines before returning the reply.
                                     tokio::spawn(async move {
                                         match publisher
                                             .submit_to_run(
@@ -1381,33 +1427,7 @@ where
                                             )
                                             .await
                                         {
-                                            Ok(CommitResult::Applied { new_state }) => {
-                                                if new_state.workflow_execution_timeout.is_some()
-                                                    || new_state.workflow_run_timeout.is_some()
-                                                {
-                                                    workflow_timeout_tracking.insert(
-                                                        crate::timeout::WorkflowTimeoutEntry {
-                                                            run_key: new_state.run_key,
-                                                            shard_id: crate::shard::shard_for(
-                                                                new_state.run_key,
-                                                                shard_count,
-                                                            ),
-                                                            workflow_execution_timeout: new_state
-                                                                .workflow_execution_timeout,
-                                                            workflow_run_timeout: new_state
-                                                                .workflow_run_timeout,
-                                                            started_at: new_state.started_at,
-                                                            workflow_start_delay: new_state
-                                                                .workflow_start_delay,
-                                                            first_run_started_at: new_state
-                                                                .first_run_started_at,
-                                                            has_retry_policy: new_state
-                                                                .retry_policy
-                                                                .is_some(),
-                                                        },
-                                                    );
-                                                }
-                                            }
+                                            Ok(CommitResult::Applied { .. }) => {}
                                             Ok(CommitResult::Duplicate) => {
                                                 tracing::error!(
                                                     predecessor_run_key = ?predecessor_run_key,
@@ -1558,6 +1578,7 @@ where
         config,
         max_retries,
         &mut cache,
+        &mut None,
     )
     .await
 }
@@ -1619,6 +1640,7 @@ async fn handle_message_with_cache<K, R>(
     config: &LaneConfig,
     max_retries: u32,
     cache: &mut LaneCache,
+    write_admission: &mut Option<crate::serving_gate::WritePermit>,
 ) -> Result<(
     CommitResult,
     SmallVec<[DispatchOp; 4]>,
@@ -1715,6 +1737,10 @@ where
                 SmallVec::new(),
                 SmallVec::new(),
             ));
+        }
+        if write_admission.is_none() {
+            *write_admission =
+                crate::serving_gate::admit(shard_owner, execution_home_bundle).await?;
         }
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
@@ -2788,7 +2814,12 @@ mod tests {
 
     #[async_trait]
     impl DispatchPublisher for MockPublisher {
-        async fn publish(&self, run_key: RunKey, ops: &[DispatchOp]) -> Result<()> {
+        async fn publish(
+            &self,
+            run_key: RunKey,
+            _execution_home: ShardId,
+            ops: &[DispatchOp],
+        ) -> Result<()> {
             let mut state = self.state.lock().await;
             state.publishes.push((run_key, ops.to_vec()));
             drop(state);
@@ -3135,6 +3166,7 @@ mod tests {
             &config,
             config.max_occ_retries,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -3150,6 +3182,7 @@ mod tests {
             &config,
             config.max_occ_retries,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -3203,6 +3236,7 @@ mod tests {
             &config,
             2,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -3243,6 +3277,7 @@ mod tests {
             &config,
             2,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -3269,6 +3304,7 @@ mod tests {
             &config,
             2,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -3334,6 +3370,7 @@ mod tests {
             &config,
             config.max_occ_retries,
             &mut cache,
+            &mut None,
         )
         .await
         .unwrap();
@@ -4313,10 +4350,7 @@ mod tests {
             other => panic!("expected successor Start request, got {other:?}"),
         }
 
-        let tracking_snapshot = tracking.snapshot();
-        assert_eq!(tracking_snapshot.len(), 1);
-        assert_eq!(tracking_snapshot[0].run_key, successor_run_key);
-        assert_eq!(tracking_snapshot[0].first_run_started_at, Some(chain_start));
+        assert!(tracking.snapshot().is_empty());
     }
 
     proptest! {

@@ -16,6 +16,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Imports can live outside this package's own proto directory.
     println!("cargo:rerun-if-changed={}", proto_root.display());
+    // Disabling generated file directives also disables this descriptor decode input.
+    println!("cargo:rerun-if-env-changed=BUFFA_ELEMENT_MEMORY_LIMIT");
 
     let protos = discover_protos(&conformance_dir)?;
     if !protos.is_empty() {

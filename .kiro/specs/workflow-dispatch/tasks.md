@@ -225,8 +225,8 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Tag: `// Feature: workflow-dispatch, Property 7: Sticky recovery and affinity independence`
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 12.2_
 
-- [ ] 9. Add complete single-owner execution-home reconciliation
-  - [ ] 9.1 Implement one-run repair transactions on both stores
+- [x] 9. Add complete single-owner execution-home reconciliation
+  - [x] 9.1 Implement one-run repair transactions on both stores
     - Implement `reconcile_workflow_dispatch_run` for single-owner acquisition.
       Carry execution-home context and the run key; read authoritative state in
       that same transaction, derive, and upsert/delete. Task 17 supplies the
@@ -238,7 +238,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       sequence, projection accumulator, or recovery flag. Fail on corruption,
       ownership loss, decode error, and exhausted retries rather than skipping.
     - _Requirements: 8.7, 8.8, 8.9, 8.10, 10.8_
-  - [ ] 9.2 Wire the two walks and execution-home serving gate
+  - [x] 9.2 Wire the two walks and execution-home serving gate
     - Keep the acquired home Sweeping. Page recovery candidates through NULL/true
       phases, repair them, and reconstruct timeouts; then sweep every home-index
       dispatch key, including sticky, absent-run, and recovery-excluded rows.
@@ -250,7 +250,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Abandon lost acquisitions and restart both walks from the head after failure;
       never persist a continuation or serve after partial repair.
     - _Requirements: 8.1, 8.2, 8.3, 8.7, 8.9, 8.11, 12.5_
-  - [ ] 9.3 Required property test: Property 8 — Complete bounded repair
+  - [x] 9.3 Required property test: Property 8 — Complete bounded repair
     - Implement at least 100 `proptest` cases per backend over missing, stale,
       and mismatched rows; NULL/false recovery flags consistent with their state;
       sticky tasks, closed runs, and absent runs. Interrupt after arbitrary batches.
@@ -260,7 +260,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Tag: `// Feature: workflow-dispatch, Property 8: Complete bounded repair`
     - _Requirements: 8.1, 8.2, 8.3, 8.7, 8.8, 8.9, 8.10, 8.11, 12.2, 12.5_
 
-- [ ] 10. Checkpoint: runtime discovery and acquisition are green
+- [x] 10. Checkpoint: runtime discovery and acquisition are green
   - Run affected-crate locked checks, all-target clippy, focused nextest suites,
     and doctests for broker, discovery, registration, sticky timers, and repair.
     Confirm every background task cancels and every new error has the design's
@@ -274,6 +274,14 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
   - [ ] 11.1 Remove workflow writes, grace demotion, and regular draining together
     - In `backlog.rs`, broker, publisher, and runtime wiring, remove only workflow
       backlog paths after the replacement discovery/recovery paths are connected.
+    - Before enabling repair by default, handle legacy reset successors whose hot
+      row and timers remain on the run-key shard after a stop before their first
+      commit. Preserve eventual execution-home recovery; skipping such a row alone
+      is insufficient. This placement issue blocks cutover until covered by a
+      stopped-upgrade regression on both stores (see the design).
+    - Align outer runtime admission and task-token epoch lookup with execution
+      home, then verify a public start and delivery when only that home is held
+      and its run-key hash selects another shard.
     - Preserve activity backlog, its shared loops, `activity_dispatch`, and
       `reconcile_due_activity_dispatches_once`. Add no mixed-release branch or
       durable workflow delivery checkpoint.
@@ -318,8 +326,8 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Tag: `// Feature: workflow-dispatch, Property 11: Routing, state, and delivery preservation`
     - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7_
 
-- [ ] 13. Encode the concrete hand-off refinement in model checks
-  - [ ] 13.1 Add bounded paging, retry, and repair refinement cases
+- [x] 13. Encode the concrete hand-off refinement in model checks
+  - [x] 13.1 Add bounded paging, retry, and repair refinement cases
     - Extend or add a companion to `40_dispatch_handoff.tla` with enough distinct
       positions for a multi-page blocked prefix, slice continuation, retained
       failure retry as a new incarnation, and interrupted two-walk acquisition.
@@ -327,7 +335,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       same-epoch serving gate to Reconcile. Keep weak fairness and explicit
       eventual fault cessation; add no notification fairness assumption.
     - _Requirements: 6.6, 12.4, 12.5, 12.6_
-  - [ ] 13.2 Add positive and negative configuration checks
+  - [x] 13.2 Add positive and negative configuration checks
     - Assert both row invariants for complete repair. Add negative controls for
       restarting at every slice, retained retry identity, and omitted stale-row
       deletion; preserve existing controls and their intended failure outcomes.
@@ -490,8 +498,10 @@ unrelated lease work in this feature.
   Tasks 5–7 are implemented behind a temporary internal construction choice,
   disabled by ordinary runtime constructors. Tests enable it explicitly; the
   cutover removes it. Task 8's deadline reconstruction and local acquisition
-  lifecycle checks are active with existing delivery. Task 9 still supplies the
-  complete reconciliation and writer serving gate.
+  lifecycle checks are active with existing delivery. Tasks 9–10 supply complete
+  single-owner reconciliation and writer admission behind the same private choice;
+  all five trackers are acquisition-scoped in both modes. Task 13's positive and
+  negative models pass on both checkers. Tasks 11–12 and 14–16 remain the cutover.
 - Read crate-local instructions before implementing kernel/storage/runtime work.
   Keep API shape and public behavior tied to the vendored protos and Temporal
   v1.31.0 sources cited in requirements/design. Existing request-result gaps are

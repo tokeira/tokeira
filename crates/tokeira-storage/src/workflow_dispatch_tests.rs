@@ -790,3 +790,191 @@ pub(crate) async fn routing_and_home_pages(backend: &impl Backend) {
         after = page.last().copied();
     }
 }
+
+/// Test-only corruption and observation around the shared repair algorithm.
+#[async_trait]
+pub(crate) trait RepairBackend: Backend {
+    async fn remove_row(&self, key: RunKey) -> Result<()>;
+    async fn legacy_recovery_flag(&self, key: RunKey) -> Result<()>;
+    async fn authority(&self, keys: &[RunKey]) -> Result<Vec<u8>>;
+    async fn finish_repair_case(&self, keys: &[RunKey]) -> Result<()>;
+}
+
+pub(crate) fn run_repair_cases(backend: &impl RepairBackend, runtime: &tokio::runtime::Runtime) {
+    let strategy = (
+        0usize..20,
+        1usize..5,
+        any::<bool>(),
+        any::<bool>(),
+        1u64..100,
+    );
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: 100,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    runner
+        .run(
+            &strategy,
+            |(interrupt, page_size, exact, legacy, generation)| {
+                runtime.block_on(async {
+                    // Feature: workflow-dispatch, Property 8: Complete bounded repair
+                    // Partial walks may disagree; a complete head restart converges without changing authority.
+                    let mut expected = Vec::new();
+                    for kind in 0..7 {
+                        let mut transition = fresh_transition(RunKey::new());
+                        transition.next_state.workflow_id.0 =
+                            format!("repair-{}", transition.next_state.run_key.0);
+                        transition
+                            .next_state
+                            .pending_workflow_task
+                            .as_mut()
+                            .unwrap()
+                            .logical_seq = LogicalTaskSeq(generation);
+                        if exact {
+                            transition.next_state.deployment =
+                                Some(DeploymentId("repair-deployment".into()));
+                            transition.next_state.build_id = Some(BuildId("repair-build".into()));
+                        }
+                        let stale = transition.next_state.clone();
+                        match kind {
+                            2 => {
+                                // A stale incarnation and routing coordinate.
+                                transition
+                                    .next_state
+                                    .pending_workflow_task
+                                    .as_mut()
+                                    .unwrap()
+                                    .logical_seq = LogicalTaskSeq(generation + 1);
+                                transition.next_state.task_queue =
+                                    TaskQueueName("repaired-queue".into());
+                            }
+                            3 => {
+                                transition.next_state.sticky = Some(StickyAffinity {
+                                    sticky_queue: TaskQueueName("repair-sticky".into()),
+                                    worker_identity: WorkerIdentity("repair-worker".into()),
+                                    schedule_to_start_timeout: Duration::seconds(5),
+                                });
+                                transition
+                                    .next_state
+                                    .pending_workflow_task
+                                    .as_mut()
+                                    .unwrap()
+                                    .schedule_to_start_deadline =
+                                    Some(transition.next_state.started_at + Duration::seconds(5));
+                            }
+                            4 => {
+                                transition.next_state.status = ExecutionStatus::Completed;
+                                transition.next_state.closed_at =
+                                    Some(transition.next_state.started_at);
+                                transition.next_state.pending_workflow_task = None;
+                            }
+                            5 => {
+                                transition
+                                    .next_state
+                                    .pending_workflow_task
+                                    .as_mut()
+                                    .unwrap()
+                                    .task_type = WorkflowTaskType::Speculative
+                            }
+                            _ => {}
+                        }
+                        let key = transition.next_state.run_key;
+                        if kind != 6 {
+                            let state = applied(commit(backend, transition).await.unwrap());
+                            if legacy {
+                                backend.legacy_recovery_flag(key).await.unwrap();
+                            }
+                            expected.push((key, reference(&state)));
+                        } else {
+                            expected.push((key, None));
+                        }
+                        if kind == 0 {
+                            backend.remove_row(key).await.unwrap();
+                        } else {
+                            backend.seed_stale_row(&stale).await.unwrap();
+                        }
+                    }
+                    let keys: Vec<_> = expected.iter().map(|(key, _)| *key).collect();
+                    let before = backend.authority(&keys).await.unwrap();
+                    for budget in [Some(interrupt), None] {
+                        let mut remaining = budget.unwrap_or(usize::MAX);
+                        let mut cursor = None;
+                        loop {
+                            let page = backend
+                                .repo()
+                                .list_recovery_candidates_for_shard(
+                                    ShardId(0),
+                                    cursor.as_ref(),
+                                    page_size,
+                                )
+                                .await
+                                .unwrap();
+                            for state in page.states {
+                                if remaining == 0 {
+                                    break;
+                                }
+                                repair_retry(backend, state.run_key).await.unwrap();
+                                remaining -= 1;
+                            }
+                            if remaining == 0 || page.next.is_none() {
+                                break;
+                            }
+                            cursor = page.next;
+                        }
+                        let mut cursor = None;
+                        while remaining > 0 {
+                            let page = backend
+                                .repo()
+                                .list_workflow_dispatch_for_home(
+                                    ShardId(0),
+                                    cursor,
+                                    NonZeroU32::new(page_size as u32).unwrap(),
+                                )
+                                .await
+                                .unwrap();
+                            if page.is_empty() {
+                                break;
+                            }
+                            cursor = page.last().copied();
+                            for key in page {
+                                if remaining == 0 {
+                                    break;
+                                }
+                                repair_retry(backend, key).await.unwrap();
+                                remaining -= 1;
+                            }
+                        }
+                        prop_assert_eq!(backend.authority(&keys).await.unwrap(), before.clone());
+                    }
+                    for (key, row) in &expected {
+                        prop_assert_eq!(backend.row(*key).await.unwrap(), row.clone());
+                    }
+                    // Repeating a repair is also a one-run transaction and remains read-only for authority.
+                    for key in &keys {
+                        repair_retry(backend, *key).await.unwrap();
+                    }
+                    prop_assert_eq!(backend.authority(&keys).await.unwrap(), before);
+                    backend.finish_repair_case(&keys).await.unwrap();
+                    Ok(())
+                })
+            },
+        )
+        .unwrap();
+}
+
+async fn repair_retry(backend: &impl Backend, key: RunKey) -> Result<()> {
+    for attempt in 0..10 {
+        match backend
+            .repo()
+            .reconcile_workflow_dispatch_run(ShardId(0), key)
+            .await
+        {
+            Err(error) if error.is::<crate::WorkflowDispatchRepairConflict>() && attempt < 9 => {
+                continue;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("last attempt returns")
+}

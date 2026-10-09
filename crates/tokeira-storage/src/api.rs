@@ -1112,6 +1112,22 @@ pub trait RunRepository: Send + Sync {
         limit: std::num::NonZeroU32,
     ) -> Result<Vec<RunKey>>;
 
+    /// Repair one derived row from an authoritative read in the same transaction.
+    ///
+    /// The caller must hold this execution home non-serving and exclude every
+    /// authoritative writer for the whole acquisition. This single-owner API
+    /// does not provide the deferred transaction-local competing-owner fence.
+    /// A home mismatch or corrupt state fails without changing authoritative data.
+    /// A serialization error requires retrying the entire call with fresh local
+    /// acquisition validation; no decoded state may be reused across attempts.
+    async fn reconcile_workflow_dispatch_run(
+        &self,
+        _home: ShardId,
+        _run_key: RunKey,
+    ) -> Result<()> {
+        anyhow::bail!("workflow dispatch repair is not implemented by this repository")
+    }
+
     /// Return workflow tasks that are scheduled but not
     /// yet started for the given queue, up to `limit`.
     async fn list_dispatchable_workflow_tasks(
@@ -2306,6 +2322,13 @@ pub struct ProjectionBatch {
 /// the fenced-lease model.
 #[async_trait]
 pub trait LeaseRepository: Send + Sync {
+    /// Duration granted by a successful acquire or renewal. `None` denotes a
+    /// non-expiring local lease, as in the memory backend. Runtime admission may
+    /// use the request start plus this duration as a conservative local deadline.
+    fn bundle_lease_duration(&self) -> Option<time::Duration> {
+        None
+    }
+
     /// Attempt to acquire ownership of `bundle`.
     ///
     /// Returns [`LeaseOutcome::Acquired`] on success,
@@ -2609,6 +2632,12 @@ where
             .await
     }
 
+    async fn reconcile_workflow_dispatch_run(&self, home: ShardId, run_key: RunKey) -> Result<()> {
+        self.as_ref()
+            .reconcile_workflow_dispatch_run(home, run_key)
+            .await
+    }
+
     async fn list_workflow_dispatch_page(
         &self,
         range: &WorkflowDiscoveryRange,
@@ -2781,6 +2810,10 @@ impl<T> LeaseRepository for std::sync::Arc<T>
 where
     T: LeaseRepository + ?Sized,
 {
+    fn bundle_lease_duration(&self) -> Option<time::Duration> {
+        self.as_ref().bundle_lease_duration()
+    }
+
     async fn try_acquire_bundle(
         &self,
         bundle: ShardId,

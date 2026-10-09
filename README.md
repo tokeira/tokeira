@@ -69,12 +69,11 @@ let handle = client
 let result: String = handle.get_result(WorkflowGetResultOptions::default()).await?;
 ```
 
-To use it in your own project: `cargo add tokeira-engine` alongside the
-Temporal SDK crates the example's
-[manifest](examples/hello-workflow/Cargo.toml) lists — including its
-`[patch.crates-io]` section, which pins the SDK to v0.7.0 plus one
-worker-shutdown fix that is merged upstream but not yet in a released SDK
-version. That section disappears once the next SDK release lands.
+To use the published engine in your own project: `cargo add tokeira-engine`
+alongside the Temporal SDK crates listed in the example's
+[manifest](examples/hello-workflow/Cargo.toml). Enable `vendored-protox` on
+`temporalio-client` (`cargo add temporalio-client --features vendored-protox`)
+so SDK code generation does not require a system `protoc`.
 
 ### The service, with Compose
 

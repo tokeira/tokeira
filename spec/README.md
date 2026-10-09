@@ -138,6 +138,51 @@ Every negative control must fail: a property that no broken variant violates pro
 
 The stale-rows configuration shows why the two row invariants are separate: a stale dispatch row only costs an offer that the start transition rejects, while a missing one can stop work for ever.
 
+### `tla/41_dispatch_repair.tla`
+
+This concrete companion adds three blocked ordering positions before a serviceable
+task, one- and two-row discovery slices, a retained failure retry, and interrupted
+acquisition across the NULL/true recovery phases and the complete home-row walk.
+Each repair changes at most one run. `abstractRow` holds the acquisition image
+while the home is non-serving: intermediate repairs are stuttering steps and
+`Activate` is the abstract `Reconcile` step. `NonServingStutters` also checks that
+an interrupted repair cannot expose its partial row image. The model uses weak fairness for
+protocol actions and a finite `MaxFaults` budget; it assumes no notification delivery.
+It does not model competing durable owners or replace the deferred lease fence.
+
+| Concrete action/property | Code and test anchor |
+|---|---|
+| `Slice`, `EventuallyResolved` | `discovery.rs`: continuation survives a page slice; `workflow_dispatch_live_query_plans` traverses equal-time deep pages |
+| `Start`, `Retry`, `AtMostOneStartPerIncarnation` | Kernel logical task sequence and start validation; storage atomic reference traces |
+| `Repair`, `NextWalk`, both row invariants | `recovery.rs::sweep_shard_inner` and `reconcile_workflow_dispatch_run`; `workflow_dispatch_generated_complete_repair` on both stores |
+| `Fault`, `Activate`, `EventuallyServing`, `NonServingStutters` | `serving_gate.rs`, acquisition cleanup and `runtime::repair_tests`; no partial acquisition serves |
+
+TLC 1.7.4 and tla-rs 0.21.2 agreed on 2026-10-08. Every positive configuration
+of both `40_dispatch_handoff` and `41_dispatch_repair` passed. Every negative
+configuration failed on its target. The existing stale-rows positive configuration
+still omits `RowsAreWanted`; its weaker result does not establish complete repair.
+
+| New configuration | Both checkers |
+|---|---|
+| `41_dispatch_repair.cfg` | Pass; 264 reachable states |
+| `41_dispatch_repair_pages.cfg` | Pass; 209 reachable states |
+| `negative/41_dispatch_repair_restart_slices.cfg` | `EventuallyResolved` fails |
+| `negative/41_dispatch_repair_retained_retry.cfg` | `AtMostOneStartPerIncarnation` fails |
+| `negative/41_dispatch_repair_skips_deletes.cfg` | `RowsAreWanted` fails |
+
+Run from `spec/tla`, with `TLC_JAR` pointing to the installed TLC jar. Substitute
+each module's positive and negative configuration for `CONFIG`:
+
+```sh
+java -cp "$TLC_JAR" tlc2.TLC -workers 2 -metadir /tmp/tlc-dispatch -config CONFIG MODULE.tla
+tla MODULE.tla --config CONFIG --max-states 20000000 --max-depth 10000
+```
+
+For TLC's liveness negatives, which report a generic temporal violation, the run
+also repeated each negative with only its target in `PROPERTIES`. All four target
+checks failed: bare limit, durable cursor and restart-every-slice on
+`EventuallyResolved`, and disabled sticky timeouts on `StickyConverts`.
+
 ## What this first spec does **not** model
 
 This is just as important as what it *does* model.

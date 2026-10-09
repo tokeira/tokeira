@@ -7,7 +7,10 @@
 //! `ShardOwner` struct that tracks which shards the current
 //! node owns, their epochs, and their lifecycle state.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use tokeira_types::{RunKey, ShardEpoch, ShardId};
 use tokio_util::sync::CancellationToken;
@@ -43,6 +46,7 @@ pub enum ShardState {
 #[derive(Debug)]
 pub struct OwnedShard {
     generation: u64,
+    deadline: Arc<Mutex<Option<tokio::time::Instant>>>,
     /// Epoch obtained when the lease was acquired.
     pub epoch: ShardEpoch,
     /// Current lifecycle state.
@@ -50,6 +54,18 @@ pub struct OwnedShard {
     /// Cancellation token for shard-scoped background tasks
     /// (lease renewer, shard-scoped scanners).
     pub cancel: CancellationToken,
+}
+
+impl OwnedShard {
+    fn active(&self) -> bool {
+        self.state == ShardState::Active
+            && !self.cancel.is_cancelled()
+            && self
+                .deadline
+                .lock()
+                .expect("acquisition deadline lock poisoned")
+                .is_none_or(|deadline| tokio::time::Instant::now() < deadline)
+    }
 }
 
 /// Tracks which shards the current runtime node owns.
@@ -62,6 +78,8 @@ pub struct ShardOwner {
     shards: HashMap<ShardId, OwnedShard>,
     shard_count: u32,
     next_generation: u64,
+    reconciliation: bool,
+    write_barriers: HashMap<ShardId, Arc<tokio::sync::RwLock<()>>>,
 }
 
 /// Identity of one local acquisition attempt, including repeated sweeps at the
@@ -72,9 +90,34 @@ pub(crate) struct ShardAcquisition {
     pub(crate) epoch: ShardEpoch,
     pub(crate) generation: u64,
     pub(crate) cancel: CancellationToken,
+    pub(crate) deadline: Arc<Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl ShardAcquisition {
+    pub(crate) fn valid(&self) -> bool {
+        !self.cancel.is_cancelled()
+            && self
+                .deadline
+                .lock()
+                .expect("acquisition deadline lock poisoned")
+                .is_none_or(|deadline| tokio::time::Instant::now() < deadline)
+    }
 }
 
 impl ShardOwner {
+    pub(crate) fn enable_reconciliation(&mut self) {
+        self.reconciliation = true;
+    }
+    pub(crate) fn reconciliation_enabled(&self) -> bool {
+        self.reconciliation
+    }
+    pub(crate) fn write_barrier(&self, home: ShardId) -> Arc<tokio::sync::RwLock<()>> {
+        self.write_barriers
+            .get(&home)
+            .expect("owned home has a write barrier")
+            .clone()
+    }
+
     /// Create a new owner with the given total shard count.
     ///
     /// No shards are owned initially.
@@ -84,6 +127,8 @@ impl ShardOwner {
             shards: HashMap::new(),
             shard_count,
             next_generation: 0,
+            reconciliation: false,
+            write_barriers: HashMap::new(),
         }
     }
 
@@ -99,6 +144,7 @@ impl ShardOwner {
     /// cancel shard-scoped background tasks when the shard
     /// is relinquished.
     pub fn record_acquired(&mut self, shard_id: ShardId, epoch: ShardEpoch) -> CancellationToken {
+        self.write_barriers.entry(shard_id).or_default();
         if let Some(previous) = self.shards.get(&shard_id) {
             previous.cancel.cancel();
         }
@@ -111,6 +157,7 @@ impl ShardOwner {
             shard_id,
             OwnedShard {
                 generation: self.next_generation,
+                deadline: Arc::new(Mutex::new(None)),
                 epoch,
                 state: ShardState::Sweeping,
                 cancel: cancel.clone(),
@@ -125,6 +172,7 @@ impl ShardOwner {
             epoch: owned.epoch,
             generation: owned.generation,
             cancel: owned.cancel.clone(),
+            deadline: owned.deadline.clone(),
         })
     }
 
@@ -136,12 +184,12 @@ impl ShardOwner {
 
     pub(crate) fn acquisition_active(&self, acquisition: &ShardAcquisition) -> bool {
         self.matches_acquisition(acquisition)
-            && !acquisition.cancel.is_cancelled()
+            && acquisition.valid()
             && self.owns(acquisition.shard_id) == Some(acquisition.epoch)
     }
 
     pub(crate) fn activate_acquisition(&mut self, acquisition: &ShardAcquisition) -> bool {
-        if !self.matches_acquisition(acquisition) || acquisition.cancel.is_cancelled() {
+        if !self.matches_acquisition(acquisition) || !acquisition.valid() {
             return false;
         }
         self.mark_active(acquisition.shard_id);
@@ -185,7 +233,7 @@ impl ShardOwner {
     /// or not owned at all.
     pub fn owns(&self, shard_id: ShardId) -> Option<ShardEpoch> {
         self.shards.get(&shard_id).and_then(|owned| {
-            if owned.state == ShardState::Active && !owned.cancel.is_cancelled() {
+            if owned.active() {
                 Some(owned.epoch)
             } else {
                 None
@@ -195,9 +243,7 @@ impl ShardOwner {
 
     /// Returns `true` only if the shard is in `Active` state.
     pub fn is_active(&self, shard_id: ShardId) -> bool {
-        self.shards
-            .get(&shard_id)
-            .is_some_and(|o| o.state == ShardState::Active && !o.cancel.is_cancelled())
+        self.shards.get(&shard_id).is_some_and(|o| o.active())
     }
 
     /// Returns the epoch for a shard regardless of state.
@@ -216,13 +262,9 @@ impl ShardOwner {
 
     /// Iterator over active shard IDs only.
     pub fn active_shards(&self) -> impl Iterator<Item = ShardId> + '_ {
-        self.shards.iter().filter_map(|(id, o)| {
-            if o.state == ShardState::Active && !o.cancel.is_cancelled() {
-                Some(*id)
-            } else {
-                None
-            }
-        })
+        self.shards
+            .iter()
+            .filter_map(|(id, o)| if o.active() { Some(*id) } else { None })
     }
 }
 

@@ -449,6 +449,22 @@ impl InMemoryStore {
             }
             apply_snapshot_extension(&mut state, trailing).map_err(SnapshotError::Extension)?;
         }
+        // Placement is derived from stable execution identity, including when
+        // restoring snapshots whose timer/activity index used run-hash placement.
+        state.run_shard_map = state
+            .runs
+            .values()
+            .map(|run| {
+                (
+                    run.run_key,
+                    tokeira_types::execution_home_bundle(
+                        run.namespace_id.0.as_bytes(),
+                        run.workflow_id.0.as_bytes(),
+                        Self::effective_shard_count(&state),
+                    ),
+                )
+            })
+            .collect();
         // Reconstruct after applying every extension; the frozen snapshot layout
         // contains all authoritative inputs and needs no redundant row payload.
         state.workflow_dispatch = state
@@ -1426,7 +1442,11 @@ impl RunRepository for InMemoryStore {
         });
 
         if transition.expected_seq == tokeira_types::TransitionSeq::ZERO {
-            let shard_id = shard_for_run_key(run_key, Self::effective_shard_count(&store));
+            let shard_id = tokeira_types::execution_home_bundle(
+                state.namespace_id.0.as_bytes(),
+                state.workflow_id.0.as_bytes(),
+                Self::effective_shard_count(&store),
+            );
             store.run_shard_map.insert(run_key, shard_id);
         }
 
@@ -1721,9 +1741,47 @@ impl RunRepository for InMemoryStore {
                 .insert((successor_run_key, timer.timer_id.clone()), timer.clone());
         }
 
-        let shard_id = shard_for_run_key(successor_run_key, Self::effective_shard_count(&store));
+        let shard_id = tokeira_types::execution_home_bundle(
+            successor_state.namespace_id.0.as_bytes(),
+            successor_state.workflow_id.0.as_bytes(),
+            Self::effective_shard_count(&store),
+        );
         store.run_shard_map.insert(successor_run_key, shard_id);
 
+        Ok(())
+    }
+
+    async fn reconcile_workflow_dispatch_run(&self, home: ShardId, run_key: RunKey) -> Result<()> {
+        let mut store = self.inner.lock().await;
+        // The same critical section protects the authoritative read and its
+        // derived replacement. Repair never replays a transition or folds the
+        // projection accumulator.
+        let row = if let Some(state) = store.runs.get(&run_key) {
+            let actual = tokeira_types::execution_home_bundle(
+                state.namespace_id.0.as_bytes(),
+                state.workflow_id.0.as_bytes(),
+                Self::effective_shard_count(&store),
+            );
+            anyhow::ensure!(
+                actual == home,
+                "workflow dispatch repair home mismatch for {run_key:?}"
+            );
+            derive_workflow_dispatch(state, home)
+        } else {
+            if let Some(row) = store.workflow_dispatch.get(&run_key) {
+                anyhow::ensure!(
+                    row.execution_home == home,
+                    "orphan dispatch repair home mismatch for {run_key:?}"
+                );
+            }
+            None
+        };
+        if let Some(row) = row {
+            row.validate()?;
+            store.workflow_dispatch.insert(run_key, row);
+        } else {
+            store.workflow_dispatch.remove(&run_key);
+        }
         Ok(())
     }
 
@@ -1990,7 +2048,11 @@ impl RunRepository for InMemoryStore {
                     .runs
                     .values()
                     .filter(|state| {
-                        store.run_shard_map.get(&state.run_key) == Some(&shard_id)
+                        tokeira_types::execution_home_bundle(
+                            state.namespace_id.0.as_bytes(),
+                            state.workflow_id.0.as_bytes(),
+                            Self::effective_shard_count(&store),
+                        ) == shard_id
                             && recovery_needed(state)
                             && after.is_none_or(|after| state.run_key > after)
                     })
@@ -2479,10 +2541,6 @@ fn workflow_dispatch_page_with_keys(
         exhausted: rows.len() < limit.get() as usize,
         candidates: rows,
     }
-}
-
-fn shard_for_run_key(run_key: RunKey, shard_count: u32) -> ShardId {
-    ShardId((run_key.0.as_u128() as u32) % shard_count.max(1))
 }
 
 #[cfg(test)]
@@ -3544,11 +3602,16 @@ mod tests {
                     if !needs_work {
                         transition.next_state.pending_workflow_task = None;
                     }
+                    let home = tokeira_types::execution_home_bundle(
+                        transition.next_state.namespace_id.0.as_bytes(),
+                        transition.next_state.workflow_id.0.as_bytes(),
+                        shard_count,
+                    );
                     store
                         .commit_transition(run_key, transition, ShardEpoch::ZERO)
                         .await
                         .unwrap();
-                    if needs_work && shard_for_run_key(run_key, shard_count) == ShardId(0) {
+                    if needs_work && home == ShardId(0) {
                         expected.push(run_key);
                     }
                 }
@@ -5959,15 +6022,13 @@ mod tests {
 
                 for idx in 0..run_count {
                     let run_key = RunKey::new();
-                    let shard_id = ShardId(
-                        (run_key.0.as_u128() as u32) % shard_count,
-                    );
-                    run_shards.push((run_key, shard_id));
-
                     let mut t = start_transition(run_key);
                     t.next_state.namespace_id = ns;
                     t.next_state.workflow_id =
                         WorkflowId(format!("wf-{idx}"));
+                    let shard_id = tokeira_types::execution_home_bundle(
+                        t.next_state.namespace_id.0.as_bytes(), t.next_state.workflow_id.0.as_bytes(), shard_count);
+                    run_shards.push((run_key, shard_id));
                     t.next_state.workflow_execution_timeout =
                         Some(Duration::minutes(5));
                     t.next_state.workflow_run_timeout =

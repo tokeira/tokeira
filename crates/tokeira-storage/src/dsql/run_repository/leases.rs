@@ -18,6 +18,10 @@ use crate::dsql::convert;
 
 #[async_trait]
 impl LeaseRepository for DsqlRunRepository {
+    fn bundle_lease_duration(&self) -> Option<time::Duration> {
+        Some(self.lease_duration)
+    }
+
     #[instrument(name = "dsql.try_acquire_bundle", skip(self), fields(shard_id = bundle.0, owner = %owner))]
     async fn try_acquire_bundle(
         &self,

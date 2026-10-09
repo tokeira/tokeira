@@ -95,6 +95,7 @@ Show the four defects first, on both stores, with tests that fail on the current
   - _Requirements: 2.2, 2.3, 2.4, 2.6, 2.11_
 
 - [x] 10. Checkpoint: the exploration tests pass on both stores, each negative control fails its test, the live suite passes on an ephemeral cluster, and the full bar of root `AGENTS.md` §10.4 passes
+  - DONE at `6129ecf9`. The exploration tests and Properties 1 to 10 pass on the in-memory store, and the live suite passes on an ephemeral cluster (task 8). Each of the 21 negative controls on the in-memory store and the runtime failed its tests, as each of the six on DSQL did. The bar passed (3,792 tests passed, 2 skipped).
 
 ## Notes
 

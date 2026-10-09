@@ -170,10 +170,12 @@ async fn delete_first(store: &InMemoryStore, state: &WorkflowState) {
     assert!(matches!(result, DeleteRunResult::Deleted { .. }));
 }
 
-fn principal(index: usize) -> EventPrincipal {
+/// A principal whose name is `len` bytes, so that a batch's principals can
+/// reach the batch budget before its events do.
+fn principal(len: usize) -> EventPrincipal {
     EventPrincipal {
         principal_type: "user".into(),
-        name: format!("principal-{index}-{}", "x".repeat(index % 64)),
+        name: "x".repeat(len),
     }
 }
 
@@ -271,16 +273,23 @@ proptest! {
             );
             let result = match abandon_after {
                 Some(yields) => {
-                    // A purge that switches the record while the
-                    // materialization runs: its later transactions are
-                    // stragglers, and none of them may commit.
-                    let (result, abandoned) = tokio::join!(materialize, async {
+                    // A purge that runs beside the materialization switches
+                    // its record, so the materialization's later transactions
+                    // are stragglers. None of them may write: a row written
+                    // after the purge had passed its table would outlive it.
+                    let (result, purged) = tokio::join!(materialize, async {
                         for _ in 0..yields {
                             tokio::task::yield_now().await;
                         }
-                        store.abandon_materialization(successor).await
+                        store.purge_run(successor).await
                     });
-                    abandoned.unwrap();
+                    let recorded = store.inner.lock().await.bulk_writes.contains_key(&successor);
+                    if purged.is_ok() && !recorded && result.is_err() {
+                        prop_assert_eq!(
+                            store.owned_rows(successor).await.unwrap(),
+                            OwnedRows::default()
+                        );
+                    }
                     result
                 }
                 None => materialize.await,
@@ -455,8 +464,8 @@ proptest! {
     // event boundaries within the batch budget
     #[test]
     fn property_reset_batches_are_cut_at_event_boundaries_within_the_budget(
-        sizes in prop::collection::vec(0usize..400_000, 0..40),
-        principals in prop::collection::vec(0usize..4_000, 0..40),
+        sizes in prop::collection::vec(0usize..150_000, 0..40),
+        principals in prop::collection::vec(0usize..200_000, 0..40),
     ) {
         let events = sizes
             .iter()
@@ -589,6 +598,48 @@ async fn the_first_transaction_changes_the_pointer_state_and_record() {
             ..before
         }
     );
+}
+
+// A purge that finishes while a materialization is still copying leaves
+// nothing behind: every later copy transaction reads the switch and writes
+// nothing (Property 6).
+#[tokio::test]
+async fn a_straggler_copy_writes_nothing_once_a_purge_has_run() {
+    let store = InMemoryStore::default();
+    // Twenty events of about 600 KB, one to a batch, copied in four pages.
+    let chunks = (0..20).map(|index| vec![signal(index, 600_000)]).collect();
+    let (base, fork) = commit_base(&store, chunks).await;
+    let successor_run_id = RunId::new();
+    let successor = RunKey::derive(base.namespace_id, &base.workflow_id, successor_run_id);
+    let (result, purged) = tokio::join!(
+        store.materialize_reset_successor(base.run_key, fork, successor_run_id, Some(base.run_key)),
+        async {
+            // The record and the first page commit first.
+            tokio::task::yield_now().await;
+            store.purge_run(successor).await
+        }
+    );
+    purged.unwrap();
+    assert!(
+        result.is_err(),
+        "the purge's switch stops the materialization"
+    );
+    assert_eq!(
+        store.owned_rows(successor).await.unwrap(),
+        OwnedRows::default()
+    );
+    assert!(
+        !store
+            .inner
+            .lock()
+            .await
+            .bulk_writes
+            .contains_key(&successor)
+    );
+    assert!(matches!(
+        store.load_run(successor).await.unwrap(),
+        LoadedRun::Absent
+    ));
 }
 
 #[tokio::test]

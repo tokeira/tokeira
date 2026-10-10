@@ -4499,6 +4499,27 @@ mod tests {
 
     // ---- The start's read of the scheduled event (`activity-inputs-from-history`) ----
 
+    /// A runtime whose activity scanner doesn't re-offer dispatch rows while a
+    /// test runs, so a task that a start didn't return to its queue stays gone.
+    fn quiet_runtime(repo: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
+        TokeiraRuntime::new_with_nexus(
+            repo,
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+            crate::ActivityTimeoutScannerConfig {
+                scan_interval: tokio::time::Duration::from_secs(3600),
+                ..crate::ActivityTimeoutScannerConfig::default()
+            },
+            crate::NexusTimeoutScannerConfig::default(),
+            crate::NexusEndpointRegistry::default(),
+            Arc::new(crate::NoopNexusHttpClient),
+            crate::NexusCompletionDeps::default(),
+        )
+    }
+
     fn inputs_runtime(repo: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         TokeiraRuntime::new(
             repo,
@@ -4653,7 +4674,7 @@ mod tests {
         ) {
             tokio::runtime::Runtime::new().unwrap().block_on(async move {
                 let repo = Arc::new(InMemoryStore::default());
-                let runtime = inputs_runtime(repo.clone());
+                let runtime = quiet_runtime(repo.clone());
                 let (state, queue, _task) = if missing {
                     seed_scheduled_activity_lacking_its_event(&runtime, &repo).await
                 } else {
@@ -4664,13 +4685,14 @@ mod tests {
                 }
                 let before = repo.load_run(state.run_key).await.unwrap();
                 let rows = repo.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
-                // A poll finds the task each time, so each failed start put it back.
+                // A poll finds the task each time, so each failed start put it back:
+                // nothing else re-offers it while the test runs.
                 for _ in 0..failures {
                     let error = runtime
                         .poll_activity_task(
                             queue.clone(),
                             WorkerIdentity("poller".into()),
-                            tokio::time::Duration::from_secs(5),
+                            tokio::time::Duration::from_secs(1),
                         )
                         .await
                         .expect_err("the start answers the failed read");
@@ -4695,7 +4717,7 @@ mod tests {
                         .poll_activity_task(
                             queue.clone(),
                             WorkerIdentity("poller".into()),
-                            tokio::time::Duration::from_secs(5),
+                            tokio::time::Duration::from_secs(1),
                         )
                         .await
                         .unwrap()

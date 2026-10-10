@@ -127,7 +127,7 @@ async fn token_zero_empty_ledger_state_converges_through_the_embedded_target() -
 
 #[tokio::test]
 #[ignore = "migrates an explicitly acknowledged disposable V068 DSQL database; set TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_DATABASE_URL and TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_ACK"]
-async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
+async fn v68_upgrade_installs_chasm_tables_and_reaches_the_target() -> Result<()> {
     let database_url = std::env::var("TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_DATABASE_URL").context(
         "TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_DATABASE_URL must name a disposable V068 database",
     )?;
@@ -145,9 +145,14 @@ async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
     let mut connection = PgConnection::connect(&database_url).await?;
     let runner = MigrationRunner::embedded();
     let contract = MigrationRunner::compatibility_contract();
-    assert_eq!(contract.target_version, 76);
+    // The fixture starts at V068; every later embedded migration applies on top.
+    ensure!(
+        contract.target_version > 68,
+        "the embedded target must lie beyond the V068 fixture"
+    );
+    let target = contract.target_version;
     // Inspect before any mutation: this fixture must exercise the released V068
-    // boundary, not silently pass against a database already upgraded to V076.
+    // boundary, not silently pass against a database already at the target.
     assert_eq!(
         runner
             .assess_connection(
@@ -158,13 +163,19 @@ async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
             .await?,
         SchemaDecision::MigrationRequired {
             current: 68,
-            target: 73
+            target
         },
     );
     let decision = runner
         .assess_connection(&mut connection, &contract, SchemaMigrationPolicy::Automatic)
         .await?;
-    assert_eq!(decision, SchemaDecision::Migrate { from: 68, to: 73 });
+    assert_eq!(
+        decision,
+        SchemaDecision::Migrate {
+            from: 68,
+            to: target
+        }
+    );
     runner
         .bootstrap_migration_coordination(&mut connection, &decision)
         .await?;
@@ -187,7 +198,7 @@ async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
         .apply_decision(&mut connection, &decision, &leases, &mut guard, &gate)
         .await;
     let release = leases.release(&mut connection, &guard, &gate).await;
-    assert_eq!(application?.applied, 5);
+    assert_eq!(application?.applied, usize::try_from(target - 68)?);
     release?;
     verify_target_boundary(&mut connection, &runner.dry_run()?).await?;
     verify_chasm_startup_tables(&mut connection).await?;
@@ -200,7 +211,7 @@ async fn v68_upgrade_installs_chasm_tables_and_accepts_v71() -> Result<()> {
             )
             .await?,
         SchemaDecision::Compatible {
-            current: 73,
+            current: target,
             legacy_backfill: false
         },
     );

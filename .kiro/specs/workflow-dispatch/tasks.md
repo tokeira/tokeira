@@ -8,9 +8,9 @@ Completed checks and remaining verification are recorded in
 
 The external `lease-fence` prerequisite means the passing transaction-local
 ownership protocol described in the design and
-[30_bundle_lease.tla](../../../spec/tla/30_bundle_lease.tla). It must be implemented
-and verified separately before competing-owner acquisition repair is enabled.
-Tasks 17–18 consume that protocol and do not redesign lease acquisition/renewal.
+[30_bundle_lease.tla](../../../spec/tla/30_bundle_lease.tla). That protocol has landed;
+its integration into acquisition repair and competing-owner verification remain
+in Tasks 17–18. Those tasks do not redesign lease acquisition/renewal.
 Single-owner reconciliation and backlog retirement do not depend on those tasks.
 
 ## Tasks
@@ -229,8 +229,8 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
   - [x] 9.1 Implement one-run repair transactions on both stores
     - Implement `reconcile_workflow_dispatch_run` for single-owner acquisition.
       Carry execution-home context and the run key; read authoritative state in
-      that same transaction, derive, and upsert/delete. Task 17 supplies the
-      transaction-local competing-owner fence when its prerequisite lands.
+      that same transaction, derive, and upsert/delete. Task 17 integrates the
+      landed transaction-local competing-owner fence into repair.
     - Validate home agreement and row encoding; account for all transaction writes
       within aggregate limits. Read pages are not write batches. Retry complete
       transactions after OCC conflict with fresh state and acquisition validation.
@@ -265,13 +265,13 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     and doctests for broker, discovery, registration, sticky timers, and repair.
     Confirm every background task cancels and every new error has the design's
     existing admission/poll behavior and actionable diagnostics.
-  - Leave competing-owner integration and its verification in Tasks 17–18 until
-    the external lease prerequisite is satisfied. Single-owner completion may
-    proceed; do not report its results as competing-owner verification.
+  - Leave competing-owner integration and its verification in Tasks 17–18.
+    Single-owner completion may proceed; the landed lease prerequisite does not
+    make these results competing-owner verification.
   - _Requirements: 4.1, 5.4, 6.5, 7.3, 8.1, 8.9, 10.8, 12.9_
 
-- [ ] 11. Retire workflow backlog use and implement bounded legacy disposal
-  - [ ] 11.1 Remove workflow writes, grace demotion, and regular draining together
+- [x] 11. Retire workflow backlog use and implement bounded legacy disposal
+  - [x] 11.1 Remove workflow writes, grace demotion, and regular draining together
     - In `backlog.rs`, broker, publisher, and runtime wiring, remove only workflow
       backlog paths after the replacement discovery/recovery paths are connected.
     - Before enabling repair by default, handle legacy reset successors whose hot
@@ -296,7 +296,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       `reconcile_due_activity_dispatches_once`. Add no mixed-release branch or
       durable workflow delivery checkpoint.
     - _Requirements: 9.1, 9.2, 9.3, 9.5, 9.6, 10.7_
-  - [ ] 11.2 Implement the reconstruction-coverage cleanup predicate
+  - [x] 11.2 Implement the reconstruction-coverage cleanup predicate
     - Enumerate legacy workflow backlog keys with pass-local paging. In each delete
       transaction, check the design's state/dispatch equality predicate, including
       absence after stale-row repair; defer uncovered entries and page past them.
@@ -306,7 +306,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Put the exact upgrade line in the implementation's release/upgrade note:
       `Upgrade with every node stopped.`
     - _Requirements: 9.3, 9.4, 9.5, 9.7, 12.8_
-  - [ ] 11.3 Required property test: Property 10 — Workflow-only backlog retirement
+  - [x] 11.3 Required property test: Property 10 — Workflow-only backlog retirement
     - Implement at least 100 `proptest` cases with old workflow and activity
       entries, uncovered/covered/absent runs, cleanup interruption, and concurrent
       new-release commits. Assert idempotent bounded disposal and unchanged
@@ -316,8 +316,8 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     - Tag: `// Feature: workflow-dispatch, Property 10: Workflow-only backlog retirement`
     - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 10.7_
 
-- [ ] 12. Preserve routing, scheduling policy, statistics, and state contracts
-  - [ ] 12.1 Update workflow accounting and discovery diagnostics
+- [x] 12. Preserve routing, scheduling policy, statistics, and state contracts
+  - [x] 12.1 Update workflow accounting and discovery diagnostics
     - Derive workflow durable-backlog statistics from dispatch intent without
       double counting retained copies. Preserve activity/query sources and the
       existing priority/fairness delivery policy.
@@ -325,7 +325,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       skips, admissions, slice yields, capacity blocks, pass duration, repairs,
       and ownership loss. Do not add queue/run/worker/deployment metric labels.
     - _Requirements: 4.1, 4.6, 10.5, 11.4_
-  - [ ] 12.2 Required property test: Property 11 — Routing, state, and delivery preservation
+  - [x] 12.2 Required property test: Property 11 — Routing, state, and delivery preservation
     - Implement at least 100 `proptest` cases across storage and runtime tests
       over routing configurations, version policies, feature modes, priorities,
       fairness metadata, and delivery modes. Check compatible resolution without
@@ -354,8 +354,8 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       documentation; record actual model commands/results at the final checkpoint.
     - _Requirements: 12.3, 12.4, 12.5, 12.6, 12.9_
 
-- [ ] 14. Add end-to-end loss and progress regressions
-  - [ ] 14.1 Required property test: Property 12 — Next-pass recovery and eventual resolution
+- [x] 14. Add end-to-end loss and progress regressions
+  - [x] 14.1 Required property test: Property 12 — Next-pass recovery and eventual resolution
     - Implement at least 100 `proptest` cases over end-to-end runtime traces with
       finite faults and a fair completion phase. Generate healthy serving homes,
       compatible demand, sufficient capacity, and competing finite prefixes.
@@ -366,7 +366,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       not turn the scheduling period into an unsupported wall-clock deadline.
     - Tag: `// Feature: workflow-dispatch, Property 12: Next-pass recovery and eventual resolution`
     - _Requirements: 11.1, 11.2, 11.3, 11.4, 12.4, 12.6_
-  - [ ] 14.2 Add fixed cross-component regressions for failure boundaries
+  - [x] 14.2 Add fixed cross-component regressions for failure boundaries
     - Cover all publications lost then fresh polling after broker restart;
       committed start with lost reply then start-to-close recovery; overlap of
       queue homes; overdue sticky acquisition after affinity reset; and repeated
@@ -375,17 +375,20 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       legacy workflow backlog while activity recovery remains operational.
     - _Requirements: 5.3, 5.5, 6.3, 6.4, 7.4, 7.5, 8.7, 9.3, 9.6, 12.2_
 
-- [ ] 15. Add and execute reproducible live DSQL verification
-  - [ ] 15.1 Implement real-DSQL query-plan and transaction integration tests
+- [x] 15. Add and execute reproducible live DSQL verification
+  - [x] 15.1 Implement real-DSQL query-plan and transaction integration tests
     - Use the existing DSQL test connection path and schema runner. Exercise first
       and continuation pages, Exact/Live plans, partial index selection, digest
       widths at valid name limits, deployment/build selection, and ASYNC readiness.
     - Add multi-statement rollback and aggregate row/byte-limit boundary cases for
-      commit, reset, repair, and legacy disposal; verify whole-transaction abort.
+      commit, reset, repair, and legacy disposal. Run independent successful
+      boundary/control cases and over-limit rejections; verify rejected
+      multi-statement transactions leave no partial writes. Reset budgets apply
+      to its bounded pages, not one aggregate transaction.
     - Include generated single-owner storage suites for Properties 1, 3, 8, 10,
       and the storage portions of Property 11, at least 100 cases per property.
     - _Requirements: 1.2, 1.3, 8.8, 9.4, 10.2, 10.4, 12.1, 12.8_
-  - [ ] 15.2 Checkpoint: run the DSQL suites and preserve accurate evidence
+  - [x] 15.2 Checkpoint: run the DSQL suites and preserve accurate evidence
     - Run only on a newly created ephemeral real DSQL cluster under the authorized
       profile and region. Ensure cleanup runs on success or failure and touches
       only that cluster; keep endpoints/identifiers/credentials out of artifacts.
@@ -396,7 +399,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       task incomplete; a local simulation or PostgreSQL result cannot complete it.
     - _Requirements: 10.2, 10.8, 12.1, 12.8, 12.9_
 
-- [ ] 16. Single-owner implementation checkpoint
+- [x] 16. Single-owner implementation checkpoint
   - Verify every in-scope property below has its required executable test, every
     in-scope acceptance criterion has implementation or verification coverage, and all positive/negative
     model checks have their expected outcomes. Add module/public-item and inline
@@ -414,7 +417,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
   - _Requirements: 10.3, 10.4, 10.5, 10.6, 12.4, 12.5, 12.6, 12.7, 12.8, 12.9_
 
 - [ ] 17. Consume the lease fence and verify competing-owner repair
-  - Deferred: requires the separately implemented and verified transaction-local lease fence.
+  - Deferred: the lease fence has landed; its acquisition-repair integration and competing-owner verification remain separate.
   - [ ] 17.1 Protect every repair and final activation against ownership loss
     - Consume the landed home/owner/epoch fence inside every repair transaction.
       Preserve takeover/release conflict ordering, compatible renewal, and local
@@ -434,7 +437,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
   - Deferred: requires Task 17's transaction-local fence and concurrency tests.
   - Run deterministic renewal/takeover/repair and final-activation races on an
     owned ephemeral real DSQL cluster, including at least 100 Property 9 cases.
-    Record actual outcomes and lifecycle times under Task 15's evidence rules.
+    Record actual outcomes under Task 15's evidence rules; keep lifecycle times private.
   - _Requirements: 8.4, 8.5, 8.6, 10.8, 12.5, 12.8, 12.9_
 
 ## Task Dependency Graph
@@ -505,13 +508,13 @@ unrelated lease work in this feature.
   Enable bounded, expiring offers and retire workflow backlog paths only when
   dispatch reconstruction and the serving gate are wired and verified together.
   Upgrade with every node stopped.
-  Tasks 5–7 are implemented behind a temporary internal construction choice,
-  disabled by ordinary runtime constructors. Tests enable it explicitly; the
-  cutover removes it. Task 8's deadline reconstruction and local acquisition
-  lifecycle checks are active with existing delivery. Tasks 9–10 supply complete
-  single-owner reconciliation and writer admission behind the same private choice;
-  all five trackers are acquisition-scoped in both modes. Task 13's positive and
-  negative models pass on both checkers. Tasks 11–12 and 14–16 remain the cutover.
+  Ordinary constructors now use discovery, bounded offers and complete
+  single-owner reconstruction before activation. All five recovery trackers are
+  scoped to their acquisition. Workflow backlog delivery is retired while
+  activity recovery and backlog delivery remain operational. Task 13's positive
+  and negative models pass on both checkers. The implementation evidence records
+  the cutover's workspace and live verification; competing-owner repair remains
+  deferred to Tasks 17–18.
 - Read crate-local instructions before implementing kernel/storage/runtime work.
   Keep API shape and public behavior tied to the vendored protos and Temporal
   v1.31.0 sources cited in requirements/design. Existing request-result gaps are

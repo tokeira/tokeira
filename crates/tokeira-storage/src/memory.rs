@@ -1803,13 +1803,13 @@ impl RunRepository for InMemoryStore {
         // tombstone, the pointer when it names the run, the run's state and
         // dispatch row, and the record that the purge finishes from.
         let mut model = store.begin_bulk_transaction()?;
-        model.write(&[crate::codec::encode_projection_context(&tombstone.context)?.len()])?;
+        model.write(&[crate::codec::encode_projection_context(&tombstone.context)?.len()]);
         model.delete(
             usize::from(names_run)
                 + 1
                 + usize::from(store.workflow_dispatch.contains_key(&run_key)),
-        )?;
-        model.write(&[])?;
+        );
+        model.write(&[]);
         store.commit_bulk_transaction(&model);
 
         // The tombstone, the run's removal and its purge record share this lock
@@ -1984,7 +1984,7 @@ impl RunRepository for InMemoryStore {
                 "successor run {successor_run_key:?} already has a bulk-write record"
             );
             let mut model = store.begin_bulk_transaction()?;
-            model.write(&[])?;
+            model.write(&[]);
             store.commit_bulk_transaction(&model);
             store.bulk_writes.insert(
                 successor_run_key,
@@ -2013,7 +2013,7 @@ impl RunRepository for InMemoryStore {
             store.ensure_materializing(successor_run_key)?;
             let mut model = store.begin_bulk_transaction()?;
             for (cost, principals) in &costs[page.clone()] {
-                model.write(&[cost.bytes, *principals])?;
+                model.write(&[cost.bytes, *principals]);
             }
             store.commit_bulk_transaction(&model);
             for index in page {
@@ -2072,12 +2072,12 @@ impl RunRepository for InMemoryStore {
             current
         );
         let mut model = store.begin_bulk_transaction()?;
-        model.write(&[crate::codec::encode_workflow_state(&successor_state)?.len()])?;
+        model.write(&[crate::codec::encode_workflow_state(&successor_state)?.len()]);
         if dispatch.is_some() {
-            model.write(&[])?;
+            model.write(&[]);
         }
-        model.write(&[])?;
-        model.delete(1)?;
+        model.write(&[]);
+        model.delete(1);
         store.commit_bulk_transaction(&model);
         if let Some(row) = dispatch {
             store.workflow_dispatch.insert(successor_run_key, row);
@@ -2153,7 +2153,7 @@ impl RunRepository for InMemoryStore {
             return Ok(());
         }
         let mut model = store.begin_bulk_transaction()?;
-        model.write(&[])?;
+        model.write(&[]);
         store.commit_bulk_transaction(&model);
         if let Some(record) = store.bulk_writes.get_mut(&run_key) {
             record.phase = BulkWritePhase::Purging;
@@ -2185,7 +2185,7 @@ impl RunRepository for InMemoryStore {
                 .collect::<Vec<_>>();
             if !dedupe.is_empty() {
                 let mut model = store.begin_bulk_transaction()?;
-                model.delete(dedupe.len())?;
+                model.delete(dedupe.len());
                 store.commit_bulk_transaction(&model);
                 for key in dedupe {
                     store.request_dedupe.remove(&key);
@@ -2201,7 +2201,7 @@ impl RunRepository for InMemoryStore {
                 .collect::<Vec<_>>();
             if !timers.is_empty() {
                 let mut model = store.begin_bulk_transaction()?;
-                model.delete(timers.len())?;
+                model.delete(timers.len());
                 store.commit_bulk_transaction(&model);
                 for key in timers {
                     store.timer_bucket.remove(&key);
@@ -2217,7 +2217,7 @@ impl RunRepository for InMemoryStore {
                 .collect::<Vec<_>>();
             if !dispatch.is_empty() {
                 let mut model = store.begin_bulk_transaction()?;
-                model.delete(dispatch.len())?;
+                model.delete(dispatch.len());
                 store.commit_bulk_transaction(&model);
                 for key in dispatch {
                     store.activity_dispatch.remove(&key);
@@ -2232,7 +2232,7 @@ impl RunRepository for InMemoryStore {
                 .count();
             if backlog > 0 {
                 let mut model = store.begin_bulk_transaction()?;
-                model.delete(backlog)?;
+                model.delete(backlog);
                 store.commit_bulk_transaction(&model);
                 let mut left = backlog;
                 store.dispatch_backlog.retain(|entry| {
@@ -2249,7 +2249,7 @@ impl RunRepository for InMemoryStore {
             let last = rows < budget;
             let page = if last { rows } else { budget };
             let mut model = store.begin_bulk_transaction()?;
-            model.delete(page + usize::from(last))?;
+            model.delete(page + usize::from(last));
             store.commit_bulk_transaction(&model);
             store.purge_history_batches(run_key, page);
             if last {
@@ -2431,11 +2431,11 @@ impl RunRepository for InMemoryStore {
             // Let other operations run between transactions, as they can on DSQL.
             tokio::task::yield_now().await;
             let mut store = self.inner.lock().await;
-            let declared = store.begin_bulk_transaction().and_then(|mut model| {
+            let declared = store.begin_bulk_transaction().map(|mut model| {
                 for cost in &costs[page.clone()] {
-                    model.write(&[cost.bytes])?;
+                    model.write(&[cost.bytes]);
                 }
-                Ok(model)
+                model
             });
             let model = declared.map_err(|source| BacklogPersistError {
                 persisted: page.start,

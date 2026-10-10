@@ -324,14 +324,28 @@ async fn placement_hot_pages_stop_at_the_byte_budget_before_the_key_budget() {
     assert!(cost.bytes <= crate::write_budget::MAX_BYTES_PER_TRANSACTION);
 }
 
+/// The execution home of `key`'s run, from its identity.
+fn identity_home(store: &StoreState, key: RunKey) -> ShardId {
+    let state = &store.runs[&key];
+    tokeira_types::execution_home_bundle(
+        state.namespace_id.0.as_bytes(),
+        state.workflow_id.0.as_bytes(),
+        8,
+    )
+}
+
+/// The in-memory store applies none of DSQL's limits: a timer too large for any
+/// page, with its cursor, moves in a page of its own instead of stopping the
+/// placement pass.
 #[tokio::test]
-async fn oversized_timer_and_marker_fail_without_committing_empty_progress() {
+async fn an_oversized_timer_moves_in_a_page_of_its_own() {
     let store = InMemoryStore::with_shard_count(8);
     let key = seed(&store, 1, false, true).await;
+    let timer_id = "x".repeat(1_500_000);
     {
         let mut inner = store.inner.lock().await;
         let (position, mut timer) = inner.timer_bucket.pop_first().unwrap();
-        timer.timer_id = "x".repeat(1_500_000);
+        timer.timer_id = timer_id.clone();
         inner.timer_bucket.insert(
             TimerPosition {
                 timer_id: timer.timer_id.clone(),
@@ -344,15 +358,59 @@ async fn oversized_timer_and_marker_fail_without_committing_empty_progress() {
             ..PlacementProgress::default()
         });
     }
-    let before = store.snapshot().await.unwrap();
-    let error = store
-        .prepare_placement_page()
+    let PlacementPage::Committed(progress) = store.prepare_placement_page().await.unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(progress.timers_moved, 1);
+    let inner = store.inner.lock().await;
+    let positions: Vec<_> = inner
+        .timer_bucket
+        .keys()
+        .filter(|position| position.run_key == key)
+        .collect();
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].shard, shard_uuid(identity_home(&inner, key)));
+    assert_eq!(positions[0].timer_id, timer_id);
+    let cost = inner.modeled_transactions.last().unwrap();
+    assert!(cost.bytes > crate::write_budget::MAX_BYTES_PER_TRANSACTION);
+}
+
+/// The in-memory store applies none of DSQL's limits: a hot row too large for
+/// any page moves in a page of its own, after the page before it ends.
+#[tokio::test]
+async fn an_oversized_hot_row_moves_in_a_page_of_its_own() {
+    let store = InMemoryStore::with_shard_count(8);
+    let first = seed(&store, 1, true, false).await;
+    let oversized = seed(&store, 2, true, false).await;
+    store
+        .inner
+        .lock()
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains(&format!("run={key:?}")));
-    assert!(error.contains("stored_shard") && error.contains("computed_home"));
-    assert!(error.contains("timer and marker exceed relocation budget"));
-    assert_eq!(store.snapshot().await.unwrap(), before);
-    assert!(!store.placement_ready());
+        .runs
+        .get_mut(&oversized)
+        .unwrap()
+        .memo
+        .0
+        .insert(
+            "large".into(),
+            tokeira_types::Payload::new(vec![1; 5 * 1024 * 1024]),
+        );
+    let PlacementPage::Committed(progress) = store.prepare_placement_page().await.unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(progress.hot_moved, 1);
+    let PlacementPage::Committed(progress) = store.prepare_placement_page().await.unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(progress.hot_moved, 2);
+    let inner = store.inner.lock().await;
+    for key in [first, oversized] {
+        assert_eq!(
+            inner.run_shard_map.get(&key).copied(),
+            Some(identity_home(&inner, key))
+        );
+    }
+    let cost = inner.modeled_transactions.last().unwrap();
+    assert_eq!(cost.rows, 2);
+    assert!(cost.bytes > crate::write_budget::MAX_BYTES_PER_TRANSACTION);
 }

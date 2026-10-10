@@ -100,6 +100,22 @@ Safety never depends on the owner stopping; failover does.
 
 The first four negative controls are today's code, so the model also shows what has to change: the in-transaction read and the controller-mode check are plain reads, `shard_lease` is keyed on `shard_id` alone, and renewal reads `FOR UPDATE`.
 
+The conflict rules the model takes from AWS's documentation are also checked on a real cluster, through Tokeira's own SQLx client, by `crates/tokeira-storage/tests/dsql_lease_fence.rs`.
+Each of its ten cases runs two transactions on one lease row in a fixed interleaving and checks which commit DSQL refuses.
+
+| Rule the model assumes | Live case | DSQL's answer |
+|---|---|---|
+| `FOR KEY SHARE` reads don't conflict | two fenced run commits | both commit |
+| an update of non-key columns doesn't conflict with `FOR KEY SHARE` | a renewal and a fenced run commit, in each order | both commit |
+| a write of a key column conflicts with `FOR KEY SHARE` | a takeover and a fenced run commit, in each order | the later commit is refused |
+| `FOR UPDATE` conflicts with `FOR KEY SHARE` | a renewal that reads `FOR UPDATE` and a fenced run commit, in each order | the later commit is refused |
+| only a key column's change fences | a change of owner alone, then a fenced run commit | both commit |
+| `epoch` fences only through a unique index | a takeover on a lease keyed on `shard_id` alone, then a fenced run commit | both commit |
+| a plain read never conflicts | a takeover, then a run commit that read the epoch plainly | both commit |
+
+The `FOR UPDATE` cases are the live counterpart of `negative/30_bundle_lease_renew_for_update.cfg`, the lease keyed on `shard_id` of `negative/30_bundle_lease_epoch_not_key.cfg`, and the plain read of `negative/30_bundle_lease_plain_read.cfg`.
+The suite creates its own probe tables and needs no migrations; run it under the `dsql-live` profile ([docs/testing/dsql-live-suites.md](../docs/testing/dsql-live-suites.md)).
+
 ### `tla/40_dispatch_handoff.tla`
 
 This models how a scheduled task reaches a worker when dispatch is durable state rather than a message.

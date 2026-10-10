@@ -18,9 +18,10 @@ minutes, longer than the default profile's three-minute ceiling.
 
 Set `TOKEIRA_DSQL_TEST_DATABASE_URL` to a connection URL for a disposable test database.
 The four integration suites fall back to `DATABASE_URL` when that variable is unset
-and return without connecting when neither is set. The five CHASM tests, the task-queue
-policy and worker-deployment tests, and the projection's visibility-row test use only
-`TOKEIRA_DSQL_TEST_DATABASE_URL` and return without connecting when it is unset. The
+and return without connecting when neither is set. The five CHASM tests, the lease-fence
+check, the task-queue policy and worker-deployment tests, and the projection's
+visibility-row test use only `TOKEIRA_DSQL_TEST_DATABASE_URL` and return without
+connecting when it is unset. The
 seven projection-accumulator tests are ignored by default, use only that variable, and
 fail when it is unset.
 These suites connect through SQLx directly rather than the IAM connector. The database must permit schema setup and test-data writes; do not
@@ -31,6 +32,7 @@ point them at a database holding application data.
 | Storage `dsql_shard_leasing` | 5 | Lease ownership and fencing, and every lease state an acquire can meet |
 | Storage `dsql_on_conflict_counts` | 6 | The row count DSQL returns for an `ON CONFLICT` statement that leaves its row unwritten, and the answers of the slot, action, provenance, configuration and backlog operations built on one |
 | Storage `dsql_embedded_ownership` | 1 | Embedded ownership lifecycle |
+| Storage `dsql_lease_fence` | 1 | The conflict rules the lease-fence model assumes, through SQLx: ten interleavings of fenced run commits, renewals and takeovers on the suite's own probe tables, including the weaker fences the model rejects; no migrations; `dsql-integration`, URL gate only |
 | Projection `dsql_projection_persistence` | 6 | Visibility persistence and queries |
 | Storage `dsql_archetype_scoped_business_ids` | 1 | CHASM Property 8: scoped pointers and backfill; `--features dsql`, URL gate only |
 | Storage `dsql_chasm_node_store_round_trips_and_fences` | 1 | CHASM nodes, atomic pointers and fencing; `--features dsql`, URL gate only |
@@ -60,6 +62,7 @@ fixtures reuse a deterministic shard ID across nextest's separate test processes
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_shard_leasing --test-threads 1
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_on_conflict_counts --test-threads 1
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_embedded_ownership --test-threads 1
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_lease_fence --test-threads 1
 cargo nextest run -p tokeira-projection --features dsql-integration --locked --profile dsql-live --test dsql_projection_persistence --test-threads 1
 cargo nextest run -p tokeira-projection --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(=dsql_store::tests::dsql_a_visibility_row_applies_only_a_newer_version)'
 cargo nextest run -p tokeira-storage --features dsql --locked --profile dsql-live --test-threads 1 -E 'test(=dsql::chasm_node::tests::dsql_archetype_scoped_business_ids) | test(=dsql::chasm_node::tests::dsql_chasm_node_store_round_trips_and_fences) | test(=dsql::chasm_node::tests::dsql_concurrent_starts_fence_pointer_and_roll_back_losing_nodes) | test(=dsql::chasm_node::tests::dsql_a_chasm_execution_commits_only_with_its_pointer) | test(=dsql::chasm_node::tests::dsql_a_backfill_returns_what_it_copied)'
@@ -70,8 +73,9 @@ cargo nextest run -p tokeira-storage --features dsql-integration --locked --prof
 The accumulator tests run for about 45 minutes in all. The longest two take about 14
 minutes each, inside the profile's twenty-minute limit.
 
-A green result with the URL gates unset is not live evidence. Record the date, revision,
-suite, and outcome after a credentialed run, without recording the connection URL.
+A green result with the URL gates unset is not live evidence. Record the revision, suite,
+and outcome after a credentialed run. Leave out the connection URL, the run's date and
+times, and the Region.
 
 The workflow-dispatch tests use only `TOKEIRA_DSQL_TEST_DATABASE_URL`, apply the
 embedded migrations, and await ASYNC index readiness. Run them serially on an

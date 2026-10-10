@@ -130,9 +130,7 @@ The scanner SHALL delete every other stale due timer's row as today. A kept time
 
 Property 9: The in-memory store refuses what DSQL refuses
 
-_For any_ transaction of the covered writes, the in-memory store SHALL refuse it exactly when it changes more than 3,000 rows, writes a value over 1,048,576 bytes, or inserts or updates more than 9 MiB of values, and SHALL then change nothing. The row and value limits match DSQL's to the row and the byte. The 9 MiB is the largest size measured to commit, since the store doesn't model the keys and per-row overhead DSQL counts with the values.
-
-**Validates: Requirements 1.5, 2.12**
+**Withdrawn.** The in-memory store applies none of DSQL's limits (bugfix 2.12), and the live suites test them. The property required the store to refuse a covered transaction exactly when it changed more than 3,000 rows, wrote a value over 1,048,576 bytes, or inserted or updated more than 9 MiB of values.
 
 Property 10: A successor replaces only the run the pointer named at admission
 
@@ -148,7 +146,7 @@ _For any_ reset of an open or a closed workflow, and any start, close or deletio
 
 - Constants for the budgets of bugfix 2.1: `MAX_ROWS_PER_TRANSACTION` (1,000), `MAX_BYTES_PER_TRANSACTION` (4 MiB) and `MAX_RESET_BATCH_BYTES` (512 KiB).
 - One helper cuts an ordered sequence of items, each with a row count and a byte count, into consecutive pages within the transaction budgets, with at least one item in each page. The spill, the purge and the materialization all page through it. A transaction that also changes a few fixed rows, such as a record, takes them off its page's row budget.
-- The in-memory store's model of DSQL: `DSQL_MAX_ROWS_PER_TRANSACTION` (3,000) and `DSQL_MAX_VALUE_BYTES` (1,048,576), DSQL's own limits, and `MODEL_MAX_BYTES_PER_TRANSACTION` (9 MiB), the largest size measured to commit.
+- DSQL's limits, which the budgets sit under and the live suite `dsql_transaction_limits` pins: `DSQL_MAX_ROWS_PER_TRANSACTION` (3,000), `DSQL_MAX_VALUE_BYTES` (1,048,576) and `DSQL_MEASURED_BYTES_PER_TRANSACTION` (9 MiB), the largest size measured to commit.
 - A transaction's bytes are the lengths of the values it inserts or updates: payloads, encoded events and principals, encoded state, timers and tombstones. The 5 MiB between the budget and the 9 MiB measured to commit covers keys, fixed-width columns and per-row overhead for up to 1,000 rows. Deleted rows count only toward rows (bugfix introduction).
 
 ### The bulk-write record (`crates/tokeira-storage/migrations/`)
@@ -271,13 +269,13 @@ A due timer row can exist without its run's hot row only while the run is being 
   - Every record found here is abandoned: the recovery finishes before the shard admits commands, so no materialization started under this ownership is running. Such records are rare, so the switches don't hold activation up in practice. A switch that fails fails the recovery, and the shard isn't activated until a recovery succeeds.
   - The recovery then hands every record's run to the purger and doesn't wait for the purges. The switch is the only write this spec adds to a shard's recovery.
 
-### The in-memory store's model of DSQL (`crates/tokeira-storage/src/memory.rs`)
+### The in-memory store (`crates/tokeira-storage/src/memory.rs`)
 
-- Each transaction of the covered writes counts the rows it changes and the bytes it inserts or updates, and checks each value it writes. Past the model's limits — DSQL's rows and value size, and 9 MiB of values — it fails with an error naming the limit, as DSQL's SQLSTATE 54000 does, and changes nothing (Property 9). It counts as `write_budget` defines.
+- Each transaction of the covered writes tallies the rows it changes and the bytes it inserts or updates, as `write_budget` counts them, so tests can check the budgets (Property 1). It refuses nothing at DSQL's limits (bugfix 2.12).
 - The store keeps each run's history as DSQL stores it, one batch per commit with events and one per batch a reset writes, so it counts and removes history rows as DSQL does. A reset's batches also appear in `read_transition_audit`, one record per batch, as DSQL's do.
 - It keeps the records, and its snapshot carries them, empty when a snapshot is from before this change.
 - For tests, it can stop a covered write after a given number of transactions, and fail a given transaction.
-- The model applies only to the writes this spec covers. A transition's own commit is out of scope (bugfix Out of Scope).
+- The tally covers only the writes this spec covers. A transition's own commit is out of scope (bugfix Out of Scope).
 
 ### Specs this changes
 
@@ -295,7 +293,7 @@ The fix changes these specs:
 
 ### Exploratory Bug Condition Checking
 
-- First the in-memory store gets its model of DSQL (Property 9), with unit tests at each limit's boundary.
+- First the in-memory store gets its model of DSQL (Property 9), with unit tests at each limit's boundary. The model's refusals were withdrawn later (bugfix 2.12).
 - One contract test per defect then runs on both stores: on the in-memory store in the default suite, and on DSQL in the live suite.
   - a pass of 3,001 small expired tasks, and one of eleven tasks whose payloads are about 1 MB each;
   - the deletion of a closed run owning more than 3,000 rows;

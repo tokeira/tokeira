@@ -5,8 +5,7 @@
 //! Aurora DSQL's transaction limits, as the paged bulk writes count on them
 //! (`bounded-bulk-writes`).
 //!
-//! The budgets in `tokeira_storage::write_budget` sit under DSQL's limits, and
-//! the in-memory store refuses what DSQL refuses for the writes they cover. Both
+//! The budgets in `tokeira_storage::write_budget` sit under DSQL's limits. They
 //! rest on how DSQL counts a transaction's rows and bytes, which these probes
 //! pin on a live cluster, apart from the budgets: a change in DSQL fails a probe
 //! here rather than a purge. Each probe writes only the rows of its own batch,
@@ -17,7 +16,7 @@
 use anyhow::{Result, ensure};
 use sqlx::{PgPool, Postgres, QueryBuilder, postgres::PgPoolOptions};
 use tokeira_storage::write_budget::{
-    DSQL_MAX_ROWS_PER_TRANSACTION, DSQL_MAX_VALUE_BYTES, MODEL_MAX_BYTES_PER_TRANSACTION,
+    DSQL_MAX_ROWS_PER_TRANSACTION, DSQL_MAX_VALUE_BYTES, DSQL_MEASURED_BYTES_PER_TRANSACTION,
 };
 use uuid::Uuid;
 
@@ -292,13 +291,13 @@ async fn dsql_a_value_over_one_mib_is_refused() -> Result<()> {
     Ok(())
 }
 
-/// A transaction may write 9 MiB of values, the in-memory store's limit, but not
-/// 10 MiB: DSQL counts keys and per-row overhead with the values.
+/// A transaction may write 9 MiB of values, but not 10 MiB: DSQL counts keys and
+/// per-row overhead with the values.
 #[tokio::test]
 async fn dsql_nine_mib_of_values_commit_and_ten_are_refused() -> Result<()> {
     let probe = probe!();
-    let rows = MODEL_MAX_BYTES_PER_TRANSACTION / MIB;
-    assert_eq!(rows * MIB, MODEL_MAX_BYTES_PER_TRANSACTION);
+    let rows = DSQL_MEASURED_BYTES_PER_TRANSACTION / MIB;
+    assert_eq!(rows * MIB, DSQL_MEASURED_BYTES_PER_TRANSACTION);
     assert_eq!(
         probe.insert(0, &values(rows, MIB)).await?,
         Outcome::Committed

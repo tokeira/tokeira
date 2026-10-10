@@ -166,9 +166,11 @@ payloads incrementally. Cap each
 transaction using the shared `write_budget` limits: 1,000 modified rows and
 4 MiB of written values, reserving room for the marker. Count a timer copy and
 source delete separately; stop before exceeding either budget and advance only
-past the processed prefix. A relocation that cannot fit on an otherwise empty
-page, including its marker reserve, fails with the row identified instead of
-committing unchanged progress. Keep read payload accumulation bounded as well.
+past the processed prefix. On DSQL, a relocation that cannot fit on an
+otherwise empty page, including its marker reserve, fails with the row
+identified instead of committing unchanged progress. The in-memory store applies
+none of DSQL's limits, so it moves such a relocation in a page of its own. Keep
+read payload accumulation bounded as well.
 Use primary-key keyset predicates, not offsets; verify the continuation plans on
 DSQL. This does not change the separate 64-key legacy-backlog disposal cap.
 

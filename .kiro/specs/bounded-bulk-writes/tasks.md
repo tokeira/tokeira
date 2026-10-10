@@ -16,6 +16,7 @@ Show the four defects first, on both stores, with tests that fail on the current
   - [x] 1.1 Give the in-memory store its model of DSQL's limits for the covered writes, with unit tests at each limit's boundary
     - **Property 9: The in-memory store refuses what DSQL refuses**
     - **Validates: Requirements 1.5, 2.12**
+    - Withdrawn later: the in-memory store applies none of DSQL's limits, and tallies each transaction only for the budget checks (bugfix 2.12).
   - [x] 1.2 Write the contract tests, each run on both stores:
     - a pass of 3,001 small expired tasks, and one of eleven tasks whose payloads are about 1 MB each;
     - the deletion of a closed run owning more than 3,000 rows;

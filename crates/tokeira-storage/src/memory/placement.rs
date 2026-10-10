@@ -177,11 +177,9 @@ impl InMemoryStore {
                         let extra = WriteCost::write(
                             encode_workflow_state(&store.runs[key])?.len() + wf.0.len() + 128,
                         );
-                        ensure!(
-                            extra.bytes + 8_192 <= MAX_BYTES_PER_TRANSACTION,
-                            "placement upgrade run={key:?} stored_shard={stored:?} computed_home={target:?}: hot row exceeds relocation budget"
-                        );
-                        if !fits(cost, extra) {
+                        // A row too large for any page moves in a page of its own:
+                        // the in-memory store applies none of DSQL's limits.
+                        if !hot_moves.is_empty() && !fits(cost, extra) {
                             break;
                         }
                         cost.rows += extra.rows;
@@ -210,10 +208,8 @@ impl InMemoryStore {
                     .max()
                     .unwrap_or(0)
                     .max(cost.bytes);
-                // A large timer identity also enlarges the durable cursor. A
-                // move must fit with that reserve on an otherwise empty page,
-                // or retries would commit the same position forever.
-                let marker_cost = cost;
+                // A large timer identity also enlarges the durable cursor, so the
+                // page reserves room for it.
                 let first_move = keys.iter().position(|key| {
                     home(&store, key.run_key).is_some_and(|home| key.shard != shard_uuid(home))
                 });
@@ -241,13 +237,10 @@ impl InMemoryStore {
                             rows: 2,
                             bytes: payload.len() + key.timer_id.len() + 128,
                         };
-                        ensure!(
-                            fits(marker_cost, extra),
-                            "placement upgrade run={:?} stored_shard={} computed_home={target:?}: timer and marker exceed relocation budget",
-                            key.run_key,
-                            key.shard
-                        );
-                        if !fits(cost, extra) {
+                        // A move too large for any page, with its cursor, moves in a
+                        // page of its own, so no position is retried forever: the
+                        // in-memory store applies none of DSQL's limits.
+                        if !timer_moves.is_empty() && !fits(cost, extra) {
                             break;
                         }
                         cost.rows += extra.rows;
@@ -265,24 +258,24 @@ impl InMemoryStore {
             PlacementPhase::Complete => unreachable!("completed progress returned above"),
         }
         let mut model = store.begin_bulk_transaction()?;
-        // The model enforces the shared service budget too; no mutation precedes
-        // its acceptance, including a failure injected between pages.
+        // The page is tallied for tests before any mutation, and a failure
+        // injected between pages stops it here, changing nothing.
         let cursor_bytes = match &progress.phase {
             PlacementPhase::Timers(Some(cursor)) => (cursor.timer_id.len() + 512).max(8_192),
             _ => 8_192,
         };
-        model.write(&[cursor_bytes])?;
+        model.write(&[cursor_bytes]);
         for (key, _) in &hot_moves {
             let (_, wf) = identity(&store, *key).expect("hot row has identity");
             model.write(&[
                 encode_workflow_state(&store.runs[key])?.len(),
                 wf.0.len(),
                 128,
-            ])?;
+            ]);
         }
         for (source, _, timer) in &timer_moves {
-            model.write(&[encode_timer_state(timer)?.len(), source.timer_id.len(), 128])?;
-            model.delete(1)?;
+            model.write(&[encode_timer_state(timer)?.len(), source.timer_id.len(), 128]);
+            model.delete(1);
         }
         store.commit_bulk_transaction(&model);
         for (key, home) in hot_moves {

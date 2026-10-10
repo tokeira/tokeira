@@ -24,7 +24,7 @@ Temporal v1.31.0 splits the same work:
 - Its SQL store appends a run's history before the transaction that writes the run's mutable state (`common/persistence/sql/execution.go:334-358 @ v1.31.0`).
 - It holds a write to persistence to 4 MiB (`DefaultTransactionSizeLimit`, `common/primitives/constants.go:10-11 @ v1.31.0`).
 
-This spec splits each of the four writes into transactions within fixed budgets, each safe to retry, and makes an interrupted write finish or undo itself later. A reset's successor becomes current only while the current pointer still names the run it named when the reset was admitted. The spec also makes the in-memory store refuse what DSQL refuses for these writes, so a test on either store shows the defects.
+This spec splits each of the four writes into transactions within fixed budgets, each safe to retry, and makes an interrupted write finish or undo itself later. A reset's successor becomes current only while the current pointer still names the run it named when the reset was admitted. The in-memory store applies none of DSQL's limits, so the defects show on DSQL, in the live suite (2.12).
 
 ## Bug Analysis
 
@@ -43,7 +43,7 @@ This spec splits each of the four writes into transactions within fixed budgets,
 
 1.4 WHEN a reset's successor holds more pending timers than fit in 3,000 rows beside its state, workflow dispatch row and current pointer THEN the transaction that creates the successor writes a timer row for each, which DSQL refuses, with the outcome 1.3 describes.
 
-1.5 WHEN any of 1.1 to 1.4 runs on the in-memory store THEN it succeeds, so no test on that store shows these defects.
+1.5 WHEN any of 1.1 to 1.4 runs on the in-memory store THEN it succeeds, so no test on that store shows these defects. This is no longer a defect: DSQL is the reference backend, and the in-memory store applies none of its limits (2.12).
 
 1.6 WHEN a start of the same workflow id commits after a reset's commit on its base and before the transaction that creates the reset's successor THEN that transaction moves the current pointer from the started run to the successor (`upsert_current_execution_start` in `do_materialize_reset_successor`). The workflow id then has two open runs, and the started run can't be found without its run id.
 
@@ -97,11 +97,9 @@ v1.31.0 likewise appends a new run's history before the transaction that writes 
 
 2.11 A reset successor's History Size SHALL be the sum of the encoded sizes of the batches written for its copied history, which is how [continue-as-new-advice](../continue-as-new-advice/requirements.md) Requirement 1.6 measures a copied prefix. A prefix that fits one batch keeps today's value.
 
-2.12 WHEN any write this spec covers runs on the in-memory store THEN the store SHALL refuse:
-- a transaction that changes more than 3,000 rows, or writes a value over 1,048,576 bytes, as DSQL refuses it;
-- a transaction that inserts or updates more than 9 MiB of values, the largest size measured to commit. DSQL refuses 10 MiB, counting keys and per-row overhead with the values, which the store doesn't model.
+2.12 WHEN any write this spec covers runs on the in-memory store THEN the store SHALL tally each of its transactions' rows and bytes, as the budgets count them, and SHALL NOT refuse a transaction at DSQL's limits. DSQL is the reference backend, and the live suites test its limits. The store SHALL count a run's history as DSQL stores it, one row per batch.
 
-The store SHALL count a run's history as DSQL stores it, one row per batch.
+Earlier, 2.12 required the store to refuse a transaction that changed more than 3,000 rows, wrote a value over 1,048,576 bytes, or inserted or updated more than 9 MiB of values. That requirement is withdrawn.
 
 2.13 WHEN a materialization's final transaction runs THEN it SHALL make the successor current only if the current pointer still names the run it named when the runtime admitted the reset, whether that run was open or closed, or is still absent if there was no pointer then. IF the pointer has changed THEN the materialization SHALL fail, its rows SHALL be purged as 2.9 says, and the run the pointer names SHALL stay current. v1.31.0 moves the pointer to a reset's run only while the pointer names the run its reset updates (`persistToDB`, `service/history/ndc/workflow_resetter.go:358-430`; `assertRunIDAndUpdateCurrentExecution`, `common/persistence/sql/execution_util.go:966-1009 @ v1.31.0`).
 

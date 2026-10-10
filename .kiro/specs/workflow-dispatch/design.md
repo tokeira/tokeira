@@ -555,26 +555,34 @@ The current repair and admission barrier are enabled by the temporary private
 queue-home construction choice. Default acquisition retains its previous delivery
 and due-work behavior until cutover. Tracker scoping is active in both modes.
 
-Cutover remains blocked on legacy reset placement: before the execution-home fix,
-`crates/tokeira-storage/src/dsql/run_repository/load.rs @ a0addfa2^1` materialized
-both the successor hot row and timers under `shard_for_run_key(successor_run_key)`
-and committed before the successor's first lane command. A stop in that interval
-can leave persisted placement different from the namespace/workflow execution
-home. Current acquisition repair intentionally rejects that mismatch instead of
-changing authoritative placement in a derived-row-only transaction. Before default
-enablement, an explicit placement recovery path must preserve eventual recovery
-of the affected workflow without blocking unrelated runs. Simply skipping the row
-cannot establish that guarantee. The cutover implementation must cover this exact
-stopped-upgrade fixture on both stores, including timer and dispatch placement.
+Legacy reset placement is repaired by a bounded storage upgrade before runtime
+construction, as specified in the approved [placement recovery note](placement-recovery-note.md).
+Before the execution-home fix, `crates/tokeira-storage/src/dsql/run_repository/load.rs @ a0addfa2^1`
+materialized the successor hot row and timers under the run-key shard. The upgrade
+walks every hot key and then every physical timer key, including timers left behind
+after an ordinary commit has already corrected the hot row. It screens identity
+columns in pages of up to 1,000 keys; a relocating page processes at most 64 keys
+within the shared row/byte budgets. Moves and the exclusive continuation update
+commit together through a single versioned marker. Concurrent starters retry lost
+pages with jitter and fresh progress; no runtime writer, scanner or acquisition
+starts until completion is observed.
 
-The cutover must also align outer runtime admission and task-token epoch lookup
-with execution-home ownership.
-`crates/tokeira-runtime/src/runtime/commit.rs` currently uses the run-key hash
-in `shard_id_for`, before the lane's execution-home gate. A node holding only the
-execution home can therefore reject a valid start. The tracker regressions submit
-through the real lane to isolate tracking from that pre-existing outer gate; they
-do not establish public multi-home admission. Add an end-to-end regression with
-only the execution home held before enabling the new delivery path by default.
+Relocation is stopped-cluster storage-upgrade authority, outside per-home dispatch
+repair. Repair still changes only derived dispatch and rejects misplaced authority.
+Every older node must stay stopped. A raw live-lease check also recognizes legacy
+shard encodings, but cannot fence an older node acquiring or renewing afterwards.
+Unexplained placement, invalid relocation identity or conflicting timer payloads
+fail startup with row-specific diagnostics; skipping cannot establish completeness.
+This first-startup delay replaces the failure of an unrelated shard's acquisition.
+
+Outer runtime admission and token epochs use execution-home identity in both
+construction modes. New starts carry namespace/workflow identity directly; bare-run
+calls ask the existing lane cache for that immutable identity, reusing its normal
+cold load. Token minting, heartbeat and activity completion paths already holding
+state derive the home directly. The run hash remains a local-lane routing input; processing spans record the
+execution home when state becomes available, without another load. The regressions exercise start,
+delivery and completion with only the execution home held, distinct non-zero epochs,
+stale tokens, and activity heartbeat/completion.
 
 When enabled, acquisition first publishes Sweeping and drains a per-home writer
 barrier before either walk. Lane commits retain admission through post-commit

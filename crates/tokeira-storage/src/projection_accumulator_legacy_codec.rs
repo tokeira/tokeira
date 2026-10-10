@@ -1,10 +1,16 @@
 //! Pre-accumulator state codec from Tokeira `689e89a8622d114de1dd80232a22bb63705d50d1`.
 //! The mixed-writer contracts execute this reader (which skips tag 3) and writer
 //! (which drops it), including the baseline heartbeat extension.
+//!
+//! It reads and writes the envelope version it was frozen with, which this release
+//! calls the previous version, so it refuses a state this release writes, as that
+//! release does (`activity-inputs-from-history`).
 
+// The frozen code names the version it checks `WORKFLOW_STATE_ENVELOPE_VERSION`.
 use crate::codec::{
-    ACTIVITY_HEARTBEAT_SECTION, BlobFormatError, ExtensionSection, StateExtensionError,
-    WORKFLOW_STATE_ENVELOPE_VERSION, WORKFLOW_STATE_EXTENSION_MAGIC, encode,
+    ACTIVITY_HEARTBEAT_SECTION, BlobFormatError, ExtensionSection,
+    PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION as WORKFLOW_STATE_ENVELOPE_VERSION,
+    StateExtensionError, WORKFLOW_STATE_EXTENSION_MAGIC, encode,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};

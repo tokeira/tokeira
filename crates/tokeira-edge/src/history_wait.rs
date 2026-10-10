@@ -122,6 +122,16 @@ where
             .await
     }
 
+    async fn read_history_event(
+        &self,
+        run_key: RunKey,
+        event_id: i64,
+    ) -> Result<Option<HistoryEvent>> {
+        // Forwarded explicitly: the trait default would read through the general
+        // history read instead of the store's one-batch lookup.
+        self.inner.read_history_event(run_key, event_id).await
+    }
+
     async fn read_attributed_history(
         &self,
         run_key: RunKey,

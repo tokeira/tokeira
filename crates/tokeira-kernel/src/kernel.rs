@@ -49,9 +49,9 @@ use crate::{
         EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, Link, LoadedRun, NexusOperationCancellation,
         NexusOperationCancellationState, ParentClosePolicy, PauseInfo, PendingExternalCancel,
         PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask,
-        RecordedAdvice, RequestIdInfo, TimerState, VersioningBehavior, VersioningOverride,
-        WorkflowState, WorkflowTaskProblem, WorkflowTaskType, WorkflowVersioningInfo,
-        merge_priority,
+        RecordedAdvice, RequestIdInfo, RetiredField, TimerState, VersioningBehavior,
+        VersioningOverride, WorkflowState, WorkflowTaskProblem, WorkflowTaskType,
+        WorkflowVersioningInfo, merge_priority,
     },
     transition::{
         ActivityOp, CallbackCompletionOutcome, DispatchOp, RequestDedupeOp, TimerOp, Transition,
@@ -4412,8 +4412,6 @@ impl BasicKernel {
                 activity_id,
                 activity_type,
                 task_queue,
-                input,
-                header,
                 retry_policy,
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
@@ -4437,8 +4435,10 @@ impl BasicKernel {
                         task_queue: task_queue.clone(),
                         deployment: state.deployment.clone(),
                         build_id: state.build_id.clone(),
-                        input: input.clone(),
-                        header: header.clone(),
+                        // The input and header stay in this event, which a start
+                        // reads (`activity-inputs-from-history`).
+                        retired_input: RetiredField::default(),
+                        retired_header: RetiredField::default(),
                         attempt: 1,
                         retry_policy: retry_policy.clone(),
                         schedule_to_close_timeout: *schedule_to_close_timeout,
@@ -4988,7 +4988,6 @@ fn enqueue_activity_dispatch(builder: &mut TransitionBuilder, activity: &Activit
                 .or_else(|| builder.state.build_id.clone()),
         },
         activity_id: activity.activity_id.clone(),
-        input: activity.input.clone(),
         schedule_event_id: activity.schedule_event_id,
         attempt: activity.attempt,
         dispatch_revision: builder
@@ -5383,8 +5382,8 @@ fn apply_workflow_command(
                 activity_id: activity_id.clone(),
                 activity_type: activity_type.clone(),
                 task_queue: task_queue.clone(),
-                input: input.clone(),
-                header: header.clone(),
+                input,
+                header,
                 retry_policy: retry_policy.clone(),
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
@@ -5408,8 +5407,10 @@ fn apply_workflow_command(
                     .clone()
                     .or_else(|| builder.state.deployment.clone()),
                 build_id: build_id.clone().or_else(|| builder.state.build_id.clone()),
-                input: input.clone(),
-                header,
+                // The scheduled event above is the input's and header's only
+                // store, as in v1.31.0 (`activity-inputs-from-history`).
+                retired_input: RetiredField::default(),
+                retired_header: RetiredField::default(),
                 attempt: 1,
                 retry_policy: retry_policy.clone(),
                 schedule_to_close_timeout,
@@ -5443,7 +5444,6 @@ fn apply_workflow_command(
                     build_id: activity.build_id.clone(),
                 },
                 activity_id,
-                input,
                 schedule_event_id,
                 attempt: 1,
                 dispatch_revision: builder

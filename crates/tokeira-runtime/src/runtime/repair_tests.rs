@@ -930,7 +930,6 @@ async fn dispatch_batch_uses_committed_home_without_loading_run() {
         .map(|n| DispatchOp::EnqueueActivityTask {
             queue: queue.clone(),
             activity_id: format!("activity-{n}"),
-            input: Payloads::default(),
             schedule_event_id: n + 1,
             attempt: 1,
             dispatch_revision: 0,

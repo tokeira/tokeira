@@ -38,6 +38,23 @@ pub(super) const READ_HISTORY_BATCHES_SQL: &str = "
 /// History batches each statement of a history read fetches.
 const HISTORY_BATCH_PAGE: usize = 64;
 
+/// The one history batch that can hold an event: the batch with the greatest first
+/// event id not after the event's.
+///
+/// A run's batches cover its event ids from 1 without gaps or overlaps, a reset
+/// successor's copied batches included (`bounded-bulk-writes`), so this is the
+/// batch that holds the event when the history does. The primary key
+/// `(run_key, first_event_id)` serves it as a backward scan that starts at the
+/// event's id and stops at the first row (`activity-inputs-from-history` criterion
+/// 2.3). [`READ_HISTORY_BATCHES_SQL`] can't stand in: no index covers its
+/// `last_event_id` filter, so it walks the run's batches from the first.
+pub(super) const READ_HISTORY_EVENT_BATCH_SQL: &str = "
+    SELECT first_event_id, last_event_id, events_data
+    FROM history_batch
+    WHERE run_key = $1 AND first_event_id <= $2
+    ORDER BY first_event_id DESC
+    LIMIT 1";
+
 impl DsqlRunRepository {
     #[instrument(name = "dsql.resolve_execution", skip(self), fields(namespace_id = %execution.namespace_id.0, workflow_id = %execution.workflow_id.0))]
     pub(super) async fn do_resolve_execution(
@@ -223,6 +240,38 @@ impl DsqlRunRepository {
             .into_iter()
             .map(|attributed| attributed.event)
             .collect())
+    }
+
+    #[instrument(name = "dsql.read_history_event", skip(self), fields(run_key = %run_key.0, event_id))]
+    pub(super) async fn do_read_history_event(
+        &self,
+        run_key: RunKey,
+        event_id: i64,
+    ) -> Result<Option<HistoryEvent>> {
+        record_dsql_operation!(
+            self,
+            "read_history_event",
+            Some(self.shard_for_run_key(run_key)),
+            {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let row = sqlx::query_as::<_, (i64, i64, Vec<u8>)>(READ_HISTORY_EVENT_BATCH_SQL)
+                    .bind(run_key.0)
+                    .bind(event_id)
+                    .fetch_optional(permit.connection()?)
+                    .await?;
+                metrics::record_dsql_rows_read("read_history_event", usize::from(row.is_some()));
+                let Some((_first_event_id, last_event_id, events_data)) = row else {
+                    return Ok(None);
+                };
+                // An id past the end of the history finds the last batch.
+                if event_id > last_event_id {
+                    return Ok(None);
+                }
+                Ok(codec::decode_history_events(run_key, &events_data)?
+                    .into_iter()
+                    .find(|event| event.event_id == event_id))
+            }
+        )
     }
 
     #[instrument(name = "dsql.read_attributed_history", skip(self), fields(run_key = %run_key.0, after_event_id, limit))]

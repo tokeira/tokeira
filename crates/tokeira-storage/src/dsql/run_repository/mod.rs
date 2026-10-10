@@ -17,9 +17,9 @@ use tokeira_kernel::{
     Transition, WorkflowState, merge_priority,
 };
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads, QueueKey,
-    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
-    WorkflowId, WorkflowRuleRecord, dsql_spread_uuid,
+    BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, QueueKey, RequestId, RunId,
+    RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq, WorkflowId,
+    WorkflowRuleRecord, dsql_spread_uuid,
 };
 use tracing::{Instrument, instrument};
 use uuid::Uuid;
@@ -86,6 +86,8 @@ mod bulk_write_tests;
 mod commit;
 mod delete;
 mod dispatch;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod history_event_tests;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod lease_fence_tests;
 mod leases;
@@ -569,6 +571,14 @@ impl RunRepository for DsqlRunRepository {
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
         self.do_read_history(run_key, after_event_id, limit).await
+    }
+
+    async fn read_history_event(
+        &self,
+        run_key: RunKey,
+        event_id: i64,
+    ) -> Result<Option<HistoryEvent>> {
+        self.do_read_history_event(run_key, event_id).await
     }
 
     async fn read_attributed_history(
@@ -1531,7 +1541,6 @@ mod tests {
     fn activity_dispatch_row_preserves_field_fidelity() {
         let run_key = RunKey::new();
         let namespace_id = NamespaceId::new();
-        let payloads = Payloads::default();
         let row: ActivityDispatchRow = (
             run_key.0,
             "activity".to_owned(),
@@ -1544,7 +1553,6 @@ mod tests {
             3,
             17,
             5,
-            codec::encode_payloads(&payloads).unwrap(),
             None,
             OffsetDateTime::from_unix_timestamp(1_700_000_777).unwrap(),
         );
@@ -1558,7 +1566,6 @@ mod tests {
 
         assert_eq!(task.run_key, run_key);
         assert_eq!(task.activity_id, "activity");
-        assert_eq!(task.input, payloads);
         assert_eq!(task.schedule_event_id, 42);
         assert_eq!(task.attempt, 3);
         assert_eq!(task.dispatch_revision, 17);
@@ -1884,8 +1891,8 @@ mod tests {
             deployment: None,
             build_id: None,
             priority: None,
-            input: Payloads::default(),
-            header: None,
+            retired_input: Default::default(),
+            retired_header: Default::default(),
             last_failure: None,
             heartbeat_details: None,
             attempt: 1,

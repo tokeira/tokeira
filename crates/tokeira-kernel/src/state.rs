@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -746,12 +749,65 @@ pub enum WorkflowTaskType {
     Speculative,
 }
 
+/// A field's position in a stored layout, kept after its data has moved elsewhere.
+///
+/// Kernel state is stored with postcard, which is positional, so removing a field
+/// would shift every field after it. A retired field keeps the position and holds no
+/// data, so no code can put the moved data back by mistake. It writes
+/// `T::default()`. It reads a `T` in full, so the fields after it decode from the
+/// right offset, and drops it. So a value that an earlier release wrote, with data
+/// in the position, still decodes, and its next write stores the default
+/// (`activity-inputs-from-history`).
+///
+/// Every retired field equals every other.
+pub struct RetiredField<T>(PhantomData<fn() -> T>);
+
+impl<T> Default for RetiredField<T> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T> Clone for RetiredField<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for RetiredField<T> {}
+
+impl<T> PartialEq for RetiredField<T> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl<T> Eq for RetiredField<T> {}
+
+impl<T> std::fmt::Debug for RetiredField<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RetiredField")
+    }
+}
+
+impl<T: Default + Serialize> Serialize for RetiredField<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        T::default().serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for RetiredField<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(|_dropped| Self::default())
+    }
+}
+
 /// Durable state for a single open activity.
 ///
-/// Carries the full set of parameters needed to re-dispatch
-/// the activity after pause/unpause or retry. The `stamp`
-/// field is a monotonic invalidation counter used to detect
-/// stale deliveries.
+/// Carries what a re-dispatch after a pause, an unpause or a retry needs, except
+/// the activity's input and header: those live only in its ActivityTaskScheduled
+/// event, which a start reads. The `stamp` field is a monotonic invalidation
+/// counter used to detect stale deliveries.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActivityState {
     /// User-assigned activity identifier.
@@ -766,10 +822,14 @@ pub struct ActivityState {
     pub deployment: Option<DeploymentId>,
     /// Optional build identifier override for this activity.
     pub build_id: Option<BuildId>,
-    /// Arguments passed to the activity function.
-    pub input: Payloads,
-    /// Transport headers carried with the activity task.
-    pub header: Option<Headers>,
+    /// The position of the input, which lives only in the ActivityTaskScheduled
+    /// event. v1.31.0's activity info likewise holds no input or header, and keeps
+    /// the id of the batch that holds the event to read them from
+    /// (`proto/internal/temporal/server/api/persistence/v1/executions.proto:523-525 @ v1.31.0`).
+    pub retired_input: RetiredField<Payloads>,
+    /// The position of the header, which lives only in the ActivityTaskScheduled
+    /// event, as the input does.
+    pub retired_header: RetiredField<Option<Headers>>,
     /// Current attempt number (1-based, incremented on retry).
     pub attempt: u32,
     /// Retry policy for this activity.
@@ -1885,8 +1945,8 @@ pub(crate) mod tests {
             task_queue: TaskQueueName("activity-q".into()),
             deployment: None,
             build_id: None,
-            input: Payloads::default(),
-            header: None,
+            retired_input: Default::default(),
+            retired_header: Default::default(),
             last_failure: None,
             heartbeat_details: None,
             attempt: 2,

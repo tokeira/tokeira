@@ -751,7 +751,7 @@ mod tests {
     use proptest::prelude::*;
     use time::Duration;
     use tokeira_kernel::ActivityState;
-    use tokeira_types::{Payloads, TaskQueueName};
+    use tokeira_types::TaskQueueName;
 
     fn sample_activity() -> ActivityState {
         ActivityState {
@@ -767,8 +767,8 @@ mod tests {
             task_queue: TaskQueueName("q".into()),
             deployment: None,
             build_id: None,
-            input: Payloads::default(),
-            header: None,
+            retired_input: Default::default(),
+            retired_header: Default::default(),
             last_failure: None,
             heartbeat_details: None,
             attempt: 1,

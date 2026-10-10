@@ -1304,7 +1304,6 @@ where
                             .or_else(|| new_state.build_id.clone()),
                     },
                     activity_id: activity.activity_id.clone(),
-                    input: activity.input.clone(),
                     schedule_event_id: activity.schedule_event_id,
                     attempt: activity.attempt,
                     dispatch_revision: new_state
@@ -1413,15 +1412,13 @@ where
             .values()
             .filter(|activity| target.matches(activity))
         {
-            // Read the schedule event by its id rather than the whole history
-            // (`history-pagination` criterion 2.8).
+            // Read the schedule event by its id, with the one lookup that
+            // returns only the batch holding it (`history-pagination` criterion
+            // 2.8; `activity-inputs-from-history` criterion 2.3).
             let scheduled = self
                 .repo
-                .read_history(run_key, activity.schedule_event_id - 1, 1)
+                .read_history_event(run_key, activity.schedule_event_id)
                 .await?
-                .into_iter()
-                .next()
-                .filter(|event| event.event_id == activity.schedule_event_id)
                 .ok_or_else(|| anyhow!("activity schedule event not found"))?;
             let HistoryEventKind::ActivityTaskScheduled {
                 task_queue,

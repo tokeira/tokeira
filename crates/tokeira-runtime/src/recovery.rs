@@ -80,8 +80,7 @@ const RECOVERY_PAGE: usize = 100;
 /// bytes.
 const DUE_TIMER_PAGE: usize = 500;
 
-/// Rows the sweep reads per page of due activity dispatches. A dispatch row
-/// carries the activity's input payload, so these pages are smaller.
+/// Rows the sweep reads per page of due activity dispatches.
 const DUE_ACTIVITY_DISPATCH_PAGE: usize = 100;
 
 /// Reconstruct volatile delivery and timeout state for a newly-owned shard.
@@ -621,7 +620,7 @@ mod tests {
     };
     use tokeira_storage::{CommitResult, InMemoryStore};
     use tokeira_types::{
-        ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey, RunId, RunKey,
+        ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey, RunId, RunKey,
         SearchAttributes, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
         WorkerIdentity, WorkflowId, WorkflowType,
     };
@@ -1095,8 +1094,8 @@ mod tests {
                         task_queue: TaskQueueName("q".into()),
                         deployment: None,
                         build_id: None,
-                        input: Payloads::default(),
-                        header: None,
+                        retired_input: Default::default(),
+                        retired_header: Default::default(),
                         last_failure: None,
                         heartbeat_details: None,
                         attempt: 1,
@@ -1124,7 +1123,6 @@ mod tests {
                         DispatchOp::EnqueueActivityTask {
                             queue,
                             activity_id: act_id.clone(),
-                            input: Payloads::default(),
                             schedule_event_id: idx as i64,
                             attempt: 1,
                             dispatch_revision: 0,
@@ -1274,8 +1272,8 @@ mod tests {
                     task_queue: TaskQueueName("q".into()),
                     deployment: None,
                     build_id: None,
-                    input: Payloads::default(),
-                    header: None,
+                    retired_input: Default::default(),
+                    retired_header: Default::default(),
                     last_failure: None,
                     heartbeat_details: None,
                     attempt: 2,
@@ -1307,7 +1305,6 @@ mod tests {
                         build_id: None,
                     },
                     activity_id: "activity".into(),
-                    input: Payloads::default(),
                     schedule_event_id: 7,
                     attempt: 2,
                     dispatch_revision: 11,
@@ -1646,8 +1643,8 @@ mod tests {
                     task_queue: TaskQueueName("q".into()),
                     deployment: None,
                     build_id: None,
-                    input: Payloads::default(),
-                    header: None,
+                    retired_input: Default::default(),
+                    retired_header: Default::default(),
                     last_failure: None,
                     heartbeat_details: None,
                     attempt: 2,
@@ -1794,8 +1791,8 @@ mod tests {
                 task_queue: TaskQueueName("q".into()),
                 deployment: None,
                 build_id: None,
-                input: Payloads::default(),
-                header: None,
+                retired_input: Default::default(),
+                retired_header: Default::default(),
                 last_failure: None,
                 heartbeat_details: None,
                 attempt: 1,
@@ -1890,8 +1887,8 @@ mod tests {
             task_queue: TaskQueueName("q".into()),
             deployment: None,
             build_id: None,
-            input: Payloads::default(),
-            header: None,
+            retired_input: Default::default(),
+            retired_header: Default::default(),
             last_failure: None,
             heartbeat_details: None,
             attempt: 2,
@@ -2306,8 +2303,8 @@ mod tests {
             task_queue: TaskQueueName("q".into()),
             deployment: None,
             build_id: None,
-            input: Payloads::default(),
-            header: None,
+            retired_input: Default::default(),
+            retired_header: Default::default(),
             last_failure: None,
             heartbeat_details: None,
             attempt: 1,
@@ -2343,7 +2340,6 @@ mod tests {
                     build_id: None,
                 },
                 activity_id: "act".into(),
-                input: Payloads::default(),
                 schedule_event_id: 5,
                 attempt: 1,
                 dispatch_revision: 0,

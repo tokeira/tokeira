@@ -802,12 +802,8 @@ fn dsql_projection_accumulator_failure_isolation() {
 #[ignore = "requires an ephemeral Aurora DSQL cluster"]
 fn dsql_projection_accumulator_growth_accounting() {
     contract(
-        (
-            prop::collection::vec("[ab]{0,80}", 0..140),
-            prop::collection::vec(any::<u8>(), 0..128),
-            any::<bool>(),
-        ),
-        |runtime, fixture, (values, input, observe_new)| {
+        (prop::collection::vec("[ab]{0,80}", 0..140), any::<bool>()),
+        |runtime, fixture, (values, observe_new)| {
             runtime.block_on(async {
                 for bundle in [false, true] {
                     let mut start = fixture.fresh();
@@ -824,14 +820,13 @@ fn dsql_projection_accumulator_growth_accounting() {
                         &mut transition.next_state,
                         &(observe_new.then(|| "new".into()), 0, false),
                     );
-                    let mut activity =
-                        crate::memory::projection_accumulator_tests::activity_fixture();
-                    activity.input = Payloads(vec![tokeira_types::Payload::new(input.clone())]);
-                    let excluded = codec::encode(&activity.input).unwrap().len();
+                    let activity = crate::memory::projection_accumulator_tests::activity_fixture();
                     transition
                         .next_state
                         .activities
                         .insert(activity.activity_id.clone(), activity);
+                    // The activity's empty input and absent header, one byte each.
+                    let excluded = 2 * transition.next_state.activities.len();
                     let mut expected_state = transition.next_state.clone();
                     if observe_new {
                         expected_state
@@ -1122,7 +1117,7 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
 
                     let legacy = legacy_codec::decode_workflow_state(
                         key,
-                        &codec::encode_workflow_state(&ready).unwrap(),
+                        &crate::codec::encode_workflow_state_as_previous_release(&ready).unwrap(),
                     )
                     .unwrap();
                     fixture.replace(&legacy, 0, None).await;

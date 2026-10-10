@@ -188,7 +188,10 @@ pub(crate) fn legacy_step(
     observation: &Observation,
     history_size: i64,
 ) -> (WorkflowState, ProjectionContext) {
-    let bytes = crate::codec::encode_workflow_state(state).unwrap();
+    // The frozen reader refuses this release's envelope version, as the release it
+    // was frozen from does, so it reads the state as the release before this one
+    // wrote it.
+    let bytes = crate::codec::encode_workflow_state_as_previous_release(state).unwrap();
     let mut legacy = legacy_codec::decode_workflow_state(state.run_key, &bytes).unwrap();
     assert!(legacy.used_worker_deployment_versions.is_none());
     legacy.transition_seq = legacy.transition_seq.next();
@@ -506,11 +509,10 @@ proptest! {
     }
 
     // Feature: projection-accumulator, Property 8: exact state growth accounting
-    // Every byte of the folded extension counts; only existing activity-input exclusion remains.
+    // Every byte of the folded extension counts; only the activity's retired fields don't.
     #[test]
     fn projection_accumulator_growth_counts_folded_bytes(
         values in prop::collection::vec("[ab]{0,80}", 0..140),
-        input in prop::collection::vec(any::<u8>(), 0..128),
     ) {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             for bundle in [false, true] {
@@ -522,10 +524,10 @@ proptest! {
                 let mut transition = following(&state);
                 transition.next_state.used_worker_deployment_versions = Some(values.clone());
                 observe(&mut transition.next_state, &(Some("new-observation".into()), 0, false));
-                let mut activity = activity_fixture();
-                activity.input = tokeira_types::Payloads(vec![tokeira_types::Payload::new(input.clone())]);
-                let excluded = crate::codec::encode(&activity.input).unwrap().len();
+                let activity = activity_fixture();
                 transition.next_state.activities.insert(activity.activity_id.clone(), activity);
+                // The activity's empty input and absent header, one byte each.
+                let excluded = 2 * transition.next_state.activities.len();
                 let mut folded = transition.next_state.clone();
                 prepare_workflow_projection(&mut folded, 0).unwrap();
                 let bytes = crate::codec::encode_workflow_state(&folded).unwrap();

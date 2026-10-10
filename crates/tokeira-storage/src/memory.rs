@@ -226,6 +226,8 @@ struct StoreState {
     /// Test hook: how many more transactions of covered writes succeed before
     /// the next one fails without changing anything.
     bulk_write_failure: Option<usize>,
+    /// Test hook: how many of the next reads of one history event fail.
+    history_event_read_failures: usize,
     /// Every covered write transaction's total, for the budget properties.
     #[cfg(test)]
     modeled_transactions: Vec<WriteCost>,
@@ -536,6 +538,14 @@ impl InMemoryStore {
         self.inner.lock().await.bulk_write_failure = Some(succeed);
     }
 
+    /// Make the next `count` reads of one history event
+    /// ([`RunRepository::read_history_event`]) fail. Tests use it to show that
+    /// an activity start whose read of its scheduled event fails changes nothing
+    /// (`activity-inputs-from-history`).
+    pub async fn fail_history_event_reads(&self, count: usize) {
+        self.inner.lock().await.history_event_read_failures = count;
+    }
+
     /// Override the current-execution conflict policy
     /// used by `commit_transition` when a new workflow
     /// start collides with an existing open execution.
@@ -667,12 +677,15 @@ impl InMemoryStore {
 // v4: the per-run `history_size` map, plus the continue-as-new advice fields on
 // `WorkflowState` and `HistoryEventKind::WorkflowTaskStarted` that changed the
 // positional layout of every `runs` and `history` entry.
+// v5: `DispatchableActivityTask` and `DispatchOp::EnqueueActivityTask` lost their
+// input, which changed the layout of the activity dispatch entries and of the
+// transition audit records that hold the op (`activity-inputs-from-history`).
 //
 // Data carried in the snapshot extension after the document (each activity's
 // last heartbeat time) does not change the document and needs no bump; releases
 // without the extension refuse it as trailing bytes (activity-heartbeat-time,
 // Requirement 7).
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 5;
 
 /// Magic that opens the snapshot extension after a snapshot's document (`"TKSX"`).
 pub const SNAPSHOT_EXTENSION_MAGIC: u32 = 0x544B_5358;
@@ -893,6 +906,7 @@ impl SnapshotDoc {
             // Carried by the snapshot extension, after the document.
             bulk_writes: _,
             bulk_write_failure: _,
+            history_event_read_failures: _,
             #[cfg(test)]
                 modeled_transactions: _,
         } = state;
@@ -1002,6 +1016,7 @@ impl SnapshotDoc {
             // Restored from the snapshot extension when the snapshot has one.
             bulk_writes: BTreeMap::new(),
             bulk_write_failure: None,
+            history_event_read_failures: 0,
             #[cfg(test)]
             modeled_transactions: Vec::new(),
         };
@@ -1124,6 +1139,31 @@ impl RunRepository for InMemoryStore {
         storage_metrics::record_read_history_duration(started.elapsed());
         storage_metrics::record_storage_operation("read_history", "success");
         result
+    }
+
+    #[tracing::instrument(name = "storage.read_history_event", skip(self), fields(run_key = %run_key.0, event_id))]
+    async fn read_history_event(
+        &self,
+        run_key: RunKey,
+        event_id: i64,
+    ) -> Result<Option<tokeira_kernel::HistoryEvent>> {
+        let mut store = self.inner.lock().await;
+        if store.history_event_read_failures > 0 {
+            store.history_event_read_failures -= 1;
+            anyhow::bail!(
+                "injected failure reading event {event_id} of run {}",
+                run_key.0
+            );
+        }
+        // A run's history is held in event-id order.
+        let event = store.history.get(&run_key).and_then(|history| {
+            history
+                .binary_search_by_key(&event_id, |event| event.event_id)
+                .ok()
+                .map(|index| history[index].clone())
+        });
+        storage_metrics::record_storage_operation("read_history_event", "success");
+        Ok(event)
     }
 
     #[tracing::instrument(name = "storage.read_attributed_history", skip(self), fields(run_key = %run_key.0, after_event_id, limit))]
@@ -1526,7 +1566,6 @@ impl RunRepository for InMemoryStore {
                                 .or_else(|| state.deployment.clone()),
                             build_id: activity.build_id.clone().or_else(|| state.build_id.clone()),
                         };
-                        entry.task.input = activity.input.clone();
                         entry.task.schedule_event_id = activity.schedule_event_id;
                         entry.task.attempt = activity.attempt;
                         // Keep the dispatch row's stamp in step with the activity
@@ -1580,7 +1619,6 @@ impl RunRepository for InMemoryStore {
             if let DispatchOp::EnqueueActivityTask {
                 queue,
                 activity_id,
-                input,
                 schedule_event_id,
                 attempt,
                 dispatch_revision,
@@ -1603,7 +1641,6 @@ impl RunRepository for InMemoryStore {
                             run_key,
                             queue: queue.clone(),
                             activity_id: activity_id.clone(),
-                            input: input.clone(),
                             schedule_event_id: *schedule_event_id,
                             attempt: *attempt,
                             dispatch_revision: *dispatch_revision,
@@ -4265,8 +4302,8 @@ mod tests {
             task_queue: TaskQueueName("activity-q".into()),
             deployment: None,
             build_id: None,
-            input: tokeira_types::Payloads::default(),
-            header: None,
+            retired_input: Default::default(),
+            retired_header: Default::default(),
             last_failure: None,
             heartbeat_details: None,
             attempt: 2,
@@ -4319,7 +4356,6 @@ mod tests {
             .push(DispatchOp::EnqueueActivityTask {
                 queue: queue.clone(),
                 activity_id: "activity-1".to_owned(),
-                input: tokeira_types::Payloads::default(),
                 schedule_event_id: 7,
                 attempt,
                 dispatch_revision: 4,
@@ -4576,7 +4612,6 @@ mod tests {
         replace.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
             queue: queue.clone(),
             activity_id: "activity-1".to_owned(),
-            input: tokeira_types::Payloads::default(),
             schedule_event_id: 7,
             attempt: 3,
             dispatch_revision: 4,
@@ -4653,7 +4688,6 @@ mod tests {
             .push(DispatchOp::EnqueueActivityTask {
                 queue: queue.clone(),
                 activity_id: "activity-1".to_owned(),
-                input: tokeira_types::Payloads::default(),
                 schedule_event_id: 7,
                 attempt: 1,
                 dispatch_revision: 0,
@@ -4712,7 +4746,6 @@ mod tests {
             .push(DispatchOp::EnqueueActivityTask {
                 queue: old_queue.clone(),
                 activity_id: "activity-1".to_owned(),
-                input: tokeira_types::Payloads::default(),
                 schedule_event_id: 7,
                 attempt: 1,
                 dispatch_revision: 0,
@@ -4783,7 +4816,6 @@ mod tests {
             .push(DispatchOp::EnqueueActivityTask {
                 queue: queue.clone(),
                 activity_id: "activity-1".to_owned(),
-                input: tokeira_types::Payloads::default(),
                 schedule_event_id: 7,
                 attempt: 1,
                 dispatch_revision: 0,
@@ -4847,7 +4879,6 @@ mod tests {
                 .push(DispatchOp::EnqueueActivityTask {
                     queue: queue.clone(),
                     activity_id: activity_id.to_owned(),
-                    input: tokeira_types::Payloads::default(),
                     schedule_event_id: 7,
                     attempt: 1,
                     dispatch_revision: 0,
@@ -4925,7 +4956,6 @@ mod tests {
             .push(DispatchOp::EnqueueActivityTask {
                 queue: queue.clone(),
                 activity_id: "activity-1".to_owned(),
-                input: tokeira_types::Payloads::default(),
                 schedule_event_id: 7,
                 attempt: 1,
                 dispatch_revision: 0,
@@ -5014,7 +5044,6 @@ mod tests {
                 transition.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
                     queue: queue.clone(),
                     activity_id: activity_id.clone(),
-                    input: tokeira_types::Payloads::default(),
                     schedule_event_id: 42,
                     attempt: 3,
                     dispatch_revision: 0,
@@ -5060,7 +5089,6 @@ mod tests {
                 transition.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
                     queue: queue.clone(),
                     activity_id: activity_id.clone(),
-                    input: tokeira_types::Payloads::default(),
                     schedule_event_id: 42,
                     attempt: 3,
                     dispatch_revision: 0,
@@ -5117,7 +5145,6 @@ mod tests {
                 first.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
                     queue: queue.clone(),
                     activity_id: activity_id.clone(),
-                    input: tokeira_types::Payloads::default(),
                     schedule_event_id: 42,
                     attempt: 3,
                     dispatch_revision: 0,
@@ -5151,7 +5178,6 @@ mod tests {
                 conflict.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
                     queue: queue.clone(),
                     activity_id: "other".into(),
-                    input: tokeira_types::Payloads::default(),
                     schedule_event_id: 99,
                     attempt: 1,
                     dispatch_revision: 0,
@@ -5186,7 +5212,6 @@ mod tests {
                     transition.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
                         queue: if idx % 2 == 0 { activity_queue.clone() } else { other_queue.clone() },
                         activity_id: format!("a{idx}"),
-                        input: tokeira_types::Payloads::default(),
                         schedule_event_id: idx as i64,
                         attempt: 1,
                         dispatch_revision: 0,
@@ -5567,7 +5592,7 @@ mod tests {
                                     activity_queues[queue].clone(),
                                     crate::api::BacklogPayload::Activity {
                                         activity_id: "a1".into(),
-                                        input: tokeira_types::Payloads::default(),
+                                        retired_input: Default::default(),
                                         schedule_event_id: 7,
                                         attempt: task as u32 - 1,
                                         dispatch_revision: 0,
@@ -5889,7 +5914,7 @@ mod tests {
                     queue: queue.clone(),
                     payload: crate::api::BacklogPayload::Activity {
                         activity_id: "a1".into(),
-                        input: tokeira_types::Payloads::default(),
+                        retired_input: Default::default(),
                         schedule_event_id: 7,
                         attempt: 1,
                         dispatch_revision: 0,
@@ -5938,7 +5963,6 @@ mod tests {
             .push(DispatchOp::EnqueueActivityTask {
                 queue: sample_queue(TaskKind::Activity),
                 activity_id: "a1".into(),
-                input: tokeira_types::Payloads::default(),
                 schedule_event_id: 3,
                 attempt: 1,
                 dispatch_revision: 0,
@@ -5985,7 +6009,6 @@ mod tests {
                 build_id: None,
             },
             activity_id: "a1".into(),
-            input: tokeira_types::Payloads::default(),
             schedule_event_id: 3,
             attempt: 1,
             dispatch_revision: 0,
@@ -6690,9 +6713,8 @@ mod tests {
                         ),
                         deployment: None,
                         build_id: None,
-                        input:
-                            tokeira_types::Payloads::default(),
-                        header: None,
+                        retired_input: Default::default(),
+                        retired_header: Default::default(),
                         last_failure: None,
                         heartbeat_details: None,
                         attempt: 1,
@@ -6748,8 +6770,6 @@ mod tests {
                         DispatchOp::EnqueueActivityTask {
                             queue,
                             activity_id: act_id,
-                            input:
-                                tokeira_types::Payloads::default(),
                             schedule_event_id: idx as i64,
                             attempt: 1,
                             dispatch_revision: 0,
@@ -6996,7 +7016,6 @@ mod tests {
                     transition.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
                         queue: activity_queue.clone(),
                         activity_id,
-                        input: tokeira_types::Payloads::default(),
                         schedule_event_id: index as i64 + 1,
                         attempt: 1,
                         dispatch_revision: 0,
@@ -7026,7 +7045,7 @@ mod tests {
                                 queue: activity_queue.clone(),
                                 payload: crate::api::BacklogPayload::Activity {
                                     activity_id: format!("backlog-{index}"),
-                                    input: tokeira_types::Payloads::default(),
+                                    retired_input: Default::default(),
                                     schedule_event_id: index as i64 + 1,
                                     attempt: 1,
                                     dispatch_revision: 0,
@@ -7626,7 +7645,6 @@ mod tests {
                         build_id: None,
                     },
                     activity_id: "activity-1".to_owned(),
-                    input: tokeira_types::Payloads::default(),
                     schedule_event_id: 7,
                     attempt: 1,
                     dispatch_revision: 0,
@@ -8230,7 +8248,6 @@ mod tests {
                                 build_id: None,
                             },
                             activity_id: activity_id.clone(),
-                            input: tokeira_types::Payloads::default(),
                             schedule_event_id: activity.schedule_event_id,
                             attempt: activity.attempt,
                             dispatch_revision: 0,
@@ -8630,12 +8647,10 @@ mod tests {
         }
 
         #[test]
-        fn the_measured_state_leaves_out_activity_inputs() {
+        fn the_measured_state_leaves_out_each_activitys_retired_fields() {
             let mut state = sample_state(RunKey::new());
-            for (index, size) in [0usize, 10, 3000].into_iter().enumerate() {
-                let mut activity = activity_state(&format!("activity-{index}"));
-                activity.input =
-                    tokeira_types::Payloads(vec![tokeira_types::Payload::new(vec![1; size])]);
+            for index in 0..3 {
+                let activity = activity_state(&format!("activity-{index}"));
                 state
                     .activities
                     .insert(activity.activity_id.clone(), activity);
@@ -8645,17 +8660,11 @@ mod tests {
                 crate::codec::workflow_state_encoded_len(&state).expect("length"),
                 encoded.len()
             );
-            let measured =
-                crate::codec::measured_state_len(encoded.len(), &state).expect("measure");
-            let mut emptied = state.clone();
-            for activity in emptied.activities.values_mut() {
-                activity.input = tokeira_types::Payloads::default();
-            }
-            // An empty input still encodes its length, one byte.
-            let emptied_len = crate::codec::encode_workflow_state(&emptied)
-                .expect("encode")
-                .len();
-            assert_eq!(measured, emptied_len - emptied.activities.len());
+            // An activity's empty input and absent header encode as one byte each.
+            assert_eq!(
+                crate::codec::measured_state_len(encoded.len(), &state).expect("measure"),
+                encoded.len() - 2 * state.activities.len()
+            );
         }
 
         #[tokio::test]

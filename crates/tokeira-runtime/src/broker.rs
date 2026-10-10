@@ -2582,7 +2582,6 @@ mod tests {
             run_key: RunKey::new(),
             queue,
             activity_id: "activity-1".to_string(),
-            input: Payloads::default(),
             schedule_event_id: 7,
             attempt: 1,
             dispatch_revision: 0,

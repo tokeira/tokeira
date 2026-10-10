@@ -23,6 +23,7 @@
 use std::sync::Arc;
 
 use time::OffsetDateTime;
+use tokeira_kernel::RetiredField;
 use tokeira_storage::{
     BacklogEntry, BacklogPayload, DispatchableActivityTask, DispatchableWorkflowTask, RunRepository,
 };
@@ -244,7 +245,7 @@ pub(crate) async fn drain_once<R>(
                     match entry.payload {
                         BacklogPayload::Activity {
                             activity_id,
-                            input,
+                            retired_input: _,
                             schedule_event_id,
                             attempt,
                             dispatch_revision,
@@ -256,7 +257,6 @@ pub(crate) async fn drain_once<R>(
                                         run_key: entry.run_key,
                                         queue: entry.queue,
                                         activity_id,
-                                        input,
                                         schedule_event_id,
                                         attempt,
                                         dispatch_revision,
@@ -342,7 +342,7 @@ fn activity_to_backlog_entry(task: &crate::broker::TimestampedActivityTask) -> B
         queue: task.task.queue.clone(),
         payload: BacklogPayload::Activity {
             activity_id: task.task.activity_id.clone(),
-            input: task.task.input.clone(),
+            retired_input: RetiredField::default(),
             schedule_event_id: task.task.schedule_event_id,
             attempt: task.task.attempt,
             dispatch_revision: task.task.dispatch_revision,
@@ -691,7 +691,6 @@ mod tests {
                         run_key: RunKey::new(),
                         queue: queue.clone(),
                         activity_id: format!("activity-{index}"),
-                        input: tokeira_types::Payloads::default(),
                         schedule_event_id: 5,
                         attempt: 1,
                         dispatch_revision: 0,
@@ -991,7 +990,7 @@ mod tests {
                         queue: activity_queue.clone(),
                         payload: BacklogPayload::Activity {
                             activity_id: "activity".into(),
-                            input: tokeira_types::Payloads::default(),
+                            retired_input: Default::default(),
                             schedule_event_id: 42,
                             attempt,
                             dispatch_revision: 0,

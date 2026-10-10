@@ -26,14 +26,14 @@ use crate::{
 
 const SHARD_COUNT: u32 = 1;
 
-struct Fixture {
-    pool: PgPool,
-    store: DsqlStore,
+pub(super) struct Fixture {
+    pub(super) pool: PgPool,
+    pub(super) store: DsqlStore,
 }
 
 impl Fixture {
     /// The cluster's store, or none when the live suite isn't configured.
-    async fn connect() -> Result<Option<Self>> {
+    pub(super) async fn connect() -> Result<Option<Self>> {
         let Ok(url) = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL") else {
             return Ok(None);
         };

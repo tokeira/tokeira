@@ -62,6 +62,7 @@ async fn dsql_runtime()
     .await?;
     let (_, repo, _, _, _) = store.into_parts();
     let repo = Arc::new(repo);
+    tokeira_storage::prepare_execution_placement(repo.as_ref()).await?;
     Ok(Some((
         TokeiraRuntime::new(
             repo.clone(),

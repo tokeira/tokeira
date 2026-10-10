@@ -3624,6 +3624,9 @@ impl WorkflowService {
                 DeleteWorkflowRequest {
                     request: batch_request_context(ctx),
                     now: OffsetDateTime::now_utc(),
+                    // A batch purges each run before it deletes the next, so
+                    // the work it leaves queued stays bounded.
+                    purge_inline: true,
                 },
             )
             .await
@@ -3668,6 +3671,8 @@ impl WorkflowService {
                     reapply_exclude_signal: false,
                     reapply_exclude_update: false,
                     post_reset_versioning_overrides: Vec::new(),
+                    // The runtime reads the current pointer when it admits the reset.
+                    expected_current_run_key: None,
                     reason,
                     request: batch_request_context(ctx),
                     now: OffsetDateTime::now_utc(),
@@ -6398,6 +6403,9 @@ impl WorkflowService {
                                 received_at: ctx.received_at,
                             },
                             now,
+                            // DeleteWorkflowExecution returns once the run is
+                            // unreachable; the purger removes the rest.
+                            purge_inline: false,
                         },
                     )
                     .await
@@ -8769,6 +8777,9 @@ impl crate::operator_service::NamespaceDeletionApi for WorkflowService {
                                 received_at: OffsetDateTime::now_utc(),
                             },
                             now: OffsetDateTime::now_utc(),
+                            // The reclaim purges each run before it deletes the
+                            // next, so the work it leaves queued stays bounded.
+                            purge_inline: true,
                         },
                     )
                     .await

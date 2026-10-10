@@ -1,0 +1,5 @@
+kind: fixed
+body: Deletions, resets and backlog spills now stay within DSQL's transaction limits, and a reset no longer leaves two runs open when a start lands while it runs.
+time: 2026-10-09T04:23:13.000000+01:00
+custom:
+    Slice: 496562e4-8af0-4bf0-979d-6fcdefd94208

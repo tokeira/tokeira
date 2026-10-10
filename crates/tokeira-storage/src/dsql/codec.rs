@@ -11,22 +11,27 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
-use tokeira_kernel::{ActivityState, TimerState, state::Priority};
-use tokeira_types::{EventPrincipal, Payloads, ProjectionCursor, WorkflowRuleRecord};
+use tokeira_kernel::{ActivityState, state::Priority};
+use tokeira_types::{Payloads, ProjectionCursor, WorkflowRuleRecord};
 
-// The hot-state and history-batch envelopes live in the feature-independent
-// `crate::codec` so the in-memory store accounts the History Size with the
-// same bytes; they are re-exported here so DSQL call sites keep one codec path.
+// The hot-state and history-batch envelopes, and the encodings of the rows the
+// paged bulk writes size, live in the feature-independent `crate::codec`: the
+// in-memory store accounts the History Size and DSQL's transaction limits with
+// the same bytes. They are re-exported here so DSQL call sites keep one codec
+// path.
 pub use crate::codec::{
-    BlobFormatError, StateExtensionError, decode_history_events, decode_workflow_state,
-    encode_history_events, encode_workflow_state, history_batch_encoded_len, measured_state_len,
+    BlobFormatError, StateExtensionError, decode_backlog_payload, decode_history_events,
+    decode_history_principals, decode_projection_context, decode_timer_state,
+    decode_workflow_state, encode_backlog_payload, encode_history_events,
+    encode_history_principals, encode_projection_context, encode_timer_state,
+    encode_workflow_state, ensure_contiguous_prefix, history_batch_encoded_len, measured_state_len,
+    reset_history_batches,
 };
 use crate::{
-    BacklogPayload, ProjectionContext, StoredTaskQueueConfig, StoredTaskQueueConfigKind,
-    StoredTaskQueueConfigMetadata, StoredWorkerDeployment, WorkerComputeControllerRecord,
+    StoredTaskQueueConfig, StoredTaskQueueConfigKind, StoredTaskQueueConfigMetadata,
+    StoredWorkerDeployment, WorkerComputeControllerRecord,
 };
 
-const BACKLOG_ENVELOPE_VERSION: u32 = 0x544B_4251;
 const TASK_QUEUE_CONFIG_DOCUMENT_VERSION: u32 = 1;
 
 /// Postcard's encoded empty sequence retained for the locked `projection_log.ops_data` column.
@@ -35,13 +40,6 @@ const TASK_QUEUE_CONFIG_DOCUMENT_VERSION: u32 = 1;
 /// this column `NOT NULL`. Writing the established one-byte representation keeps
 /// new rows compatible without retaining the retired kernel type or its codec.
 pub const LEGACY_EMPTY_PROJECTION_OPS_DATA: &[u8] = &[0];
-
-#[derive(Serialize, serde::Deserialize)]
-struct BacklogEnvelope {
-    version: u32,
-    payload: BacklogPayload,
-    priority: Option<Priority>,
-}
 
 #[derive(Serialize, serde::Deserialize)]
 struct TaskQueueConfigDocument {
@@ -84,16 +82,6 @@ pub fn decode_worker_compute_controller(bytes: &[u8]) -> Result<WorkerComputeCon
     decode(bytes)
 }
 
-/// Serialize the batch-aligned history-principal sidecar.
-pub fn encode_history_principals(principals: &[Option<EventPrincipal>]) -> Result<Vec<u8>> {
-    encode(&principals)
-}
-
-/// Deserialize the batch-aligned history-principal sidecar.
-pub fn decode_history_principals(bytes: &[u8]) -> Result<Vec<Option<EventPrincipal>>> {
-    decode(bytes)
-}
-
 /// Serialize an `activity_state` row. Nothing writes these rows any more, and
 /// sweeps read activities from run state; the layout stays for rows that
 /// earlier releases wrote (`activity-state-writes`).
@@ -104,43 +92,6 @@ pub fn encode_activity_state(state: &ActivityState) -> Result<Vec<u8>> {
 /// Deserialize one activity side-table row.
 pub fn decode_activity_state(bytes: &[u8]) -> Result<ActivityState> {
     decode(bytes)
-}
-
-/// Serialize timer metadata that is not already indexed in `timer_bucket`.
-pub fn encode_timer_state(state: &TimerState) -> Result<Vec<u8>> {
-    encode(state)
-}
-
-/// Deserialize one timer side-table row.
-pub fn decode_timer_state(bytes: &[u8]) -> Result<TimerState> {
-    decode(bytes)
-}
-
-/// Serialize backlog payload and public delivery metadata for the generic backlog table.
-pub fn encode_backlog_payload(
-    payload: &BacklogPayload,
-    priority: Option<&Priority>,
-) -> Result<Vec<u8>> {
-    encode(&BacklogEnvelope {
-        version: BACKLOG_ENVELOPE_VERSION,
-        payload: payload.clone(),
-        priority: priority.cloned(),
-    })
-}
-
-/// Deserialize backlog payload and delivery metadata after a queue drain.
-///
-/// Before the schema baseline, rows contained a bare [`BacklogPayload`]. The
-/// explicit envelope marker prevents an old enum discriminant from being
-/// mistaken for the new shape, while the fallback keeps a real old byte fixture
-/// readable with default Priority.
-pub fn decode_backlog_payload(bytes: &[u8]) -> Result<(BacklogPayload, Option<Priority>)> {
-    if let Ok(envelope) = decode::<BacklogEnvelope>(bytes)
-        && envelope.version == BACKLOG_ENVELOPE_VERSION
-    {
-        return Ok((envelope.payload, envelope.priority));
-    }
-    decode(bytes).map(|payload| (payload, None))
 }
 
 /// Serialize activity input payloads for `activity_dispatch.input_data`.
@@ -164,16 +115,6 @@ pub fn encode_priority(priority: &Priority) -> Result<Vec<u8>> {
 
 /// Deserialize effective activity dispatch Priority.
 pub fn decode_priority(bytes: &[u8]) -> Result<Priority> {
-    decode(bytes)
-}
-
-/// Serialize projection delivery context for replayable projection records.
-pub fn encode_projection_context(ctx: &ProjectionContext) -> Result<Vec<u8>> {
-    encode(ctx)
-}
-
-/// Deserialize projection delivery context.
-pub fn decode_projection_context(bytes: &[u8]) -> Result<ProjectionContext> {
     decode(bytes)
 }
 
@@ -293,6 +234,7 @@ pub fn decode_workflow_rule(bytes: &[u8]) -> Result<WorkflowRuleRecord> {
 mod tests {
     use std::collections::BTreeMap;
 
+    use crate::{BacklogPayload, ProjectionContext};
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_kernel::{HistoryEvent, HistoryEventKind};

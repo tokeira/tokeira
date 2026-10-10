@@ -334,7 +334,8 @@ fn continue_as_new_advice_policy() -> ContinueAsNewAdvicePolicy;
 *For any* sequence of committed transitions for a run in either store, the persisted
 History Size after each commit SHALL equal the sum of `history_batch_encoded_len` over
 every batch committed so far; it SHALL be non-decreasing; a fresh run SHALL start at `0`;
-a reset successor SHALL start at the encoded size of its copied prefix; deleting the run
+a reset successor SHALL start at the sum of the encoded sizes of the batches holding its
+copied prefix; deleting the run
 SHALL remove it; and every visibility record built from a commit SHALL carry the value at
 that commit.
 

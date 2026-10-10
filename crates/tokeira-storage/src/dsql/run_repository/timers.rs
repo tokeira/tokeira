@@ -97,9 +97,35 @@ impl DsqlRunRepository {
     }
 
     #[instrument(name = "dsql.delete_due_timer_if_matches", skip(self, timer), fields(run_key = %timer.run_key.0, timer_id = %timer.timer_id))]
-    pub(super) async fn do_delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
+    pub(super) async fn do_delete_due_timer_if_matches(
+        &self,
+        timer: &DueTimer,
+        reason: crate::StaleTimer,
+    ) -> Result<bool> {
         record_dsql_operation!(self, "delete_due_timer_if_matches", None, {
             let mut permit = self.director.acquire(DbClass::Commit).await?;
+            let mut tx = permit.connection()?.begin().await?;
+            if reason == crate::StaleTimer::RunMissing {
+                // A reset's successor holds its timer rows before its final
+                // transaction makes it visible (`bounded-bulk-writes`). Plain
+                // reads suffice, in this transaction's one snapshot: if the
+                // final transaction committed before it, the run has mutable
+                // state, and if not, it has its materializing record. The row
+                // stays either way; only a run with neither loses it.
+                let (kept,) = sqlx::query_as::<_, (bool,)>(
+                    "SELECT EXISTS (SELECT 1 FROM workflow_hot WHERE run_key = $1)
+                         OR EXISTS (SELECT 1 FROM run_bulk_write
+                                    WHERE run_key = $1 AND phase = $2)",
+                )
+                .bind(timer.run_key.0)
+                .bind(crate::BulkWritePhase::Materializing.to_db_smallint())
+                .fetch_one(&mut *tx)
+                .await?;
+                if kept {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+            }
             // `fire_at` is part of the row's primary key, so matching it
             // deletes exactly the row the scan read: a later timer that
             // reuses the id has a different fire time and survives.
@@ -110,8 +136,9 @@ impl DsqlRunRepository {
             .bind(timer.run_key.0)
             .bind(&timer.timer_id)
             .bind(timer.fire_at)
-            .execute(permit.connection()?)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             Ok(result.rows_affected() > 0)
         })
     }

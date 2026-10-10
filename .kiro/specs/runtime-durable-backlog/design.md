@@ -84,7 +84,7 @@ TokeiraRuntime
 
 Both brokers use `tokio::sync::Mutex`. The grace scanner and drain loop share the broker lock with pollers and publishers. Critical sections must be kept short:
 
-- **Grace scanner**: lock → scan + collect expired → remove from ready + dedup → unlock → call `persist_to_backlog` (outside lock).
+- **Grace scanner**: lock → scan + collect expired → remove from ready + dedup → unlock → call `persist_to_backlog` (outside lock). The repository writes the call's entries in pages, each a transaction of its own ([bounded-bulk-writes](../bounded-bulk-writes/design.md)).
 - **Drain loop**: call `drain_backlog` (no lock) → lock → re-publish each task → unlock.
 - **Pollers/publishers**: unchanged, already short critical sections.
 
@@ -376,7 +376,7 @@ When the drain loop receives a `BacklogEntry`, it reconstructs the dispatchable 
 
 ### Property 5: Persist failure retains tasks in live-ready
 
-*For any* set of expired tasks in the live-ready tier, if `persist_to_backlog` returns an error, all expired tasks SHALL remain in the live-ready tier with their dedup keys intact, and SHALL be eligible for persistence on the next scan cycle.
+*For any* set of expired tasks in the live-ready tier, if `persist_to_backlog` returns an error, the expired tasks it did not persist SHALL be back in the live-ready tier with their dedup keys intact, and SHALL be eligible for persistence on the next scan cycle. The tasks it persisted SHALL be in durable backlog and in no broker.
 
 **Validates: Requirements 3.7**
 
@@ -414,8 +414,8 @@ When the drain loop receives a `BacklogEntry`, it reconstructs the dispatchable 
 
 ### `persist_to_backlog` Failure
 
-- **Behavior**: Grace scanner retains expired tasks in the live-ready tier. Dedup keys are NOT removed. Tasks are retried on the next scan cycle.
-- **Safety**: Tasks remain deliverable from live-ready. No data loss.
+- **Behavior**: The call stops at the first transaction that fails and reports how many entries the transactions before it stored. The grace scanner re-publishes the tasks after those, and only those, to the live-ready tier, with their dedup keys, and retries them on the next scan cycle.
+- **Safety**: Every task is deliverable from live-ready or durable backlog, and none from both. No data loss.
 - **Logging**: `tracing::warn!` with the error, queue, and count of affected tasks.
 
 ### Duplicate Backlog Identity
@@ -464,7 +464,7 @@ Tests will use:
 
 - Default `BacklogConfig` values are in expected ranges (Requirements 2.2, 2.3, 3.6).
 - Zero grace window edge case (Requirement 2.4).
-- Batching: multiple expired tasks produce a single `persist_to_backlog` call (Requirement 3.5).
+- Batching: multiple expired tasks produce a single `persist_to_backlog` call (Requirement 3.5), which the repository writes in pages within the budgets of [bounded-bulk-writes](../bounded-bulk-writes/design.md).
 - No-waiters skip: drain loop makes zero `drain_backlog` calls when no pollers are registered (Requirement 10.4).
 - `BacklogEntry` construction: correct `BacklogPayload` variant for workflow vs activity tasks (Requirement 9.3).
 - DSQL `persist_to_backlog` statement shape: the insert carries `ON CONFLICT (key) DO NOTHING` (Requirement 3.8).

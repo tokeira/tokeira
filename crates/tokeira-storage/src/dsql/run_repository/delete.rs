@@ -2,29 +2,32 @@
 //!
 //! Deletion is deliberately separate from the kernel transition writer: an
 //! open run first closes through the ordinary lane/kernel path, then this module
-//! atomically appends a visibility tombstone and purges the closed run's
-//! authoritative and dispatch rows. The sequence and execution-home epoch are
-//! checked inside the same transaction so a stale owner cannot partially erase
-//! a run.
+//! makes the closed run unreachable in one transaction: it appends a visibility
+//! tombstone, removes the current pointer, the run's mutable state and its
+//! workflow dispatch row, and records the run for purging. The sequence and
+//! execution-home epoch are checked inside that transaction, so a stale owner
+//! cannot erase any of a run.
+//!
+//! The run's other rows can outnumber what one DSQL transaction may change, so
+//! the purge in `bulk_write` removes them in pages, history last
+//! (`bounded-bulk-writes`).
 
 use super::*;
 
 const CURRENT_EXECUTION_DELETE_STATEMENT: &str =
     "DELETE FROM current_execution WHERE key = $1 AND run_key = $2";
-const RUN_OWNED_DELETE_STATEMENTS: [&str; 8] = [
-    "DELETE FROM request_dedupe WHERE run_key = $1",
-    // Nothing writes `activity_state` any more; this clears the rows that
-    // earlier releases wrote (`activity-state-writes` criterion 3.2).
-    "DELETE FROM activity_state WHERE run_key = $1",
-    "DELETE FROM timer_bucket WHERE run_key = $1",
-    "DELETE FROM activity_dispatch WHERE run_key = $1",
+/// The first transaction's removals besides the pointer: the dispatch row a
+/// closed run no longer needs, then the mutable state every lookup reads.
+const FIRST_TRANSACTION_DELETE_STATEMENTS: [&str; 2] = [
     "DELETE FROM workflow_dispatch WHERE run_key = $1",
-    "DELETE FROM dispatch_backlog WHERE run_key = $1",
     "DELETE FROM workflow_hot WHERE run_key = $1",
-    // History is last so a future non-transactional backend never exposes
-    // mutable state whose branch is gone.
-    "DELETE FROM history_batch WHERE run_key = $1",
 ];
+
+/// The record the purge finishes from. A plain insert: the run has mutable
+/// state, so it has no record (`bounded-bulk-writes`).
+const RECORD_PURGE_STATEMENT: &str =
+    "INSERT INTO run_bulk_write (run_key, shard_id, phase, created_at)
+     VALUES ($1, $2, $3, now())";
 
 impl DsqlRunRepository {
     pub(super) async fn do_delete_run_for_bundle(
@@ -142,9 +145,10 @@ impl DsqlRunRepository {
                 };
 
                 // Temporal deletes visibility/current/mutable/history in that
-                // order (`service/history/shard/context_impl.go @ v1.31.0`).
-                // DSQL makes the full write set atomic, while retaining the
-                // same logical order and keeping history last.
+                // order, each stage safe to retry
+                // (`service/history/shard/context_impl.go:941-963 @ v1.31.0`).
+                // This transaction is the first three stages at once; the
+                // purge is the fourth, history last.
                 sqlx::query(
                     "INSERT INTO projection_log
                      (partition_id, fanout, run_key, transition_seq, context_data, ops_data, created_at)
@@ -170,12 +174,18 @@ impl DsqlRunRepository {
                     .execute(&mut *tx)
                     .await?;
 
-                for statement in RUN_OWNED_DELETE_STATEMENTS {
+                for statement in FIRST_TRANSACTION_DELETE_STATEMENTS {
                     sqlx::query(statement)
                         .bind(run_key.0)
                         .execute(&mut *tx)
                         .await?;
                 }
+                sqlx::query(RECORD_PURGE_STATEMENT)
+                    .bind(run_key.0)
+                    .bind(Self::shard_id_to_uuid(execution_home_bundle))
+                    .bind(crate::BulkWritePhase::Purging.to_db_smallint())
+                    .execute(&mut *tx)
+                    .await?;
 
                 match tx.commit().await {
                     Ok(()) => Ok(DeleteRunResult::Deleted { tombstone }),
@@ -195,7 +205,7 @@ impl DsqlRunRepository {
 
 #[cfg(test)]
 mod tests {
-    use super::{CURRENT_EXECUTION_DELETE_STATEMENT, RUN_OWNED_DELETE_STATEMENTS};
+    use super::{CURRENT_EXECUTION_DELETE_STATEMENT, FIRST_TRANSACTION_DELETE_STATEMENTS};
 
     #[test]
     fn current_execution_delete_is_conditional_on_pointer_and_target() {
@@ -206,8 +216,8 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_delete_covers_every_run_owned_table_and_history_is_last() {
-        let tables: Vec<_> = RUN_OWNED_DELETE_STATEMENTS
+    fn the_first_transaction_removes_the_dispatch_row_and_the_mutable_state() {
+        let tables: Vec<_> = FIRST_TRANSACTION_DELETE_STATEMENTS
             .iter()
             .map(|statement| {
                 statement
@@ -216,19 +226,6 @@ mod tests {
                     .expect("delete statement table")
             })
             .collect();
-
-        assert_eq!(
-            tables,
-            [
-                "request_dedupe",
-                "activity_state",
-                "timer_bucket",
-                "activity_dispatch",
-                "workflow_dispatch",
-                "dispatch_backlog",
-                "workflow_hot",
-                "history_batch",
-            ]
-        );
+        assert_eq!(tables, ["workflow_dispatch", "workflow_hot"]);
     }
 }

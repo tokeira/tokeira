@@ -77,11 +77,19 @@ where
             biased;
             _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped during shard recovery")),
             _ = recovery.acquisition.cancel.cancelled() => return Err(anyhow!("shard recovery acquisition cancelled")),
-            result = crate::recovery::sweep_shard_inner(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
-                &workflow_tracking, &tracking,
-                &activity_tracking,
-                &nexus_tracking,
-                &callback_tracking, &retry, reconciliation.then_some(&repair)) => result?,
+            result = async {
+                let swept = crate::recovery::sweep_shard_inner(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
+                    &workflow_tracking, &tracking,
+                    &activity_tracking,
+                    &nexus_tracking,
+                    &callback_tracking, &retry, reconciliation.then_some(&repair)).await?;
+                // Before activation, on both of the sweep's paths: switch the
+                // materializations recorded on the shard and hand its records
+                // to the purger, checking the acquisition as the repair does.
+                crate::purge::recover_bulk_writes(shard_id, self.repo.as_ref(), &self.purger,
+                    reconciliation.then_some(&repair)).await?;
+                anyhow::Ok(swept)
+            } => result?,
         };
         Self::settle_self_assigned_recovery(&mut recovery, Ok(result))
     }
@@ -247,11 +255,19 @@ where
             _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped during shard recovery")),
             _ = cancel.cancelled() => return Err(anyhow!("shard acquisition cancelled during recovery")),
             _ = &mut lost_rx => return Err(anyhow!("shard lease lost during recovery")),
-            result = crate::recovery::sweep_shard_inner(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
-                &workflow_tracking, &tracking,
-                &activity_tracking,
-                &nexus_tracking,
-                &callback_tracking, &retry, reconciliation.then_some(&repair)) => { result?; }
+            result = async {
+                crate::recovery::sweep_shard_inner(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
+                    &workflow_tracking, &tracking,
+                    &activity_tracking,
+                    &nexus_tracking,
+                    &callback_tracking, &retry, reconciliation.then_some(&repair)).await?;
+                // Before activation, on both of the sweep's paths: switch the
+                // materializations recorded on the shard and hand its records
+                // to the purger, checking the acquisition as the repair does.
+                crate::purge::recover_bulk_writes(shard_id, self.repo.as_ref(), &self.purger,
+                    reconciliation.then_some(&repair)).await?;
+                anyhow::Ok(())
+            } => { result?; }
         }
         // No await between final loss inspection and activation. Generation and
         // cancellation are checked under the same owner lock as replacement.

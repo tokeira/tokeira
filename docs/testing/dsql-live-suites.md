@@ -50,6 +50,8 @@ point them at a database holding application data.
 | Storage `workflow_dispatch_live_repair_decode_and_encoding_failures_preserve_authority` | 1 | Wrong-home, corrupt hot bytes and invalid sequence encoding abort repair without partial changes; `dsql-integration`, URL gate only |
 | Runtime `workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs` | 1 | Real lease acquisition, interrupted recovery and rejected old-generation installs in all recovery trackers; runtime `dsql-integration`, URL gate only; run after storage schema bootstrap |
 | Storage `workflow_dispatch_live_query_plans` | 1 | Before/after queue Live/Exact and actual home page SQL, including full traversal of deep equal-time pages, with 16,384 seeded rows; set `TOKEIRA_WORKFLOW_DISPATCH_PLAN_OUTPUT` to save plans and selectivity; `dsql-integration`, URL gate only |
+| Storage `dsql_bulk_` (`bulk_write_tests`) | 10 | The paged bulk writes: spills of more than 3,000 rows or 10 MiB, the deletion of a run owning more than 3,000 rows, resets whose copied history is over 1 MiB or 10 MiB or whose successor holds 3,500 timers, a reset of a closed workflow, a start between a reset's commit and its materialization, a purge resumed by two purges at once, and an abandoned materialization refusing its open transaction; `dsql-integration`, URL gate only |
+| Storage `dsql_transaction_limits` | 6 | DSQL's transaction limits, apart from the bulk writes' budgets: 3,000 rows, deleted rows included and rows read `FOR UPDATE` not; 9 MiB of values but not 10, deleted rows not counted; 1 MiB a value; `dsql-integration`, URL gate only |
 
 Run the suites and their test cases serially against the selected database. The shard
 fixtures reuse a deterministic shard ID across nextest's separate test processes:
@@ -85,6 +87,15 @@ the existing DSQL storage dependency. Run it serially in the same cluster lifecy
 
 ```bash
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --lib -E 'test(workflow_dispatch_live_acquisition)'
+```
+
+The bulk-write tests and the limits probe also use only `TOKEIRA_DSQL_TEST_DATABASE_URL`.
+The bulk-write tests apply the embedded migrations; the probe creates and writes only its own
+table, `dsql_limits_probe`. Run them serially on an ephemeral cluster:
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(dsql_bulk_)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_transaction_limits --test-threads 1
 ```
 
 ## Endpoint-gated IAM connector

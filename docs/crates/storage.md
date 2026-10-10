@@ -14,7 +14,7 @@ optimistic and ownership fences, and exposes ordered projection records.
 
 | Area | Representative contracts |
 |---|---|
-| Workflow authority | `RunRepository`, `CommitResult`, request deduplication, transition audit, reset successor materialization |
+| Workflow authority | `RunRepository`, `CommitResult`, request deduplication, transition audit, run deletion and purge, reset successor materialization |
 | Ownership | `LeaseRepository`, `ControlRepository`, `BundleLease`, `LeaseOutcome` |
 | Derived work | Dispatchable workflow/activity tasks, durable backlog, timer and timeout sweep records |
 | Projection feed | `ProjectionLog`, `ProjectionRecord`, partitioned `ProjectionCursor` batches |

@@ -562,7 +562,8 @@ proptest! {
                         let run_id = RunId::new();
                         let key = RunKey::derive(base_state.namespace_id, &base_state.workflow_id, run_id);
                         let fork = if generation == 0 { 10 } else { 7 };
-                        store.materialize_reset_successor(predecessor, fork, run_id).await.unwrap();
+                        let expected = store.find_latest_run(base_state.namespace_id, &base_state.workflow_id).await.unwrap();
+                        store.materialize_reset_successor(predecessor, fork, run_id, expected).await.unwrap();
                         {
                             let mut durable = store.inner.lock().await;
                             assert_eq!(durable.runs[&key].used_worker_deployment_versions, Some(Vec::new()));
@@ -614,7 +615,8 @@ proptest! {
                 let first = applied(commit(&store, start, bundle, ShardEpoch::ZERO).await.unwrap());
                 if boundary == 2 {
                     let new_id = RunId::new();
-                    store.materialize_reset_successor(key, 10, new_id).await.unwrap();
+                    let expected = store.find_latest_run(first.namespace_id, &first.workflow_id).await.unwrap();
+                    store.materialize_reset_successor(key, 10, new_id, expected).await.unwrap();
                     key = RunKey::derive(first.namespace_id, &first.workflow_id, new_id);
                 }
                 for (index, observation) in steps.iter().enumerate() {

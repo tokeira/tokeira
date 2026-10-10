@@ -25,7 +25,7 @@ use tokeira_kernel::{
     Command, Reject, TimerDueRequest, WORKFLOW_START_DELAY_TIMER_ID,
     WorkflowStartDelayElapsedRequest,
 };
-use tokeira_storage::{DueTimer, RunRepository};
+use tokeira_storage::{DueTimer, RunRepository, StaleTimer};
 use tokeira_types::{RunKey, ShardId, dsql_spread_uuid};
 use tokio_util::sync::CancellationToken;
 
@@ -97,19 +97,25 @@ pub(crate) fn command_for_due_timer(due: DueTimer, fired_at: OffsetDateTime) -> 
     }
 }
 
-/// Whether `error` is the kernel rejecting a due timer because its run has
-/// closed or no longer exists.
+/// Why the kernel rejected a due timer, when its run has closed or doesn't
+/// exist.
 ///
 /// Such a timer can never fire. v1.31.0 discards the task when it runs: the
 /// timer executor answers `ErrWorkflowExecutionNotFound` or
 /// `ErrWorkflowCompleted`, both NotFound
 /// (timer_queue_active_task_executor.go:154-157, 178-181 @ v1.31.0), and the
 /// queue completes a NotFound task instead of retrying it
-/// (queues/executable.go:401 @ v1.31.0).
-fn rejected_because_run_is_gone(error: &anyhow::Error) -> bool {
+/// (queues/executable.go:401 @ v1.31.0). A missing run may be a reset's
+/// successor still being materialized, whose timer rows precede its state
+/// (`bounded-bulk-writes`), so storage keeps those rows.
+fn rejected_because_run_is_gone(error: &anyhow::Error) -> Option<StaleTimer> {
     error
         .downcast_ref::<KernelRejected>()
-        .is_some_and(|rejected| matches!(rejected.0, Reject::RunClosed(_) | Reject::MissingRun))
+        .and_then(|rejected| match rejected.0 {
+            Reject::RunClosed(_) => Some(StaleTimer::RunClosed),
+            Reject::MissingRun => Some(StaleTimer::RunMissing),
+            _ => None,
+        })
 }
 
 /// Settle a due timer whose submission failed, as every pass over due timers
@@ -128,8 +134,8 @@ pub(crate) async fn settle_failed_due_timer<R>(
 where
     R: RunRepository + ?Sized,
 {
-    if rejected_because_run_is_gone(error) {
-        return delete_stale_due_timer(repo, due).await;
+    if let Some(reason) = rejected_because_run_is_gone(error) {
+        return delete_stale_due_timer(repo, due, reason).await;
     }
     if error.to_string().contains("kernel rejected") {
         tracing::debug!(
@@ -153,11 +159,11 @@ where
 
 /// Delete the row of a due timer whose run is gone, if it is still the row
 /// the scan read. Returns whether a row was deleted.
-async fn delete_stale_due_timer<R>(repo: &R, due: &DueTimer) -> bool
+async fn delete_stale_due_timer<R>(repo: &R, due: &DueTimer, reason: StaleTimer) -> bool
 where
     R: RunRepository + ?Sized,
 {
-    match repo.delete_due_timer_if_matches(due).await {
+    match repo.delete_due_timer_if_matches(due, reason).await {
         Ok(deleted) => deleted,
         Err(error) => {
             tracing::warn!(
@@ -291,6 +297,27 @@ mod tests {
     use proptest::prelude::*;
     use tokeira_types::RunKey;
     use uuid::Uuid;
+
+    // A timer rejected because its run is missing keeps that reason, so storage
+    // can keep the row of a run still being materialized (`bounded-bulk-writes`).
+    #[test]
+    fn a_stale_timers_reason_is_the_kernels() {
+        let rejection = |reject| anyhow::Error::new(KernelRejected(reject));
+        assert_eq!(
+            rejected_because_run_is_gone(&rejection(Reject::MissingRun)),
+            Some(StaleTimer::RunMissing)
+        );
+        assert_eq!(
+            rejected_because_run_is_gone(&rejection(Reject::RunClosed(
+                tokeira_types::ExecutionStatus::Completed
+            ))),
+            Some(StaleTimer::RunClosed)
+        );
+        assert_eq!(
+            rejected_because_run_is_gone(&rejection(Reject::UnknownTimer("t".into()))),
+            None
+        );
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]

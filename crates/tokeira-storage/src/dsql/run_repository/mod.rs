@@ -80,6 +80,9 @@ macro_rules! record_dsql_commit_operation {
 }
 
 mod activity;
+mod bulk_write;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod bulk_write_tests;
 mod commit;
 mod delete;
 mod dispatch;
@@ -573,9 +576,32 @@ impl RunRepository for DsqlRunRepository {
         base_run_key: RunKey,
         fork_event_id: i64,
         successor_run_id: RunId,
+        expected_current: Option<RunKey>,
     ) -> Result<()> {
-        self.do_materialize_reset_successor(base_run_key, fork_event_id, successor_run_id)
-            .await
+        self.do_materialize_reset_successor(
+            base_run_key,
+            fork_event_id,
+            successor_run_id,
+            expected_current,
+        )
+        .await
+    }
+
+    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()> {
+        self.do_abandon_materialization(run_key).await
+    }
+
+    async fn purge_run(&self, run_key: RunKey) -> Result<()> {
+        self.do_purge_run(run_key).await
+    }
+
+    async fn list_run_bulk_writes(
+        &self,
+        shard_id: ShardId,
+        after: Option<RunKey>,
+        limit: usize,
+    ) -> Result<Vec<crate::RunBulkWrite>> {
+        self.do_list_run_bulk_writes(shard_id, after, limit).await
     }
 
     async fn reconcile_workflow_dispatch_run(&self, home: ShardId, run_key: RunKey) -> Result<()> {
@@ -647,7 +673,10 @@ impl RunRepository for DsqlRunRepository {
         self.do_delete_activity_dispatch_if_matches(candidate).await
     }
 
-    async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
+    async fn persist_to_backlog(
+        &self,
+        entries: Vec<BacklogEntry>,
+    ) -> std::result::Result<(), crate::BacklogPersistError> {
         self.do_persist_to_backlog(entries).await
     }
 
@@ -702,8 +731,12 @@ impl RunRepository for DsqlRunRepository {
             .await
     }
 
-    async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
-        self.do_delete_due_timer_if_matches(timer).await
+    async fn delete_due_timer_if_matches(
+        &self,
+        timer: &DueTimer,
+        reason: crate::StaleTimer,
+    ) -> Result<bool> {
+        self.do_delete_due_timer_if_matches(timer, reason).await
     }
 }
 
@@ -1443,7 +1476,7 @@ mod tests {
             )
             .await;
         let _ = repo
-            .materialize_reset_successor(run_key, 1, RunId::new())
+            .materialize_reset_successor(run_key, 1, RunId::new(), None)
             .await;
 
         assert_eq!(recorder.classes(), vec![DbClass::Commit, DbClass::Commit]);

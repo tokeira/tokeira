@@ -1757,7 +1757,7 @@ mod tests {
         let plans = MigrationRunner::embedded()
             .dry_run()
             .expect("embedded migrations are valid");
-        assert_eq!(plans.len(), 76);
+        assert_eq!(plans.len(), 80);
         assert!(plans.iter().all(|plan| migration_is_idempotent(&plan.sql)));
     }
 

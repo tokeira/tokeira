@@ -140,7 +140,7 @@ pub(crate) struct RepairAcquisition {
 }
 
 impl RepairAcquisition {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         crate::serving_gate::validate(&self.owner, &self.acquisition)
     }
 

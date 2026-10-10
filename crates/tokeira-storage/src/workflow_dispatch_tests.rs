@@ -436,9 +436,14 @@ async fn atomic_case(
     if reset > 0 {
         let run_id = RunId::new();
         let key = RunKey::derive(state.namespace_id, &state.workflow_id, run_id);
+        let expected = backend
+            .repo()
+            .find_latest_run(state.namespace_id, &state.workflow_id)
+            .await
+            .unwrap();
         backend
             .repo()
-            .materialize_reset_successor(state.run_key, [0, 3, 4, 7][reset], run_id)
+            .materialize_reset_successor(state.run_key, [0, 3, 4, 7][reset], run_id, expected)
             .await
             .unwrap();
         let LoadedRun::Existing(successor) = backend.repo().load_run(key).await.unwrap() else {
@@ -587,9 +592,14 @@ pub(crate) async fn reset_materialization(backend: &impl Backend) {
         let mut stale = source.clone();
         stale.run_key = key;
         backend.seed_stale_row(&stale).await.unwrap();
+        let expected = backend
+            .repo()
+            .find_latest_run(source.namespace_id, &source.workflow_id)
+            .await
+            .unwrap();
         backend
             .repo()
-            .materialize_reset_successor(source.run_key, boundary, run_id)
+            .materialize_reset_successor(source.run_key, boundary, run_id, expected)
             .await
             .unwrap();
         let LoadedRun::Existing(state) = backend.repo().load_run(key).await.unwrap() else {

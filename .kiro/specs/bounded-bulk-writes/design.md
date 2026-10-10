@@ -153,7 +153,7 @@ _For any_ reset of an open or a closed workflow, and any start, close or deletio
 
 ### The bulk-write record (`crates/tokeira-storage/migrations/`)
 
-The spec adds four migrations, which take the next four free numbers: V077 to V080 at the time of writing. If another change adds a migration first, they move up, and nothing else here changes.
+The spec adds four migrations, V077 to V080.
 
 - `V077__run_bulk_write.sql` creates `run_bulk_write (run_key UUID NOT NULL, shard_id UUID NOT NULL, phase SMALLINT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (run_key))`. The phase is 1 for `materializing` and 2 for `purging`. The application validates it, since DSQL has no `CHECK`.
 - `V078__idx_run_bulk_write_shard.sql` adds `CREATE INDEX ASYNC ... ON run_bulk_write (shard_id, run_key)`, so a shard's records page by run key.
@@ -168,7 +168,7 @@ The spec adds four migrations, which take the next four free numbers: V077 to V0
 
 ### Indexes for the purge
 
-- `V079__idx_request_dedupe_run_key.sql` and `V080__idx_dispatch_backlog_run_key.sql` index those tables by `run_key`, `ASYNC`. Today's deletion scans both tables in full, once per deleted run. A paged purge would scan them once per page, so a namespace's reclaim would scan them once per page of every run. The other run-owned tables already have a run-key index or key prefix: V021, V022, V028 and the primary keys of `workflow_dispatch` and `history_batch`.
+- `V079__idx_request_dedupe_run_key.sql` and `V080__idx_dispatch_backlog_run_key.sql` index those tables by `(run_key, key)`, `ASYNC`, so a purge reads each page of a run's keys in key order from the index. Today's deletion scans both tables in full, once per deleted run. A paged purge would scan them once per page, so a namespace's reclaim would scan them once per page of every run. The other run-owned tables already have a run-key index or key prefix: V021, V022, V028 and the primary keys of `workflow_dispatch` and `history_batch`.
 - The migration bookkeeping follows V074-V076:
   - the schema contracts in `crates/tokeira-storage` and `crates/tokeira-build-info`;
   - the baseline lock and the build information;
@@ -214,7 +214,7 @@ The memory store mirrors this under its lock: it removes the run, its pointers a
   - `dispatch_backlog`;
   - `history_batch`, last.
 
-  Each transaction selects a page of the table's keys for the run, in key order, and deletes them.
+  Each transaction selects a page of the table's keys for the run, in key order, and deletes the run's rows up to the page's last key, which are exactly the page.
 - The transaction that deletes the run's last history rows also deletes the record, within the same 1,000 rows. A run with no history rows left has its record deleted alone.
 - Every step is a delete of rows that no one recreates: the run has no mutable state, so no commit writes to it. Repeating a step, or running two purges of the run at once, deletes nothing twice. A transaction refused with a serialization conflict, as one of two concurrent purges can be, is retried, as the materialization's are. The record goes only when every table is empty, so a purge that stops early leaves the record for the next attempt (Property 4).
 
@@ -223,7 +223,7 @@ The memory store mirrors this under its lock: it removes the run, its pointers a
 The call gains the run the successor replaces as current: `materialize_reset_successor(base_run_key, fork_event_id, successor_run_id, expected_current)`, where `expected_current` is an `Option<RunKey>`.
 - `reset_workflow` reads it when it admits the reset, with `find_latest_run`. That returns the run the current pointer names, whether the run is open or closed, or none when there is no pointer.
 - The open-only run that `reset_workflow` resolves today, through `resolve_execution` without a run id, can't serve. It reads a closed current run as none, so every reset of a closed workflow would fail the check. It stays for the step that terminates a distinct open current run.
-- `reset_workflow`'s comment says `find_latest_run` orders runs by start time. That is out of date, since both stores read the pointer, and the code PR corrects it. The edge already picks a reset's base with `find_latest_run` when the request names no run.
+- Both stores answer `find_latest_run` from the pointer. The edge also picks a reset's base with it when the request names no run.
 - The Reset command carries the value to the lane in `ResetRequest::expected_current_run_key`. The kernel ignores that field, and the command already carries the reapply exclusions and post-reset options the lane reads after the commit.
 
 Today the materialization is one transaction. It becomes:
@@ -263,11 +263,11 @@ A due timer row can exist without its run's hot row only while the run is being 
 - **Deletion.** `delete_workflow` runs the first transaction and then hands the run to the purger, both in a task the caller's cancellation doesn't stop, and returns the deletion once the run is handed over (2.6). A caller whose deadline expires during the first transaction can't then strand a committed deletion without its purge.
   - `DeleteWorkflowRequest` gains `purge_inline`. DeleteWorkflowExecution leaves it unset.
   - A batch delete and a namespace's reclaim set it. `delete_workflow` then purges the run itself before it returns, and hands the run to the purger only if that purge fails. Each moves to its next run only once a run's rows are gone, or queued after a failure, so a large reclaim doesn't fill the purger's queue.
-- **Reset.** When `materialize_reset_successor` fails, the lane hands the successor's run key to the purger, and reports the error to the reset RPC as today.
-- **Recovery.** `sweep_shard` pages through the shard's records.
-  - Before the shard admits commands, the sweep switches each `materializing` record to `purging` with `abandon_materialization`, one small transaction per record (2.9). A materialization still running from an earlier ownership of the shard then fails at its next transaction, so none can complete once the shard is active. Otherwise one could make its successor visible after the sweep's walks had passed it, so no tracker would be installed for the successor until the next acquisition, and its follow-up command would be refused by a node that no longer owns the shard.
-  - Every record found here is abandoned: the sweep finishes before the shard admits commands, so no materialization started under this ownership is running. Such records are rare, so the switches don't hold activation up in practice. A switch that fails fails the sweep, and the shard isn't activated until a sweep succeeds.
-  - The sweep then hands every record's run to the purger and doesn't wait for the purges. The switch is the only write this spec adds to the sweep.
+- **Reset.** When `materialize_reset_successor` fails, the lane purges the successor before it answers, and reports the error to the reset RPC as today. The attempt has stopped by then, since the lane runs the materialization itself. `reset_workflow` then hands the successor to the purger, which retries the purge if the lane's failed; a successor without a record is a purge that does nothing.
+- **Recovery.** Right after the sweep (`sweep_shard_inner`), on both of its paths and under its writer barrier, the runtime pages through the shard's records (`recover_bulk_writes`). With dispatch reconciliation on, each page and each switch first checks that the recovery's acquisition is still current, as the repair's transactions do.
+  - Before the shard admits commands, the recovery switches each `materializing` record to `purging` with `abandon_materialization`, one small transaction per record (2.9). A materialization still running from an earlier ownership of the shard then fails at its next transaction, so none can complete once the shard is active. Otherwise one could make its successor visible after the sweep's walks had passed it, so no tracker would be installed for the successor until the next acquisition, and its follow-up command would be refused by a node that no longer owns the shard.
+  - Every record found here is abandoned: the recovery finishes before the shard admits commands, so no materialization started under this ownership is running. Such records are rare, so the switches don't hold activation up in practice. A switch that fails fails the recovery, and the shard isn't activated until a recovery succeeds.
+  - The recovery then hands every record's run to the purger and doesn't wait for the purges. The switch is the only write this spec adds to a shard's recovery.
 
 ### The in-memory store's model of DSQL (`crates/tokeira-storage/src/memory.rs`)
 
@@ -279,7 +279,7 @@ A due timer row can exist without its run's hot row only while the run is being 
 
 ### Specs this changes
 
-The code PR aligns these specs with the fix:
+The fix changes these specs:
 - [runtime-durable-backlog](../runtime-durable-backlog/requirements.md): criterion 3.7 re-publishes only the tasks the call didn't persist. The design's batching note says the one call writes in pages.
 - [temporal-ui-support](../temporal-ui-support/design.md): the deletion steps become the first transaction and the purge, DeleteWorkflowExecution returns after the first, and its tests stop requiring one transaction.
 - [continue-as-new-advice](../continue-as-new-advice/requirements.md): Requirement 1.6 and Property 1 measure a copied prefix as the sum of its batches.
@@ -327,14 +327,15 @@ The code PR aligns these specs with the fix:
 
 The live suite runs on an ephemeral cluster under the `dsql-live` profile ([docs/testing/dsql-live-suites.md](../../../docs/testing/dsql-live-suites.md)). It covers:
 - **The contract tests above.**
-- **An interrupted deletion.** The first transaction commits, the purge stops after some of its transactions, and a later purge finishes the run with no row left.
+- **An interrupted deletion.** The first transaction commits, the purge stops after some of its transactions, and two later purges at once finish the run with no row left.
 - **An abandoned materialization.** It stops after some of its transactions and is purged, and a straggler commits nothing.
 - **DSQL's limits, apart from the budgets**, so that a change in DSQL fails a test rather than a purge:
   - 3,000 inserted rows commit and 3,001 are refused;
   - 3,000 deleted rows commit and 3,001 are refused;
   - a transaction deleting rows that hold more than 10 MiB commits;
   - 3,000 rows read `FOR UPDATE` beside one insert commit;
-  - a value of 1,048,576 bytes is stored and one of 1,048,577 is refused.
+  - a value of 1,048,576 bytes is stored and one of 1,048,577 is refused;
+  - 9 MiB of values commit and 10 MiB are refused.
 
 ### Property-Based Tests
 
@@ -344,11 +345,11 @@ The live suite runs on an ephemeral cluster under the `dsql-live` profile ([docs
 
 ### Unit Tests
 
-- The first transaction changes the five rows the design lists, and nothing else.
+- The first transaction changes only the rows the design lists.
 - The purge's table order, and the purge of an abandoned materialization, which has only history and timer rows.
 - The listing of a shard's records in run-key order.
 - `delete_workflow` returns after the first transaction, and the purger removes the run's rows. With `purge_inline`, the rows are gone when it returns, and an inline purge that fails is handed to the purger.
-- `sweep_shard` switches a `materializing` record before the shard is activated, after which the stopped materialization's final transaction changes nothing. It hands the shard's records to the purger without waiting for them.
+- The recovery switches a `materializing` record before it hands the record's run to the purger, and a takeover leaves no record `materializing` once the shard is activated. The recovery hands the shard's records to the purger without waiting for them.
 - A reset whose materialization fails answers the error, and its successor's rows are purged.
 - A reset's copied history of one batch keeps today's History Size (2.11).
 

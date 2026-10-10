@@ -451,7 +451,7 @@ async fn reset_uses_execution_home(fixture: &Fixture) -> Result<()> {
     );
     fixture
         .repo()
-        .materialize_reset_successor(source.run_key, 7, run_id)
+        .materialize_reset_successor(source.run_key, 7, run_id, Some(source.run_key))
         .await?;
     // Observe materialization before another commit can mask wrong placement.
     let hot_shard =

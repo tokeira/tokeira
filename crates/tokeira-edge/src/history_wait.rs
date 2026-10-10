@@ -254,9 +254,15 @@ where
         base_run_key: RunKey,
         fork_event_id: i64,
         successor_run_id: RunId,
+        expected_current: Option<RunKey>,
     ) -> Result<()> {
         self.inner
-            .materialize_reset_successor(base_run_key, fork_event_id, successor_run_id)
+            .materialize_reset_successor(
+                base_run_key,
+                fork_event_id,
+                successor_run_id,
+                expected_current,
+            )
             .await?;
         let loaded = self.inner.load_run(base_run_key).await?;
         if let LoadedRun::Existing(base_state) = loaded {
@@ -332,8 +338,32 @@ where
             .await
     }
 
-    async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
+    async fn persist_to_backlog(
+        &self,
+        entries: Vec<BacklogEntry>,
+    ) -> std::result::Result<(), tokeira_storage::BacklogPersistError> {
         self.inner.persist_to_backlog(entries).await
+    }
+
+    // Purges and abandoned materializations change no visible run: a recorded
+    // run has no mutable state, so no waiter can be watching it.
+    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()> {
+        self.inner.abandon_materialization(run_key).await
+    }
+
+    async fn purge_run(&self, run_key: RunKey) -> Result<()> {
+        self.inner.purge_run(run_key).await
+    }
+
+    async fn list_run_bulk_writes(
+        &self,
+        shard_id: ShardId,
+        after: Option<RunKey>,
+        limit: usize,
+    ) -> Result<Vec<tokeira_storage::RunBulkWrite>> {
+        self.inner
+            .list_run_bulk_writes(shard_id, after, limit)
+            .await
     }
 
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
@@ -379,8 +409,12 @@ where
             .await
     }
 
-    async fn delete_due_timer_if_matches(&self, timer: &DueTimer) -> Result<bool> {
-        self.inner.delete_due_timer_if_matches(timer).await
+    async fn delete_due_timer_if_matches(
+        &self,
+        timer: &DueTimer,
+        reason: tokeira_storage::StaleTimer,
+    ) -> Result<bool> {
+        self.inner.delete_due_timer_if_matches(timer, reason).await
     }
 }
 

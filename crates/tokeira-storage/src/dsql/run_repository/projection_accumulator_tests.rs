@@ -879,12 +879,18 @@ fn dsql_projection_accumulator_reset_boundaries() {
                     for (generation, changed) in [(0, false), (1, true)] {
                         let id = RunId::new();
                         let key = RunKey::derive(base.namespace_id, &base.workflow_id, id);
+                        let expected = fixture
+                            .repo()
+                            .find_latest_run(base.namespace_id, &base.workflow_id)
+                            .await
+                            .unwrap();
                         fixture
                             .repo()
                             .materialize_reset_successor(
                                 predecessor,
                                 if generation == 0 { 10 } else { 7 },
                                 id,
+                                expected,
                             )
                             .await
                             .unwrap();
@@ -964,9 +970,14 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
                     let mut key = initial.run_key;
                     if boundary == 2 {
                         let id = RunId::new();
+                        let expected = fixture
+                            .repo()
+                            .find_latest_run(initial.namespace_id, &initial.workflow_id)
+                            .await
+                            .unwrap();
                         fixture
                             .repo()
-                            .materialize_reset_successor(key, 10, id)
+                            .materialize_reset_successor(key, 10, id, expected)
                             .await
                             .unwrap();
                         key = RunKey::derive(initial.namespace_id, &initial.workflow_id, id);

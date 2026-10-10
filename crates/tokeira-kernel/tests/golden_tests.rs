@@ -851,6 +851,7 @@ fn make_reset_request() -> ResetRequest {
         reapply_exclude_signal: false,
         reapply_exclude_update: false,
         post_reset_versioning_overrides: Vec::new(),
+        expected_current_run_key: None,
         reason: "operator reset".into(),
         request: request_context("reset-req"),
         now: now(),

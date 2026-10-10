@@ -52,12 +52,13 @@ This spec covers these limits on a run's growth. The limits on what a request or
 
 3.3 The force-close for buffered events SHALL CONTINUE TO record what it records today: WorkflowTaskFailed with `ForceCloseCommand`, the flushed events and a new workflow task
 
-3.4 A reset SHALL CONTINUE TO write its successor's copied history as today
+3.4 A reset SHALL CONTINUE TO write its successor's copied history without these limits' checks, in the batches of [bounded-bulk-writes](../bounded-bulk-writes/design.md)
 
 ### Out of Scope
 
 - v1.31.0's state check on a write that closes the run. v1.31.0 still persists the closing write and then answers `InvalidArgument` (`context.go:423-460, 1093-1122 @ v1.31.0`); Tokeira checks only writes that leave the run open.
-- DSQL's 1 MiB column and 2 MiB row limits, which a state or batch below these limits can still exceed, and a reset's copied history, which is written as one batch. Separate changes bound both.
+- DSQL's 1 MiB column and 2 MiB row limits, which a state or batch below these limits can still exceed. A separate change bounds them.
+- A reset's copied history, which [bounded-bulk-writes](../bounded-bulk-writes/design.md) writes in batches within DSQL's limits.
 - What a timer or scanner does with a refused write. v1.31.0's task executors retry the error and eventually move the task to a dead-letter queue.
 - The limits on a run's signals and updates, which [signal-update-limits](../signal-update-limits/bugfix.md) covers.
 - Standalone activities and other CHASM executions, which v1.31.0 checks the same way and terminates through their component tree (`context.go:1138-1145 @ v1.31.0`). Tokeira stores them apart from runs.

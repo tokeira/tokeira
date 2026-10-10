@@ -2,7 +2,7 @@
 
 ## Introduction
 
-Aurora DSQL refuses a write transaction that changes more than 3,000 rows or writes more than 10 MiB, and it refuses any single value over 1 MiB ([quotas](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)). Live probes on 2026-10-08 established how those limits count:
+Aurora DSQL refuses a write transaction that changes more than 3,000 rows or writes more than 10 MiB, and it refuses any single value over 1 MiB ([quotas](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)). Live probes established how those limits count:
 - 3,000 inserted rows commit, and 3,001 are refused. The count is cumulative across statements, and deleted rows count too.
 - A transaction writing 9 MiB commits, and one writing 10 MiB is refused.
 - A value of 1,048,576 bytes is stored, and one byte more is refused.

@@ -210,7 +210,8 @@ function as the DSQL codec.
 including continue-as-new, retry, and cron successors.
 
 1.6 WHEN a reset successor is materialized, THE storage layer SHALL set its History Size
-to the encoded size of the copied history prefix.
+to the sum of the encoded sizes of the batches that hold its copied history prefix
+([bounded-bulk-writes](../bounded-bulk-writes/design.md)).
 
 1.7 WHEN a run is deleted, THE storage layer SHALL remove its History Size with the run.
 

@@ -95,15 +95,20 @@ pub(crate) async fn scan_grace_once<R>(
         // The tasks were already removed from the brokers above. Until storage
         // acknowledges them, the in-memory copy is the only record they exist,
         // so re-publish rather than drop — losing them here would silently lose
-        // work the durable backlog never received.
+        // work the durable backlog never received. The spill writes the entries
+        // in order, in transactions of their own, so the first `persisted` are
+        // stored and stay out of the brokers (`runtime-durable-backlog` criterion 3.7).
         tracing::warn!(
-            ?error,
+            error = ?error.source,
+            persisted = error.persisted,
             "failed to persist expired live-ready tasks to backlog"
         );
-        for task in expired_workflow {
+        let workflow_persisted = error.persisted.min(expired_workflow.len());
+        let activity_persisted = error.persisted - workflow_persisted;
+        for task in expired_workflow.into_iter().skip(workflow_persisted) {
             broker.publish_workflow_task(task.task, None).await;
         }
-        for task in expired_activity {
+        for task in expired_activity.into_iter().skip(activity_persisted) {
             if let Err(republish_error) =
                 activity_broker.publish_activity_task(task.task, None).await
             {
@@ -454,8 +459,26 @@ mod tests {
             _base_run_key: RunKey,
             _fork_event_id: i64,
             _successor_run_id: tokeira_types::RunId,
+            _expected_current: Option<RunKey>,
         ) -> Result<()> {
             Err(anyhow!("unused"))
+        }
+
+        async fn abandon_materialization(&self, _run_key: RunKey) -> Result<()> {
+            Ok(())
+        }
+
+        async fn purge_run(&self, _run_key: RunKey) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list_run_bulk_writes(
+            &self,
+            _shard_id: tokeira_types::ShardId,
+            _after: Option<RunKey>,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::RunBulkWrite>> {
+            Ok(Vec::new())
         }
         async fn list_workflow_dispatch_page(
             &self,
@@ -503,13 +526,19 @@ mod tests {
         ) -> Result<bool> {
             Ok(false)
         }
-        async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
+        async fn persist_to_backlog(
+            &self,
+            entries: Vec<BacklogEntry>,
+        ) -> std::result::Result<(), tokeira_storage::BacklogPersistError> {
             if *self
                 .fail_persist
                 .lock()
                 .expect("fail_persist lock poisoned")
             {
-                return Err(anyhow!("persist failed"));
+                return Err(tokeira_storage::BacklogPersistError {
+                    persisted: 0,
+                    source: anyhow!("persist failed"),
+                });
             }
             self.persisted
                 .lock()
@@ -569,7 +598,11 @@ mod tests {
         ) -> Result<Vec<DueTimer>> {
             Ok(Vec::new())
         }
-        async fn delete_due_timer_if_matches(&self, _timer: &DueTimer) -> Result<bool> {
+        async fn delete_due_timer_if_matches(
+            &self,
+            _timer: &DueTimer,
+            _reason: tokeira_storage::StaleTimer,
+        ) -> Result<bool> {
             Ok(false)
         }
     }
@@ -634,6 +667,64 @@ mod tests {
                 logical_seq: LogicalTaskSeq::ONE
             }
         ));
+    }
+
+    // A spill that fails at its second page keeps its first page stored and
+    // re-publishes only the tasks after it, so no task is both stored and in a
+    // broker (`bounded-bulk-writes` criterion 2.2).
+    #[tokio::test]
+    async fn a_failed_spill_re_publishes_only_the_tasks_it_did_not_store() {
+        let repo = tokeira_storage::InMemoryStore::default();
+        let broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let queue = activity_queue();
+        for index in 0..1_500 {
+            activity_broker
+                .publish_activity_task(
+                    tokeira_storage::DispatchableActivityTask {
+                        run_key: RunKey::new(),
+                        queue: queue.clone(),
+                        activity_id: format!("activity-{index}"),
+                        input: tokeira_types::Payloads::default(),
+                        schedule_event_id: 5,
+                        attempt: 1,
+                        dispatch_revision: 0,
+                        stamp: 0,
+                        priority: None,
+                        order: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        // The first page, of 1,000 entries, commits, and the second fails.
+        repo.fail_bulk_write_after(1).await;
+        let config = BacklogConfig {
+            activity_grace_window: std::time::Duration::ZERO,
+            ..BacklogConfig::default()
+        };
+        scan_grace_once(&broker, &activity_broker, &repo, &config).await;
+
+        let stored = repo
+            .drain_backlog(&queue, 2_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| match entry.payload {
+                BacklogPayload::Activity { activity_id, .. } => activity_id,
+                BacklogPayload::Workflow { .. } => unreachable!("only activities were spilled"),
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let republished = activity_broker
+            .take_expired(std::time::Duration::ZERO)
+            .await
+            .into_iter()
+            .map(|expired| expired.task.activity_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(stored.len(), 1_000);
+        assert_eq!(republished.len(), 500);
+        assert!(stored.is_disjoint(&republished));
     }
 
     #[tokio::test]

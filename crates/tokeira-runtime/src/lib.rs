@@ -45,6 +45,7 @@ pub mod metrics;
 pub mod nexus;
 pub mod nexus_http;
 pub mod publisher;
+mod purge;
 pub mod query;
 pub mod query_consistency_model;
 pub mod recovery;

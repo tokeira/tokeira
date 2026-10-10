@@ -584,6 +584,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restored_store_placement_preparation_delegates_through_history_notifier() {
+        let original = Arc::new(InMemoryStore::default());
+        let repo =
+            HistoryNotifyingRepository::new(original.clone(), HistoryWaitRegistry::default());
+        seed_open_pinned_run(
+            &repo,
+            NamespaceId::new(),
+            &WorkerDeploymentVersionKey {
+                deployment_name: DeploymentName("deployment".into()),
+                build_id: BuildId("build".into()),
+            },
+        )
+        .await;
+        let restored =
+            Arc::new(InMemoryStore::from_snapshot(&original.snapshot().await.unwrap()).unwrap());
+        let repo =
+            HistoryNotifyingRepository::new(restored.clone(), HistoryWaitRegistry::default());
+        assert!(!restored.placement_ready());
+        assert!(!repo.placement_ready());
+        let progress = tokeira_storage::prepare_execution_placement(&repo)
+            .await
+            .unwrap();
+        assert!(progress.complete());
+        assert_eq!(progress.hot_examined, 1);
+        assert!(restored.placement_ready());
+        assert!(repo.placement_ready());
+    }
+
+    #[tokio::test]
     async fn workflow_rule_storage_delegates_through_history_notifier() {
         let inner = Arc::new(InMemoryStore::default());
         let repo = HistoryNotifyingRepository::new(inner, HistoryWaitRegistry::default());

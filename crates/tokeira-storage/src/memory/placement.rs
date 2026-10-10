@@ -210,6 +210,10 @@ impl InMemoryStore {
                     .max()
                     .unwrap_or(0)
                     .max(cost.bytes);
+                // A large timer identity also enlarges the durable cursor. A
+                // move must fit with that reserve on an otherwise empty page,
+                // or retries would commit the same position forever.
+                let marker_cost = cost;
                 let first_move = keys.iter().position(|key| {
                     home(&store, key.run_key).is_some_and(|home| key.shard != shard_uuid(home))
                 });
@@ -238,8 +242,8 @@ impl InMemoryStore {
                             bytes: payload.len() + key.timer_id.len() + 128,
                         };
                         ensure!(
-                            extra.bytes + 8_192 <= MAX_BYTES_PER_TRANSACTION,
-                            "placement upgrade run={:?} stored_shard={} computed_home={target:?}: timer exceeds relocation budget",
+                            fits(marker_cost, extra),
+                            "placement upgrade run={:?} stored_shard={} computed_home={target:?}: timer and marker exceed relocation budget",
                             key.run_key,
                             key.shard
                         );

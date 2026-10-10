@@ -156,7 +156,9 @@ impl DsqlRunRepository {
                 }
                 Ok(PlacementPage::Committed(progress))
             }
-            Err(error) if retryable(&error) => Ok(PlacementPage::Retry),
+            Err(error) if retryable(&error) => Ok(PlacementPage::Retry {
+                cause: format!("{error:#}"),
+            }),
             Err(error) => Err(error),
         }
     }

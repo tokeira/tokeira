@@ -99,7 +99,10 @@ pub enum PlacementPage {
     /// Durable progress, including a previously completed marker.
     Committed(PlacementProgress),
     /// Retry from a fresh marker after contention or a transient connection error.
-    Retry,
+    Retry {
+        /// Diagnostic chain for the lost or uncertain page, retained for startup logs.
+        cause: String,
+    },
 }
 
 /// Complete physical preparation before constructing any runtime tasks.
@@ -110,7 +113,7 @@ pub enum PlacementPage {
 pub async fn prepare_execution_placement<R: RunRepository + ?Sized>(
     repo: &R,
 ) -> Result<PlacementProgress> {
-    let mut lost = 0u32;
+    let mut attempt = 0u64;
     loop {
         match repo.prepare_placement_page().await? {
             PlacementPage::Committed(progress) => {
@@ -125,11 +128,16 @@ pub async fn prepare_execution_placement<R: RunRepository + ?Sized>(
                 if progress.complete() {
                     return Ok(progress);
                 }
-                lost = 0;
+                attempt = 0;
             }
-            PlacementPage::Retry => {
-                lost = lost.saturating_add(1).min(7);
-                let ceiling = (10u64 << lost).min(1_000);
+            PlacementPage::Retry { cause } => {
+                attempt = attempt.saturating_add(1);
+                tracing::warn!(
+                    attempt,
+                    cause,
+                    "execution-home placement preparation retrying from durable progress"
+                );
+                let ceiling = (10u64 << attempt.min(7)).min(1_000);
                 // Per-attempt randomness prevents simultaneous starters from
                 // falling into the same retry cadence on the singleton.
                 let jitter = (Uuid::new_v4().as_u128() % u128::from(ceiling)) as u64;

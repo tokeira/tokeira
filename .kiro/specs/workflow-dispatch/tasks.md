@@ -288,8 +288,10 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       and its run-key hash selects another shard.
       Implementation evidence: admission resolves execution identity through
       the lane cache; epoch helpers use already-loaded state. Runtime tests
-      cover both construction modes, distinct epochs, stale tokens, activity
-      heartbeat/completion and unchanged hot-path load counts.
+      cover both construction modes, distinct epochs, wrong-shard tokens,
+      same-home reacquisition from epoch 17 to 18 rejecting old workflow completions
+      and activity heartbeats without mutation, activity completion and unchanged
+      hot-path load counts.
     - Preserve activity backlog, its shared loops, `activity_dispatch`, and
       `reconcile_due_activity_dispatches_once`. Add no mixed-release branch or
       durable workflow delivery checkpoint.

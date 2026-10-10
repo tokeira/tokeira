@@ -11,6 +11,20 @@ use tokeira_storage::*;
 use tokeira_types::*;
 use tokio::sync::oneshot;
 
+#[derive(Clone, Debug, Default)]
+struct PlacementLogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for PlacementLogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Point {
     Load,
@@ -333,7 +347,9 @@ impl RunRepository for Repo {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Ok(PlacementPage::Retry);
+            return Ok(PlacementPage::Retry {
+                cause: "injected placement connection failure".into(),
+            });
         }
         self.inner.prepare_placement_page().await
     }
@@ -992,8 +1008,8 @@ fn signal_start(start: StartRequest) -> SignalWithStartRequest {
 }
 
 #[tokio::test]
-async fn execution_home_admission_delivery_and_completion_use_the_same_epoch() {
-    for repair in [false, true] {
+async fn execution_home_admission_delivery_and_completion_check_current_and_stale_epochs() {
+    for (repair, reacquire) in [(false, false), (true, false), (false, true), (true, true)] {
         let repo = Arc::new(Repo {
             inner: InMemoryStore::with_shard_count(8),
             ..Default::default()
@@ -1058,10 +1074,29 @@ async fn execution_home_admission_delivery_and_completion_use_the_same_epoch() {
                 .is::<crate::errors::NotShardOwner>()
         );
         completion.token.shard_epoch = ShardEpoch(17);
-        assert!(matches!(
-            runtime.complete_workflow_task(completion).await.unwrap(),
-            CommitResult::Applied { .. }
-        ));
+        if reacquire {
+            {
+                let mut owner = runtime.shard_owner.write().unwrap();
+                owner.record_acquired(home, ShardEpoch(18));
+                owner.mark_active(home);
+            }
+            let before = repo.inner.snapshot().await.unwrap();
+            let error = runtime
+                .complete_workflow_task(completion)
+                .await
+                .unwrap_err();
+            let not_owner = error
+                .downcast_ref::<crate::errors::NotShardOwner>()
+                .unwrap();
+            assert_eq!(not_owner.bundle_id, home);
+            assert_eq!(not_owner.current_epoch, ShardEpoch(18));
+            assert_eq!(repo.inner.snapshot().await.unwrap(), before);
+        } else {
+            assert!(matches!(
+                runtime.complete_workflow_task(completion).await.unwrap(),
+                CommitResult::Applied { .. }
+            ));
+        }
         stop(&runtime).await;
 
         let wrong = home_runtime(
@@ -1163,9 +1198,25 @@ async fn restored_store_requires_preparation_before_any_runtime_construction() {
 #[tokio::test]
 async fn placement_preparation_retries_without_restart_and_backoff_is_cancellable() {
     let repo = Repo::default();
-    repo.preparation_retries.store(2, Ordering::SeqCst);
+    let output = PlacementLogCapture::default();
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .without_time()
+        .with_ansi(false)
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+    repo.preparation_retries.store(9, Ordering::SeqCst);
     assert!(prepare_execution_placement(&repo).await.unwrap().complete());
-    assert_eq!(repo.preparation_attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(repo.preparation_attempts.load(Ordering::SeqCst), 10);
+    let log = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    let retries: Vec<_> = log.lines().filter(|line| line.contains(" WARN ")).collect();
+    assert_eq!(retries.len(), 9);
+    for (index, line) in retries.iter().enumerate() {
+        assert!(line.contains(&format!("attempt={}", index + 1)));
+        assert!(line.contains("cause=\"injected placement connection failure\""));
+    }
 
     repo.preparation_retries.store(100, Ordering::SeqCst);
     let mut waiting = Box::pin(prepare_execution_placement(&repo));
@@ -1175,7 +1226,7 @@ async fn placement_preparation_retries_without_restart_and_backoff_is_cancellabl
         ))
         .await
     );
-    assert_eq!(repo.preparation_attempts.load(Ordering::SeqCst), 4);
+    assert_eq!(repo.preparation_attempts.load(Ordering::SeqCst), 11);
     drop(waiting);
     assert_eq!(repo.preparation_retries.load(Ordering::SeqCst), 99);
 }

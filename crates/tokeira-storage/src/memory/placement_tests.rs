@@ -198,7 +198,7 @@ async fn duplicate_timer_is_retained_but_conflicting_payload_aborts_page() {
                         break;
                     }
                     Ok(PlacementPage::Committed(p)) => assert!(!p.complete()),
-                    Ok(PlacementPage::Retry) => unreachable!(),
+                    Ok(PlacementPage::Retry { .. }) => unreachable!(),
                 }
             }
         } else {
@@ -322,4 +322,37 @@ async fn placement_hot_pages_stop_at_the_byte_budget_before_the_key_budget() {
     let inner = store.inner.lock().await;
     let cost = inner.modeled_transactions.last().unwrap();
     assert!(cost.bytes <= crate::write_budget::MAX_BYTES_PER_TRANSACTION);
+}
+
+#[tokio::test]
+async fn oversized_timer_and_marker_fail_without_committing_empty_progress() {
+    let store = InMemoryStore::with_shard_count(8);
+    let key = seed(&store, 1, false, true).await;
+    {
+        let mut inner = store.inner.lock().await;
+        let (position, mut timer) = inner.timer_bucket.pop_first().unwrap();
+        timer.timer_id = "x".repeat(1_500_000);
+        inner.timer_bucket.insert(
+            TimerPosition {
+                timer_id: timer.timer_id.clone(),
+                ..position
+            },
+            timer,
+        );
+        inner.placement_progress = Some(PlacementProgress {
+            phase: PlacementPhase::Timers(None),
+            ..PlacementProgress::default()
+        });
+    }
+    let before = store.snapshot().await.unwrap();
+    let error = store
+        .prepare_placement_page()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&format!("run={key:?}")));
+    assert!(error.contains("stored_shard") && error.contains("computed_home"));
+    assert!(error.contains("timer and marker exceed relocation budget"));
+    assert_eq!(store.snapshot().await.unwrap(), before);
+    assert!(!store.placement_ready());
 }

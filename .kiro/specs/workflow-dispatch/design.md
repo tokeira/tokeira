@@ -564,8 +564,9 @@ after an ordinary commit has already corrected the hot row. It screens identity
 columns in pages of up to 1,000 keys; a relocating page processes at most 64 keys
 within the shared row/byte budgets. Moves and the exclusive continuation update
 commit together through a single versioned marker. Concurrent starters retry lost
-pages with jitter and fresh progress; no runtime writer, scanner or acquisition
-starts until completion is observed.
+pages with jitter and fresh progress, warning on each retry with its cause and
+consecutive attempt count; no runtime writer, scanner or acquisition starts until
+completion is observed.
 
 Relocation is stopped-cluster storage-upgrade authority, outside per-home dispatch
 repair. Repair still changes only derived dispatch and rejects misplaced authority.
@@ -582,7 +583,9 @@ cold load. Token minting, heartbeat and activity completion paths already holdin
 state derive the home directly. The run hash remains a local-lane routing input; processing spans record the
 execution home when state becomes available, without another load. The regressions exercise start,
 delivery and completion with only the execution home held, distinct non-zero epochs,
-stale tokens, and activity heartbeat/completion.
+wrong-shard token epochs, and activity heartbeat/completion. Reacquiring the same
+home at epoch 18 rejects workflow completions and activity heartbeats minted at
+epoch 17 without changing durable state.
 
 When enabled, acquisition first publishes Sweeping and drains a per-home writer
 barrier before either walk. Lane commits retain admission through post-commit

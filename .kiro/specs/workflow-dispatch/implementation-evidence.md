@@ -2,7 +2,7 @@
 
 ## Fourth implementation PR: placement and execution-home prerequisites
 
-Base: `d3294203ece51d9ebcf2441d135a38325a5a370d`; the PR records its final base
+Base: `2a4474057aff90e46468afdc3bdde51b8f5c6065`; the PR records its final base
 and head. Task 11.1 remains unchecked until default cutover. Tasks 17–18 and
 requirements 8.4–8.6 still depend on the transaction-local competing-owner lease
 fence.
@@ -34,7 +34,7 @@ change is introduced; V001–V080 remain byte-for-byte unchanged.
 |---|---|
 | `runtime/commit.rs::submit` and `submit_for_owned_shard` | Start, signal-with-start and start-and-update commands supply namespace/workflow identity; other commands share the lane cache's ordinary load. |
 | `runtime/commit.rs::shard_id_for` | Asks the owning local lane for immutable execution identity; derives the home using the configured shard count. |
-| `runtime/mod.rs::validate_workflow_task_token_epoch` | Resolves the home once through that cache, then checks its current completion epoch. |
+| `runtime/mod.rs::validate_workflow_task_token` | Resolves the home once through that cache, then checks its current completion epoch. |
 | `runtime/workflow_task.rs` normal and reserved task-token minting | Passes already-loaded committed state to `current_shard_epoch`. |
 | `runtime/activity.rs` activity task-token minting | Passes already-loaded committed state to `current_shard_epoch`. |
 | `runtime/activity.rs` heartbeat, by-ID resolution, forced-start token creation and completion validation | Passes existing loaded state to `shard_epoch_for_completion`. |
@@ -49,7 +49,9 @@ row conservation, semantic snapshot preservation, committed-only counters and
 shared budget assertions. Fixed fixtures cover the actual reset materialization,
 timers remaining on the old shard after hot placement is correct, equivalent and
 conflicting copies, orphan timers, unexplained placement, invalid identity,
-1,000-key screening and a byte-limited page of large states.
+1,000-key screening and a byte-limited page of large states. An oversized memory
+timer whose relocation fits alone but cannot fit with its cursor fails with row
+identity before any page progress or physical mutation commits.
 
 The same reset fixture is exercised through real DSQL. Live contracts cover
 concurrent starters, a stale transaction attempting to write after completion,
@@ -57,9 +59,13 @@ unchanged authoritative bytes, complete dispatch repair, raw live leases with
 unrecognized shard encodings, corruption diagnostics, duplicates/orphans, and the
 exact SQL used by first and deep continuation pages. Runtime regressions cover
 both construction modes with only the execution home held, distinct nonzero
-epochs, wrong-home rejection, stale workflow/activity tokens, heartbeat and
-completion, cold-load reuse and no extra hot-cache load. Another regression
-checks restored-store construction and cancellable retry without restart.
+epochs, wrong-home rejection, heartbeat and completion, cold-load reuse and no
+extra hot-cache load. Both modes mint tokens at the home's epoch 17, reacquire
+that home at 18, and reject the original workflow completion and activity
+heartbeat without mutating storage. The history-notifying wrapper preserves
+not-ready status for a restored memory snapshot and completes its scan through
+the wrapper. Retry coverage checks warning-level causes and consecutive attempts
+beyond the backoff cap, as well as cancellation without restart.
 
 ### Live DSQL and workspace validation
 
@@ -104,13 +110,19 @@ not require state or timer decoding.
 
 The full root §10.4 bar passed: nightly formatting, `cargo lint --locked`,
 workspace check, workspace nextest, workspace doctests, and documentation with
-`RUSTDOCFLAGS="-D warnings"`. Nextest ran **3,804 tests, all passed**; the two
+`RUSTDOCFLAGS="-D warnings"`. Nextest ran **3,806 tests, all passed**; the two
 existing ignored external SDK integration tests remained ignored. The additional
 DSQL-feature check passed:
 
 ```sh
 cargo clippy -p tokeira-storage -p tokeira-runtime --all-targets --features tokeira-storage/dsql-integration,tokeira-runtime/dsql-integration --locked
 ```
+
+The review update repeated the full bar and DSQL-feature Clippy. Its focused
+filter passed seven checks, including same-home token staleness, retry diagnostics,
+wrapper preparation and oversized timer/cursor rejection. The live DSQL checks
+above were not repeated: their SQL and transaction logic are unchanged. No new
+cluster was created for this update.
 
 Offline Markdown links and `git diff --check` passed. The link command uses the
 CI exclusions plus the ignored generated `.tokeira-build` scratch directory.

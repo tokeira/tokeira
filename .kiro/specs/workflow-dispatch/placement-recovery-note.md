@@ -92,7 +92,9 @@ There is no process-owned migration lease to strand. A second node can make
 progress if the first exits or stalls. A node arriving mid-pass joins this
 protocol and remains non-serving. Retryable failures use cancellation-aware
 backoff and fresh transactions; bounded inner retries must not require a process
-restart to resume the outer preparation loop. An uncertain commit result is
+restart to resume the outer preparation loop. Each retry logs its cause and
+consecutive attempt count at warning level; the counter continues beyond the
+backoff cap and resets after committed progress. An uncertain commit result is
 resolved by rereading the marker.
 
 Persist phase, rows examined and rows moved with the cursor. Progress logs report
@@ -164,7 +166,9 @@ payloads incrementally. Cap each
 transaction using the shared `write_budget` limits: 1,000 modified rows and
 4 MiB of written values, reserving room for the marker. Count a timer copy and
 source delete separately; stop before exceeding either budget and advance only
-past the processed prefix. Keep read payload accumulation bounded as well.
+past the processed prefix. A relocation that cannot fit on an otherwise empty
+page, including its marker reserve, fails with the row identified instead of
+committing unchanged progress. Keep read payload accumulation bounded as well.
 Use primary-key keyset predicates, not offsets; verify the continuation plans on
 DSQL. This does not change the separate 64-key legacy-backlog disposal cap.
 

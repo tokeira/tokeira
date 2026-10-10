@@ -4254,8 +4254,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execution_home_activity_heartbeat_and_completion_ignore_run_hash_epoch() {
-        for repair in [false, true] {
+    async fn execution_home_activity_heartbeat_and_completion_check_current_and_stale_epochs() {
+        for (repair, reacquire) in [(false, false), (true, false), (false, true), (true, true)] {
             let repo = Arc::new(InMemoryStore::with_shard_count(8));
             let runtime =
                 super::super::repair_tests::home_runtime(repo.clone(), ShardId(0), repair);
@@ -4286,20 +4286,21 @@ mod tests {
                 owner.record_acquired(other, ShardEpoch(33));
                 owner.mark_active(other);
             }
-            let stale = ActivityTaskToken {
+            assert_eq!(token.shard_epoch, ShardEpoch(17));
+            let wrong_epoch = ActivityTaskToken {
                 shard_epoch: ShardEpoch(33),
                 ..token.clone()
             };
             assert!(
                 runtime
-                    .record_activity_heartbeat(stale.clone(), None, None)
+                    .record_activity_heartbeat(wrong_epoch.clone(), None, None)
                     .await
                     .is_err()
             );
             assert!(
                 runtime
                     .complete_activity_task(
-                        stale,
+                        wrong_epoch,
                         Payloads::default(),
                         None,
                         RequestContext::unattributed(OffsetDateTime::now_utc())
@@ -4307,18 +4308,33 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert!(matches!(
-                runtime
-                    .complete_activity_task(
-                        token,
-                        Payloads::default(),
-                        None,
-                        RequestContext::unattributed(OffsetDateTime::now_utc())
-                    )
+            if reacquire {
+                {
+                    let mut owner = runtime.shard_owner.write().unwrap();
+                    owner.record_acquired(home, ShardEpoch(18));
+                    owner.mark_active(home);
+                }
+                let before = repo.snapshot().await.unwrap();
+                let error = runtime
+                    .record_activity_heartbeat(token, Some(payloads(b"stale-heartbeat")), None)
                     .await
-                    .unwrap(),
-                CommitResult::Applied { .. }
-            ));
+                    .unwrap_err();
+                assert_eq!(error.to_string(), "activity heartbeat shard epoch mismatch");
+                assert_eq!(repo.snapshot().await.unwrap(), before);
+            } else {
+                assert!(matches!(
+                    runtime
+                        .complete_activity_task(
+                            token,
+                            Payloads::default(),
+                            None,
+                            RequestContext::unattributed(OffsetDateTime::now_utc())
+                        )
+                        .await
+                        .unwrap(),
+                    CommitResult::Applied { .. }
+                ));
+            }
             runtime.runtime_shutdown.begin_shutdown();
             runtime
                 .runtime_shutdown
